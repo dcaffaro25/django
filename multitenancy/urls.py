@@ -1,6 +1,6 @@
 # NORD/multitenancy/urls.py
 
-from django.urls import path, include
+from django.urls import path, include, re_path
 from rest_framework.routers import DefaultRouter
 from .views import CustomUserViewSet, CompanyViewSet, EntityViewSet, EntityTreeView, LoginView, LogoutView, IntegrationRuleViewSet
 from accounting.views import CurrencyViewSet
