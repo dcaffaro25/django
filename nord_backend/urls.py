@@ -21,8 +21,8 @@ from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from . import views
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
-    path('home/', views.index, name='index'),
+    re_path(r'^admin/?', admin.site.urls),
+    re_path(r'^home/?$', views.index, name='index'),
     #re_path(r'^(?P<tenant_id>[^/]+)/', include('multitenancy.urls')),
     path('', include('multitenancy.urls')),
     path('', include('core.urls')),
@@ -31,8 +31,8 @@ urlpatterns = [
     re_path(r'^(?P<tenant_id>[^/]+)/', include('multitenancy.urls')),
     re_path(r'^(?P<tenant_id>[^/]+)/', include('billing.urls')),
     #path('api/', include('accounting.urls')),
-    path('api/token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
-    path('api/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path(r'^api/token/?$', TokenObtainPairView.as_view(), name='token_obtain_pair'),
+    path(r'^api/token/refresh/?$', TokenRefreshView.as_view(), name='token_refresh'),
 ]
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

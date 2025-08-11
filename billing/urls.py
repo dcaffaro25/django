@@ -13,6 +13,8 @@ from .views import (
 )
 
 router = DefaultRouter()
+router.trailing_slash = r'/?'
+
 router.register(r'business_partner_categories', BusinessPartnerCategoryViewSet)
 router.register(r'business_partners', BusinessPartnerViewSet)
 router.register(r'product_service_categories', ProductServiceCategoryViewSet)
@@ -22,5 +24,5 @@ router.register(r'invoices', InvoiceViewSet)
 router.register(r'invoice_lines', InvoiceLineViewSet)
 
 urlpatterns = [
-    path('api/', include(router.urls)),
+    path(r'^api/?$', include(router.urls)),
 ]

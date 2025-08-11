@@ -10,15 +10,17 @@ from .views import (
 )
 
 router = DefaultRouter()
+router.trailing_slash = r'/?'
+
 router.register(r'financial_indices', FinancialIndexViewSet)
 router.register(r'index_quotes', IndexQuoteViewSet)
 router.register(r'index_forecasts', FinancialIndexQuoteForecastViewSet)
 
 custom_routes = [
-    path('rrule_preview/', RecurrencePreviewView.as_view(), name='rrule-preview'),
+    path(r'^rrule_preview/?$', RecurrencePreviewView.as_view(), name='rrule-preview'),
 ]
 
 urlpatterns = [
-    path('api/', include(router.urls)),
-    path('api/', include(custom_routes)),
+    path(r'^api/?$', include(router.urls)),
+    path(r'^api/?$', include(custom_routes)),
 ]

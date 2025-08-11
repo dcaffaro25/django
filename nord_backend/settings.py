@@ -40,6 +40,8 @@ LOGGING = {
     },
 }
 
+APPEND_SLASH = True  # keep this; helps GET/HEAD without slash
+
 # Feature flag for Retool authentication
 ALLOW_RETOOL_AUTHENTICATION = True
 RETOOL_AUTH_ORIGIN = "https://nordventures.retool.com"

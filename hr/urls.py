@@ -7,6 +7,8 @@ from .views import (
 )
 
 router = DefaultRouter()
+router.trailing_slash = r'/?'
+
 router.register(r'positions', PositionViewSet)
 router.register(r'employees', EmployeeViewSet)
 router.register(r'timetracking', TimeTrackingViewSet)
@@ -17,5 +19,5 @@ router.register(r'recurring-adjustments', RecurringAdjustmentViewSet)
 
 
 urlpatterns = [
-    path('api/hr/', include(router.urls)),
+    path(r'^api/hr/?$', include(router.urls)),
 ]
