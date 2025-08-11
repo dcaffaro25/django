@@ -190,6 +190,7 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 CORS_ALLOW_CREDENTIALS = True
 
 CORS_ALLOWED_ORIGINS = [
+    "*",
     "http://localhost:5173",
     "https://nordventures.retool.com",
     "https://82f3-8-242-11-50.ngrok-free.app",
@@ -197,6 +198,7 @@ CORS_ALLOWED_ORIGINS = [
 ]
 
 CSRF_TRUSTED_ORIGINS = [
+    "*",
     'http://localhost:5173', 
     "https://nordventures.retool.com",
     "https://82f3-8-242-11-50.ngrok-free.app",
