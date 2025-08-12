@@ -1,6 +1,6 @@
 # NORD/accounting/urls.py
 
-from django.urls import path, include
+from django.urls import re_path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
     CurrencyViewSet,
@@ -16,49 +16,44 @@ from .views import (
     ReconciliationViewSet,
     UnreconciledDashboardView,
     transaction_schema,
-    journal_entry_schema
+    journal_entry_schema,
 )
 from multitenancy.views import EntityViewSet, EntityMiniViewSet, EntityTreeView, EntityDynamicTransposedView
 
-# Create a router and register viewsets
-router = DefaultRouter()
-router.trailing_slash = r'/?'
+# Router that accepts with/without trailing slash
+class LooseSlashRouter(DefaultRouter):
+    trailing_slash = r'/?'
 
-router.register(r'currencies', CurrencyViewSet)
-router.register(r'accounts', AccountViewSet)
-router.register(r'cost_centers', CostCenterViewSet)
-router.register(r'transactions', TransactionViewSet)
-router.register(r'journal_entries', JournalEntryViewSet)
-router.register(r'rules', RuleViewSet)
-router.register(r'banks', BankViewSet)
-router.register(r'bank_accounts', BankAccountViewSet)
-router.register(r'bank_transactions', BankTransactionViewSet)
-router.register(r'reconciliation', ReconciliationViewSet)
-router.register(r'entities', EntityViewSet, basename='entity')
-router.register(r'entities-mini', EntityMiniViewSet)
-#router.register(r'reconciliation_dashboard', UnreconciledDashboardView)
+router = LooseSlashRouter()
+router.register('currencies', CurrencyViewSet)
+router.register('accounts', AccountViewSet)
+router.register('cost_centers', CostCenterViewSet)
+router.register('transactions', TransactionViewSet)
+router.register('journal_entries', JournalEntryViewSet)
+router.register('rules', RuleViewSet)
+router.register('banks', BankViewSet)
+router.register('bank_accounts', BankAccountViewSet)
+router.register('bank_transactions', BankTransactionViewSet)
+router.register('reconciliation', ReconciliationViewSet)
+router.register('entities', EntityViewSet, basename='entity')
+router.register('entities-mini', EntityMiniViewSet)
 
-# Add custom routes for specific actions or views
-custom_routes = [
-    # Transaction-specific actions
-    path(r'^transactions/<int:pk>/post/?$', TransactionViewSet.as_view({'post': 'post'}), name='transaction-post'),
-    path(r'^transactions/<int:pk>/unpost/?$', TransactionViewSet.as_view({'post': 'unpost'}), name='transaction-unpost'),
-    path(r'^transactions/<int:pk>/cancel/?$', TransactionViewSet.as_view({'post': 'cancel'}), name='transaction-cancel'),
-    path(r'^transactions/<int:pk>/create_balancing_entry/?$', TransactionViewSet.as_view({'post': 'create_balancing_entry'}), name='transaction-create-balancing-entry'),
-    path(r'^transactions/filtered/?$', TransactionViewSet.as_view({'get': 'filtered'}), name='transaction-filtered'),
-    path(r'^reconciliation-dashboard/?$', UnreconciledDashboardView.as_view(), name='reconciliation-dashboard'),
-    path(r'^schema/transaction/?$', transaction_schema, name='transaction-schema'),
-    path(r'^schema/journal-entry/?$', journal_entry_schema, name='journal-entry-schema'),
-    # Account summary
-    path(r'^account_summary/?$', AccountSummaryView.as_view(), name='account-summary'),
-
-    # Entity tree for multitenancy
-    path(r'^entities-dynamic-transposed/?$', EntityDynamicTransposedView.as_view(), name='entity-dynamic-transposed'),
-    path(r'^entity-tree/<int:company_id>/?$', EntityTreeView.as_view(), name='entity-tree'),
-]
-
-# Combine router URLs and custom routes
 urlpatterns = [
-    path(r'^api/?$', include(router.urls)),
-    path(r'^api/?$', include(custom_routes))
+    # IMPORTANT: no extra 'api/' here because the project urls already mount this file at /<tenant>/api/
+    re_path(r'', include(router.urls)),
+
+    # Custom routes — use re_path for optional trailing slash
+    re_path(r'^transactions/(?P<pk>\d+)/post/?$',  TransactionViewSet.as_view({'post': 'post'}), name='transaction-post'),
+    re_path(r'^transactions/(?P<pk>\d+)/unpost/?$', TransactionViewSet.as_view({'post': 'unpost'}), name='transaction-unpost'),
+    re_path(r'^transactions/(?P<pk>\d+)/cancel/?$', TransactionViewSet.as_view({'post': 'cancel'}), name='transaction-cancel'),
+    re_path(r'^transactions/(?P<pk>\d+)/create_balancing_entry/?$', TransactionViewSet.as_view({'post': 'create_balancing_entry'}), name='transaction-create-balancing-entry'),
+    re_path(r'^transactions/filtered/?$', TransactionViewSet.as_view({'get': 'filtered'}), name='transaction-filtered'),
+
+    re_path(r'^reconciliation-dashboard/?$', UnreconciledDashboardView.as_view(), name='reconciliation-dashboard'),
+    re_path(r'^schema/transaction/?$', transaction_schema, name='transaction-schema'),
+    re_path(r'^schema/journal-entry/?$', journal_entry_schema, name='journal-entry-schema'),
+    re_path(r'^account_summary/?$', AccountSummaryView.as_view(), name='account-summary'),
+
+    re_path(r'^entities-dynamic-transposed/?$', EntityDynamicTransposedView.as_view(), name='entity-dynamic-transposed'),
+    re_path(r'^entity-tree/(?P<company_id>\d+)/?$', EntityTreeView.as_view(), name='entity-tree'),
 ]

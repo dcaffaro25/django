@@ -1,6 +1,5 @@
 # NORD/billing/urls.py
-
-from django.urls import path, include
+from django.urls import re_path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
     BusinessPartnerCategoryViewSet,
@@ -15,14 +14,15 @@ from .views import (
 router = DefaultRouter()
 router.trailing_slash = r'/?'
 
-router.register(r'business_partner_categories', BusinessPartnerCategoryViewSet)
-router.register(r'business_partners', BusinessPartnerViewSet)
-router.register(r'product_service_categories', ProductServiceCategoryViewSet)
-router.register(r'product_services', ProductServiceViewSet)
-router.register(r'contracts', ContractViewSet)
-router.register(r'invoices', InvoiceViewSet)
-router.register(r'invoice_lines', InvoiceLineViewSet)
+router.register('business_partner_categories', BusinessPartnerCategoryViewSet)
+router.register('business_partners', BusinessPartnerViewSet)
+router.register('product_service_categories', ProductServiceCategoryViewSet)
+router.register('product_services', ProductServiceViewSet)
+router.register('contracts', ContractViewSet)
+router.register('invoices', InvoiceViewSet)
+router.register('invoice_lines', InvoiceLineViewSet)
 
 urlpatterns = [
-    path(r'^api/?$', include(router.urls)),
+    # NOTE: no extra 'api/' here — project urls mount this at /<tenant>/api/
+    re_path(r'', include(router.urls)),
 ]
