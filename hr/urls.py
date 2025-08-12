@@ -20,5 +20,5 @@ router.register('recurring-adjustments', RecurringAdjustmentViewSet)
 
 urlpatterns = [
     # IMPORTANT: no extra 'api/hr' here
-    re_path(r'', include(router.urls)),
+    re_path(r'api/', include(router.urls)),
 ]

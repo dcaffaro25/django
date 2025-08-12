@@ -24,5 +24,5 @@ router.register('invoice_lines', InvoiceLineViewSet)
 
 urlpatterns = [
     # NOTE: no extra 'api/' here — project urls mount this at /<tenant>/api/
-    re_path(r'', include(router.urls)),
+    re_path(r'api/', include(router.urls)),
 ]
