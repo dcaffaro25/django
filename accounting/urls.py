@@ -40,7 +40,7 @@ router.register('entities-mini', EntityMiniViewSet)
 
 urlpatterns = [
     # IMPORTANT: no extra 'api/' here because the project urls already mount this file at /<tenant>/api/
-    re_path(r'', include(router.urls)),
+    re_path(r'api/', include(router.urls)),
 
     # Custom routes — use re_path for optional trailing slash
     re_path(r'^transactions/(?P<pk>\d+)/post/?$',  TransactionViewSet.as_view({'post': 'post'}), name='transaction-post'),
