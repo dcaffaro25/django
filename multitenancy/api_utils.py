@@ -522,7 +522,7 @@ class BulkImportTemplateDownloadView(APIView):
             "Company": ["__row_id", "name", "subdomain"],
             "Currency": ["__row_id", "code", "name"],
             "Bank": ["__row_id", "name", "bank_code"],
-            "BankAccount": ["__row_id", "name", "account_number", "company_fk", "entity_fk", "currency_fk", "bank_fk"],
+            "BankAccount": ["__row_id", "name", "branch_id", "account_number", "company_fk", "entity_fk", "currency_fk", "bank_fk"],
             "Account": ["__row_id", "name", "account_code", "company_fk", "currency_fk", "bank_account_fk", "account_direction", "balance_date", "balance"],
             "CostCenter": ["__row_id", "name", "company_fk"],
             "Entity": ["__row_id", "name", "company_fk", "parent_fk", "inherit_accounts", "inherit_cost_centers", "@path"],
@@ -556,8 +556,10 @@ class BulkImportTemplateDownloadView(APIView):
         col_position = 1  # Start at column A
 
         references = [
+            ("Company", Company.objects.all(), ["id", "name", "subdomain"]),
             ('Currency', Currency.objects.all(), ['id', 'code', 'name']),
             ('Bank', Bank.objects.all(), ['id', 'name', 'bank_code']),
+            ("BankAccount", BankAccount.objects.all(), ["id", "name", "branch_id", "account_number", "company_id", "entity_id", "currency_id", "bank_id"],),
             ('Entity', Entity.objects.filter(company_id=tenant_id), ['id', 'name', 'parent_id', '@path']),
             ('CostCenter', CostCenter.objects.filter(company_id=tenant_id), ['id', 'name']),
             ('Account', Account.objects.filter(company_id=tenant_id), ['id', 'name', 'account_code', 'parent_id', '@path', 'account_direction', 'bank_account_id', 'balance_date', 'balance']),
