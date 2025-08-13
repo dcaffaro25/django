@@ -559,7 +559,7 @@ class BulkImportTemplateDownloadView(APIView):
             ("Company", Company.objects.all(), ["id", "name", "subdomain"]),
             ('Currency', Currency.objects.all(), ['id', 'code', 'name']),
             ('Bank', Bank.objects.all(), ['id', 'name', 'bank_code']),
-            ("BankAccount", BankAccount.objects.all(), ["id", "name", "branch_id", "account_number", "company_id", "entity_id", "currency_id", "bank_id"],),
+            ("BankAccount", BankAccount.objects.all(), ["id", "name", "branch_id", "account_number", "company_id", "entity_id", "currency_id", "bank_id", "balance_date", "balance"],),
             ('Entity', Entity.objects.filter(company_id=tenant_id), ['id', 'name', 'parent_id', '@path']),
             ('CostCenter', CostCenter.objects.filter(company_id=tenant_id), ['id', 'name']),
             ('Account', Account.objects.filter(company_id=tenant_id), ['id', 'name', 'account_code', 'parent_id', '@path', 'account_direction', 'bank_account_id', 'balance_date', 'balance']),
