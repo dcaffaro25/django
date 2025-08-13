@@ -134,7 +134,7 @@ class AllocationBase(TenantAwareBaseModel):
 #incluir tabela para gerenciar visibilidade e acesso de cada entidade aos modelos de centro de custo e plano de contas.
 
 class Account(TenantAwareBaseModel, MPTTModel):
-    account_code = models.CharField(max_length=100)
+    account_code = models.CharField(max_length=100, null=True, blank=True)
     name = models.CharField(max_length=100)
     type = models.CharField(max_length=50, null=True, blank=True)
     account_direction = models.IntegerField()
