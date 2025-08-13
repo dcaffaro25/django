@@ -522,7 +522,7 @@ class BulkImportTemplateDownloadView(APIView):
             "Company": ["__row_id", "name", "subdomain"],
             "Currency": ["__row_id", "code", "name"],
             "Bank": ["__row_id", "name", "bank_code", "country"],
-            "BankAccount": ["__row_id", "name", "branch_id", "account_number", "company_fk", "entity_fk", "currency_fk", "bank_fk"],
+            "BankAccount": ["__row_id", "name", "branch_id", "account_number", "company_fk", "entity_fk", "currency_fk", "bank_fk", "balance_date", "balance"],
             "Account": ["__row_id", "name", "account_code", "company_fk", "currency_fk", "bank_account_fk", "account_direction", "balance_date", "balance"],
             "CostCenter": ["__row_id", "name", "company_fk"],
             "Entity": ["__row_id", "name", "company_fk", "parent_fk", "inherit_accounts", "inherit_cost_centers"],
