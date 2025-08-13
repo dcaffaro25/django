@@ -153,7 +153,7 @@ class EntityMiniSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = Entity
-        fields = ['id', 'level', 'parent_id', 'name', 'path']
+        fields = ['id', 'level', 'parent_id', 'name', 'path', 'inherit_accounts', 'inherit_cost_centers']
     
     def get_level(self, obj):
         """Calculate the level of the entity in the tree."""
@@ -169,6 +169,9 @@ class EntityMiniSerializer(serializers.ModelSerializer):
     
 class EntitySerializer(serializers.ModelSerializer):
     parent_id = serializers.IntegerField(source='parent.id', read_only=True)
+    parent = serializers.PrimaryKeyRelatedField(
+        queryset=Entity.objects.all(), required=False, allow_null=True
+    )
     level = serializers.SerializerMethodField()
     path = serializers.SerializerMethodField()
     path_ids = serializers.SerializerMethodField()
@@ -189,7 +192,7 @@ class EntitySerializer(serializers.ModelSerializer):
     
     class Meta:
         model = Entity
-        fields = ['id', 'name', 'company', 'parent_id', 'level', 'path', 'path_ids',
+        fields = ['id', 'name', 'company', 'parent', 'parent_id', 'level', 'path', 'path_ids',
                   'accounts', 'cost_centers',
                   'inherit_accounts', 'inherit_cost_centers',
             'effective_accounts', 'effective_cost_centers'
