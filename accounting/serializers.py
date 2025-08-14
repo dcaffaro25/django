@@ -91,7 +91,7 @@ class AccountSerializer(serializers.ModelSerializer):
     class Meta:
         model = Account
         fields = ['id', 'name', 'company', 'parent','parent_id', 'level', 'path', 'path_ids',
-                  'account_code','type','bank_account',
+                  'account_code','description','bank_account',
                   'account_direction', 'balance_date',
             'balance', 'currency', 'is_active', 'current_balance'
         ]
