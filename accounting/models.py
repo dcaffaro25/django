@@ -137,6 +137,8 @@ class Account(TenantAwareBaseModel, MPTTModel):
     account_code = models.CharField(max_length=100, null=True, blank=True)
     name = models.CharField(max_length=100)
     description = models.CharField(max_length=255, null=True, blank=True)
+    key_words = models.CharField(max_length=100, null=True, blank=True)
+    examples = models.CharField(max_length=255, null=True, blank=True)
     account_direction = models.IntegerField()
     balance_date = models.DateField()
     balance = models.DecimalField(max_digits=12, decimal_places=2)
