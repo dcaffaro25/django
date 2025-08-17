@@ -23,128 +23,6 @@ from billing.models import (
     Contract, Invoice, InvoiceLine)
 
 
-PATH_COLS = ("path", "Caminho")   # accepted path column names
-PATH_SEPARATOR = " > "
-NAME_FIELD = "name"               # adjust if your MPTT model uses a different field
-PARENT_FIELD = "parent"           # adjust if your MPTT model uses a different field
-
-from django.core.exceptions import FieldDoesNotExist, ObjectDoesNotExist
-
-def is_mptt_model(model):
-    return hasattr(model, "_mptt_meta")
-
-def has_field(model, field_name):
-    try:
-        model._meta.get_field(field_name)
-        return True
-    except FieldDoesNotExist:
-        return False
-
-def get_path_value(row_dict):
-    for c in PATH_COLS:
-        val = row_dict.get(c)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-    return None
-
-def split_path(path_str, sep=PATH_SEPARATOR):
-    parts = [p.strip() for p in str(path_str).split(sep)]
-    return [p for p in parts if p]
-
-def path_depth(path_str):
-    return len(split_path(path_str)) if path_str else 0
-
-def sort_df_by_path_depth(df):
-    df = df.copy()
-    def depth_of_row(r):
-        d = r.dropna().to_dict()
-        p = get_path_value(d)
-        if p:
-            return path_depth(p)
-        # if has 'parent' only, count it as depth 1 to order under roots
-        if isinstance(d.get("parent"), str) and d.get("parent").strip():
-            return 1
-        return 0
-    df["_depth"] = df.apply(depth_of_row, axis=1)
-    df.sort_values(by=["_depth"], inplace=True, kind="stable")
-    return df
-
-def resolve_parent_or_error(model, row_data, name_field=NAME_FIELD, parent_field=PARENT_FIELD):
-    """
-    Returns the parent instance or None (root), respecting precedence:
-      1) parent_id
-      2) parent as path  ("A > B > C")
-      3) parent as root  (plain name at root)
-      4) None (root)
-    Raises ValueError if any referenced ancestor is missing.
-    """
-    parent_id = row_data.get("parent_id")
-    parent_val = row_data.get("parent")
-
-    # 1) parent_id wins
-    if parent_id not in (None, "", float("nan")):
-        try:
-            return model.objects.get(pk=int(parent_id))
-        except (ValueError, ObjectDoesNotExist):
-            raise ValueError(f"{model.__name__}: parent_id '{parent_id}' not found.")
-
-    # 2) parent as path
-    if isinstance(parent_val, str) and parent_val.strip() and PATH_SEPARATOR in parent_val:
-        parts = split_path(parent_val)
-        parent = None
-        for idx, name in enumerate(parts):
-            inst = model.objects.filter(**{name_field: name, parent_field: parent}).first()
-            if not inst:
-                missing = " > ".join(parts[: idx + 1])
-                raise ValueError(
-                    f"{model.__name__}: missing ancestor '{missing}' for parent path '{parent_val}'. "
-                    f"Ensure the ancestor rows exist (and are processed first)."
-                )
-            parent = inst
-        return parent
-
-    # 3) parent as root name
-    if isinstance(parent_val, str) and parent_val.strip():
-        inst = model.objects.filter(**{name_field: parent_val.strip(), parent_field: None}).first()
-        if not inst:
-            raise ValueError(
-                f"{model.__name__}: parent '{parent_val}' (root) not found. "
-                f"Ensure the parent row exists before children."
-            )
-        return inst
-
-    # 4) No parent provided => root
-    return None
-
-def validate_path_vs_parent_and_name(model, parent, name, path_str, name_field=NAME_FIELD, parent_field=PARENT_FIELD):
-    """
-    If path is provided, ensure last segment == name and ancestor chain == parent's chain.
-    Raise a helpful error when inconsistent.
-    """
-    if not path_str:
-        return
-    parts = split_path(path_str)
-    if not parts:
-        return
-    if parts[-1] != name:
-        raise ValueError(
-            f"{model.__name__}: path/name mismatch. Leaf in path is '{parts[-1]}', but row has name '{name}'."
-        )
-    # Rebuild parent's chain from DB (root → ... → direct parent)
-    chain = []
-    p = parent
-    while p is not None:
-        chain.append(getattr(p, name_field))
-        p = getattr(p, parent_field)
-    chain = list(reversed(chain))
-    if parts[:-1] != chain:
-        exp = " > ".join(chain) if chain else "(root)"
-        got = " > ".join(parts[:-1]) if parts[:-1] else "(root)"
-        raise ValueError(
-            f"{model.__name__}: parent chain differs from path. Expected '{exp}', got '{got}'."
-        )
-
-
 def success_response(data, message="Success"):
     return Response({"status": "success", "data": data, "message": message})
 
@@ -250,142 +128,102 @@ class BulkImportPreview(APIView):
             xls = pd.read_excel(file, sheet_name=None)
             print(f"[INFO] Loaded {len(xls)} sheets from Excel.")
 
-            preview_data = []
+            preview_data = {}
             errors = []
             row_id_map = {}
 
             with transaction.atomic():
                 savepoint = transaction.savepoint()
                 print("[DEBUG] Started transaction with savepoint.")
-
+                model_preview = []
                 for model_name, df in xls.items():
-                    if model_name == "References":
-                        continue
-
-                    print(f"\n[INFO] Processing sheet: {model_name}")
-                    app_label = MODEL_APP_MAP.get(model_name)
-                    if not app_label:
-                        msg = f"Unknown model: {model_name}"
-                        print("[ERROR]", msg)
-                        errors.append({"model": model_name, "row": None, "field": None, "message": msg})
-                        continue
-
-                    model = apps.get_model(app_label, model_name)
-
-                    # detect MPTT model
-                    model_is_mptt = is_mptt_model(model)
-                    if model_is_mptt and not (has_field(model, NAME_FIELD) and has_field(model, PARENT_FIELD)):
-                        msg = f"MPTT model {model_name} must have '{NAME_FIELD}' and '{PARENT_FIELD}' fields."
-                        print("[ERROR]", msg)
-                        errors.append({"model": model_name, "row": None, "field": None, "message": msg})
-                        continue
-
-                    # sort rows by path depth to ensure ancestors first
-                    df = sort_df_by_path_depth(df)
-
-                    for i, row in df.iterrows():
-                        row_data = row.dropna().to_dict()
-                        row_id = row_data.pop('__row_id', None)
-                        action = None
-                        instance = None
-
-                        try:
-                            # Resolve FKs the same way as before
-                            fk_fields = {k: v for k, v in row_data.items() if k.endswith('_fk')}
-                            for fk_field, fk_ref in fk_fields.items():
-                                field_name = fk_field[:-3]
-                                print(f"  Resolving FK for {field_name} -> {fk_ref}")
-                                try:
-                                    if isinstance(fk_ref, str) and fk_ref in row_id_map:
-                                        fk_instance = row_id_map[fk_ref]
-                                    elif isinstance(fk_ref, (int, float)) or (isinstance(fk_ref, str) and fk_ref.isdigit()):
-                                        related_field = model._meta.get_field(field_name)
-                                        fk_model = related_field.related_model
-                                        fk_instance = fk_model.objects.get(id=int(fk_ref))
-                                    else:
-                                        raise ValueError(f"Invalid FK reference format: {fk_ref}")
-                                except Exception as e:
-                                    error_msg = f"FK reference '{fk_ref}' not found for field '{field_name}' in model {model_name}: {str(e)}"
-                                    print("[ERROR]", error_msg)
-                                    raise ValueError(error_msg)
-
-                                row_data[field_name] = fk_instance
-                                del row_data[fk_field]
-
-                            # MPTT strict handling
-                            if model_is_mptt:
-                                if not row_data.get(NAME_FIELD):
-                                    raise ValueError(f"{model_name}: missing required column '{NAME_FIELD}'.")
-
-                                name = row_data.get(NAME_FIELD)
-                                path_str = get_path_value(row_data)
-                                parent = resolve_parent_or_error(model, row_data, name_field=NAME_FIELD, parent_field=PARENT_FIELD)
-                                validate_path_vs_parent_and_name(model, parent, name, path_str, name_field=NAME_FIELD, parent_field=PARENT_FIELD)
-
-                                # Upsert by (parent, name) if no 'id'
-                                if 'id' in row_data and row_data['id']:
-                                    instance = model.objects.get(id=row_data['id'])
-                                    action = 'update'
-                                else:
-                                    instance = model.objects.filter(**{NAME_FIELD: name, PARENT_FIELD: parent}).first()
-                                    action = 'update' if instance else 'create'
-                                    if not instance:
-                                        instance = model(**{NAME_FIELD: name, PARENT_FIELD: parent})
-
-                                # apply remaining fields (skip identity/parent/path columns)
-                                for skip in ("id", "parent_id", "parent") + PATH_COLS:
-                                    row_data.pop(skip, None)
-                                for field, value in row_data.items():
-                                    setattr(instance, field, value)
-
-                            else:
-                                # Non-MPTT: your original upsert by id
+                    if model_name != "References":
+                        print(f"\n[INFO] Processing sheet: {model_name}")
+                        app_label = MODEL_APP_MAP.get(model_name)
+    
+                        if not app_label:
+                            msg = f"Unknown model: {model_name}"
+                            print("[ERROR]", msg)
+                            errors.append({"model": model_name, "row": None, "field": None, "message": f"Unknown model: {model_name}"})
+                            continue
+    
+                        model = apps.get_model(app_label, model_name)
+                        #model_preview = []
+    
+                        for i, row in df.iterrows():
+                            print(f"[DEBUG] Processing row {i} of model {model_name}")
+                            row_data = row.dropna().to_dict()
+                            row_id = row_data.pop('__row_id', None)
+                            print("  Raw data:", row_data)
+                            print("  __row_id:", row_id)
+                            try:
+                                # Handle FK fields
+                                fk_fields = {k: v for k, v in row_data.items() if k.endswith('_fk')}
+                                for fk_field, fk_ref in fk_fields.items():
+                                    field_name = fk_field[:-3]
+                                    print(f"  Resolving FK for {field_name} -> {fk_ref}")
+                                    try:
+                                        # Try resolving from __row_id map first
+                                        if isinstance(fk_ref, str) and fk_ref in row_id_map:
+                                            fk_instance = row_id_map[fk_ref]
+                                        # If numeric (int or numeric string), try to fetch the actual object from DB
+                                        elif isinstance(fk_ref, (int, float)) or (isinstance(fk_ref, str) and fk_ref.isdigit()):
+                                            related_field = model._meta.get_field(field_name)
+                                            fk_model = related_field.related_model
+                                            fk_instance = fk_model.objects.get(id=int(fk_ref))
+                                        else:
+                                            raise ValueError(f"Invalid FK reference format: {fk_ref}")
+                                    except Exception as e:
+                                        error_msg = f"FK reference '{fk_ref}' not found for field '{field_name}' in model {model_name}: {str(e)}"
+                                        print("[ERROR]", error_msg)
+                                        raise ValueError(error_msg)
+                                
+                                    row_data[field_name] = fk_instance
+                                    del row_data[fk_field]
+    
+                            
                                 if 'id' in row_data and row_data['id']:
                                     instance = model.objects.get(id=row_data['id'])
                                     for field, value in row_data.items():
                                         setattr(instance, field, value)
                                     action = 'update'
+                                    print(f"[UPDATE] {model_name} ID {row_data['id']}")
                                 else:
                                     instance = model(**row_data)
                                     action = 'create'
-
-                            instance.save()
-                            if row_id:
-                                row_id_map[row_id] = instance
-
-                            preview_data.append({
-                                "model": model_name,
-                                "__row_id": row_id,
-                                "status": "success",
-                                "action": action,
-                                "data": model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active']),
-                                "message": "ok"
-                            })
-
-                        except Exception as e:
-                            print("[ERROR]", f"{model_name} row {i+1}: {str(e)}")
-                            preview_data.append({
-                                "model": model_name,
-                                "__row_id": row_id,
-                                "status": "error",
-                                "action": action,
-                                "data": {},
-                                "message": str(e)
-                            })
-                            errors.append({"model": model_name, "row": i+1, "field": None, "message": str(e)})
-
-                transaction.savepoint_rollback(savepoint)
-                print("[INFO] Rolled back transaction after preview.")
+                                    print(f"[CREATE] New {model_name} instance")
+    
+                                instance.save()
+                                print(f"[SAVE] {model_name} row saved successfully.")
+    
+                                if row_id:
+                                    row_id_map[row_id] = instance
+                                    print(f"[MAP] __row_id '{row_id}' bound to ID {instance.pk}")
+    
+                                #model_preview.append({'action': action, 'data': row_data, '__row_id': row_id})
+                                model_preview.append({'model': model_name, '__row_id': row_id, 'status': 'success', 'action': action, 'data': model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active']), "message": "ok"})
+                                #model_to_dict(instance)
+                            except Exception as e:
+                                error = f"{model_name} row {i}: {str(e)}"
+                                print("[ERROR]", error)
+                                model_preview.append({'model': model_name, '__row_id': row_id, 'status': 'error', 'action': action, 'data': model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active']), "message": str(e)})
+                                #errors.append(error)
+                                errors.append({"model": model_name, "row": i, "field": None, "message": str(e)})
+                    preview_data = model_preview
+    
+                    transaction.savepoint_rollback(savepoint)
+                    print("[INFO] Rolled back transaction after preview.")
 
             return Response({
                 "success": not errors,
                 "preview": preview_data,
-                "errors": errors
-            })
+                "errors": errors if errors else []
+            })#, status=status.HTTP_200_OK if not errors else status.HTTP_400_BAD_REQUEST)
 
         except Exception as e:
             print("[FATAL ERROR]", str(e))
-            return Response({"success": False, "preview": [], "errors": [{"message": str(e)}]})
+            errors.append({"model": model_name, "row": i, "field": None, "message": str(e)})
+            return Response({"success": False, "preview": [], "errors": errors})#, status=status.HTTP_400_BAD_REQUEST)
 
 
 class BulkImportExecute(APIView):
@@ -412,27 +250,20 @@ class BulkImportExecute(APIView):
 
                     model = apps.get_model(app_label, model_name)
 
-                    model_is_mptt = is_mptt_model(model)
-                    if model_is_mptt and not (has_field(model, NAME_FIELD) and has_field(model, PARENT_FIELD)):
-                        errors.append({"model": model_name, "message": f"MPTT model {model_name} must have '{NAME_FIELD}' and '{PARENT_FIELD}' fields."})
-                        continue
-
-                    # sort to ensure ancestors first
-                    df = sort_df_by_path_depth(df)
-
                     for i, row in df.iterrows():
                         row_data = row.dropna().to_dict()
                         row_id = row_data.pop('__row_id', None)
-                        action = None
                         try:
-                            # Handle FK fields (as before)
+                            # Handle FK fields
                             fk_fields = {k: v for k, v in row_data.items() if k.endswith('_fk')}
                             for fk_field, fk_ref in fk_fields.items():
                                 field_name = fk_field[:-3]
                                 print(f"  Resolving FK for {field_name} -> {fk_ref}")
                                 try:
+                                    # Try resolving from __row_id map first
                                     if isinstance(fk_ref, str) and fk_ref in row_id_map:
                                         fk_instance = row_id_map[fk_ref]
+                                    # If numeric (int or numeric string), try to fetch the actual object from DB
                                     elif isinstance(fk_ref, (int, float)) or (isinstance(fk_ref, str) and fk_ref.isdigit()):
                                         related_field = model._meta.get_field(field_name)
                                         fk_model = related_field.related_model
@@ -443,48 +274,21 @@ class BulkImportExecute(APIView):
                                     error_msg = f"FK reference '{fk_ref}' not found for field '{field_name}' in model {model_name}: {str(e)}"
                                     print("[ERROR]", error_msg)
                                     raise ValueError(error_msg)
-
+                            
                                 row_data[field_name] = fk_instance
                                 del row_data[fk_field]
 
-                            if model_is_mptt:
-                                if not row_data.get(NAME_FIELD):
-                                    raise ValueError(f"{model_name}: missing required column '{NAME_FIELD}'.")
-
-                                name = row_data.get(NAME_FIELD)
-                                path_str = get_path_value(row_data)
-                                parent = resolve_parent_or_error(model, row_data, name_field=NAME_FIELD, parent_field=PARENT_FIELD)
-                                validate_path_vs_parent_and_name(model, parent, name, path_str, name_field=NAME_FIELD, parent_field=PARENT_FIELD)
-
-                                if 'id' in row_data and row_data['id']:
-                                    instance = model.objects.get(id=row_data['id'])
-                                    action = 'update'
-                                else:
-                                    instance = model.objects.filter(**{NAME_FIELD: name, PARENT_FIELD: parent}).first()
-                                    action = 'update' if instance else 'create'
-                                    if not instance:
-                                        instance = model(**{NAME_FIELD: name, PARENT_FIELD: parent})
-
-                                # apply remaining fields (skip identity/parent/path cols)
-                                for skip in ("id", "parent_id", "parent") + PATH_COLS:
-                                    row_data.pop(skip, None)
+                            if 'id' in row_data and row_data['id']:
+                                instance = model.objects.get(id=row_data['id'])
                                 for field, value in row_data.items():
                                     setattr(instance, field, value)
-
+                                action = 'update'
                             else:
-                                # Non-MPTT: original behavior
-                                if 'id' in row_data and row_data['id']:
-                                    instance = model.objects.get(id=row_data['id'])
-                                    for field, value in row_data.items():
-                                        setattr(instance, field, value)
-                                    action = 'update'
-                                else:
-                                    instance = model(**row_data)
-                                    action = 'create'
+                                instance = model(**row_data)
+                                action = 'create'
 
                             instance.save()
-                            if row_id:
-                                row_id_map[row_id] = instance
+                            row_id_map[row_id] = instance
 
                             results.append({
                                 "model": model_name,
@@ -502,7 +306,7 @@ class BulkImportExecute(APIView):
                                 "status": "error",
                                 "message": str(e)
                             })
-                            errors.append(f"{model_name} row {i+1}: {str(e)}")
+                            errors.append(str(e))
 
             return Response({
                 "success": not errors,
