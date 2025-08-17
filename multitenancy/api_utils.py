@@ -1,5 +1,7 @@
 # NORD/multitenancy/api_utils.py
 
+# NORD/multitenancy/api_utils.py
+
 import csv
 import io
 import pandas as pd
@@ -14,19 +16,26 @@ from django.http import HttpResponse
 from openpyxl import Workbook
 from django.forms.models import model_to_dict
 from django.utils.timezone import now
+from django.db.models import Q
+from decimal import Decimal
+
 from multitenancy.models import Company, Entity
 from accounting.models import Currency, Bank, BankAccount, Account, CostCenter, Transaction, JournalEntry, BankTransaction
 from core.models import FinancialIndex, IndexQuote, FinancialIndexQuoteForecast
 from billing.models import (
     BusinessPartnerCategory, BusinessPartner,
     ProductServiceCategory, ProductService,
-    Contract, Invoice, InvoiceLine)
+    Contract, Invoice, InvoiceLine,
+)
 
+# ---------------- Path / Tree conventions ----------------
 
 PATH_COLS = ("path", "Caminho")   # accepted path column names
-PATH_SEPARATOR = " > "
-NAME_FIELD = "name"               # adjust if your MPTT model uses a different field
-PARENT_FIELD = "parent"           # adjust if your MPTT model uses a different field
+PATH_SEPARATOR = " > "            # NOTE: keep this consistent with your Excel (spaces around >)
+NAME_FIELD = "name"               # default MPTT name field
+PARENT_FIELD = "parent"           # default MPTT parent field
+COMPANY_ID_COLS = ("company_id", "company_fk")  # accepted ways to pass company in rows
+ACCOUNT_CODE_FIELD = "account_code"
 
 from django.core.exceptions import FieldDoesNotExist, ObjectDoesNotExist
 
@@ -55,19 +64,45 @@ def path_depth(path_str):
     return len(split_path(path_str)) if path_str else 0
 
 def sort_df_by_path_depth(df):
+    """
+    Ensures parent rows (shallower path) are processed before children.
+    If only 'parent' (string) exists, treat as depth 1 so it comes after roots.
+    """
     df = df.copy()
     def depth_of_row(r):
         d = r.dropna().to_dict()
         p = get_path_value(d)
         if p:
             return path_depth(p)
-        # if has 'parent' only, count it as depth 1 to order under roots
         if isinstance(d.get("parent"), str) and d.get("parent").strip():
             return 1
         return 0
     df["_depth"] = df.apply(depth_of_row, axis=1)
     df.sort_values(by=["_depth"], inplace=True, kind="stable")
     return df
+
+# ---------------- Company scoping (important for Account) ----------------
+
+def resolve_company_id(request, row_data):
+    """
+    Determine company_id: prefer explicit column (company_id/company_fk),
+    otherwise resolve from request tenant/user. Customize to your tenancy.
+    """
+    for col in COMPANY_ID_COLS:
+        cid = row_data.get(col)
+        if cid not in (None, "", float("nan")):
+            try:
+                return int(cid)
+            except (ValueError, TypeError):
+                pass
+    # Try resolve from request – customize to your middleware / auth
+    if hasattr(request, "tenant") and getattr(request.tenant, "company_id", None):
+        return int(request.tenant.company_id)
+    if hasattr(request, "user") and getattr(request.user, "company_id", None):
+        return int(request.user.company_id)
+    raise ValueError("company_id/company_fk missing and could not infer from request/tenant.")
+
+# ---------------- Generic parent resolution & validation ----------------
 
 def resolve_parent_or_error(model, row_data, name_field=NAME_FIELD, parent_field=PARENT_FIELD):
     """
@@ -92,8 +127,8 @@ def resolve_parent_or_error(model, row_data, name_field=NAME_FIELD, parent_field
     if isinstance(parent_val, str) and parent_val.strip() and PATH_SEPARATOR in parent_val:
         parts = split_path(parent_val)
         parent = None
-        for idx, name in enumerate(parts):
-            inst = model.objects.filter(**{name_field: name, parent_field: parent}).first()
+        for idx, seg_name in enumerate(parts):
+            inst = model.objects.filter(**{name_field: seg_name, parent_field: parent}).first()
             if not inst:
                 missing = " > ".join(parts[: idx + 1])
                 raise ValueError(
@@ -115,6 +150,29 @@ def resolve_parent_or_error(model, row_data, name_field=NAME_FIELD, parent_field
 
     # 4) No parent provided => root
     return None
+
+def resolve_parent_from_path(model, path_str, name_field=NAME_FIELD, parent_field=PARENT_FIELD):
+    """
+    Given a full path 'A > B > C', return the parent instance for leaf 'C' (i.e., instance 'B'),
+    strictly requiring all ancestors to already exist.
+    """
+    parts = split_path(path_str)
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return None  # leaf at root
+    ancestors = parts[:-1]
+    parent = None
+    for idx, seg in enumerate(ancestors):
+        inst = model.objects.filter(**{name_field: seg, parent_field: parent}).first()
+        if not inst:
+            missing = " > ".join(ancestors[: idx + 1])
+            raise ValueError(
+                f"{model.__name__}: missing ancestor '{missing}' while resolving parent from path '{path_str}'. "
+                f"Ensure ancestors are imported first."
+            )
+        parent = inst
+    return parent
 
 def validate_path_vs_parent_and_name(model, parent, name, path_str, name_field=NAME_FIELD, parent_field=PARENT_FIELD):
     """
@@ -144,13 +202,76 @@ def validate_path_vs_parent_and_name(model, parent, name, path_str, name_field=N
             f"{model.__name__}: parent chain differs from path. Expected '{exp}', got '{got}'."
         )
 
+# ---------------- Account-specific (company-scoped) helpers ----------------
+
+def resolve_account_parent_from_path(model, company_id, path_str, name_field=NAME_FIELD, parent_field=PARENT_FIELD):
+    parts = split_path(path_str)
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return None
+    ancestors = parts[:-1]
+    parent = None
+    for idx, seg in enumerate(ancestors):
+        inst = model.objects.filter(company_id=company_id,
+                                    **{name_field: seg, parent_field: parent}).first()
+        if not inst:
+            missing = " > ".join(ancestors[: idx + 1])
+            raise ValueError(f"Account: missing ancestor '{missing}' for company_id={company_id}.")
+        parent = inst
+    return parent
+
+def get_or_build_account_instance_for_upsert(model, company_id, parent, row_data):
+    """
+    Upsert selection when no 'id':
+      1) Try (company, account_code, name) if account_code provided
+      2) Else (company, parent, name)
+    Returns (instance, action).
+    """
+    name = row_data.get(NAME_FIELD)
+    acc_code = row_data.get(ACCOUNT_CODE_FIELD)
+
+    if not name:
+        raise ValueError(f"{model.__name__}: missing required column '{NAME_FIELD}'.")
+
+    # 1) (company, account_code, name)
+    if acc_code not in (None, "", float("nan")):
+        inst = model.objects.filter(company_id=company_id,
+                                    account_code=acc_code,
+                                    name=name).first()
+        if inst:
+            return inst, "update"
+
+    # 2) (company, parent, name)
+    inst = model.objects.filter(company_id=company_id,
+                                **{NAME_FIELD: name, PARENT_FIELD: parent}).first()
+    if inst:
+        return inst, "update"
+
+    # create new
+    inst = model(company_id=company_id, **{NAME_FIELD: name, PARENT_FIELD: parent})
+    return inst, "create"
+
+def ensure_account_required_fields_for_create(instance, row_data):
+    """
+    Enforce Account required fields on create. Adjust if your template always provides them.
+    """
+    required_simple = ["account_direction", "balance_date", "balance"]
+    # prefer 'currency_id' in template; we also accept 'currency' if FK already resolved
+    for fld in required_simple:
+        if getattr(instance, fld, None) in (None, "") and fld not in row_data:
+            raise ValueError(f"Account: missing required field '{fld}' for create.")
+
+    if not getattr(instance, "currency_id", None) and "currency_id" not in row_data and "currency" not in row_data:
+        raise ValueError("Account: missing required foreign key 'currency' (currency_id).")
+
+# ---------------- Convenience responses & generic helpers ----------------
 
 def success_response(data, message="Success"):
     return Response({"status": "success", "data": data, "message": message})
 
 def error_response(message, status_code=400):
     return Response({"status": "error", "message": message}, status=status_code)
-
 
 @transaction.atomic
 def generic_bulk_create(viewset, request_data):
@@ -181,7 +302,7 @@ def generic_bulk_delete(viewset, ids):
     model.objects.filter(id__in=ids).delete()
     return Response({'status': 'bulk delete successful'}, status=status.HTTP_204_NO_CONTENT)
 
-# Function for CSV response
+# CSV and Excel responses
 def create_csv_response(data, delimiter=','):
     csvfile = io.StringIO()
     writer = csv.DictWriter(csvfile, fieldnames=data[0].keys(), delimiter=delimiter)
@@ -190,7 +311,6 @@ def create_csv_response(data, delimiter=','):
     csvfile.seek(0)
     return Response(csvfile.getvalue(), content_type='text/csv')
 
-# Function for Excel response
 def create_excel_response(data):
     df = pd.DataFrame(data)
     excel_file = io.BytesIO()
@@ -199,6 +319,7 @@ def create_excel_response(data):
     excel_file.seek(0)
     return Response(excel_file.getvalue(), content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
+# ---------------- Model map & safe_model_dict ----------------
 
 MODEL_APP_MAP = {
     "Account": "accounting",
@@ -220,26 +341,25 @@ MODEL_APP_MAP = {
     "InvoiceLine": "billing",
     "FinancialIndex": "core",
     "IndexQuote": "core",
-    "FinancialIndexQuoteForecast": "core"
-    
-    # Add other model-app mappings as needed
+    "FinancialIndexQuoteForecast": "core",
 }
 
 def safe_model_dict(instance, exclude_fields=None):
     data = model_to_dict(instance)
     exclude_fields = exclude_fields or []
 
-    # Remove campos indesejados
     for field in exclude_fields:
         data.pop(field, None)
 
-    # Substitui FKs por seus respectivos IDs
+    # Replace FKs with IDs
     for field in instance._meta.fields:
         if field.is_relation and field.name in data:
             related_obj = getattr(instance, field.name)
             data[field.name] = related_obj.id if related_obj else None
 
     return data
+
+# ---------------- BulkImportPreview ----------------
 
 class BulkImportPreview(APIView):
     def post(self, request, *args, **kwargs):
@@ -271,30 +391,27 @@ class BulkImportPreview(APIView):
                         continue
 
                     model = apps.get_model(app_label, model_name)
-
-                    # detect MPTT model
                     model_is_mptt = is_mptt_model(model)
+
                     if model_is_mptt and not (has_field(model, NAME_FIELD) and has_field(model, PARENT_FIELD)):
                         msg = f"MPTT model {model_name} must have '{NAME_FIELD}' and '{PARENT_FIELD}' fields."
                         print("[ERROR]", msg)
                         errors.append({"model": model_name, "row": None, "field": None, "message": msg})
                         continue
 
-                    # sort rows by path depth to ensure ancestors first
                     df = sort_df_by_path_depth(df)
 
                     for i, row in df.iterrows():
                         row_data = row.dropna().to_dict()
                         row_id = row_data.pop('__row_id', None)
-                        action = None
                         instance = None
+                        action = None
 
                         try:
-                            # Resolve FKs the same way as before
+                            # Resolve FK fields (supports __row_id mapping)
                             fk_fields = {k: v for k, v in row_data.items() if k.endswith('_fk')}
                             for fk_field, fk_ref in fk_fields.items():
                                 field_name = fk_field[:-3]
-                                print(f"  Resolving FK for {field_name} -> {fk_ref}")
                                 try:
                                     if isinstance(fk_ref, str) and fk_ref in row_id_map:
                                         fk_instance = row_id_map[fk_ref]
@@ -305,24 +422,93 @@ class BulkImportPreview(APIView):
                                     else:
                                         raise ValueError(f"Invalid FK reference format: {fk_ref}")
                                 except Exception as e:
-                                    error_msg = f"FK reference '{fk_ref}' not found for field '{field_name}' in model {model_name}: {str(e)}"
-                                    print("[ERROR]", error_msg)
-                                    raise ValueError(error_msg)
-
+                                    raise ValueError(f"FK reference '{fk_ref}' not found for field '{field_name}' in model {model_name}: {str(e)}")
                                 row_data[field_name] = fk_instance
                                 del row_data[fk_field]
 
-                            # MPTT strict handling
-                            if model_is_mptt:
-                                if not row_data.get(NAME_FIELD):
-                                    raise ValueError(f"{model_name}: missing required column '{NAME_FIELD}'.")
-
-                                name = row_data.get(NAME_FIELD)
+                            if model_is_mptt and model.__name__ == "Account":
+                                # -------- Account (company-scoped) with path-only support --------
+                                company_id = resolve_company_id(request, row_data)
                                 path_str = get_path_value(row_data)
-                                parent = resolve_parent_or_error(model, row_data, name_field=NAME_FIELD, parent_field=PARENT_FIELD)
-                                validate_path_vs_parent_and_name(model, parent, name, path_str, name_field=NAME_FIELD, parent_field=PARENT_FIELD)
 
-                                # Upsert by (parent, name) if no 'id'
+                                # Derive name from path if missing
+                                name = row_data.get(NAME_FIELD)
+                                if not name and path_str:
+                                    parts = split_path(path_str)
+                                    if not parts:
+                                        raise ValueError(f"{model_name}: empty path; cannot derive name.")
+                                    name = parts[-1]
+                                    row_data[NAME_FIELD] = name
+                                if not name:
+                                    raise ValueError(f"{model_name}: missing '{NAME_FIELD}' and no usable 'path' to derive it from.")
+
+                                # Resolve parent: try parent_id/parent; else derive from path ancestors
+                                try:
+                                    parent = resolve_parent_or_error(model, row_data, name_field=NAME_FIELD, parent_field=PARENT_FIELD)
+                                except ValueError as e:
+                                    if path_str and (row_data.get("parent_id") in (None, "", float("nan"))) and not (isinstance(row_data.get("parent"), str) and row_data.get("parent").strip()):
+                                        parent = resolve_account_parent_from_path(model, company_id, path_str,
+                                                                                  name_field=NAME_FIELD, parent_field=PARENT_FIELD)
+                                    else:
+                                        raise
+
+                                # Validate path vs parent/name only if parent was explicitly provided
+                                explicit_parent_given = (row_data.get("parent_id") not in (None, "", float("nan"))) or (isinstance(row_data.get("parent"), str) and row_data.get("parent").strip())
+                                if path_str and explicit_parent_given:
+                                    # NOTE: This validation is generic, which is OK because we're using company filtering in upsert
+                                    validate_path_vs_parent_and_name(model, parent, name, path_str,
+                                                                     name_field=NAME_FIELD, parent_field=PARENT_FIELD)
+
+                                # Upsert selection (company-scoped)
+                                if 'id' in row_data and row_data['id']:
+                                    instance = model.objects.get(id=row_data['id'], company_id=company_id)
+                                    action = 'update'
+                                else:
+                                    instance, action = get_or_build_account_instance_for_upsert(
+                                        model, company_id, parent, row_data
+                                    )
+
+                                # Apply fields (strip identity/parent/path/company cols first)
+                                for skip in ("id", "parent_id", "parent") + PATH_COLS + COMPANY_ID_COLS:
+                                    row_data.pop(skip, None)
+                                setattr(instance, "company_id", company_id)
+                                setattr(instance, PARENT_FIELD, parent)
+                                for field, value in row_data.items():
+                                    setattr(instance, field, value)
+
+                                if action == "create":
+                                    ensure_account_required_fields_for_create(instance, row_data)
+
+                            elif model_is_mptt:
+                                # -------- Generic MPTT model with path-only support --------
+                                path_str = get_path_value(row_data)
+
+                                # Derive name from path if missing
+                                name = row_data.get(NAME_FIELD)
+                                if not name and path_str:
+                                    parts = split_path(path_str)
+                                    if not parts:
+                                        raise ValueError(f"{model_name}: empty path; cannot derive name.")
+                                    name = parts[-1]
+                                    row_data[NAME_FIELD] = name
+                                if not name:
+                                    raise ValueError(f"{model_name}: missing '{NAME_FIELD}' and no usable 'path' to derive it from.")
+
+                                # Resolve parent: try parent_id/parent; else from path ancestors
+                                try:
+                                    parent = resolve_parent_or_error(model, row_data, name_field=NAME_FIELD, parent_field=PARENT_FIELD)
+                                except ValueError as e:
+                                    if path_str and (row_data.get("parent_id") in (None, "", float("nan"))) and not (isinstance(row_data.get("parent"), str) and row_data.get("parent").strip()):
+                                        parent = resolve_parent_from_path(model, path_str, name_field=NAME_FIELD, parent_field=PARENT_FIELD)
+                                    else:
+                                        raise
+
+                                explicit_parent_given = (row_data.get("parent_id") not in (None, "", float("nan"))) or (isinstance(row_data.get("parent"), str) and row_data.get("parent").strip())
+                                if path_str and explicit_parent_given:
+                                    validate_path_vs_parent_and_name(model, parent, name, path_str,
+                                                                     name_field=NAME_FIELD, parent_field=PARENT_FIELD)
+
+                                # Upsert by (parent, name) if no ID
                                 if 'id' in row_data and row_data['id']:
                                     instance = model.objects.get(id=row_data['id'])
                                     action = 'update'
@@ -332,14 +518,14 @@ class BulkImportPreview(APIView):
                                     if not instance:
                                         instance = model(**{NAME_FIELD: name, PARENT_FIELD: parent})
 
-                                # apply remaining fields (skip identity/parent/path columns)
+                                # Apply fields
                                 for skip in ("id", "parent_id", "parent") + PATH_COLS:
                                     row_data.pop(skip, None)
                                 for field, value in row_data.items():
                                     setattr(instance, field, value)
 
                             else:
-                                # Non-MPTT: your original upsert by id
+                                # -------- Non-MPTT: original behavior --------
                                 if 'id' in row_data and row_data['id']:
                                     instance = model.objects.get(id=row_data['id'])
                                     for field, value in row_data.items():
@@ -363,7 +549,6 @@ class BulkImportPreview(APIView):
                             })
 
                         except Exception as e:
-                            print("[ERROR]", f"{model_name} row {i+1}: {str(e)}")
                             preview_data.append({
                                 "model": model_name,
                                 "__row_id": row_id,
@@ -387,6 +572,7 @@ class BulkImportPreview(APIView):
             print("[FATAL ERROR]", str(e))
             return Response({"success": False, "preview": [], "errors": [{"message": str(e)}]})
 
+# ---------------- BulkImportExecute ----------------
 
 class BulkImportExecute(APIView):
     def post(self, request, *args, **kwargs):
@@ -411,13 +597,12 @@ class BulkImportExecute(APIView):
                         continue
 
                     model = apps.get_model(app_label, model_name)
-
                     model_is_mptt = is_mptt_model(model)
+
                     if model_is_mptt and not (has_field(model, NAME_FIELD) and has_field(model, PARENT_FIELD)):
                         errors.append({"model": model_name, "message": f"MPTT model {model_name} must have '{NAME_FIELD}' and '{PARENT_FIELD}' fields."})
                         continue
 
-                    # sort to ensure ancestors first
                     df = sort_df_by_path_depth(df)
 
                     for i, row in df.iterrows():
@@ -425,11 +610,10 @@ class BulkImportExecute(APIView):
                         row_id = row_data.pop('__row_id', None)
                         action = None
                         try:
-                            # Handle FK fields (as before)
+                            # FK handling (as before)
                             fk_fields = {k: v for k, v in row_data.items() if k.endswith('_fk')}
                             for fk_field, fk_ref in fk_fields.items():
                                 field_name = fk_field[:-3]
-                                print(f"  Resolving FK for {field_name} -> {fk_ref}")
                                 try:
                                     if isinstance(fk_ref, str) and fk_ref in row_id_map:
                                         fk_instance = row_id_map[fk_ref]
@@ -441,20 +625,88 @@ class BulkImportExecute(APIView):
                                         raise ValueError(f"Invalid FK reference format: {fk_ref}")
                                 except Exception as e:
                                     error_msg = f"FK reference '{fk_ref}' not found for field '{field_name}' in model {model_name}: {str(e)}"
-                                    print("[ERROR]", error_msg)
                                     raise ValueError(error_msg)
-
                                 row_data[field_name] = fk_instance
                                 del row_data[fk_field]
 
-                            if model_is_mptt:
-                                if not row_data.get(NAME_FIELD):
-                                    raise ValueError(f"{model_name}: missing required column '{NAME_FIELD}'.")
-
-                                name = row_data.get(NAME_FIELD)
+                            if model_is_mptt and model.__name__ == "Account":
+                                # -------- Account (company-scoped) with path-only support --------
+                                company_id = resolve_company_id(request, row_data)
                                 path_str = get_path_value(row_data)
-                                parent = resolve_parent_or_error(model, row_data, name_field=NAME_FIELD, parent_field=PARENT_FIELD)
-                                validate_path_vs_parent_and_name(model, parent, name, path_str, name_field=NAME_FIELD, parent_field=PARENT_FIELD)
+
+                                # Derive name from path if missing
+                                name = row_data.get(NAME_FIELD)
+                                if not name and path_str:
+                                    parts = split_path(path_str)
+                                    if not parts:
+                                        raise ValueError(f"{model_name}: empty path; cannot derive name.")
+                                    name = parts[-1]
+                                    row_data[NAME_FIELD] = name
+                                if not name:
+                                    raise ValueError(f"{model_name}: missing '{NAME_FIELD}' and no usable 'path' to derive it from.")
+
+                                # Resolve parent precedence; else derive from path
+                                try:
+                                    parent = resolve_parent_or_error(model, row_data, name_field=NAME_FIELD, parent_field=PARENT_FIELD)
+                                except ValueError as e:
+                                    if path_str and (row_data.get("parent_id") in (None, "", float("nan"))) and not (isinstance(row_data.get("parent"), str) and row_data.get("parent").strip()):
+                                        parent = resolve_account_parent_from_path(model, company_id, path_str,
+                                                                                  name_field=NAME_FIELD, parent_field=PARENT_FIELD)
+                                    else:
+                                        raise
+
+                                explicit_parent_given = (row_data.get("parent_id") not in (None, "", float("nan"))) or (isinstance(row_data.get("parent"), str) and row_data.get("parent").strip())
+                                if path_str and explicit_parent_given:
+                                    validate_path_vs_parent_and_name(model, parent, name, path_str,
+                                                                     name_field=NAME_FIELD, parent_field=PARENT_FIELD)
+
+                                if 'id' in row_data and row_data['id']:
+                                    instance = model.objects.get(id=row_data['id'], company_id=company_id)
+                                    action = 'update'
+                                else:
+                                    instance, action = get_or_build_account_instance_for_upsert(
+                                        model, company_id, parent, row_data
+                                    )
+
+                                # Apply fields (strip identity/parent/path/company cols first)
+                                for skip in ("id", "parent_id", "parent") + PATH_COLS + COMPANY_ID_COLS:
+                                    row_data.pop(skip, None)
+                                setattr(instance, "company_id", company_id)
+                                setattr(instance, PARENT_FIELD, parent)
+                                for field, value in row_data.items():
+                                    setattr(instance, field, value)
+
+                                if action == "create":
+                                    ensure_account_required_fields_for_create(instance, row_data)
+
+                            elif model_is_mptt:
+                                # -------- Generic MPTT model with path-only support --------
+                                path_str = get_path_value(row_data)
+
+                                # Derive name from path if missing
+                                name = row_data.get(NAME_FIELD)
+                                if not name and path_str:
+                                    parts = split_path(path_str)
+                                    if not parts:
+                                        raise ValueError(f"{model_name}: empty path; cannot derive name.")
+                                    name = parts[-1]
+                                    row_data[NAME_FIELD] = name
+                                if not name:
+                                    raise ValueError(f"{model_name}: missing '{NAME_FIELD}' and no usable 'path' to derive it from.")
+
+                                # Resolve parent precedence; else derive from path
+                                try:
+                                    parent = resolve_parent_or_error(model, row_data, name_field=NAME_FIELD, parent_field=PARENT_FIELD)
+                                except ValueError as e:
+                                    if path_str and (row_data.get("parent_id") in (None, "", float("nan"))) and not (isinstance(row_data.get("parent"), str) and row_data.get("parent").strip()):
+                                        parent = resolve_parent_from_path(model, path_str, name_field=NAME_FIELD, parent_field=PARENT_FIELD)
+                                    else:
+                                        raise
+
+                                explicit_parent_given = (row_data.get("parent_id") not in (None, "", float("nan"))) or (isinstance(row_data.get("parent"), str) and row_data.get("parent").strip())
+                                if path_str and explicit_parent_given:
+                                    validate_path_vs_parent_and_name(model, parent, name, path_str,
+                                                                     name_field=NAME_FIELD, parent_field=PARENT_FIELD)
 
                                 if 'id' in row_data and row_data['id']:
                                     instance = model.objects.get(id=row_data['id'])
@@ -465,14 +717,13 @@ class BulkImportExecute(APIView):
                                     if not instance:
                                         instance = model(**{NAME_FIELD: name, PARENT_FIELD: parent})
 
-                                # apply remaining fields (skip identity/parent/path cols)
                                 for skip in ("id", "parent_id", "parent") + PATH_COLS:
                                     row_data.pop(skip, None)
                                 for field, value in row_data.items():
                                     setattr(instance, field, value)
 
                             else:
-                                # Non-MPTT: original behavior
+                                # -------- Non-MPTT: original behavior --------
                                 if 'id' in row_data and row_data['id']:
                                     instance = model.objects.get(id=row_data['id'])
                                     for field, value in row_data.items():
@@ -516,6 +767,11 @@ class BulkImportExecute(APIView):
                 "results": [],
                 "errors": [str(e)]
             }, status=400)
+
+# ---------------- (The rest of your template generation utilities remain unchanged) ----------------
+# generate_bulk_import_template(), BulkImportTemplateDownloadView2, get_dynamic_value(), BulkImportTemplateDownloadView
+# ... Keep your existing implementations below (omitted here for brevity) ...
+
         
         
 def generate_bulk_import_template():
