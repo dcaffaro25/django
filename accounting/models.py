@@ -36,7 +36,7 @@ class CostCenter(TenantAwareBaseModel):
     #company = models.ForeignKey('multitenancy.Company', related_name='costcenters', on_delete=models.CASCADE)
     name = models.CharField(max_length=100)
     center_type = models.CharField(max_length=10, choices=TYPE_CHOICES)
-    description = models.CharField(max_length=100)
+    description = models.CharField(max_length=255, null=True, blank=True)
     balance = models.DecimalField(max_digits=12, decimal_places=2)
     balance_date = models.DateField()
     
@@ -136,7 +136,9 @@ class AllocationBase(TenantAwareBaseModel):
 class Account(TenantAwareBaseModel, MPTTModel):
     account_code = models.CharField(max_length=100, null=True, blank=True)
     name = models.CharField(max_length=100)
-    type = models.CharField(max_length=50, null=True, blank=True)
+    description = models.CharField(max_length=255, null=True, blank=True)
+    key_words = models.CharField(max_length=100, null=True, blank=True)
+    examples = models.CharField(max_length=255, null=True, blank=True)
     account_direction = models.IntegerField()
     balance_date = models.DateField()
     balance = models.DecimalField(max_digits=12, decimal_places=2)
