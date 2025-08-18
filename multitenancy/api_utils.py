@@ -413,3 +413,112 @@ class BulkImportExecute(APIView):
                 "results": [],
                 "errors": [str(e)]
             }, status=400)
+
+def get_dynamic_value(obj, field_name):
+    """
+    Dynamically fetch either an attribute or a computed value based on the @ convention.
+    - If the field starts with '@', call the corresponding get_<field>() method if it exists.
+    - Otherwise, return the attribute directly.
+    """
+    if field_name.startswith('@'):
+        method_name = f"get_{field_name[1:]}"  # Remove '@' and prepend 'get_'
+        method = getattr(obj, method_name, None)
+        if callable(method):
+            return method()
+        else:
+            return None  # or raise Exception(f"Method {method_name} not found")
+    else:
+        return getattr(obj, field_name, None)
+
+class BulkImportTemplateDownloadView(APIView):
+    def get(self, request, tenant_id):
+        wb = Workbook()
+
+        # -------- Main sheets with templates --------
+        sheet_defs = {
+            "Company": ["__row_id", "name", "subdomain"],
+            "Currency": ["__row_id", "code", "name"],
+            "Bank": ["__row_id", "name", "bank_code", "country"],
+            "BankAccount": ["__row_id", "name", "branch_id", "account_number", "company_fk", "entity_fk", "currency_fk", "bank_fk", "balance_date", "balance"],
+            "Account": ["__row_id", "name", "parent_fk", "account_code", "company_fk", "currency_fk", "bank_account_fk", "account_direction", "balance_date", "balance"],
+            "CostCenter": ["__row_id", "name", "company_fk"],
+            "Entity": ["__row_id", "name", "company_fk", "parent_fk", "inherit_accounts", "inherit_cost_centers"],
+            "BusinessPartnerCategory": ["__row_id", "name", "company_fk", "parent_fk"],
+            "BusinessPartner": ["__row_id", "name", "company_fk", "partner_type", "category_fk", "identifier", "address", "city", "state", "zipcode", "country", "email", "phone", "currency_fk", "payment_terms", "is_active"],
+            "FinancialIndex": ["__row_id", "name", "index_type", "code", "interpolation_strategy", "description", "quote_frequency", "expected_quote_format", "is_forecastable"],
+            "IndexQuote": ["__row_id", "index_fk", "date", "value"],
+            "FinancialIndexQuoteForecast": ["__row_id", "index_fk", "date", "estimated_value", "source"],
+            "ProductServiceCategory": ["__row_id", "name", "company_fk", "parent_fk"],
+            "ProductService": ["__row_id", "name", "company_fk", "code", "category_fk", "description", "item_type", "price", "cost", "currency_fk", "track_inventory", "stock_quantity"],
+            "Contract": ["__row_id", "name", "company_fk", "partner_fk", "contract_number", "start_date", "end_date", "recurrence_rule", "base_value", "base_index_date", "adjustment_index_fk", "adjustment_frequency", "adjustment_cap", "description"],
+            "Invoice": ["__row_id", "name", "company_fk", "partner_fk", "invoice_type", "invoice_number", "invoice_date", "due_date", "status", "currency", "total_amount", "tax_amount", "discount_amount", "recurrence_rule", "recurrence_start_date", "recurrence_end_date", "description"],
+            "InvoiceLine": ["__row_id", "name", "company_fk", "invoice_fk", "product_service_fk", "description", "quantity", "unit_price", "tax_amount"],
+            "Transaction": ["__row_id", "company_fk", "date", "entity_fk", "description", "amount", "currency_fk"],
+            "JournalEntry": ["__row_id", "date", "company_fk", "transaction_fk", "account_fk", "cost_center_fk", "debit_amount", "credit_amount"],
+            "BankTransaction": ["__row_id", "company_fk", "entity_fk", "bank_account_fk", "date", "amount", "description", "currency_fk", "transaction_type", "check_number", "reference_number", "payee", "memo", "account_number", "routing_number", "transaction_id"],
+        }
+
+        ws = wb.active
+        ws.title = 'Company'
+        ws.append(sheet_defs['Company'])
+
+        for sheet_name, columns in sheet_defs.items():
+            if sheet_name == 'Company':
+                continue
+            sheet = wb.create_sheet(sheet_name)
+            sheet.append(columns)
+
+        # -------- References sheet --------
+        ref_ws = wb.create_sheet("References")
+        col_position = 1  # Start at column A
+
+        references = [
+            ("Company", Company.objects.all(), ["id", "name", "subdomain"]),
+            ('Currency', Currency.objects.all(), ['id', 'code', 'name']),
+            ('Bank', Bank.objects.all(), ['id', 'name', 'bank_code']),
+            ("BankAccount", BankAccount.objects.all(), ["id", "name", "branch_id", "account_number", "company_id", "entity_id", "currency_id", "bank_id", "balance_date", "balance"],),
+            ('Entity', Entity.objects.filter(company_id=tenant_id), ['id', 'name', 'parent_id', '@path']),
+            ('CostCenter', CostCenter.objects.filter(company_id=tenant_id), ['id', 'name']),
+            ('Account', Account.objects.filter(company_id=tenant_id), ['id', 'name', 'account_code', 'parent_id', '@path', 'account_direction', 'bank_account_id', 'balance_date', 'balance']),
+            ('BusinessPartnerCategory', BusinessPartnerCategory.objects.filter(company_id=tenant_id), ['id', 'name', 'parent_id', '@path']),
+            ('BusinessPartner', BusinessPartner.objects.filter(company_id=tenant_id), ['id', 'name', 'partner_type']),
+            ('ProductServiceCategory', ProductServiceCategory.objects.filter(company_id=tenant_id), ['id', 'name', 'parent_id', '@path']),
+            ('ProductService', ProductService.objects.filter(company_id=tenant_id), ['id', 'name', 'code']),
+            ('FinancialIndex', FinancialIndex.objects.all(), ['id', 'name', 'code']),
+            ('Invoice', Invoice.objects.filter(company_id=tenant_id), ['id', 'invoice_number', 'invoice_date']),
+            ('Contract', Contract.objects.filter(company_id=tenant_id), ['id', 'contract_number', 'start_date']),
+            ('Transaction', Transaction.objects.filter(company_id=tenant_id), ['id', 'date', 'entity_id', 'description', 'amount', 'state']),
+            ('JournalEntry', JournalEntry.objects.filter(company_id=tenant_id), ['id', 'transaction_id', 'account_id', 'debit_amount', 'credit_amount', 'date']),
+            ('BankTransaction', BankTransaction.objects.filter(company_id=tenant_id), ['id', 'entity_id', 'bank_account_id', 'date', 'amount', 'description', 'transaction_type', 'status']),
+        ]
+
+        for title, queryset, columns in references:
+            start_col = col_position
+
+            # Write table title
+            ref_ws.cell(row=1, column=start_col, value=title)
+
+            # Write header
+            for idx, col_name in enumerate(columns):
+                ref_ws.cell(row=2, column=start_col + idx, value=col_name)
+
+            # Write data rows
+            for row_idx, obj in enumerate(queryset, start=3):
+                for col_idx, field in enumerate(columns):
+                    value = get_dynamic_value(obj, field)
+                    ref_ws.cell(row=row_idx, column=start_col + col_idx, value=value)
+
+            col_position += len(columns) + 1  # Move to next table
+
+        # -------- Output --------
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        filename = f"bulk_import_template_{now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+        return HttpResponse(
+            output,
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            headers={'Content-Disposition': f'attachment; filename="{filename}"'},
+        )
