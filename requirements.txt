@@ -34,3 +34,7 @@ typing_extensions==4.8.0
 tzdata==2023.3
 whitenoise==6.7.0
 XlsxWriter==3.1.9
+celery[redis]==5.3.6
+django-celery-results==2.5.1
+flower==2.0.1
+backoff==2.2.1

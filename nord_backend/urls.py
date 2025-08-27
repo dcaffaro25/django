@@ -19,6 +19,7 @@ from django.conf import settings
 from django.conf.urls.static import static
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from . import views
+from accounting.views_celery import start_task, task_status
 
 urlpatterns = [
     re_path(r'^admin/?', admin.site.urls),
@@ -33,6 +34,8 @@ urlpatterns = [
     #path('api/', include('accounting.urls')),
     path(r'^api/token/?$', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     path(r'^api/token/refresh/?$', TokenRefreshView.as_view(), name='token_refresh'),
+    path("celery/start/", start_task, name="celery_start"),
+    path("celery/status/<str:task_id>/", task_status, name="celery_status"),
 ]
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

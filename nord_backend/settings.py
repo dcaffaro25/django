@@ -85,6 +85,7 @@ INSTALLED_APPS = [
     'hr',
     'billing',
     'ML',
+    'django_celery_results',
 ]
 
 MIDDLEWARE = [
@@ -154,6 +155,18 @@ if os.environ.get('PGDATABASE'):
         }
     }
 
+# Celery / Redis
+CELERY_BROKER_URL = os.environ["REDIS_URL"] #os.getenv("REDIS_URL", "redis://localhost:6379/0")
+CELERY_RESULT_BACKEND = CELERY_BROKER_URL
+
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TIMEZONE = "UTC"
+
+# Optional task time limits (protects against runaway jobs)
+CELERY_TASK_SOFT_TIME_LIMIT = 60 * 12  # 12 minutes
+CELERY_TASK_TIME_LIMIT = 60 * 15       # 15 minutes
 
 # Password validation
 # https://docs.djangoproject.com/en/4.0/ref/settings/#auth-password-validators
