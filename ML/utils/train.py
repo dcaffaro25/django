@@ -1,0 +1,251 @@
+import io
+import joblib
+from typing import List, Dict, Any, Optional
+
+import pandas as pd
+from django.utils import timezone
+from django.db.models import Q
+
+from .models import MLModel
+from .feature_extraction import build_classification_model
+
+try:
+    from accounting.models import Account, JournalEntry, Transaction
+except Exception:
+    Account = None
+    JournalEntry = None
+    Transaction = None
+
+def _collect_training_samples(
+    company_id: int,
+    records_per_account: int = 100,
+    include_pending: bool = False,
+    training_fields: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    Collect the most recent transactions for each leaf account in the company,
+    returning a DataFrame with specified training fields and a 'label' column.
+    """
+    if Account is None or JournalEntry is None or Transaction is None:
+        raise RuntimeError("Accounting models are unavailable.")
+
+    if training_fields is None:
+        training_fields = ["description", "amount"]
+
+    # Base query: posted (and optionally pending) entries
+    entry_qs = JournalEntry.objects.filter(
+        account__company_id=company_id,
+        account__is_active=True,
+    ).select_related("transaction", "account")
+
+    if include_pending:
+        entry_qs = entry_qs.filter(
+            Q(state="posted") | Q(state="pending"),
+            Q(transaction__state="posted") | Q(transaction__state="pending"),
+        )
+    else:
+        entry_qs = entry_qs.filter(state="posted", transaction__state="posted")
+
+    leaf_accounts = (
+        Account.objects.filter(company_id=company_id, is_active=True)
+        .filter(children__isnull=True)
+        .values_list("id", flat=True)
+    )
+
+    samples: List[Dict[str, Any]] = []
+    for account_id in leaf_accounts:
+        qs = (
+            entry_qs.filter(account_id=account_id)
+            .order_by("-transaction__date")[:records_per_account]
+        )
+        for entry in qs:
+            tx = entry.transaction
+            if not tx:
+                continue
+            row = {}
+            for field in training_fields:
+                row[field] = getattr(tx, field) if hasattr(tx, field) else None
+            row["label"] = account_id
+            samples.append(row)
+
+    return pd.DataFrame(samples)
+
+def train_categorization_model(
+    company_id: int,
+    records_per_account: int = 100,
+    training_fields: Optional[List[str]] = None,
+    prediction_fields: Optional[List[str]] = None,
+    include_pending: bool = False,
+) -> MLModel:
+    """
+    Train a categorisation model and store it in MLModel.
+    """
+    if training_fields is None:
+        training_fields = ["description", "amount"]
+    if prediction_fields is None:
+        prediction_fields = ["description", "amount"]
+
+    df = _collect_training_samples(
+        company_id=company_id,
+        records_per_account=records_per_account,
+        include_pending=include_pending,
+        training_fields=training_fields,
+    )
+    if df.empty:
+        raise RuntimeError("No training data found.")
+
+    X = df[training_fields]
+    y = df["label"]
+
+    model = build_classification_model()
+    model.fit(X, y)
+
+    # Versioning: increment version
+    last = (
+        MLModel.objects.filter(company_id=company_id, name="categorization")
+        .order_by("-version")
+        .first()
+    )
+    version = (last.version + 1) if last else 1
+
+    buffer = io.BytesIO()
+    joblib.dump(model, buffer)
+    buffer.seek(0)
+
+    ml_record = MLModel.objects.create(
+        company_id=company_id,
+        name="categorization",
+        model_type="classification",
+        version=version,
+        trained_at=timezone.now(),
+        model_blob=buffer.read(),
+        training_fields=training_fields,
+        prediction_fields=prediction_fields,
+        records_per_account=records_per_account,
+    )
+    return ml_record
+
+def _assemble_journal_training_data(
+    company_id: int,
+    max_records: int = 1000,
+    include_pending: bool = False,
+    training_fields: Optional[List[str]] = None,
+) -> (pd.DataFrame, List[List[str]]):
+    """
+    Build a DataFrame of transactions and a list of label lists
+    (debit:<account_id>, credit:<account_id>) for journal predictions.
+    Only the specified training_fields are used in X.
+    """
+    if Account is None or JournalEntry is None or Transaction is None:
+        raise RuntimeError("Accounting models are unavailable.")
+
+    if training_fields is None:
+        training_fields = ["description", "amount"]
+
+    tx_qs = (
+        Transaction.objects.filter(company_id=company_id)
+        .select_related()
+        .prefetch_related("journal_entries")
+        .order_by("-date")
+    )
+    if not include_pending:
+        tx_qs = tx_qs.filter(state="posted")
+
+    X_rows: List[Dict[str, Any]] = []
+    y_labels: List[List[str]] = []
+
+    for tx in tx_qs[:max_records]:
+        entries = list(tx.journal_entries.all())
+        if not entries or len(entries) > 4:
+            continue
+        labels = []
+        for entry in entries:
+            if entry.debit_amount:
+                labels.append(f"debit:{entry.account_id}")
+            elif entry.credit_amount:
+                labels.append(f"credit:{entry.account_id}")
+        if not labels:
+            continue
+        row = {}
+        for field in training_fields:
+            row[field] = getattr(tx, field) if hasattr(tx, field) else None
+        X_rows.append(row)
+        y_labels.append(labels)
+
+    df = pd.DataFrame(X_rows)
+    return df, y_labels
+
+def train_journal_model(
+    company_id: int,
+    records_per_account: int = 100,
+    training_fields: Optional[List[str]] = None,
+    prediction_fields: Optional[List[str]] = None,
+    include_pending: bool = False,
+) -> MLModel:
+    """
+    Train a journal suggestion model (multi-label) and store it.
+    """
+    if training_fields is None:
+        training_fields = ["description", "amount"]
+    if prediction_fields is None:
+        prediction_fields = ["description", "amount"]
+
+    X_df, y_labels = _assemble_journal_training_data(
+        company_id=company_id,
+        max_records=records_per_account,
+        include_pending=include_pending,
+        training_fields=training_fields,
+    )
+    if X_df.empty or not y_labels:
+        raise RuntimeError("No journal training data available.")
+
+    # Build a simple multi-label classifier
+    from sklearn.preprocessing import MultiLabelBinarizer, StandardScaler
+    from sklearn.multiclass import OneVsRestClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.compose import ColumnTransformer
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    mlb = MultiLabelBinarizer()
+    y_encoded = mlb.fit_transform(y_labels)
+
+    # For this example, we fix text and numeric columns as description/amount
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("text", TfidfVectorizer(stop_words="english", max_features=5000), "description"),
+            ("num", StandardScaler(), ["amount"]),
+        ],
+        remainder="drop",
+    )
+    classifier = OneVsRestClassifier(LogisticRegression(max_iter=1000, n_jobs=-1))
+    model = Pipeline([
+        ("preprocessor", preprocessor),
+        ("classifier", classifier),
+    ])
+
+    model.fit(X_df, y_encoded)
+
+    last = (
+        MLModel.objects.filter(company_id=company_id, name="journal")
+        .order_by("-version")
+        .first()
+    )
+    version = (last.version + 1) if last else 1
+
+    buffer = io.BytesIO()
+    joblib.dump((model, mlb), buffer)
+    buffer.seek(0)
+
+    ml_record = MLModel.objects.create(
+        company_id=company_id,
+        name="journal",
+        model_type="multi-label",
+        version=version,
+        trained_at=timezone.now(),
+        model_blob=buffer.read(),
+        training_fields=training_fields,
+        prediction_fields=prediction_fields,
+        records_per_account=records_per_account,
+    )
+    return ml_record

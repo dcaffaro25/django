@@ -249,10 +249,31 @@ class BulkImportExecute(APIView):
                         continue
 
                     model = apps.get_model(app_label, model_name)
+                    
+                    model_is_mptt = is_mptt_model(model)
+                    name_field = "name" if has_field(model, "name") else None
+                    parent_field = "parent" if has_field(model, "parent") else None
+                    if model_is_mptt and (not name_field or not parent_field):
+                        errors.append({"model": model_name, "message": f"MPTT model {model_name} must have 'name' and 'parent' fields."})
+                        continue
 
+                    # ----- sort by path depth so ancestors are first -----
+                    df = df.copy()
+                    if any(c in df.columns for c in PATH_COLS):
+                        def depth_of_row(r):
+                            rd = r.dropna().to_dict()
+                            path = get_path_value(rd)
+                            return path_depth(path) if path else (1 if rd.get("parent") else 0)
+                        df["_depth"] = df.apply(depth_of_row, axis=1)
+                        df.sort_values(by=["_depth"], inplace=True, kind="stable")
+                    else:
+                        df["_depth"] = 0
+                    
                     for i, row in df.iterrows():
                         row_data = row.dropna().to_dict()
                         row_id = row_data.pop('__row_id', None)
+                        row_data.pop("_depth", None)
+                        
                         try:
                             # Handle FK fields
                             fk_fields = {k: v for k, v in row_data.items() if k.endswith('_fk')}

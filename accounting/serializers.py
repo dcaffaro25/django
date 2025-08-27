@@ -212,6 +212,7 @@ class TransactionListSerializer(serializers.ModelSerializer):
         Returns a single-line summary for each journal entry.
         Example output for each entry: "Acct:1000, D=500.00, C=0.00"
         """
+        bank_date = "1900-01-01"
         lines = []
         for je in obj.journal_entries.all():
             if je.account and je.account.bank_account:
