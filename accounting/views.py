@@ -10,8 +10,8 @@ from datetime import timedelta
 from itertools import product, combinations
 from multitenancy.api_utils import generic_bulk_create, generic_bulk_update, generic_bulk_delete
 from multitenancy.models import CustomUser, Company, Entity, TenantQuerysetMixin
-from .models import (Currency, Account, Transaction, JournalEntry, Rule, CostCenter, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter)
-from .serializers import (CurrencySerializer, AccountSerializer, TransactionSerializer, CostCenterSerializer, JournalEntrySerializer, RuleSerializer, BankSerializer, BankAccountSerializer, BankTransactionSerializer, ReconciliationSerializer, TransactionListSerializer)
+from .models import (Currency, Account, Transaction, JournalEntry, Rule, CostCenter, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter,ReconciliationTask)
+from .serializers import (CurrencySerializer, AccountSerializer, TransactionSerializer, CostCenterSerializer, JournalEntrySerializer, RuleSerializer, BankSerializer, BankAccountSerializer, BankTransactionSerializer, ReconciliationSerializer, TransactionListSerializer,ReconciliationTaskSerializer)
 from .services.transaction_service import *
 from .utils import parse_ofx_text, decode_ofx_content, generate_ofx_transaction_hash, find_book_combos
 from datetime import datetime
@@ -26,6 +26,7 @@ from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 from django.http import HttpResponse
 from bisect import bisect_left, bisect_right
+from .tasks import match_many_to_many_task
 
 # Currency ViewSet
 class CurrencyViewSet(viewsets.ModelViewSet):
@@ -1170,7 +1171,35 @@ class BankTransactionViewSet(viewsets.ModelViewSet):
     
     @action(detail=False, methods=['post'])
     def match_many_to_many_with_set2(self, request, tenant_id):
+        """
+        Instead of running inline, enqueue a Celery job.
+        """
         data = request.data
+        task = match_many_to_many_task.delay(data, tenant_id)
+        
+        return Response({
+            "message": "Task queued",
+            "task_id": task.id,
+            "status": task.status
+        })
+    
+    @action(detail=False, methods=['get'])
+    def reconciliation_status(self, request, tenant_id=None):
+        """
+        Poll reconciliation task status/result
+        """
+        task_id = request.query_params.get("task_id")
+        if not task_id:
+            return Response({"error": "task_id is required"}, status=400)
+
+        res = AsyncResult(task_id)
+        return Response({
+            "task_id": task_id,
+            "status": res.status,
+            "result": res.result if res.ready() else None
+        })
+    
+    '''
         bank_filters = data.get("bank_filters", {})
         book_filters = data.get("book_filters", {})
         
@@ -1233,7 +1262,7 @@ class BankTransactionViewSet(viewsets.ModelViewSet):
     
         return Response({"suggestions": combined_suggestions})
     
-    
+    '''
     
     def get_exact_matches(self, banks, books):
         from collections import defaultdict
@@ -1687,7 +1716,31 @@ class UnreconciledDashboardView(APIView):
             return Response({"error": str(e)}, status=500)
     
     
+class ReconciliationTaskViewSet(viewsets.ModelViewSet):
+    queryset = ReconciliationTask.objects.all().order_by("-created_at")
+    serializer_class = ReconciliationTaskSerializer
 
+    @action(detail=False, methods=["post"])
+    def start(self, request, tenant_id=None):
+        """
+        Start reconciliation as a background task
+        """
+        data = request.data
+        task = match_many_to_many_task.delay(data, tenant_id)
+
+        return Response({
+            "message": "Task enqueued",
+            "task_id": task.id,
+        })
+
+    @action(detail=True, methods=["get"])
+    def status(self, request, pk=None):
+        """
+        Get status/result of a task by DB ID
+        """
+        task = self.get_object()
+        serializer = self.get_serializer(task)
+        return Response(serializer.data)
 
 # Transaction Schema Endpoint
 @api_view(['GET'])

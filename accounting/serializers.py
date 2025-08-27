@@ -1,7 +1,7 @@
 # NORD/accounting/serializers.py
 
 from rest_framework import serializers
-from .models import (Currency, Account, Transaction, JournalEntry, Rule, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter)
+from .models import (Currency, Account, Transaction, JournalEntry, ReconciliationTask, Rule, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter)
 from multitenancy.serializers import CompanySerializer, EntitySerializer, FlexibleRelatedField
 from multitenancy.serializers import CompanyMiniSerializer, EntityMiniSerializer
 from django.core.exceptions import ObjectDoesNotExist
@@ -297,6 +297,11 @@ class BankTransactionSerializer(serializers.ModelSerializer):
             return 'pending'
         else:
             return 'mixed'
+
+class ReconciliationTaskSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ReconciliationTask
+        fields = "__all__"
 
 class ReconciliationSerializer(serializers.ModelSerializer):
     class Meta:

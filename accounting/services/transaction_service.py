@@ -73,3 +73,5 @@ def cancel_transaction(transaction):
     transaction.journal_entries.update(state='canceled')
     transaction.state = 'canceled'
     transaction.save()
+
+

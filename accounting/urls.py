@@ -17,6 +17,7 @@ from .views import (
     UnreconciledDashboardView,
     transaction_schema,
     journal_entry_schema,
+    ReconciliationTaskViewSet,
 )
 from multitenancy.views import EntityViewSet, EntityMiniViewSet, EntityTreeView, EntityDynamicTransposedView
 
@@ -37,6 +38,7 @@ router.register('bank_transactions', BankTransactionViewSet)
 router.register('reconciliation', ReconciliationViewSet)
 router.register('entities', EntityViewSet, basename='entity')
 router.register('entities-mini', EntityMiniViewSet)
+router.register(r"reconciliation-tasks", ReconciliationTaskViewSet, basename="reconciliationtask")
 
 urlpatterns = [
     # IMPORTANT: no extra 'api/' here because the project urls already mount this file at /<tenant>/api/

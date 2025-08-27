@@ -9,6 +9,7 @@ from decimal import Decimal
 from itertools import combinations
 from django.apps import apps
 from django.core.exceptions import ValidationError
+from django.utils.timezone import now
 
 from multitenancy.models import BaseModel, TenantAwareBaseModel
 from mptt.models import MPTTModel, TreeForeignKey
@@ -384,7 +385,29 @@ class BankTransaction(TenantAwareBaseModel):
     def __str__(self):
         return f'{self.date} - {self.amount} - {self.description} - {self.bank_account}'
      
-    
+
+class ReconciliationTask(models.Model):
+    STATUS_CHOICES = [
+        ("PENDING", "Pending"),
+        ("STARTED", "Started"),
+        ("SUCCESS", "Success"),
+        ("FAILURE", "Failure"),
+    ]
+
+    task_id = models.CharField(max_length=255, unique=True, db_index=True)
+    tenant_id = models.CharField(max_length=255, null=True, blank=True)
+
+    parameters = models.JSONField(default=dict)  # request payload
+    result = models.JSONField(null=True, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="PENDING")
+    error_message = models.TextField(null=True, blank=True)
+
+    created_at = models.DateTimeField(default=now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"ReconciliationTask {self.task_id} ({self.status})"
+
 class Reconciliation(TenantAwareBaseModel):
     """
     Represents a reconciliation process linking journal entries and bank transactions.

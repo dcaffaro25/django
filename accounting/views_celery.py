@@ -1,6 +1,12 @@
 from django.http import JsonResponse
 from celery.result import AsyncResult
-from .tasks import demo_add
+#from .tasks import demo_add
+
+from celery import shared_task
+from .models import BankTransaction, JournalEntry
+from .views import BankTransactionViewSet
+
+
 
 
 def start_task(request):

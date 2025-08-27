@@ -156,7 +156,8 @@ if os.environ.get('PGDATABASE'):
     }
 
 # Celery / Redis
-CELERY_BROKER_URL = os.environ["REDIS_URL"] #os.getenv("REDIS_URL", "redis://localhost:6379/0")
+#CELERY_BROKER_URL = os.environ["REDIS_URL"] #
+CELERY_BROKER_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 CELERY_RESULT_BACKEND = CELERY_BROKER_URL
 
 CELERY_ACCEPT_CONTENT = ["json"]
