@@ -1,3 +1,5 @@
+# NORD/multitenancy/api_utils.py
+
 import csv
 import io
 import pandas as pd
@@ -18,65 +20,15 @@ from core.models import FinancialIndex, IndexQuote, FinancialIndexQuoteForecast
 from billing.models import (
     BusinessPartnerCategory, BusinessPartner,
     ProductServiceCategory, ProductService,
-    Contract, Invoice, InvoiceLine
-)
+    Contract, Invoice, InvoiceLine)
 
-# -----------------------
-# MPTT PATH SUPPORT (generic)
-# -----------------------
-PATH_COLS = ("path", "Caminho")
-PATH_SEPARATOR = " > "
-
-def _is_mptt_model(model) -> bool:
-    """True if model is an MPTT model with a 'parent' foreign key and a 'name' field."""
-    return hasattr(model, "_mptt_meta") and any(f.name == "parent" for f in model._meta.fields) and any(f.name == "name" for f in model._meta.fields)
-
-def _get_path_value(row_dict):
-    """Return the path string if present under any accepted column name; else None."""
-    for c in PATH_COLS:
-        val = row_dict.get(c)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-    return None
-
-def _split_path(path_str):
-    return [p.strip() for p in str(path_str).split(PATH_SEPARATOR) if p and p.strip()]
-
-def _sort_df_by_path_depth_if_mptt(model, df):
-    """Stable-sort by path depth so ancestors come before children (only if a path col exists)."""
-    if not _is_mptt_model(model):
-        return df
-    if not any(col in df.columns for col in PATH_COLS):
-        return df
-    df = df.copy()
-    def depth(row):
-        p = _get_path_value(row.dropna().to_dict())
-        return len(_split_path(p)) if p else 0
-    df["_depth"] = df.apply(depth, axis=1)
-    df.sort_values(by=["_depth"], inplace=True, kind="stable")
-    df.drop(columns=["_depth"], inplace=True)
-    return df
-
-def _resolve_parent_from_path_chain(model, parts):
-    """
-    Walk the chain of names (all but the last are ancestors) and return the parent instance.
-    Raises ValueError if any ancestor is missing.
-    """
-    parent = None
-    for idx, node_name in enumerate(parts):
-        inst = model.objects.filter(name=node_name, parent=parent).first()
-        if not inst:
-            missing = " > ".join(parts[: idx + 1])
-            raise ValueError(f"{model.__name__}: missing ancestor '{missing}'. Provide this row before its children.")
-        parent = inst
-    return parent
-# -----------------------
 
 def success_response(data, message="Success"):
     return Response({"status": "success", "data": data, "message": message})
 
 def error_response(message, status_code=400):
     return Response({"status": "error", "message": message}, status=status_code)
+
 
 @transaction.atomic
 def generic_bulk_create(viewset, request_data):
@@ -125,6 +77,7 @@ def create_excel_response(data):
     excel_file.seek(0)
     return Response(excel_file.getvalue(), content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
+
 MODEL_APP_MAP = {
     "Account": "accounting",
     "CostCenter": "accounting",
@@ -146,17 +99,24 @@ MODEL_APP_MAP = {
     "FinancialIndex": "core",
     "IndexQuote": "core",
     "FinancialIndexQuoteForecast": "core"
+    
+    # Add other model-app mappings as needed
 }
 
 def safe_model_dict(instance, exclude_fields=None):
     data = model_to_dict(instance)
     exclude_fields = exclude_fields or []
+
+    # Remove campos indesejados
     for field in exclude_fields:
         data.pop(field, None)
+
+    # Substitui FKs por seus respectivos IDs
     for field in instance._meta.fields:
         if field.is_relation and field.name in data:
             related_obj = getattr(instance, field.name)
             data[field.name] = related_obj.id if related_obj else None
+
     return data
 
 class BulkImportPreview(APIView):
@@ -180,35 +140,33 @@ class BulkImportPreview(APIView):
                     if model_name != "References":
                         print(f"\n[INFO] Processing sheet: {model_name}")
                         app_label = MODEL_APP_MAP.get(model_name)
-
+    
                         if not app_label:
                             msg = f"Unknown model: {model_name}"
                             print("[ERROR]", msg)
-                            errors.append({"model": model_name, "row": None, "field": None, "message": msg})
+                            errors.append({"model": model_name, "row": None, "field": None, "message": f"Unknown model: {model_name}"})
                             continue
-
+    
                         model = apps.get_model(app_label, model_name)
-
-                        # ----- OPTIONAL: keep ancestors first if 'path' given on MPTT models
-                        df = _sort_df_by_path_depth_if_mptt(model, df)
-
+                        #model_preview = []
+    
                         for i, row in df.iterrows():
                             print(f"[DEBUG] Processing row {i} of model {model_name}")
                             row_data = row.dropna().to_dict()
                             row_id = row_data.pop('__row_id', None)
                             print("  Raw data:", row_data)
                             print("  __row_id:", row_id)
-                            action = None
-                            instance = None
                             try:
-                                # Handle FK fields (original behavior)
+                                # Handle FK fields
                                 fk_fields = {k: v for k, v in row_data.items() if k.endswith('_fk')}
                                 for fk_field, fk_ref in fk_fields.items():
                                     field_name = fk_field[:-3]
                                     print(f"  Resolving FK for {field_name} -> {fk_ref}")
                                     try:
+                                        # Try resolving from __row_id map first
                                         if isinstance(fk_ref, str) and fk_ref in row_id_map:
                                             fk_instance = row_id_map[fk_ref]
+                                        # If numeric (int or numeric string), try to fetch the actual object from DB
                                         elif isinstance(fk_ref, (int, float)) or (isinstance(fk_ref, str) and fk_ref.isdigit()):
                                             related_field = model._meta.get_field(field_name)
                                             fk_model = related_field.related_model
@@ -219,31 +177,11 @@ class BulkImportPreview(APIView):
                                         error_msg = f"FK reference '{fk_ref}' not found for field '{field_name}' in model {model_name}: {str(e)}"
                                         print("[ERROR]", error_msg)
                                         raise ValueError(error_msg)
+                                
                                     row_data[field_name] = fk_instance
                                     del row_data[fk_field]
-
-                                # --------- MPTT PATH SUPPORT (derive name/parent from path if provided)
-                                if _is_mptt_model(model):
-                                    path_val = _get_path_value(row_data)
-                                    if path_val:
-                                        parts = _split_path(path_val)
-                                        if not parts:
-                                            raise ValueError(f"{model_name}: empty path.")
-                                        leaf_name = parts[-1]
-                                        parent = None
-                                        if len(parts) > 1:
-                                            parent = _resolve_parent_from_path_chain(model, parts[:-1])
-                                        # Set/override name & parent based on path
-                                        row_data['name'] = row_data.get('name', leaf_name) or leaf_name
-                                        row_data['parent'] = parent
-                                        # Remove possible conflicting parent hints
-                                        row_data.pop('parent_id', None)
-                                        row_data.pop('parent_fk', None)
-                                        # Remove the path column itself
-                                        for c in PATH_COLS:
-                                            row_data.pop(c, None)
-
-                                # Original create/update
+    
+                            
                                 if 'id' in row_data and row_data['id']:
                                     instance = model.objects.get(id=row_data['id'])
                                     for field, value in row_data.items():
@@ -254,36 +192,25 @@ class BulkImportPreview(APIView):
                                     instance = model(**row_data)
                                     action = 'create'
                                     print(f"[CREATE] New {model_name} instance")
-
+    
                                 instance.save()
                                 print(f"[SAVE] {model_name} row saved successfully.")
-
+    
                                 if row_id:
                                     row_id_map[row_id] = instance
                                     print(f"[MAP] __row_id '{row_id}' bound to ID {instance.pk}")
-
-                                model_preview.append({
-                                    "model": model_name,
-                                    "__row_id": row_id,
-                                    "status": "success",
-                                    "action": action,
-                                    "data": model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active']),
-                                    "message": "ok"
-                                })
+    
+                                #model_preview.append({'action': action, 'data': row_data, '__row_id': row_id})
+                                model_preview.append({'model': model_name, '__row_id': row_id, 'status': 'success', 'action': action, 'data': model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active']), "message": "ok"})
+                                #model_to_dict(instance)
                             except Exception as e:
                                 error = f"{model_name} row {i}: {str(e)}"
                                 print("[ERROR]", error)
-                                model_preview.append({
-                                    "model": model_name,
-                                    "__row_id": row_id,
-                                    "status": "error",
-                                    "action": action,
-                                    "data": {},
-                                    "message": str(e)
-                                })
+                                model_preview.append({'model': model_name, '__row_id': row_id, 'status': 'error', 'action': action, 'data': model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active']), "message": str(e)})
+                                #errors.append(error)
                                 errors.append({"model": model_name, "row": i, "field": None, "message": str(e)})
                     preview_data = model_preview
-
+    
                     transaction.savepoint_rollback(savepoint)
                     print("[INFO] Rolled back transaction after preview.")
 
@@ -291,12 +218,13 @@ class BulkImportPreview(APIView):
                 "success": not errors,
                 "preview": preview_data,
                 "errors": errors if errors else []
-            })
+            })#, status=status.HTTP_200_OK if not errors else status.HTTP_400_BAD_REQUEST)
 
         except Exception as e:
             print("[FATAL ERROR]", str(e))
             errors.append({"model": model_name, "row": i, "field": None, "message": str(e)})
-            return Response({"success": False, "preview": [], "errors": errors})
+            return Response({"success": False, "preview": [], "errors": errors})#, status=status.HTTP_400_BAD_REQUEST)
+
 
 class BulkImportExecute(APIView):
     def post(self, request, *args, **kwargs):
@@ -322,22 +250,20 @@ class BulkImportExecute(APIView):
 
                     model = apps.get_model(app_label, model_name)
 
-                    # Optional: ensure ancestors first when path is present
-                    df = _sort_df_by_path_depth_if_mptt(model, df)
-
                     for i, row in df.iterrows():
                         row_data = row.dropna().to_dict()
                         row_id = row_data.pop('__row_id', None)
-                        action = None
                         try:
-                            # Handle FK fields (original behavior)
+                            # Handle FK fields
                             fk_fields = {k: v for k, v in row_data.items() if k.endswith('_fk')}
                             for fk_field, fk_ref in fk_fields.items():
                                 field_name = fk_field[:-3]
                                 print(f"  Resolving FK for {field_name} -> {fk_ref}")
                                 try:
+                                    # Try resolving from __row_id map first
                                     if isinstance(fk_ref, str) and fk_ref in row_id_map:
                                         fk_instance = row_id_map[fk_ref]
+                                    # If numeric (int or numeric string), try to fetch the actual object from DB
                                     elif isinstance(fk_ref, (int, float)) or (isinstance(fk_ref, str) and fk_ref.isdigit()):
                                         related_field = model._meta.get_field(field_name)
                                         fk_model = related_field.related_model
@@ -348,26 +274,9 @@ class BulkImportExecute(APIView):
                                     error_msg = f"FK reference '{fk_ref}' not found for field '{field_name}' in model {model_name}: {str(e)}"
                                     print("[ERROR]", error_msg)
                                     raise ValueError(error_msg)
+                            
                                 row_data[field_name] = fk_instance
                                 del row_data[fk_field]
-
-                            # --------- MPTT PATH SUPPORT
-                            if _is_mptt_model(model):
-                                path_val = _get_path_value(row_data)
-                                if path_val:
-                                    parts = _split_path(path_val)
-                                    if not parts:
-                                        raise ValueError(f"{model_name}: empty path.")
-                                    leaf_name = parts[-1]
-                                    parent = None
-                                    if len(parts) > 1:
-                                        parent = _resolve_parent_from_path_chain(model, parts[:-1])
-                                    row_data['name'] = row_data.get('name', leaf_name) or leaf_name
-                                    row_data['parent'] = parent
-                                    row_data.pop('parent_id', None)
-                                    row_data.pop('parent_fk', None)
-                                    for c in PATH_COLS:
-                                        row_data.pop(c, None)
 
                             if 'id' in row_data and row_data['id']:
                                 instance = model.objects.get(id=row_data['id'])
@@ -411,6 +320,182 @@ class BulkImportExecute(APIView):
                 "results": [],
                 "errors": [str(e)]
             }, status=400)
+        
+        
+def generate_bulk_import_template():
+    wb = Workbook()
+
+    # Ensure sheets are ordered logically
+    sheet_defs = {
+        "company": ["__row_id", "name", "subdomain"],
+        "currency": ["__row_id", "code", "name"],
+        "bank": ["__row_id", "name", "bank_code"],
+        "bankaccount": ["__row_id", "name", "account_number", "company_fk", "entity_fk", "currency_fk", "bank_fk"],
+        "account": ["__row_id", "name", "account_code", "company_fk", "currency_fk", "bank_account_fk", "account_direction", "balance_date", "balance"],
+        "costcenter": ["__row_id", "name", "company_fk"],
+        "entity": ["__row_id", "name", "company_fk", "parent_fk", "inherit_accounts", "inherit_cost_centers"],
+        "BusinessPartnerCategory": ["__row_id", "name", "company_fk", "parent_fk"],
+        "BusinessPartner": ["__row_id", "name", "company_fk", "partner_type", "category_fk", "identifier", "address", 
+                            "city", "state", "zipcode", "country", "email", "phone", "currency_fk", "payment_terms", "is_active", ""],
+        
+        "FinancialIndex": ["__row_id", "name", "index_type", "code", "interpolation_strategy", "description", 
+                           "quote_frequency", "expected_quote_format", "is_forecastable"],
+        
+        
+        "IndexQuote": ["__row_id", "index_fk", "date", "value"],
+        "FinancialIndexQuoteForecast": ["__row_id", "index_fk", "date", "estimated_value", "source"],
+        
+        
+        "ProductServiceCategory": ["__row_id", "name", "company_fk", "parent_fk"],
+        
+        "ProductService": ["__row_id", "name", "company_fk", "code", "category_fk", "description", 
+                           "item_type", "price", "cost", "currency_fk", "track_inventory", "stock_quantity"],
+        
+        "Contract": ["__row_id", "name", "company_fk", "partner_fk", "contract_number", "start_date", "end_date",
+                     "recurrence_rule", "base_value", "base_index_date", "adjustment_index_fk", "adjustment_frequency", 
+                     "adjustment_cap", "description"],
+        
+        "Invoice": ["__row_id", "name", "company_fk", "partner_fk", "invoice_type", "invoice_number", "invoice_date", 
+                    "due_date", "status", "currency", "total_amount", "tax_amount", "discount_amount", "recurrence_rule", 
+                    "recurrence_start_date", "recurrence_end_date", "description"],
+        
+        "InvoiceLine": ["__row_id", "name", "company_fk", "invoice_fk", "product_service_fk", "description", 
+                        "quantity", "unit_price", "tax_amount"],
+        
+        
+    }
+
+
+
+    sample_data = {
+        "company": [["c1", "Acme Inc.", "acme"]],
+        "currency": [["cur1", "USD", "US Dollar"]],
+        "bank": [["b1", "Bank of Nowhere", "999"]],
+        "bankaccount": [["ba1", "Main Account", "12345-6", "c1", "e1", "cur1", "b1"]],
+        "account": [["a1", "Cash", "1.01.01", "c1", "cur1", "ba1", 1, "2023-12-31", 10000.00]],
+        "costcenter": [["cc1", "Operations", "c1"]],
+        "entity": [["e1", "Headquarters", "c1", "", True, True]],
+        "BusinessPartnerCategory": [["bpc1", "Suppliers", "c1", ""]],
+    "BusinessPartner": [["bp1", "Globex Corp.", "c1", "supplier", "bpc1", "123456789", "123 Market St", 
+                          "San Francisco", "CA", "94105", "USA", "contact@globex.com", "+14155552671", 
+                          "cur1", "30 days", True, ""]],
+    
+    "FinancialIndex": [["fi1", "CPI", "inflation", "CPI", "linear", "Consumer Price Index", 
+                         "monthly", "accumulated", True]],
+
+    "IndexQuote": [["iq1", "fi1", "2024-01-01", 110.5],
+                   ["iq2", "fi1", "2024-02-01", 111.0],
+                   ["iq3", "fi1", "2024-03-01", 111.7]],
+
+    "FinancialIndexQuoteForecast": [["iqf1", "fi1", "2024-04-01", 112.3, "internal forecast"],
+                                    ["iqf2", "fi1", "2024-05-01", 113.0, "internal forecast"]],
+
+    "ProductServiceCategory": [["psc1", "Office Supplies", "c1", ""]],
+    "ProductService": [["ps1", "Printer Paper", "c1", "PP001", "psc1", "A4 white printer paper", 
+                         "product", 5.00, 2.00, "cur1", True, 500]],
+
+    "Contract": [["ct1", "Office Supplies Agreement", "c1", "bp1", "CT2024-001", "2024-01-01", "2024-12-31",
+                  "FREQ=MONTHLY", 1000.00, "2024-01-01", "", "monthly", "", "Contract for monthly supply of office items."]],
+
+    "Invoice": [["inv1", "January Invoice", "c1", "bp1", "purchase", "INV2024-001", "2024-01-01", 
+                 "2024-01-30", "issued", "cur1", 500.00, 50.00, 0.00, "", "", "", "Monthly supply invoice."]],
+
+    "InvoiceLine": [["il1", "Paper Order", "c1", "inv1", "ps1", "A4 white printer paper", 
+                     100, 5.00, 50.00]],
+
+
+    }
+
+    for sheet_name, columns in sheet_defs.items():
+        if sheet_name == "company":
+            ws = wb.active
+            ws.title = sheet_name
+        else:
+            ws = wb.create_sheet(sheet_name)
+
+        ws.append(columns)
+        for row in sample_data.get(sheet_name, []):
+            ws.append(row)
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    return HttpResponse(
+        output,
+        content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+
+
+class BulkImportTemplateDownloadView2(APIView):
+    #permission_classes = [IsAuthenticated]  # (opcional) restrinja para usuários autenticados
+
+    def get(self, request):
+        wb = Workbook()
+
+        sheet_defs = {
+            "company": ["__row_id", "name", "subdomain"],
+            "currency": ["__row_id", "code", "name"],
+            "bank": ["__row_id", "name", "bank_code"],
+            "bankaccount": ["__row_id", "name", "account_number", "company_fk", "entity_fk", "currency_fk", "bank_fk"],
+            "account": ["__row_id", "name", "account_code", "company_fk", "currency_fk", "bank_account_fk", "account_direction", "balance_date", "balance"],
+            "costcenter": ["__row_id", "name", "company_fk"],
+            "entity": ["__row_id", "name", "company_fk", "parent_fk", "inherit_accounts", "inherit_cost_centers"],
+            "businesspartnercategory": ["__row_id", "name", "company_fk", "parent_fk"],
+            "businesspartner": ["__row_id", "name", "company_fk", "partner_type", "category_fk", "identifier", "address", "city", "state", "zipcode", "country", "email", "phone", "currency_fk", "payment_terms", "is_active", ""],
+            "financialindex": ["__row_id", "name", "index_type", "code", "interpolation_strategy", "description", "quote_frequency", "expected_quote_format", "is_forecastable"],
+            "indexquote": ["__row_id", "index_fk", "date", "value"],
+            "financialindexquoteforecast": ["__row_id", "index_fk", "date", "estimated_value", "source"],
+            "productservicecategory": ["__row_id", "name", "company_fk", "parent_fk"],
+            "productservice": ["__row_id", "name", "company_fk", "code", "category_fk", "description", "item_type", "price", "cost", "currency_fk", "track_inventory", "stock_quantity"],
+            "contract": ["__row_id", "name", "company_fk", "partner_fk", "contract_number", "start_date", "end_date", "recurrence_rule", "base_value", "base_index_date", "adjustment_index_fk", "adjustment_frequency", "adjustment_cap", "description"],
+            "invoice": ["__row_id", "name", "company_fk", "partner_fk", "invoice_type", "invoice_number", "invoice_date", "due_date", "status", "currency", "total_amount", "tax_amount", "discount_amount", "recurrence_rule", "recurrence_start_date", "recurrence_end_date", "description"],
+            "invoiceline": ["__row_id", "name", "company_fk", "invoice_fk", "product_service_fk", "description", "quantity", "unit_price", "tax_amount"],
+        }
+
+        sample_data = {
+            "company": [["c1", "Acme Inc.", "acme"]],
+            "currency": [["cur1", "USD", "US Dollar"]],
+            "bank": [["b1", "Bank of Nowhere", "999"]],
+            "bankaccount": [["ba1", "Main Account", "12345-6", "c1", "e1", "cur1", "b1"]],
+            "account": [["a1", "Cash", "1.01.01", "c1", "cur1", "ba1", 1, "2023-12-31", 10000.00]],
+            "costcenter": [["cc1", "Operations", "c1"]],
+            "entity": [["e1", "Headquarters", "c1", "", True, True]],
+            "BusinessPartnerCategory": [["bpc1", "Suppliers", "c1", ""]],
+            "BusinessPartner": [["bp1", "Globex Corp.", "c1", "supplier", "bpc1", "123456789", "123 Market St", "San Francisco", "CA", "94105", "USA", "contact@globex.com", "+14155552671", "cur1", "30 days", True, ""]],
+            "FinancialIndex": [["fi1", "CPI", "inflation", "CPI", "linear", "Consumer Price Index", "monthly", "accumulated", True]],
+            "IndexQuote": [["iq1", "fi1", "2024-01-01", 110.5], ["iq2", "fi1", "2024-02-01", 111.0], ["iq3", "fi1", "2024-03-01", 111.7]],
+            "FinancialIndexQuoteForecast": [["iqf1", "fi1", "2024-04-01", 112.3, "internal forecast"], ["iqf2", "fi1", "2024-05-01", 113.0, "internal forecast"]],
+            "ProductServiceCategory": [["psc1", "Office Supplies", "c1", ""]],
+            "ProductService": [["ps1", "Printer Paper", "c1", "PP001", "psc1", "A4 white printer paper", "product", 5.00, 2.00, "cur1", True, 500]],
+            "Contract": [["ct1", "Office Supplies Agreement", "c1", "bp1", "CT2024-001", "2024-01-01", "2024-12-31", "FREQ=MONTHLY", 1000.00, "2024-01-01", "", "monthly", "", "Contract for monthly supply of office items."]],
+            "Invoice": [["inv1", "January Invoice", "c1", "bp1", "purchase", "INV2024-001", "2024-01-01", "2024-01-30", "issued", "cur1", 500.00, 50.00, 0.00, "", "", "", "Monthly supply invoice."]],
+            "InvoiceLine": [["il1", "Paper Order", "c1", "inv1", "ps1", "A4 white printer paper", 100, 5.00, 50.00]],
+        }
+
+        for sheet_name, columns in sheet_defs.items():
+            if sheet_name == "company":
+                ws = wb.active
+                ws.title = sheet_name
+            else:
+                ws = wb.create_sheet(sheet_name)
+
+            ws.append(columns)
+            for row in sample_data.get(sheet_name, []):
+                ws.append(row)
+
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        filename = f"bulk_import_template_{now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+        return HttpResponse(
+            output,
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            headers={'Content-Disposition': f'attachment; filename="{filename}"'},
+        )
+    
 
 def get_dynamic_value(obj, field_name):
     """
