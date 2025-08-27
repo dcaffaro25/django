@@ -1726,15 +1726,30 @@ class ReconciliationTaskViewSet(viewsets.ModelViewSet):
         Start reconciliation as a background task
         """
         data = request.data
-        task = match_many_to_many_task.delay(data, tenant_id)
-
+    
+        # Create DB record now so we have an ID
+        task_obj = ReconciliationTask.objects.create(
+            task_id="PENDING",   # placeholder, will be updated once Celery assigns one
+            tenant_id=tenant_id,
+            parameters=data,
+            status="PENDING"
+        )
+    
+        # Trigger Celery job and pass along the DB id
+        async_result = match_many_to_many_task.delay(data, tenant_id)
+    
+        # update the DB record with Celery’s task_id
+        task_obj.task_id = async_result.id
+        task_obj.save(update_fields=["task_id"])
+    
         return Response({
             "message": "Task enqueued",
-            "task_id": task.id,
+            "task_id": async_result.id,   # Celery UUID
+            "db_id": task_obj.id,         # persistent DB PK
         })
 
     @action(detail=True, methods=["get"])
-    def status(self, request, pk=None):
+    def status(self, request, pk=None, tenant_id=None):
         """
         Get status/result of a task by DB ID
         """
