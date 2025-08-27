@@ -27,6 +27,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 from django.http import HttpResponse
 from bisect import bisect_left, bisect_right
 from .tasks import match_many_to_many_task
+from celery.task.control import inspect
 
 # Currency ViewSet
 class CurrencyViewSet(viewsets.ModelViewSet):
@@ -1760,22 +1761,37 @@ class ReconciliationTaskViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=["get"])
     def queued(self, request, tenant_id=None):
         """
-        Returns all queued or running tasks.
-        Optional filter: ?tenant_id=foo
-        Optional filter: ?status=STARTED
+        Returns both:
+        1. DB-persisted tasks (filterable by tenant_id, status)
+        2. Live Celery queue info (active/reserved/scheduled)
         """
-        tenant_filter = tenant_id#request.query_params.get("tenant_id")
+        tenant_filter = request.query_params.get("tenant_id")
         status_filter = request.query_params.get("status")
 
+        # ---- DB tasks ----
         qs = ReconciliationTask.objects.all().order_by("-created_at")
-
         if tenant_filter:
             qs = qs.filter(tenant_id=tenant_filter)
         if status_filter:
             qs = qs.filter(status=status_filter)
 
-        serializer = self.get_serializer(qs, many=True)
-        return Response(serializer.data)
+        db_tasks = self.get_serializer(qs, many=True).data
+
+        # ---- Celery live tasks ----
+        try:
+            i = inspect()
+            live_info = {
+                "active": i.active() or {},
+                "reserved": i.reserved() or {},
+                "scheduled": i.scheduled() or {}
+            }
+        except Exception as e:
+            live_info = {"error": str(e)}
+
+        return Response({
+            "db_tasks": db_tasks,
+            "celery_live": live_info
+        })
     
 # Transaction Schema Endpoint
 @api_view(['GET'])
