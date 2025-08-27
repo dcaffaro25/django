@@ -1756,7 +1756,27 @@ class ReconciliationTaskViewSet(viewsets.ModelViewSet):
         task = self.get_object()
         serializer = self.get_serializer(task)
         return Response(serializer.data)
+    
+    @action(detail=False, methods=["get"])
+    def queued(self, request, tenant_id=None):
+        """
+        Returns all queued or running tasks.
+        Optional filter: ?tenant_id=foo
+        Optional filter: ?status=STARTED
+        """
+        tenant_filter = tenant_id#request.query_params.get("tenant_id")
+        status_filter = request.query_params.get("status")
 
+        qs = ReconciliationTask.objects.all().order_by("-created_at")
+
+        if tenant_filter:
+            qs = qs.filter(tenant_id=tenant_filter)
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+
+        serializer = self.get_serializer(qs, many=True)
+        return Response(serializer.data)
+    
 # Transaction Schema Endpoint
 @api_view(['GET'])
 def transaction_schema(request, tenant_id=None):
