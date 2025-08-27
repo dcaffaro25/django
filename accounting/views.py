@@ -1727,18 +1727,18 @@ class ReconciliationTaskViewSet(viewsets.ModelViewSet):
         """
         data = request.data
     
-        # Create DB record now so we have an ID
+        # 1. Pre-create DB record with placeholder task_id
         task_obj = ReconciliationTask.objects.create(
-            task_id="PENDING",   # placeholder, will be updated once Celery assigns one
+            task_id="PENDING",   # will be updated after Celery fires
             tenant_id=tenant_id,
             parameters=data,
             status="PENDING"
         )
     
-        # Trigger Celery job and pass along the DB id
-        async_result = match_many_to_many_task.delay(data, tenant_id)
+        # 2. Trigger Celery, pass the db_id
+        async_result = match_many_to_many_task.delay(task_obj.id, data, tenant_id)
     
-        # update the DB record with Celery’s task_id
+        # 3. Update the DB record with Celery task_id
         task_obj.task_id = async_result.id
         task_obj.save(update_fields=["task_id"])
     

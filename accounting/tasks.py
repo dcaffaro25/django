@@ -3,16 +3,12 @@ from .services.reconciliation_service import ReconciliationService
 from .models import ReconciliationTask
 
 @shared_task(bind=True)
-def match_many_to_many_task(self, data, tenant_id=None):
-    # Ensure a DB record exists for this task
-    task_obj, created = ReconciliationTask.objects.get_or_create(
-        task_id=self.request.id,
-        defaults={
-            "tenant_id": tenant_id,
-            "parameters": data,
-            "status": "PENDING",
-        },
-    )
+def match_many_to_many_task(self, db_id, data, tenant_id=None):
+    """
+    Background reconciliation task.
+    Updates the ReconciliationTask row instead of creating a new one.
+    """
+    task_obj = ReconciliationTask.objects.get(id=db_id)
 
     try:
         task_obj.status = "STARTED"
