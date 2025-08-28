@@ -1798,13 +1798,13 @@ class ReconciliationTaskViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=["get"])
     def task_counts(self, request, tenant_id=None):
         """
-        Lightweight endpoint to return counts of tasks by status,
-        with optional filters:
-        - ?tenant_id=foo
-        - ?last_n=100   (last 100 tasks)
-        - ?hours_ago=6  (tasks from the last 6 hours)
+        Lightweight endpoint to return counts of tasks by status.
+        Filters:
+          - ?tenant_id=foo
+          - ?last_n=100   (last 100 tasks)
+          - ?hours_ago=6  (tasks from the last 6 hours)
         """
-        tenant_filter = request.query_params.get("tenant_id")
+        tenant_filter = tenant_id
         last_n = request.query_params.get("last_n")
         hours_ago = request.query_params.get("hours_ago")
     
@@ -1831,9 +1831,10 @@ class ReconciliationTaskViewSet(viewsets.ModelViewSet):
         status_map = {row["status"]: row["total"] for row in counts}
     
         return Response({
-            "running": status_map.get("running", 0),
-            "completed": status_map.get("completed", 0),
-            "queued": status_map.get("queued", 0),
+            "running": status_map.get("STARTED", 0),
+            "completed": status_map.get("SUCCESS", 0),
+            "queued": status_map.get("PENDING", 0),
+            "failed": status_map.get("FAILURE", 0),
         })
     
 # Transaction Schema Endpoint
