@@ -278,7 +278,7 @@ class ReconciliationService:
             "bank_transaction_details": [{
                 "id": tx.id,
                 "date": tx.date.isoformat() if tx.date else None,
-                "amount": tx.amount,
+                "amount": float(tx.amount) if tx.amount is not None else None,
                 "description": tx.description,
                 "tx_hash": tx.tx_hash,
                 "bank_account": {
@@ -288,17 +288,17 @@ class ReconciliationService:
                 "entity": tx.entity.id if tx.entity else None,
                 "currency": tx.currency.id
             } for tx in bank_combo],
+            
             "journal_entry_details":[{
                 "id": entry.id,
                 "date": entry.date.isoformat() if entry.date else None,
-                "amount": entry.get_effective_amount(),
+                "amount": float(entry.get_effective_amount()) if entry.get_effective_amount() is not None else None,
                 "description": entry.transaction.description,
                 "account": {
                     "id": entry.account.id,
                     "account_code": entry.account.account_code,
                     "name": entry.account.name
                 } if entry.account else None,
-                
                 "transaction": {
                     "id": entry.transaction.id,
                     "entity": {
