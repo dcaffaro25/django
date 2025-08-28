@@ -222,7 +222,7 @@ class ReconciliationService:
         return round(0.7 * amount_score + 0.3 * date_score, 2)
 
     @staticmethod
-    def format_suggestion_output(match_type, bank_combo, book_combo, confidence_score):
+    def format_suggestion_output2(match_type, bank_combo, book_combo, confidence_score):
         sum_bank = sum(tx.amount for tx in bank_combo)
         sum_book = sum(entry.get_effective_amount() for entry in book_combo)
         diff = abs(sum_bank - sum_book)
@@ -238,3 +238,85 @@ class ReconciliationService:
             "difference": float(diff),
             "confidence_score": float(confidence_score),
         }
+    
+    @staticmethod
+    def format_suggestion_output(match_type, bank_combo, book_combo, confidence_score):
+        sum_bank = sum(tx.amount for tx in bank_combo)
+        sum_book = sum(entry.get_effective_amount() for entry in book_combo)
+        diff = abs(sum_bank - sum_book)
+    
+        # Média das diferenças de datas entre os pares
+        date_diffs = [
+            abs((tx.date - entry.date).days)
+            for tx in bank_combo
+            for entry in book_combo
+        ]
+        avg_date_diff = sum(date_diffs) / len(date_diffs) if date_diffs else 0
+    
+        bank_lines = []    
+        for tx in bank_combo:
+            bank_lines.append(f"ID: {tx.id}, Date: {tx.date}, Amount: {tx.amount}, Desc: {tx.description}")
+        bank_summary = "\n".join(bank_lines)
+        #bank_summary = f"{[ID: tx.id, Date: tx.date, Amount: tx.amount, Desc: tx.description for tx in bank_combo]}"
+        #journal_summary = f"IDs: {[entry.id for entry in book_combo]}, Total: {sum_book:.2f}"
+        
+        #bank_summary = f"ID: {tx.id}, Date: {tx.date}, Amount: {tx.amount}, Desc: {tx.description}"
+        
+        journal_lines = []
+        for entry in book_combo:
+            account_code = entry.account.account_code if entry.account else 'N/A'
+            account_name = entry.account.name if entry.account else 'N/A'
+            direction = 'DEBIT' if entry.debit_amount else 'CREDIT'
+            journal_lines.append(f"ID: {entry.transaction.id}, Date: {entry.date}, JE: {direction} {entry.get_effective_amount()} - ({account_code}) {account_name}, Desc: {entry.transaction.description}")
+        journal_summary = "\n".join(journal_lines)
+        
+        
+        return {
+            "match_type": match_type,
+            "N bank": len(bank_combo),
+            "N book": len(book_combo),
+            "bank_transaction_details": [{
+                "id": tx.id,
+                "date": tx.date,
+                "amount": tx.amount,
+                "description": tx.description,
+                "tx_hash": tx.tx_hash,
+                "bank_account": {
+                    "id": tx.bank_account.id,
+                    "name": tx.bank_account.name
+                } if tx.bank_account else None,
+                "entity": tx.entity.id if tx.entity else None,
+                "currency": tx.currency.id
+            } for tx in bank_combo],
+            "journal_entry_details":[{
+                "id": entry.id,
+                "date": entry.date,
+                "amount": entry.get_effective_amount(),
+                "description": entry.transaction.description,
+                "account": {
+                    "id": entry.account.id,
+                    "account_code": entry.account.account_code,
+                    "name": entry.account.name
+                } if entry.account else None,
+                
+                "transaction": {
+                    "id": entry.transaction.id,
+                    "entity": {
+                        "id": entry.transaction.entity.id,
+                        "name": entry.transaction.entity.name
+                    } if entry.transaction.entity else None,
+                    "description": entry.transaction.description,
+                    "date": entry.transaction.date
+                } if entry.transaction else None
+            } for entry in book_combo],
+            "bank_transaction_summary": bank_summary,
+            "journal_entries_summary": journal_summary,
+            "bank_ids": [tx.id for tx in bank_combo],
+            "journal_entries_ids": [entry.id for entry in book_combo],
+            "sum_bank": float(sum_bank),
+            "sum_book": float(sum_book),
+            "difference": float(diff),
+            "avg_date_diff": avg_date_diff,
+            "confidence_score": float(confidence_score)
+        }
+    
