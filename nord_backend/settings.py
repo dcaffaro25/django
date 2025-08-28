@@ -166,8 +166,9 @@ CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = "UTC"
 
 # Optional task time limits (protects against runaway jobs)
-CELERY_TASK_SOFT_TIME_LIMIT = (os.getenv("CELERY_TASK_TIME_LIMIT", 15)-3)*60  # 12 minutes
-CELERY_TASK_TIME_LIMIT = os.getenv("CELERY_TASK_TIME_LIMIT",15)*60       # 15 minutes
+CELERY_TASK_T_LIMIT = int(os.getenv("CELERY_TASK_TIME_LIMIT", 15))  # minutes
+CELERY_TASK_SOFT_TIME_LIMIT = (CELERY_TASK_T_LIMIT-3)*60  # 12 minutes
+CELERY_TASK_TIME_LIMIT = CELERY_TASK_T_LIMIT*60       # 15 minutes
 
 # Password validation
 # https://docs.djangoproject.com/en/4.0/ref/settings/#auth-password-validators
