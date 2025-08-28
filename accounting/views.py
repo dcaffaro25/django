@@ -27,7 +27,8 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 from django.http import HttpResponse
 from bisect import bisect_left, bisect_right
 from .tasks import match_many_to_many_task
-from celery.task.control import inspect
+#from celery.task.control import inspect
+from nord_backend.celery import app
 
 # Currency ViewSet
 class CurrencyViewSet(viewsets.ModelViewSet):
@@ -1779,7 +1780,7 @@ class ReconciliationTaskViewSet(viewsets.ModelViewSet):
 
         # ---- Celery live tasks ----
         try:
-            i = inspect()
+            i = app.control.inspect()
             live_info = {
                 "active": i.active() or {},
                 "reserved": i.reserved() or {},
