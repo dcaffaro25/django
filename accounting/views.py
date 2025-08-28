@@ -6,6 +6,7 @@ from rest_framework.decorators import action, api_view
 from django.db.models import Q, Sum, Count, F, Value as V
 from django.db.models.functions import TruncDate, Coalesce, Cast
 from django.db import transaction
+from django.utils import timezone
 from datetime import timedelta
 from itertools import product, combinations
 from multitenancy.api_utils import generic_bulk_create, generic_bulk_update, generic_bulk_delete
@@ -1792,6 +1793,47 @@ class ReconciliationTaskViewSet(viewsets.ModelViewSet):
         return Response({
             "db_tasks": db_tasks,
             "celery_live": live_info
+        })
+    
+    @action(detail=False, methods=["get"])
+    def task_counts(self, request, tenant_id=None):
+        """
+        Lightweight endpoint to return counts of tasks by status,
+        with optional filters:
+        - ?tenant_id=foo
+        - ?last_n=100   (last 100 tasks)
+        - ?hours_ago=6  (tasks from the last 6 hours)
+        """
+        tenant_filter = request.query_params.get("tenant_id")
+        last_n = request.query_params.get("last_n")
+        hours_ago = request.query_params.get("hours_ago")
+    
+        qs = ReconciliationTask.objects.all()
+    
+        if tenant_filter:
+            qs = qs.filter(tenant_id=tenant_filter)
+    
+        if hours_ago:
+            try:
+                cutoff = timezone.now() - timedelta(hours=int(hours_ago))
+                qs = qs.filter(created_at__gte=cutoff)
+            except ValueError:
+                pass
+    
+        if last_n:
+            try:
+                last_n = int(last_n)
+                qs = qs.order_by("-created_at")[:last_n]
+            except ValueError:
+                pass
+    
+        counts = qs.values("status").annotate(total=Count("id"))
+        status_map = {row["status"]: row["total"] for row in counts}
+    
+        return Response({
+            "running": status_map.get("running", 0),
+            "completed": status_map.get("completed", 0),
+            "queued": status_map.get("queued", 0),
         })
     
 # Transaction Schema Endpoint
