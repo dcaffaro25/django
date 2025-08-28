@@ -1732,10 +1732,10 @@ class ReconciliationTaskViewSet(viewsets.ModelViewSet):
     
         # 1. Pre-create DB record with placeholder task_id
         task_obj = ReconciliationTask.objects.create(
-            task_id="PENDING",   # will be updated after Celery fires
+            task_id="queued",   # will be updated after Celery fires
             tenant_id=tenant_id,
             parameters=data,
-            status="PENDING"
+            status="queued"
         )
     
         # 2. Trigger Celery, pass the db_id
@@ -1831,10 +1831,10 @@ class ReconciliationTaskViewSet(viewsets.ModelViewSet):
         status_map = {row["status"]: row["total"] for row in counts}
     
         return Response({
-            "running": status_map.get("STARTED", 0),
-            "completed": status_map.get("SUCCESS", 0),
-            "queued": status_map.get("PENDING", 0),
-            "failed": status_map.get("FAILURE", 0),
+            "running": status_map.get("running", 0),
+            "completed": status_map.get("completed", 0),
+            "queued": status_map.get("queued", 0),
+            "failed": status_map.get("failed", 0),
         })
     
 # Transaction Schema Endpoint

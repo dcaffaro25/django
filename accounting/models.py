@@ -388,10 +388,10 @@ class BankTransaction(TenantAwareBaseModel):
 
 class ReconciliationTask(models.Model):
     STATUS_CHOICES = [
-        ("PENDING", "Pending"),
-        ("STARTED", "Started"),
-        ("SUCCESS", "Success"),
-        ("FAILURE", "Failure"),
+        ("queued", "queued"),
+        ("running", "running"),
+        ("completed", "completed"),
+        ("failed", "failed"),
     ]
 
     task_id = models.CharField(max_length=255, unique=True, db_index=True)
