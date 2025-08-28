@@ -277,7 +277,7 @@ class ReconciliationService:
             "N book": len(book_combo),
             "bank_transaction_details": [{
                 "id": tx.id,
-                "date": tx.date,
+                "date": tx.date.isoformat() if tx.date else None,
                 "amount": tx.amount,
                 "description": tx.description,
                 "tx_hash": tx.tx_hash,
@@ -290,7 +290,7 @@ class ReconciliationService:
             } for tx in bank_combo],
             "journal_entry_details":[{
                 "id": entry.id,
-                "date": entry.date,
+                "date": entry.date.isoformat() if entry.date else None,
                 "amount": entry.get_effective_amount(),
                 "description": entry.transaction.description,
                 "account": {
@@ -306,7 +306,7 @@ class ReconciliationService:
                         "name": entry.transaction.entity.name
                     } if entry.transaction.entity else None,
                     "description": entry.transaction.description,
-                    "date": entry.transaction.date
+                    "date": entry.transaction.date.isoformat() if entry.transaction.date else None
                 } if entry.transaction else None
             } for entry in book_combo],
             "bank_transaction_summary": bank_summary,
