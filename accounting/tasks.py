@@ -11,18 +11,18 @@ def match_many_to_many_task(self, db_id, data, tenant_id=None):
     task_obj = ReconciliationTask.objects.get(id=db_id)
 
     try:
-        task_obj.status = "STARTED"
+        task_obj.status = "running"
         task_obj.save(update_fields=["status", "updated_at"])
 
         result = ReconciliationService.match_many_to_many_with_set2(data, tenant_id)
 
-        task_obj.status = "SUCCESS"
+        task_obj.status = "completed"
         task_obj.result = result
         task_obj.save(update_fields=["status", "result", "updated_at"])
         return result
 
     except Exception as e:
-        task_obj.status = "FAILURE"
+        task_obj.status = "failed"
         task_obj.error_message = str(e)
         task_obj.save(update_fields=["status", "error_message", "updated_at"])
         raise

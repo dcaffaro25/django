@@ -399,7 +399,7 @@ class ReconciliationTask(models.Model):
 
     parameters = models.JSONField(default=dict)  # request payload
     result = models.JSONField(null=True, blank=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="PENDING")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="queued")
     error_message = models.TextField(null=True, blank=True)
 
     created_at = models.DateTimeField(default=now)
