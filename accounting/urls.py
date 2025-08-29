@@ -18,6 +18,8 @@ from .views import (
     transaction_schema,
     journal_entry_schema,
     ReconciliationTaskViewSet,
+    ReconciliationViewSet,
+    ReconciliationConfigViewSet,
 )
 from multitenancy.views import EntityViewSet, EntityMiniViewSet, EntityTreeView, EntityDynamicTransposedView
 
@@ -39,12 +41,13 @@ router.register('reconciliation', ReconciliationViewSet)
 router.register('entities', EntityViewSet, basename='entity')
 router.register('entities-mini', EntityMiniViewSet)
 router.register(r"reconciliation-tasks", ReconciliationTaskViewSet, basename="reconciliationtask")
+router.register(r'reconciliation_configs', ReconciliationConfigViewSet, basename="reconciliation-configs")  # 👈 new
 
 urlpatterns = [
     # IMPORTANT: no extra 'api/' here because the project urls already mount this file at /<tenant>/api/
     re_path(r'api/', include(router.urls)),
 
-    # Custom routes � use re_path for optional trailing slash
+    # Custom routes  use re_path for optional trailing slash
     re_path(r'^transactions/(?P<pk>\d+)/post/?$',  TransactionViewSet.as_view({'post': 'post'}), name='transaction-post'),
     re_path(r'^transactions/(?P<pk>\d+)/unpost/?$', TransactionViewSet.as_view({'post': 'unpost'}), name='transaction-unpost'),
     re_path(r'^transactions/(?P<pk>\d+)/cancel/?$', TransactionViewSet.as_view({'post': 'cancel'}), name='transaction-cancel'),

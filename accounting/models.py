@@ -14,6 +14,8 @@ from django.utils.timezone import now
 from multitenancy.models import BaseModel, TenantAwareBaseModel
 from mptt.models import MPTTModel, TreeForeignKey
 from mptt.managers import TreeManager
+from multitenancy.models import Company, CustomUser
+from django.conf import settings
 
 class Currency(BaseModel):
     code = models.CharField(max_length=3, unique=True)
@@ -453,3 +455,70 @@ class Reconciliation(TenantAwareBaseModel):
         return self.total_bank_amount - self.total_journal_amount
     
     
+class ReconciliationConfig(models.Model):
+    """
+    Stores reusable reconciliation settings (shortcuts / presets).
+    Can be global (system-wide), per company, or per user.
+    """
+
+    SCOPE_CHOICES = [
+        ("global", "Global"),
+        ("company", "Company"),
+        ("user", "User"),
+    ]
+
+    scope = models.CharField(
+        max_length=20, choices=SCOPE_CHOICES, default="company",
+        help_text="Who this config applies to: global, company, or user"
+    )
+    # Only required if scope == "company"
+    company = models.ForeignKey(
+        Company,
+        null=True, blank=True,
+        on_delete=models.CASCADE,
+        related_name="reconciliation_configs"
+    )
+    
+    # Only required if scope == "user"
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.CASCADE,
+        related_name="reconciliation_configs"
+    )
+    
+    name = models.CharField(max_length=255, help_text="Name of this config, e.g. 'High Precision Match' or 'Loose Match'")
+    description = models.TextField(blank=True, null=True)
+
+    # Bank & Book filters (saved queries)
+    bank_filters = models.JSONField(default=dict, blank=True)
+    book_filters = models.JSONField(default=dict, blank=True)
+
+    # Reconciliation parameters
+    strategy = models.CharField(
+        max_length=50,
+        choices=[
+            ("exact 1-to-1", "Exact 1-to-1"),
+            ("fuzzy", "Fuzzy"),
+            ("many-to-many", "Many-to-Many"),
+            ("optimized", "Optimized"),
+        ],
+        default="optimized"
+    )
+    max_group_size = models.PositiveIntegerField(default=2)
+    amount_tolerance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    date_tolerance_days = models.PositiveIntegerField(default=2)
+    min_confidence = models.DecimalField(max_digits=4, decimal_places=2, default=0.9)
+    max_suggestions = models.PositiveIntegerField(default=5)
+
+    # Metadata
+    is_default = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("company", "name")  # each company can’t have duplicate config names
+        ordering = ["-updated_at"]
+
+    def __str__(self):
+        return f"{self.company.name} - {self.name}"

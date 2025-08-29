@@ -11,8 +11,8 @@ from datetime import timedelta
 from itertools import product, combinations
 from multitenancy.api_utils import generic_bulk_create, generic_bulk_update, generic_bulk_delete
 from multitenancy.models import CustomUser, Company, Entity, TenantQuerysetMixin
-from .models import (Currency, Account, Transaction, JournalEntry, Rule, CostCenter, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter,ReconciliationTask)
-from .serializers import (CurrencySerializer, AccountSerializer, TransactionSerializer, CostCenterSerializer, JournalEntrySerializer, RuleSerializer, BankSerializer, BankAccountSerializer, BankTransactionSerializer, ReconciliationSerializer, TransactionListSerializer,ReconciliationTaskSerializer)
+from .models import (Currency, Account, Transaction, JournalEntry, Rule, CostCenter, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter,ReconciliationTask, ReconciliationConfig)
+from .serializers import (CurrencySerializer, AccountSerializer, TransactionSerializer, CostCenterSerializer, JournalEntrySerializer, RuleSerializer, BankSerializer, BankAccountSerializer, BankTransactionSerializer, ReconciliationSerializer, TransactionListSerializer,ReconciliationTaskSerializer,ReconciliationConfigSerializer)
 from .services.transaction_service import *
 from .utils import parse_ofx_text, decode_ofx_content, generate_ofx_transaction_hash, find_book_combos
 from datetime import datetime
@@ -1836,7 +1836,48 @@ class ReconciliationTaskViewSet(viewsets.ModelViewSet):
             "queued": status_map.get("queued", 0),
             "failed": status_map.get("failed", 0),
         })
-    
+
+class ReconciliationConfigViewSet(viewsets.ModelViewSet):
+    queryset = ReconciliationConfig.objects.all()
+    serializer_class = ReconciliationConfigSerializer
+
+    def get_queryset(self):
+        user = self.request.user
+        company_id = self.request.query_params.get("company_id")
+
+        qs = super().get_queryset()
+
+        return qs.filter(
+            models.Q(scope="global") |
+            models.Q(scope="company", company_id=company_id) |
+            models.Q(scope="user", user=user)
+        )
+
+class ReconciliationConfigViewSet(viewsets.ModelViewSet):
+    queryset = ReconciliationConfig.objects.all()
+    serializer_class = ReconciliationConfigSerializer
+
+    @action(detail=False, methods=["get"])
+    def resolved(self, request, *args, **kwargs):
+        """
+        Return all configs available to the current user:
+        - Global
+        - Company-specific (if company_id provided)
+        - User-specific
+        """
+        user = request.user
+        company_id = request.query_params.get("company_id")
+
+        qs = ReconciliationConfig.objects.filter(
+            Q(scope="global")
+            | Q(scope="company", company_id=company_id)
+            | Q(scope="user", user=user)
+        )
+
+        serializer = ResolvedReconciliationConfigSerializer(qs, many=True)
+        return Response(serializer.data)
+
+
 # Transaction Schema Endpoint
 @api_view(['GET'])
 def transaction_schema(request, tenant_id=None):

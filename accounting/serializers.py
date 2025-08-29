@@ -1,7 +1,7 @@
 # NORD/accounting/serializers.py
 
 from rest_framework import serializers
-from .models import (Currency, Account, Transaction, JournalEntry, ReconciliationTask, Rule, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter)
+from .models import (Currency, Account, Transaction, JournalEntry, ReconciliationTask, Rule, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter, ReconciliationConfig)
 from multitenancy.serializers import CompanySerializer, EntitySerializer, FlexibleRelatedField
 from multitenancy.serializers import CompanyMiniSerializer, EntityMiniSerializer
 from django.core.exceptions import ObjectDoesNotExist
@@ -307,3 +307,84 @@ class ReconciliationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Reconciliation
         fields = '__all__'
+
+class ReconciliationConfigSerializer(serializers.ModelSerializer):
+    company_name = serializers.CharField(
+        source="company.name", read_only=True
+    )
+    user_name = serializers.CharField(
+        source="user.username", read_only=True
+    )
+
+    class Meta:
+        model = ReconciliationConfig
+        fields = [
+            "id",
+            "scope",
+            "company",
+            "company_name",
+            "user",
+            "user_name",
+            "name",
+            "description",
+            "bank_filters",
+            "book_filters",
+            "strategy",
+            "max_group_size",
+            "amount_tolerance",
+            "date_tolerance_days",
+            "min_confidence",
+            "max_suggestions",
+            "is_default",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+    def validate(self, attrs):
+        scope = attrs.get("scope") or getattr(self.instance, "scope", None)
+
+        if scope == "company" and not attrs.get("company") and not getattr(self.instance, "company", None):
+            raise serializers.ValidationError("Company is required when scope is 'company'.")
+        if scope == "user" and not attrs.get("user") and not getattr(self.instance, "user", None):
+            raise serializers.ValidationError("User is required when scope is 'user'.")
+
+        return attrs
+
+class ResolvedReconciliationConfigSerializer(serializers.ModelSerializer):
+    company_name = serializers.CharField(source="company.name", read_only=True)
+    user_name = serializers.CharField(source="user.username", read_only=True)
+    scope_label = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ReconciliationConfig
+        fields = [
+            "id",
+            "scope",
+            "scope_label",
+            "company",
+            "company_name",
+            "user",
+            "user_name",
+            "name",
+            "description",
+            "bank_filters",
+            "book_filters",
+            "strategy",
+            "max_group_size",
+            "amount_tolerance",
+            "date_tolerance_days",
+            "min_confidence",
+            "max_suggestions",
+            "is_default",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_scope_label(self, obj):
+        mapping = {
+            "global": "Global Shortcut",
+            "company": f"Company Shortcut ({obj.company.name if obj.company else ''})",
+            "user": f"User Shortcut ({obj.user.username if obj.user else ''})",
+        }
+        return mapping.get(obj.scope, obj.scope)
