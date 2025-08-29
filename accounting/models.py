@@ -465,11 +465,12 @@ class ReconciliationConfig(models.Model):
         ("global", "Global"),
         ("company", "Company"),
         ("user", "User"),
+        ("company_user", "Company + User"),
     ]
 
     scope = models.CharField(
         max_length=20, choices=SCOPE_CHOICES, default="company",
-        help_text="Who this config applies to: global, company, or user"
+        help_text="Who this config applies to: global, company, user, or company+user"
     )
     # Only required if scope == "company"
     company = models.ForeignKey(
@@ -517,7 +518,7 @@ class ReconciliationConfig(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        unique_together = ("company", "name")  # each company can’t have duplicate config names
+        unique_together = ("company", "user", "name")  # each company can’t have duplicate config names
         ordering = ["-updated_at"]
 
     def __str__(self):
@@ -527,4 +528,17 @@ class ReconciliationConfig(models.Model):
             return f"[Company: {self.company.name}] {self.name}"
         elif self.scope == "user" and self.user:
             return f"[User: {self.user.username}] {self.name}"
+        elif self.scope == "company_user" and self.company and self.user:
+            return f"[Company: {self.company.name} | User: {self.user.username}] {self.name}"
         return f"{self.name} (Unscoped)"
+
+    def clean(self):
+        """Ensure required fields are set depending on scope."""
+        from django.core.exceptions import ValidationError
+
+        if self.scope == "company" and not self.company:
+            raise ValidationError("Company is required for company scope configs.")
+        if self.scope == "user" and not self.user:
+            raise ValidationError("User is required for user scope configs.")
+        if self.scope == "company_user" and (not self.company or not self.user):
+            raise ValidationError("Both company and user are required for company_user scope configs.")

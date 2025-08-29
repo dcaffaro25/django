@@ -1862,8 +1862,9 @@ class ReconciliationConfigViewSet(viewsets.ModelViewSet):
         """
         Return all configs available to the current user:
         - Global
-        - Company-specific (if company_id provided)
-        - User-specific
+        - Company
+        - User
+        - Company+User
         """
         user = request.user
         company_id = request.query_params.get("company_id")
@@ -1872,6 +1873,7 @@ class ReconciliationConfigViewSet(viewsets.ModelViewSet):
             Q(scope="global")
             | Q(scope="company", company_id=company_id)
             | Q(scope="user", user=user)
+            | Q(scope="company_user", company_id=company_id, user=user)
         )
 
         serializer = ResolvedReconciliationConfigSerializer(qs, many=True)

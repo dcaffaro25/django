@@ -382,9 +382,12 @@ class ResolvedReconciliationConfigSerializer(serializers.ModelSerializer):
         ]
 
     def get_scope_label(self, obj):
-        mapping = {
-            "global": "Global Shortcut",
-            "company": f"Company Shortcut ({obj.company.name if obj.company else ''})",
-            "user": f"User Shortcut ({obj.user.username if obj.user else ''})",
-        }
-        return mapping.get(obj.scope, obj.scope)
+        if obj.scope == "global":
+            return "Global Shortcut"
+        if obj.scope == "company" and obj.company:
+            return f"Company Shortcut ({obj.company.name})"
+        if obj.scope == "user" and obj.user:
+            return f"User Shortcut ({obj.user.username})"
+        if obj.scope == "company_user" and obj.company and obj.user:
+            return f"Company+User Shortcut ({obj.company.name} | {obj.user.username})"
+        return obj.scope
