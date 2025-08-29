@@ -521,4 +521,10 @@ class ReconciliationConfig(models.Model):
         ordering = ["-updated_at"]
 
     def __str__(self):
-        return f"{self.company.name} - {self.name}"
+        if self.scope == "global":
+            return f"[Global] {self.name}"
+        elif self.scope == "company" and self.company:
+            return f"[Company: {self.company.name}] {self.name}"
+        elif self.scope == "user" and self.user:
+            return f"[User: {self.user.username}] {self.name}"
+        return f"{self.name} (Unscoped)"
