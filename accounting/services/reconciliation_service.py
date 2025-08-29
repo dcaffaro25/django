@@ -20,7 +20,7 @@ class ReconciliationService:
         """
         amount_tolerance = Decimal(str(data.get("amount_tolerance", "0")))
         date_tolerance_days = int(data.get("date_tolerance_days", 2))
-        max_suggestions = int(data.get("max_suggestions", 5))
+        #max_suggestions = int(data.get("max_suggestions", 5))
         max_group_size = int(data.get("max_group_size", 5))
         strategy = data.get("strategy", "Exact 1-to-1")
 
@@ -61,7 +61,7 @@ class ReconciliationService:
                 candidate_bank, candidate_book, amount_tolerance, date_tolerance_days, max_group_size
             )
 
-        combined_suggestions = (exact_matches + fuzzy_matches + group_matches)[:max_suggestions]
+        combined_suggestions = (exact_matches + fuzzy_matches + group_matches)#[:max_suggestions]
 
         return {"suggestions": combined_suggestions}
 
