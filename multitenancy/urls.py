@@ -2,7 +2,7 @@
 
 from django.urls import path, include, re_path
 from rest_framework.routers import DefaultRouter
-from .views import CustomUserViewSet, CompanyViewSet, EntityViewSet, EntityTreeView, LoginView, LogoutView, IntegrationRuleViewSet, ChangePasswordView, UserCreateView
+from .views import CustomUserViewSet, CompanyViewSet, EntityViewSet, EntityTreeView, LoginView, LogoutView, IntegrationRuleViewSet, ChangePasswordView, UserCreateView, PasswordResetForceView
 from accounting.views import CurrencyViewSet
 from .api_utils import BulkImportPreview, BulkImportExecute
 from .views import ValidateRuleView, ExecuteRuleView#, TriggerListView
@@ -22,6 +22,7 @@ urlpatterns = [
     re_path(r'^login/?$', LoginView.as_view(), name='login'),
     re_path(r'^logout/?$', LogoutView.as_view(), name='logout'),
     path("change-password/", ChangePasswordView.as_view(), name="change-password"),
+    path("reset-password/", PasswordResetForceView.as_view(), name="reset-password"),
     path("users/create/", UserCreateView.as_view(), name="user-create"),
 
     # Make the prefix itself optional-slash:
