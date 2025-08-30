@@ -4,7 +4,7 @@ from django.contrib.auth import authenticate, login, logout
 from rest_framework import views, viewsets, generics, status, serializers
 from rest_framework.response import Response
 from .models import CustomUser, Company, Entity, IntegrationRule, TenantQuerysetMixin
-from .serializers import CustomUserSerializer, CompanySerializer, EntitySerializer, UserLoginSerializer, IntegrationRuleSerializer, EntityMiniSerializer
+from .serializers import CustomUserSerializer, CompanySerializer, EntitySerializer, UserLoginSerializer, IntegrationRuleSerializer, EntityMiniSerializer, ChangePasswordSerializer, UserCreateSerializer
 from .api_utils import create_csv_response, create_excel_response
 from rest_framework import permissions
 from rest_framework.authentication import SessionAuthentication
@@ -12,6 +12,8 @@ from rest_framework.decorators import action
 from accounting.serializers import AccountSerializer, CostCenterSerializer
 from .formula_engine import validate_rule, run_rule_in_sandbox
 from rest_framework.authtoken.models import Token
+from django.core.mail import send_mail
+from django.conf import settings
 
 class LoginView(views.APIView):
     permission_classes = (permissions.AllowAny,)
@@ -54,6 +56,57 @@ class LogoutView(views.APIView):
     def post(self, request):
         logout(request)
         return Response({'detail': 'Logged out successfully'}, status=status.HTTP_200_OK)
+
+#User = get_user_model()
+
+class UserCreateView(generics.CreateAPIView):
+    queryset = CustomUser.objects.all()
+    serializer_class = UserCreateSerializer
+    permission_classes = [permissions.IsAdminUser]  # only admins can invite
+
+    def perform_create(self, serializer):
+        user = serializer.save()
+
+        # send email with temporary password
+        subject = "Your account has been created"
+        message = (
+            f"Hello {user.first_name or user.username},\n\n"
+            f"Your account has been created.\n"
+            f"Username: {user.username}\n"
+            f"Temporary Password: {user._temp_password}\n\n"
+            f"Please log in and change your password immediately."
+        )
+
+        send_mail(
+            subject,
+            message,
+            settings.DEFAULT_FROM_EMAIL,
+            [user.email],
+            fail_silently=False,
+        )
+
+class ChangePasswordView(generics.UpdateAPIView):
+    serializer_class = ChangePasswordSerializer
+    model = CustomUser
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_object(self, queryset=None):
+        return self.request.user
+
+    def update(self, request, *args, **kwargs):
+        user = self.get_object()
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        if not user.check_password(serializer.validated_data.get("old_password")):
+            return Response({"old_password": ["Wrong password."]}, status=status.HTTP_400_BAD_REQUEST)
+
+        user.set_password(serializer.validated_data.get("new_password"))
+        user.save()
+
+        return Response({"detail": "Password updated successfully"}, status=status.HTTP_200_OK)
+
+
 
 class CustomUserViewSet(viewsets.ModelViewSet):
     queryset = CustomUser.objects.all()

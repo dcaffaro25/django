@@ -7,6 +7,8 @@ from django.contrib.auth import authenticate
 from accounting.models import Account, CostCenter
 from django.core.exceptions import ObjectDoesNotExist
 #from accounting.serializers import AccountSerializer, CostCenterSerializer
+import secrets
+import string
 
 class FlexibleRelatedField(serializers.PrimaryKeyRelatedField):
     """
@@ -107,6 +109,27 @@ class FlexibleRelatedField(serializers.PrimaryKeyRelatedField):
         # Prevent the browsable API from trying to build a select widget by returning no choices.
         return {}
 
+class UserCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CustomUser
+        fields = ["id", "username", "email", "first_name", "last_name"]
+
+    def create(self, validated_data):
+        # generate a secure random temporary password
+        alphabet = string.ascii_letters + string.digits
+        temp_password = ''.join(secrets.choice(alphabet) for _ in range(10))
+
+        user = CustomUser.objects.create_user(
+            username=validated_data["username"],
+            email=validated_data["email"],
+            first_name=validated_data.get("first_name", ""),
+            last_name=validated_data.get("last_name", ""),
+            password=temp_password
+        )
+
+        # attach temp password so the view can send email
+        user._temp_password = temp_password
+        return user
 
 class UserLoginSerializer(serializers.Serializer):
     username = serializers.CharField()
@@ -120,6 +143,11 @@ class UserLoginSerializer(serializers.Serializer):
         return user
 
 
+
+class ChangePasswordSerializer(serializers.Serializer):
+    old_password = serializers.CharField(required=True)
+    new_password = serializers.CharField(required=True)
+    
 
 class CustomUserSerializer(serializers.ModelSerializer):
     class Meta:
