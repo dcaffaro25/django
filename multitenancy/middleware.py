@@ -14,7 +14,10 @@ class TenantMiddleware:
         # Log the incoming request and headers
         print(f"Path: {request.path}")
         print(f"Headers: {request.headers}")
-
+        
+        if request.path.startswith('/login'):
+            return self.get_response(request)
+        
         # Bypass tenant check for admin, login/logout, or core API paths
         if (
             request.path.startswith('/admin') or
@@ -27,14 +30,17 @@ class TenantMiddleware:
 
         # Extract the tenant identifier
         path_parts = request.path_info.strip('/').split('/')
-        subdomain = path_parts[0]
+        subdomain = path_parts[0] if path_parts else None
         print(subdomain)
         # Check if the user is authenticated
         if not request.user.is_authenticated and subdomain != 'testco':
             try:
                 auth = TokenAuthentication()
-                user, token = auth.authenticate(request)
-                request.user = user
+                auth_result = auth.authenticate(request)
+                if auth_result is not None:
+                    user, token = auth_result
+                    request.user = user
+                    request.auth = token
             except AuthenticationFailed:
                 return JsonResponse({'error': 'Authentication required'}, status=401)
 
