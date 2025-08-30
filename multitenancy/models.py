@@ -16,7 +16,14 @@ from crum import get_current_user
 
 class CustomUser(AbstractUser):
     # Add any additional fields here
-    pass
+    must_change_password = models.BooleanField(default=False)
+    email_last_sent_at = models.DateTimeField(null=True, blank=True)
+
+    def mark_email_sent(self):
+        """Helper to update timestamp when an email is sent to the user"""
+        self.email_last_sent_at = timezone.now()
+        self.save(update_fields=["email_last_sent_at"])
+    #pass
 
 def company_icon_upload_path(instance, filename):
     return f'company_icons/{instance.subdomain}/{filename}'

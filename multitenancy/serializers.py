@@ -148,6 +148,15 @@ class ChangePasswordSerializer(serializers.Serializer):
     old_password = serializers.CharField(required=True)
     new_password = serializers.CharField(required=True)
     
+class PasswordResetForceSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+    def validate_email(self, value):
+        try:
+            user = CustomUser.objects.get(email=value)
+        except CustomUser.DoesNotExist:
+            raise serializers.ValidationError("No user with this email found.")
+        return value
 
 class CustomUserSerializer(serializers.ModelSerializer):
     class Meta:

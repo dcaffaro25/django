@@ -4,7 +4,7 @@ from django.contrib.auth import authenticate, login, logout
 from rest_framework import views, viewsets, generics, status, serializers
 from rest_framework.response import Response
 from .models import CustomUser, Company, Entity, IntegrationRule, TenantQuerysetMixin
-from .serializers import CustomUserSerializer, CompanySerializer, EntitySerializer, UserLoginSerializer, IntegrationRuleSerializer, EntityMiniSerializer, ChangePasswordSerializer, UserCreateSerializer
+from .serializers import CustomUserSerializer, CompanySerializer, EntitySerializer, UserLoginSerializer, IntegrationRuleSerializer, EntityMiniSerializer, ChangePasswordSerializer, UserCreateSerializer, PasswordResetForceSerializer
 from .api_utils import create_csv_response, create_excel_response
 from rest_framework import permissions
 from rest_framework.authentication import SessionAuthentication
@@ -15,6 +15,8 @@ from rest_framework.authtoken.models import Token
 from django.core.mail import send_mail
 from django.conf import settings
 from .tasks import send_user_invite_email
+from django.utils import timezone
+from datetime import timedelta
 
 class LoginView(views.APIView):
     permission_classes = (permissions.AllowAny,)
@@ -100,6 +102,62 @@ class ChangePasswordView(generics.UpdateAPIView):
         return Response({"detail": "Password updated successfully"}, status=status.HTTP_200_OK)
 
 
+class PasswordResetForceView(generics.GenericAPIView):
+    serializer_class = PasswordResetForceSerializer
+    permission_classes = [permissions.IsAdminUser]  # or AllowAny if self-service
+    
+    
+    COOLDOWN_MINUTES = settings.PASSWORD_RESET_EMAIL_COOLDOWN  # ✅ minimum time before another email can be sent
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        email = serializer.validated_data["email"]
+        user = CustomUser.objects.get(email=email)
+
+        # ✅ Check cooldown
+        if user.email_last_sent_at:
+            next_allowed = user.email_last_sent_at + timedelta(minutes=self.COOLDOWN_MINUTES)
+            if timezone.now() < next_allowed:
+                remaining = (next_allowed - timezone.now()).seconds // 60 + 1
+                return Response(
+                    {"detail": f"Password reset email already sent. Try again in {remaining} minutes."},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
+
+        # Generate temporary password
+        temp_password = "ChangeMe123"
+        user.set_password(temp_password)
+        user.must_change_password = True
+        user.save()
+
+        subject = "Your password has been reset"
+        message = (
+            f"Hello {user.first_name or user.username},\n\n"
+            f"Your password has been reset.\n"
+            f"Temporary Password: {temp_password}\n\n"
+            f"Please log in and change it immediately."
+        )
+
+        send_mail(
+            subject,
+            message,
+            settings.DEFAULT_FROM_EMAIL,
+            [user.email],
+            fail_silently=False,
+        )
+
+        # ✅ Track email sent
+        user.mark_email_sent()
+
+        return Response(
+            {
+                "detail": "Temporary password sent via email.",
+                "email_last_sent_at": user.email_last_sent_at
+            },
+            status=status.HTTP_200_OK
+        )
 
 class CustomUserViewSet(viewsets.ModelViewSet):
     queryset = CustomUser.objects.all()
