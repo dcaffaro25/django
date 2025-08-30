@@ -110,7 +110,7 @@ class FlexibleRelatedField(serializers.PrimaryKeyRelatedField):
 
 class UserLoginSerializer(serializers.Serializer):
     username = serializers.CharField()
-    password = serializers.CharField
+    password = serializers.CharField(write_only=True)
     
     def check_user(self, clean_data):
         user = authenticate(username=clean_data['username'], password=clean_data['password'])
@@ -118,6 +118,7 @@ class UserLoginSerializer(serializers.Serializer):
             raise ValidationError('user not found')
             
         return user
+
 
 
 class CustomUserSerializer(serializers.ModelSerializer):

@@ -11,21 +11,31 @@ from rest_framework.authentication import SessionAuthentication
 from rest_framework.decorators import action
 from accounting.serializers import AccountSerializer, CostCenterSerializer
 from .formula_engine import validate_rule, run_rule_in_sandbox
+from rest_framework.authtoken.models import Token
 
 class LoginView(views.APIView):
     permission_classes = (permissions.AllowAny,)
-    authentication_classes = (SessionAuthentication,)
+    authentication_classes = ()#(SessionAuthentication,)
     
 
     def post(self, request, *args, **kwargs):
-        data = request.data
-        print(data)
-        serializer = UserLoginSerializer(data=data)
+        serializer = UserLoginSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
         
-        if serializer.is_valid(raise_exception=True):
-            user = serializer.check_user(data)
-            login(request, user)
-            return Response({'detail': 'Login successful'})
+        user = serializer.check_user(serializer.validated_data)
+        
+        token, _ = Token.objects.get_or_create(user=user)
+        login(request, user)
+        
+        return Response({
+            "detail": "Login successful",
+            "token": token.key,
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+            }
+        }, status=status.HTTP_200_OK)
 
         
         '''
