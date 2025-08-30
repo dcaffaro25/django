@@ -14,6 +14,7 @@ from .formula_engine import validate_rule, run_rule_in_sandbox
 from rest_framework.authtoken.models import Token
 from django.core.mail import send_mail
 from django.conf import settings
+from .tasks import send_user_invite_email
 
 class LoginView(views.APIView):
     permission_classes = (permissions.AllowAny,)
@@ -62,12 +63,10 @@ class LogoutView(views.APIView):
 class UserCreateView(generics.CreateAPIView):
     queryset = CustomUser.objects.all()
     serializer_class = UserCreateSerializer
-    permission_classes = [permissions.IsAdminUser]  # only admins can invite
+    permission_classes = [permissions.IsAdminUser]
 
     def perform_create(self, serializer):
         user = serializer.save()
-
-        # send email with temporary password
         subject = "Your account has been created"
         message = (
             f"Hello {user.first_name or user.username},\n\n"
@@ -76,14 +75,8 @@ class UserCreateView(generics.CreateAPIView):
             f"Temporary Password: {user._temp_password}\n\n"
             f"Please log in and change your password immediately."
         )
-
-        send_mail(
-            subject,
-            message,
-            settings.DEFAULT_FROM_EMAIL,
-            [user.email],
-            fail_silently=False,
-        )
+        # enqueue email task
+        send_user_invite_email.delay(subject, message, user.email)
 
 class ChangePasswordView(generics.UpdateAPIView):
     serializer_class = ChangePasswordSerializer
