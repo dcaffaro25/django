@@ -2,7 +2,7 @@
 
 from django.urls import path, include, re_path
 from rest_framework.routers import DefaultRouter
-from .views import CustomUserViewSet, CompanyViewSet, EntityViewSet, EntityTreeView, LoginView, LogoutView, IntegrationRuleViewSet, ChangePasswordView, UserCreateView, PasswordResetForceView
+from .views import CustomUserViewSet, CompanyViewSet, EntityViewSet, EntityTreeView, LoginView, LogoutView, IntegrationRuleViewSet, ChangePasswordView, UserCreateView, PasswordResetForceView, AdminForcePasswordView
 from accounting.views import CurrencyViewSet
 from .api_utils import BulkImportPreview, BulkImportExecute
 from .views import ValidateRuleView, ExecuteRuleView#, TriggerListView
@@ -24,6 +24,8 @@ urlpatterns = [
     path("change-password/", ChangePasswordView.as_view(), name="change-password"),
     path("reset-password/", PasswordResetForceView.as_view(), name="reset-password"),
     path("users/create/", UserCreateView.as_view(), name="user-create"),
+    path("admin-reset-password", AdminForcePasswordView.as_view(), name="admin-reset-password"),
+    
 
     # Make the prefix itself optional-slash:
     re_path(r'^api/core/?', include(router.urls)),

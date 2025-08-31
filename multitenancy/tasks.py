@@ -18,3 +18,14 @@ def send_user_invite_email(self, subject, message, to_email):
         [to_email],
         fail_silently=False,
     )
+
+
+@shared_task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
+def send_user_email(self, subject, message, to_email):
+    send_mail(
+        subject,
+        message,
+        settings.DEFAULT_FROM_EMAIL,
+        [to_email],
+        fail_silently=False,
+    )

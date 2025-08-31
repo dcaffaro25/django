@@ -9,6 +9,7 @@ from django.core.exceptions import ObjectDoesNotExist
 #from accounting.serializers import AccountSerializer, CostCenterSerializer
 import secrets
 import string
+from django.conf import settings
 
 class FlexibleRelatedField(serializers.PrimaryKeyRelatedField):
     """
@@ -117,7 +118,7 @@ class UserCreateSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         # generate a secure random temporary password
         alphabet = string.ascii_letters + string.digits
-        temp_password = ''.join(secrets.choice(alphabet) for _ in range(10))
+        temp_password = settings.TEMP_PASSWORD
 
         user = CustomUser.objects.create_user(
             username=validated_data["username"],

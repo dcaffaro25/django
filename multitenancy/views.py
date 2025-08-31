@@ -14,7 +14,7 @@ from .formula_engine import validate_rule, run_rule_in_sandbox
 from rest_framework.authtoken.models import Token
 from django.core.mail import send_mail
 from django.conf import settings
-from .tasks import send_user_invite_email
+from .tasks import send_user_invite_email, send_user_email
 from django.utils import timezone
 from datetime import timedelta
 
@@ -78,7 +78,7 @@ class UserCreateView(generics.CreateAPIView):
             f"Please log in and change your password immediately."
         )
         # enqueue email task
-        send_user_invite_email.delay(subject, message, user.email)
+        #send_user_invite_email.delay(subject, message, user.email)
 
 class ChangePasswordView(generics.UpdateAPIView):
     serializer_class = ChangePasswordSerializer
@@ -140,7 +140,7 @@ class PasswordResetForceView(generics.GenericAPIView):
             f"Please log in and change it immediately."
         )
 
-        send_mail(
+        send_user_email.delay(
             subject,
             message,
             settings.DEFAULT_FROM_EMAIL,
@@ -155,6 +155,45 @@ class PasswordResetForceView(generics.GenericAPIView):
             {
                 "detail": "Temporary password sent via email.",
                 "email_last_sent_at": user.email_last_sent_at
+            },
+            status=status.HTTP_200_OK
+        )
+
+class AdminForcePasswordView(generics.GenericAPIView):
+    """
+    Admin endpoint to reset a user's password.
+    - If admin provides a 'new_password', use it.
+    - Otherwise, use the standard fallback "ChangeMe123".
+    - User is forced to change password on next login.
+    """
+    permission_classes = [permissions.IsAdminUser]
+
+    def post(self, request, *args, **kwargs):
+        username_or_email = request.data.get("username") or request.data.get("email")
+        new_password = request.data.get("new_password", None)
+
+        if not username_or_email:
+            return Response({"detail": "username or email is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            if "@" in username_or_email:
+                user = CustomUser.objects.get(email=username_or_email)
+            else:
+                user = CustomUser.objects.get(username=username_or_email)
+        except CustomUser.DoesNotExist:
+            return Response({"detail": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Use admin-provided password, otherwise fallback
+        temp_password = new_password if new_password else "ChangeMe123"
+        user.set_password(temp_password)
+        user.must_change_password = True
+        user.save(update_fields=["password", "must_change_password"])
+
+        return Response(
+            {
+                "detail": f"Password for {user.username} has been reset.",
+                "temporary_password": temp_password,
+                "must_change_password": user.must_change_password,
             },
             status=status.HTTP_200_OK
         )
