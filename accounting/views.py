@@ -1815,7 +1815,15 @@ class ReconciliationTaskViewSet(viewsets.ModelViewSet):
     
         if hours_ago:
             try:
-                cutoff = timezone.now() - timedelta(hours=int(hours_ago))
+                raw = str(hours_ago).lower()
+                if raw.endswith("d"):
+                    hours = int(raw[:-1]) * 24
+                elif raw.endswith("h"):
+                    hours = int(raw[:-1])
+                else:
+                    hours = int(raw)  # fallback if pure number
+        
+                cutoff = timezone.now() - timedelta(hours=hours)
                 qs = qs.filter(created_at__gte=cutoff)
             except ValueError:
                 pass

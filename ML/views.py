@@ -1,3 +1,4 @@
+from rest_framework.views import APIView
 import io
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
@@ -5,6 +6,9 @@ from rest_framework.response import Response
 
 from .models import MLModel
 from .serializers import MLModelSerializer
+
+from .tasks import train_model_task
+from celery.result import AsyncResult
 
 from .utils.train import (
     train_categorization_model,
@@ -46,28 +50,22 @@ class MLModelViewSet(viewsets.ModelViewSet):
         except Exception:
             return Response({"error": "records_per_account must be an integer"}, status=status.HTTP_400_BAD_REQUEST)
 
-        try:
-            if model_name == "categorization":
-                ml_record = train_categorization_model(
-                    company_id=company_id,
-                    records_per_account=records_per_account,
-                    training_fields=training_fields,
-                    prediction_fields=prediction_fields,
-                )
-            elif model_name == "journal":
-                ml_record = train_journal_model(
-                    company_id=company_id,
-                    records_per_account=records_per_account,
-                    training_fields=training_fields,
-                    prediction_fields=prediction_fields,
-                )
-            else:
-                return Response({"error": "Unsupported model_name"}, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as exc:
-            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        # ✅ Enqueue async training
+        task = train_model_task.delay(
+            company_id=company_id,
+            model_name=model_name,
+            training_fields=training_fields,
+            prediction_fields=prediction_fields,
+            records_per_account=records_per_account,
+        )
 
-        serializer = self.get_serializer(ml_record)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(
+            {
+                "detail": f"Training task queued for {model_name}",
+                "task_id": task.id,
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
 
     @action(detail=True, methods=["post"])
     def predict(self, request, pk=None):
@@ -101,3 +99,12 @@ class MLModelViewSet(viewsets.ModelViewSet):
                 return Response({"error": f"Prediction not implemented for model {ml_model.name}"}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+class TaskStatusView(APIView):
+    def get(self, request, task_id):
+        result = AsyncResult(task_id)
+        return Response({
+            "task_id": task_id,
+            "status": result.status,
+            "result": result.result if result.ready() else None,
+        })
