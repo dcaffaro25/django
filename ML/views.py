@@ -25,7 +25,7 @@ class MLModelViewSet(viewsets.ModelViewSet):
     serializer_class = MLModelSerializer
 
     @action(detail=False, methods=["post"])
-    def train(self, request):
+    def train(self, request, tenant_id=None):
         """
         Trigger training of a model. Required keys:
           - company_id: int
@@ -68,7 +68,7 @@ class MLModelViewSet(viewsets.ModelViewSet):
         )
 
     @action(detail=True, methods=["post"])
-    def predict(self, request, pk=None):
+    def predict(self, request, pk=None, tenant_id=None):
         """
         Use the specified model to make a prediction.
         The request body must include all fields listed in the model's prediction_fields.
@@ -101,7 +101,7 @@ class MLModelViewSet(viewsets.ModelViewSet):
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
 class TaskStatusView(APIView):
-    def get(self, request, task_id):
+    def get(self, request, task_id, tenant_id=None):
         result = AsyncResult(task_id)
         return Response({
             "task_id": task_id,
