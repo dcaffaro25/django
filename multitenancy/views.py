@@ -17,6 +17,8 @@ from django.conf import settings
 from .tasks import send_user_invite_email, send_user_email
 from django.utils import timezone
 from datetime import timedelta
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt
 
 class LoginView(views.APIView):
     permission_classes = (permissions.AllowAny,)
@@ -159,6 +161,7 @@ class PasswordResetForceView(generics.GenericAPIView):
             status=status.HTTP_200_OK
         )
 
+@method_decorator(csrf_exempt, name="dispatch")
 class AdminForcePasswordView(generics.GenericAPIView):
     """
     Admin endpoint to reset a user's password.
