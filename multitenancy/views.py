@@ -127,7 +127,7 @@ class PasswordResetForceView(generics.GenericAPIView):
                 )
 
         # Generate temporary password
-        temp_password = "ChangeMe123"
+        temp_password = settings.TEMP_PASSWORD
         user.set_password(temp_password)
         user.must_change_password = True
         user.save()
@@ -184,7 +184,7 @@ class AdminForcePasswordView(generics.GenericAPIView):
             return Response({"detail": "User not found"}, status=status.HTTP_404_NOT_FOUND)
 
         # Use admin-provided password, otherwise fallback
-        temp_password = new_password if new_password else "ChangeMe123"
+        temp_password = new_password if new_password else settings.TEMP_PASSWORD#"ChangeMe123"
         user.set_password(temp_password)
         user.must_change_password = True
         user.save(update_fields=["password", "must_change_password"])
