@@ -41,6 +41,9 @@ class LoginView(views.APIView):
                 "id": user.id,
                 "username": user.username,
                 "email": user.email,
+                "is_superuser": user.is_superuser,
+                "is_staff": user.is_staff,
+                "must_change_password": getattr(user, "must_change_password", False),
             }
         }, status=status.HTTP_200_OK)
 

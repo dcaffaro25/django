@@ -24,7 +24,7 @@ urlpatterns = [
     path("change-password/", ChangePasswordView.as_view(), name="change-password"),
     path("reset-password/", PasswordResetForceView.as_view(), name="reset-password"),
     path("users/create/", UserCreateView.as_view(), name="user-create"),
-    path("force-reset-password", AdminForcePasswordView.as_view(), name="force-reset-password"),
+    path("force-reset-password/", AdminForcePasswordView.as_view(), name="force-reset-password"),
     
 
     # Make the prefix itself optional-slash:
