@@ -3,7 +3,7 @@ import joblib
 import pandas as pd
 from typing import Any, Dict, List
 
-from .models import MLModel
+from ML.models import MLModel
 
 try:
     from accounting.models import Account

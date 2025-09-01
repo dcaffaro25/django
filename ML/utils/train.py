@@ -6,7 +6,7 @@ import pandas as pd
 from django.utils import timezone
 from django.db.models import Q
 
-from .models import MLModel
+from ML.models import MLModel
 from .feature_extraction import build_classification_model
 
 try:
