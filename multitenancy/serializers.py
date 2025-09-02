@@ -113,7 +113,7 @@ class FlexibleRelatedField(serializers.PrimaryKeyRelatedField):
 class UserCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = CustomUser
-        fields = ["id", "username", "email", "first_name", "last_name"]
+        fields = ["id", "username", "email", "first_name", "last_name", "must_change_password", "is_active", "is_superuser", "is_staff"]
 
     def create(self, validated_data):
         # generate a secure random temporary password
@@ -125,7 +125,11 @@ class UserCreateSerializer(serializers.ModelSerializer):
             email=validated_data["email"],
             first_name=validated_data.get("first_name", ""),
             last_name=validated_data.get("last_name", ""),
-            password=temp_password
+            password=temp_password,
+            must_change_password = True, 
+            is_active = True, 
+            is_superuser = validated_data["is_superuser"],
+            is_staff= validated_data["is_staff"],
         )
 
         # attach temp password so the view can send email
