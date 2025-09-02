@@ -3,6 +3,7 @@ from django.db import transaction
 from rest_framework import viewsets, filters, status
 from .models import Position, Employee, TimeTracking, KPI, Bonus, Payroll, RecurringAdjustment
 from multitenancy.models import Company
+from multitenancy.mixins import ScopedQuerysetMixin
 from multitenancy.formula_engine import trigger_rule_event
 
 from .serializers import (
@@ -18,18 +19,18 @@ from rest_framework.response import Response
 
 
 
-class PositionViewSet(viewsets.ModelViewSet):
+class PositionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Position.objects.all()
     serializer_class = PositionSerializer
 
-class EmployeeViewSet(viewsets.ModelViewSet):
+class EmployeeViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Employee.objects.select_related('position')
     serializer_class = EmployeeSerializer
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ['name', 'CPF', 'position__title']
     ordering_fields = ['hire_date', 'salary']
 
-class TimeTrackingViewSet(viewsets.ModelViewSet):
+class TimeTrackingViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = TimeTracking.objects.all()
     serializer_class = TimeTrackingSerializer
 
@@ -38,15 +39,15 @@ class TimeTrackingViewSet(viewsets.ModelViewSet):
         with transaction.atomic():
             serializer.save()
 
-class KPIViewSet(viewsets.ModelViewSet):
+class KPIViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = KPI.objects.all()
     serializer_class = KPISerializer
 
-class BonusViewSet(viewsets.ModelViewSet):
+class BonusViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Bonus.objects.all()
     serializer_class = BonusSerializer
 
-class PayrollViewSet(viewsets.ModelViewSet):
+class PayrollViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Payroll.objects.all()
     serializer_class = PayrollSerializer
 
@@ -207,6 +208,6 @@ class PayrollViewSet(viewsets.ModelViewSet):
                     "updated_ids": [p.id for p in updated_payrolls],
                 }, status=status.HTTP_200_OK)
 
-class RecurringAdjustmentViewSet(viewsets.ModelViewSet):
+class RecurringAdjustmentViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = RecurringAdjustment.objects.all()
     serializer_class = RecurringAdjustmentSerializer

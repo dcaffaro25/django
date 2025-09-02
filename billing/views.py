@@ -11,9 +11,10 @@ from .serializers import (
     ProductServiceCategorySerializer, ProductServiceSerializer,
     ContractSerializer, InvoiceSerializer, InvoiceLineSerializer
 )
+from multitenancy.mixins import ScopedQuerysetMixin
 from multitenancy.api_utils import generic_bulk_create, generic_bulk_update, generic_bulk_delete
 
-class BusinessPartnerCategoryViewSet(viewsets.ModelViewSet):
+class BusinessPartnerCategoryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = BusinessPartnerCategory.objects.all()
     serializer_class = BusinessPartnerCategorySerializer
 
@@ -29,7 +30,7 @@ class BusinessPartnerCategoryViewSet(viewsets.ModelViewSet):
     def bulk_delete(self, request):
         return generic_bulk_delete(self, request.data)
 
-class BusinessPartnerViewSet(viewsets.ModelViewSet):
+class BusinessPartnerViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = BusinessPartner.objects.all()
     serializer_class = BusinessPartnerSerializer
 
@@ -45,7 +46,7 @@ class BusinessPartnerViewSet(viewsets.ModelViewSet):
     def bulk_delete(self, request):
         return generic_bulk_delete(self, request.data)
 
-class ProductServiceCategoryViewSet(viewsets.ModelViewSet):
+class ProductServiceCategoryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = ProductServiceCategory.objects.all()
     serializer_class = ProductServiceCategorySerializer
 
@@ -61,7 +62,7 @@ class ProductServiceCategoryViewSet(viewsets.ModelViewSet):
     def bulk_delete(self, request):
         return generic_bulk_delete(self, request.data)
 
-class ProductServiceViewSet(viewsets.ModelViewSet):
+class ProductServiceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = ProductService.objects.all()
     serializer_class = ProductServiceSerializer
 
@@ -77,7 +78,7 @@ class ProductServiceViewSet(viewsets.ModelViewSet):
     def bulk_delete(self, request):
         return generic_bulk_delete(self, request.data)
 
-class InvoiceViewSet(viewsets.ModelViewSet):
+class InvoiceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Invoice.objects.all()
     serializer_class = InvoiceSerializer
 
@@ -93,7 +94,7 @@ class InvoiceViewSet(viewsets.ModelViewSet):
     def bulk_delete(self, request):
         return generic_bulk_delete(self, request.data)
 
-class InvoiceLineViewSet(viewsets.ModelViewSet):
+class InvoiceLineViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = InvoiceLine.objects.all()
     serializer_class = InvoiceLineSerializer
 
@@ -109,7 +110,7 @@ class InvoiceLineViewSet(viewsets.ModelViewSet):
     def bulk_delete(self, request):
         return generic_bulk_delete(self, request.data)
 
-class ContractViewSet(viewsets.ModelViewSet):
+class ContractViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Contract.objects.all()
     serializer_class = ContractSerializer
     

@@ -230,22 +230,7 @@ class Entity(TenantAwareBaseModel, MPTTModel):
     class MPTTMeta:
         order_insertion_by = ['name']   
         
-class TenantQuerysetMixin:
-    """
-    A mixin to enforce tenant-based filtering on querysets.
-    """
 
-    def get_queryset(self):
-        # Ensure 'tenant' is set on the request
-        print('TenantQuerysetMixin:', self.request)
-        if hasattr(self.request, 'tenant'):
-            queryset = super().get_queryset()
-            # Filter by company if the model has a `company` field
-            if hasattr(queryset.model, 'company'):
-                return queryset.filter(company=self.request.tenant)
-            return queryset
-        else:
-            return super().get_queryset().none()
 
 class IntegrationRule(TenantAwareBaseModel):
     MODULE_CHOICES = [

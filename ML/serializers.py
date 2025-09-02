@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import MLModel
+from .models import MLModel, MLTrainingTask
 
 class MLModelSerializer(serializers.ModelSerializer):
     class Meta:
@@ -18,3 +18,8 @@ class MLModelSerializer(serializers.ModelSerializer):
             "active",
         ]
         read_only_fields = ["id", "version", "trained_at"]
+
+class MLTrainingTaskSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MLTrainingTask
+        fields = "__all__"

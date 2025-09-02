@@ -3,7 +3,8 @@ from rest_framework.views import APIView
 from django.contrib.auth import authenticate, login, logout
 from rest_framework import views, viewsets, generics, status, serializers
 from rest_framework.response import Response
-from .models import CustomUser, Company, Entity, IntegrationRule, TenantQuerysetMixin
+from .models import CustomUser, Company, Entity, IntegrationRule
+from .mixins import ScopedQuerysetMixin
 from .serializers import CustomUserSerializer, CompanySerializer, EntitySerializer, UserLoginSerializer, IntegrationRuleSerializer, EntityMiniSerializer, ChangePasswordSerializer, UserCreateSerializer, PasswordResetForceSerializer
 from .api_utils import create_csv_response, create_excel_response
 from rest_framework import permissions
@@ -236,15 +237,15 @@ class CompanyViewSet(viewsets.ModelViewSet):
         #    return Company.objects.none()  # Or handle as appropriate
         return Company.objects.all()
 
-class IntegrationRuleViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
+class IntegrationRuleViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = IntegrationRule.objects.all()
     serializer_class = IntegrationRuleSerializer
 
-class EntityMiniViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
+class EntityMiniViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Entity.objects.all()
     serializer_class = EntityMiniSerializer
 
-class EntityViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
+class EntityViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Entity.objects.all()
     serializer_class = EntitySerializer
 

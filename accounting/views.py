@@ -10,7 +10,8 @@ from django.utils import timezone
 from datetime import timedelta
 from itertools import product, combinations
 from multitenancy.api_utils import generic_bulk_create, generic_bulk_update, generic_bulk_delete
-from multitenancy.models import CustomUser, Company, Entity, TenantQuerysetMixin
+from multitenancy.models import CustomUser, Company, Entity
+from multitenancy.mixins import ScopedQuerysetMixin
 from .models import (Currency, Account, Transaction, JournalEntry, Rule, CostCenter, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter,ReconciliationTask, ReconciliationConfig)
 from .serializers import (CurrencySerializer, AccountSerializer, TransactionSerializer, CostCenterSerializer, JournalEntrySerializer, RuleSerializer, BankSerializer, BankAccountSerializer, BankTransactionSerializer, ReconciliationSerializer, TransactionListSerializer,ReconciliationTaskSerializer,ReconciliationConfigSerializer)
 from .services.transaction_service import *
@@ -50,7 +51,7 @@ class CurrencyViewSet(viewsets.ModelViewSet):
         return generic_bulk_delete(self, ids)
 
 # Account ViewSet
-class CostCenterViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
+class CostCenterViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = CostCenter.objects.all()
     serializer_class = CostCenterSerializer
     
@@ -68,7 +69,7 @@ class CostCenterViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
         return generic_bulk_delete(self, ids)
 
 # Account ViewSet
-class AccountViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
+class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Account.objects.all()
     serializer_class = AccountSerializer
     
@@ -104,7 +105,7 @@ class AccountSummaryView(APIView):
         return Response(data)
 
 # Account ViewSet
-class ReconciliationViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
+class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Reconciliation.objects.all()
     serializer_class = ReconciliationSerializer
     
@@ -133,7 +134,7 @@ class ReconciliationViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
         return generic_bulk_delete(self, ids)
 
 # Transaction ViewSet
-class TransactionViewSet(viewsets.ModelViewSet):
+class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     #queryset = Transaction.objects.select_related('company').prefetch_related('journal_entries')
     queryset = (
         Transaction.objects
@@ -464,7 +465,7 @@ class TransactionViewSet(viewsets.ModelViewSet):
         response['Content-Disposition'] = 'attachment; filename=bulk_import_template.xlsx'
         return response
 
-class JournalEntryViewSet(viewsets.ModelViewSet):
+class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     #queryset = JournalEntry.objects.all()
     queryset = (
         JournalEntry.objects
@@ -516,7 +517,7 @@ class JournalEntryViewSet(viewsets.ModelViewSet):
 
     
 # Rule ViewSet
-class RuleViewSet(viewsets.ModelViewSet):
+class RuleViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Rule.objects.all()
     serializer_class = RuleSerializer
     
@@ -554,7 +555,7 @@ class BankViewSet(viewsets.ModelViewSet):
 
 
 # BankAccount ViewSet
-class BankAccountViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
+class BankAccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = BankAccount.objects.all()
     serializer_class = BankAccountSerializer
     
@@ -572,7 +573,7 @@ class BankAccountViewSet(TenantQuerysetMixin, viewsets.ModelViewSet):
         return generic_bulk_delete(self, ids)
     
 # BankTransaction ViewSet
-class BankTransactionViewSet(viewsets.ModelViewSet):
+class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = BankTransaction.objects.all()
     serializer_class = BankTransactionSerializer
     
@@ -1719,7 +1720,7 @@ class UnreconciledDashboardView(APIView):
             return Response({"error": str(e)}, status=500)
     
     
-class ReconciliationTaskViewSet(viewsets.ModelViewSet):
+class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = ReconciliationTask.objects.all().order_by("-created_at")
     serializer_class = ReconciliationTaskSerializer
 
@@ -1845,7 +1846,7 @@ class ReconciliationTaskViewSet(viewsets.ModelViewSet):
             "failed": status_map.get("failed", 0),
         })
 
-class ReconciliationConfigViewSet(viewsets.ModelViewSet):
+class ReconciliationConfigViewSet2(viewsets.ModelViewSet):
     queryset = ReconciliationConfig.objects.all()
     serializer_class = ReconciliationConfigSerializer
 

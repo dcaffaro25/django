@@ -3,9 +3,9 @@ import io
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-
-from .models import MLModel
-from .serializers import MLModelSerializer
+from datetime import timedelta
+from .models import MLModel, MLTrainingTask
+from .serializers import MLModelSerializer, MLTrainingTaskSerializer
 
 from .tasks import train_model_task
 from celery.result import AsyncResult
@@ -16,23 +16,18 @@ from .utils.train import (
 )
 from .utils.predict import predict_top_accounts_with_names
 from .utils.journal import suggest_journal_entries
+from django.utils import timezone
+from django.db.models import Count
+from nord_backend.celery import app
 
 class MLModelViewSet(viewsets.ModelViewSet):
-    """
-    CRUD and actions for stored ML models.
-    """
     queryset = MLModel.objects.all().order_by("-trained_at")
     serializer_class = MLModelSerializer
 
     @action(detail=False, methods=["post"])
     def train(self, request, tenant_id=None):
         """
-        Trigger training of a model. Required keys:
-          - company_id: int
-          - model_name: "categorization" or "journal"
-          - training_fields: list of strings
-          - prediction_fields: list of strings
-          - records_per_account: int
+        Enqueue training as a background task & persist job record.
         """
         company_id = request.data.get("company_id")
         model_name = request.data.get("model_name")
@@ -45,66 +40,83 @@ class MLModelViewSet(viewsets.ModelViewSet):
                 {"error": "company_id, model_name, training_fields, prediction_fields, and records_per_account are required"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
         try:
             records_per_account = int(records_per_account)
         except Exception:
             return Response({"error": "records_per_account must be an integer"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # ✅ Enqueue async training
-        task = train_model_task.delay(
+        # 1. Pre-create DB record with placeholder task_id
+        task_obj = MLTrainingTask.objects.create(
+            task_id="queued",
+            tenant_id=tenant_id,
             company_id=company_id,
             model_name=model_name,
-            training_fields=training_fields,
-            prediction_fields=prediction_fields,
-            records_per_account=records_per_account,
+            parameters=request.data,
+            status="queued"
         )
 
-        return Response(
-            {
-                "detail": f"Training task queued for {model_name}",
-                "task_id": task.id,
-            },
-            status=status.HTTP_202_ACCEPTED,
-        )
+        # 2. Trigger Celery, pass the db_id
+        async_result = train_model_task.delay(task_obj.id, company_id, model_name, training_fields, prediction_fields, records_per_account)
 
-    @action(detail=True, methods=["post"])
-    def predict(self, request, pk=None, tenant_id=None):
-        """
-        Use the specified model to make a prediction.
-        The request body must include all fields listed in the model's prediction_fields.
-        """
-        ml_model = self.get_object()
+        # 3. Update task_id
+        task_obj.task_id = async_result.id
+        task_obj.save(update_fields=["task_id"])
 
-        payload = {}
-        missing = []
-        for field in (ml_model.prediction_fields or []):
-            if field in request.data:
-                payload[field] = request.data[field]
-            else:
-                missing.append(field)
-        if missing:
-            return Response(
-                {"error": f"Missing required prediction fields: {missing}"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        return Response({
+            "message": f"Training queued for {model_name}",
+            "task_id": async_result.id,
+            "db_id": task_obj.id,
+        }, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=False, methods=["get"])
+    def queued(self, request, tenant_id=None):
+        """
+        List persisted training tasks + live Celery state.
+        """
+        tenant_filter = request.query_params.get("tenant_id")
+        status_filter = request.query_params.get("status")
+
+        qs = MLTrainingTask.objects.all()
+        if tenant_filter:
+            qs = qs.filter(tenant_id=tenant_filter)
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+
+        db_tasks = MLTrainingTaskSerializer(qs, many=True).data
 
         try:
-            if ml_model.name == "categorization":
-                result = predict_top_accounts_with_names(payload, ml_model, top_n=3)
-                return Response({"predictions": result})
-            elif ml_model.name == "journal":
-                result = suggest_journal_entries(payload, ml_model, top_k=2)
-                return Response({"suggestions": result})
-            else:
-                return Response({"error": f"Prediction not implemented for model {ml_model.name}"}, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as exc:
-            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+            i = app.control.inspect()
+            live_info = {
+                "active": i.active() or {},
+                "reserved": i.reserved() or {},
+                "scheduled": i.scheduled() or {}
+            }
+        except Exception as e:
+            live_info = {"error": str(e)}
 
-class TaskStatusView(APIView):
-    def get(self, request, task_id, tenant_id=None):
-        result = AsyncResult(task_id)
-        return Response({
-            "task_id": task_id,
-            "status": result.status,
-            "result": result.result if result.ready() else None,
-        })
+        return Response({"db_tasks": db_tasks, "celery_live": live_info})
+
+    @action(detail=False, methods=["get"])
+    def task_counts(self, request, tenant_id=None):
+        """
+        Counts by status, with filters.
+        """
+        tenant_filter = request.query_params.get("tenant_id")
+        hours_ago = request.query_params.get("hours_ago")
+
+        qs = MLTrainingTask.objects.all()
+
+        if tenant_filter:
+            qs = qs.filter(tenant_id=tenant_filter)
+        if hours_ago:
+            try:
+                raw = str(hours_ago).lower()
+                hours = int(raw[:-1]) * 24 if raw.endswith("d") else int(raw[:-1]) if raw.endswith("h") else int(raw)
+                cutoff = timezone.now() - timedelta(hours=hours)
+                qs = qs.filter(created_at__gte=cutoff)
+            except ValueError:
+                pass
+
+        counts = qs.values("status").annotate(total=Count("id"))
+        return Response({row["status"]: row["total"] for row in counts})
