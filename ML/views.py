@@ -69,6 +69,55 @@ class MLModelViewSet(viewsets.ModelViewSet):
             "db_id": task_obj.id,
         }, status=status.HTTP_202_ACCEPTED)
 
+    @action(detail=False, methods=["post"])
+    def predict(self, request, tenant_id=None):
+        """
+        Prediz a(s) conta(s) mais provável(is) para uma ou mais transações.
+        Pode receber um único dict em 'transaction' ou uma lista em 'transactions'.
+        Usa top_n para limitar o número de sugestões.
+        """
+        data = request.data
+        model_id = data.get("model_id")
+        company_id = data.get("company_id")
+        transactions = data.get("transactions") or data.get("transaction")
+        top_n = data.get("top_n", 3)
+
+        try:
+            top_n = int(top_n)
+        except Exception:
+            return Response({"error": "top_n must be an integer"}, status=status.HTTP_400_BAD_REQUEST)
+        if not transactions:
+            return Response({"error": "No transaction data provided"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Seleção do modelo: via model_id ou último ativo da empresa
+        if model_id:
+            try:
+                ml_model = MLModel.objects.get(id=model_id)
+            except MLModel.DoesNotExist:
+                return Response({"error": "Specified model_id does not exist"}, status=status.HTTP_404_NOT_FOUND)
+        else:
+            if not company_id:
+                return Response({"error": "company_id is required when model_id is not provided"},
+                                status=status.HTTP_400_BAD_REQUEST)
+            ml_model = (
+                MLModel.objects.filter(company_id=company_id, name="categorization", active=True)
+                .order_by("-version")
+                .first()
+            )
+            if not ml_model:
+                return Response({"error": "No active categorisation model found for this company"},
+                                status=status.HTTP_404_NOT_FOUND)
+
+        # Normaliza para lista
+        is_single = not isinstance(transactions, list)
+        tx_list = transactions if isinstance(transactions, list) else [transactions]
+
+        results = []
+        for tx in tx_list:
+            preds = predict_top_accounts_with_names(tx, ml_model, top_n=top_n)
+            results.append(preds)
+        return Response({"predictions": results if not is_single else results[0]})
+    
     @action(detail=False, methods=["get"])
     def queued(self, request, tenant_id=None):
         """

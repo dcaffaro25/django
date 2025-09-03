@@ -9,24 +9,37 @@ logger = logging.getLogger(__name__)
 
 
 @shared_task(bind=True)
-def train_model_task(self, task_id, company_id, model_name, training_fields, prediction_fields, records_per_account):
+def train_model_task(self, task_id, company_id, model_name,
+                     training_fields, prediction_fields, records_per_account):
+    """
+    Tarefa Celery para treinar um modelo ML e atualizar o status.
+    """
     task_obj = MLTrainingTask.objects.get(id=task_id)
     try:
         task_obj.status = "running"
         task_obj.save(update_fields=["status"])
 
         if model_name == "categorization":
-            ml_record = train_categorization_model(company_id, records_per_account, training_fields, prediction_fields)
+            ml_record = train_categorization_model(
+                company_id, records_per_account,
+                training_fields, prediction_fields
+            )
         elif model_name == "journal":
-            ml_record = train_journal_model(company_id, records_per_account, training_fields, prediction_fields)
+            ml_record = train_journal_model(
+                company_id, records_per_account,
+                training_fields, prediction_fields
+            )
         else:
             raise ValueError("Unsupported model_name")
 
+        # Marca conclusão e retorna métricas no result, se existirem
         task_obj.status = "completed"
-        task_obj.result = {"ml_model_id": ml_record.id}
+        result_data = {"ml_model_id": ml_record.id}
+        if ml_record.training_metrics:
+            result_data["training_metrics"] = ml_record.training_metrics
+        task_obj.result = result_data
         task_obj.save(update_fields=["status", "result"])
-
-        return {"ml_model_id": ml_record.id}
+        return result_data
 
     except Exception as e:
         task_obj.status = "failed"

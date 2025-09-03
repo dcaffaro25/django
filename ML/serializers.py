@@ -16,6 +16,7 @@ class MLModelSerializer(serializers.ModelSerializer):
             "prediction_fields",
             "records_per_account",
             "active",
+            "training_metrics",
         ]
         read_only_fields = ["id", "version", "trained_at"]
 

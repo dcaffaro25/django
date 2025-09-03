@@ -62,9 +62,25 @@ def _collect_training_samples(
             tx = entry.transaction
             if not tx:
                 continue
-            row = {}
+            row: Dict[str, Any] = {}
+
+            # Constrói texto combinado: descrição da transação + atributos da conta
+            if "description" in training_fields:
+                parts = [
+                    getattr(tx, "description", "") or "",
+                    getattr(entry.account, "description", "") or "",
+                    getattr(entry.account, "key_words", "") or "",
+                    getattr(entry.account, "examples", "") or "",
+                ]
+                combined = " ".join([p for p in parts if p])
+                row["description"] = combined
+
+            # Copia outros campos numéricos
             for field in training_fields:
+                if field == "description":
+                    continue
                 row[field] = getattr(tx, field) if hasattr(tx, field) else None
+
             row["label"] = account_id
             samples.append(row)
 
@@ -97,10 +113,27 @@ def train_categorization_model(
     X = df[training_fields]
     y = df["label"]
 
-    model = build_classification_model()
-    model.fit(X, y)
+    # Divisão treino/validação para calcular métricas (usa estratificação se possível)
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import accuracy_score, confusion_matrix
 
-    # Versioning: increment version
+    stratify = y if len(set(y)) > 1 else None
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=stratify
+    )
+
+    model = build_classification_model()
+    model.fit(X_train, y_train)
+
+    # Cálculo de métricas na validação
+    accuracy = None
+    conf = None
+    if len(X_val) > 0:
+        y_pred = model.predict(X_val)
+        accuracy = float(accuracy_score(y_val, y_pred))
+        conf = confusion_matrix(y_val, y_pred, labels=model.classes_).tolist()
+
+    # Versionamento: incrementa versão por companhia/nome de modelo
     last = (
         MLModel.objects.filter(company_id=company_id, name="categorization")
         .order_by("-version")
@@ -122,6 +155,7 @@ def train_categorization_model(
         training_fields=training_fields,
         prediction_fields=prediction_fields,
         records_per_account=records_per_account,
+        training_metrics={"accuracy": accuracy, "confusion_matrix": conf} if accuracy is not None else None,
     )
     return ml_record
 

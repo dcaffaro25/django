@@ -36,7 +36,6 @@ def predict_top_accounts_with_names(
 
     model = joblib.load(io.BytesIO(ml_model.model_blob))
 
-    # Use prediction fields from metadata
     fields = ml_model.prediction_fields or ["description", "amount"]
     row = _transaction_to_dict(transaction, fields)
     df = pd.DataFrame([row])
@@ -68,7 +67,7 @@ def predict_top_accounts_with_names(
             )
         return predictions
     else:
-        # fallback if model does not support predict_proba
+        # fallback se o modelo não suportar predict_proba
         account_id = int(model.predict(df)[0])
         account_code = None
         account_name = None

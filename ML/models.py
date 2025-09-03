@@ -26,7 +26,9 @@ class MLModel(models.Model):
         help_text="Number of recent records used per account when training"
     )
     active = models.BooleanField(default=True)
-
+    
+    training_metrics = models.JSONField(blank=True, null=True)
+    
     class Meta:
         unique_together = ("company", "name", "version")
         ordering = ["-trained_at"]
@@ -40,8 +42,11 @@ class MLTrainingTask(models.Model):
     Track async ML training jobs.
     """
     task_id = models.CharField(max_length=255, unique=True)
-    tenant_id = models.CharField(max_length=100, null=True, blank=True)
-    company_id = models.IntegerField()
+    company = models.ForeignKey(
+        "multitenancy.Company",
+        on_delete=models.CASCADE,
+        related_name="ml_training_tasks"
+    )
     model_name = models.CharField(max_length=50)
     parameters = models.JSONField()
     status = models.CharField(max_length=20, default="queued")  # queued, running, completed, failed
@@ -53,4 +58,4 @@ class MLTrainingTask(models.Model):
         ordering = ["-created_at"]
 
     def __str__(self):
-        return f"{self.model_name} [{self.status}]"
+        return f"[{self.company}] {self.model_name} [{self.status}]"
