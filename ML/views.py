@@ -29,7 +29,7 @@ class MLModelViewSet(viewsets.ModelViewSet):
         """
         Enqueue training as a background task & persist job record.
         """
-        company_id = request.data.get("company_id")
+        company_id = tenant_id#request.data.get("company_id")
         model_name = request.data.get("model_name")
         training_fields = request.data.get("training_fields")
         prediction_fields = request.data.get("prediction_fields")
@@ -49,7 +49,7 @@ class MLModelViewSet(viewsets.ModelViewSet):
         # 1. Pre-create DB record with placeholder task_id
         task_obj = MLTrainingTask.objects.create(
             task_id="queued",
-            tenant_id=tenant_id,
+            #tenant_id=tenant_id,
             company_id=company_id,
             model_name=model_name,
             parameters=request.data,
@@ -78,7 +78,7 @@ class MLModelViewSet(viewsets.ModelViewSet):
         """
         data = request.data
         model_id = data.get("model_id")
-        company_id = data.get("company_id")
+        company_id = tenant_id#data.get("company_id")
         transactions = data.get("transactions") or data.get("transaction")
         top_n = data.get("top_n", 3)
 
@@ -123,12 +123,12 @@ class MLModelViewSet(viewsets.ModelViewSet):
         """
         List persisted training tasks + live Celery state.
         """
-        tenant_filter = request.query_params.get("tenant_id")
+        tenant_filter = tenant_id#request.query_params.get("tenant_id")
         status_filter = request.query_params.get("status")
 
         qs = MLTrainingTask.objects.all()
         if tenant_filter:
-            qs = qs.filter(tenant_id=tenant_filter)
+            qs = qs.filter(company_id=tenant_filter)
         if status_filter:
             qs = qs.filter(status=status_filter)
 
@@ -151,13 +151,13 @@ class MLModelViewSet(viewsets.ModelViewSet):
         """
         Counts by status, with filters.
         """
-        tenant_filter = request.query_params.get("tenant_id")
+        tenant_filter = tenant_id#request.query_params.get("tenant_id")
         hours_ago = request.query_params.get("hours_ago")
 
         qs = MLTrainingTask.objects.all()
 
         if tenant_filter:
-            qs = qs.filter(tenant_id=tenant_filter)
+            qs = qs.filter(company_id=tenant_filter)
         if hours_ago:
             try:
                 raw = str(hours_ago).lower()
