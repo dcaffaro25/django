@@ -91,7 +91,7 @@ def train_categorization_model(
     records_per_account: int = 100,
     training_fields: Optional[List[str]] = None,
     prediction_fields: Optional[List[str]] = None,
-    include_pending: bool = False,
+    include_pending: bool = True,
 ) -> MLModel:
     """
     Train a categorisation model and store it in MLModel.
