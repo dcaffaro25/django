@@ -11,13 +11,7 @@ except Exception:
     Account = None  # type: ignore
 
 def _transaction_to_dict(tx: Any, fields: List[str]) -> Dict[str, Any]:
-    row = {}
-    for f in fields:
-        if isinstance(tx, dict):
-            row[f] = tx.get(f)
-        else:
-            row[f] = getattr(tx, f, None)
-    return row
+    return {f: tx.get(f) if isinstance(tx, dict) else getattr(tx, f, None) for f in fields}
 
 def suggest_journal_entries(
     transaction: Any,
@@ -31,46 +25,64 @@ def suggest_journal_entries(
     if ml_model.name != "journal":
         raise ValueError("This model is not a journal model.")
 
+
+    # Deserializa (modelo multi-label + MultiLabelBinarizer)
     model, mlb = joblib.load(io.BytesIO(ml_model.model_blob))
 
     fields = ml_model.prediction_fields or ["description", "amount"]
     row = _transaction_to_dict(transaction, fields)
     X_df = pd.DataFrame([row])
 
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(X_df)[0]
-    else:
-        proba = model.predict(X_df)[0]
-        proba = proba.astype(float)
-
+    # Probabilidade de cada classe ("debit:123" ou "credit:456")
+    proba = model.predict_proba(X_df)[0] if hasattr(model, "predict_proba") else model.predict(X_df)[0].astype(float)
     labels = mlb.classes_
-    sorted_indices = proba.argsort()[::-1][:top_k]
-    suggestions: List[Dict[str, Any]] = []
-    for idx in sorted_indices:
-        label = labels[idx]
-        prob = float(proba[idx])
+
+    # Separa e ordena rótulos por tipo (débito/crédito)
+    debit_candidates: List[Tuple[str, float]] = []
+    credit_candidates: List[Tuple[str, float]] = []
+    for label, p in zip(labels, proba):
         if ":" in label:
-            entry_type, account_id_str = label.split(":", 1)
-            account_id = int(account_id_str)
-        else:
-            entry_type = "unknown"
-            account_id = None
-        account_code = None
-        account_name = None
-        if Account is not None and account_id is not None:
-            try:
-                account = Account.objects.get(id=account_id)
-                account_code = account.account_code
-                account_name = account.name
-            except Account.DoesNotExist:
-                pass
-        suggestions.append(
-            {
-                "type": entry_type,
-                "account_id": account_id,
-                "account_code": account_code,
-                "account_name": account_name,
-                "probability": prob,
-            }
-        )
+            entry_type, acc_id = label.split(":", 1)
+            if entry_type == "debit":
+                debit_candidates.append((acc_id, p))
+            elif entry_type == "credit":
+                credit_candidates.append((acc_id, p))
+    debit_candidates.sort(key=lambda x: x[1], reverse=True)
+    credit_candidates.sort(key=lambda x: x[1], reverse=True)
+
+    suggestions: List[List[Dict[str, Any]]] = []
+    # Gera até top_k sugestões combinando i-ésimo débito com i-ésimo crédito
+    for i in range(top_k):
+        if i >= len(debit_candidates) and i >= len(credit_candidates):
+            break
+        suggestion: List[Dict[str, Any]] = []
+        # Adiciona débito i, se existir
+        if i < len(debit_candidates):
+            acc_id, p = debit_candidates[i]
+            suggestion.append(_build_entry_dict(acc_id, p, "debit"))
+        # Adiciona crédito i, se existir
+        if i < len(credit_candidates):
+            acc_id, p = credit_candidates[i]
+            suggestion.append(_build_entry_dict(acc_id, p, "credit"))
+        suggestions.append(suggestion)
+
     return suggestions
+
+def _build_entry_dict(account_id: str, prob: float, entry_type: str) -> Dict[str, Any]:
+    acc_id_int = int(account_id)
+    account_code = None
+    account_name = None
+    if Account is not None:
+        try:
+            acc = Account.objects.get(id=acc_id_int)
+            account_code = acc.account_code
+            account_name = acc.name
+        except Account.DoesNotExist:
+            pass
+    return {
+        "type": entry_type,
+        "account_id": acc_id_int,
+        "account_code": account_code,
+        "account_name": account_name,
+        "probability": float(prob),
+    }

@@ -129,7 +129,7 @@ class MLModelViewSet(viewsets.ModelViewSet):
             if ml_model.name == "categorization":
                 preds = predict_top_accounts_with_names(tx, ml_model, top_n=top_n)
             elif ml_model.name == "journal":
-                preds = suggest_journal_entries(tx, ml_model, top_n=top_n)
+                preds = suggest_journal_entries(tx, ml_model, top_k=top_n)
             else:
                 return Response({"error": f"Unsupported model type: {ml_model.name}"}, status=status.HTTP_400_BAD_REQUEST)
             results.append(preds)
