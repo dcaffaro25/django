@@ -5,6 +5,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from datetime import timedelta
 from .models import MLModel, MLTrainingTask
+
 from .serializers import MLModelSerializer, MLTrainingTaskSerializer
 
 from .tasks import train_model_task
@@ -19,6 +20,7 @@ from .utils.journal import suggest_journal_entries
 from django.utils import timezone
 from django.db.models import Count
 from nord_backend.celery import app
+from multitenancy.models import Company
 
 class MLModelViewSet(viewsets.ModelViewSet):
     queryset = MLModel.objects.all().order_by("-trained_at")
@@ -29,37 +31,45 @@ class MLModelViewSet(viewsets.ModelViewSet):
         """
         Enqueue training as a background task & persist job record.
         """
-        company_id = tenant_id#request.data.get("company_id")
+        company = getattr(request, "tenant", None)
+        if not isinstance(company, Company):
+            return Response({"error": "Company not found for this tenant"}, status=status.HTTP_404_NOT_FOUND)
+        
         model_name = request.data.get("model_name")
         training_fields = request.data.get("training_fields")
         prediction_fields = request.data.get("prediction_fields")
         records_per_account = request.data.get("records_per_account")
 
-        if not (company_id and model_name and training_fields and prediction_fields and records_per_account):
+        if not (model_name and training_fields and prediction_fields and records_per_account):
             return Response(
-                {"error": "company_id, model_name, training_fields, prediction_fields, and records_per_account are required"},
+                {"error": "model_name, training_fields, prediction_fields, and records_per_account are required"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         try:
             records_per_account = int(records_per_account)
-        except Exception:
+        except ValueError:
             return Response({"error": "records_per_account must be an integer"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # 1. Pre-create DB record with placeholder task_id
+        # Cria a tarefa de treinamento associada à empresa correta
         task_obj = MLTrainingTask.objects.create(
             task_id="queued",
-            #tenant_id=tenant_id,
-            company_id=company_id,
+            company=company,
             model_name=model_name,
             parameters=request.data,
-            status="queued"
+            status="queued",
         )
 
-        # 2. Trigger Celery, pass the db_id
-        async_result = train_model_task.delay(task_obj.id, company_id, model_name, training_fields, prediction_fields, records_per_account)
+        # Dispara a task Celery; passa o ID da empresa (company.id) para a função
+        async_result = train_model_task.delay(
+            task_obj.id,
+            company.id,
+            model_name,
+            training_fields,
+            prediction_fields,
+            records_per_account,
+        )
 
-        # 3. Update task_id
         task_obj.task_id = async_result.id
         task_obj.save(update_fields=["task_id"])
 
@@ -76,9 +86,13 @@ class MLModelViewSet(viewsets.ModelViewSet):
         Pode receber um único dict em 'transaction' ou uma lista em 'transactions'.
         Usa top_n para limitar o número de sugestões.
         """
+        company = getattr(request, "tenant", None)
+        if not isinstance(company, Company):
+            return Response({"error": "Company not found for this tenant"}, status=status.HTTP_404_NOT_FOUND)
+        
         data = request.data
         model_id = data.get("model_id")
-        company_id = tenant_id#data.get("company_id")
+        #company_id = tenant_id#data.get("company_id")
         transactions = data.get("transactions") or data.get("transaction")
         top_n = data.get("top_n", 3)
 
@@ -96,11 +110,9 @@ class MLModelViewSet(viewsets.ModelViewSet):
             except MLModel.DoesNotExist:
                 return Response({"error": "Specified model_id does not exist"}, status=status.HTTP_404_NOT_FOUND)
         else:
-            if not company_id:
-                return Response({"error": "company_id is required when model_id is not provided"},
-                                status=status.HTTP_400_BAD_REQUEST)
+
             ml_model = (
-                MLModel.objects.filter(company_id=company_id, name="categorization", active=True)
+                MLModel.objects.filter(company=company, name="categorization", active=True)
                 .order_by("-version")
                 .first()
             )
@@ -123,12 +135,14 @@ class MLModelViewSet(viewsets.ModelViewSet):
         """
         List persisted training tasks + live Celery state.
         """
-        tenant_filter = tenant_id#request.query_params.get("tenant_id")
+        company = getattr(request, "tenant", None)
+        
+        #tenant_filter = tenant_id#request.query_params.get("tenant_id")
         status_filter = request.query_params.get("status")
 
         qs = MLTrainingTask.objects.all()
-        if tenant_filter:
-            qs = qs.filter(company_id=tenant_filter)
+        if isinstance(company, Company):
+            qs = qs.filter(company=company)
         if status_filter:
             qs = qs.filter(status=status_filter)
 
@@ -151,13 +165,14 @@ class MLModelViewSet(viewsets.ModelViewSet):
         """
         Counts by status, with filters.
         """
-        tenant_filter = tenant_id#request.query_params.get("tenant_id")
+        company = getattr(request, "tenant", None)
+        #tenant_filter = tenant_id#request.query_params.get("tenant_id")
         hours_ago = request.query_params.get("hours_ago")
 
         qs = MLTrainingTask.objects.all()
 
-        if tenant_filter:
-            qs = qs.filter(company_id=tenant_filter)
+        if isinstance(company, Company):
+            qs = qs.filter(company=company)
         if hours_ago:
             try:
                 raw = str(hours_ago).lower()
