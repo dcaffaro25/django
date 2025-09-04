@@ -240,18 +240,14 @@ def train_journal_model(
     records_per_account: int = 100,
     training_fields: Optional[List[str]] = None,
     prediction_fields: Optional[List[str]] = None,
-    include_pending: bool = True,
+    include_pending: bool = False,
 ) -> MLModel:
-    """
-    Train a journal suggestion model (multi-label) and store it.
-    Each label is a list of "debit:<account_id>" and "credit:<account_id>" strings.
-    """
     if training_fields is None:
         training_fields = ["description", "amount"]
     if prediction_fields is None:
         prediction_fields = ["description", "amount"]
 
-    # Extrai transações e as labels de journal
+    # Extrai transações e listas de labels ["debit:400", "credit:1202", ...]
     X_df, y_labels = _assemble_journal_training_data(
         company_id=company_id,
         max_records=records_per_account,
@@ -261,22 +257,15 @@ def train_journal_model(
     if X_df.empty or not y_labels:
         raise RuntimeError("No journal training data available.")
 
-    # Oversampling simples: se alguma combinação de labels aparece uma única vez,
-    # duplica a transação correspondente para evitar classes isoladas.
-    combo_counts = Counter(tuple(lbls) for lbls in y_labels)
-    for combo, count in combo_counts.items():
-        if count == 1:
-            # Encontra o índice da primeira ocorrência dessa combinação
-            idx = next(i for i, lbls in enumerate(y_labels) if tuple(lbls) == combo)
-            # Duplica a linha de dados e o label
-            X_df = pd.concat([X_df, X_df.iloc[[idx]]], ignore_index=True)
-            y_labels.append(y_labels[idx].copy())
+    # Constrói uma label powerset: cada combinação vira uma string única
+    # e mapeamos de volta para lista de labels
+    comb_map: Dict[str, List[str]] = {}
+    y_comb: List[str] = []
+    for lbls in y_labels:
+        combo = "|".join(sorted(lbls))
+        comb_map[combo] = lbls
+        y_comb.append(combo)
 
-    # Codifica as labels multi-rótulo
-    mlb = MultiLabelBinarizer()
-    y_encoded = mlb.fit_transform(y_labels)
-
-    # Pipeline de pré-processamento e classificação
     preprocessor = ColumnTransformer(
         transformers=[
             ("text", TfidfVectorizer(stop_words="english", max_features=5000), "description"),
@@ -284,16 +273,15 @@ def train_journal_model(
         ],
         remainder="drop",
     )
-    classifier = OneVsRestClassifier(LogisticRegression(max_iter=1000, n_jobs=-1))
+    classifier = LogisticRegression(max_iter=200, solver="lbfgs", multi_class="multinomial")
     model = Pipeline([
         ("preprocessor", preprocessor),
         ("classifier", classifier),
     ])
 
-    # Ajusta o modelo com todo o dataset disponível
-    model.fit(X_df, y_encoded)
+    model.fit(X_df, y_comb)
 
-    # Versionamento padrão
+    # Versionamento e armazenamento
     last = (
         MLModel.objects.filter(company_id=company_id, name="journal")
         .order_by("-version")
@@ -301,15 +289,15 @@ def train_journal_model(
     )
     version = (last.version + 1) if last else 1
 
-    # Serializa o modelo e o MultiLabelBinarizer
     buffer = io.BytesIO()
-    joblib.dump((model, mlb), buffer)
+    # Serializamos (classificador, mapping de classes)
+    joblib.dump((model, comb_map), buffer)
     buffer.seek(0)
 
     ml_record = MLModel.objects.create(
         company_id=company_id,
         name="journal",
-        model_type="multi-label",
+        model_type="multiclass-powerset",
         version=version,
         trained_at=timezone.now(),
         model_blob=buffer.read(),
