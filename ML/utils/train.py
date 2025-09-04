@@ -180,7 +180,7 @@ def train_categorization_model(
 def _assemble_journal_training_data(
     company_id: int,
     max_records: int = 1000,
-    include_pending: bool = True,
+    include_pending: bool = False,
     training_fields: Optional[List[str]] = None,
 ) -> (pd.DataFrame, List[List[str]]):
     """
@@ -227,21 +227,31 @@ def _assemble_journal_training_data(
     df = pd.DataFrame(X_rows)
     return df, y_labels
 
+from collections import Counter
+from sklearn.preprocessing import MultiLabelBinarizer, StandardScaler
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+
 def train_journal_model(
     company_id: int,
     records_per_account: int = 100,
     training_fields: Optional[List[str]] = None,
     prediction_fields: Optional[List[str]] = None,
-    include_pending: bool = False,
+    include_pending: bool = True,
 ) -> MLModel:
     """
     Train a journal suggestion model (multi-label) and store it.
+    Each label is a list of "debit:<account_id>" and "credit:<account_id>" strings.
     """
     if training_fields is None:
         training_fields = ["description", "amount"]
     if prediction_fields is None:
         prediction_fields = ["description", "amount"]
 
+    # Extrai transações e as labels de journal
     X_df, y_labels = _assemble_journal_training_data(
         company_id=company_id,
         max_records=records_per_account,
@@ -251,18 +261,22 @@ def train_journal_model(
     if X_df.empty or not y_labels:
         raise RuntimeError("No journal training data available.")
 
-    # Build a simple multi-label classifier
-    from sklearn.preprocessing import MultiLabelBinarizer, StandardScaler
-    from sklearn.multiclass import OneVsRestClassifier
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.pipeline import Pipeline
-    from sklearn.compose import ColumnTransformer
-    from sklearn.feature_extraction.text import TfidfVectorizer
+    # Oversampling simples: se alguma combinação de labels aparece uma única vez,
+    # duplica a transação correspondente para evitar classes isoladas.
+    combo_counts = Counter(tuple(lbls) for lbls in y_labels)
+    for combo, count in combo_counts.items():
+        if count == 1:
+            # Encontra o índice da primeira ocorrência dessa combinação
+            idx = next(i for i, lbls in enumerate(y_labels) if tuple(lbls) == combo)
+            # Duplica a linha de dados e o label
+            X_df = pd.concat([X_df, X_df.iloc[[idx]]], ignore_index=True)
+            y_labels.append(y_labels[idx].copy())
 
+    # Codifica as labels multi-rótulo
     mlb = MultiLabelBinarizer()
     y_encoded = mlb.fit_transform(y_labels)
 
-    # For this example, we fix text and numeric columns as description/amount
+    # Pipeline de pré-processamento e classificação
     preprocessor = ColumnTransformer(
         transformers=[
             ("text", TfidfVectorizer(stop_words="english", max_features=5000), "description"),
@@ -276,8 +290,10 @@ def train_journal_model(
         ("classifier", classifier),
     ])
 
+    # Ajusta o modelo com todo o dataset disponível
     model.fit(X_df, y_encoded)
 
+    # Versionamento padrão
     last = (
         MLModel.objects.filter(company_id=company_id, name="journal")
         .order_by("-version")
@@ -285,6 +301,7 @@ def train_journal_model(
     )
     version = (last.version + 1) if last else 1
 
+    # Serializa o modelo e o MultiLabelBinarizer
     buffer = io.BytesIO()
     joblib.dump((model, mlb), buffer)
     buffer.seek(0)
