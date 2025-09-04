@@ -12,6 +12,7 @@ from .feature_extraction import build_classification_model
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, confusion_matrix
 
+
 try:
     from accounting.models import Account, JournalEntry, Transaction
 except Exception:
