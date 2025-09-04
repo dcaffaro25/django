@@ -8,6 +8,8 @@ from django.db.models import Q
 
 from ML.models import MLModel
 from .feature_extraction import build_classification_model
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, confusion_matrix
 
 try:
     from accounting.models import Account, JournalEntry, Transaction
@@ -114,14 +116,28 @@ def train_categorization_model(
     y = df["label"]
 
     # Divisão treino/validação para calcular métricas (usa estratificação se possível)
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import accuracy_score, confusion_matrix
+    
+    # Se alguma classe tiver apenas 1 amostra, duplica essa amostra
+    class_counts = Counter(y)
+    for label, count in class_counts.items():
+        if count == 1:
+            extra_rows = df[df["label"] == label].copy()
+            X = pd.concat([X, extra_rows[training_fields]], ignore_index=True)
+            y = pd.concat([y, extra_rows["label"]], ignore_index=True)
 
-    stratify = y if len(set(y)) > 1 else None
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=stratify
-    )
+    # Tentativa de split estratificado; fallback caso falhe
+    try:
 
+        stratify = y if len(set(y)) > 1 else None
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=stratify
+        )
+    except ValueError:
+        # Dataset muito pequeno / classes isoladas: treina com todo o conjunto
+        X_train, y_train = X, y
+        X_val = pd.DataFrame()
+        y_val = pd.Series(dtype=y.dtype)
+        
     model = build_classification_model()
     model.fit(X_train, y_train)
 
