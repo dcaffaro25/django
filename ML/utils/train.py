@@ -180,7 +180,7 @@ def train_categorization_model(
 def _assemble_journal_training_data(
     company_id: int,
     max_records: int = 1000,
-    include_pending: bool = False,
+    include_pending: bool = True,
     training_fields: Optional[List[str]] = None,
 ) -> (pd.DataFrame, List[List[str]]):
     """
