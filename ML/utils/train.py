@@ -240,7 +240,7 @@ def train_journal_model(
     records_per_account: int = 100,
     training_fields: Optional[List[str]] = None,
     prediction_fields: Optional[List[str]] = None,
-    include_pending: bool = False,
+    include_pending: bool = True,
 ) -> MLModel:
     if training_fields is None:
         training_fields = ["description", "amount"]

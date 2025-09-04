@@ -2,6 +2,7 @@ import io
 import joblib
 import pandas as pd
 from typing import Any, Dict, List
+import numpy as np
 
 from ML.models import MLModel
 
