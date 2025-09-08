@@ -590,6 +590,7 @@ class BulkImportAPIView(APIView):
     def post(self, request, *args, **kwargs):
         file = request.FILES['file']
         xls = pd.read_excel(file, sheet_name=None)
+        commit = getattr(request, 'commit', False)
         company = getattr(request, 'tenant', None)
         company_id = request.data.get('company_id')
         if not company_id and hasattr(request.user, 'company_id'):
@@ -606,10 +607,10 @@ class BulkImportAPIView(APIView):
             rows = df.dropna(how='all').to_dict(orient="records")
             if use_celery:
                 # dispara async
-                async_res = dispatch_import.delay(company_id, model_name, rows, commit=True, use_celery=True)
+                async_res = dispatch_import.delay(company_id, model_name, rows, commit=commit, use_celery=True)
                 responses.append({"model": model_name, "task_id": async_res.id})
             else:
                 # processa síncrono
-                result = dispatch_import(company_id, model_name, rows, commit=True, use_celery=False)
+                result = dispatch_import(company_id, model_name, rows, commit=commit, use_celery=False)
                 responses.append({"model": model_name, "result": result})
         return Response({"imports": responses}, status=status.HTTP_202_ACCEPTED)

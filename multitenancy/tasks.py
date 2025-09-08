@@ -64,18 +64,34 @@ def trigger_integration_event(company_id, event_name, payload):
 def process_import_records(company_id, model_name, rows, commit=True):
     """
     Processa uma lista de dicionários (rows) criando ou atualizando objetos.
-    Retorna lista de resultados por registro.
+    Retorna lista de resultados por registro, incluindo observações de substituição.
     """
     app_label = MODEL_APP_MAP.get(model_name)
+    if not app_label:
+        raise LookupError(f"No app mapping for model '{model_name}'")
     model = apps.get_model(app_label, model_name)
-    results = []
+
+    # Copia profunda para preservar valores originais
+    original_rows = [row.copy() for row in rows]
+    # Aplica substituições in-place
     rows = apply_substitutions(rows, company_id=company_id, model_name=model_name)
 
+    results = []
     with transaction.atomic():
-        for row_data in rows:
+        for idx, row_data in enumerate(rows):
             row_id = row_data.pop('__row_id', None)
+            observations = []
+            # Calcula diferenças entre original e transformado
+            original_data = original_rows[idx]
+            for key, orig_val in original_data.items():
+                new_val = row_data.get(key)
+                if orig_val != new_val:
+                    observations.append(
+                        f"campo '{key}' alterado de '{orig_val}' para '{new_val}'"
+                    )
+
             try:
-                if commit and 'id' in row_data and row_data['id']:
+                if commit and row_data.get('id'):
                     instance = model.objects.get(id=row_data['id'])
                     for field, value in row_data.items():
                         setattr(instance, field, value)
@@ -91,6 +107,7 @@ def process_import_records(company_id, model_name, rows, commit=True):
                     "status": "success",
                     "action": action,
                     "data": safe_model_dict(instance),
+                    "observations": observations,
                     "message": "ok"
                 })
             except Exception as e:
@@ -100,6 +117,7 @@ def process_import_records(company_id, model_name, rows, commit=True):
                     "status": "error",
                     "action": None,
                     "data": {},
+                    "observations": observations,
                     "message": str(e),
                 })
     return results
