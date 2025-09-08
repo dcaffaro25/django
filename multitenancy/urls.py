@@ -2,10 +2,10 @@
 
 from django.urls import path, include, re_path
 from rest_framework.routers import DefaultRouter
-from .views import CustomUserViewSet, CompanyViewSet, EntityViewSet, EntityTreeView, LoginView, LogoutView, IntegrationRuleViewSet, ChangePasswordView, UserCreateView, PasswordResetForceView, AdminForcePasswordView
+from .views import CustomUserViewSet, CompanyViewSet, EntityViewSet, EntityTreeView, LoginView, LogoutView, IntegrationRuleViewSet, ChangePasswordView, UserCreateView, PasswordResetForceView, AdminForcePasswordView, SubstitutionRuleViewSet
 from accounting.views import CurrencyViewSet
 from .api_utils import BulkImportPreview, BulkImportExecute
-from .views import ValidateRuleView, ExecuteRuleView#, TriggerListView
+from .views import ValidateRuleView, ExecuteRuleView, BulkImportAPIView#, TriggerListView
 from .api_utils import BulkImportTemplateDownloadView
 
 
@@ -17,6 +17,7 @@ router.register(r'companies', CompanyViewSet, basename='company')
 #router.register(r'entities', EntityViewSet, basename='entity')
 router.register(r'currencies', CurrencyViewSet)
 router.register(r'integration-rules', IntegrationRuleViewSet)
+router.register(r'substitution-rules', SubstitutionRuleViewSet, basename='substitutionrule')
 
 urlpatterns = [
     re_path(r'^login/?$', LoginView.as_view(), name='login'),
@@ -26,7 +27,8 @@ urlpatterns = [
     path("users/create/", UserCreateView.as_view(), name="user-create"),
     path("force-reset-password/", AdminForcePasswordView.as_view(), name="force-reset-password"),
     
-
+    path('api/core/', include(router.urls)),
+    path('api/core/bulk-import/', BulkImportAPIView.as_view(), name='bulk-import'),
     # Make the prefix itself optional-slash:
     re_path(r'^api/core/?', include(router.urls)),
 

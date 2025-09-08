@@ -179,6 +179,9 @@ CELERY_TASK_T_LIMIT = int(os.getenv("CELERY_TASK_TIME_LIMIT", 15))  # minutes
 CELERY_TASK_SOFT_TIME_LIMIT = (CELERY_TASK_T_LIMIT-3)*60  # 12 minutes
 CELERY_TASK_TIME_LIMIT = CELERY_TASK_T_LIMIT*60       # 15 minutes
 
+IMPORT_MAX_BATCH_SIZE = 1000
+INTEGRATION_MAX_BATCH_SIZE = 500
+
 # Password validation
 # https://docs.djangoproject.com/en/4.0/ref/settings/#auth-password-validators
 

@@ -3,9 +3,9 @@ from rest_framework.views import APIView
 from django.contrib.auth import authenticate, login, logout
 from rest_framework import views, viewsets, generics, status, serializers
 from rest_framework.response import Response
-from .models import CustomUser, Company, Entity, IntegrationRule
+from .models import CustomUser, Company, Entity, IntegrationRule, SubstitutionRule
 from .mixins import ScopedQuerysetMixin
-from .serializers import CustomUserSerializer, CompanySerializer, EntitySerializer, UserLoginSerializer, IntegrationRuleSerializer, EntityMiniSerializer, ChangePasswordSerializer, UserCreateSerializer, PasswordResetForceSerializer
+from .serializers import CustomUserSerializer, CompanySerializer, EntitySerializer, UserLoginSerializer, IntegrationRuleSerializer, EntityMiniSerializer, ChangePasswordSerializer, UserCreateSerializer, PasswordResetForceSerializer, SubstitutionRuleSerializer
 from .api_utils import create_csv_response, create_excel_response
 from rest_framework import permissions
 from rest_framework.authentication import SessionAuthentication
@@ -20,6 +20,10 @@ from django.utils import timezone
 from datetime import timedelta
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
+from multitenancy.tasks import dispatch_import, trigger_integration_event
+
+import pandas as pd
+
 
 class LoginView(views.APIView):
     permission_classes = (permissions.AllowAny,)
@@ -237,9 +241,7 @@ class CompanyViewSet(viewsets.ModelViewSet):
         #    return Company.objects.none()  # Or handle as appropriate
         return Company.objects.all()
 
-class IntegrationRuleViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
-    queryset = IntegrationRule.objects.all()
-    serializer_class = IntegrationRuleSerializer
+
 
 class EntityMiniViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Entity.objects.all()
@@ -548,3 +550,66 @@ class ExecuteRuleView(APIView):
                 {"success": False, "error": str(e)},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        
+class SubstitutionRuleViewSet(viewsets.ModelViewSet):
+    """
+    CRUD de regras de substituição (de‑para).
+    """
+    queryset = SubstitutionRule.objects.all()
+    serializer_class = SubstitutionRuleSerializer
+
+    def get_queryset(self):
+        company = getattr(self.request, 'tenant', None)
+        return super().get_queryset().filter(company=company)
+    
+
+class IntegrationRuleViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
+    queryset = IntegrationRule.objects.all()
+    serializer_class = IntegrationRuleSerializer
+
+    def get_queryset(self):
+        company = getattr(self.request, 'tenant', None)
+        return super().get_queryset().filter(company=company)
+
+    # Endpoint para executar uma regra específica (síncrono ou assíncrono)
+    def run(self, request, pk=None):
+        rule = self.get_object()
+        payload = request.data.get("payload", {})
+        if rule.use_celery:
+            res = trigger_integration_event.delay(rule.company_id, rule.triggers, payload)
+            return Response({"task_id": res.id}, status=status.HTTP_202_ACCEPTED)
+        else:
+            result = rule.run_rule(payload)
+            return Response({"result": result}, status=status.HTTP_200_OK)
+
+class BulkImportAPIView(APIView):
+    """
+    Endpoint de importação em massa.
+    Divide o DataFrame em chunks e utiliza Celery se use_celery=True.
+    """
+    def post(self, request, *args, **kwargs):
+        file = request.FILES['file']
+        xls = pd.read_excel(file, sheet_name=None)
+        company = getattr(request, 'tenant', None)
+        company_id = request.data.get('company_id')
+        if not company_id and hasattr(request.user, 'company_id'):
+            company_id = request.user.company_id
+        
+        if not company_id:
+            return Response({"error": "No company defined"}, status=400)
+        
+        use_celery = request.data.get('use_celery', False)
+        responses = []
+        for model_name, df in xls.items():
+            if model_name == "References":
+                continue
+            rows = df.dropna(how='all').to_dict(orient="records")
+            if use_celery:
+                # dispara async
+                async_res = dispatch_import.delay(company_id, model_name, rows, commit=True, use_celery=True)
+                responses.append({"model": model_name, "task_id": async_res.id})
+            else:
+                # processa síncrono
+                result = dispatch_import(company_id, model_name, rows, commit=True, use_celery=False)
+                responses.append({"model": model_name, "result": result})
+        return Response({"imports": responses}, status=status.HTTP_202_ACCEPTED)

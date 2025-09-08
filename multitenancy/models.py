@@ -253,6 +253,7 @@ class IntegrationRule(TenantAwareBaseModel):
         help_text="Python expression for filtering payload records. Example: \"record['department'] == 'HR' and record['base_salary'] > 3000\""
     )
     rule = models.TextField(help_text="Formula engine code to execute.")
+    use_celery = models.BooleanField(default=True)
     is_active = models.BooleanField(default=True)
     
     # Optional fields for quick stats:
@@ -298,6 +299,9 @@ class IntegrationRule(TenantAwareBaseModel):
             filtered_payload = self.apply_filter(payload)
             #filtered_payload = apply_substitutions(filtered_payload, self.company_id)
             result = execute_rule(self.company.id, self.rule, filtered_payload)  # formula engine call
+            self.last_run_at = timezone.now()
+            self.times_executed += 1
+            self.save(update_fields=['last_run_at', 'times_executed'])
             success = True
         except Exception as e:
             # 2) Possibly capture the error message
@@ -345,19 +349,65 @@ class IntegrationRuleLog(TenantAwareBaseModel):
     
 class SubstitutionRule(TenantAwareBaseModel):
     """
-    Represents substitution rules for cleaning and standardizing data.
+    Define regras de substituição (de‑para) para limpar e padronizar dados.
+
+    - `model_name` e `field_name`: aplicam a regra a instâncias de um modelo específico.
+    - `column_name`: aplica a regra quando o payload é um dicionário (ex.: linha de CSV), usando a chave/coluna informada.
+    - `column_index`: aplica a regra quando o payload é uma lista/tupla, usando o índice indicado (zero‑based).
+    Pelo menos um desses alvos deve ser definido.
+
+    O campo `match_type` controla o tipo de comparação:
+    - `exact` (padrão) – igualdade direta.
+    - `regex` – usa expressões regulares para substituir (`re.sub`).
+    - `caseless` – comparação sem diferenciar maiúsculas/minúsculas nem acentuação.
     """
-    model_name = models.CharField(max_length=255)  # Target model (e.g., 'Employee', 'Transaction')
-    field_name = models.CharField(max_length=255)  # Target field (e.g., 'status', 'department')
+
+    model_name = models.CharField(max_length=255, null=True, blank=True)
+    field_name = models.CharField(max_length=255, null=True, blank=True)
+    column_name = models.CharField(max_length=255, null=True, blank=True)
+    column_index = models.PositiveIntegerField(null=True, blank=True)
+
     match_type = models.CharField(
         max_length=50,
-        choices=[('exact', 'Exact'), ('regex', 'Regex')],
-        default='exact'
+        choices=[('exact', 'Exact'),
+                 ('regex', 'Regex'),
+                 ('caseless', 'Case/Accent Insensitive')],
+        default='exact',
+        help_text=(
+            "Tipo de comparação:\n"
+            "- 'exact': igualdade direta.\n"
+            "- 'regex': usa re.sub.\n"
+            "- 'caseless': ignora maiúsculas/minúsculas e acentuação."
+        ),
     )
-    match_value = models.TextField()  # Value or pattern to match
-    substitution_value = models.TextField()  # Value to substitute
+    match_value = models.TextField()
+    substitution_value = models.TextField()
 
+    class Meta:
+        unique_together = (
+            'company',
+            'model_name',
+            'field_name',
+            'column_name',
+            'column_index',
+            'match_value',
+        )
+
+    def clean(self):
+        super().clean()
+        if not (self.field_name or self.column_name or self.column_index is not None):
+            raise ValidationError(
+                "Defina ao menos um alvo (field_name, column_name ou column_index)."
+            )
 
     def __str__(self):
-        return f"{self.model_name}.{self.field_name}: {self.match_value} → {self.substitution_value}"
+        if self.model_name and self.field_name:
+            target = f"{self.model_name}.{self.field_name}"
+        elif self.column_name:
+            target = f"[col:{self.column_name}]"
+        elif self.column_index is not None:
+            target = f"[idx:{self.column_index}]"
+        else:
+            target = "<unspecified>"
+        return f"{target}: {self.match_value} -> {self.substitution_value}"
 

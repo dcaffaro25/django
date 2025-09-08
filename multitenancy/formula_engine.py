@@ -1,7 +1,7 @@
 from django.apps import apps
 
 from multitenancy.signals import CHANGES_TRACKER, clear_changes, get_changes
-
+import unicodedata
 
 from django.forms.models import model_to_dict
 from django.db.models.signals import post_save, post_delete
@@ -144,32 +144,93 @@ def to_decimal(value, places=2):
     quant_str = "1." + ("0" * places)
     return dec_val.quantize(Decimal(quant_str), rounding=ROUND_HALF_UP)
 
-def apply_substitutions(payload, model_name, field_names=None, company_id=None):
+def _normalize(value: str) -> str:
+    """Remove acentuação e converte para minúsculas."""
+    if value is None:
+        return ''
+    nfkd = unicodedata.normalize('NFKD', str(value))
+    stripped = ''.join(c for c in nfkd if not unicodedata.combining(c))
+    return stripped.casefold()
+
+def apply_substitutions(payload, company_id, model_name=None, field_names=None,
+                        column_names=None):
     if not company_id:
         raise ValueError("Company ID is required for substitutions.")
 
     from multitenancy.models import SubstitutionRule
-    rules = SubstitutionRule.objects.filter(company_id=company_id, model_name=model_name)
+    rules = SubstitutionRule.objects.filter(company_id=company_id)
     
+    if model_name:
+        rules = rules.filter(model_name=model_name)
     if field_names:
         rules = rules.filter(field_name__in=field_names)
     
-    substitutions = {}
+    grouped = {
+        "model_field": {},
+        "column_name": {},
+        "column_index": {},
+    }
+    
+    
     for rule in rules:
-        key = (rule.model_name, rule.field_name)
-        if key not in substitutions:
-            substitutions[key] = []
-        substitutions[key].append(rule)
+        if rule.model_name and rule.field_name:
+            key = (rule.model_name, rule.field_name)
+            grouped["model_field"].setdefault(key, []).append(rule)
+        elif rule.column_name:
+            grouped["column_name"].setdefault(rule.column_name, []).append(rule)
+        elif rule.column_index is not None:
+            grouped["column_index"].setdefault(rule.column_index, []).append(rule)
 
-    for record in payload:
-        for (model, field), rule_list in substitutions.items():
-            if field in record:
-                value = record[field]
-                for rl in rule_list:
-                    if rl.match_type == "exact" and value == rl.match_value:
-                        record[field] = rl.substitution_value
-                    elif rl.match_type == "regex" and re.match(rl.match_value, str(value)):
-                        record[field] = re.sub(rl.match_value, rl.substitution_value, str(value))
+    for rec in payload:
+        # Caso dicionário
+        if isinstance(rec, dict):
+            # aplica regras model/field
+            for (mdl, fld), rule_list in grouped["model_field"].items():
+                if model_name == mdl and fld in rec:
+                    value = rec[fld]
+                    for rl in rule_list:
+                        if rl.match_type == 'exact' and value == rl.match_value:
+                            rec[fld] = rl.substitution_value
+                            break
+                        if rl.match_type == 'regex' and re.match(rl.match_value, str(value)):
+                            rec[fld] = re.sub(rl.match_value, rl.substitution_value, str(value))
+                            break
+                        if rl.match_type == 'caseless':
+                            if _normalize(value) == _normalize(rl.match_value):
+                                rec[fld] = rl.substitution_value
+                                break
+            # aplica regras por column_name
+            for col_name, rule_list in grouped["column_name"].items():
+                if col_name in rec:
+                    value = rec[col_name]
+                    for rl in rule_list:
+                        if rl.match_type == 'exact' and value == rl.match_value:
+                            rec[col_name] = rl.substitution_value
+                            break
+                        if rl.match_type == 'regex' and re.match(rl.match_value, str(value)):
+                            rec[col_name] = re.sub(rl.match_value, rl.substitution_value, str(value))
+                            break
+                        if rl.match_type == 'caseless':
+                            if _normalize(value) == _normalize(rl.match_value):
+                                rec[col_name] = rl.substitution_value
+                                break
+        # Caso lista/tupla
+        elif isinstance(rec, (list, tuple)):
+            for idx, rule_list in grouped["column_index"].items():
+                if idx < len(rec):
+                    value = rec[idx]
+                    for rl in rule_list:
+                        if rl.match_type == 'exact' and value == rl.match_value:
+                            rec[idx] = rl.substitution_value
+                            break
+                        if rl.match_type == 'regex' and re.match(rl.match_value, str(value)):
+                            rec[idx] = re.sub(rl.match_value, rl.substitution_value, str(value))
+                            break
+                        if rl.match_type == 'caseless':
+                            if _normalize(value) == _normalize(rl.match_value):
+                                rec[idx] = rl.substitution_value
+                                break
+
     return payload
 
 SAFE_FUNCTIONS = {

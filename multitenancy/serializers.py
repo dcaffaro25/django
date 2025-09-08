@@ -1,7 +1,7 @@
 # NORD/multitenancy/serializers.py
 
 from rest_framework import serializers
-from .models import CustomUser, Company, Entity, IntegrationRule
+from .models import CustomUser, Company, Entity, IntegrationRule, SubstitutionRule
 from rest_framework.exceptions import ValidationError
 from django.contrib.auth import authenticate
 from accounting.models import Account, CostCenter
@@ -272,4 +272,12 @@ class IntegrationRuleSerializer(serializers.ModelSerializer):
     class Meta:
         model = IntegrationRule
         fields = '__all__'
-    
+
+class SubstitutionRuleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SubstitutionRule
+        fields = [
+            'id', 'company', 'model_name', 'field_name',
+            'column_name', 'column_index',
+            'match_type', 'match_value', 'substitution_value',
+        ]

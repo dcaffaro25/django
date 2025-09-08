@@ -1,8 +1,13 @@
 # tasks.py (e.g. in multitenancy/tasks.py)
-from celery import shared_task
+from celery import shared_task, group, chord
 from django.core.mail import send_mail
 from django.conf import settings
 import smtplib
+from django.apps import apps
+from multitenancy.formula_engine import apply_substitutions
+from django.db import transaction
+from .api_utils import safe_model_dict, MODEL_APP_MAP
+from multitenancy.models import IntegrationRule
 
 @shared_task(bind=True, autoretry_for=(smtplib.SMTPException, ConnectionError), retry_backoff=True, max_retries=5)
 def send_user_invite_email(self, subject, message, to_email):
@@ -29,3 +34,104 @@ def send_user_email(self, subject, message, to_email):
         [to_email],
         fail_silently=False,
     )
+
+@shared_task
+def execute_integration_rule(rule_id, payload):
+    """
+    Executa uma IntegrationRule específica de forma assíncrona.
+    """
+    rule = IntegrationRule.objects.get(pk=rule_id)
+    result = rule.run_rule(payload)
+    return result
+
+@shared_task
+def trigger_integration_event(company_id, event_name, payload):
+    """
+    Executa todas as IntegrationRule ativas para determinado evento.
+    """
+    rules = IntegrationRule.objects.filter(
+        company_id=company_id,
+        is_active=True,
+        triggers__icontains=event_name
+    ).order_by('execution_order')
+    for rule in rules:
+        if rule.use_celery:
+            execute_integration_rule.delay(rule.id, payload)
+        else:
+            execute_integration_rule(rule.id, payload)
+
+@shared_task
+def process_import_records(company_id, model_name, rows, commit=True):
+    """
+    Processa uma lista de dicionários (rows) criando ou atualizando objetos.
+    Retorna lista de resultados por registro.
+    """
+    app_label = MODEL_APP_MAP.get(model_name)
+    model = apps.get_model(app_label, model_name)
+    results = []
+    rows = apply_substitutions(rows, company_id=company_id, model_name=model_name)
+
+    with transaction.atomic():
+        for row_data in rows:
+            row_id = row_data.pop('__row_id', None)
+            try:
+                if commit and 'id' in row_data and row_data['id']:
+                    instance = model.objects.get(id=row_data['id'])
+                    for field, value in row_data.items():
+                        setattr(instance, field, value)
+                    action = 'update'
+                else:
+                    instance = model(**row_data)
+                    action = 'create'
+                if commit:
+                    instance.save()
+                results.append({
+                    "model": model_name,
+                    "__row_id": row_id,
+                    "status": "success",
+                    "action": action,
+                    "data": safe_model_dict(instance),
+                    "message": "ok"
+                })
+            except Exception as e:
+                results.append({
+                    "model": model_name,
+                    "__row_id": row_id,
+                    "status": "error",
+                    "action": None,
+                    "data": {},
+                    "message": str(e),
+                })
+    return results
+
+@shared_task
+def finalize_import(results, company_id, model_name, commit=True):
+    """
+    Callback de um chord: junta todos os resultados de substituição, aplica a importação
+    em lote único, e retorna a soma dos resultados.
+    """
+    # "results" é uma lista de listas (uma por chunk)
+    rows = []
+    for subset in results:
+        rows.extend(subset)
+    # Reutiliza process_import_records para gravação final (commit=True)
+    return process_import_records(company_id, model_name, rows, commit=commit)
+
+@shared_task
+def dispatch_import(company_id, model_name, rows, commit=True, use_celery=True):
+    """
+    Decide se processa sincronicamente ou cria subtarefas de substituição em lotes.
+    Se use_celery=True e o total excede IMPORT_MAX_BATCH_SIZE, divide em chunks
+    e cria um chord cujo callback finaliza a importação de uma vez.
+    """
+    batch_size = getattr(settings, 'IMPORT_MAX_BATCH_SIZE', 1000)
+    if not use_celery or len(rows) <= batch_size:
+        return process_import_records(company_id, model_name, rows, commit=commit)
+
+    # Divide em lotes e cria chord
+    header = []
+    for i in range(0, len(rows), batch_size):
+        chunk = rows[i:i+batch_size]
+        header.append(apply_substitutions.s(chunk, company_id, model_name))
+    # O callback finalize_import será chamado quando todos os chunks concluírem
+    return chord(header)(finalize_import.s(company_id, model_name, commit))

@@ -171,7 +171,9 @@ class BulkImportPreview(APIView):
             preview_data = {}
             errors = []
             row_id_map = {}
-
+            
+            company_id = request.tenant.id if hasattr(request, 'tenant') else None
+            
             with transaction.atomic():
                 savepoint = transaction.savepoint()
                 print("[DEBUG] Started transaction with savepoint.")
