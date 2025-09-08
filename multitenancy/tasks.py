@@ -136,142 +136,89 @@ def process_import_records(
     company_id: int,
     model_name: str,
     rows: List[Dict[str, Any]],
-    commit: bool = True,
+    *,
+    commit: bool = True
 ) -> List[Dict[str, Any]]:
     """
-    Processa um lote de registros (list[dict]) e retorna um relatório por linha:
-      - 'status': success/error
-      - 'action': 'create' ou 'update'
-      - 'data': dicionário serializado do modelo criado/atualizado (quando success)
-      - 'observations': lista de textos explicando cada alteração (campo, de, para, e regras aplicadas)
-      - Ignora qualquer mudança no campo especial '__row_id'
-      - Inclui id e nome da(s) regra(s) de substituição aplicada(s)
-
-    Caso commit=False, a função simula a importação e não salva no banco (mas ainda aplica substituições para fins de preview).
+    Processa registros de importação:
+      - Aplica substituições com auditoria.
+      - Ignora alterações no campo '__row_id'.
+      - Registra id e nome da regra aplicada em cada campo alterado.
+      - Cria ou atualiza instâncias dependendo da presença de 'id'.
     """
     app_label = MODEL_APP_MAP.get(model_name)
     if not app_label:
-        return [{
-            "model": model_name,
-            "__row_id": None,
-            "status": "error",
-            "action": None,
-            "data": {},
-            "observations": [],
-            "message": f"Unknown model '{model_name}' (MODEL_APP_MAP missing).",
-        }]
+        raise LookupError(f"MODEL_APP_MAP missing entry for '{model_name}'")
 
-    try:
-        model = apps.get_model(app_label, model_name)
-    except LookupError as e:
-        return [{
-            "model": model_name,
-            "__row_id": None,
-            "status": "error",
-            "action": None,
-            "data": {},
-            "observations": [],
-            "message": f"Model lookup error: {e}",
-        }]
+    model = apps.get_model(app_label, model_name)
 
-    # Copia profunda das linhas originais para diff (quando audit não traz 'from')
-    originals: List[Dict[str, Any]] = deepcopy(rows)
+    # Copia original apenas se quiser preservar (para logs mais profundos).
+    # Não é estritamente necessário com auditoria de substituições.
+    original_rows = deepcopy(rows)
 
-    # Aplica substituições com auditoria
-    rows_sub, audit_map = apply_substitutions(rows, company_id=company_id, model_name=model_name, return_audit=True)
-
+    # Aplica substituições e coleta auditoria
+    rows, audit = apply_substitutions(
+        rows,
+        company_id=company_id,
+        model_name=model_name,
+        return_audit=True
+    )
 
     results: List[Dict[str, Any]] = []
-
-    # Bloco atomic único para todo o lote (rollback se commit=False simulando)
     with transaction.atomic():
-        for idx, row_data in enumerate(rows_sub):
-            # Certifique-se de trabalhar com dicts; não suportamos listas/tuplas aqui
-            if not isinstance(row_data, dict):
-                results.append({
-                    "model": model_name,
-                    "__row_id": None,
-                    "status": "error",
-                    "action": None,
-                    "data": {},
-                    "observations": [],
-                    "message": "Row is not a dict; only dict-based imports are supported.",
-                })
-                continue
-
-            original = originals[idx]
-            row_id = row_data.get("__row_id")
-            # Monta observações de acordo com a auditoria e ignora __row_id
-            observations: List[str] = []
-            rec_audit = audit_map.get(idx, {})
-
-            for field, changes in rec_audit.items():
-                if field == "__row_id":
-                    continue  # ignora mudanças no identificador temporário
-
-                for change in changes:
-                    # Usa valores da auditoria (old, new) se disponíveis
-                    old_val = change.get("from", original.get(field))
-                    new_val = change.get("to", row_data.get(field))
-                    rules_info = ", ".join(
-                        f"{r['name']}({r['id']})" for r in change.get("rules", [])
-                    )
-                    observations.append(
-                        f"campo '{field}' alterado de '{old_val}' para '{new_val}' (regras: {rules_info or 'n/a'})"
-                    )
-
+        for idx, row in enumerate(rows):
+            # Guarda e remove '__row_id'
+            row_id = row.pop("__row_id", None)
             try:
                 # Decide se atualiza ou cria
-                instance = None
-                action = None
-
-                # Retira __row_id antes de persistir
-                row_data = {k: v for k, v in row_data.items() if k != "__row_id"}
-
-                if commit and row_data.get("id"):
-                    # UPDATE
-                    instance = model.objects.get(id=row_data["id"])
-                    for f, v in row_data.items():
-                        setattr(instance, f, v)
+                action = "create"
+                if commit and row.get("id"):
+                    instance = model.objects.get(id=row["id"])
+                    for field, value in row.items():
+                        setattr(instance, field, value)
                     action = "update"
-                    if commit:
-                        instance.save()
                 else:
-                    # CREATE
-                    instance = model(**row_data)
-                    action = "create"
-                    if commit:
-                        instance.save()
+                    instance = model(**row)
+
+                if commit:
+                    instance.save()
+
+                # Constrói observações a partir do audit (ignora __row_id)
+                changes = audit[idx]["changes"]
+                observations: List[Dict[str, Any]] = []
+                for change in changes:
+                    if change["field"] == "__row_id":
+                        continue
+                    observations.append({
+                        "field": change["field"],
+                        "from": change["old"],
+                        "to": change["new"],
+                        "rule_id": change["rule_id"],
+                        "rule_name": change["rule_name"],
+                    })
 
                 results.append({
                     "model": model_name,
                     "__row_id": row_id,
                     "status": "success",
                     "action": action,
-                    "data": safe_model_dict(instance, exclude_fields=['created_by', 'updated_by', 'is_deleted', 'is_active']),
+                    "data": safe_model_dict(instance),
                     "observations": observations,
                     "message": "ok",
                 })
-
             except Exception as e:
-                # Em caso de falha por linha, ainda registra as observações
                 results.append({
                     "model": model_name,
                     "__row_id": row_id,
                     "status": "error",
                     "action": None,
                     "data": {},
-                    "observations": observations,
+                    "observations": [],
                     "message": str(e),
                 })
 
-        # Se commit=False, desfaz qualquer alteração para simular a importação
-        if not commit:
-            # Provoca um rollback ao final, mas mantém o 'results'
-            with contextlib.suppress(Exception):
-                raise transaction.TransactionManagementError("Preview mode: rolling back all changes")
-
     return results
+
 @shared_task
 def finalize_import(results, company_id, model_name, commit=True):
     """
