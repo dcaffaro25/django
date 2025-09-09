@@ -21,7 +21,7 @@ from core.utils.exception_utils import exception_to_dict
 
 from django.core.exceptions import FieldDoesNotExist
 from core.utils.exception_utils import exception_to_dict
-from core.utils.model_utils import safe_model_dict
+
 
 
 @shared_task(bind=True, autoretry_for=(smtplib.SMTPException, ConnectionError), retry_backoff=True, max_retries=5)
