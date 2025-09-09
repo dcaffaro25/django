@@ -115,7 +115,7 @@ def process_import_records2(company_id, model_name, rows, commit=True):
                     "__row_id": row_id,
                     "status": "success",
                     "action": action,
-                    "data": safe_model_dict(instance),
+                    "data": safe_model_dict(instance, exclude_fields=['created_by', 'updated_by', 'is_deleted', 'is_active']),
                     "observations": observations,
                     "message": "ok"
                 })
@@ -125,7 +125,7 @@ def process_import_records2(company_id, model_name, rows, commit=True):
                     "__row_id": row_id,
                     "status": "error",
                     "action": None,
-                    "data": {},
+                    "data": row_data,
                     "observations": observations,
                     "message": str(e),
                 })
@@ -199,7 +199,7 @@ def process_import_records(
                     "__row_id": row_id,
                     "status": "success",
                     "action": action,
-                    "data": safe_model_dict(instance),
+                    "data": safe_model_dict(instance, exclude_fields=['created_by', 'updated_by', 'is_deleted', 'is_active']),
                     "observations": observations,
                     "message": "ok",
                 })
@@ -209,7 +209,7 @@ def process_import_records(
                     "__row_id": row_id,
                     "status": "error",
                     "action": None,
-                    "data": {},
+                    "data": payload,
                     "observations": observations,
                     "message": str(e),
                 })
