@@ -234,7 +234,7 @@ def apply_substitutions(
                                         "old": old_val,
                                         "new": row[fld],
                                         "rule_id": rl.id,
-                                        "rule_name": rl.name,
+                                        #"rule_name": rl.name,
                                     })
                                 break
                             if rl.match_type == "regex" and re.search(str(rl.match_value), str(old_val)):
@@ -245,7 +245,7 @@ def apply_substitutions(
                                         "old": old_val,
                                         "new": row[fld],
                                         "rule_id": rl.id,
-                                        "rule_name": rl.name,
+                                        #"rule_name": rl.name,
                                     })
                                 break
                             if rl.match_type == "caseless" and _normalize(old_val) == _normalize(rl.match_value):
@@ -256,7 +256,7 @@ def apply_substitutions(
                                         "old": old_val,
                                         "new": row[fld],
                                         "rule_id": rl.id,
-                                        "rule_name": rl.name,
+                                        #"rule_name": rl.name,
                                     })
                                 break
 
@@ -280,7 +280,7 @@ def apply_substitutions(
                             "old": old_val,
                             "new": row[col_name],
                             "rule_id": rl.id,
-                            "rule_name": rl.name,
+                            #"rule_name": rl.name,
                         })
 
         elif isinstance(row, (list, tuple)):
@@ -307,7 +307,7 @@ def apply_substitutions(
                             "old": old_val,
                             "new": row[idx],
                             "rule_id": rl.id,
-                            "rule_name": rl.name,
+                            #"rule_name": rl.name,
                         })
 
         audit.append({"row_index": i, "row_id": row_id, "changes": row_changes})
