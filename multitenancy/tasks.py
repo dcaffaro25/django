@@ -164,39 +164,36 @@ def process_import_records(
         return_audit=True
     )
 
+    # cria um índice de auditoria por __row_id
+    audit_by_rowid: Dict[Any, List[Dict[str, Any]]] = {}
+    for change in audit:
+        rowid = change.get("__row_id")
+        audit_by_rowid.setdefault(rowid, []).append(change)
     results: List[Dict[str, Any]] = []
     with transaction.atomic():
-        for idx, row in enumerate(rows):
-            # Guarda e remove '__row_id'
-            row_id = row.pop("__row_id", None)
+        for row in rows:
+            row_id = row.get("__row_id")
+            # monta observações baseadas na auditoria (ignorando __row_id)
+            observations = []
+            for chg in audit_by_rowid.get(row_id, []):
+                if chg.get("field") == "__row_id":
+                    continue
+                observations.append(
+                    f"campo '{chg['field']}' alterado de '{chg['old']}' para '{chg['new']}' "
+                    f"(regra id={chg['rule_id']}')"
+                )
             try:
-                # Decide se atualiza ou cria
-                action = "create"
-                if commit and row.get("id"):
-                    instance = model.objects.get(id=row["id"])
-                    for field, value in row.items():
+                payload = {k: v for k, v in row.items() if k != "__row_id"}
+                if commit and payload.get("id"):
+                    instance = model.objects.get(id=payload["id"])
+                    for field, value in payload.items():
                         setattr(instance, field, value)
                     action = "update"
                 else:
-                    instance = model(**row)
-
+                    instance = model(**payload)
+                    action = "create"
                 if commit:
                     instance.save()
-
-                # Constrói observações a partir do audit (ignora __row_id)
-                changes = audit[idx]["changes"]
-                observations: List[Dict[str, Any]] = []
-                for change in changes:
-                    if change["field"] == "__row_id":
-                        continue
-                    observations.append({
-                        "field": change["field"],
-                        "from": change["old"],
-                        "to": change["new"],
-                        "rule_id": change["rule_id"],
-                        #"rule_name": change["rule_name"],
-                    })
-
                 results.append({
                     "model": model_name,
                     "__row_id": row_id,
@@ -213,10 +210,9 @@ def process_import_records(
                     "status": "error",
                     "action": None,
                     "data": {},
-                    "observations": [],
+                    "observations": observations,
                     "message": str(e),
                 })
-
     return results
 
 @shared_task

@@ -12,7 +12,7 @@ from django.core.exceptions import ValidationError
 import datetime
 from crum import get_current_user
 #from jsonfield import JSONField
-
+from django.db.models import JSONField
 
 class CustomUser(AbstractUser):
     # Add any additional fields here
@@ -382,7 +382,11 @@ class SubstitutionRule(TenantAwareBaseModel):
     )
     match_value = models.TextField()
     substitution_value = models.TextField()
+    filter_conditions = JSONField(null=True, blank=True)
 
+    # NOVO: título/descrição legível da regra, usado em relatórios
+    title = models.CharField(max_length=255, null=True, blank=True)
+    
     class Meta:
         unique_together = (
             'company',
@@ -409,5 +413,5 @@ class SubstitutionRule(TenantAwareBaseModel):
             target = f"[idx:{self.column_index}]"
         else:
             target = "<unspecified>"
-        return f"{target}: {self.match_value} -> {self.substitution_value}"
+        return f"Regra {self.id} – {self.title}_{target}: {self.match_value} -> {self.substitution_value}"
 

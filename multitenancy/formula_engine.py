@@ -155,164 +155,198 @@ def _normalize(value: str) -> str:
     stripped = ''.join(c for c in nfkd if not unicodedata.combining(c))
     return stripped.casefold()
 
+def _passes_conditions(row: Dict[str, Any], conditions: Optional[Dict[str, Any]]) -> bool:
+    """
+    Avalia condicional (em JSON) para decidir se a regra deve ser aplicada.
+    Formatos suportados:
+      {"all": [cond1, cond2, ...]}
+      {"any": [cond1, cond2, ...]}
+      {"not": cond}
+      {"field": "campo", "op": "eq|neq|in|nin|regex|iexact|lt|lte|gt|gte|contains|icontains", "value": X}
+    """
+    if not conditions:
+        return True
+    # operadores lógicos
+    if isinstance(conditions, dict) and "all" in conditions:
+        return all(_passes_conditions(row, c) for c in conditions["all"])
+    if isinstance(conditions, dict) and "any" in conditions:
+        return any(_passes_conditions(row, c) for c in conditions["any"])
+    if isinstance(conditions, dict) and "not" in conditions:
+        return not _passes_conditions(row, conditions["not"])
+    # condição simples
+    if not isinstance(conditions, dict):
+        return True
+    field = conditions.get("field")
+    op = (conditions.get("op") or "eq").lower()
+    target = conditions.get("value")
+    value = row.get(field)
+    def to_num(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+    if op == "eq":   return value == target
+    if op == "neq":  return value != target
+    if op == "iexact": return _normalize(value) == _normalize(target)
+    if op == "in":
+        try: return value in target
+        except Exception: return False
+    if op == "nin":
+        try: return value not in target
+        except Exception: return False
+    if op == "contains": return str(target) in str(value)
+    if op == "icontains": return _normalize(target) in _normalize(value)
+    if op == "regex":
+        try: return re.search(str(target), str(value)) is not None
+        except re.error: return False
+    if op in {"lt", "lte", "gt", "gte"}:
+        a, b = to_num(value), to_num(target)
+        if a is None or b is None: return False
+        if op == "lt":  return a < b
+        if op == "lte": return a <= b
+        if op == "gt":  return a > b
+        if op == "gte": return a >= b
+    return True
+
 def apply_substitutions(
-    payload: List[Row],
+    payload: List[Union[Dict[str, Any], List[Any]]],
     company_id: int,
     model_name: Optional[str] = None,
     field_names: Optional[List[str]] = None,
     column_names: Optional[List[str]] = None,
     *,
     return_audit: bool = False,
-) -> Union[List[Row], Tuple[List[Row], List[Dict[str, Any]]]]:
+) -> Union[
+    List[Union[Dict[str, Any], List[Any]]],
+    Tuple[List[Union[Dict[str, Any], List[Any]]], List[Dict[str, Any]]]
+]:
     """
-    Aplica regras de substituição ao payload e, opcionalmente, gera auditoria.
-
-    - payload: lista de dicionários (linhas) ou listas/tuplas (planilhas por posição).
-    - return_audit=True fará a função retornar (payload_modificado, auditoria).
-      Auditoria é uma lista onde cada elemento corresponde a uma linha e contém:
-        {
-          "row_index": <índice>,
-          "row_id": <valor de __row_id se houver>,
-          "changes": [
-            {
-              "field": <campo ou índice>,
-              "old": <valor antigo>,
-              "new": <novo valor>,
-              "rule_id": <id da regra>,
-              "rule_name": <nome da regra>
-            },
-            ...
-          ]
-        }
-    - Quando return_audit=False (padrão), mantém o comportamento antigo e retorna apenas o payload modificado.
+    Aplica regras de substituição a cada linha do payload.
+    Aceita campo JSON `filter_conditions` em SubstitutionRule para determinar se a regra se aplica.
+    Quando `return_audit=True`, retorna também uma auditoria de mudanças por linha.
+    Auditoria: lista de dicionários { "__row_id", "field", "old", "new", "rule_id", "rule_name" }.
     """
     if not company_id:
         raise ValueError("Company ID is required for substitutions.")
-
-    from multitenancy.models import SubstitutionRule
-
-    qs = SubstitutionRule.objects.filter(company_id=company_id)
+    from multitenancy.models import SubstitutionRule  # evitar import circular
+    rules_qs = SubstitutionRule.objects.filter(company_id=company_id)
     if model_name:
-        qs = qs.filter(model_name=model_name)
+        rules_qs = rules_qs.filter(model_name=model_name)
     if field_names:
-        qs = qs.filter(field_name__in=field_names)
+        rules_qs = rules_qs.filter(field_name__in=field_names)
     if column_names:
-        qs = qs.filter(column_name__in=column_names)
-
-    # Agrupa regras
+        rules_qs = rules_qs.filter(column_name__in=column_names)
+    # agrupar regras
     grouped = {"model_field": {}, "column_name": {}, "column_index": {}}
-    for rl in qs:
+    for rl in rules_qs:
         if rl.model_name and rl.field_name:
-            grouped["model_field"].setdefault((rl.model_name, rl.field_name), []).append(rl)
+            key = (rl.model_name, rl.field_name)
+            grouped["model_field"].setdefault(key, []).append(rl)
         elif rl.column_name:
             grouped["column_name"].setdefault(rl.column_name, []).append(rl)
         elif rl.column_index is not None:
-            grouped["column_index"].setdefault(int(rl.column_index), []).append(rl)
-
-    # Auditoria por linha
+            grouped["column_index"].setdefault(rl.column_index, []).append(rl)
+    # trabalhar com cópia
+    rows = deepcopy(payload)
     audit: List[Dict[str, Any]] = []
-
-    # Aplica modificações
-    for i, row in enumerate(payload):
-        row_changes = []
-        row_id = None
-
-        if isinstance(row, dict):
-            row_id = row.get("__row_id")
-
-            # Regras específicas de model/field
-            if model_name:
-                for (mdl, fld), rules in grouped["model_field"].items():
-                    if mdl == model_name and fld in row:
-                        old_val = row[fld]
-                        for rl in rules:
-                            if rl.match_type == "exact" and old_val == rl.match_value:
-                                row[fld] = rl.substitution_value
-                                if row[fld] != old_val:
-                                    row_changes.append({
+    def _should_apply_rule(row_dict: Dict[str, Any], rl: SubstitutionRule, field: str, value: Any) -> Tuple[bool, Any]:
+        """Avalia condições, tipo de correspondência e retorna (True, novo_valor) se aplicar."""
+        # verifica condições
+        if not _passes_conditions(row_dict, getattr(rl, "filter_conditions", None)):
+            return (False, value)
+        # verifica match
+        mt = (rl.match_type or "exact").lower()
+        mv = rl.match_value
+        sv = rl.substitution_value
+        if mt == "exact":
+            if value == mv: return (True, sv)
+        elif mt == "regex":
+            try:
+                if re.search(str(mv), str(value or "")):
+                    return (True, re.sub(str(mv), str(sv), str(value or "")))
+            except re.error:
+                return (False, value)
+        elif mt == "caseless":
+            if _normalize(value) == _normalize(mv): return (True, sv)
+        return (False, value)
+    def _rule_name(rl: SubstitutionRule) -> str:
+        """Retorna nome legível da regra, usando campos alternativos se não existir 'name'."""
+        return (
+            getattr(rl, "name", None)
+            or getattr(rl, "title", None)
+            or getattr(rl, "label", None)
+            or getattr(rl, "description", None)
+            or f"Rule#{rl.id}"
+        )
+    for rec in rows:
+        # dicionários: usar __row_id e campos nomeados
+        if isinstance(rec, dict):
+            rid = rec.get("__row_id")
+            # regras por model/field
+            for (mdl, fld), rule_list in grouped["model_field"].items():
+                if mdl == model_name and fld in rec:
+                    original = rec[fld]
+                    for rl in rule_list:
+                        apply, new_value = _should_apply_rule(rec, rl, fld, rec[fld])
+                        if apply:
+                            if new_value != original:
+                                rec[fld] = new_value
+                                if return_audit:
+                                    audit.append({
+                                        "__row_id": rid,
                                         "field": fld,
-                                        "old": old_val,
-                                        "new": row[fld],
+                                        "old": original,
+                                        "new": new_value,
                                         "rule_id": rl.id,
-                                        #"rule_name": rl.name,
+                                        "rule_name": _rule_name(rl),
                                     })
-                                break
-                            if rl.match_type == "regex" and re.search(str(rl.match_value), str(old_val)):
-                                row[fld] = re.sub(str(rl.match_value), str(rl.substitution_value), str(old_val))
-                                if row[fld] != old_val:
-                                    row_changes.append({
-                                        "field": fld,
-                                        "old": old_val,
-                                        "new": row[fld],
+                            break
+            # regras por column_name
+            for col, rule_list in grouped["column_name"].items():
+                if col in rec:
+                    original = rec[col]
+                    for rl in rule_list:
+                        apply, new_value = _should_apply_rule(rec, rl, col, rec[col])
+                        if apply:
+                            if new_value != original:
+                                rec[col] = new_value
+                                if return_audit:
+                                    audit.append({
+                                        "__row_id": rid,
+                                        "field": col,
+                                        "old": original,
+                                        "new": new_value,
                                         "rule_id": rl.id,
-                                        #"rule_name": rl.name,
+                                        "rule_name": _rule_name(rl),
                                     })
-                                break
-                            if rl.match_type == "caseless" and _normalize(old_val) == _normalize(rl.match_value):
-                                row[fld] = rl.substitution_value
-                                if row[fld] != old_val:
-                                    row_changes.append({
-                                        "field": fld,
-                                        "old": old_val,
-                                        "new": row[fld],
+                            break
+        # listas ou tuplas: usar índices
+        elif isinstance(rec, (list, tuple)):
+            # converter tupla para lista para permitir mutação
+            if isinstance(rec, tuple):
+                rec = list(rec)
+                rows[rows.index(rec)] = rec  # atualiza referência
+            for idx, rule_list in grouped["column_index"].items():
+                if idx < len(rec):
+                    original = rec[idx]
+                    for rl in rule_list:
+                        # constrói um dict simplificado para avaliar conditions (campo fictício col_x)
+                        row_dict_for_cond = {f"col_{i}": rec[i] for i in range(len(rec))}
+                        apply, new_value = _should_apply_rule(row_dict_for_cond, rl, f"col_{idx}", rec[idx])
+                        if apply:
+                            if new_value != original:
+                                rec[idx] = new_value
+                                if return_audit:
+                                    audit.append({
+                                        "__row_id": None,
+                                        "field": f"col_{idx}",
+                                        "old": original,
+                                        "new": new_value,
                                         "rule_id": rl.id,
-                                        #"rule_name": rl.name,
+                                        "rule_name": _rule_name(rl),
                                     })
-                                break
-
-            # Regras por column_name
-            for col_name, rules in grouped["column_name"].items():
-                if col_name in row:
-                    old_val = row[col_name]
-                    for rl in rules:
-                        if rl.match_type == "exact" and old_val == rl.match_value:
-                            row[col_name] = rl.substitution_value
                             break
-                        if rl.match_type == "regex" and re.search(str(rl.match_value), str(old_val)):
-                            row[col_name] = re.sub(str(rl.match_value), str(rl.substitution_value), str(old_val))
-                            break
-                        if rl.match_type == "caseless" and _normalize(old_val) == _normalize(rl.match_value):
-                            row[col_name] = rl.substitution_value
-                            break
-                    if old_val != row[col_name]:
-                        row_changes.append({
-                            "field": col_name,
-                            "old": old_val,
-                            "new": row[col_name],
-                            "rule_id": rl.id,
-                            #"rule_name": rl.name,
-                        })
-
-        elif isinstance(row, (list, tuple)):
-            # Converte tupla para lista para permitir modificação
-            if isinstance(row, tuple):
-                payload[i] = list(row)
-                row = payload[i]
-            for idx, rules in grouped["column_index"].items():
-                if idx < len(row):
-                    old_val = row[idx]
-                    for rl in rules:
-                        if rl.match_type == "exact" and old_val == rl.match_value:
-                            row[idx] = rl.substitution_value
-                            break
-                        if rl.match_type == "regex" and re.search(str(rl.match_value), str(old_val)):
-                            row[idx] = re.sub(str(rl.match_value), str(rl.substitution_value), str(old_val))
-                            break
-                        if rl.match_type == "caseless" and _normalize(old_val) == _normalize(rl.match_value):
-                            row[idx] = rl.substitution_value
-                            break
-                    if old_val != row[idx]:
-                        row_changes.append({
-                            "field": idx,
-                            "old": old_val,
-                            "new": row[idx],
-                            "rule_id": rl.id,
-                            #"rule_name": rl.name,
-                        })
-
-        audit.append({"row_index": i, "row_id": row_id, "changes": row_changes})
-
-    return (payload, audit) if return_audit else payload
+    return (rows, audit) if return_audit else rows
 
 def apply_substitutions2(payload, company_id, model_name=None, field_names=None,
                         column_names=None):
