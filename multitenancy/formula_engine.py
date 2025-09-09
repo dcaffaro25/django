@@ -2,7 +2,7 @@ from django.apps import apps
 
 from multitenancy.signals import CHANGES_TRACKER, clear_changes, get_changes
 import unicodedata
-
+from copy import deepcopy
 from django.forms.models import model_to_dict
 from django.db.models.signals import post_save, post_delete
 from django.dispatch import receiver
