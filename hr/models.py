@@ -156,10 +156,11 @@ class KPI(TenantAwareBaseModel):
     """
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE)
     name = models.CharField(max_length=255)
+    month_date = models.DateField(help_text="First day of that month.")
     value = models.DecimalField(max_digits=10, decimal_places=2)
 
     def __str__(self):
-        return f"{self.employee.name} - {self.name}"
+        return f"{self.employee.name} - {self.month_date:%b %Y} - {self.name}"
 
 class Bonus(TenantAwareBaseModel):
     """

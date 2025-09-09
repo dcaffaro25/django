@@ -131,6 +131,7 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
+    "EXCEPTION_HANDLER": "core.utils.error_reporting.custom_exception_handler",
 }
 
 # Database

@@ -361,7 +361,8 @@ class SubstitutionRule(TenantAwareBaseModel):
     - `regex` – usa expressões regulares para substituir (`re.sub`).
     - `caseless` – comparação sem diferenciar maiúsculas/minúsculas nem acentuação.
     """
-
+    # NOVO: título/descrição legível da regra, usado em relatórios
+    title = models.CharField(max_length=255, null=True, blank=True)
     model_name = models.CharField(max_length=255, null=True, blank=True)
     field_name = models.CharField(max_length=255, null=True, blank=True)
     column_name = models.CharField(max_length=255, null=True, blank=True)
@@ -384,8 +385,7 @@ class SubstitutionRule(TenantAwareBaseModel):
     substitution_value = models.TextField()
     filter_conditions = JSONField(null=True, blank=True)
 
-    # NOVO: título/descrição legível da regra, usado em relatórios
-    title = models.CharField(max_length=255, null=True, blank=True)
+    
     
     class Meta:
         unique_together = (

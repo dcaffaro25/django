@@ -12,7 +12,7 @@ from django.http import HttpResponse
 from openpyxl import Workbook
 from django.forms.models import model_to_dict
 from django.utils.timezone import now
-from multitenancy.models import Company, Entity
+from multitenancy.models import Company, Entity, IntegrationRule, SubstitutionRule
 from accounting.models import Currency, Bank, BankAccount, Account, CostCenter, Transaction, JournalEntry, BankTransaction
 from core.models import FinancialIndex, IndexQuote, FinancialIndexQuoteForecast
 from billing.models import (
@@ -20,6 +20,8 @@ from billing.models import (
     ProductServiceCategory, ProductService,
     Contract, Invoice, InvoiceLine
 )
+from hr.models import Employee, Position, TimeTracking, KPI, Bonus, RecurringAdjustment
+
 
 # -----------------------
 # MPTT PATH SUPPORT (generic)
@@ -130,6 +132,8 @@ MODEL_APP_MAP = {
     "CostCenter": "accounting",
     "Entity": "multitenancy",
     "Company": "multitenancy",
+    "IntegrationRule": "multitenancy",
+    "SubstitutionRule": "multitenancy",
     "Currency": "accounting",
     "Bank": "accounting",
     "BankAccount": "accounting",
@@ -145,7 +149,15 @@ MODEL_APP_MAP = {
     "InvoiceLine": "billing",
     "FinancialIndex": "core",
     "IndexQuote": "core",
-    "FinancialIndexQuoteForecast": "core"
+    "FinancialIndexQuoteForecast": "core",
+    "Employee": "hr",
+    "Position": "hr",
+    "TimeTracking": "hr",
+    "KPI": "hr",
+    "Bonus": "hr",
+    "RecurringAdjustment": "hr",
+    
+    
 }
 
 def safe_model_dict(instance, exclude_fields=None):
@@ -441,7 +453,7 @@ class BulkImportTemplateDownloadView(APIView):
             "Bank": ["__row_id", "name", "bank_code", "country"],
             "BankAccount": ["__row_id", "name", "branch_id", "account_number", "company_fk", "entity_fk", "currency_fk", "bank_fk", "balance_date", "balance"],
             "Account": ["__row_id", "name", "parent_fk", "account_code", "company_fk", "currency_fk", "bank_account_fk", "account_direction", "balance_date", "balance"],
-            "CostCenter": ["__row_id", "name", "company_fk"],
+            "CostCenter": ["__row_id", "name", "company_fk", "balance_date", "balance"],
             "Entity": ["__row_id", "name", "company_fk", "parent_fk", "inherit_accounts", "inherit_cost_centers"],
             "BusinessPartnerCategory": ["__row_id", "name", "company_fk", "parent_fk"],
             "BusinessPartner": ["__row_id", "name", "company_fk", "partner_type", "category_fk", "identifier", "address", "city", "state", "zipcode", "country", "email", "phone", "currency_fk", "payment_terms", "is_active"],
@@ -456,7 +468,20 @@ class BulkImportTemplateDownloadView(APIView):
             "Transaction": ["__row_id", "company_fk", "date", "entity_fk", "description", "amount", "currency_fk"],
             "JournalEntry": ["__row_id", "date", "company_fk", "transaction_fk", "account_fk", "cost_center_fk", "debit_amount", "credit_amount"],
             "BankTransaction": ["__row_id", "company_fk", "entity_fk", "bank_account_fk", "date", "amount", "description", "currency_fk", "transaction_type", "check_number", "reference_number", "payee", "memo", "account_number", "routing_number", "transaction_id"],
+            "Employee": ["__row_id", "company_fk", "CPF", "name", "position_fk", "hire_date", "salary", "vacation_days", "is_active"],
+            "Position": ["__row_id", "company_fk", "title", "description", "department", "hierarchy_level", "min_salary", "max_salary"],
+            "TimeTracking": ["__row_id", "company_fk", "employee_fk", "month_date", "total_hours_worked", "total_overtime_hours", "overtime_hours_paid", "days_present", "days_absent", 
+                             "leave_days", "effective_hours", "bank_hours_balance", "vacation_start_date", "vacation_end_date", "vacation_days_used", "absence_reason", "status"],
+            "KPI": ["__row_id", "company_fk", "employee_fk", "name", "month_date", "value"],
+            "Bonus": ["__row_id", "company_fk", "employee_fk", "calculation_formula", "value"],
+            "RecurringAdjustment": ["__row_id", "company_fk", "name", "type", "employee_fk", "start_date", "end_date", "base_for_inss", "base_for_fgts", "base_for_irpf", "calculation_formula",
+                                    "employer_cost_formula", "priority", "default_account"],
+            "IntegrationRule": ["__row_id", "company_fk","name","description","trigger_event","execution_order","filter_conditions","rule","use_celery","is_active","last_run_at","times_executed"],
+            "SubstitutionRule": ["__row_id", "company_fk","title","model_name","field_name","column_name","column_index","match_type","match_value","substitution_value","filter_conditions"],
+            
         }
+
+
 
         ws = wb.active
         ws.title = 'Company'
@@ -490,6 +515,18 @@ class BulkImportTemplateDownloadView(APIView):
             ('Transaction', Transaction.objects.filter(company_id=tenant_id), ['id', 'date', 'entity_id', 'description', 'amount', 'state']),
             ('JournalEntry', JournalEntry.objects.filter(company_id=tenant_id), ['id', 'transaction_id', 'account_id', 'debit_amount', 'credit_amount', 'date']),
             ('BankTransaction', BankTransaction.objects.filter(company_id=tenant_id), ['id', 'entity_id', 'bank_account_id', 'date', 'amount', 'description', 'transaction_type', 'status']),
+            ("Employee", Employee.objects.filter(company_id=tenant_id), ["id", "company_id", "CPF", "name", "position_id", "hire_date", "salary", "vacation_days", "is_active"]),
+            ("Position", Position.objects.filter(company_id=tenant_id), ["id", "company_id", "title", "description", "department", "hierarchy_level", "min_salary", "max_salary"]),
+            ("TimeTracking", TimeTracking.objects.filter(company_id=tenant_id), ["id", "company_id", "employee_id", "month_date", "total_hours_worked", "total_overtime_hours", "overtime_hours_paid", "days_present", "days_absent", 
+                             "leave_days", "effective_hours", "bank_hours_balance", "vacation_start_date", "vacation_end_date", "vacation_days_used", "absence_reason", "status"]),
+            ("KPI", KPI.objects.filter(company_id=tenant_id), ["id", "company_if", "employee_id", "name", "month_date", "value"]),
+            ("Bonus", Bonus.objects.filter(company_id=tenant_id), ["id", "company_if", "employee_id", "calculation_formula", "value"]),
+            ("RecurringAdjustment", RecurringAdjustment.objects.filter(company_id=tenant_id), ["id", "company_id", "name", "type", "employee_id", "start_date", "end_date", "base_for_inss", "base_for_fgts", "base_for_irpf", "calculation_formula",
+                                    "employer_cost_formula", "priority", "default_account"]),
+            ("IntegrationRule", IntegrationRule.objects.filter(company_id=tenant_id), ["id", "company_id","name","description","trigger_event","execution_order","filter_conditions","rule","use_celery","is_active","last_run_at","times_executed"]),
+            ("SubstitutionRule", SubstitutionRule.objects.filter(company_id=tenant_id), ["id", "company_id","title","model_name","field_name","column_name","column_index","match_type","match_value","substitution_value","filter_conditions"]),
+            
+            
         ]
 
         for title, queryset, columns in references:
