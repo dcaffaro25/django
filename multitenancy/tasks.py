@@ -194,7 +194,7 @@ def process_import_records(
                         "from": change["old"],
                         "to": change["new"],
                         "rule_id": change["rule_id"],
-                        "rule_name": change["rule_name"],
+                        #"rule_name": change["rule_name"],
                     })
 
                 results.append({
