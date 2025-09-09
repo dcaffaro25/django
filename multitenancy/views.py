@@ -21,6 +21,7 @@ from datetime import timedelta
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 from multitenancy.tasks import dispatch_import, trigger_integration_event
+from core.utils.json_sanitize import json_nullsafe
 
 import pandas as pd
 
@@ -613,4 +614,4 @@ class BulkImportAPIView(APIView):
                 # processa síncrono
                 result = dispatch_import(company_id, model_name, rows, commit=commit, use_celery=False)
                 responses.append({"model": model_name, "result": result})
-        return Response({"imports": responses}, status=status.HTTP_202_ACCEPTED)
+        return Response({"imports": json_nullsafe(responses)}, status=status.HTTP_202_ACCEPTED)
