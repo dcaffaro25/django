@@ -21,7 +21,7 @@ from core.utils.exception_utils import exception_to_dict
 
 from django.core.exceptions import FieldDoesNotExist
 from core.utils.exception_utils import exception_to_dict
-
+from core.utils.db_sequences import reset_pk_sequences
 
 
 @shared_task(bind=True, autoretry_for=(smtplib.SMTPException, ConnectionError), retry_backoff=True, max_retries=5)
@@ -318,6 +318,7 @@ def process_import_records(
         # rollback total se era apenas preview
         if savepoint_id is not None:
             transaction.savepoint_rollback(savepoint_id)
+            reset_pk_sequences([model])
 
     return results
 
