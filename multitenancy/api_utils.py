@@ -21,8 +21,41 @@ from billing.models import (
     Contract, Invoice, InvoiceLine
 )
 from hr.models import Employee, Position, TimeTracking, KPI, Bonus, RecurringAdjustment
+import json
+from datetime import datetime, date, time, timezone
+from decimal import Decimal
 
+def _excel_safe(value):
+    # None is fine
+    if value is None:
+        return None
 
+    # Simple scalars
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    # Decimal -> float (or str if you prefer exactness)
+    if isinstance(value, Decimal):
+        try:
+            return float(value)
+        except Exception:
+            return str(value)
+
+    # Datetime: make naive (Excel/openpyxl dislikes tz-aware)
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+
+    # Dates/times are OK as-is
+    if isinstance(value, (date, time)):
+        return value
+
+    # dict/list/other -> JSON string
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    except Exception:
+        return str(value)
 # -----------------------
 # MPTT PATH SUPPORT (generic)
 # -----------------------
@@ -543,7 +576,7 @@ class BulkImportTemplateDownloadView(APIView):
             for row_idx, obj in enumerate(queryset, start=3):
                 for col_idx, field in enumerate(columns):
                     value = get_dynamic_value(obj, field)
-                    ref_ws.cell(row=row_idx, column=start_col + col_idx, value=value)
+                    ref_ws.cell(row=row_idx, column=start_col + col_idx, value=_excel_safe(value))
 
             col_position += len(columns) + 1  # Move to next table
 

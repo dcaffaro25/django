@@ -100,5 +100,5 @@ def custom_exception_handler(exc, context):
 
     request = context.get("request")
     # debug=True se estiver em modo DEBUG
-    debug = context.get("view").settings.DEBUG if hasattr(context.get("view"), "settings") else False
+    debug = True#context.get("view").settings.DEBUG if hasattr(context.get("view"), "settings") else False
     return get_error_response(request, exc, debug=debug)
