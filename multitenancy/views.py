@@ -591,7 +591,7 @@ class BulkImportAPIView(APIView):
     def post(self, request, *args, **kwargs):
         file = request.FILES['file']
         xls = pd.read_excel(file, sheet_name=None)
-        commit = getattr(request, 'commit', False)
+        commit = request.data.get('commit', False)#getattr(request, 'commit', False)
         company = getattr(request, 'tenant', None)
         company_id = request.data.get('company_id')
         if not company_id and hasattr(request.user, 'company_id'):
