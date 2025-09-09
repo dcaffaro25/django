@@ -15,6 +15,7 @@ import contextlib
 from celery import shared_task
 from django.apps import apps
 from django.db import transaction
+from core.utils.exception_utils import exception_to_dict
 
 @shared_task(bind=True, autoretry_for=(smtplib.SMTPException, ConnectionError), retry_backoff=True, max_retries=5)
 def send_user_invite_email(self, subject, message, to_email):
@@ -204,14 +205,16 @@ def process_import_records(
                     "message": "ok",
                 })
             except Exception as e:
+                error_meta = exception_to_dict(e, include_stack=True)  # or False in prod
                 results.append({
                     "model": model_name,
                     "__row_id": row_id,
                     "status": "error",
                     "action": None,
-                    "data": payload,
+                    "data": payload,              # keep if you need to debug the input row
                     "observations": observations,
-                    "message": str(e),
+                    "message": error_meta["summary"],   # short, human-readable line
+                    "error": error_meta,                # full structured details
                 })
     return results
 
