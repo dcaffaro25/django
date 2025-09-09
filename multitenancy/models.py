@@ -413,5 +413,5 @@ class SubstitutionRule(TenantAwareBaseModel):
             target = f"[idx:{self.column_index}]"
         else:
             target = "<unspecified>"
-        return f"Regra {self.id} – {self.title}_{target}: {self.match_value} -> {self.substitution_value}"
+        return f"({self.id}) {self.title} - {target}: {self.match_value} -> {self.substitution_value}"
 
