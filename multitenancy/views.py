@@ -15,12 +15,12 @@ from .formula_engine import validate_rule, run_rule_in_sandbox
 from rest_framework.authtoken.models import Token
 from django.core.mail import send_mail
 from django.conf import settings
-from .tasks import send_user_invite_email, send_user_email
+from .tasks import send_user_invite_email, send_user_email, prepare_model_for_import, finalize_file_import
 from django.utils import timezone
 from datetime import timedelta
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
-from multitenancy.tasks import dispatch_import, trigger_integration_event
+#from multitenancy.tasks import dispatch_import, trigger_integration_event
 from core.utils.json_sanitize import json_nullsafe
 
 import pandas as pd
@@ -591,27 +591,26 @@ class BulkImportAPIView(APIView):
     def post(self, request, *args, **kwargs):
         file = request.FILES['file']
         xls = pd.read_excel(file, sheet_name=None)
-        commit = _to_bool(request.data.get('commit'), default=False)#getattr(request, 'commit', False)
-        company = getattr(request, 'tenant', None)
-        company_id = request.data.get('company_id')
-        if not company_id and hasattr(request.user, 'company_id'):
-            company_id = request.user.company_id
-        
+
+        commit = _to_bool(request.data.get('commit'), default=False)
+        company_id = request.data.get('company_id') or getattr(request.user, 'company_id', None)
         if not company_id:
             return Response({"error": "No company defined"}, status=400)
-        
-        use_celery = request.data.get('use_celery', False)
-        responses = []
+
+        # Build header: one prep task per model/sheet (skip “References”)
+        header = []
+        sheet_order = []  # keep order for nicer reporting
         for model_name, df in xls.items():
             if model_name == "References":
                 continue
             rows = df.dropna(how='all').to_dict(orient="records")
-            if use_celery:
-                # dispara async
-                async_res = dispatch_import.delay(company_id, model_name, rows, commit=commit, use_celery=True)
-                responses.append({"model": model_name, "task_id": async_res.id})
-            else:
-                # processa síncrono
-                result = dispatch_import(company_id, model_name, rows, commit=commit, use_celery=False)
-                responses.append({"model": model_name, "result": result})
-        return Response({"imports": json_nullsafe(responses)}, status=status.HTTP_202_ACCEPTED)
+            sheet_order.append(model_name)
+            header.append(prepare_model_for_import.s(company_id, model_name, rows))
+
+        # Fan-in: one callback that sees all models and commits atomically (or previews)
+        async_res = chord(header)(finalize_file_import.s(company_id, sheet_order, commit))
+
+        return Response(
+            {"task_id": async_res.id, "message": "File import scheduled"},
+            status=status.HTTP_202_ACCEPTED
+        )

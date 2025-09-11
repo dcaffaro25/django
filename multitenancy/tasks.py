@@ -1,4 +1,6 @@
 # tasks.py (e.g. in multitenancy/tasks.py)
+from django.db import transaction, connection, IntegrityError, DataError, DatabaseError
+from django.core.exceptions import ValidationError
 from celery import shared_task, group, chord
 from django.core.mail import send_mail
 from django.conf import settings
@@ -175,331 +177,243 @@ def _path_depth(row: Dict[str, Any]) -> int:
             return len(str(row[c]).strip().replace(" > ", "\\").split("\\"))
     return 0
 
+# ---------- utilities ----------
+def _friendly_db_message(exc: Exception) -> str:
+    from django.db import IntegrityError, DataError, DatabaseError
+    from django.core.exceptions import ValidationError
+    if isinstance(exc, IntegrityError):
+        cause = getattr(exc, "__cause__", None)
+        detail = getattr(cause, "diag", None)
+        if detail and getattr(detail, "constraint_name", None):
+            return f"Constraint violation ({detail.constraint_name})"
+        return "Integrity constraint violation (duplicate, null, or FK error)"
+    if isinstance(exc, DataError):
+        return "Invalid or too-long data for a column"
+    if isinstance(exc, ValidationError):
+        return f"Validation error: {exc}"
+    if isinstance(exc, DatabaseError):
+        return "Database error"
+    return str(exc)
+
+def _row_observations(audit_by_rowid, row_id):
+    obs = []
+    for chg in audit_by_rowid.get(row_id, []):
+        if chg.get("field") == "__row_id":
+            continue
+        obs.append(
+            f"campo '{chg['field']}' alterado de '{chg['old']}' para '{chg['new']}' "
+            f"(regra id={chg['rule_id']}')"
+        )
+    return obs
+
+# ---------- 1) PREPARE PER MODEL (NO WRITES) ----------
 @shared_task
-def process_import_records(
-    company_id: int,
-    model_name: str,
-    rows: List[Dict[str, Any]],
-    *,
-    commit: bool = True
-) -> List[Dict[str, Any]]:
+def prepare_model_for_import(company_id: int, model_name: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Processa registros de importação:
-      - Aplica substituições com auditoria.
-      - Resolve *_fk e company_fk (inclusive referência por __row_id).
-      - Suporte a MPTT 'path' (define parent/nome, remove colunas de caminho).
-      - Ignora alterações no campo '__row_id'.
-      - Registra id e nome da regra aplicada em cada campo alterado.
-      - Cria ou atualiza instâncias dependendo da presença de 'id'.
-      - Quando commit=False, salva em savepoint para gerar IDs e faz rollback ao final.
+    Apply substitutions and normalize payloads. Validate as much as possible
+    WITHOUT writing to the DB, so we can parallelize safely.
+    Returns per-row diagnostics and a normalized payload for commit phase.
     """
     app_label = MODEL_APP_MAP.get(model_name)
     if not app_label:
-        raise LookupError(f"MODEL_APP_MAP missing entry for '{model_name}'")
+        return {"model": model_name, "error": f"MODEL_APP_MAP missing entry for '{model_name}'"}
+
     model = apps.get_model(app_label, model_name)
 
-    # Preserva original (se precisar inspecionar)
-    original_rows = deepcopy(rows)
-
-    # Substituições com auditoria
-    rows, audit = apply_substitutions(
-        rows,
-        company_id=company_id,
-        model_name=model_name,
-        return_audit=True
-    )
-
-    # Index de auditoria por __row_id
+    # Substitutions + audit (pure-Python)
+    rows, audit = apply_substitutions(rows, company_id=company_id, model_name=model_name, return_audit=True)
     audit_by_rowid: Dict[Any, List[Dict[str, Any]]] = {}
     for change in audit:
         audit_by_rowid.setdefault(change.get("__row_id"), []).append(change)
 
-    # Se MPTT, ordenar por profundidade do path (pais antes de filhos)
+    # Reorder MPTT so parents come first (no DB writes yet)
     if _is_mptt_model(model):
-        rows = sorted(rows, key=_path_depth)
+        rows = sorted(rows, key=lambda r: len(str(_get_path_value(r) or "").replace(" > ", "\\").split("\\")) or 0)
 
-    results: List[Dict[str, Any]] = []
-    row_id_map: Dict[str, Any] = {}  # __row_id -> instance
+    prepared = []
+    had_error = False
 
+    for row in rows:
+        row_id = row.get("__row_id")
+        raw_payload = {k: v for k, v in row.items() if k != "__row_id"}
+        observations = _row_observations(audit_by_rowid, row_id)
+
+        try:
+            payload = _normalize_payload_for_model(model, raw_payload, context_company_id=company_id)
+
+            # Resolve *_fk that are numeric or __row_id references to PREVIOUS rows only by marker.
+            # We DO NOT hit DB here; we only keep the raw value for commit resolution.
+            fk_keys = [k for k in list(payload.keys()) if k.endswith("_fk")]
+            # Keep *_fk as is for the commit phase (where we will resolve with DB)
+            for fk_key in fk_keys:
+                pass
+
+            # MPTT path cleanup (name/parent will be resolved at commit)
+            if _is_mptt_model(model):
+                path_val = _get_path_value(payload)
+                if path_val:
+                    parts = _split_path(path_val)
+                    if not parts:
+                        raise ValueError(f"{model_name}: empty path.")
+                    leaf_name = parts[-1]
+                    payload['name'] = payload.get('name', leaf_name) or leaf_name
+                    # parent resolution deferred to commit
+                    payload.pop('parent_id', None)
+                    payload.pop('parent_fk', None)
+                    for c in PATH_COLS:
+                        payload.pop(c, None)
+
+            prepared.append({
+                "__row_id": row_id,
+                "status": "ok",
+                "payload": payload,
+                "observations": observations,
+                "message": "validated",
+            })
+
+        except Exception as e:
+            had_error = True
+            err = exception_to_dict(e, include_stack=False)
+            if not err.get("summary"):
+                err["summary"] = _friendly_db_message(e)
+            prepared.append({
+                "__row_id": row_id,
+                "status": "error",
+                "payload": raw_payload,
+                "observations": observations,
+                "message": err["summary"],
+                "error": err,
+            })
+
+    return {"model": model_name, "had_error": had_error, "rows": prepared}
+
+# ---------- 2) FINALIZE FOR WHOLE FILE (ONE ATOMIC TX ACROSS MODELS) ----------
+@shared_task
+def finalize_file_import(prepared_list: List[Dict[str, Any]], company_id: int, sheet_order: List[str], commit: bool):
+    """
+    Receives list of {"model": ..., "rows": [...], "had_error": bool} from all sheets.
+    If commit=False -> return diagnostics only (no writes).
+    If commit=True:
+      - If any prep error -> NO WRITES, return diagnostics.
+      - Else open ONE atomic() and apply all models. If any row fails -> rollback ALL.
+    """
+    # Sort outputs by original sheet order
+    prepared_by_model = {x["model"]: x for x in prepared_list if isinstance(x, dict) and "model" in x}
+    ordered_models = [m for m in sheet_order if m in prepared_by_model]
+
+    # If preview or early prep errors, just return
+    any_prep_error = any(prepared_by_model[m].get("had_error") for m in ordered_models)
+    result_payload = []
+    models_touched = []
+
+    if not commit or any_prep_error:
+        # Pass-through (no DB writes)
+        for m in ordered_models:
+            result_payload.append({"model": m, "result": prepared_by_model[m]["rows"]})
+        return {
+            "committed": False,
+            "reason": "preview" if not commit else "prep_errors",
+            "imports": result_payload
+        }
+
+    # COMMIT PHASE: one transaction for the whole file
+    from django.db import IntegrityError
+    # open a single atomic block covering ALL models
     with transaction.atomic():
-        savepoint_id = transaction.savepoint() if not commit else None
+        # Make deferrable constraints fire per statement (Postgres)
+        if connection.vendor == "postgresql":
+            with connection.cursor() as cur:
+                cur.execute("SET CONSTRAINTS ALL IMMEDIATE")
 
-        for row in rows:
-            row_id = row.get("__row_id")
-            observations = []
-            for chg in audit_by_rowid.get(row_id, []):
-                if chg.get("field") == "__row_id":
-                    continue
-                observations.append(
-                    f"campo '{chg['field']}' alterado de '{chg['old']}' para '{chg['new']}' "
-                    f"(regra id={chg['rule_id']}')"
-                )
+        outer_sp = transaction.savepoint()
+        any_error = False
 
-            # Monta payload base
-            raw_payload = {k: v for k, v in row.items() if k != "__row_id"}
+        # stash of __row_id -> instance for intra-model references (resets per model)
+        for model_name in ordered_models:
+            app_label = MODEL_APP_MAP[model_name]
+            model = apps.get_model(app_label, model_name)
+            models_touched.append(model)
+            row_map = {}  # __row_id -> instance (for this model)
 
-            try:
-                # Normalizações genéricas (company_fk, tipos, json, drop unknowns)
-                payload = _normalize_payload_for_model(model, raw_payload, context_company_id=company_id)
+            rows = prepared_by_model[model_name]["rows"]
 
-                # Resolver todos os *_fk
-                fk_keys = [k for k in list(payload.keys()) if k.endswith("_fk")]
-                for fk_key in fk_keys:
-                    field_name = fk_key[:-3]
-                    fk_val = payload.pop(fk_key)
-                    resolved = _resolve_fk(model, field_name, fk_val, row_id_map)
-                    payload[field_name] = resolved
+            for row in rows:
+                row_id = row["__row_id"]
+                observations = row.get("observations", [])
+                payload = dict(row.get("payload", {}))
+                raw_payload = dict(payload)
 
-                # ----- MPTT PATH SUPPORT
-                if _is_mptt_model(model):
-                    path_val = _get_path_value(payload)
-                    if path_val:
-                        parts = _split_path(path_val)
-                        if not parts:
-                            raise ValueError(f"{model_name}: empty path.")
-                        leaf_name = parts[-1]
-                        parent = None
-                        if len(parts) > 1:
-                            parent = _resolve_parent_from_path_chain(model, parts[:-1])
-                        # Set/override name & parent
-                        payload['name'] = payload.get('name', leaf_name) or leaf_name
-                        payload['parent'] = parent
-                        # Remove colunas de caminho e pistas de parent conflitantes
-                        payload.pop('parent_id', None)
-                        payload.pop('parent_fk', None)
-                        for c in PATH_COLS:
-                            payload.pop(c, None)
+                # per-row savepoint: capture error but continue gathering diagnostics
+                try:
+                    # Resolve *_fk now (DB lookups + __row_id indirection within same model)
+                    fk_keys = [k for k in list(payload.keys()) if k.endswith("_fk")]
+                    for fk_key in fk_keys:
+                        field_name = fk_key[:-3]
+                        fk_val = payload.pop(fk_key)
+                        # resolve using prior created instances (row_map) or direct ids
+                        payload[field_name] = _resolve_fk(model, field_name, fk_val, row_map)
 
-                # CREATE or UPDATE
-                if payload.get("id"):
-                    instance = model.objects.get(id=payload["id"])
-                    for field, value in payload.items():
-                        setattr(instance, field, value)
-                    action = "update"
-                else:
-                    instance = model(**payload)
-                    action = "create"
+                    # Resolve MPTT parent chain if applicable
+                    if _is_mptt_model(model):
+                        path_val = _get_path_value(payload)
+                        if path_val:
+                            parts = _split_path(path_val)
+                            parent = None
+                            if len(parts) > 1:
+                                parent = _resolve_parent_from_path_chain(model, parts[:-1])
+                            payload['parent'] = parent
+                            payload.pop('parent_id', None)
 
-                if commit or (not commit):
-                    # Mesmo com commit=False salvamos para obter PKs e permitir referências via __row_id,
-                    # e depois faremos rollback do savepoint ao final.
-                    instance.save()
+                    with transaction.atomic():
+                        if payload.get("id"):
+                            instance = model.objects.select_for_update().get(id=payload["id"])
+                            for field, value in payload.items():
+                                setattr(instance, field, value)
+                            action = "update"
+                        else:
+                            instance = model(**payload)
+                            action = "create"
 
-                # Mapeia __row_id -> instance para FKs subsequentes nesta carga
-                if row_id:
-                    row_id_map[row_id] = instance
+                        instance.save()
 
-                results.append({
-                    "model": model_name,
-                    "__row_id": row_id,
-                    "status": "success",
-                    "action": action,
-                    "data": safe_model_dict(
-                        instance,
-                        exclude_fields=['created_by', 'updated_by', 'is_deleted', 'is_active']
-                    ),
-                    "observations": observations,
-                    "message": "ok",
-                })
+                    if row_id:
+                        row_map[row_id] = instance
 
-            except Exception as e:
-                error_meta = exception_to_dict(e, include_stack=True)
-                results.append({
-                    "model": model_name,
-                    "__row_id": row_id,
-                    "status": "error",
-                    "action": None,
-                    "data": payload if 'payload' in locals() else raw_payload,
-                    "observations": observations,
-                    "message": error_meta["summary"],
-                    "error": error_meta,
-                })
+                    row.update({
+                        "status": "success",
+                        "action": action,
+                        "data": safe_model_dict(instance, exclude_fields=['created_by','updated_by','is_deleted','is_active']),
+                        "message": "ok",
+                    })
 
-        # rollback total se era apenas preview
-        if savepoint_id is not None:
-            transaction.savepoint_rollback(savepoint_id)
-            reset_pk_sequences([model])
+                except Exception as e:
+                    any_error = True
+                    err = exception_to_dict(e, include_stack=False)
+                    if not err.get("summary"):
+                        err["summary"] = _friendly_db_message(e)
+                    row.update({
+                        "status": "error",
+                        "action": None,
+                        "data": raw_payload,
+                        "message": err["summary"],
+                        "error": err,
+                    })
 
-    return results
+            # Append per model block into final payload (after processing all rows)
+            result_payload.append({"model": model_name, "result": rows})
 
-@shared_task
-def process_import_records2(company_id, model_name, rows, commit=True):
-    """
-    Processa uma lista de dicionários (rows) criando ou atualizando objetos.
-    Retorna lista de resultados por registro, incluindo observações de substituição.
-    """
-    app_label = MODEL_APP_MAP.get(model_name)
-    if not app_label:
-        raise LookupError(f"No app mapping for model '{model_name}'")
-    model = apps.get_model(app_label, model_name)
+        if any_error:
+            transaction.savepoint_rollback(outer_sp)
+            # optional: reset sequences for all models touched (IDs may have advanced in failed rows)
+            reset_pk_sequences(models_touched)
+            return {
+                "committed": False,
+                "reason": "row_errors",
+                "imports": result_payload
+            }
 
-    # Copia profunda para preservar valores originais
-    original_rows = [row.copy() for row in rows]
-    # Aplica substituições in-place
-    rows, audits = apply_substitutions(rows, company_id=company_id, model_name=model_name, return_audit=True)
-    
-    audit_by_index = {a["record_index"]: a for a in audits}
-    
-    results = []
-    with transaction.atomic():
-        for idx, row_data in enumerate(rows):
-            row_id = row_data.pop('__row_id', None)
-            observations = []
-            # Calcula diferenças entre original e transformado
-            original_data = original_rows[idx]
-            for key, orig_val in original_data.items():
-                new_val = row_data.get(key)
-                if orig_val != new_val:
-                    observations.append(
-                        f"campo '{key}' alterado de '{orig_val}' para '{new_val}'"
-                    )
-
-            try:
-                if commit and row_data.get('id'):
-                    instance = model.objects.get(id=row_data['id'])
-                    for field, value in row_data.items():
-                        setattr(instance, field, value)
-                    action = 'update'
-                else:
-                    instance = model(**row_data)
-                    action = 'create'
-                if commit:
-                    instance.save()
-                results.append({
-                    "model": model_name,
-                    "__row_id": row_id,
-                    "status": "success",
-                    "action": action,
-                    "data": safe_model_dict(instance, exclude_fields=['created_by', 'updated_by', 'is_deleted', 'is_active']),
-                    "observations": observations,
-                    "message": "ok"
-                })
-            except Exception as e:
-                results.append({
-                    "model": model_name,
-                    "__row_id": row_id,
-                    "status": "error",
-                    "action": None,
-                    "data": row_data,
-                    "observations": observations,
-                    "message": str(e),
-                })
-    return results
-
-@shared_task
-def process_import_records3(
-    company_id: int,
-    model_name: str,
-    rows: List[Dict[str, Any]],
-    *,
-    commit: bool = True
-) -> List[Dict[str, Any]]:
-    """
-    Processa registros de importação:
-      - Aplica substituições com auditoria.
-      - Ignora alterações no campo '__row_id'.
-      - Registra id e nome da regra aplicada em cada campo alterado.
-      - Cria ou atualiza instâncias dependendo da presença de 'id'.
-    """
-    app_label = MODEL_APP_MAP.get(model_name)
-    if not app_label:
-        raise LookupError(f"MODEL_APP_MAP missing entry for '{model_name}'")
-
-    model = apps.get_model(app_label, model_name)
-
-    # Copia original apenas se quiser preservar (para logs mais profundos).
-    # Não é estritamente necessário com auditoria de substituições.
-    original_rows = deepcopy(rows)
-
-    # Aplica substituições e coleta auditoria
-    rows, audit = apply_substitutions(
-        rows,
-        company_id=company_id,
-        model_name=model_name,
-        return_audit=True
-    )
-
-    # cria um índice de auditoria por __row_id
-    audit_by_rowid: Dict[Any, List[Dict[str, Any]]] = {}
-    for change in audit:
-        rowid = change.get("__row_id")
-        audit_by_rowid.setdefault(rowid, []).append(change)
-    results: List[Dict[str, Any]] = []
-    with transaction.atomic():
-        for row in rows:
-            row_id = row.get("__row_id")
-            # monta observações baseadas na auditoria (ignorando __row_id)
-            observations = []
-            for chg in audit_by_rowid.get(row_id, []):
-                if chg.get("field") == "__row_id":
-                    continue
-                observations.append(
-                    f"campo '{chg['field']}' alterado de '{chg['old']}' para '{chg['new']}' "
-                    f"(regra id={chg['rule_id']}')"
-                )
-            try:
-                payload = {k: v for k, v in row.items() if k != "__row_id"}
-                if commit and payload.get("id"):
-                    instance = model.objects.get(id=payload["id"])
-                    for field, value in payload.items():
-                        setattr(instance, field, value)
-                    action = "update"
-                else:
-                    instance = model(**payload)
-                    action = "create"
-                if commit:
-                    instance.save()
-                results.append({
-                    "model": model_name,
-                    "__row_id": row_id,
-                    "status": "success",
-                    "action": action,
-                    "data": safe_model_dict(instance, exclude_fields=['created_by', 'updated_by', 'is_deleted', 'is_active']),
-                    "observations": observations,
-                    "message": "ok",
-                })
-            except Exception as e:
-                error_meta = exception_to_dict(e, include_stack=True)  # or False in prod
-                results.append({
-                    "model": model_name,
-                    "__row_id": row_id,
-                    "status": "error",
-                    "action": None,
-                    "data": payload,              # keep if you need to debug the input row
-                    "observations": observations,
-                    "message": error_meta["summary"],   # short, human-readable line
-                    "error": error_meta,                # full structured details
-                })
-    return results
-
-@shared_task
-def finalize_import(results, company_id, model_name, commit=True):
-    """
-    Callback de um chord: junta todos os resultados de substituição, aplica a importação
-    em lote único, e retorna a soma dos resultados.
-    """
-    # "results" é uma lista de listas (uma por chunk)
-    rows = []
-    for subset in results:
-        rows.extend(subset)
-    # Reutiliza process_import_records para gravação final (commit=True)
-    return process_import_records(company_id, model_name, rows, commit=commit)
-
-@shared_task
-def dispatch_import(company_id, model_name, rows, commit=True, use_celery=True):
-    """
-    Decide se processa sincronicamente ou cria subtarefas de substituição em lotes.
-    Se use_celery=True e o total excede IMPORT_MAX_BATCH_SIZE, divide em chunks
-    e cria um chord cujo callback finaliza a importação de uma vez.
-    """
-    batch_size = getattr(settings, 'IMPORT_MAX_BATCH_SIZE', 1000)
-    if not use_celery or len(rows) <= batch_size:
-        return process_import_records(company_id, model_name, rows, commit=commit)
-
-    # Divide em lotes e cria chord
-    header = []
-    for i in range(0, len(rows), batch_size):
-        chunk = rows[i:i+batch_size]
-        header.append(apply_substitutions.s(chunk, company_id, model_name))
-    # O callback finalize_import será chamado quando todos os chunks concluírem
-    return chord(header)(finalize_import.s(company_id, model_name, commit))
+        # No errors → let the outer atomic commit
+        return {
+            "committed": True,
+            "imports": result_payload
+        }
