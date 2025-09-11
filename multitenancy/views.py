@@ -15,7 +15,7 @@ from .formula_engine import validate_rule, run_rule_in_sandbox
 from rest_framework.authtoken.models import Token
 from django.core.mail import send_mail
 from django.conf import settings
-from .tasks import send_user_invite_email, send_user_email, prepare_model_for_import, finalize_file_import
+from .tasks import send_user_invite_email, send_user_email, run_import_job, execute_import_job
 from django.utils import timezone
 from datetime import timedelta
 from django.utils.decorators import method_decorator
@@ -586,32 +586,37 @@ class IntegrationRuleViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
 
 class BulkImportAPIView(APIView):
     """
-    Endpoint de importação em massa.
-    Divide o DataFrame em chunks e utiliza Celery se use_celery=True.
+    One-shot file import (one job per file).
+    Can run with Celery (async) or synchronously (no Celery).
     """
     def post(self, request, *args, **kwargs):
-        file = request.FILES['file']
+        file = request.FILES["file"]
         xls = pd.read_excel(file, sheet_name=None)
 
-        commit = _to_bool(request.data.get('commit'), default=False)
-        company_id = request.data.get('company_id') or getattr(request.user, 'company_id', None)
+        commit = _to_bool(request.data.get("commit"), default=False)
+        use_celery = _to_bool(request.data.get("use_celery"), default=False)
+
+        company_id = request.data.get("company_id") or getattr(request.user, "company_id", None)
         if not company_id:
             return Response({"error": "No company defined"}, status=400)
 
-        # Build header: one prep task per model/sheet (skip “References”)
-        header = []
-        sheet_order = []  # keep order for nicer reporting
+        # Build one payload for the whole file (skip auxiliary sheets)
+        sheets = []
         for model_name, df in xls.items():
             if model_name == "References":
                 continue
-            rows = df.dropna(how='all').to_dict(orient="records")
-            sheet_order.append(model_name)
-            header.append(prepare_model_for_import.s(company_id, model_name, rows))
+            rows = df.dropna(how="all").to_dict(orient="records")
+            sheets.append({"model": model_name, "rows": rows})
 
-        # Fan-in: one callback that sees all models and commits atomically (or previews)
-        async_res = chord(header)(finalize_file_import.s(company_id, sheet_order, commit))
+        if use_celery:
+            # ONE task for the entire file import
+            async_res = run_import_job.delay(company_id, sheets, commit)
+            return Response(
+                {"task_id": async_res.id, "message": "Import scheduled"},
+                status=status.HTTP_202_ACCEPTED
+            )
 
-        return Response(
-            {"task_id": async_res.id, "message": "File import scheduled"},
-            status=status.HTTP_202_ACCEPTED
-        )
+        # Synchronous path (no Celery)
+        result = execute_import_job(company_id, sheets, commit)
+        http_status = status.HTTP_200_OK if result.get("committed") else status.HTTP_400_BAD_REQUEST
+        return Response(result, status=http_status)

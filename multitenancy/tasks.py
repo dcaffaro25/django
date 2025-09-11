@@ -207,153 +207,203 @@ def _row_observations(audit_by_rowid, row_id):
     return obs
 
 # ---------- 1) PREPARE PER MODEL (NO WRITES) ----------
-@shared_task
-def prepare_model_for_import(company_id: int, model_name: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _friendly_db_message(exc: Exception) -> str:
+    # quick mapper; expand as needed
+    cause = getattr(exc, "__cause__", None)
+    code = getattr(cause, "pgcode", None)
+    if isinstance(exc, IntegrityError):
+        if code == "23505": return "Unique constraint violation (duplicate)"
+        if code == "23503": return "Foreign key violation (related row missing)"
+        if code == "23502": return "NOT NULL violation (required field missing)"
+        if code == "23514": return "CHECK constraint violation"
+        return "Integrity constraint violation"
+    if isinstance(exc, DataError):
+        return "Invalid/too long value for column"
+    if isinstance(exc, ValidationError):
+        return "Validation error"
+    if isinstance(exc, DatabaseError):
+        return "Database error"
+    return str(exc)
+
+def _row_observations(audit_by_rowid, row_id):
+    obs = []
+    for chg in audit_by_rowid.get(row_id, []):
+        if chg.get("field") == "__row_id":
+            continue
+        obs.append(
+            f"campo '{chg['field']}' alterado de '{chg['old']}' para '{chg['new']}' "
+            f"(regra id={chg['rule_id']}')"
+        )
+    return obs
+
+def _preflight_basic(model, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """
-    Apply substitutions and normalize payloads. Validate as much as possible
-    WITHOUT writing to the DB, so we can parallelize safely.
-    Returns per-row diagnostics and a normalized payload for commit phase.
+    Return a dict row_id -> preflight_error for quick wins (missing required, unknown columns).
+    Keep it lightweight; DB-free.
     """
-    app_label = MODEL_APP_MAP.get(model_name)
-    if not app_label:
-        return {"model": model_name, "error": f"MODEL_APP_MAP missing entry for '{model_name}'"}
+    pre = {}
+    required = {f.name for f in model._meta.fields
+                if not f.null and not f.auto_created and not getattr(f, "has_default", False)}
+    allowed = {f.name for f in model._meta.fields} | {f.name + "_fk" for f in model._meta.fields} \
+              | set(PATH_COLS) | {"__row_id", "id"}
 
-    model = apps.get_model(app_label, model_name)
+    for i, row in enumerate(rows):
+        rid = row.get("__row_id") or f"row{i+1}"
+        payload = {k: v for k, v in row.items() if k != "__row_id"}
+        missing = sorted([f for f in required if f not in payload or payload.get(f) in ("", None)])
+        unknown = sorted([k for k in payload.keys() if k not in allowed])
+        msgs = []
+        if missing:
+            msgs.append(f"Missing required: {', '.join(missing)}")
+        if unknown:
+            msgs.append(f"Unknown columns: {', '.join(unknown)}")
+        if msgs:
+            pre[rid] = {"code": "E-PREFLIGHT", "message": " | ".join(msgs),
+                        "fields": {"missing": missing, "unknown": unknown}}
+    return pre
 
-    # Substitutions + audit (pure-Python)
-    rows, audit = apply_substitutions(rows, company_id=company_id, model_name=model_name, return_audit=True)
-    audit_by_rowid: Dict[Any, List[Dict[str, Any]]] = {}
-    for change in audit:
-        audit_by_rowid.setdefault(change.get("__row_id"), []).append(change)
+# ---- core executor ---------------------------------------------------------
 
-    # Reorder MPTT so parents come first (no DB writes yet)
-    if _is_mptt_model(model):
-        rows = sorted(rows, key=lambda r: len(str(_get_path_value(r) or "").replace(" > ", "\\").split("\\")) or 0)
-
-    prepared = []
-    had_error = False
-
-    for row in rows:
-        row_id = row.get("__row_id")
-        raw_payload = {k: v for k, v in row.items() if k != "__row_id"}
-        observations = _row_observations(audit_by_rowid, row_id)
-
-        try:
-            payload = _normalize_payload_for_model(model, raw_payload, context_company_id=company_id)
-
-            # Resolve *_fk that are numeric or __row_id references to PREVIOUS rows only by marker.
-            # We DO NOT hit DB here; we only keep the raw value for commit resolution.
-            fk_keys = [k for k in list(payload.keys()) if k.endswith("_fk")]
-            # Keep *_fk as is for the commit phase (where we will resolve with DB)
-            for fk_key in fk_keys:
-                pass
-
-            # MPTT path cleanup (name/parent will be resolved at commit)
-            if _is_mptt_model(model):
-                path_val = _get_path_value(payload)
-                if path_val:
-                    parts = _split_path(path_val)
-                    if not parts:
-                        raise ValueError(f"{model_name}: empty path.")
-                    leaf_name = parts[-1]
-                    payload['name'] = payload.get('name', leaf_name) or leaf_name
-                    # parent resolution deferred to commit
-                    payload.pop('parent_id', None)
-                    payload.pop('parent_fk', None)
-                    for c in PATH_COLS:
-                        payload.pop(c, None)
-
-            prepared.append({
-                "__row_id": row_id,
-                "status": "ok",
-                "payload": payload,
-                "observations": observations,
-                "message": "validated",
-            })
-
-        except Exception as e:
-            had_error = True
-            err = exception_to_dict(e, include_stack=False)
-            if not err.get("summary"):
-                err["summary"] = _friendly_db_message(e)
-            prepared.append({
-                "__row_id": row_id,
-                "status": "error",
-                "payload": raw_payload,
-                "observations": observations,
-                "message": err["summary"],
-                "error": err,
-            })
-
-    return {"model": model_name, "had_error": had_error, "rows": prepared}
-
-# ---------- 2) FINALIZE FOR WHOLE FILE (ONE ATOMIC TX ACROSS MODELS) ----------
-@shared_task
-def finalize_file_import(prepared_list: List[Dict[str, Any]], company_id: int, sheet_order: List[str], commit: bool):
+def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool) -> Dict[str, Any]:
     """
-    Receives list of {"model": ..., "rows": [...], "had_error": bool} from all sheets.
-    If commit=False -> return diagnostics only (no writes).
-    If commit=True:
-      - If any prep error -> NO WRITES, return diagnostics.
-      - Else open ONE atomic() and apply all models. If any row fails -> rollback ALL.
+    Orchestrates the entire file import (all models).
+    - commit=False: dry run (no writes), full row diagnostics
+    - commit=True: ONE cross-model atomic commit; if any row fails -> rollback all
     """
-    # Sort outputs by original sheet order
-    prepared_by_model = {x["model"]: x for x in prepared_list if isinstance(x, dict) and "model" in x}
-    ordered_models = [m for m in sheet_order if m in prepared_by_model]
+    # 1) Prepare & normalize each sheet (no writes)
+    prepared = []          # [{model, rows:[{__row_id, payload, observations}] , had_error}]
+    models_in_order = []   # keep order
+    any_prep_error = False
 
-    # If preview or early prep errors, just return
-    any_prep_error = any(prepared_by_model[m].get("had_error") for m in ordered_models)
-    result_payload = []
-    models_touched = []
+    for sheet in sheets:
+        model_name = sheet["model"]
+        app_label = MODEL_APP_MAP.get(model_name)
+        if not app_label:
+            prepared.append({"model": model_name,
+                             "rows": [],
+                             "had_error": True,
+                             "sheet_error": f"MODEL_APP_MAP missing entry for '{model_name}'"})
+            any_prep_error = True
+            continue
 
+        model = apps.get_model(app_label, model_name)
+        raw_rows = sheet["rows"]
+
+        # substitutions + audit (pure-python)
+        rows, audit = apply_substitutions(raw_rows, company_id=company_id,
+                                          model_name=model_name, return_audit=True)
+        audit_by_rowid = {}
+        for ch in audit:
+            audit_by_rowid.setdefault(ch.get("__row_id"), []).append(ch)
+
+        # order for MPTT
+        if _is_mptt_model(model):
+            rows = sorted(rows, key=_path_depth)
+
+        # lightweight preflight (required/unknown)
+        preflight_map = _preflight_basic(model, rows)
+
+        packed_rows = []
+        had_err = False
+        for idx, row in enumerate(rows):
+            rid = row.get("__row_id") or f"row{idx+1}"
+            observations = _row_observations(audit_by_rowid, rid)
+            raw_payload = {k: v for k, v in row.items() if k != "__row_id"}
+
+            # normalize without hitting DB
+            try:
+                payload = _normalize_payload_for_model(model, raw_payload, context_company_id=company_id)
+
+                # strip path hints; parent resolution deferred to commit
+                if _is_mptt_model(model):
+                    path_val = _get_path_value(payload)
+                    if path_val:
+                        parts = _split_path(path_val)
+                        if not parts:
+                            raise ValueError(f"{model_name}: empty path.")
+                        leaf = parts[-1]
+                        payload['name'] = payload.get('name', leaf) or leaf
+                        payload.pop('parent_id', None)
+                        payload.pop('parent_fk', None)
+                        for c in PATH_COLS:
+                            payload.pop(c, None)
+
+                row_obj = {"__row_id": rid, "payload": payload,
+                           "observations": observations, "status": "ok", "message": "validated"}
+
+                # attach preflight errors if any
+                if rid in preflight_map:
+                    row_obj.update({
+                        "status": "error",
+                        "preflight_error": preflight_map[rid],
+                        "message": preflight_map[rid]["message"]
+                    })
+                    had_err = True
+
+                packed_rows.append(row_obj)
+
+            except Exception as e:
+                had_err = True
+                err = exception_to_dict(e, include_stack=False)
+                if not err.get("summary"):
+                    err["summary"] = _friendly_db_message(e)
+                packed_rows.append({
+                    "__row_id": rid,
+                    "status": "error",
+                    "payload": raw_payload,
+                    "observations": observations,
+                    "message": err["summary"],
+                    "error": err
+                })
+
+        any_prep_error = any_prep_error or had_err
+        prepared.append({"model": model_name, "rows": packed_rows, "had_error": had_err})
+        models_in_order.append(model_name)
+
+    # 2) If preview OR prep errors → no writes, just return diagnostics
     if not commit or any_prep_error:
-        # Pass-through (no DB writes)
-        for m in ordered_models:
-            result_payload.append({"model": m, "result": prepared_by_model[m]["rows"]})
         return {
             "committed": False,
             "reason": "preview" if not commit else "prep_errors",
-            "imports": result_payload
+            "imports": [{"model": b["model"], "result": b["rows"]} for b in prepared]
         }
 
-    # COMMIT PHASE: one transaction for the whole file
-    from django.db import IntegrityError
-    # open a single atomic block covering ALL models
+    # 3) COMMIT phase: one cross-model atomic transaction; per-row savepoints for diagnostics
+    models_touched = []
+    result_payload = []
+    any_row_error = False
+
     with transaction.atomic():
-        # Make deferrable constraints fire per statement (Postgres)
         if connection.vendor == "postgresql":
+            # fire deferrable constraints per statement
             with connection.cursor() as cur:
                 cur.execute("SET CONSTRAINTS ALL IMMEDIATE")
 
         outer_sp = transaction.savepoint()
-        any_error = False
 
-        # stash of __row_id -> instance for intra-model references (resets per model)
-        for model_name in ordered_models:
+        for model_name in models_in_order:
             app_label = MODEL_APP_MAP[model_name]
             model = apps.get_model(app_label, model_name)
             models_touched.append(model)
-            row_map = {}  # __row_id -> instance (for this model)
 
-            rows = prepared_by_model[model_name]["rows"]
+            # For intra-model __row_id FKs
+            row_map = {}  # __row_id -> instance
+
+            rows = next(b["rows"] for b in prepared if b["model"] == model_name)
 
             for row in rows:
-                row_id = row["__row_id"]
-                observations = row.get("observations", [])
-                payload = dict(row.get("payload", {}))
+                rid = row["__row_id"]
+                payload = dict(row.get("payload") or {})
                 raw_payload = dict(payload)
 
-                # per-row savepoint: capture error but continue gathering diagnostics
                 try:
-                    # Resolve *_fk now (DB lookups + __row_id indirection within same model)
-                    fk_keys = [k for k in list(payload.keys()) if k.endswith("_fk")]
-                    for fk_key in fk_keys:
+                    # resolve *_fk now (DB lookups + __row_id indirection)
+                    for fk_key in [k for k in list(payload.keys()) if k.endswith("_fk")]:
                         field_name = fk_key[:-3]
                         fk_val = payload.pop(fk_key)
-                        # resolve using prior created instances (row_map) or direct ids
                         payload[field_name] = _resolve_fk(model, field_name, fk_val, row_map)
 
-                    # Resolve MPTT parent chain if applicable
+                    # resolve MPTT parent chain
                     if _is_mptt_model(model):
                         path_val = _get_path_value(payload)
                         if path_val:
@@ -364,20 +414,25 @@ def finalize_file_import(prepared_list: List[Dict[str, Any]], company_id: int, s
                             payload['parent'] = parent
                             payload.pop('parent_id', None)
 
+                    # per-row savepoint so we can continue collecting errors
                     with transaction.atomic():
                         if payload.get("id"):
                             instance = model.objects.select_for_update().get(id=payload["id"])
-                            for field, value in payload.items():
-                                setattr(instance, field, value)
+                            for f, v in payload.items():
+                                setattr(instance, f, v)
                             action = "update"
                         else:
                             instance = model(**payload)
                             action = "create"
 
+                        # business validation before save → better, field-level errors
+                        if hasattr(instance, "full_clean"):
+                            instance.full_clean()
+
                         instance.save()
 
-                    if row_id:
-                        row_map[row_id] = instance
+                    if rid:
+                        row_map[rid] = instance
 
                     row.update({
                         "status": "success",
@@ -387,7 +442,7 @@ def finalize_file_import(prepared_list: List[Dict[str, Any]], company_id: int, s
                     })
 
                 except Exception as e:
-                    any_error = True
+                    any_row_error = True
                     err = exception_to_dict(e, include_stack=False)
                     if not err.get("summary"):
                         err["summary"] = _friendly_db_message(e)
@@ -399,21 +454,24 @@ def finalize_file_import(prepared_list: List[Dict[str, Any]], company_id: int, s
                         "error": err,
                     })
 
-            # Append per model block into final payload (after processing all rows)
             result_payload.append({"model": model_name, "result": rows})
 
-        if any_error:
+        if any_row_error:
             transaction.savepoint_rollback(outer_sp)
-            # optional: reset sequences for all models touched (IDs may have advanced in failed rows)
-            reset_pk_sequences(models_touched)
+            reset_pk_sequences(models_touched)  # keep IDs tidy after rollback
             return {
                 "committed": False,
                 "reason": "row_errors",
                 "imports": result_payload
             }
 
-        # No errors → let the outer atomic commit
+        # success → commit all models in one shot
         return {
             "committed": True,
             "imports": result_payload
         }
+
+# Celery entrypoint: one task per file
+@shared_task
+def run_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool) -> Dict[str, Any]:
+    return execute_import_job(company_id, sheets, commit)
