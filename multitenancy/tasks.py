@@ -264,14 +264,25 @@ def _preflight_basic(model, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, A
 
 # ---- core executor ---------------------------------------------------------
 
+from typing import Any, Dict, List
+from django.db import transaction, connection
+from django.apps import apps
+
+# Assumes these exist in your project:
+# MODEL_APP_MAP, apply_substitutions
+# safe_model_dict, exception_to_dict, reset_pk_sequences
+# _is_mptt_model, _path_depth, _get_path_value, _split_path, _resolve_parent_from_path_chain
+# _normalize_payload_for_model, _resolve_fk, PATH_COLS
+
 def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool) -> Dict[str, Any]:
     """
-    Orchestrates the entire file import (all models).
-    - commit=False: DB-backed dry-run (no writes ultimately), full row diagnostics
-    - commit=True : ONE cross-model atomic commit; if any row fails -> rollback all
+    One-shot import for all models in a file.
+    - commit=False: DB-backed dry run (validates exactly like commit), then rollback
+    - commit=True : cross-model atomic; if any row fails, rollback everything
+    Always returns per-row diagnostics and includes the inferred 'action'.
     """
 
-    # ----------------- local helpers (no external deps) -----------------
+    # ----------------- helpers -----------------
     def _friendly_db_message(exc: Exception) -> str:
         from django.db import IntegrityError, DataError, DatabaseError
         from django.core.exceptions import ValidationError
@@ -303,12 +314,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
         return obs
 
     def _preflight_basic(model, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        """
-        Lightweight DB-free checks:
-          - missing required (not null, no default, not auto)
-          - unknown columns
-        Returns: row_id -> preflight_error dict
-        """
+        """DB-free checks: missing required & unknown columns."""
         pre = {}
         required = {
             f.name for f in model._meta.fields
@@ -330,17 +336,52 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
             if unknown:
                 msgs.append(f"Unknown columns: {', '.join(unknown)}")
             if msgs:
-                pre[rid] = {
-                    "code": "E-PREFLIGHT",
-                    "message": " | ".join(msgs),
-                    "fields": {"missing": missing, "unknown": unknown}
-                }
+                pre[rid] = {"code": "E-PREFLIGHT", "message": " | ".join(msgs),
+                            "fields": {"missing": missing, "unknown": unknown}}
         return pre
-    # -------------------------------------------------------------------
+
+    def _coerce_pk(val):
+        """Return int PK if val looks numeric (e.g., 3, '3', '3.0'); else None."""
+        if val is None or val == "":
+            return None
+        if isinstance(val, int):
+            return val
+        if isinstance(val, float):
+            return int(val) if float(val).is_integer() else None
+        s = str(val).strip()
+        if s.isdigit():
+            return int(s)
+        # '3.0' from Excel cells
+        try:
+            f = float(s)
+            return int(f) if f.is_integer() else None
+        except Exception:
+            return None
+
+    def _infer_action_and_clean_id(payload: Dict[str, Any], original_input: Dict[str, Any]):
+        """
+        Decide 'create' vs 'update' and make payload safe for the ORM:
+          - update: id must be coerced to int (pk)
+          - create: drop id if non-numeric; keep as _external_id for diagnostics
+        Returns (action, pk or None, external_id or None)
+        """
+        ext_id = None
+        pk = _coerce_pk(payload.get("id"))
+        if pk is not None:
+            payload["id"] = pk
+            return "update", pk, None
+        # create: remove any non-numeric id to avoid pk assignment issues
+        if "id" in payload:
+            # keep the original text id (if provided) for the UI
+            if "id" in original_input and original_input["id"] not in ("", None):
+                ext_id = str(original_input["id"])
+            payload.pop("id", None)
+        return "create", None, ext_id
+    # -------------------------------------------
 
     # 1) Prepare & normalize each sheet (no writes)
-    prepared: List[Dict[str, Any]] = []   # [{model, rows:[{__row_id, payload, _original_input, observations, status}], had_error}]
-    models_in_order: List[str] = []        # keep original order
+    prepared: List[Dict[str, Any]] = []
+    models_in_order: List[str] = []
     any_prep_error = False
 
     for sheet in sheets:
@@ -371,7 +412,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
         if _is_mptt_model(model):
             rows = sorted(rows, key=_path_depth)
 
-        # quick preflight (missing/unknown)
+        # quick preflight
         preflight_map = _preflight_basic(model, rows)
 
         packed_rows = []
@@ -387,7 +428,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                     model, original_input, context_company_id=company_id
                 )
 
-                # MPTT: keep name, defer parent resolution to commit
+                # MPTT: keep name; defer parent resolution to commit
                 if _is_mptt_model(model):
                     path_val = _get_path_value(payload)
                     if path_val:
@@ -401,6 +442,9 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         for c in PATH_COLS:
                             payload.pop(c, None)
 
+                # Infer action now (so it's available even on error)
+                action, pk, ext_id = _infer_action_and_clean_id(payload, original_input)
+
                 row_obj = {
                     "__row_id": rid,
                     "payload": payload,
@@ -408,6 +452,8 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                     "observations": observations,
                     "status": "ok",
                     "message": "validated",
+                    "action": action,             # <= always present
+                    "external_id": ext_id,        # <= only when create with text id
                 }
 
                 if rid in preflight_map:
@@ -425,14 +471,20 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                 err = exception_to_dict(e, include_stack=False)
                 if not err.get("summary"):
                     err["summary"] = _friendly_db_message(e)
+                # try to infer action from original input (best-effort)
+                tmp_payload = _normalize_payload_for_model(model, original_input, context_company_id=company_id) \
+                              if hasattr(model, "_meta") else original_input
+                action, pk, ext_id = _infer_action_and_clean_id(dict(tmp_payload), original_input)
                 packed_rows.append({
                     "__row_id": rid,
                     "status": "error",
-                    "payload": original_input,
+                    "payload": tmp_payload,
                     "_original_input": original_input,
                     "observations": observations,
                     "message": err["summary"],
                     "error": err,
+                    "action": action,
+                    "external_id": ext_id,
                 })
 
         any_prep_error = any_prep_error or had_err
@@ -444,53 +496,49 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
         models_touched = []
         result_payload = []
         with transaction.atomic():
-            # Make deferrable constraints fire per statement (Postgres)
             if connection.vendor == "postgresql":
                 with connection.cursor() as cur:
                     cur.execute("SET CONSTRAINTS ALL IMMEDIATE")
 
             outer_sp = transaction.savepoint()
-            any_row_error = False
-
             for model_name in models_in_order:
                 app_label = MODEL_APP_MAP[model_name]
                 model = apps.get_model(app_label, model_name)
                 models_touched.append(model)
 
-                # intra-model __row_id references
-                row_map = {}  # __row_id -> instance
-
+                row_map = {}  # __row_id -> instance (intra-model)
                 rows = next(b["rows"] for b in prepared if b["model"] == model_name)
                 out_rows = []
 
                 for row in rows:
                     rid = row["__row_id"]
-
                     # If preflight already failed, surface it and skip DB interaction
                     if row.get("status") == "error" and row.get("preflight_error"):
                         out_rows.append({
                             "__row_id": rid,
                             "status": "error",
-                            "action": None,
+                            "action": row.get("action"),   # intended action
                             "data": row.get("_original_input") or row.get("payload") or {},
                             "message": row["preflight_error"]["message"],
                             "error": row["preflight_error"],
                             "observations": row.get("observations", []),
+                            "external_id": row.get("external_id"),
                         })
-                        any_row_error = True
                         continue
 
                     payload = dict(row.get("payload") or {})
                     original_input = row.get("_original_input") or payload.copy()
+                    # Ensure action reflected even if DB fails before save
+                    action = row.get("action") or "create"
 
                     try:
-                        # Resolve *_fk (DB lookups and/or __row_id indirection)
+                        # Resolve *_fk
                         for fk_key in [k for k in list(payload.keys()) if k.endswith("_fk")]:
                             field_name = fk_key[:-3]
                             fk_val = payload.pop(fk_key)
                             payload[field_name] = _resolve_fk(model, field_name, fk_val, row_map)
 
-                        # Resolve MPTT parent chain
+                        # Resolve MPTT parent
                         if _is_mptt_model(model):
                             path_val = _get_path_value(payload)
                             if path_val:
@@ -499,22 +547,17 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                                 payload['parent'] = parent
                                 payload.pop('parent_id', None)
 
-                        # per-row savepoint so failures don't poison the loop
                         with transaction.atomic():
-                            if payload.get("id"):
+                            if action == "update":
                                 instance = model.objects.select_for_update().get(id=payload["id"])
                                 for f, v in payload.items():
                                     setattr(instance, f, v)
-                                action = "update"
                             else:
                                 instance = model(**payload)
-                                action = "create"
 
-                            # business/model validation
                             if hasattr(instance, "full_clean"):
                                 instance.full_clean()  # includes validate_unique()
 
-                            # Save to trigger DB-level constraints; rolled back later
                             instance.save()
 
                         if rid:
@@ -527,21 +570,22 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                             "data": safe_model_dict(instance, exclude_fields=['created_by','updated_by','is_deleted','is_active']),
                             "message": "ok",
                             "observations": row.get("observations", []),
+                            "external_id": row.get("external_id"),
                         })
 
                     except Exception as e:
-                        any_row_error = True
                         err = exception_to_dict(e, include_stack=False)
                         if not err.get("summary"):
                             err["summary"] = _friendly_db_message(e)
                         out_rows.append({
                             "__row_id": rid,
                             "status": "error",
-                            "action": None,
+                            "action": action,
                             "data": original_input,
                             "message": err["summary"],
                             "error": err,
                             "observations": row.get("observations", []),
+                            "external_id": row.get("external_id"),
                         })
 
                 result_payload.append({"model": model_name, "result": out_rows})
@@ -552,7 +596,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
 
         return {"committed": False, "reason": "preview", "imports": result_payload}
 
-    # 3) COMMIT (all-or-nothing across models), but bail out early if prep failed
+    # 3) COMMIT (cross-model atomic), but bail early on prep errors
     if any_prep_error:
         return {
             "committed": False,
@@ -565,7 +609,6 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
     any_row_error = False
 
     with transaction.atomic():
-        # Fire deferrable constraints per statement (Postgres)
         if connection.vendor == "postgresql":
             with connection.cursor() as cur:
                 cur.execute("SET CONSTRAINTS ALL IMMEDIATE")
@@ -577,8 +620,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
             model = apps.get_model(app_label, model_name)
             models_touched.append(model)
 
-            row_map = {}  # __row_id -> instance (intra-model)
-
+            row_map = {}  # __row_id -> instance (within this model)
             rows = next(b["rows"] for b in prepared if b["model"] == model_name)
 
             for row in rows:
@@ -586,29 +628,28 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
 
                 # Skip rows that already failed preflight
                 if row.get("status") == "error" and row.get("preflight_error"):
-                    result_row = {
-                        "__row_id": rid,
+                    row.update({
                         "status": "error",
-                        "action": None,
+                        "action": row.get("action"),
                         "data": row.get("_original_input") or row.get("payload") or {},
                         "message": row["preflight_error"]["message"],
                         "error": row["preflight_error"],
-                    }
+                    })
                     any_row_error = True
-                    row.update(result_row)
                     continue
 
                 payload = dict(row.get("payload") or {})
                 original_input = row.get("_original_input") or payload.copy()
+                action = row.get("action") or "create"
 
                 try:
-                    # resolve *_fk now (DB lookups + __row_id indirection)
+                    # Resolve *_fk now
                     for fk_key in [k for k in list(payload.keys()) if k.endswith("_fk")]:
                         field_name = fk_key[:-3]
                         fk_val = payload.pop(fk_key)
                         payload[field_name] = _resolve_fk(model, field_name, fk_val, row_map)
 
-                    # resolve MPTT parent chain
+                    # Resolve MPTT parent chain
                     if _is_mptt_model(model):
                         path_val = _get_path_value(payload)
                         if path_val:
@@ -617,16 +658,13 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                             payload['parent'] = parent
                             payload.pop('parent_id', None)
 
-                    # per-row savepoint for diagnostics (outer tx remains clean)
                     with transaction.atomic():
-                        if payload.get("id"):
+                        if action == "update":
                             instance = model.objects.select_for_update().get(id=payload["id"])
                             for f, v in payload.items():
                                 setattr(instance, f, v)
-                            action = "update"
                         else:
                             instance = model(**payload)
-                            action = "create"
 
                         if hasattr(instance, "full_clean"):
                             instance.full_clean()
@@ -650,7 +688,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         err["summary"] = _friendly_db_message(e)
                     row.update({
                         "status": "error",
-                        "action": None,
+                        "action": action,
                         "data": original_input,
                         "message": err["summary"],
                         "error": err,
@@ -660,10 +698,10 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
 
         if any_row_error:
             transaction.savepoint_rollback(outer_sp)
-            reset_pk_sequences(models_touched)  # keep IDs tidy after rollback
+            reset_pk_sequences(models_touched)
             return {"committed": False, "reason": "row_errors", "imports": result_payload}
 
-        # success → commit all models in one shot
+        # Success → commit all
         return {"committed": True, "imports": result_payload}
 
 # Celery entrypoint: one task per file
