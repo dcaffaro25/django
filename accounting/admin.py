@@ -21,4 +21,5 @@ for model in app_models:
         admin.site.register(model)
     except:
         print(f'{model} already registered')
+        
     
