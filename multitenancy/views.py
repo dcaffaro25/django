@@ -6,7 +6,7 @@ from rest_framework.response import Response
 from .models import CustomUser, Company, Entity, IntegrationRule, SubstitutionRule
 from .mixins import ScopedQuerysetMixin
 from .serializers import CustomUserSerializer, CompanySerializer, EntitySerializer, UserLoginSerializer, IntegrationRuleSerializer, EntityMiniSerializer, ChangePasswordSerializer, UserCreateSerializer, PasswordResetForceSerializer, SubstitutionRuleSerializer
-from .api_utils import create_csv_response, create_excel_response
+from .api_utils import create_csv_response, create_excel_response, _to_bool
 from rest_framework import permissions
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.decorators import action
@@ -591,7 +591,7 @@ class BulkImportAPIView(APIView):
     def post(self, request, *args, **kwargs):
         file = request.FILES['file']
         xls = pd.read_excel(file, sheet_name=None)
-        commit = request.data.get('commit', False)#getattr(request, 'commit', False)
+        commit = _to_bool(request.data.get('commit'), default=False)#getattr(request, 'commit', False)
         company = getattr(request, 'tenant', None)
         company_id = request.data.get('company_id')
         if not company_id and hasattr(request.user, 'company_id'):

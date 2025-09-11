@@ -25,6 +25,13 @@ import json
 from datetime import datetime, date, time, timezone
 from decimal import Decimal
 
+def _to_bool(v, default=False):
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1","true","t","yes","y","on"}
+
 def _excel_safe(value):
     # None is fine
     if value is None:
