@@ -363,10 +363,8 @@ class SubstitutionRule(TenantAwareBaseModel):
     """
     # NOVO: título/descrição legível da regra, usado em relatórios
     title = models.CharField(max_length=255, null=True, blank=True)
-    model_name = models.CharField(max_length=255, null=True, blank=True)
-    field_name = models.CharField(max_length=255, null=True, blank=True)
-    column_name = models.CharField(max_length=255, null=True, blank=True)
-    column_index = models.PositiveIntegerField(null=True, blank=True)
+    model_name = models.CharField(max_length=255)
+    field_name = models.CharField(max_length=255)
 
     match_type = models.CharField(
         max_length=50,
@@ -392,25 +390,14 @@ class SubstitutionRule(TenantAwareBaseModel):
             'company',
             'model_name',
             'field_name',
-            'column_name',
-            'column_index',
             'match_value',
+            'filter_conditions'
         )
 
-    def clean(self):
-        super().clean()
-        if not (self.field_name or self.column_name or self.column_index is not None):
-            raise ValidationError(
-                "Defina ao menos um alvo (field_name, column_name ou column_index)."
-            )
 
     def __str__(self):
         if self.model_name and self.field_name:
             target = f"{self.model_name}.{self.field_name}"
-        elif self.column_name:
-            target = f"[col:{self.column_name}]"
-        elif self.column_index is not None:
-            target = f"[idx:{self.column_index}]"
         else:
             target = "<unspecified>"
         return f"({self.id}) {self.title} - {target}: {self.match_value} -> {self.substitution_value}"

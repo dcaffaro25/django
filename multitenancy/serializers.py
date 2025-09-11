@@ -278,6 +278,5 @@ class SubstitutionRuleSerializer(serializers.ModelSerializer):
         model = SubstitutionRule
         fields = [
             'id', 'company', 'model_name', 'field_name',
-            'column_name', 'column_index',
             'match_type', 'match_value', 'substitution_value',
         ]
