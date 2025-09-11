@@ -267,54 +267,127 @@ def _preflight_basic(model, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, A
 def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool) -> Dict[str, Any]:
     """
     Orchestrates the entire file import (all models).
-    - commit=False: dry run (no writes), full row diagnostics
-    - commit=True: ONE cross-model atomic commit; if any row fails -> rollback all
+    - commit=False: DB-backed dry-run (no writes ultimately), full row diagnostics
+    - commit=True : ONE cross-model atomic commit; if any row fails -> rollback all
     """
+
+    # ----------------- local helpers (no external deps) -----------------
+    def _friendly_db_message(exc: Exception) -> str:
+        from django.db import IntegrityError, DataError, DatabaseError
+        from django.core.exceptions import ValidationError
+        cause = getattr(exc, "__cause__", None)
+        code = getattr(cause, "pgcode", None)
+        if isinstance(exc, IntegrityError):
+            if code == "23505": return "Unique constraint violation (duplicate)"
+            if code == "23503": return "Foreign key violation (related row missing)"
+            if code == "23502": return "NOT NULL violation (required field missing)"
+            if code == "23514": return "CHECK constraint violation"
+            return "Integrity constraint violation"
+        if isinstance(exc, DataError):
+            return "Invalid/too long value for column"
+        if isinstance(exc, ValidationError):
+            return "Validation error"
+        if isinstance(exc, DatabaseError):
+            return "Database error"
+        return str(exc)
+
+    def _row_observations(audit_by_rowid, row_id):
+        obs = []
+        for chg in audit_by_rowid.get(row_id, []):
+            if chg.get("field") == "__row_id":
+                continue
+            obs.append(
+                f"campo '{chg['field']}' alterado de '{chg['old']}' para '{chg['new']}' "
+                f"(regra id={chg['rule_id']}')"
+            )
+        return obs
+
+    def _preflight_basic(model, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """
+        Lightweight DB-free checks:
+          - missing required (not null, no default, not auto)
+          - unknown columns
+        Returns: row_id -> preflight_error dict
+        """
+        pre = {}
+        required = {
+            f.name for f in model._meta.fields
+            if not f.null and not f.auto_created and not getattr(f, "has_default", False)
+        }
+        allowed = (
+            {f.name for f in model._meta.fields}
+            | {f.name + "_fk" for f in model._meta.fields}
+            | set(PATH_COLS) | {"__row_id", "id"}
+        )
+        for i, row in enumerate(rows):
+            rid = row.get("__row_id") or f"row{i+1}"
+            payload = {k: v for k, v in row.items() if k != "__row_id"}
+            missing = sorted([f for f in required if f not in payload or payload.get(f) in ("", None)])
+            unknown = sorted([k for k in payload.keys() if k not in allowed])
+            msgs = []
+            if missing:
+                msgs.append(f"Missing required: {', '.join(missing)}")
+            if unknown:
+                msgs.append(f"Unknown columns: {', '.join(unknown)}")
+            if msgs:
+                pre[rid] = {
+                    "code": "E-PREFLIGHT",
+                    "message": " | ".join(msgs),
+                    "fields": {"missing": missing, "unknown": unknown}
+                }
+        return pre
+    # -------------------------------------------------------------------
+
     # 1) Prepare & normalize each sheet (no writes)
-    prepared = []          # [{model, rows:[{__row_id, payload, observations}] , had_error}]
-    models_in_order = []   # keep order
+    prepared: List[Dict[str, Any]] = []   # [{model, rows:[{__row_id, payload, _original_input, observations, status}], had_error}]
+    models_in_order: List[str] = []        # keep original order
     any_prep_error = False
 
     for sheet in sheets:
         model_name = sheet["model"]
         app_label = MODEL_APP_MAP.get(model_name)
         if not app_label:
-            prepared.append({"model": model_name,
-                             "rows": [],
-                             "had_error": True,
-                             "sheet_error": f"MODEL_APP_MAP missing entry for '{model_name}'"})
+            prepared.append({
+                "model": model_name,
+                "rows": [],
+                "had_error": True,
+                "sheet_error": f"MODEL_APP_MAP missing entry for '{model_name}'",
+            })
             any_prep_error = True
             continue
 
         model = apps.get_model(app_label, model_name)
         raw_rows = sheet["rows"]
 
-        # substitutions + audit (pure-python)
-        rows, audit = apply_substitutions(raw_rows, company_id=company_id,
-                                          model_name=model_name, return_audit=True)
+        # substitutions + audit (pure-Python)
+        rows, audit = apply_substitutions(
+            raw_rows, company_id=company_id, model_name=model_name, return_audit=True
+        )
         audit_by_rowid = {}
         for ch in audit:
             audit_by_rowid.setdefault(ch.get("__row_id"), []).append(ch)
 
-        # order for MPTT
+        # ensure parents first for MPTT
         if _is_mptt_model(model):
             rows = sorted(rows, key=_path_depth)
 
-        # lightweight preflight (required/unknown)
+        # quick preflight (missing/unknown)
         preflight_map = _preflight_basic(model, rows)
 
         packed_rows = []
         had_err = False
+
         for idx, row in enumerate(rows):
             rid = row.get("__row_id") or f"row{idx+1}"
             observations = _row_observations(audit_by_rowid, rid)
-            raw_payload = {k: v for k, v in row.items() if k != "__row_id"}
+            original_input = {k: v for k, v in row.items() if k != "__row_id"}
 
-            # normalize without hitting DB
             try:
-                payload = _normalize_payload_for_model(model, raw_payload, context_company_id=company_id)
+                payload = _normalize_payload_for_model(
+                    model, original_input, context_company_id=company_id
+                )
 
-                # strip path hints; parent resolution deferred to commit
+                # MPTT: keep name, defer parent resolution to commit
                 if _is_mptt_model(model):
                     path_val = _get_path_value(payload)
                     if path_val:
@@ -328,15 +401,20 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         for c in PATH_COLS:
                             payload.pop(c, None)
 
-                row_obj = {"__row_id": rid, "payload": payload,
-                           "observations": observations, "status": "ok", "message": "validated"}
+                row_obj = {
+                    "__row_id": rid,
+                    "payload": payload,
+                    "_original_input": original_input,
+                    "observations": observations,
+                    "status": "ok",
+                    "message": "validated",
+                }
 
-                # attach preflight errors if any
                 if rid in preflight_map:
                     row_obj.update({
                         "status": "error",
                         "preflight_error": preflight_map[rid],
-                        "message": preflight_map[rid]["message"]
+                        "message": preflight_map[rid]["message"],
                     })
                     had_err = True
 
@@ -350,32 +428,145 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                 packed_rows.append({
                     "__row_id": rid,
                     "status": "error",
-                    "payload": raw_payload,
+                    "payload": original_input,
+                    "_original_input": original_input,
                     "observations": observations,
                     "message": err["summary"],
-                    "error": err
+                    "error": err,
                 })
 
         any_prep_error = any_prep_error or had_err
         prepared.append({"model": model_name, "rows": packed_rows, "had_error": had_err})
         models_in_order.append(model_name)
 
-    # 2) If preview OR prep errors → no writes, just return diagnostics
-    if not commit or any_prep_error:
+    # 2) PREVIEW (DB-backed dry run with rollback)
+    if not commit:
+        models_touched = []
+        result_payload = []
+        with transaction.atomic():
+            # Make deferrable constraints fire per statement (Postgres)
+            if connection.vendor == "postgresql":
+                with connection.cursor() as cur:
+                    cur.execute("SET CONSTRAINTS ALL IMMEDIATE")
+
+            outer_sp = transaction.savepoint()
+            any_row_error = False
+
+            for model_name in models_in_order:
+                app_label = MODEL_APP_MAP[model_name]
+                model = apps.get_model(app_label, model_name)
+                models_touched.append(model)
+
+                # intra-model __row_id references
+                row_map = {}  # __row_id -> instance
+
+                rows = next(b["rows"] for b in prepared if b["model"] == model_name)
+                out_rows = []
+
+                for row in rows:
+                    rid = row["__row_id"]
+
+                    # If preflight already failed, surface it and skip DB interaction
+                    if row.get("status") == "error" and row.get("preflight_error"):
+                        out_rows.append({
+                            "__row_id": rid,
+                            "status": "error",
+                            "action": None,
+                            "data": row.get("_original_input") or row.get("payload") or {},
+                            "message": row["preflight_error"]["message"],
+                            "error": row["preflight_error"],
+                            "observations": row.get("observations", []),
+                        })
+                        any_row_error = True
+                        continue
+
+                    payload = dict(row.get("payload") or {})
+                    original_input = row.get("_original_input") or payload.copy()
+
+                    try:
+                        # Resolve *_fk (DB lookups and/or __row_id indirection)
+                        for fk_key in [k for k in list(payload.keys()) if k.endswith("_fk")]:
+                            field_name = fk_key[:-3]
+                            fk_val = payload.pop(fk_key)
+                            payload[field_name] = _resolve_fk(model, field_name, fk_val, row_map)
+
+                        # Resolve MPTT parent chain
+                        if _is_mptt_model(model):
+                            path_val = _get_path_value(payload)
+                            if path_val:
+                                parts = _split_path(path_val)
+                                parent = _resolve_parent_from_path_chain(model, parts[:-1]) if len(parts) > 1 else None
+                                payload['parent'] = parent
+                                payload.pop('parent_id', None)
+
+                        # per-row savepoint so failures don't poison the loop
+                        with transaction.atomic():
+                            if payload.get("id"):
+                                instance = model.objects.select_for_update().get(id=payload["id"])
+                                for f, v in payload.items():
+                                    setattr(instance, f, v)
+                                action = "update"
+                            else:
+                                instance = model(**payload)
+                                action = "create"
+
+                            # business/model validation
+                            if hasattr(instance, "full_clean"):
+                                instance.full_clean()  # includes validate_unique()
+
+                            # Save to trigger DB-level constraints; rolled back later
+                            instance.save()
+
+                        if rid:
+                            row_map[rid] = instance
+
+                        out_rows.append({
+                            "__row_id": rid,
+                            "status": "success",
+                            "action": action,
+                            "data": safe_model_dict(instance, exclude_fields=['created_by','updated_by','is_deleted','is_active']),
+                            "message": "ok",
+                            "observations": row.get("observations", []),
+                        })
+
+                    except Exception as e:
+                        any_row_error = True
+                        err = exception_to_dict(e, include_stack=False)
+                        if not err.get("summary"):
+                            err["summary"] = _friendly_db_message(e)
+                        out_rows.append({
+                            "__row_id": rid,
+                            "status": "error",
+                            "action": None,
+                            "data": original_input,
+                            "message": err["summary"],
+                            "error": err,
+                            "observations": row.get("observations", []),
+                        })
+
+                result_payload.append({"model": model_name, "result": out_rows})
+
+            # Rollback all side-effects and reset sequences
+            transaction.savepoint_rollback(outer_sp)
+            reset_pk_sequences(models_touched)
+
+        return {"committed": False, "reason": "preview", "imports": result_payload}
+
+    # 3) COMMIT (all-or-nothing across models), but bail out early if prep failed
+    if any_prep_error:
         return {
             "committed": False,
-            "reason": "preview" if not commit else "prep_errors",
-            "imports": [{"model": b["model"], "result": b["rows"]} for b in prepared]
+            "reason": "prep_errors",
+            "imports": [{"model": b["model"], "result": b["rows"]} for b in prepared],
         }
 
-    # 3) COMMIT phase: one cross-model atomic transaction; per-row savepoints for diagnostics
-    models_touched = []
-    result_payload = []
+    models_touched: List[Any] = []
+    result_payload: List[Dict[str, Any]] = []
     any_row_error = False
 
     with transaction.atomic():
+        # Fire deferrable constraints per statement (Postgres)
         if connection.vendor == "postgresql":
-            # fire deferrable constraints per statement
             with connection.cursor() as cur:
                 cur.execute("SET CONSTRAINTS ALL IMMEDIATE")
 
@@ -386,15 +577,29 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
             model = apps.get_model(app_label, model_name)
             models_touched.append(model)
 
-            # For intra-model __row_id FKs
-            row_map = {}  # __row_id -> instance
+            row_map = {}  # __row_id -> instance (intra-model)
 
             rows = next(b["rows"] for b in prepared if b["model"] == model_name)
 
             for row in rows:
                 rid = row["__row_id"]
+
+                # Skip rows that already failed preflight
+                if row.get("status") == "error" and row.get("preflight_error"):
+                    result_row = {
+                        "__row_id": rid,
+                        "status": "error",
+                        "action": None,
+                        "data": row.get("_original_input") or row.get("payload") or {},
+                        "message": row["preflight_error"]["message"],
+                        "error": row["preflight_error"],
+                    }
+                    any_row_error = True
+                    row.update(result_row)
+                    continue
+
                 payload = dict(row.get("payload") or {})
-                raw_payload = dict(payload)
+                original_input = row.get("_original_input") or payload.copy()
 
                 try:
                     # resolve *_fk now (DB lookups + __row_id indirection)
@@ -408,13 +613,11 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         path_val = _get_path_value(payload)
                         if path_val:
                             parts = _split_path(path_val)
-                            parent = None
-                            if len(parts) > 1:
-                                parent = _resolve_parent_from_path_chain(model, parts[:-1])
+                            parent = _resolve_parent_from_path_chain(model, parts[:-1]) if len(parts) > 1 else None
                             payload['parent'] = parent
                             payload.pop('parent_id', None)
 
-                    # per-row savepoint so we can continue collecting errors
+                    # per-row savepoint for diagnostics (outer tx remains clean)
                     with transaction.atomic():
                         if payload.get("id"):
                             instance = model.objects.select_for_update().get(id=payload["id"])
@@ -425,7 +628,6 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                             instance = model(**payload)
                             action = "create"
 
-                        # business validation before save → better, field-level errors
                         if hasattr(instance, "full_clean"):
                             instance.full_clean()
 
@@ -449,7 +651,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                     row.update({
                         "status": "error",
                         "action": None,
-                        "data": raw_payload,
+                        "data": original_input,
                         "message": err["summary"],
                         "error": err,
                     })
@@ -459,17 +661,10 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
         if any_row_error:
             transaction.savepoint_rollback(outer_sp)
             reset_pk_sequences(models_touched)  # keep IDs tidy after rollback
-            return {
-                "committed": False,
-                "reason": "row_errors",
-                "imports": result_payload
-            }
+            return {"committed": False, "reason": "row_errors", "imports": result_payload}
 
         # success → commit all models in one shot
-        return {
-            "committed": True,
-            "imports": result_payload
-        }
+        return {"committed": True, "imports": result_payload}
 
 # Celery entrypoint: one task per file
 @shared_task
