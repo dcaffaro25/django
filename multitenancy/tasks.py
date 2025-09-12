@@ -288,6 +288,21 @@ def _preflight_basic(model, rows: List[Dict[str, Any]]):
 
     return errors, warns
 
+def _quantize_decimal_fields(model, payload: dict) -> dict:
+    """
+    For every DecimalField in `model`, coerce payload[field] to Decimal and
+    quantize to the field's decimal_places. Leaves missing/blank values alone.
+    """
+    out = dict(payload)
+    for f in model._meta.get_fields():
+        if isinstance(f, models.DecimalField):
+            name = getattr(f, 'attname', f.name)
+            if name in out and out[name] not in (None, ''):
+                dp = getattr(f, 'decimal_places', 0) or 0
+                q = Decimal('1').scaleb(-dp)  # 0.01 when dp=2, 1 when dp=0, etc.
+                # go through str() to avoid binary float artifacts coming from Excel
+                out[name] = Decimal(str(out[name])).quantize(q, rounding=ROUND_HALF_UP)
+    return out
 
 
 # ---- core executor ---------------------------------------------------------
@@ -470,7 +485,9 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                 payload = _normalize_payload_for_model(
                     model, filtered_input, context_company_id=company_id
                 )
-
+                
+                payload = _quantize_decimal_fields(model, payload)
+                
                 # MPTT: keep name; defer parent resolution to commit
                 if _is_mptt_model(model):
                     path_val = _get_path_value(payload)
@@ -618,7 +635,9 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                                 parent = _resolve_parent_from_path_chain(model, parts[:-1]) if len(parts) > 1 else None
                                 payload['parent'] = parent
                                 payload.pop('parent_id', None)
-
+                            
+                        payload = _quantize_decimal_fields(model, payload)    
+                        
                         with transaction.atomic():
                             if action == "update":
                                 instance = model.objects.select_for_update().get(id=payload["id"])
@@ -739,7 +758,9 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                             parent = _resolve_parent_from_path_chain(model, parts[:-1]) if len(parts) > 1 else None
                             payload['parent'] = parent
                             payload.pop('parent_id', None)
-
+                    
+                    payload = _quantize_decimal_fields(model, payload)
+                    
                     with transaction.atomic():
                         if action == "update":
                             instance = model.objects.select_for_update().get(id=payload["id"])
