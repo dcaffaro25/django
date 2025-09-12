@@ -236,31 +236,59 @@ def _row_observations(audit_by_rowid, row_id):
         )
     return obs
 
-def _preflight_basic(model, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def _allowed_keys(model):
+    return (
+        {f.name for f in model._meta.fields}
+        | {f.name + "_fk" for f in model._meta.fields}
+        | set(PATH_COLS)
+        | {"__row_id", "id"}
+    )
+
+def _filter_unknown(model, row: Dict[str, Any]):
+    """Return (filtered_row, unknown_keys) keeping only allowed keys for this model."""
+    allowed = _allowed_keys(model)
+    filtered = {k: v for k, v in row.items() if k in allowed}
+    unknown = sorted([k for k in row.keys() if k not in allowed and k != "__row_id"])
+    return filtered, unknown
+
+def _preflight_basic(model, rows: List[Dict[str, Any]]):
     """
-    Return a dict row_id -> preflight_error for quick wins (missing required, unknown columns).
-    Keep it lightweight; DB-free.
+    DB-free checks.
+    - Missing required -> ERROR (blocks commit/preview row)
+    - Unknown columns  -> WARN (row proceeds; columns will be ignored)
+    Returns (errors_map, warnings_map) keyed by __row_id.
     """
-    pre = {}
-    required = {f.name for f in model._meta.fields
-                if not f.null and not f.auto_created and not getattr(f, "has_default", False)}
-    allowed = {f.name for f in model._meta.fields} | {f.name + "_fk" for f in model._meta.fields} \
-              | set(PATH_COLS) | {"__row_id", "id"}
+    errors, warns = {}, {}
+
+    required = {
+        f.name for f in model._meta.fields
+        if not f.null and not f.auto_created and not getattr(f, "has_default", False)
+    }
+    allowed = _allowed_keys(model)
 
     for i, row in enumerate(rows):
         rid = row.get("__row_id") or f"row{i+1}"
         payload = {k: v for k, v in row.items() if k != "__row_id"}
+
         missing = sorted([f for f in required if f not in payload or payload.get(f) in ("", None)])
         unknown = sorted([k for k in payload.keys() if k not in allowed])
-        msgs = []
+
         if missing:
-            msgs.append(f"Missing required: {', '.join(missing)}")
+            errors[rid] = {
+                "code": "E-PREFLIGHT",
+                "message": f"Missing required: {', '.join(missing)}",
+                "fields": {"missing": missing, "unknown": []},
+            }
         if unknown:
-            msgs.append(f"Unknown columns: {', '.join(unknown)}")
-        if msgs:
-            pre[rid] = {"code": "E-PREFLIGHT", "message": " | ".join(msgs),
-                        "fields": {"missing": missing, "unknown": unknown}}
-    return pre
+            warns[rid] = {
+                "code": "W-UNKNOWN-COLS",
+                "message": f"Ignoring unknown columns: {', '.join(unknown)}",
+                "fields": {"missing": [], "unknown": unknown},
+            }
+
+    return errors, warns
+
+
 
 # ---- core executor ---------------------------------------------------------
 
@@ -279,6 +307,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
     One-shot import for all models in a file.
     - commit=False: DB-backed dry run (validates exactly like commit), then rollback
     - commit=True : cross-model atomic; if any row fails, rollback everything
+    Unknown columns are treated as WARNINGS (status='warning') and ignored.
     Always returns per-row diagnostics and includes the inferred 'action'.
     """
 
@@ -313,45 +342,67 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
             )
         return obs
 
-    def _preflight_basic(model, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        """DB-free checks: missing required & unknown columns."""
-        pre = {}
-        required = {
-            f.name for f in model._meta.fields
-            if not f.null and not f.auto_created and not getattr(f, "has_default", False)
-        }
-        allowed = (
+    def _allowed_keys(model):
+        return (
             {f.name for f in model._meta.fields}
             | {f.name + "_fk" for f in model._meta.fields}
             | set(PATH_COLS) | {"__row_id", "id"}
         )
+
+    def _filter_unknown(model, row: Dict[str, Any]):
+        """
+        Return (filtered_row, unknown_keys). Unknown keys are dropped and returned
+        to be surfaced as warnings.
+        """
+        allowed = _allowed_keys(model)
+        filtered = {k: v for k, v in row.items() if k in allowed}
+        unknown = sorted([k for k in row.keys() if k not in allowed and k != "__row_id"])
+        return filtered, unknown
+
+    def _preflight_basic(model, rows: List[Dict[str, Any]]):
+        """
+        DB-free checks.
+        - Missing required -> ERROR (blocks row)
+        - Unknown columns  -> WARN (row proceeds; columns will be ignored)
+        Returns (errors_map, warnings_map) keyed by __row_id.
+        """
+        errors, warns = {}, {}
+
+        required = {
+            f.name for f in model._meta.fields
+            if not f.null and not f.auto_created and not getattr(f, "has_default", False)
+        }
+        allowed = _allowed_keys(model)
+
         for i, row in enumerate(rows):
             rid = row.get("__row_id") or f"row{i+1}"
             payload = {k: v for k, v in row.items() if k != "__row_id"}
+
             missing = sorted([f for f in required if f not in payload or payload.get(f) in ("", None)])
             unknown = sorted([k for k in payload.keys() if k not in allowed])
-            msgs = []
+
             if missing:
-                msgs.append(f"Missing required: {', '.join(missing)}")
+                errors[rid] = {
+                    "code": "E-PREFLIGHT",
+                    "message": f"Missing required: {', '.join(missing)}",
+                    "fields": {"missing": missing, "unknown": []},
+                }
             if unknown:
-                msgs.append(f"Unknown columns: {', '.join(unknown)}")
-            if msgs:
-                pre[rid] = {"code": "E-PREFLIGHT", "message": " | ".join(msgs),
-                            "fields": {"missing": missing, "unknown": unknown}}
-        return pre
+                warns[rid] = {
+                    "code": "W-UNKNOWN-COLS",
+                    "message": f"Ignoring unknown columns: {', '.join(unknown)}",
+                    "fields": {"missing": [], "unknown": unknown},
+                }
+
+        return errors, warns
 
     def _coerce_pk(val):
         """Return int PK if val looks numeric (e.g., 3, '3', '3.0'); else None."""
-        if val is None or val == "":
-            return None
-        if isinstance(val, int):
-            return val
-        if isinstance(val, float):
-            return int(val) if float(val).is_integer() else None
+        if val is None or val == "": return None
+        if isinstance(val, int): return val
+        if isinstance(val, float): return int(val) if float(val).is_integer() else None
         s = str(val).strip()
-        if s.isdigit():
-            return int(s)
-        # '3.0' from Excel cells
+        if s.isdigit(): return int(s)
         try:
             f = float(s)
             return int(f) if f.is_integer() else None
@@ -360,9 +411,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
 
     def _infer_action_and_clean_id(payload: Dict[str, Any], original_input: Dict[str, Any]):
         """
-        Decide 'create' vs 'update' and make payload safe for the ORM:
-          - update: id must be coerced to int (pk)
-          - create: drop id if non-numeric; keep as _external_id for diagnostics
+        Decide 'create' vs 'update' and make payload safe for the ORM.
         Returns (action, pk or None, external_id or None)
         """
         ext_id = None
@@ -370,9 +419,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
         if pk is not None:
             payload["id"] = pk
             return "update", pk, None
-        # create: remove any non-numeric id to avoid pk assignment issues
         if "id" in payload:
-            # keep the original text id (if provided) for the UI
             if "id" in original_input and original_input["id"] not in ("", None):
                 ext_id = str(original_input["id"])
             payload.pop("id", None)
@@ -412,8 +459,8 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
         if _is_mptt_model(model):
             rows = sorted(rows, key=_path_depth)
 
-        # quick preflight
-        preflight_map = _preflight_basic(model, rows)
+        # quick preflight (errors + warnings)
+        preflight_err, preflight_warn = _preflight_basic(model, rows)
 
         packed_rows = []
         had_err = False
@@ -424,8 +471,11 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
             original_input = {k: v for k, v in row.items() if k != "__row_id"}
 
             try:
+                # Drop unknown columns now; surface as warnings
+                filtered_input, unknown_cols = _filter_unknown(model, original_input)
+
                 payload = _normalize_payload_for_model(
-                    model, original_input, context_company_id=company_id
+                    model, filtered_input, context_company_id=company_id
                 )
 
                 # MPTT: keep name; defer parent resolution to commit
@@ -450,19 +500,36 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                     "payload": payload,
                     "_original_input": original_input,
                     "observations": observations,
-                    "status": "ok",
-                    "message": "validated",
                     "action": action,             # <= always present
                     "external_id": ext_id,        # <= only when create with text id
                 }
 
-                if rid in preflight_map:
+                # Attach warnings (unknown columns)
+                if rid in preflight_warn:
+                    row_obj["warnings"] = [preflight_warn[rid]]
+                else:
+                    row_obj["warnings"] = []
+
+                # Errors (missing required)
+                if rid in preflight_err:
                     row_obj.update({
                         "status": "error",
-                        "preflight_error": preflight_map[rid],
-                        "message": preflight_map[rid]["message"],
+                        "preflight_error": preflight_err[rid],
+                        "message": preflight_err[rid]["message"],
                     })
                     had_err = True
+                else:
+                    # No error; flag warning status if warnings exist
+                    if row_obj["warnings"]:
+                        row_obj.update({
+                            "status": "warning",
+                            "message": "validated (with warnings)",
+                        })
+                    else:
+                        row_obj.update({
+                            "status": "ok",
+                            "message": "validated",
+                        })
 
                 packed_rows.append(row_obj)
 
@@ -471,9 +538,11 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                 err = exception_to_dict(e, include_stack=False)
                 if not err.get("summary"):
                     err["summary"] = _friendly_db_message(e)
-                # try to infer action from original input (best-effort)
-                tmp_payload = _normalize_payload_for_model(model, original_input, context_company_id=company_id) \
-                              if hasattr(model, "_meta") else original_input
+                # best-effort normalize for action display
+                try:
+                    tmp_payload = _normalize_payload_for_model(model, filtered_input, context_company_id=company_id)
+                except Exception:
+                    tmp_payload = filtered_input
                 action, pk, ext_id = _infer_action_and_clean_id(dict(tmp_payload), original_input)
                 packed_rows.append({
                     "__row_id": rid,
@@ -485,6 +554,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                     "error": err,
                     "action": action,
                     "external_id": ext_id,
+                    "warnings": [preflight_warn[rid]] if rid in preflight_warn else [],
                 })
 
         any_prep_error = any_prep_error or had_err
@@ -517,19 +587,20 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         out_rows.append({
                             "__row_id": rid,
                             "status": "error",
-                            "action": row.get("action"),   # intended action
+                            "action": row.get("action"),
                             "data": row.get("_original_input") or row.get("payload") or {},
                             "message": row["preflight_error"]["message"],
                             "error": row["preflight_error"],
                             "observations": row.get("observations", []),
                             "external_id": row.get("external_id"),
+                            "warnings": row.get("warnings", []),
                         })
                         continue
 
                     payload = dict(row.get("payload") or {})
                     original_input = row.get("_original_input") or payload.copy()
-                    # Ensure action reflected even if DB fails before save
                     action = row.get("action") or "create"
+                    warnings = row.get("warnings", [])
 
                     try:
                         # Resolve *_fk
@@ -565,12 +636,13 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
 
                         out_rows.append({
                             "__row_id": rid,
-                            "status": "success",
+                            "status": "warning" if warnings else "success",
                             "action": action,
                             "data": safe_model_dict(instance, exclude_fields=['created_by','updated_by','is_deleted','is_active']),
-                            "message": "ok",
+                            "message": "ok with warnings" if warnings else "ok",
                             "observations": row.get("observations", []),
                             "external_id": row.get("external_id"),
+                            "warnings": warnings,
                         })
 
                     except Exception as e:
@@ -586,6 +658,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                             "error": err,
                             "observations": row.get("observations", []),
                             "external_id": row.get("external_id"),
+                            "warnings": warnings,
                         })
 
                 result_payload.append({"model": model_name, "result": out_rows})
@@ -596,7 +669,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
 
         return {"committed": False, "reason": "preview", "imports": result_payload}
 
-    # 3) COMMIT (cross-model atomic), but bail early on prep errors
+    # 3) COMMIT (cross-model atomic), but bail early on prep errors (warnings do NOT block)
     if any_prep_error:
         return {
             "committed": False,
@@ -626,9 +699,10 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
             for row in rows:
                 rid = row["__row_id"]
 
-                # Skip rows that already failed preflight
+                # Skip rows that already failed preflight (warnings don't block)
                 if row.get("status") == "error" and row.get("preflight_error"):
                     row.update({
+                        "__row_id": rid,
                         "status": "error",
                         "action": row.get("action"),
                         "data": row.get("_original_input") or row.get("payload") or {},
@@ -641,6 +715,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                 payload = dict(row.get("payload") or {})
                 original_input = row.get("_original_input") or payload.copy()
                 action = row.get("action") or "create"
+                warnings = row.get("warnings", [])
 
                 try:
                     # Resolve *_fk now
@@ -675,10 +750,11 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         row_map[rid] = instance
 
                     row.update({
-                        "status": "success",
+                        "status": "warning" if warnings else "success",
                         "action": action,
                         "data": safe_model_dict(instance, exclude_fields=['created_by','updated_by','is_deleted','is_active']),
-                        "message": "ok",
+                        "message": "ok with warnings" if warnings else "ok",
+                        "warnings": warnings,
                     })
 
                 except Exception as e:
@@ -692,6 +768,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         "data": original_input,
                         "message": err["summary"],
                         "error": err,
+                        "warnings": warnings,
                     })
 
             result_payload.append({"model": model_name, "result": rows})
@@ -703,6 +780,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
 
         # Success → commit all
         return {"committed": True, "imports": result_payload}
+
 
 # Celery entrypoint: one task per file
 @shared_task
