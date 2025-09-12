@@ -16,6 +16,7 @@ from mptt.models import MPTTModel, TreeForeignKey
 from mptt.managers import TreeManager
 from multitenancy.models import Company, CustomUser
 from django.conf import settings
+from decimal import Decimal, ROUND_HALF_UP
 
 class Currency(BaseModel):
     code = models.CharField(max_length=3, unique=True)
@@ -273,7 +274,17 @@ class Transaction(TenantAwareBaseModel):
             # If you often filter by company (inherited from TenantAwareBaseModel), add:
             models.Index(fields=['company']),
         ]
-            
+    
+    def clean_fields(self, exclude=None):
+        # Ensure exclude is a set
+        exclude = set(exclude or [])
+        # Pre-quantize BEFORE parent clean_fields() triggers validators
+        if 'amount' not in exclude and self.amount is not None:
+            # avoid float artifacts: go through str() then quantize
+            q = Decimal('0.01')
+            self.amount = Decimal(str(self.amount)).quantize(q, rounding=ROUND_HALF_UP)
+        super().clean_fields(exclude=exclude)
+    
     def check_balance(self):
         sum([entry.debit_amount for entry in self.journal_entries.all()]) - sum(
             [entry.credit_amount for entry in self.journal_entries.all()])
@@ -292,6 +303,22 @@ class JournalEntry(TenantAwareBaseModel):
     credit_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     state = models.CharField(max_length=10, choices=[('pending', 'Pending'), ('posted', 'Posted'), ('canceled', 'Canceled')], default='pending')
     date = models.DateField(null=True, blank=True)
+    
+    def clean_fields(self, exclude=None):
+        # Ensure exclude is a set
+        exclude = set(exclude or [])
+        # Pre-quantize BEFORE parent clean_fields() triggers validators
+        if 'debit_amount' not in exclude and self.debit_amount is not None:
+            # avoid float artifacts: go through str() then quantize
+            q = Decimal('0.01')
+            self.debit_amount = Decimal(str(self.debit_amount)).quantize(q, rounding=ROUND_HALF_UP)
+        
+        if 'credit_amount' not in exclude and self.dcredit_amount is not None:
+            # avoid float artifacts: go through str() then quantize
+            q = Decimal('0.01')
+            self.credit_amount = Decimal(str(self.credit_amount)).quantize(q, rounding=ROUND_HALF_UP)
+            
+        super().clean_fields(exclude=exclude)
     
     class Meta:
         indexes = [
@@ -363,18 +390,28 @@ class BankTransaction(TenantAwareBaseModel):
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     description = models.CharField(max_length=255)
     currency = models.ForeignKey(Currency, on_delete=models.CASCADE)
-    transaction_type = models.CharField(max_length=50)
-    check_number = models.CharField(max_length=50, blank=True, null=True)
+    #transaction_type = models.CharField(max_length=50)
+    #check_number = models.CharField(max_length=50, blank=True, null=True)
     reference_number = models.CharField(max_length=50, blank=True, null=True)
-    payee = models.CharField(max_length=255, blank=True, null=True)
-    memo = models.CharField(max_length=255)
-    account_number = models.CharField(max_length=50, blank=True, null=True)
-    routing_number = models.CharField(max_length=50, blank=True, null=True)
-    transaction_id = models.CharField(max_length=50, blank=True, null=True)
-    status = models.CharField(max_length=50)
+    #payee = models.CharField(max_length=255, blank=True, null=True)
+    #memo = models.CharField(max_length=255)
+    #account_number = models.CharField(max_length=50, blank=True, null=True)
+    #routing_number = models.CharField(max_length=50, blank=True, null=True)
+    #transaction_id = models.CharField(max_length=50, blank=True, null=True)
+    status = models.CharField(max_length=50, default="pending")
     balance_validated = models.BooleanField(default=False)  # <-- NEW FIELD
     tx_hash = models.CharField(max_length=64, blank=True, null=True, db_index=True)
-
+    
+    def clean_fields(self, exclude=None):
+        # Ensure exclude is a set
+        exclude = set(exclude or [])
+        # Pre-quantize BEFORE parent clean_fields() triggers validators
+        if 'amount' not in exclude and self.amount is not None:
+            # avoid float artifacts: go through str() then quantize
+            q = Decimal('0.01')
+            self.amount = Decimal(str(self.amount)).quantize(q, rounding=ROUND_HALF_UP)
+        super().clean_fields(exclude=exclude)
+    
     class Meta:
         indexes = [
             models.Index(fields=['date']),

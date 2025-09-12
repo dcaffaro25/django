@@ -1123,7 +1123,7 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                             currency=bank_txs[0].currency,
                             amount=adjustment_amount,
                             description="Adjustment record for reconciliation",
-                            transaction_type="ADJUSTMENT",
+                            #transaction_type="ADJUSTMENT",
                             status="pending",
                             tx_hash=f"adjustment_{bank_txs[0].id}"
                         )
