@@ -275,6 +275,13 @@ class Transaction(TenantAwareBaseModel):
             models.Index(fields=['company']),
         ]
     
+    def clean_fields(self, exclude=None):
+        exclude = set(exclude or [])
+        if 'amount' not in exclude and self.amount is not None:
+            # go through str() to kill binary float artifacts; then force 2dp
+            self.amount = Decimal(str(self.amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        super().clean_fields(exclude=exclude)
+    
     def save(self, *args, **kwargs):
         if self.amount is not None:
             self.amount = Decimal(str(self.amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
@@ -297,6 +304,18 @@ class JournalEntry(TenantAwareBaseModel):
     credit_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     state = models.CharField(max_length=10, choices=[('pending', 'Pending'), ('posted', 'Posted'), ('canceled', 'Canceled')], default='pending')
     date = models.DateField(null=True, blank=True)
+    
+    def clean_fields(self, exclude=None):
+        exclude = set(exclude or [])
+        if 'debit_amount' not in exclude and self.debit_amount is not None:
+            # go through str() to kill binary float artifacts; then force 2dp
+            self.debit_amount = Decimal(str(self.debit_amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        
+        if 'credit_amount' not in exclude and self.credit_amount is not None:
+            # go through str() to kill binary float artifacts; then force 2dp
+            self.credit_amount = Decimal(str(self.credit_amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        
+        super().clean_fields(exclude=exclude)
     
     def save(self, *args, **kwargs):
         if self.debit_amount is not None:
@@ -388,6 +407,13 @@ class BankTransaction(TenantAwareBaseModel):
     status = models.CharField(max_length=50, default="pending")
     balance_validated = models.BooleanField(default=False)  # <-- NEW FIELD
     tx_hash = models.CharField(max_length=64, blank=True, null=True, db_index=True)
+    
+    def clean_fields(self, exclude=None):
+        exclude = set(exclude or [])
+        if 'amount' not in exclude and self.amount is not None:
+            # go through str() to kill binary float artifacts; then force 2dp
+            self.amount = Decimal(str(self.amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        super().clean_fields(exclude=exclude)
     
     def save(self, *args, **kwargs):
         if self.amount is not None:
