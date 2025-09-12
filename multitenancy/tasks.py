@@ -308,6 +308,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
     - commit=False: DB-backed dry run (validates exactly like commit), then rollback
     - commit=True : cross-model atomic; if any row fails, rollback everything
     Unknown columns are treated as WARNINGS (status='warning') and ignored.
+    The full warning text is appended to the row 'message'; no 'warnings' column is created.
     Always returns per-row diagnostics and includes the inferred 'action'.
     """
 
@@ -351,50 +352,42 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
 
     def _filter_unknown(model, row: Dict[str, Any]):
         """
-        Return (filtered_row, unknown_keys). Unknown keys are dropped and returned
-        to be surfaced as warnings.
+        Return (filtered_row, unknown_keys). Unknown keys are dropped and returned.
         """
         allowed = _allowed_keys(model)
         filtered = {k: v for k, v in row.items() if k in allowed}
         unknown = sorted([k for k in row.keys() if k not in allowed and k != "__row_id"])
         return filtered, unknown
 
-    def _preflight_basic(model, rows: List[Dict[str, Any]]):
+    def _unknown_from_original_input(model, row_obj: Dict[str, Any]) -> List[str]:
         """
-        DB-free checks.
-        - Missing required -> ERROR (blocks row)
-        - Unknown columns  -> WARN (row proceeds; columns will be ignored)
-        Returns (errors_map, warnings_map) keyed by __row_id.
+        Compute unknown keys from the original input for this row (used to compose message).
         """
-        errors, warns = {}, {}
+        allowed = _allowed_keys(model)
+        orig = row_obj.get("_original_input") or row_obj.get("payload") or {}
+        return sorted([k for k in orig.keys() if k not in allowed and k != "__row_id"])
 
+    def _preflight_missing_required(model, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """
+        DB-free check: only missing required fields (true error).
+        Returns a map: rid -> {"code": "...", "message": "...", "fields": {"missing":[...]} }
+        """
+        errors = {}
         required = {
             f.name for f in model._meta.fields
             if not f.null and not f.auto_created and not getattr(f, "has_default", False)
         }
-        allowed = _allowed_keys(model)
-
         for i, row in enumerate(rows):
             rid = row.get("__row_id") or f"row{i+1}"
             payload = {k: v for k, v in row.items() if k != "__row_id"}
-
             missing = sorted([f for f in required if f not in payload or payload.get(f) in ("", None)])
-            unknown = sorted([k for k in payload.keys() if k not in allowed])
-
             if missing:
                 errors[rid] = {
                     "code": "E-PREFLIGHT",
                     "message": f"Missing required: {', '.join(missing)}",
-                    "fields": {"missing": missing, "unknown": []},
+                    "fields": {"missing": missing},
                 }
-            if unknown:
-                warns[rid] = {
-                    "code": "W-UNKNOWN-COLS",
-                    "message": f"Ignoring unknown columns: {', '.join(unknown)}",
-                    "fields": {"missing": [], "unknown": unknown},
-                }
-
-        return errors, warns
+        return errors
 
     def _coerce_pk(val):
         """Return int PK if val looks numeric (e.g., 3, '3', '3.0'); else None."""
@@ -459,8 +452,8 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
         if _is_mptt_model(model):
             rows = sorted(rows, key=_path_depth)
 
-        # quick preflight (errors + warnings)
-        preflight_err, preflight_warn = _preflight_basic(model, rows)
+        # preflight (only missing required -> error)
+        preflight_err = _preflight_missing_required(model, rows)
 
         packed_rows = []
         had_err = False
@@ -471,8 +464,8 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
             original_input = {k: v for k, v in row.items() if k != "__row_id"}
 
             try:
-                # Drop unknown columns now; surface as warnings
-                filtered_input, unknown_cols = _filter_unknown(model, original_input)
+                # Drop unknown columns now (they will be warned in message later)
+                filtered_input, _unknown_cols = _filter_unknown(model, original_input)
 
                 payload = _normalize_payload_for_model(
                     model, filtered_input, context_company_id=company_id
@@ -500,30 +493,30 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                     "payload": payload,
                     "_original_input": original_input,
                     "observations": observations,
-                    "action": action,             # <= always present
-                    "external_id": ext_id,        # <= only when create with text id
+                    "action": action,
+                    "external_id": ext_id,
                 }
-
-                # Attach warnings (unknown columns)
-                if rid in preflight_warn:
-                    row_obj["warnings"] = [preflight_warn[rid]]
-                else:
-                    row_obj["warnings"] = []
 
                 # Errors (missing required)
                 if rid in preflight_err:
+                    # Append unknown detail into message as well
+                    unknown_cols_now = _unknown_from_original_input(model, row_obj)
+                    msg = preflight_err[rid]["message"]
+                    if unknown_cols_now:
+                        msg = f"{msg} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
                     row_obj.update({
                         "status": "error",
-                        "preflight_error": preflight_err[rid],
-                        "message": preflight_err[rid]["message"],
+                        "preflight_error": {**preflight_err[rid], "message": msg},
+                        "message": msg,
                     })
                     had_err = True
                 else:
-                    # No error; flag warning status if warnings exist
-                    if row_obj["warnings"]:
+                    # Decide warning/ok based on unknowns
+                    unknown_cols_now = _unknown_from_original_input(model, row_obj)
+                    if unknown_cols_now:
                         row_obj.update({
                             "status": "warning",
-                            "message": "validated (with warnings)",
+                            "message": f"validated; Ignoring unknown columns: {', '.join(unknown_cols_now)}",
                         })
                     else:
                         row_obj.update({
@@ -544,17 +537,23 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                 except Exception:
                     tmp_payload = filtered_input
                 action, pk, ext_id = _infer_action_and_clean_id(dict(tmp_payload), original_input)
+                # Include unknowns in message as well
+                unknown_cols_now = _unknown_from_original_input(model, {
+                    "_original_input": original_input, "payload": tmp_payload
+                })
+                msg = err["summary"]
+                if unknown_cols_now:
+                    msg = f"{msg} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
                 packed_rows.append({
                     "__row_id": rid,
                     "status": "error",
                     "payload": tmp_payload,
                     "_original_input": original_input,
                     "observations": observations,
-                    "message": err["summary"],
-                    "error": err,
+                    "message": msg,
+                    "error": {**err, "summary": msg},
                     "action": action,
                     "external_id": ext_id,
-                    "warnings": [preflight_warn[rid]] if rid in preflight_warn else [],
                 })
 
         any_prep_error = any_prep_error or had_err
@@ -582,6 +581,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
 
                 for row in rows:
                     rid = row["__row_id"]
+
                     # If preflight already failed, surface it and skip DB interaction
                     if row.get("status") == "error" and row.get("preflight_error"):
                         out_rows.append({
@@ -589,18 +589,19 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                             "status": "error",
                             "action": row.get("action"),
                             "data": row.get("_original_input") or row.get("payload") or {},
-                            "message": row["preflight_error"]["message"],
+                            "message": row["preflight_error"]["message"],  # already includes unknown detail
                             "error": row["preflight_error"],
                             "observations": row.get("observations", []),
                             "external_id": row.get("external_id"),
-                            "warnings": row.get("warnings", []),
                         })
                         continue
 
                     payload = dict(row.get("payload") or {})
                     original_input = row.get("_original_input") or payload.copy()
                     action = row.get("action") or "create"
-                    warnings = row.get("warnings", [])
+
+                    # Recompute unknowns from original input for the final message
+                    unknown_cols_now = _unknown_from_original_input(model, row)
 
                     try:
                         # Resolve *_fk
@@ -634,31 +635,36 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         if rid:
                             row_map[rid] = instance
 
+                        msg = "ok"
+                        status_val = "success"
+                        if unknown_cols_now:
+                            status_val = "warning"
+                            msg = f"{msg} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
+
                         out_rows.append({
                             "__row_id": rid,
-                            "status": "warning" if warnings else "success",
+                            "status": status_val,
                             "action": action,
                             "data": safe_model_dict(instance, exclude_fields=['created_by','updated_by','is_deleted','is_active']),
-                            "message": "ok with warnings" if warnings else "ok",
+                            "message": msg,
                             "observations": row.get("observations", []),
                             "external_id": row.get("external_id"),
-                            "warnings": warnings,
                         })
 
                     except Exception as e:
                         err = exception_to_dict(e, include_stack=False)
-                        if not err.get("summary"):
-                            err["summary"] = _friendly_db_message(e)
+                        base = err.get("summary") or _friendly_db_message(e)
+                        if unknown_cols_now:
+                            base = f"{base} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
                         out_rows.append({
                             "__row_id": rid,
                             "status": "error",
                             "action": action,
                             "data": original_input,
-                            "message": err["summary"],
-                            "error": err,
+                            "message": base,
+                            "error": {**err, "summary": base},
                             "observations": row.get("observations", []),
                             "external_id": row.get("external_id"),
-                            "warnings": warnings,
                         })
 
                 result_payload.append({"model": model_name, "result": out_rows})
@@ -702,7 +708,6 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                 # Skip rows that already failed preflight (warnings don't block)
                 if row.get("status") == "error" and row.get("preflight_error"):
                     row.update({
-                        "__row_id": rid,
                         "status": "error",
                         "action": row.get("action"),
                         "data": row.get("_original_input") or row.get("payload") or {},
@@ -715,7 +720,9 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                 payload = dict(row.get("payload") or {})
                 original_input = row.get("_original_input") or payload.copy()
                 action = row.get("action") or "create"
-                warnings = row.get("warnings", [])
+
+                # Recompute unknowns (from original input) for final message
+                unknown_cols_now = _unknown_from_original_input(model, row)
 
                 try:
                     # Resolve *_fk now
@@ -749,26 +756,31 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                     if rid:
                         row_map[rid] = instance
 
+                    msg = "ok"
+                    status_val = "success"
+                    if unknown_cols_now:
+                        status_val = "warning"
+                        msg = f"{msg} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
+
                     row.update({
-                        "status": "warning" if warnings else "success",
+                        "status": status_val,
                         "action": action,
                         "data": safe_model_dict(instance, exclude_fields=['created_by','updated_by','is_deleted','is_active']),
-                        "message": "ok with warnings" if warnings else "ok",
-                        "warnings": warnings,
+                        "message": msg,
                     })
 
                 except Exception as e:
                     any_row_error = True
                     err = exception_to_dict(e, include_stack=False)
-                    if not err.get("summary"):
-                        err["summary"] = _friendly_db_message(e)
+                    base = err.get("summary") or _friendly_db_message(e)
+                    if unknown_cols_now:
+                        base = f"{base} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
                     row.update({
                         "status": "error",
                         "action": action,
                         "data": original_input,
-                        "message": err["summary"],
-                        "error": err,
-                        "warnings": warnings,
+                        "message": base,
+                        "error": {**err, "summary": base},
                     })
 
             result_payload.append({"model": model_name, "result": rows})
