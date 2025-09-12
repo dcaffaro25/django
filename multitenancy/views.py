@@ -23,9 +23,9 @@ from django.views.decorators.csrf import csrf_exempt
 from multitenancy.tasks import trigger_integration_event
 from core.utils.json_sanitize import json_nullsafe
 from celery import shared_task, group, chord
-
+import numpy as np
 import pandas as pd
-
+import math
 
 class LoginView(views.APIView):
     permission_classes = (permissions.AllowAny,)
@@ -584,14 +584,38 @@ class IntegrationRuleViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             result = rule.run_rule(payload)
             return Response({"result": result}, status=status.HTTP_200_OK)
 
+def _scrub_json(o):
+    # Replace NaN/±Inf with None (valid JSON), recurse containers
+    if isinstance(o, float) and (math.isnan(o) or math.isinf(o)):
+        return None
+    if isinstance(o, dict):
+        return {k: _scrub_json(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_scrub_json(v) for v in o]
+    # Convert numpy scalars if present
+    if hasattr(o, "item") and callable(getattr(o, "item", None)):
+        try:
+            return _scrub_json(o.item())
+        except Exception:
+            pass
+    return o
+
 class BulkImportAPIView(APIView):
-    """
-    One-shot file import (one job per file).
-    Can run with Celery (async) or synchronously (no Celery).
-    """
     def post(self, request, *args, **kwargs):
         file = request.FILES["file"]
-        xls = pd.read_excel(file, sheet_name=None)
+
+        # Read all sheets
+        book = pd.read_excel(file, sheet_name=None)
+
+        # Build "sheets" with per-sheet sanitization
+        sheets = []
+        for model_name, df in book.items():
+            if model_name == "References":
+                continue
+            df = df.replace([np.inf, -np.inf], np.nan)
+            df = df.where(df.notna(), None)        # NaN/NaT -> None
+            rows = df.dropna(how="all").to_dict(orient="records")
+            sheets.append({"model": model_name, "rows": rows})
 
         commit = _to_bool(request.data.get("commit"), default=False)
         use_celery = _to_bool(request.data.get("use_celery"), default=False)
@@ -600,23 +624,16 @@ class BulkImportAPIView(APIView):
         if not company_id:
             return Response({"error": "No company defined"}, status=400)
 
-        # Build one payload for the whole file (skip auxiliary sheets)
-        sheets = []
-        for model_name, df in xls.items():
-            if model_name == "References":
-                continue
-            rows = df.dropna(how="all").to_dict(orient="records")
-            sheets.append({"model": model_name, "rows": rows})
-
         if use_celery:
-            # ONE task for the entire file import
             async_res = run_import_job.delay(company_id, sheets, commit)
-            return Response(
-                {"task_id": async_res.id, "message": "Import scheduled"},
-                status=status.HTTP_202_ACCEPTED
-            )
+            return Response({"task_id": async_res.id, "message": "Import scheduled"},
+                            status=status.HTTP_202_ACCEPTED)
 
-        # Synchronous path (no Celery)
+        # Synchronous
         result = execute_import_job(company_id, sheets, commit)
+
+        # Final safety: scrub any NaN/±Inf that may have been produced downstream
+        result = _scrub_json(result)
+
         http_status = status.HTTP_200_OK if result.get("committed") else status.HTTP_400_BAD_REQUEST
         return Response(result, status=http_status)
