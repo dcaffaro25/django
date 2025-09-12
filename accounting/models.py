@@ -275,15 +275,9 @@ class Transaction(TenantAwareBaseModel):
             models.Index(fields=['company']),
         ]
     
-    def clean_fields(self, exclude=None):
-        # Ensure exclude is a set
-        exclude = set(exclude or [])
-        # Pre-quantize BEFORE parent clean_fields() triggers validators
-        if 'amount' not in exclude and self.amount is not None:
-            # avoid float artifacts: go through str() then quantize
-            q = Decimal('0.01')
-            self.amount = Decimal(str(self.amount)).quantize(q, rounding=ROUND_HALF_UP)
-        super().clean_fields(exclude=exclude)
+    def save(self, *args, **kwargs):
+        if self.amount is not None:
+            self.amount = Decimal(str(self.amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
     
     def check_balance(self):
         sum([entry.debit_amount for entry in self.journal_entries.all()]) - sum(
@@ -304,21 +298,14 @@ class JournalEntry(TenantAwareBaseModel):
     state = models.CharField(max_length=10, choices=[('pending', 'Pending'), ('posted', 'Posted'), ('canceled', 'Canceled')], default='pending')
     date = models.DateField(null=True, blank=True)
     
-    def clean_fields(self, exclude=None):
-        # Ensure exclude is a set
-        exclude = set(exclude or [])
-        # Pre-quantize BEFORE parent clean_fields() triggers validators
-        if 'debit_amount' not in exclude and self.debit_amount is not None:
-            # avoid float artifacts: go through str() then quantize
-            q = Decimal('0.01')
-            self.debit_amount = Decimal(str(self.debit_amount)).quantize(q, rounding=ROUND_HALF_UP)
+    def save(self, *args, **kwargs):
+        if self.debit_amount is not None:
+            self.debit_amount = Decimal(str(self.debit_amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         
-        if 'credit_amount' not in exclude and self.dcredit_amount is not None:
-            # avoid float artifacts: go through str() then quantize
-            q = Decimal('0.01')
-            self.credit_amount = Decimal(str(self.credit_amount)).quantize(q, rounding=ROUND_HALF_UP)
-            
-        super().clean_fields(exclude=exclude)
+        if self.credit_amount is not None:
+            self.credit_amount = Decimal(str(self.credit_amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        
+        super().save(*args, **kwargs)
     
     class Meta:
         indexes = [
@@ -402,15 +389,14 @@ class BankTransaction(TenantAwareBaseModel):
     balance_validated = models.BooleanField(default=False)  # <-- NEW FIELD
     tx_hash = models.CharField(max_length=64, blank=True, null=True, db_index=True)
     
-    def clean_fields(self, exclude=None):
-        # Ensure exclude is a set
-        exclude = set(exclude or [])
-        # Pre-quantize BEFORE parent clean_fields() triggers validators
-        if 'amount' not in exclude and self.amount is not None:
-            # avoid float artifacts: go through str() then quantize
-            q = Decimal('0.01')
-            self.amount = Decimal(str(self.amount)).quantize(q, rounding=ROUND_HALF_UP)
-        super().clean_fields(exclude=exclude)
+    def save(self, *args, **kwargs):
+        if self.amount is not None:
+            # if floats can reach here, protect with str() to avoid artifacts
+            self.amount = Decimal(str(self.amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+        super().save(*args, **kwargs)
+        
+
     
     class Meta:
         indexes = [
