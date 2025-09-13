@@ -245,12 +245,18 @@ def _row_observations(audit_by_rowid, row_id):
     return obs
 
 def _allowed_keys(model):
-    return (
-        {f.name for f in model._meta.fields}
-        | {f.name + "_fk" for f in model._meta.fields}
-        | set(PATH_COLS)
-        | {"__row_id", "id"}
-    )
+    """
+    Accept base names (e.g., 'entity'), DB attnames (e.g., 'entity_id'),
+    and importer aliases '*_fk'. Also path cols, '__row_id', 'id'.
+    """
+    names = set()
+    for f in model._meta.fields:
+        names.add(f.name)
+        att = getattr(f, "attname", None)
+        if att:
+            names.add(att)  # e.g., 'entity_id'
+    fk_aliases = {n + "_fk" for n in names}
+    return names | fk_aliases | set(PATH_COLS) | {"__row_id", "id"}
 
 def _filter_unknown(model, row: Dict[str, Any]):
     """Return (filtered_row, unknown_keys) keeping only allowed keys for this model."""
@@ -422,11 +428,18 @@ def execute_import_job(
         return obs
 
     def _allowed_keys(model):
-        return (
-            {f.name for f in model._meta.fields}
-            | {f.name + "_fk" for f in model._meta.fields}
-            | set(PATH_COLS) | {"__row_id", "id"}
-        )
+        """
+        Accept base names (e.g., 'entity'), DB attnames (e.g., 'entity_id'),
+        and importer aliases '*_fk'. Also path cols, '__row_id', 'id'.
+        """
+        names = set()
+        for f in model._meta.fields:
+            names.add(f.name)
+            att = getattr(f, "attname", None)
+            if att:
+                names.add(att)  # e.g., 'entity_id'
+        fk_aliases = {n + "_fk" for n in names}
+        return names | fk_aliases | set(PATH_COLS) | {"__row_id", "id"}
 
     def _filter_unknown(model, row: Dict[str, Any]):
         """Return (filtered_row, unknown_keys). Unknown are dropped, returned for messaging."""
@@ -436,24 +449,70 @@ def execute_import_job(
         return filtered, unknown
 
     def _preflight_missing_required(model, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        """Only missing required (true error). Unknown columns are handled as warnings elsewhere."""
+        """
+        Only flag truly required fields:
+          - concrete, not null
+          - not primary_key
+          - not auto_created
+          - no default
+          - not auto_now / auto_now_add (auto-managed timestamps)
+        Treat presence of either <field>, <field>_id, or <field>_fk as satisfying the requirement.
+        """
         errors = {}
-        required = {
-            f.name for f in model._meta.fields
-            if (not f.null)
-               and (not f.auto_created)
-               and (getattr(f, "default", NOT_PROVIDED) is NOT_PROVIDED)
-        }
+    
+        # Build metadata for required fields and map base -> accepted keys
+        required_fields = []
+        field_map = {}  # base name -> {accepted keys}
+        for f in model._meta.fields:
+            # skip non-concrete / reverse relations
+            if not hasattr(f, "attname"):
+                continue
+    
+            # auto-managed timestamps should NOT be required
+            is_auto_ts = (
+                (hasattr(f, "auto_now") and getattr(f, "auto_now")) or
+                (hasattr(f, "auto_now_add") and getattr(f, "auto_now_add"))
+            )
+    
+            has_default = (getattr(f, "default", NOT_PROVIDED) is not NOT_PROVIDED)
+    
+            if (
+                (not f.null)
+                and (not f.primary_key)
+                and (not f.auto_created)
+                and (not has_default)
+                and (not is_auto_ts)
+            ):
+                required_fields.append(f)
+    
+            base = f.name                          # e.g., 'entity'
+            attn = getattr(f, "attname", f.name)   # e.g., 'entity_id'
+            accepted = {base, attn, f"{base}_fk"}
+            field_map[base] = accepted
+    
         for i, row in enumerate(rows):
             rid = row.get("__row_id") or f"row{i+1}"
             payload = {k: v for k, v in row.items() if k != "__row_id"}
-            missing = sorted([f for f in required if f not in payload or payload.get(f) in ("", None)])
+    
+            missing = []
+            for f in required_fields:
+                base = f.name
+                accepted_keys = field_map.get(base, {base})
+                present = False
+                for k in accepted_keys:
+                    if k in payload and payload.get(k) not in ("", None):
+                        present = True
+                        break
+                if not present:
+                    missing.append(base)
+    
             if missing:
                 errors[rid] = {
                     "code": "E-PREFLIGHT",
-                    "message": f"Missing required: {', '.join(missing)}",
-                    "fields": {"missing": missing},
+                    "message": f"Missing required: {', '.join(sorted(missing))}",
+                    "fields": {"missing": sorted(missing)},
                 }
+    
         return errors
 
     def _coerce_pk(val):
