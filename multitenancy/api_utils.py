@@ -63,6 +63,91 @@ def _excel_safe(value):
         return json.dumps(value, ensure_ascii=False, indent=2)
     except Exception:
         return str(value)
+
+# utils/fingerprint.py
+import hashlib, json, re
+from decimal import Decimal, ROUND_HALF_UP
+from typing import List, Dict, Any
+from django.db import models
+
+_WHITESPACE_RE = re.compile(r"\s+")
+
+# Optional: tune per model; fallback is "all non-volatile fields present in the row"
+IDENTITY_FIELDS_MAP = {
+    # "BankTransaction": ["date", "amount", "description", "currency", "bank_account"],
+}
+
+IGNORE_FIELDS = {"id","created_at","updated_at","created_by","updated_by","is_deleted","is_active"}
+
+def _norm_scalar(val):
+    if val is None: return None
+    if isinstance(val, (bool, int)): return val
+    if isinstance(val, float): return float(str(val))  # kill binary artifacts
+    if isinstance(val, Decimal): return str(val)
+    s = str(val).strip()
+    return _WHITESPACE_RE.sub(" ", s)
+
+def _quantize_decimal(val, dp):
+    if val in (None, ""): return None
+    q = Decimal("1").scaleb(-int(dp))
+    return Decimal(str(val)).quantize(q, rounding=ROUND_HALF_UP)
+
+def canonicalize_row(model, row: Dict[str, Any]) -> Dict[str, Any]:
+    field_by = {f.name: f for f in model._meta.get_fields() if hasattr(f, "attname")}
+    allowed  = set(field_by.keys())
+    ident    = set(IDENTITY_FIELDS_MAP.get(model.__name__, [])) or \
+               {k for k in row.keys() if k in allowed and k not in IGNORE_FIELDS}
+
+    # fold *_fk into base field name
+    incoming = {}
+    for k, v in row.items():
+        if k == "__row_id": continue
+        incoming[k[:-3] if k.endswith("_fk") else k] = v
+
+    out = {}
+    for k in sorted(ident):
+        v = incoming.get(k)
+        f = field_by.get(k)
+        if isinstance(f, models.DecimalField):
+            v = _quantize_decimal(v, f.decimal_places)
+            out[k] = str(v) if v is not None else None
+        elif isinstance(f, models.DateField):
+            out[k] = str(v) if v is not None else None
+        elif isinstance(f, models.ForeignKey):
+            out[k] = int(v) if v not in (None, "") else None
+        else:
+            out[k] = _norm_scalar(v)
+    return out
+
+def row_hash(model, row: Dict[str, Any]) -> str:
+    canon = canonicalize_row(model, row)
+    blob  = json.dumps(canon, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+def table_fingerprint(model, rows: List[Dict[str, Any]], sample_n: int = 200) -> Dict[str, Any]:
+    rhashes = [row_hash(model, r) for r in rows]
+    unique_sorted = sorted(set(rhashes))  # order-insensitive, dedup
+    cols = sorted(canonicalize_row(model, rows[0]).keys()) if rows else []
+    header_blob = json.dumps(cols, separators=(",", ":"), sort_keys=True)
+    concat = header_blob + "|" + "|".join(unique_sorted)
+    thash  = hashlib.sha256(concat.encode("utf-8")).hexdigest()
+    return {
+        "row_count": len(rows),
+        "colnames": cols,
+        "row_hashes": unique_sorted,
+        "row_hash_sample": unique_sorted[:sample_n],
+        "table_hash": thash,
+    }
+
+def jaccard(a: set[str], b: set[str]) -> float:
+    if not a and not b: return 1.0
+    if not a or not b:  return 0.0
+    inter = len(a & b); union = len(a | b)
+    return inter / union
+
+
+
+
 # -----------------------
 # MPTT PATH SUPPORT (generic)
 # -----------------------

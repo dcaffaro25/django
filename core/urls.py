@@ -8,6 +8,10 @@ from .views import (
     FinancialIndexQuoteForecastViewSet,
     RecurrencePreviewView,
 )
+# core/urls.py
+from django.urls import path
+from core.views import ActivityFeedView, CeleryQueuesView, CeleryResultsView, CeleryTaskControlView
+
 
 router = DefaultRouter()
 router.trailing_slash = r'/?'
@@ -23,4 +27,8 @@ custom_routes = [
 urlpatterns = [
     path(r'^api/?$', include(router.urls)),
     path(r'^api/?$', include(custom_routes)),
+    path("api/activity/", ActivityFeedView.as_view(), name="activity-feed"),
+    path("api/celery/queues/", CeleryQueuesView.as_view(), name="celery-queues"),
+    path("api/celery/results/", CeleryResultsView.as_view(), name="celery-results"),
+    path("api/celery/tasks/<uuid:task_id>/<str:action>/", CeleryTaskControlView.as_view(), name="celery-task-control"),
 ]

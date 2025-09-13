@@ -402,3 +402,22 @@ class SubstitutionRule(TenantAwareBaseModel):
             target = "<unspecified>"
         return f"({self.id}) {self.title} - {target}: {self.match_value} -> {self.substitution_value}"
 
+class ImportSnapshot(models.Model):
+    company_id     = models.IntegerField(db_index=True)
+    model_name     = models.CharField(max_length=100, db_index=True)
+    row_count      = models.IntegerField()
+    colnames       = models.JSONField()                 # canonical columns used in hashing
+    row_hash_sample= models.JSONField()                 # small sample for diagnostics (e.g., first 200)
+    table_hash     = models.CharField(max_length=64, db_index=True)  # sha256 hex of table signature
+    file_sha256    = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+    filename       = models.CharField(max_length=255, null=True, blank=True)
+    jaccard_to_prev= models.FloatField(null=True, blank=True)        # optional, for analytics
+    created_at     = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["company_id", "model_name", "-created_at"]),
+            models.Index(fields=["file_sha256"]),
+            models.Index(fields=["table_hash"]),
+        ]
+

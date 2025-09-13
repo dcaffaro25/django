@@ -16,6 +16,114 @@ from .serializers import (
 )
 from datetime import datetime
 
+# core/views.py
+from rest_framework.generics import ListAPIView
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import permissions, status
+from django.utils import timezone
+from datetime import timedelta
+
+from core.models import ActionEvent
+from core.serializers import ActionEventSerializer, TaskResultSerializer
+
+from django_celery_results.models import TaskResult
+from django.conf import settings
+
+# import your Celery app
+from celery import app as celery_app
+
+
+class ActivityFeedView(ListAPIView):
+    """Latest actions (admin-like). Query params: company_id, level, limit, since_hours."""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = ActionEventSerializer
+
+    def get_queryset(self):
+        qs = ActionEvent.objects.all().order_by("-created_at")
+        company_id  = self.request.query_params.get("company_id")
+        level       = self.request.query_params.get("level")
+        since_hours = int(self.request.query_params.get("since_hours", "168"))  # default 7 days
+        if company_id: qs = qs.filter(company_id=company_id)
+        if level: qs = qs.filter(level=level)
+        if since_hours > 0:
+            qs = qs.filter(created_at__gte=timezone.now() - timedelta(hours=since_hours))
+        limit = int(self.request.query_params.get("limit", "200"))
+        return qs[:limit]
+
+
+class CeleryQueuesView(APIView):
+    """List workers and their tasks: active/reserved/scheduled."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        i = celery_app.control.inspect()
+        data = {
+            "workers": list((i.ping() or {}).keys()) if i else [],
+            "active": i.active() or {},
+            "reserved": i.reserved() or {},
+            "scheduled": i.scheduled() or {},
+            "stats": i.stats() or {},
+            "registered": i.registered() or {},
+            "conf": {"broker_url": getattr(settings, "CELERY_BROKER_URL", None)},
+        }
+        return Response(data)
+
+
+class CeleryResultsView(ListAPIView):
+    """Recent task results (success/fail). Query: name, status, hours, limit"""
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = TaskResultSerializer
+
+    def get_queryset(self):
+        qs = TaskResult.objects.all().order_by("-date_done")
+        name   = self.request.query_params.get("name")
+        status = self.request.query_params.get("status")
+        hours  = int(self.request.query_params.get("hours","168"))
+        if name: qs = qs.filter(task_name=name)
+        if status: qs = qs.filter(status=status.upper())
+        if hours > 0:
+            qs = qs.filter(date_done__gte=timezone.now() - timedelta(hours=hours))
+        limit = int(self.request.query_params.get("limit","200"))
+        return qs[:limit]
+
+
+class CeleryTaskControlView(APIView):
+    """
+    POST /api/celery/tasks/{task_id}/revoke
+    POST /api/celery/tasks/{task_id}/bump
+      Body: {"queue":"imports_high"}  # or {"priority": 9} if using AMQP priority
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, task_id: str, action: str):
+        if action == "revoke":
+            terminate = bool(request.data.get("terminate", False))
+            celery_app.control.revoke(task_id, terminate=terminate)
+            return Response({"ok": True, "task_id": task_id, "action": "revoked"})
+        elif action == "bump":
+            # Strategy: revoke if pending, then re-enqueue to high-priority queue or with priority header
+            target_queue = request.data.get("queue", "high_priority")
+            priority     = request.data.get("priority")  # AMQP only
+            # Try to read original TaskResult to recreate call (best effort)
+            tr = TaskResult.objects.filter(task_id=task_id).order_by("-date_done").first()
+            if tr and tr.task_name:
+                # We assume the original args/kwargs are stored in result/meta; adjust if you store elsewhere
+                args   = tr.meta.get("args", []) if isinstance(tr.meta, dict) else []
+                kwargs = tr.meta.get("kwargs", {}) if isinstance(tr.meta, dict) else {}
+                celery_app.control.revoke(task_id, terminate=False)
+                sig = celery_app.signature(tr.task_name, args=args, kwargs=kwargs)
+                opts = {}
+                if priority is not None: opts["priority"] = int(priority)  # RabbitMQ/AMQP
+                if target_queue: opts["queue"] = target_queue
+                new_id = sig.apply_async(**opts).id
+                return Response({"ok": True, "old_task_id": task_id, "new_task_id": new_id,
+                                 "routed_to": target_queue, "priority": opts.get("priority")})
+            # Fallback: try broker-level move (not generally supported), so return 400
+            return Response({"ok": False, "error": "Cannot reconstruct task; resend manually"}, status=400)
+        else:
+            return Response({"ok": False, "error": "Unknown action"}, status=400)
+
 
 class FinancialIndexViewSet(viewsets.ModelViewSet):
     queryset = FinancialIndex.objects.all()

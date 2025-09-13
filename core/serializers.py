@@ -1,6 +1,25 @@
 from rest_framework import serializers
 from .models import FinancialIndex, IndexQuote, FinancialIndexQuoteForecast
 
+# core/serializers.py
+from rest_framework import serializers
+from core.models import ActionEvent
+from django_celery_results.models import TaskResult
+
+class ActionEventSerializer(serializers.ModelSerializer):
+    actor_name = serializers.SerializerMethodField()
+    class Meta:
+        model  = ActionEvent
+        fields = ["id","company_id","actor_name","verb","level","message","meta",
+                  "target_app","target_model","target_id","created_at"]
+    def get_actor_name(self, obj):
+        return getattr(obj.actor, "get_full_name", lambda: None)() or getattr(obj.actor,"username", None)
+
+class TaskResultSerializer(serializers.ModelSerializer):
+    class Meta:
+        model  = TaskResult
+        fields = ["task_id","task_name","status","date_done","result","traceback","meta"]
+
 
 class FinancialIndexSerializer(serializers.ModelSerializer):
     class Meta:

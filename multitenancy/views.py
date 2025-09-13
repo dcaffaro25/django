@@ -26,6 +26,7 @@ from celery import shared_task, group, chord
 import numpy as np
 import pandas as pd
 import math
+import hashlib
 
 class LoginView(views.APIView):
     permission_classes = (permissions.AllowAny,)
@@ -602,12 +603,15 @@ def _scrub_json(o):
 
 class BulkImportAPIView(APIView):
     def post(self, request, *args, **kwargs):
-        file = request.FILES["file"]
+        up = request.FILES["file"]
+        # compute sha256 (preserve file pointer)
+        _bytes = up.read()
+        file_sha256 = hashlib.sha256(_bytes).hexdigest()
+        size = len(_bytes)
+        up.seek(0)
 
-        # Read all sheets
-        book = pd.read_excel(file, sheet_name=None)
-
-        # Build "sheets" with per-sheet sanitization
+        # build sheets (your existing logic)
+        book = pd.read_excel(up, sheet_name=None)
         sheets = []
         for model_name, df in book.items():
             if model_name == "References":
@@ -623,14 +627,16 @@ class BulkImportAPIView(APIView):
         company_id = request.data.get("company_id") or getattr(request.user, "company_id", None)
         if not company_id:
             return Response({"error": "No company defined"}, status=400)
-
+        
+        file_meta = {"sha256": file_sha256, "size": size, "filename": getattr(up, "name", None)}
+        
         if use_celery:
-            async_res = run_import_job.delay(company_id, sheets, commit)
+            async_res = run_import_job.delay(company_id, sheets, commit, file_meta)
             return Response({"task_id": async_res.id, "message": "Import scheduled"},
                             status=status.HTTP_202_ACCEPTED)
 
         # Synchronous
-        result = execute_import_job(company_id, sheets, commit)
+        result = execute_import_job(company_id, sheets, commit, file_meta=file_meta)
 
         # Final safety: scrub any NaN/±Inf that may have been produced downstream
         result = _scrub_json(result)

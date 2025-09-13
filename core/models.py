@@ -4,6 +4,34 @@ from datetime import datetime
 from typing import List, Optional
 from dateutil.rrule import rrulestr
 
+# core/models.py
+from django.db import models
+from django.conf import settings
+
+class ActionEvent(models.Model):
+    LEVELS = [("info","info"),("warning","warning"),("error","error")]
+    company_id     = models.IntegerField(db_index=True)
+    actor          = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True,
+                                       on_delete=models.SET_NULL, related_name="action_events")
+    verb           = models.CharField(max_length=64)   # e.g. "import.started", "import.finished", "bank_tx.created"
+    target_app     = models.CharField(max_length=64, blank=True, default="")
+    target_model   = models.CharField(max_length=64, blank=True, default="")
+    target_id      = models.CharField(max_length=64, blank=True, default="")
+    level          = models.CharField(max_length=16, choices=LEVELS, default="info", db_index=True)
+    message        = models.TextField(blank=True, default="")
+    meta           = models.JSONField(blank=True, null=True)
+    created_at     = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["company_id","-created_at"]),
+            models.Index(fields=["level","-created_at"]),
+            models.Index(fields=["verb","-created_at"]),
+        ]
+
+    def __str__(self):
+        return f"[{self.level}] {self.verb} #{self.id}"
+
 
 def get_next_n_occurrences(rrule_str: str, dtstart: datetime, n: int, after: Optional[datetime] = None) -> List[datetime]:
     """
