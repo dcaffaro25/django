@@ -1767,17 +1767,47 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         Returns both:
         1. DB-persisted tasks (filterable by tenant_id, status)
         2. Live Celery queue info (active/reserved/scheduled)
+        Filters:
+          - ?tenant_id=foo
+          - ?last_n=100   (last 100 tasks)
+          - ?hours_ago=6  (tasks from the last 6 hours)
         """
+        
         tenant_filter = request.query_params.get("tenant_id")
         status_filter = request.query_params.get("status")
-
+        last_n = request.query_params.get("last_n")
+        hours_ago = request.query_params.get("hours_ago")
+        
         # ---- DB tasks ----
         qs = ReconciliationTask.objects.all().order_by("-created_at")
         if tenant_filter:
             qs = qs.filter(tenant_id=tenant_filter)
         if status_filter:
             qs = qs.filter(status=status_filter)
-
+        
+        if hours_ago:
+            try:
+                raw = str(hours_ago).lower()
+                if raw.endswith("d"):
+                    hours = int(raw[:-1]) * 24
+                elif raw.endswith("h"):
+                    hours = int(raw[:-1])
+                else:
+                    hours = int(raw)  # fallback if pure number
+        
+                cutoff = timezone.now() - timedelta(hours=hours)
+                qs = qs.filter(created_at__gte=cutoff)
+            except ValueError:
+                pass
+    
+        if last_n:
+            try:
+                last_n = int(last_n)
+                qs = qs.order_by("-created_at")[:last_n]
+            except ValueError:
+                pass
+    
+        
         db_tasks = self.get_serializer(qs, many=True).data
 
         # ---- Celery live tasks ----
