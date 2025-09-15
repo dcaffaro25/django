@@ -541,8 +541,8 @@ class ReconciliationConfig(models.Model):
     description = models.TextField(blank=True, null=True)
 
     # Bank & Book filters (saved queries)
-    bank_filters = models.JSONField(default=dict, blank=True)
-    book_filters = models.JSONField(default=dict, blank=True)
+    bank_filters = models.JSONField(default=dict, blank=True, null=True)
+    book_filters = models.JSONField(default=dict, blank=True, null=True)
 
     # Reconciliation parameters
     strategy = models.CharField(

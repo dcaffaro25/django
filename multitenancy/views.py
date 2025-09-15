@@ -213,7 +213,7 @@ class AdminForcePasswordView(generics.GenericAPIView):
             status=status.HTTP_200_OK
         )
 
-class CustomUserViewSet(viewsets.ModelViewSet):
+class CustomUserViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = CustomUser.objects.all()
     serializer_class = CustomUserSerializer
     
