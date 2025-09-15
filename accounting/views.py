@@ -1730,7 +1730,8 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         Start reconciliation as a background task
         """
         data = request.data
-    
+        auto_match_100 = bool(data.get("auto_match_100", False))
+        
         # 1. Pre-create DB record with placeholder task_id
         task_obj = ReconciliationTask.objects.create(
             task_id="queued",   # will be updated after Celery fires
@@ -1740,7 +1741,7 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         )
     
         # 2. Trigger Celery, pass the db_id
-        async_result = match_many_to_many_task.delay(task_obj.id, data, tenant_id)
+        async_result = match_many_to_many_task.delay(task_obj.id, data, tenant_id, auto_match_100)
     
         # 3. Update the DB record with Celery task_id
         task_obj.task_id = async_result.id

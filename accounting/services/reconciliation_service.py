@@ -3,6 +3,7 @@ from decimal import Decimal
 from bisect import bisect_left, bisect_right
 from itertools import product, combinations
 from collections import defaultdict
+from django.db import transaction
 
 from accounting.models import BankTransaction, JournalEntry, Account
 
@@ -13,7 +14,7 @@ class ReconciliationService:
     """
 
     @staticmethod
-    def match_many_to_many_with_set2(data, tenant_id=None):
+    def match_many_to_many_with_set2(data, tenant_id=None, *, auto_match_100=False):
         """
         Orchestrates reconciliation matching strategies.
         Returns dict with suggestions.
@@ -61,14 +62,126 @@ class ReconciliationService:
                 candidate_bank, candidate_book, amount_tolerance, date_tolerance_days, max_group_size
             )
 
-        combined_suggestions = (exact_matches + fuzzy_matches + group_matches)#[:max_suggestions]
+        combined = (exact_matches + fuzzy_matches + group_matches)#[:max_suggestions]
+        
+        auto_info = {"enabled": bool(auto_match_100), "applied": 0, "skipped": 0, "details": []}
+        if auto_match_100:
+            auto_info = ReconciliationService._apply_auto_matches_100(combined, tenant_id)
 
-        return {"suggestions": combined_suggestions}
+        return {"suggestions": combined, "auto_match": auto_info}
+    
+    @staticmethod
+    @transaction.atomic
+    def _apply_auto_matches_100(suggestions, tenant_id=None, *, status_value="matched"):
+        """
+        Persist suggestions with confidence_score == 1.0.
+        Greedy & non-overlapping: a bank or book id is used at most once in this pass.
+        Will also skip anything already matched/approved in DB.
+        Supports either a Group model (preferred) or pairwise edges fallback.
+        """
+        from django.db.models import Q
 
+        applied, skipped = 0, 0
+        details = []
+        used_bank, used_book = set(), set()
+
+        # Try to discover models layout for persistence
+        GroupModel = None
+        EdgeModel = None
+        try:
+            # If you have a group model with M2M relations
+            from accounting.models import ReconciliationGroup as GroupModel  # type: ignore
+        except Exception:
+            GroupModel = None
+        try:
+            # Fallback: one edge per (bank, journal) pair
+            from accounting.models import Reconciliation as EdgeModel  # type: ignore
+        except Exception:
+            EdgeModel = None
+
+        # Greedy: go through current 100% candidates (already sorted in callers)
+        for s in suggestions:
+            try:
+                if float(s.get("confidence_score", 0)) != 1.0:
+                    continue
+
+                bank_ids = s.get("bank_ids")
+                book_ids = s.get("journal_entries_ids")
+                # tolerate alternate keys if present
+                if not bank_ids and s.get("bank_transaction_details"):
+                    bank_ids = [x.get("id") for x in s["bank_transaction_details"]]
+                if not book_ids and s.get("journal_entry_details"):
+                    # prefer Journal Entry ids (your suggestion dict uses entry.id in journal_entry_details)
+                    book_ids = [x.get("id") for x in s["journal_entry_details"]]
+
+                bank_ids = list({int(b) for b in (bank_ids or [])})
+                book_ids = list({int(j) for j in (book_ids or [])})
+                if not bank_ids or not book_ids:
+                    skipped += 1
+                    details.append({"reason": "empty_ids", "suggestion": s})
+                    continue
+
+                # Intra-run conflict?
+                if any(b in used_bank for b in bank_ids) or any(j in used_book for j in book_ids):
+                    skipped += 1
+                    details.append({"reason": "overlap_in_batch", "suggestion": s})
+                    continue
+
+                # DB conflict? Already matched/approved?
+                if BankTransaction.objects.filter(
+                    id__in=bank_ids, reconciliations__status__in=['matched', 'approved']
+                ).exists() or JournalEntry.objects.filter(
+                    id__in=book_ids, reconciliations__status__in=['matched', 'approved']
+                ).exists():
+                    skipped += 1
+                    details.append({"reason": "already_matched_in_db", "suggestion": s})
+                    continue
+
+                # Persist
+                if GroupModel is not None:
+                    group = GroupModel.objects.create(
+                        status=status_value,
+                        tenant_id=tenant_id,
+                        source="auto_match_100",
+                    )
+                    group.bank_transactions.add(*BankTransaction.objects.filter(id__in=bank_ids))
+                    # If your Group model stores JournalEntry (not transaction): add those
+                    group.journal_entries.add(*JournalEntry.objects.filter(id__in=book_ids))
+                    group.save()
+                    applied += 1
+                    details.append({"group_id": getattr(group, "id", None), "bank_ids": bank_ids, "journal_entries_ids": book_ids})
+                elif EdgeModel is not None:
+                    # Create a dense matching set (each bank x each journal entry)
+                    # If you keep a group_id on the edge model, create one and fill it here.
+                    for b in bank_ids:
+                        for j in book_ids:
+                            EdgeModel.objects.create(
+                                bank_transaction_id=b,
+                                journal_entry_id=j,
+                                status=status_value,
+                                source="auto_match_100",
+                                tenant_id=tenant_id,
+                            )
+                    applied += 1
+                    details.append({"edges_created": len(bank_ids) * len(book_ids), "bank_ids": bank_ids, "journal_entries_ids": book_ids})
+                else:
+                    skipped += 1
+                    details.append({"reason": "no_persistence_model_found", "suggestion": s})
+                    continue
+
+                used_bank.update(bank_ids)
+                used_book.update(book_ids)
+
+            except Exception as e:
+                skipped += 1
+                details.append({"reason": "exception", "error": str(e), "suggestion": s})
+
+        return {"enabled": True, "applied": applied, "skipped": skipped, "details": details}
+    
     # ------------------------------------------------------------------
     # Strategy helpers
     # ------------------------------------------------------------------
-
+    
     @staticmethod
     def get_exact_matches(banks, books):
         exact_matches = []
