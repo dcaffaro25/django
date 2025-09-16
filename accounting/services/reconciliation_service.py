@@ -76,83 +76,96 @@ class ReconciliationService:
         """
         Persist suggestions with confidence_score == 1.0 using the group-style
         Reconciliation model (M2M to bank/journal).
-        
+    
         Rules:
           - Greedy & non-overlapping within this pass (no bank/journal id is reused).
-          - Skip if any of the involved objects already participate in a
-            matched/approved reconciliation in the database.
-          - Tag provenance via notes='auto_match_100'. You can change to reference if you prefer.
+          - Skip if any of the involved objects already participate in a matched/approved reconciliation.
+          - Infer company_id from the involved objects; skip if mixed or unresolved.
+          - Tag provenance via notes='auto_match_100'.
         """
         applied, skipped = 0, 0
         details = []
         used_bank, used_book = set(), set()
-
+    
         for s in suggestions:
             try:
                 if float(s.get("confidence_score", 0)) != 1.0:
                     continue
-
+    
                 # Accept either flat id arrays or pull from detail blocks
                 bank_ids = s.get("bank_ids") or []
                 book_ids = s.get("journal_entries_ids") or []
-
                 if not bank_ids and s.get("bank_transaction_details"):
                     bank_ids = [x.get("id") for x in s["bank_transaction_details"]]
                 if not book_ids and s.get("journal_entry_details"):
-                    # Your detail dict uses entry.id in journal_entry_details
                     book_ids = [x.get("id") for x in s["journal_entry_details"]]
-
+    
                 # Normalize / dedupe
                 bank_ids = list({int(b) for b in (bank_ids or []) if b is not None})
                 book_ids = list({int(j) for j in (book_ids or []) if j is not None})
-
                 if not bank_ids or not book_ids:
                     skipped += 1
                     details.append({"reason": "empty_ids", "suggestion": s})
                     continue
-
+    
                 # Intra-run conflict?
                 if any(b in used_bank for b in bank_ids) or any(j in used_book for j in book_ids):
                     skipped += 1
                     details.append({"reason": "overlap_in_batch", "suggestion": s})
                     continue
-
-                # DB conflict? Anything already matched/approved?
-                if BankTransaction.objects.filter(
-                    id__in=bank_ids, reconciliations__status__in=['matched', 'approved']
-                ).exists() or JournalEntry.objects.filter(
-                    id__in=book_ids, reconciliations__status__in=['matched', 'approved']
-                ).exists():
+    
+                # Lock both sides and re-check conflicts
+                bank_qs = BankTransaction.objects.select_for_update().filter(id__in=bank_ids)
+                book_qs = JournalEntry.objects.select_for_update().filter(id__in=book_ids)
+    
+                if bank_qs.filter(reconciliations__status__in=['matched','approved']).exists() or \
+                   book_qs.filter(reconciliations__status__in=['matched','approved']).exists():
                     skipped += 1
                     details.append({"reason": "already_matched_in_db", "suggestion": s})
                     continue
-
+    
+                # --------- infer company (single) ----------
+                company_set = set(
+                    bank_qs.values_list("company_id", flat=True).distinct()
+                ) | set(
+                    book_qs.values_list("company_id", flat=True).distinct()
+                )
+                company_set.discard(None)
+    
+                if len(company_set) == 0:
+                    skipped += 1
+                    details.append({"reason": "company_unresolved", "suggestion": s})
+                    continue
+                if len(company_set) > 1:
+                    skipped += 1
+                    details.append({"reason": "mixed_company", "companies": list(company_set), "suggestion": s})
+                    continue
+    
+                company_id = next(iter(company_set))
+    
                 # Create the group reconciliation and attach both sides
                 recon = Reconciliation.objects.create(
                     status=status_value,
-                    # If you want: reference="auto_match_100",
                     notes="auto_match_100",
-                    # Do NOT set tenant/company here; your TenantAwareBaseModel + middleware should scope it.
-                    # If you really want to set company explicitly and your base adds company FK:
-                    # company_id=some_company_id
+                    company_id=company_id,  # <<<<<< include company here
                 )
-                recon.bank_transactions.add(*BankTransaction.objects.filter(id__in=bank_ids))
-                recon.journal_entries.add(*JournalEntry.objects.filter(id__in=book_ids))
-                recon.save()
-
+                recon.bank_transactions.add(*bank_qs)
+                recon.journal_entries.add(*book_qs)
+    
                 applied += 1
+                used_bank.update(bank_ids)
+                used_book.update(book_ids)
                 details.append({
                     "reconciliation_id": recon.id,
+                    "company_id": company_id,
                     "bank_ids": bank_ids,
                     "journal_entries_ids": book_ids
                 })
-                used_bank.update(bank_ids)
-                used_book.update(book_ids)
-
+    
             except Exception as e:
                 skipped += 1
                 details.append({"reason": "exception", "error": str(e), "suggestion": s})
-
+    
         return {"enabled": True, "applied": applied, "skipped": skipped, "details": details}
     
     # ------------------------------------------------------------------
