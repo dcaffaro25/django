@@ -31,6 +31,7 @@ from bisect import bisect_left, bisect_right
 from .tasks import match_many_to_many_task
 #from celery.task.control import inspect
 from nord_backend.celery import app
+from multitenancy.api_utils import _to_bool
 
 # Currency ViewSet
 class CurrencyViewSet(viewsets.ModelViewSet):
@@ -1730,7 +1731,7 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         Start reconciliation as a background task
         """
         data = request.data
-        auto_match_100 = bool(data.get("auto_match_100", False))
+        auto_match_100 = _to_bool(data.get("auto_match_100", False))
         
         # 1. Pre-create DB record with placeholder task_id
         task_obj = ReconciliationTask.objects.create(
