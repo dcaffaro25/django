@@ -5,7 +5,7 @@ from itertools import product, combinations
 from collections import defaultdict
 from django.db import transaction
 
-from accounting.models import BankTransaction, JournalEntry, Account
+from accounting.models import BankTransaction, JournalEntry, Account, Reconciliation
 
 
 class ReconciliationService:
@@ -74,48 +74,38 @@ class ReconciliationService:
     @transaction.atomic
     def _apply_auto_matches_100(suggestions, tenant_id=None, *, status_value="matched"):
         """
-        Persist suggestions with confidence_score == 1.0.
-        Greedy & non-overlapping: a bank or book id is used at most once in this pass.
-        Will also skip anything already matched/approved in DB.
-        Supports either a Group model (preferred) or pairwise edges fallback.
+        Persist suggestions with confidence_score == 1.0 using the group-style
+        Reconciliation model (M2M to bank/journal).
+        
+        Rules:
+          - Greedy & non-overlapping within this pass (no bank/journal id is reused).
+          - Skip if any of the involved objects already participate in a
+            matched/approved reconciliation in the database.
+          - Tag provenance via notes='auto_match_100'. You can change to reference if you prefer.
         """
-        from django.db.models import Q
-
         applied, skipped = 0, 0
         details = []
         used_bank, used_book = set(), set()
 
-        # Try to discover models layout for persistence
-        GroupModel = None
-        EdgeModel = None
-        try:
-            # If you have a group model with M2M relations
-            from accounting.models import ReconciliationGroup as GroupModel  # type: ignore
-        except Exception:
-            GroupModel = None
-        try:
-            # Fallback: one edge per (bank, journal) pair
-            from accounting.models import Reconciliation as EdgeModel  # type: ignore
-        except Exception:
-            EdgeModel = None
-
-        # Greedy: go through current 100% candidates (already sorted in callers)
         for s in suggestions:
             try:
                 if float(s.get("confidence_score", 0)) != 1.0:
                     continue
 
-                bank_ids = s.get("bank_ids")
-                book_ids = s.get("journal_entries_ids")
-                # tolerate alternate keys if present
+                # Accept either flat id arrays or pull from detail blocks
+                bank_ids = s.get("bank_ids") or []
+                book_ids = s.get("journal_entries_ids") or []
+
                 if not bank_ids and s.get("bank_transaction_details"):
                     bank_ids = [x.get("id") for x in s["bank_transaction_details"]]
                 if not book_ids and s.get("journal_entry_details"):
-                    # prefer Journal Entry ids (your suggestion dict uses entry.id in journal_entry_details)
+                    # Your detail dict uses entry.id in journal_entry_details
                     book_ids = [x.get("id") for x in s["journal_entry_details"]]
 
-                bank_ids = list({int(b) for b in (bank_ids or [])})
-                book_ids = list({int(j) for j in (book_ids or [])})
+                # Normalize / dedupe
+                bank_ids = list({int(b) for b in (bank_ids or []) if b is not None})
+                book_ids = list({int(j) for j in (book_ids or []) if j is not None})
+
                 if not bank_ids or not book_ids:
                     skipped += 1
                     details.append({"reason": "empty_ids", "suggestion": s})
@@ -127,7 +117,7 @@ class ReconciliationService:
                     details.append({"reason": "overlap_in_batch", "suggestion": s})
                     continue
 
-                # DB conflict? Already matched/approved?
+                # DB conflict? Anything already matched/approved?
                 if BankTransaction.objects.filter(
                     id__in=bank_ids, reconciliations__status__in=['matched', 'approved']
                 ).exists() or JournalEntry.objects.filter(
@@ -137,38 +127,25 @@ class ReconciliationService:
                     details.append({"reason": "already_matched_in_db", "suggestion": s})
                     continue
 
-                # Persist
-                if GroupModel is not None:
-                    group = GroupModel.objects.create(
-                        status=status_value,
-                        tenant_id=tenant_id,
-                        source="auto_match_100",
-                    )
-                    group.bank_transactions.add(*BankTransaction.objects.filter(id__in=bank_ids))
-                    # If your Group model stores JournalEntry (not transaction): add those
-                    group.journal_entries.add(*JournalEntry.objects.filter(id__in=book_ids))
-                    group.save()
-                    applied += 1
-                    details.append({"group_id": getattr(group, "id", None), "bank_ids": bank_ids, "journal_entries_ids": book_ids})
-                elif EdgeModel is not None:
-                    # Create a dense matching set (each bank x each journal entry)
-                    # If you keep a group_id on the edge model, create one and fill it here.
-                    for b in bank_ids:
-                        for j in book_ids:
-                            EdgeModel.objects.create(
-                                bank_transaction_id=b,
-                                journal_entry_id=j,
-                                status=status_value,
-                                source="auto_match_100",
-                                tenant_id=tenant_id,
-                            )
-                    applied += 1
-                    details.append({"edges_created": len(bank_ids) * len(book_ids), "bank_ids": bank_ids, "journal_entries_ids": book_ids})
-                else:
-                    skipped += 1
-                    details.append({"reason": "no_persistence_model_found", "suggestion": s})
-                    continue
+                # Create the group reconciliation and attach both sides
+                recon = Reconciliation.objects.create(
+                    status=status_value,
+                    # If you want: reference="auto_match_100",
+                    notes="auto_match_100",
+                    # Do NOT set tenant/company here; your TenantAwareBaseModel + middleware should scope it.
+                    # If you really want to set company explicitly and your base adds company FK:
+                    # company_id=some_company_id
+                )
+                recon.bank_transactions.add(*BankTransaction.objects.filter(id__in=bank_ids))
+                recon.journal_entries.add(*JournalEntry.objects.filter(id__in=book_ids))
+                recon.save()
 
+                applied += 1
+                details.append({
+                    "reconciliation_id": recon.id,
+                    "bank_ids": bank_ids,
+                    "journal_entries_ids": book_ids
+                })
                 used_bank.update(bank_ids)
                 used_book.update(book_ids)
 
