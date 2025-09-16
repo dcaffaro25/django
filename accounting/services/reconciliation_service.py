@@ -77,80 +77,86 @@ class ReconciliationService:
         Persist suggestions with confidence_score == 1.0 using the group-style
         Reconciliation model (M2M to bank/journal).
     
-        Rules:
-          - Greedy & non-overlapping within this pass (no bank/journal id is reused).
-          - Skip if any of the involved objects already participate in a matched/approved reconciliation.
-          - Infer company_id from the involved objects; skip if mixed or unresolved.
-          - Tag provenance via notes='auto_match_100'.
+        - Greedy & non-overlapping within this pass (no bank/journal id reused).
+        - Skip if any involved objs already matched/approved.
+        - Infer company_id from involved objs; skip if mixed/unresolved.
+        - Per-suggestion savepoint so one failure doesn't abort the batch.
         """
         applied, skipped = 0, 0
         details = []
         used_bank, used_book = set(), set()
     
         for s in suggestions:
+            # only perfect matches
+            if float(s.get("confidence_score", 0)) != 1.0:
+                continue
+    
+            # gather ids (flat or from details)
+            bank_ids = s.get("bank_ids") or []
+            book_ids = s.get("journal_entries_ids") or []
+            if not bank_ids and s.get("bank_transaction_details"):
+                bank_ids = [x.get("id") for x in s["bank_transaction_details"]]
+            if not book_ids and s.get("journal_entry_details"):
+                book_ids = [x.get("id") for x in s["journal_entry_details"]]
+    
+            bank_ids = list({int(b) for b in (bank_ids or []) if b is not None})
+            book_ids = list({int(j) for j in (book_ids or []) if j is not None})
+    
+            if not bank_ids or not book_ids:
+                skipped += 1
+                details.append({"reason": "empty_ids", "suggestion": s})
+                continue
+    
+            # intra-batch overlap?
+            if any(b in used_bank for b in bank_ids) or any(j in used_book for j in book_ids):
+                skipped += 1
+                details.append({"reason": "overlap_in_batch", "suggestion": s})
+                continue
+    
+            # per-suggestion savepoint
+            sp = transaction.savepoint()
             try:
-                if float(s.get("confidence_score", 0)) != 1.0:
-                    continue
-    
-                # Accept either flat id arrays or pull from detail blocks
-                bank_ids = s.get("bank_ids") or []
-                book_ids = s.get("journal_entries_ids") or []
-                if not bank_ids and s.get("bank_transaction_details"):
-                    bank_ids = [x.get("id") for x in s["bank_transaction_details"]]
-                if not book_ids and s.get("journal_entry_details"):
-                    book_ids = [x.get("id") for x in s["journal_entry_details"]]
-    
-                # Normalize / dedupe
-                bank_ids = list({int(b) for b in (bank_ids or []) if b is not None})
-                book_ids = list({int(j) for j in (book_ids or []) if j is not None})
-                if not bank_ids or not book_ids:
-                    skipped += 1
-                    details.append({"reason": "empty_ids", "suggestion": s})
-                    continue
-    
-                # Intra-run conflict?
-                if any(b in used_bank for b in bank_ids) or any(j in used_book for j in book_ids):
-                    skipped += 1
-                    details.append({"reason": "overlap_in_batch", "suggestion": s})
-                    continue
-    
-                # Lock both sides and re-check conflicts
-                bank_qs = BankTransaction.objects.select_for_update().filter(id__in=bank_ids)
-                book_qs = JournalEntry.objects.select_for_update().filter(id__in=book_ids)
-    
-                if bank_qs.filter(reconciliations__status__in=['matched','approved']).exists() or \
-                   book_qs.filter(reconciliations__status__in=['matched','approved']).exists():
+                # quick conflict check WITHOUT locks (avoids FOR UPDATE oddities)
+                if BankTransaction.objects.filter(
+                    id__in=bank_ids, reconciliations__status__in=['matched', 'approved']
+                ).exists() or JournalEntry.objects.filter(
+                    id__in=book_ids, reconciliations__status__in=['matched', 'approved']
+                ).exists():
                     skipped += 1
                     details.append({"reason": "already_matched_in_db", "suggestion": s})
+                    transaction.savepoint_commit(sp)
                     continue
     
-                # --------- infer company (single) ----------
-                company_set = set(
-                    bank_qs.values_list("company_id", flat=True).distinct()
-                ) | set(
-                    book_qs.values_list("company_id", flat=True).distinct()
-                )
-                company_set.discard(None)
+                # lock the rows we will attach (no DISTINCT)
+                bank_objs = list(BankTransaction.objects.select_for_update().filter(id__in=bank_ids))
+                book_objs = list(JournalEntry.objects.select_for_update().filter(id__in=book_ids))
     
-                if len(company_set) == 0:
+                # infer single company (collect in Python; no DISTINCT in SQL)
+                company_set = {b.company_id for b in bank_objs if b.company_id is not None} | \
+                              {j.company_id for j in book_objs if j.company_id is not None}
+    
+                if not company_set:
                     skipped += 1
                     details.append({"reason": "company_unresolved", "suggestion": s})
+                    transaction.savepoint_commit(sp)
                     continue
                 if len(company_set) > 1:
                     skipped += 1
                     details.append({"reason": "mixed_company", "companies": list(company_set), "suggestion": s})
+                    transaction.savepoint_commit(sp)
                     continue
     
                 company_id = next(iter(company_set))
     
-                # Create the group reconciliation and attach both sides
+                # create reconciliation and attach M2Ms
                 recon = Reconciliation.objects.create(
                     status=status_value,
                     notes="auto_match_100",
-                    company_id=company_id,  # <<<<<< include company here
+                    company_id=company_id,
                 )
-                recon.bank_transactions.add(*bank_qs)
-                recon.journal_entries.add(*book_qs)
+                # attach locked objs
+                recon.bank_transactions.add(*bank_objs)
+                recon.journal_entries.add(*book_objs)
     
                 applied += 1
                 used_bank.update(bank_ids)
@@ -162,12 +168,14 @@ class ReconciliationService:
                     "journal_entries_ids": book_ids
                 })
     
+                transaction.savepoint_commit(sp)
+    
             except Exception as e:
+                transaction.savepoint_rollback(sp)
                 skipped += 1
                 details.append({"reason": "exception", "error": str(e), "suggestion": s})
     
         return {"enabled": True, "applied": applied, "skipped": skipped, "details": details}
-    
     # ------------------------------------------------------------------
     # Strategy helpers
     # ------------------------------------------------------------------
