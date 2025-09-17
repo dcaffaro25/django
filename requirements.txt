@@ -7,6 +7,7 @@ django-mptt==0.15.0
 djangorestframework==3.14.0
 djangorestframework-simplejwt==5.3.1
 rest-framework-simplejwt==0.0.2
+django-filter>=24.0,<25.0
 Faker==33.3.1
 more-itertools==9.1.0
 mypy==1.1.1
