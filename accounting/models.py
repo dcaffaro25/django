@@ -4,7 +4,7 @@ from re import U
 from django.db import models
 #from multitenancy.models import BaseModel, TenantAwareBaseModel#Company, CustomUser, Entity
 from datetime import timedelta
-from django.db.models import Q, Sum
+from django.db.models import Q, Sum, CheckConstraint
 from decimal import Decimal
 from itertools import combinations
 from django.apps import apps
@@ -305,6 +305,29 @@ class JournalEntry(TenantAwareBaseModel):
     state = models.CharField(max_length=10, choices=[('pending', 'Pending'), ('posted', 'Posted'), ('canceled', 'Canceled')], default='pending')
     date = models.DateField(null=True, blank=True)
     
+    # NEW: allow creating a cash line without knowing the bank-specific GL yet
+    bank_designation_pending = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="If True, this line is the cash/bank leg and still awaits assignment to a specific bank GL."
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['transaction']),
+            models.Index(fields=['account']),
+            models.Index(fields=['cost_center']),
+            models.Index(fields=['date']),
+            models.Index(fields=['bank_designation_pending']),
+        ]
+        constraints = [
+            # Either it's pending designation OR an account must be present
+            CheckConstraint(
+                name="je_pending_or_account_present",
+                check=Q(bank_designation_pending=True) | Q(account__isnull=False),
+            ),
+        ]
+    
     def clean_fields(self, exclude=None):
         exclude = set(exclude or [])
         if 'debit_amount' not in exclude and self.debit_amount is not None:
@@ -318,26 +341,7 @@ class JournalEntry(TenantAwareBaseModel):
         super().clean_fields(exclude=exclude)
     
     def save(self, *args, **kwargs):
-        if self.debit_amount is not None:
-            self.debit_amount = Decimal(str(self.debit_amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-        
-        if self.credit_amount is not None:
-            self.credit_amount = Decimal(str(self.credit_amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-        
-        super().save(*args, **kwargs)
-    
-    class Meta:
-        indexes = [
-            models.Index(fields=['transaction']),
-            models.Index(fields=['account']),
-            models.Index(fields=['cost_center']),
-            models.Index(fields=['date']),  # optionally index the new field
-        ]
-    
-    def __str__(self):
-        return f'{self.transaction.date} - {self.transaction.amount} - {self.account.account_code} - {self.transaction.description}'
-    
-    def save(self, *args, **kwargs):
+        # === validations you already have ===
         if (self.debit_amount and self.debit_amount < 0) or (self.credit_amount and self.credit_amount < 0):
             raise ValueError('Amounts cannot be negative')
         if self.debit_amount and self.credit_amount:
@@ -346,13 +350,42 @@ class JournalEntry(TenantAwareBaseModel):
             raise ValueError('Either debit_amount or credit_amount must be set')
         
         if not self.date:
-            self.date = self.transaction.date  # default to transaction date
-
+            self.date = self.transaction.date
         if self.date < self.transaction.date:
             raise ValueError('Journal entry date cannot be earlier than the transaction date')
 
+        # === auto-behavior for the pending flag ===
+        # If account has a concrete bank_account, it's designated (turn the flag off)
+        if self.account and getattr(self.account, "bank_account_id", None):
+            self.bank_designation_pending = False
+
+        # If pending and account is empty, auto-route to the standard "pending" clearing account
+        if self.bank_designation_pending and self.account_id is None:
+            # Lazy import to avoid circulars
+            from accounting.services.bank_structs import ensure_pending_bank_structs
+            # Pick currency from the transaction
+            pending_ba, pending_gl = ensure_pending_bank_structs(
+                company_id=self.company_id,
+                currency_id=self.transaction.currency_id
+            )
+            self.account_id = pending_gl.id  # stays pending until reconciliation promotes it
+
+
+
+        if self.debit_amount is not None:
+            self.debit_amount = Decimal(str(self.debit_amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        
+        if self.credit_amount is not None:
+            self.credit_amount = Decimal(str(self.credit_amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         
         super().save(*args, **kwargs)
+    
+
+    
+    def __str__(self):
+        return f'{self.transaction.date} - {self.transaction.amount} - {self.account.account_code} - {self.transaction.description}'
+    
+
 
     def get_amount(self):
         return self.debit_amount if self.debit_amount else self.credit_amount
@@ -373,7 +406,11 @@ class JournalEntry(TenantAwareBaseModel):
     
     def get_balance(self):
         return self.debit_amount if self.debit_amount else -self.credit_amount
-
+    
+    @property
+    def has_designated_bank(self) -> bool:
+        return bool(self.account and getattr(self.account, "bank_account_id", None))
+    
 
 class Rule(models.Model):
     name = models.CharField(max_length=100)

@@ -151,12 +151,31 @@ class JournalEntrySerializer(serializers.ModelSerializer):
         serializer_class=AccountSerializer,
         unique_field='account_code'
     )
+    
+    bank_designation_pending = serializers.BooleanField(required=False)
+    has_designated_bank = serializers.SerializerMethodField()
+    
     #entity = EntitySerializer()
     #account = AccountSerializer()
     
+    def get_has_designated_bank(self, obj):
+        return obj.has_designated_bank
+
+    def validate(self, attrs):
+        # Enforce: if not pending, account is required
+        pending = attrs.get("bank_designation_pending", getattr(self.instance, "bank_designation_pending", False))
+        if not pending and not (attrs.get("account") or getattr(self.instance, "account_id", None)):
+            raise serializers.ValidationError("account is required when bank_designation_pending is False.")
+        return attrs
+    
     class Meta:
         model = JournalEntry
-        fields = '__all__'
+        fields = [
+            "id", "transaction", "account", "cost_center",
+            "debit_amount", "credit_amount",
+            "state", "date",
+            "bank_designation_pending", "has_designated_bank",
+        ]
 
 class TransactionListSerializer(serializers.ModelSerializer):
     company = serializers.PrimaryKeyRelatedField(read_only=True)

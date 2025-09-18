@@ -73,3 +73,14 @@ class TransactionFilter(filters.FilterSet):
     class Meta:
         model = Transaction
         fields = []
+
+class JournalEntryFilter(filters.FilterSet):
+    bank_designation_pending = filters.BooleanFilter(field_name="bank_designation_pending")
+    has_designated_bank = filters.BooleanFilter(method="filter_has_designated_bank")
+
+    def filter_has_designated_bank(self, qs, name, value):
+        if value is True:
+            return qs.filter(account__bank_account__isnull=False)
+        if value is False:
+            return qs.filter(account__bank_account__isnull=True)
+        return qs

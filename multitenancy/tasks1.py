@@ -1,75 +1,89 @@
-# tasks.py (multitenancy/tasks.py)
-from __future__ import annotations
+# tasks.py (e.g. in multitenancy/tasks.py)
+from django.db import transaction, connection, IntegrityError, DataError, DatabaseError
+from django.core.exceptions import ValidationError
+from celery import shared_task, group, chord
+from django.core.mail import send_mail
+from django.conf import settings
+import smtplib
+from django.apps import apps
+from multitenancy.formula_engine import apply_substitutions
+from django.db import transaction
+from .api_utils import safe_model_dict, MODEL_APP_MAP, PATH_COLS, _is_mptt_model, _get_path_value, _split_path, _resolve_parent_from_path_chain, table_fingerprint, jaccard
+from multitenancy.models import IntegrationRule, ImportSnapshot
+from copy import deepcopy
+from typing import Any, Dict, List, Optional, Tuple
+import contextlib
+from decimal import Decimal, ROUND_HALF_UP
+from django.apps import apps
+from django.db import transaction, connection, models as dj_models
+from django.db.models import NOT_PROVIDED
 
 import hashlib
 import json
 import re
-import smtplib
-from copy import deepcopy
-from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Dict, List, Optional, Tuple
-
 from celery import shared_task
 from django.apps import apps
-from django.conf import settings
-from django.core.exceptions import FieldDoesNotExist, ValidationError
-from django.core.mail import send_mail
-from django.db import (IntegrityError, DataError, DatabaseError, connection,
-                       models as dj_models, transaction)
-from django.db.models import NOT_PROVIDED
-
-from core.utils.db_sequences import reset_pk_sequences
+from django.db import transaction
 from core.utils.exception_utils import exception_to_dict
-from multitenancy.formula_engine import apply_substitutions
-from multitenancy.models import ImportSnapshot, IntegrationRule
-from .api_utils import (
-    MODEL_APP_MAP,
-    PATH_COLS,
-    _get_path_value,
-    _is_mptt_model,
-    _resolve_parent_from_path_chain,
-    _split_path,
-    safe_model_dict,
-    table_fingerprint as api_table_fingerprint,  # kept for compatibility if you use it elsewhere
-    jaccard as api_jaccard,                       # kept for compatibility
-)
+from decimal import Decimal, ROUND_HALF_UP
+from django.db import models
 
-# ----------------------------------------------------------------------
-# Email helpers
-# ----------------------------------------------------------------------
+
+from django.core.exceptions import FieldDoesNotExist
+from core.utils.exception_utils import exception_to_dict
+from core.utils.db_sequences import reset_pk_sequences
+
 
 @shared_task(bind=True, autoretry_for=(smtplib.SMTPException, ConnectionError), retry_backoff=True, max_retries=5)
 def send_user_invite_email(self, subject, message, to_email):
-    """Send user invite email with retry/backoff."""
-    send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, [to_email], fail_silently=False)
+    """
+    Send user invite email with retry support.
+    - retried on SMTP errors or connection failures
+    - exponential backoff (default: 2^n seconds)
+    """
+    send_mail(
+        subject,
+        message,
+        settings.DEFAULT_FROM_EMAIL,
+        [to_email],
+        fail_silently=False,
+    )
+
 
 @shared_task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
 def send_user_email(self, subject, message, to_email):
-    send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, [to_email], fail_silently=False)
-
-# ----------------------------------------------------------------------
-# Integration triggers
-# ----------------------------------------------------------------------
+    send_mail(
+        subject,
+        message,
+        settings.DEFAULT_FROM_EMAIL,
+        [to_email],
+        fail_silently=False,
+    )
 
 @shared_task
 def execute_integration_rule(rule_id, payload):
+    """
+    Executa uma IntegrationRule específica de forma assíncrona.
+    """
     rule = IntegrationRule.objects.get(pk=rule_id)
-    return rule.run_rule(payload)
+    result = rule.run_rule(payload)
+    return result
 
 @shared_task
 def trigger_integration_event(company_id, event_name, payload):
-    rules = (IntegrationRule.objects
-             .filter(company_id=company_id, is_active=True, triggers__icontains=event_name)
-             .order_by('execution_order'))
+    """
+    Executa todas as IntegrationRule ativas para determinado evento.
+    """
+    rules = IntegrationRule.objects.filter(
+        company_id=company_id,
+        is_active=True,
+        triggers__icontains=event_name
+    ).order_by('execution_order')
     for rule in rules:
         if rule.use_celery:
             execute_integration_rule.delay(rule.id, payload)
         else:
             execute_integration_rule(rule.id, payload)
-
-# ----------------------------------------------------------------------
-# Import helpers
-# ----------------------------------------------------------------------
 
 def _to_int_or_none(x):
     if x in ("", None):
@@ -80,6 +94,7 @@ def _to_int_or_none(x):
         return None
 
 def _parse_json_or_empty(v):
+    import json
     if v in ("", None):
         return {}
     if isinstance(v, dict):
@@ -88,13 +103,6 @@ def _parse_json_or_empty(v):
         return json.loads(v)
     except Exception:
         return {}
-
-def _to_bool(val, default=False):
-    if isinstance(val, bool):
-        return val
-    if val is None:
-        return default
-    return str(val).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 def _resolve_fk(model, field_name: str, raw_value, row_id_map: Dict[str, Any]):
     """
@@ -107,7 +115,7 @@ def _resolve_fk(model, field_name: str, raw_value, row_id_map: Dict[str, Any]):
     if isinstance(raw_value, str) and raw_value in row_id_map:
         return row_id_map[raw_value]
 
-    # Check model field exists and is FK
+    # numeric id path
     try:
         related_field = model._meta.get_field(field_name)
     except FieldDoesNotExist:
@@ -120,7 +128,6 @@ def _resolve_fk(model, field_name: str, raw_value, row_id_map: Dict[str, Any]):
     if raw_value in ("", None):
         return None
 
-    # numeric id
     if isinstance(raw_value, (int, float)) or (isinstance(raw_value, str) and raw_value.replace(".", "", 1).isdigit()):
         fk_id = _to_int_or_none(raw_value)
         if fk_id is None:
@@ -129,14 +136,14 @@ def _resolve_fk(model, field_name: str, raw_value, row_id_map: Dict[str, Any]):
             return fk_model.objects.get(id=fk_id)
         except fk_model.DoesNotExist:
             raise ValueError(f"{fk_model.__name__} id={fk_id} not found for field '{field_name}'")
-
     raise ValueError(f"Invalid FK reference format '{raw_value}' for field '{field_name}'")
 
 def _normalize_payload_for_model(model, payload: Dict[str, Any], *, context_company_id=None):
     """
     - map company_fk -> company_id / tenant_id if model has those fields
-    - coerce known types (column_index, filter_conditions)
-    - drop unknown keys (but keep *_id that match a real FK and keep *_fk for resolution)
+    - coerce known types (e.g., column_index)
+    - parse JSON-ish fields (e.g., filter_conditions)
+    - drop unknown keys (but keep *_id that match a real FK)
     """
     data = dict(payload)
     field_names = {f.name for f in model._meta.get_fields() if getattr(f, "concrete", False)}
@@ -158,26 +165,58 @@ def _normalize_payload_for_model(model, payload: Dict[str, Any], *, context_comp
     if "filter_conditions" in data:
         data["filter_conditions"] = _parse_json_or_empty(data.get("filter_conditions"))
 
-    # drop unknown keys except *_id matching real fields and *_fk (will be resolved later)
+    # drop unknown keys except *_id matching real fields
     for k in list(data.keys()):
-        if k in ("id",):
+        if k in ("id",):  # always allowed
             continue
         try:
             model._meta.get_field(k)
         except FieldDoesNotExist:
-            if not (k.endswith("_id") and k[:-3] in field_names) and not k.endswith("_fk"):
-                data.pop(k, None)
-
+            if not (k.endswith("_id") and k[:-3] in field_names):
+                # keep *_fk for later resolution; others drop
+                if not k.endswith("_fk"):
+                    data.pop(k, None)
     return data
 
 def _path_depth(row: Dict[str, Any]) -> int:
-    """Used to sort MPTT rows so parents come first."""
+    # used to sort MPTT rows so parents come first
     for c in PATH_COLS:
         if c in row and row[c]:
             return len(str(row[c]).strip().replace(" > ", "\\").split("\\"))
     return 0
 
+# ---------- utilities ----------
 def _friendly_db_message(exc: Exception) -> str:
+    from django.db import IntegrityError, DataError, DatabaseError
+    from django.core.exceptions import ValidationError
+    if isinstance(exc, IntegrityError):
+        cause = getattr(exc, "__cause__", None)
+        detail = getattr(cause, "diag", None)
+        if detail and getattr(detail, "constraint_name", None):
+            return f"Constraint violation ({detail.constraint_name})"
+        return "Integrity constraint violation (duplicate, null, or FK error)"
+    if isinstance(exc, DataError):
+        return "Invalid or too-long data for a column"
+    if isinstance(exc, ValidationError):
+        return f"Validation error: {exc}"
+    if isinstance(exc, DatabaseError):
+        return "Database error"
+    return str(exc)
+
+def _row_observations(audit_by_rowid, row_id):
+    obs = []
+    for chg in audit_by_rowid.get(row_id, []):
+        if chg.get("field") == "__row_id":
+            continue
+        obs.append(
+            f"campo '{chg['field']}' alterado de '{chg['old']}' para '{chg['new']}' "
+            f"(regra id={chg['rule_id']}')"
+        )
+    return obs
+
+# ---------- 1) PREPARE PER MODEL (NO WRITES) ----------
+def _friendly_db_message(exc: Exception) -> str:
+    # quick mapper; expand as needed
     cause = getattr(exc, "__cause__", None)
     code = getattr(cause, "pgcode", None)
     if isinstance(exc, IntegrityError):
@@ -226,174 +265,74 @@ def _filter_unknown(model, row: Dict[str, Any]):
     unknown = sorted([k for k in row.keys() if k not in allowed and k != "__row_id"])
     return filtered, unknown
 
-def _preflight_missing_required(model, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def _preflight_basic(model, rows: List[Dict[str, Any]]):
     """
-    Only flag truly required fields (concrete/not-null/no default/not auto/ not timestamp).
-    Treat presence of either <field>, <field>_id, or <field>_fk as satisfying the requirement.
-    NOTE: If your model uses a CheckConstraint (e.g., account is nullable when
-          bank_designation_pending=True), that is enforced at save-time and will
-          appear as a CHECK violation if broken. This is intentional.
+    DB-free checks.
+    - Missing required -> ERROR (blocks commit/preview row)
+    - Unknown columns  -> WARN (row proceeds; columns will be ignored)
+    Returns (errors_map, warnings_map) keyed by __row_id.
     """
-    errors = {}
+    errors, warns = {}, {}
 
-    # Build metadata for required fields and map base -> accepted keys
-    required_fields = []
-    field_map = {}  # base name -> {accepted keys}
-    for f in model._meta.fields:
-        if not hasattr(f, "attname"):
-            continue
-
-        is_auto_ts = (
-            (hasattr(f, "auto_now") and getattr(f, "auto_now")) or
-            (hasattr(f, "auto_now_add") and getattr(f, "auto_now_add"))
-        )
-        has_default = (getattr(f, "default", NOT_PROVIDED) is not NOT_PROVIDED)
-
-        if (
-            (not f.null)
-            and (not f.primary_key)
-            and (not f.auto_created)
-            and (not has_default)
-            and (not is_auto_ts)
-        ):
-            required_fields.append(f)
-
-        base = f.name
-        attn = getattr(f, "attname", f.name)
-        accepted = {base, attn, f"{base}_fk"}
-        field_map[base] = accepted
+    required = {
+        f.name for f in model._meta.fields
+        if not f.null and not f.auto_created and not getattr(f, "has_default", False)
+    }
+    allowed = _allowed_keys(model)
 
     for i, row in enumerate(rows):
         rid = row.get("__row_id") or f"row{i+1}"
         payload = {k: v for k, v in row.items() if k != "__row_id"}
 
-        missing = []
-        for f in required_fields:
-            base = f.name
-            accepted_keys = field_map.get(base, {base})
-            present = False
-            for k in accepted_keys:
-                if k in payload and payload.get(k) not in ("", None):
-                    present = True
-                    break
-            if not present:
-                missing.append(base)
+        missing = sorted([f for f in required if f not in payload or payload.get(f) in ("", None)])
+        unknown = sorted([k for k in payload.keys() if k not in allowed])
 
         if missing:
             errors[rid] = {
                 "code": "E-PREFLIGHT",
-                "message": f"Missing required: {', '.join(sorted(missing))}",
-                "fields": {"missing": sorted(missing)},
+                "message": f"Missing required: {', '.join(missing)}",
+                "fields": {"missing": missing, "unknown": []},
+            }
+        if unknown:
+            warns[rid] = {
+                "code": "W-UNKNOWN-COLS",
+                "message": f"Ignoring unknown columns: {', '.join(unknown)}",
+                "fields": {"missing": [], "unknown": unknown},
             }
 
-    return errors
+    return errors, warns
 
 def _quantize_decimal_fields(model, payload: dict) -> dict:
-    """Quantize all DecimalField values to the model's decimal_places."""
+    """
+    For every DecimalField in `model`, coerce payload[field] to Decimal and
+    quantize to the field's decimal_places. Leaves missing/blank values alone.
+    """
     out = dict(payload)
     for f in model._meta.get_fields():
-        if isinstance(f, dj_models.DecimalField):
+        if isinstance(f, models.DecimalField):
             name = getattr(f, 'attname', f.name)
             if name in out and out[name] not in (None, ''):
-                dp = int(getattr(f, 'decimal_places', 0) or 0)
-                q = Decimal('1').scaleb(-dp)
+                dp = getattr(f, 'decimal_places', 0) or 0
+                q = Decimal('1').scaleb(-dp)  # 0.01 when dp=2, 1 when dp=0, etc.
+                # go through str() to avoid binary float artifacts coming from Excel
                 out[name] = Decimal(str(out[name])).quantize(q, rounding=ROUND_HALF_UP)
     return out
 
-def _coerce_boolean_fields(model, payload: dict) -> dict:
-    """
-    Coerce stringy booleans to bool for BooleanFields,
-    e.g., 'true','1','yes' → True.
-    """
-    out = dict(payload)
-    for f in model._meta.get_fields():
-        if isinstance(f, dj_models.BooleanField):
-            name = getattr(f, 'attname', f.name)
-            if name in out:
-                out[name] = _to_bool(out[name])
-    return out
 
-# --------- canonicalization & fingerprint for table-level dedupe ----------
-_WS_RE = re.compile(r"\s+")
+# ---- core executor ---------------------------------------------------------
 
-def _norm_scalar(val):
-    if val is None: return None
-    if isinstance(val, (bool, int)): return val
-    if isinstance(val, float): return float(str(val))  # reduce float noise
-    if isinstance(val, Decimal): return str(val)
-    s = str(val).strip()
-    return _WS_RE.sub(" ", s)
+from typing import Any, Dict, List
+from django.db import transaction, connection
+from django.apps import apps
 
-IGNORE_FIELDS = {"id", "created_at", "updated_at", "created_by", "updated_by", "is_deleted", "is_active"}
+# Assumes these exist in your project:
+# MODEL_APP_MAP, apply_substitutions
+# safe_model_dict, exception_to_dict, reset_pk_sequences
+# _is_mptt_model, _path_depth, _get_path_value, _split_path, _resolve_parent_from_path_chain
+# _normalize_payload_for_model, _resolve_fk, PATH_COLS
 
-def _canonicalize_row(model, row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Stable identity using "all non-volatile fields present in row & on model".
-    Folds *_fk into base name; quantizes DecimalFields; ISO for dates; ints for FK ids.
-    """
-    field_by = {f.name: f for f in model._meta.get_fields() if hasattr(f, "attname")}
-    allowed = set(field_by.keys())
+DUP_CHECK_LAST_N = 10  # look back this many successful imports per model when computing closest match
 
-    # fold *_fk
-    incoming = {}
-    for k, v in row.items():
-        if k == "__row_id": continue
-        incoming[k[:-3] if k.endswith("_fk") else k] = v
-
-    ident = {k for k in incoming.keys() if k in allowed and k not in IGNORE_FIELDS}
-    out = {}
-    for k in sorted(ident):
-        v = incoming.get(k)
-        f = field_by.get(k)
-        if isinstance(f, dj_models.DecimalField):
-            dp = int(getattr(f, 'decimal_places', 0) or 0)
-            q = Decimal('1').scaleb(-dp)
-            v = None if v in (None, '') else Decimal(str(v)).quantize(q, rounding=ROUND_HALF_UP)
-            out[k] = (str(v) if v is not None else None)
-        elif isinstance(f, dj_models.DateField):
-            out[k] = str(v) if v is not None else None
-        elif isinstance(f, dj_models.ForeignKey):
-            out[k] = int(v) if v not in (None, "") else None
-        else:
-            out[k] = _norm_scalar(v)
-    return out
-
-def _row_hash(model, row: Dict[str, Any]) -> str:
-    c = _canonicalize_row(model, row)
-    blob = json.dumps(c, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
-
-def _table_fingerprint(model, rows: List[Dict[str, Any]], sample_n: int = 200) -> Dict[str, Any]:
-    rhashes = [_row_hash(model, r) for r in rows]
-    unique_sorted = sorted(set(rhashes))  # order-insensitive, dedup
-    cols = sorted(_canonicalize_row(model, rows[0]).keys()) if rows else []
-    header_blob = json.dumps(cols, separators=(",", ":"), sort_keys=True)
-    concat = header_blob + "|" + "|".join(unique_sorted)
-    thash = hashlib.sha256(concat.encode("utf-8")).hexdigest()
-    return {
-        "row_count": len(rows),
-        "colnames": cols,
-        "row_hashes": unique_sorted,
-        "row_hash_sample": unique_sorted[:sample_n],
-        "table_hash": thash,
-    }
-
-def _jaccard(a: set[str], b: set[str]) -> float:
-    if not a and not b: return 1.0
-    if not a or not b:  return 0.0
-    inter = len(a & b); uni = len(a | b)
-    return inter / uni
-
-def _unknown_from_original_input(model, row_obj: Dict[str, Any]) -> List[str]:
-    allowed = _allowed_keys(model)
-    orig = row_obj.get("_original_input") or row_obj.get("payload") or {}
-    return sorted([k for k in orig.keys() if k not in allowed and k != "__row_id"])
-
-# ----------------------------------------------------------------------
-# Core import executor
-# ----------------------------------------------------------------------
-
-DUP_CHECK_LAST_N = 10  # compare against last N snapshots per model
 
 def execute_import_job(
     company_id: int,
@@ -405,10 +344,27 @@ def execute_import_job(
     """
     One-shot import for all models in a file.
 
-    Updated for:
-      - JournalEntry.bank_designation_pending support (booleans coerced; account may be null).
-      - BankTransaction without 'entity' (entity_* columns are ignored with a warning).
-      - Safer error messages and dedupe checks.
+    Features:
+      - File-level dedupe: byte-identical file detection via sha256 (file_info).
+      - Table-level dedupe per sheet: exact duplicate via table_hash and nearest match
+        via Jaccard similarity across the last N snapshots (worst case = highest similarity).
+      - Unknown columns are warnings: included in the row 'message' and set status='warning'.
+      - Decimal safety: quantize all DecimalFields before full_clean/save.
+
+    Returns:
+      {
+        committed: bool,
+        reason?: str,
+        file_info: { filename, size, file_sha256, exact_file_duplicate, exact_file_duplicate_of? },
+        imports: [
+          {
+            model: str,
+            dup_info: { table_row_count, table_hash, exact_table_duplicate, exact_table_duplicate_of?, closest_match? },
+            result: [ per-row objects as in your current format ]
+          },
+          ...
+        ]
+      }
     """
 
     # --------------------------- file-level dedupe ---------------------------
@@ -440,21 +396,143 @@ def execute_import_job(
         ),
     }
 
-    # --------------------------- local helpers ---------------------------
-    def _infer_action_and_clean_id(payload: Dict[str, Any], original_input: Dict[str, Any]):
-        """Decide create/update, normalize 'id' for ORM."""
-        def _coerce_pk(val):
-            if val is None or val == "": return None
-            if isinstance(val, int): return val
-            if isinstance(val, float): return int(val) if float(val).is_integer() else None
-            s = str(val).strip()
-            if s.isdigit(): return int(s)
-            try:
-                f = float(s)
-                return int(f) if f.is_integer() else None
-            except Exception:
-                return None
+    # ------------------------------ local helpers ------------------------------
+    def _friendly_db_message(exc: Exception) -> str:
+        from django.db import IntegrityError, DataError, DatabaseError
+        from django.core.exceptions import ValidationError
+        cause = getattr(exc, "__cause__", None)
+        code = getattr(cause, "pgcode", None)
+        if isinstance(exc, IntegrityError):
+            if code == "23505": return "Unique constraint violation (duplicate)"
+            if code == "23503": return "Foreign key violation (related row missing)"
+            if code == "23502": return "NOT NULL violation (required field missing)"
+            if code == "23514": return "CHECK constraint violation"
+            return "Integrity constraint violation"
+        if isinstance(exc, DataError):
+            return "Invalid/too long value for column"
+        if isinstance(exc, ValidationError):
+            return "Validation error"
+        if isinstance(exc, DatabaseError):
+            return "Database error"
+        return str(exc)
 
+    def _row_observations(audit_by_rowid, row_id):
+        obs = []
+        for chg in audit_by_rowid.get(row_id, []):
+            if chg.get("field") == "__row_id":
+                continue
+            obs.append(
+                f"campo '{chg['field']}' alterado de '{chg['old']}' para '{chg['new']}' "
+                f"(regra id={chg['rule_id']}')"
+            )
+        return obs
+
+    def _allowed_keys(model):
+        """
+        Accept base names (e.g., 'entity'), DB attnames (e.g., 'entity_id'),
+        and importer aliases '*_fk'. Also path cols, '__row_id', 'id'.
+        """
+        names = set()
+        for f in model._meta.fields:
+            names.add(f.name)
+            att = getattr(f, "attname", None)
+            if att:
+                names.add(att)  # e.g., 'entity_id'
+        fk_aliases = {n + "_fk" for n in names}
+        return names | fk_aliases | set(PATH_COLS) | {"__row_id", "id"}
+
+    def _filter_unknown(model, row: Dict[str, Any]):
+        """Return (filtered_row, unknown_keys). Unknown are dropped, returned for messaging."""
+        allowed = _allowed_keys(model)
+        filtered = {k: v for k, v in row.items() if k in allowed}
+        unknown = sorted([k for k in row.keys() if k not in allowed and k != "__row_id"])
+        return filtered, unknown
+
+    def _preflight_missing_required(model, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """
+        Only flag truly required fields:
+          - concrete, not null
+          - not primary_key
+          - not auto_created
+          - no default
+          - not auto_now / auto_now_add (auto-managed timestamps)
+        Treat presence of either <field>, <field>_id, or <field>_fk as satisfying the requirement.
+        """
+        errors = {}
+    
+        # Build metadata for required fields and map base -> accepted keys
+        required_fields = []
+        field_map = {}  # base name -> {accepted keys}
+        for f in model._meta.fields:
+            # skip non-concrete / reverse relations
+            if not hasattr(f, "attname"):
+                continue
+    
+            # auto-managed timestamps should NOT be required
+            is_auto_ts = (
+                (hasattr(f, "auto_now") and getattr(f, "auto_now")) or
+                (hasattr(f, "auto_now_add") and getattr(f, "auto_now_add"))
+            )
+    
+            has_default = (getattr(f, "default", NOT_PROVIDED) is not NOT_PROVIDED)
+    
+            if (
+                (not f.null)
+                and (not f.primary_key)
+                and (not f.auto_created)
+                and (not has_default)
+                and (not is_auto_ts)
+            ):
+                required_fields.append(f)
+    
+            base = f.name                          # e.g., 'entity'
+            attn = getattr(f, "attname", f.name)   # e.g., 'entity_id'
+            accepted = {base, attn, f"{base}_fk"}
+            field_map[base] = accepted
+    
+        for i, row in enumerate(rows):
+            rid = row.get("__row_id") or f"row{i+1}"
+            payload = {k: v for k, v in row.items() if k != "__row_id"}
+    
+            missing = []
+            for f in required_fields:
+                base = f.name
+                accepted_keys = field_map.get(base, {base})
+                present = False
+                for k in accepted_keys:
+                    if k in payload and payload.get(k) not in ("", None):
+                        present = True
+                        break
+                if not present:
+                    missing.append(base)
+    
+            if missing:
+                errors[rid] = {
+                    "code": "E-PREFLIGHT",
+                    "message": f"Missing required: {', '.join(sorted(missing))}",
+                    "fields": {"missing": sorted(missing)},
+                }
+    
+        return errors
+
+    def _coerce_pk(val):
+        """Return int PK if val looks numeric (e.g., 3, '3', '3.0'); else None."""
+        if val is None or val == "": return None
+        if isinstance(val, int): return val
+        if isinstance(val, float): return int(val) if float(val).is_integer() else None
+        s = str(val).strip()
+        if s.isdigit(): return int(s)
+        try:
+            f = float(s)
+            return int(f) if f.is_integer() else None
+        except Exception:
+            return None
+
+    def _infer_action_and_clean_id(payload: Dict[str, Any], original_input: Dict[str, Any]):
+        """
+        Decide 'create' vs 'update' and make payload safe for the ORM.
+        Returns (action, pk or None, external_id or None)
+        """
         ext_id = None
         pk = _coerce_pk(payload.get("id"))
         if pk is not None:
@@ -465,6 +543,96 @@ def execute_import_job(
                 ext_id = str(original_input["id"])
             payload.pop("id", None)
         return "create", None, ext_id
+
+    def _quantize_decimal_fields(model, payload: dict) -> dict:
+        """
+        Coerce & quantize all DecimalFields in payload to the field's decimal_places.
+        """
+        out = dict(payload)
+        for f in model._meta.get_fields():
+            if isinstance(f, dj_models.DecimalField):
+                name = getattr(f, 'attname', f.name)
+                if name in out and out[name] not in (None, ''):
+                    dp = int(getattr(f, 'decimal_places', 0) or 0)
+                    q = Decimal('1').scaleb(-dp)  # 0.01 when dp=2
+                    out[name] = Decimal(str(out[name])).quantize(q, rounding=ROUND_HALF_UP)
+        return out
+
+    # --------- canonicalization & fingerprint for table-level dedupe ----------
+    _WS_RE = re.compile(r"\s+")
+
+    def _norm_scalar(val):
+        if val is None: return None
+        if isinstance(val, (bool, int)): return val
+        if isinstance(val, float): return float(str(val))  # reduce float noise
+        if isinstance(val, Decimal): return str(val)
+        s = str(val).strip()
+        return _WS_RE.sub(" ", s)
+
+    IGNORE_FIELDS = {"id", "created_at", "updated_at", "created_by", "updated_by", "is_deleted", "is_active"}
+
+    def _canonicalize_row(model, row: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Stable identity using "all non-volatile fields present in row & on model".
+        Folds *_fk into base name; quantizes DecimalFields; ISO for dates; ints for FK ids.
+        """
+        field_by = {f.name: f for f in model._meta.get_fields() if hasattr(f, "attname")}
+        allowed = set(field_by.keys())
+
+        # fold *_fk
+        incoming = {}
+        for k, v in row.items():
+            if k == "__row_id": continue
+            incoming[k[:-3] if k.endswith("_fk") else k] = v
+
+        ident = {k for k in incoming.keys() if k in allowed and k not in IGNORE_FIELDS}
+        out = {}
+        for k in sorted(ident):
+            v = incoming.get(k)
+            f = field_by.get(k)
+            if isinstance(f, dj_models.DecimalField):
+                dp = int(getattr(f, 'decimal_places', 0) or 0)
+                q = Decimal('1').scaleb(-dp)
+                v = None if v in (None, '') else Decimal(str(v)).quantize(q, rounding=ROUND_HALF_UP)
+                out[k] = (str(v) if v is not None else None)
+            elif isinstance(f, dj_models.DateField):
+                out[k] = str(v) if v is not None else None
+            elif isinstance(f, dj_models.ForeignKey):
+                out[k] = int(v) if v not in (None, "") else None
+            else:
+                out[k] = _norm_scalar(v)
+        return out
+
+    def _row_hash(model, row: Dict[str, Any]) -> str:
+        c = _canonicalize_row(model, row)
+        blob = json.dumps(c, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def _table_fingerprint(model, rows: List[Dict[str, Any]], sample_n: int = 200) -> Dict[str, Any]:
+        rhashes = [_row_hash(model, r) for r in rows]
+        unique_sorted = sorted(set(rhashes))  # order-insensitive, dedup
+        cols = sorted(_canonicalize_row(model, rows[0]).keys()) if rows else []
+        header_blob = json.dumps(cols, separators=(",", ":"), sort_keys=True)
+        concat = header_blob + "|" + "|".join(unique_sorted)
+        thash = hashlib.sha256(concat.encode("utf-8")).hexdigest()
+        return {
+            "row_count": len(rows),
+            "colnames": cols,
+            "row_hashes": unique_sorted,
+            "row_hash_sample": unique_sorted[:sample_n],
+            "table_hash": thash,
+        }
+
+    def _jaccard(a: set[str], b: set[str]) -> float:
+        if not a and not b: return 1.0
+        if not a or not b:  return 0.0
+        inter = len(a & b); uni = len(a | b)
+        return inter / uni
+
+    def _unknown_from_original_input(model, row_obj: Dict[str, Any]) -> List[str]:
+        allowed = _allowed_keys(model)
+        orig = row_obj.get("_original_input") or row_obj.get("payload") or {}
+        return sorted([k for k in orig.keys() if k not in allowed and k != "__row_id"])
 
     # --------------------------- prep per sheet ---------------------------
     prepared: List[Dict[str, Any]] = []
@@ -500,6 +668,7 @@ def execute_import_job(
 
         # ---- table-level fingerprint (order-insensitive) ----
         fp = _table_fingerprint(model, rows)
+
         exact_table_dupe_of = (
             ImportSnapshot.objects
             .filter(company_id=company_id, model_name=model_name, table_hash=fp["table_hash"], row_count=fp["row_count"])
@@ -564,8 +733,7 @@ def execute_import_job(
             try:
                 filtered_input, _ = _filter_unknown(model, original_input)
                 payload = _normalize_payload_for_model(model, filtered_input, context_company_id=company_id)
-                payload = _coerce_boolean_fields(model, payload)       # <-- booleans (bank_designation_pending, etc.)
-                payload = _quantize_decimal_fields(model, payload)     # <-- decimals
+                payload = _quantize_decimal_fields(model, payload)  # ensure 2dp etc
 
                 # MPTT: keep name, defer parent resolution
                 if _is_mptt_model(model):
@@ -583,6 +751,7 @@ def execute_import_job(
 
                 action, pk, ext_id = _infer_action_and_clean_id(payload, original_input)
 
+                # Decide status/message (unknowns => warning)
                 unknown_cols_now = _unknown_from_original_input(model, {
                     "_original_input": original_input, "payload": payload
                 })
@@ -604,11 +773,12 @@ def execute_import_job(
                     }
                     had_err = True
                 else:
-                    status_val = "ok"
-                    msg = "validated"
                     if unknown_cols_now:
+                        msg = f"validated; Ignoring unknown columns: {', '.join(unknown_cols_now)}"
                         status_val = "warning"
-                        msg = f"{msg} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
+                    else:
+                        msg = "validated"
+                        status_val = "ok"
                     row_obj = {
                         "__row_id": rid,
                         "status": status_val,
@@ -627,15 +797,15 @@ def execute_import_job(
                 err = exception_to_dict(e, include_stack=False)
                 if not err.get("summary"):
                     err["summary"] = _friendly_db_message(e)
+                # Best-effort payload for action inference
                 try:
                     tmp_filtered, _ = _filter_unknown(model, original_input)
                     tmp_payload = _normalize_payload_for_model(model, tmp_filtered, context_company_id=company_id)
-                    tmp_payload = _coerce_boolean_fields(model, tmp_payload)
                     tmp_payload = _quantize_decimal_fields(model, tmp_payload)
                 except Exception:
                     tmp_payload = original_input
-
                 action, pk, ext_id = _infer_action_and_clean_id(dict(tmp_payload), original_input)
+
                 unknown_cols_now = _unknown_from_original_input(model, {
                     "_original_input": original_input, "payload": tmp_payload
                 })
@@ -690,7 +860,7 @@ def execute_import_job(
                             "status": "error",
                             "action": row.get("action"),
                             "data": row.get("_original_input") or row.get("payload") or {},
-                            "message": row["preflight_error"]["message"],
+                            "message": row["preflight_error"]["message"],  # contains unknown info if any
                             "error": row["preflight_error"],
                             "observations": row.get("observations", []),
                             "external_id": row.get("external_id"),
@@ -701,6 +871,7 @@ def execute_import_job(
                     original_input = row.get("_original_input") or payload.copy()
                     action = row.get("action") or "create"
 
+                    # Recompute unknowns (for final message)
                     unknown_cols_now = _unknown_from_original_input(model, row)
 
                     try:
@@ -719,8 +890,7 @@ def execute_import_job(
                                 payload['parent'] = parent
                                 payload.pop('parent_id', None)
 
-                        # Coerce booleans/decimals just before save
-                        payload = _coerce_boolean_fields(model, payload)
+                        # Quantize decimals again (in case FK resolution added values)
                         payload = _quantize_decimal_fields(model, payload)
 
                         with transaction.atomic():
@@ -732,7 +902,7 @@ def execute_import_job(
                                 instance = model(**payload)
 
                             if hasattr(instance, "full_clean"):
-                                instance.full_clean()
+                                instance.full_clean()  # includes validate_unique()
 
                             instance.save()
 
@@ -853,8 +1023,7 @@ def execute_import_job(
                             payload['parent'] = parent
                             payload.pop('parent_id', None)
 
-                    # Coerce booleans/decimals just before save
-                    payload = _coerce_boolean_fields(model, payload)
+                    # Quantize decimals (final guard)
                     payload = _quantize_decimal_fields(model, payload)
 
                     with transaction.atomic():
@@ -926,6 +1095,7 @@ def execute_import_job(
             rows_src = [r.get("_original_input") or r.get("payload") or {} for r in pre["rows"]]
             fp = _table_fingerprint(model, rows_src)
 
+            # Closest-match Jaccard used (worst case = highest similarity)
             closest = (item.get("dup_info") or {}).get("closest_match") or {}
             ImportSnapshot.objects.create(
                 company_id=company_id,
@@ -944,6 +1114,7 @@ def execute_import_job(
             "file_info": file_info,
             "imports": result_payload
         }
+
 
 # Celery entrypoint: one task per file
 @shared_task

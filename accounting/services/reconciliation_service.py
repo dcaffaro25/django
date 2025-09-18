@@ -6,7 +6,10 @@ from collections import defaultdict
 from django.db import transaction
 
 from accounting.models import BankTransaction, JournalEntry, Account, Reconciliation
-
+from accounting.services.bank_structs import (
+    ensure_pending_bank_structs,
+    ensure_gl_account_for_bank,
+)
 
 class ReconciliationService:
     """

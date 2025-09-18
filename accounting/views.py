@@ -597,99 +597,157 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         """
         data = request.data
         matches = data.get("matches", [])
-        adjustment_side = data.get("adjustment_side", "none")  # expected: "bank", "journal", or "none"
+        adjustment_side = data.get("adjustment_side", "none")  # "bank" | "journal" | "none"
         reference = data.get("reference", "")
         notes = data.get("notes", "")
-        print(data, matches)
+    
         created_ids = []
-        
-        with transaction.atomic():
+        problems = []
+    
+        with db_tx.atomic():
             for match in matches:
-                bank_ids = match.get("bank_transaction_ids", [])
-                print("bank_ids: ",bank_ids)
-                journal_ids = match.get("journal_entry_ids", [])
-                print("journal_ids: ", journal_ids)
+                bank_ids = list({int(x) for x in match.get("bank_transaction_ids", []) if x is not None})
+                journal_ids = list({int(x) for x in match.get("journal_entry_ids", []) if x is not None})
                 if not bank_ids or not journal_ids:
-                    continue  # skip if incomplete
-                print("passou")
-                # Load candidate records
-                bank_txs = list(BankTransaction.objects.filter(id__in=bank_ids))
-                journal_entries = list(JournalEntry.objects.filter(id__in=journal_ids))
-                
-                # Compute sums.
-                sum_bank = sum(tx.amount for tx in bank_txs)
-                print("sum_bank", sum_bank)
-                sum_journal = sum(entry.get_effective_amount() for entry in journal_entries)
-                print("sum_journal", sum_journal)
-                diff = sum_bank - sum_journal
-                print("diff", diff)
-
-                adjustment_record = None
-                # If adjustment is requested and there's a difference, create an adjustment record.
-                if adjustment_side != "none" and diff != 0:
-                    if adjustment_side == "bank":
-                        # Create an adjustment record on the bank side so that:
-                        # new sum_bank = sum_bank + adjustment_amount equals sum_journal.
-                        adjustment_amount = sum_journal - sum_bank  # positive if bank needs an increase
-                        adjustment_record = BankTransaction.objects.create(
-                            company=bank_txs[0].company,
-                            entity=bank_txs[0].entity,
-                            bank_account=bank_txs[0].bank_account,
-                            date=bank_txs[0].date,  # you might also use today's date
-                            currency=bank_txs[0].currency,
-                            amount=adjustment_amount,
-                            description="Adjustment record for reconciliation",
-                            #transaction_type="ADJUSTMENT",
-                            status="pending",
-                            tx_hash=f"adjustment_{bank_txs[0].id}"
-                        )
-                        bank_txs.append(adjustment_record)
-                        sum_bank += adjustment_amount
-                    elif adjustment_side == "journal":
-                        # Create an adjustment record on the journal side so that:
-                        # new sum_journal = sum_journal + adjustment_amount equals sum_bank.
-                        adjustment_amount = sum_bank - sum_journal  # positive if journal needs an increase
-                        # Determine which field to set based on the sign.
-                        debit_amount = adjustment_amount if adjustment_amount > 0 else None
-                        credit_amount = -adjustment_amount if adjustment_amount < 0 else None
-                        # Use the transaction and other details from the first journal entry.
-                        adjustment_record = JournalEntry.objects.create(
-                            company=journal_entries[0].company,
-                            transaction=journal_entries[0].transaction,
-                            entity=journal_entries[0].transaction.entity,
-                            account=journal_entries[0].account,
-                            cost_center=journal_entries[0].cost_center,
-                            debit_amount=debit_amount,
-                            credit_amount=credit_amount,
-                            state="matched",
-                            memo="Adjustment record for reconciliation"
-                        )
-                        journal_entries.append(adjustment_record)
-                        sum_journal += adjustment_amount
-                
-                # Recompute final difference.
-                final_diff = sum_bank - sum_journal
-                rec_status = "matched" if final_diff == 0 else "pending"
-                
-                # Build notes including match details.
-                bank_ids_str = ", ".join(str(tx.id) for tx in bank_txs)
-                journal_ids_str = ", ".join(str(je.id) for je in journal_entries)
-                combined_notes = f"{notes}\nBank IDs: {bank_ids_str}\nJournal IDs: {journal_ids_str}\nDifference: {final_diff}"
-                
-                # Create the Reconciliation record.
-                rec = Reconciliation.objects.create(
-                    company=bank_txs[0].company,
-                    status=rec_status,
-                    reference=reference,
-                    notes=combined_notes
-                )
-                rec.bank_transactions.set(bank_txs)
-                rec.journal_entries.set(journal_entries)
-                created_ids.append(rec.id)
-                print(rec)
-        return Response({"reconciliation_ids": created_ids})
+                    problems.append({"reason": "empty_ids", "match": match})
+                    continue
     
+                # (Optional) savepoint so a single failure doesn't roll back the whole batch
+                sp = db_tx.savepoint()
+                try:
+                    # Lock rows we will attach to avoid concurrent reconciliation
+                    bank_qs = (BankTransaction.objects
+                               .select_for_update()
+                               .select_related("bank_account", "currency")
+                               .filter(id__in=bank_ids))
+                    je_qs = (JournalEntry.objects
+                             .select_for_update()
+                             .select_related("account", "account__bank_account", "transaction")
+                             .filter(id__in=journal_ids))
     
+                    bank_txs = list(bank_qs)
+                    journal_entries = list(je_qs)
+                    if not bank_txs or not journal_entries:
+                        problems.append({"reason": "not_found", "bank_ids": bank_ids, "journal_ids": journal_ids})
+                        db_tx.savepoint_commit(sp)
+                        continue
+    
+                    # Company consistency
+                    company_set = {bt.company_id for bt in bank_txs} | {je.company_id for je in journal_entries}
+                    if len(company_set) != 1:
+                        problems.append({"reason": "mixed_company", "bank_ids": bank_ids, "journal_ids": journal_ids})
+                        db_tx.savepoint_commit(sp)
+                        continue
+                    company_id = next(iter(company_set))
+    
+                    # Currency consistency (simple guard; adjust if you support FX)
+                    currency_set = {bt.currency_id for bt in bank_txs} | {je.transaction.currency_id for je in journal_entries if je.transaction_id}
+                    if len(currency_set) != 1:
+                        problems.append({"reason": "mixed_currency", "bank_ids": bank_ids, "journal_ids": journal_ids})
+                        db_tx.savepoint_commit(sp)
+                        continue
+    
+                    # Ensure "pending" structures exist (used if any JE was created with bank_designation_pending)
+                    pending_ba, pending_gl = ensure_pending_bank_structs(company_id, currency_id=bank_txs[0].currency_id)
+    
+                    # Sums
+                    sum_bank = sum((bt.amount for bt in bank_txs), Decimal("0"))
+                    sum_journal = sum(((je.get_effective_amount() or Decimal("0")) for je in journal_entries), Decimal("0"))
+                    diff = sum_bank - sum_journal
+    
+                    # Adjustment (optional)
+                    if adjustment_side != "none" and diff != 0:
+                        if adjustment_side == "bank":
+                            # Make bank total equal journal total
+                            adjustment_amount = sum_journal - sum_bank  # <-- define it!
+                            bt0 = bank_txs[0]
+                            adj_bt = BankTransaction.objects.create(
+                                company_id=company_id,
+                                bank_account=bt0.bank_account,
+                                date=bt0.date,
+                                currency=bt0.currency,
+                                amount=adjustment_amount,
+                                description="Adjustment record for reconciliation",
+                                status="pending",
+                                tx_hash="adjustment_for_rec",
+                            )
+                            bank_txs.append(adj_bt)
+                            sum_bank += adjustment_amount
+    
+                        elif adjustment_side == "journal":
+                            # Make journal total equal bank total
+                            adjustment_amount = sum_bank - sum_journal
+                            je0 = journal_entries[0]
+                            debit_amount = adjustment_amount if adjustment_amount > 0 else None
+                            credit_amount = (-adjustment_amount) if adjustment_amount < 0 else None
+                            adj_je = JournalEntry.objects.create(
+                                company_id=company_id,
+                                transaction=je0.transaction,
+                                account=je0.account or pending_gl,  # if blank, put it through pending GL
+                                cost_center=je0.cost_center,
+                                debit_amount=debit_amount,
+                                credit_amount=credit_amount,
+                                state="pending",
+                                date=je0.date or je0.transaction.date,
+                            )
+                            journal_entries.append(adj_je)
+                            sum_journal += adjustment_amount
+    
+                    # Final status
+                    final_diff = sum_bank - sum_journal
+                    rec_status = "matched" if final_diff == 0 else "pending"
+    
+                    # Create Reconciliation
+                    bank_ids_str = ", ".join(str(x.id) for x in bank_txs)
+                    journal_ids_str = ", ".join(str(x.id) for x in journal_entries)
+                    combined_notes = f"{notes}\nBank IDs: {bank_ids_str}\nJournal IDs: {journal_ids_str}\nDifference: {final_diff}"
+    
+                    rec = Reconciliation.objects.create(
+                        company_id=company_id,
+                        status=rec_status,
+                        reference=reference,
+                        notes=combined_notes,
+                    )
+                    rec.bank_transactions.set(bank_txs)
+                    rec.journal_entries.set(journal_entries)
+                    created_ids.append(rec.id)
+    
+                    # Promote pending JEs to the specific bank GL (only if a single bank_account is involved)
+                    bank_account_set = {bt.bank_account_id for bt in bank_txs if bt.bank_account_id}
+                    if len(bank_account_set) == 1:
+                        target_ba_id = next(iter(bank_account_set))
+                        target_ba = next(bt.bank_account for bt in bank_txs if bt.bank_account_id == target_ba_id)
+                        target_gl = ensure_gl_account_for_bank(company_id, target_ba)
+    
+                        for je in journal_entries:
+                            # Move lines that came through the pending path or were explicitly left blank
+                            acct_ba_id = getattr(je.account, "bank_account_id", None) if je.account_id else None
+                            if acct_ba_id == pending_ba.id or je.account_id is None or getattr(je, "bank_designation_pending", False):
+                                updates = {}
+                                if je.account_id != target_gl.id:
+                                    je.account_id = target_gl.id
+                                    updates["account"] = target_gl.id
+                                # Flip the pending marker off if present
+                                if hasattr(je, "bank_designation_pending") and je.bank_designation_pending:
+                                    je.bank_designation_pending = False
+                                    updates["bank_designation_pending"] = False
+                                if updates:
+                                    je.save(update_fields=list(updates.keys()))
+                    else:
+                        problems.append({
+                            "reason": "multiple_bank_accounts_in_match",
+                            "bank_account_ids": list(bank_account_set),
+                            "bank_ids": bank_ids,
+                            "journal_ids": journal_ids,
+                        })
+    
+                    db_tx.savepoint_commit(sp)
+    
+                except Exception as e:
+                    db_tx.savepoint_rollback(sp)
+                    problems.append({"reason": "exception", "error": str(e), "bank_ids": bank_ids, "journal_ids": journal_ids})
+    
+        return Response({"reconciliation_ids": created_ids, "problems": problems})
     
     @action(detail=False, methods=['get'])
     def reconciliation_status(self, request, tenant_id=None):
