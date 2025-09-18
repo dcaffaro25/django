@@ -276,6 +276,8 @@ class RuleSerializer(serializers.ModelSerializer):
 
 class BankTransactionSerializer(serializers.ModelSerializer):
     reconciliation_status = serializers.SerializerMethodField()
+    entity = serializers.IntegerField(source='bank_account.entity_id', read_only=True)
+    entity_name = serializers.CharField(source='bank_account.entity.name', read_only=True)
 
     class Meta:
         model = BankTransaction
@@ -284,7 +286,20 @@ class BankTransactionSerializer(serializers.ModelSerializer):
             'description', 'amount', 'status', #'transaction_type',
             'is_deleted', 'updated_at', 'updated_by', 'reconciliation_status'
         ]
-
+        extra_kwargs = {
+            "bank_account": {"queryset": BankAccount.objects.all()},
+        }
+        
+    
+    def create(self, validated_data):
+        # In case clients still send 'entity', ignore it
+        validated_data.pop("entity", None)
+        return super().create(validated_data)
+    
+    def update(self, instance, validated_data):
+        validated_data.pop("entity", None)
+        return super().update(instance, validated_data)
+    
     def get_reconciliation_status(self, obj):
         # Get all reconciliations for this bank transaction.
         qs = obj.reconciliations.all()

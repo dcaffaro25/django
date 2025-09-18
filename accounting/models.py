@@ -390,7 +390,7 @@ class Rule(models.Model):
 
 
 class BankTransaction(TenantAwareBaseModel):
-    entity = models.ForeignKey('multitenancy.Entity', related_name='bank_transactions', on_delete=models.CASCADE)
+    #entity = models.ForeignKey('multitenancy.Entity', related_name='bank_transactions', on_delete=models.CASCADE)
     bank_account = models.ForeignKey(BankAccount, on_delete=models.CASCADE)
     date = models.DateField()
     amount = models.DecimalField(max_digits=12, decimal_places=2)
@@ -408,34 +408,39 @@ class BankTransaction(TenantAwareBaseModel):
     balance_validated = models.BooleanField(default=False)  # <-- NEW FIELD
     tx_hash = models.CharField(max_length=64, blank=True, null=True, db_index=True)
     
+    @property
+    def entity(self):
+        # returns Entity instance
+        return self.bank_account.entity
+
+    @property
+    def entity_id(self):
+        # returns Entity id (fast path for DRF)
+        return self.bank_account.entity_id
+
     def clean_fields(self, exclude=None):
         exclude = set(exclude or [])
         if 'amount' not in exclude and self.amount is not None:
-            # go through str() to kill binary float artifacts; then force 2dp
             self.amount = Decimal(str(self.amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         super().clean_fields(exclude=exclude)
-    
+
     def save(self, *args, **kwargs):
         if self.amount is not None:
-            # if floats can reach here, protect with str() to avoid artifacts
             self.amount = Decimal(str(self.amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-
         super().save(*args, **kwargs)
-        
 
-    
     class Meta:
         indexes = [
             models.Index(fields=['date']),
-            models.Index(fields=['bank_account']),
-            models.Index(fields=['entity']),
+            models.Index(fields=['bank_account']),     # keep this; used in joins
             models.Index(fields=['amount']),
             models.Index(fields=['status']),
-        ]    
+        ]
 
     def __str__(self):
         return f'{self.date} - {self.amount} - {self.description} - {self.bank_account}'
-     
+    
+    
 
 class ReconciliationTask(models.Model):
     STATUS_CHOICES = [

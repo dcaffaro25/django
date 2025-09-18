@@ -366,14 +366,49 @@ class BankAccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     
 # BankTransaction ViewSet
 class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
-    queryset = BankTransaction.objects.all()
+    queryset = (
+        BankTransaction.objects
+        .select_related("bank_account", "bank_account__entity", "currency")  # add "bank_account__bank" if you render it
+        .order_by("-date", "-id")
+    )
     serializer_class = BankTransactionSerializer
-    
+
     filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
     filterset_class = BankTransactionFilter
-    search_fields = ["description", "reference_number", "bank_account__name", "entity__name"]
-    ordering_fields = ["date", "amount", "id", "created_at"]  # ?ordering=-date,amount
+    search_fields = [
+        "description",
+        "reference_number",
+        "bank_account__name",
+        "bank_account__account_number",
+        "bank_account__entity__name",  # <-- fixed
+    ]
+    ordering_fields = ["date", "amount", "id", "created_at"]
     ordering = ["-date", "-id"]
+
+    # If your mixin needs to know how to scope by entity:
+    entity_lookup = "bank_account__entity"  # <-- only if your ScopedQuerysetMixin uses this
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+
+        # /entities/<entity_id>/... or ?entity_id=...
+        entity_id = self.kwargs.get("entity_id") or self.request.query_params.get("entity_id")
+        if entity_id:
+            qs = qs.filter(bank_account__entity_id=entity_id)
+
+        bank_account_id = self.request.query_params.get("bank_account")
+        if bank_account_id:
+            qs = qs.filter(bank_account_id=bank_account_id)
+
+        # accept ?status=... or ?status=PENDING,STARTED
+        status_param = self.request.query_params.get("status")
+        if status_param:
+            if "," in status_param:
+                qs = qs.filter(status__in=[s.strip() for s in status_param.split(",") if s.strip()])
+            else:
+                qs = qs.filter(status=status_param)
+
+        return qs
     
     @action(methods=['post'], detail=False)
     def bulk_create(self, request, *args, **kwargs):
