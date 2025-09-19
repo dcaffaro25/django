@@ -1,4 +1,3 @@
-# api_utils.py
 import csv
 import io
 import pandas as pd
@@ -13,12 +12,8 @@ from django.http import HttpResponse
 from openpyxl import Workbook
 from django.forms.models import model_to_dict
 from django.utils.timezone import now
-
 from multitenancy.models import Company, Entity, IntegrationRule, SubstitutionRule
-from accounting.models import (
-    Currency, Bank, BankAccount, Account, CostCenter,
-    Transaction, JournalEntry, BankTransaction
-)
+from accounting.models import Currency, Bank, BankAccount, Account, CostCenter, Transaction, JournalEntry, BankTransaction
 from core.models import FinancialIndex, IndexQuote, FinancialIndexQuoteForecast
 from billing.models import (
     BusinessPartnerCategory, BusinessPartner,
@@ -26,7 +21,6 @@ from billing.models import (
     Contract, Invoice, InvoiceLine
 )
 from hr.models import Employee, Position, TimeTracking, KPI, Bonus, RecurringAdjustment
-
 import json
 from datetime import datetime, date, time, timezone
 from decimal import Decimal
@@ -70,7 +64,7 @@ def _excel_safe(value):
     except Exception:
         return str(value)
 
-# ----- lightweight fingerprint (used by template refs) -----
+# utils/fingerprint.py
 import hashlib, json, re
 from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Dict, Any
@@ -78,13 +72,17 @@ from django.db import models
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
-IDENTITY_FIELDS_MAP = {}
+# Optional: tune per model; fallback is "all non-volatile fields present in the row"
+IDENTITY_FIELDS_MAP = {
+    # "BankTransaction": ["date", "amount", "description", "currency", "bank_account"],
+}
+
 IGNORE_FIELDS = {"id","created_at","updated_at","created_by","updated_by","is_deleted","is_active"}
 
 def _norm_scalar(val):
     if val is None: return None
     if isinstance(val, (bool, int)): return val
-    if isinstance(val, float): return float(str(val))
+    if isinstance(val, float): return float(str(val))  # kill binary artifacts
     if isinstance(val, Decimal): return str(val)
     s = str(val).strip()
     return _WHITESPACE_RE.sub(" ", s)
@@ -100,6 +98,7 @@ def canonicalize_row(model, row: Dict[str, Any]) -> Dict[str, Any]:
     ident    = set(IDENTITY_FIELDS_MAP.get(model.__name__, [])) or \
                {k for k in row.keys() if k in allowed and k not in IGNORE_FIELDS}
 
+    # fold *_fk into base field name
     incoming = {}
     for k, v in row.items():
         if k == "__row_id": continue
@@ -127,7 +126,7 @@ def row_hash(model, row: Dict[str, Any]) -> str:
 
 def table_fingerprint(model, rows: List[Dict[str, Any]], sample_n: int = 200) -> Dict[str, Any]:
     rhashes = [row_hash(model, r) for r in rows]
-    unique_sorted = sorted(set(rhashes))
+    unique_sorted = sorted(set(rhashes))  # order-insensitive, dedup
     cols = sorted(canonicalize_row(model, rows[0]).keys()) if rows else []
     header_blob = json.dumps(cols, separators=(",", ":"), sort_keys=True)
     concat = header_blob + "|" + "|".join(unique_sorted)
@@ -146,6 +145,9 @@ def jaccard(a: set[str], b: set[str]) -> float:
     inter = len(a & b); union = len(a | b)
     return inter / union
 
+
+
+
 # -----------------------
 # MPTT PATH SUPPORT (generic)
 # -----------------------
@@ -153,9 +155,11 @@ PATH_COLS = ("path", "Caminho")
 PATH_SEPARATOR = " > "
 
 def _is_mptt_model(model) -> bool:
+    """True if model is an MPTT model with a 'parent' foreign key and a 'name' field."""
     return hasattr(model, "_mptt_meta") and any(f.name == "parent" for f in model._meta.fields) and any(f.name == "name" for f in model._meta.fields)
 
 def _get_path_value(row_dict):
+    """Return the path string if present under any accepted column name; else None."""
     for c in PATH_COLS:
         val = row_dict.get(c)
         if isinstance(val, str) and val.strip():
@@ -166,6 +170,7 @@ def _split_path(path_str):
     return [p.strip() for p in str(path_str).split(PATH_SEPARATOR) if p and p.strip()]
 
 def _sort_df_by_path_depth_if_mptt(model, df):
+    """Stable-sort by path depth so ancestors come before children (only if a path col exists)."""
     if not _is_mptt_model(model):
         return df
     if not any(col in df.columns for col in PATH_COLS):
@@ -180,6 +185,10 @@ def _sort_df_by_path_depth_if_mptt(model, df):
     return df
 
 def _resolve_parent_from_path_chain(model, parts):
+    """
+    Walk the chain of names (all but the last are ancestors) and return the parent instance.
+    Raises ValueError if any ancestor is missing.
+    """
     parent = None
     for idx, node_name in enumerate(parts):
         inst = model.objects.filter(name=node_name, parent=parent).first()
@@ -188,10 +197,8 @@ def _resolve_parent_from_path_chain(model, parts):
             raise ValueError(f"{model.__name__}: missing ancestor '{missing}'. Provide this row before its children.")
         parent = inst
     return parent
+# -----------------------
 
-# -----------------------
-# Small REST helpers
-# -----------------------
 def success_response(data, message="Success"):
     return Response({"status": "success", "data": data, "message": message})
 
@@ -245,66 +252,6 @@ def create_excel_response(data):
     excel_file.seek(0)
     return Response(excel_file.getvalue(), content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
-# -----------------------
-# Import helpers used by Preview/Execute
-# -----------------------
-def _allowed_keys(model):
-    names = set()
-    for f in model._meta.fields:
-        names.add(f.name)
-        att = getattr(f, "attname", None)
-        if att:
-            names.add(att)  # e.g. entity_id
-    fk_aliases = {n + "_fk" for n in names}
-    return names | fk_aliases | set(PATH_COLS) | {"__row_id", "id"}
-
-def _filter_unknown(model, row: Dict[str, Any]):
-    allowed = _allowed_keys(model)
-    filtered = {k: v for k, v in row.items() if k in allowed}
-    unknown = sorted([k for k in row.keys() if k not in allowed and k != "__row_id"])
-    return filtered, unknown
-
-def _resolve_fk(model, field_name: str, raw_value, row_id_map: Dict[str, Any]):
-    # __row_id indirection
-    if isinstance(raw_value, str) and raw_value in row_id_map:
-        return row_id_map[raw_value]
-
-    related_field = model._meta.get_field(field_name)
-    fk_model = getattr(related_field, "related_model", None)
-    if fk_model is None:
-        raise ValueError(f"Field '{field_name}' is not a ForeignKey on {model.__name__}")
-
-    if raw_value in ("", None):
-        return None
-
-    if isinstance(raw_value, (int, float)) or (isinstance(raw_value, str) and raw_value.replace(".", "", 1).isdigit()):
-        fk_id = int(float(raw_value))
-        try:
-            return fk_model.objects.get(id=fk_id)
-        except fk_model.DoesNotExist:
-            raise ValueError(f"{fk_model.__name__} id={fk_id} not found for field '{field_name}'")
-    raise ValueError(f"Invalid FK reference format '{raw_value}' for field '{field_name}'")
-
-def _quantize_decimal_fields(model, payload: dict) -> dict:
-    out = dict(payload)
-    for f in model._meta.get_fields():
-        if isinstance(f, models.DecimalField):
-            name = getattr(f, 'attname', f.name)
-            if name in out and out[name] not in (None, ''):
-                dp = int(getattr(f, 'decimal_places', 0) or 0)
-                q = Decimal('1').scaleb(-dp)
-                out[name] = Decimal(str(out[name])).quantize(q, rounding=ROUND_HALF_UP)
-    return out
-
-def _coerce_boolean_fields(model, payload: dict) -> dict:
-    out = dict(payload)
-    for f in model._meta.get_fields():
-        if isinstance(f, models.BooleanField):
-            name = getattr(f, 'attname', f.name)
-            if name in out:
-                out[name] = _to_bool(out[name])
-    return out
-
 MODEL_APP_MAP = {
     "Account": "accounting",
     "CostCenter": "accounting",
@@ -334,6 +281,8 @@ MODEL_APP_MAP = {
     "KPI": "hr",
     "Bonus": "hr",
     "RecurringAdjustment": "hr",
+    
+    
 }
 
 def safe_model_dict(instance, exclude_fields=None):
@@ -347,9 +296,6 @@ def safe_model_dict(instance, exclude_fields=None):
             data[field.name] = related_obj.id if related_obj else None
     return data
 
-# -----------------------
-# Preview endpoint (transaction rolled back)
-# -----------------------
 class BulkImportPreview(APIView):
     def post(self, request, *args, **kwargs):
         try:
@@ -362,14 +308,13 @@ class BulkImportPreview(APIView):
             preview_data = {}
             errors = []
             row_id_map = {}
-
+            
             company_id = request.tenant.id if hasattr(request, 'tenant') else None
-
+            
             with transaction.atomic():
                 savepoint = transaction.savepoint()
                 print("[DEBUG] Started transaction with savepoint.")
                 model_preview = []
-
                 for model_name, df in xls.items():
                     if model_name != "References":
                         print(f"\n[INFO] Processing sheet: {model_name}")
@@ -383,36 +328,42 @@ class BulkImportPreview(APIView):
 
                         model = apps.get_model(app_label, model_name)
 
-                        # Keep ancestors first if 'path' given on MPTT models
+                        # ----- OPTIONAL: keep ancestors first if 'path' given on MPTT models
                         df = _sort_df_by_path_depth_if_mptt(model, df)
 
                         for i, row in df.iterrows():
                             print(f"[DEBUG] Processing row {i} of model {model_name}")
-                            raw = row.dropna().to_dict()
-                            row_id = raw.pop('__row_id', None)
+                            row_data = row.dropna().to_dict()
+                            row_id = row_data.pop('__row_id', None)
+                            print("  Raw data:", row_data)
+                            print("  __row_id:", row_id)
                             action = None
                             instance = None
                             try:
-                                # 1) drop unknown keys (but keep *_fk for resolution)
-                                filtered_input, unknown_cols = _filter_unknown(model, raw)
-
-                                # 2) resolve *_fk
-                                fk_fields = {k: v for k, v in filtered_input.items() if k.endswith('_fk')}
+                                # Handle FK fields (original behavior)
+                                fk_fields = {k: v for k, v in row_data.items() if k.endswith('_fk')}
                                 for fk_field, fk_ref in fk_fields.items():
                                     field_name = fk_field[:-3]
                                     print(f"  Resolving FK for {field_name} -> {fk_ref}")
                                     try:
-                                        fk_instance = _resolve_fk(model, field_name, fk_ref, row_id_map)
+                                        if isinstance(fk_ref, str) and fk_ref in row_id_map:
+                                            fk_instance = row_id_map[fk_ref]
+                                        elif isinstance(fk_ref, (int, float)) or (isinstance(fk_ref, str) and fk_ref.isdigit()):
+                                            related_field = model._meta.get_field(field_name)
+                                            fk_model = related_field.related_model
+                                            fk_instance = fk_model.objects.get(id=int(fk_ref))
+                                        else:
+                                            raise ValueError(f"Invalid FK reference format: {fk_ref}")
                                     except Exception as e:
                                         error_msg = f"FK reference '{fk_ref}' not found for field '{field_name}' in model {model_name}: {str(e)}"
                                         print("[ERROR]", error_msg)
                                         raise ValueError(error_msg)
-                                    filtered_input[field_name] = fk_instance
-                                    del filtered_input[fk_field]
+                                    row_data[field_name] = fk_instance
+                                    del row_data[fk_field]
 
-                                # 3) MPTT: derive name/parent from path
+                                # --------- MPTT PATH SUPPORT (derive name/parent from path if provided)
                                 if _is_mptt_model(model):
-                                    path_val = _get_path_value(filtered_input)
+                                    path_val = _get_path_value(row_data)
                                     if path_val:
                                         parts = _split_path(path_val)
                                         if not parts:
@@ -421,32 +372,28 @@ class BulkImportPreview(APIView):
                                         parent = None
                                         if len(parts) > 1:
                                             parent = _resolve_parent_from_path_chain(model, parts[:-1])
-                                        filtered_input['name'] = filtered_input.get('name', leaf_name) or leaf_name
-                                        filtered_input['parent'] = parent
-                                        filtered_input.pop('parent_id', None)
-                                        filtered_input.pop('parent_fk', None)
+                                        # Set/override name & parent based on path
+                                        row_data['name'] = row_data.get('name', leaf_name) or leaf_name
+                                        row_data['parent'] = parent
+                                        # Remove possible conflicting parent hints
+                                        row_data.pop('parent_id', None)
+                                        row_data.pop('parent_fk', None)
+                                        # Remove the path column itself
                                         for c in PATH_COLS:
-                                            filtered_input.pop(c, None)
+                                            row_data.pop(c, None)
 
-                                # 4) coerce booleans & decimals
-                                payload = _coerce_boolean_fields(model, filtered_input)
-                                payload = _quantize_decimal_fields(model, payload)
-
-                                # 5) create/update
-                                if 'id' in payload and payload['id']:
-                                    instance = model.objects.get(id=payload['id'])
-                                    for field, value in payload.items():
+                                # Original create/update
+                                if 'id' in row_data and row_data['id']:
+                                    instance = model.objects.get(id=row_data['id'])
+                                    for field, value in row_data.items():
                                         setattr(instance, field, value)
                                     action = 'update'
-                                    print(f"[UPDATE] {model_name} ID {payload['id']}")
+                                    print(f"[UPDATE] {model_name} ID {row_data['id']}")
                                 else:
-                                    instance = model(**payload)
+                                    instance = model(**row_data)
                                     action = 'create'
                                     print(f"[CREATE] New {model_name} instance")
 
-                                # Let model validations (including JE account/flag constraints) run:
-                                if hasattr(instance, "full_clean"):
-                                    instance.full_clean()
                                 instance.save()
                                 print(f"[SAVE] {model_name} row saved successfully.")
 
@@ -454,17 +401,13 @@ class BulkImportPreview(APIView):
                                     row_id_map[row_id] = instance
                                     print(f"[MAP] __row_id '{row_id}' bound to ID {instance.pk}")
 
-                                msg = "ok"
-                                if unknown_cols:
-                                    msg += f" | Ignoring unknown columns: {', '.join(unknown_cols)}"
-
                                 model_preview.append({
                                     "model": model_name,
                                     "__row_id": row_id,
                                     "status": "success",
                                     "action": action,
                                     "data": model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active']),
-                                    "message": msg
+                                    "message": "ok"
                                 })
                             except Exception as e:
                                 error = f"{model_name} row {i}: {str(e)}"
@@ -480,8 +423,8 @@ class BulkImportPreview(APIView):
                                 errors.append({"model": model_name, "row": i, "field": None, "message": str(e)})
                     preview_data = model_preview
 
-                transaction.savepoint_rollback(savepoint)
-                print("[INFO] Rolled back transaction after preview.")
+                    transaction.savepoint_rollback(savepoint)
+                    print("[INFO] Rolled back transaction after preview.")
 
             return Response({
                 "success": not errors,
@@ -494,9 +437,6 @@ class BulkImportPreview(APIView):
             errors.append({"model": model_name, "row": i, "field": None, "message": str(e)})
             return Response({"success": False, "preview": [], "errors": errors})
 
-# -----------------------
-# Execute endpoint (persists)
-# -----------------------
 class BulkImportExecute(APIView):
     def post(self, request, *args, **kwargs):
         try:
@@ -525,30 +465,34 @@ class BulkImportExecute(APIView):
                     df = _sort_df_by_path_depth_if_mptt(model, df)
 
                     for i, row in df.iterrows():
-                        raw = row.dropna().to_dict()
-                        row_id = raw.pop('__row_id', None)
+                        row_data = row.dropna().to_dict()
+                        row_id = row_data.pop('__row_id', None)
                         action = None
                         try:
-                            # 1) filter unknown columns (warn, don't fail)
-                            filtered_input, unknown_cols = _filter_unknown(model, raw)
-
-                            # 2) resolve *_fk
-                            fk_fields = {k: v for k, v in filtered_input.items() if k.endswith('_fk')}
+                            # Handle FK fields (original behavior)
+                            fk_fields = {k: v for k, v in row_data.items() if k.endswith('_fk')}
                             for fk_field, fk_ref in fk_fields.items():
                                 field_name = fk_field[:-3]
                                 print(f"  Resolving FK for {field_name} -> {fk_ref}")
                                 try:
-                                    fk_instance = _resolve_fk(model, field_name, fk_ref, row_id_map)
+                                    if isinstance(fk_ref, str) and fk_ref in row_id_map:
+                                        fk_instance = row_id_map[fk_ref]
+                                    elif isinstance(fk_ref, (int, float)) or (isinstance(fk_ref, str) and fk_ref.isdigit()):
+                                        related_field = model._meta.get_field(field_name)
+                                        fk_model = related_field.related_model
+                                        fk_instance = fk_model.objects.get(id=int(fk_ref))
+                                    else:
+                                        raise ValueError(f"Invalid FK reference format: {fk_ref}")
                                 except Exception as e:
                                     error_msg = f"FK reference '{fk_ref}' not found for field '{field_name}' in model {model_name}: {str(e)}"
                                     print("[ERROR]", error_msg)
                                     raise ValueError(error_msg)
-                                filtered_input[field_name] = fk_instance
-                                del filtered_input[fk_field]
+                                row_data[field_name] = fk_instance
+                                del row_data[fk_field]
 
-                            # 3) MPTT chain
+                            # --------- MPTT PATH SUPPORT
                             if _is_mptt_model(model):
-                                path_val = _get_path_value(filtered_input)
+                                path_val = _get_path_value(row_data)
                                 if path_val:
                                     parts = _split_path(path_val)
                                     if not parts:
@@ -557,47 +501,32 @@ class BulkImportExecute(APIView):
                                     parent = None
                                     if len(parts) > 1:
                                         parent = _resolve_parent_from_path_chain(model, parts[:-1])
-                                    filtered_input['name'] = filtered_input.get('name', leaf_name) or leaf_name
-                                    filtered_input['parent'] = parent
-                                    filtered_input.pop('parent_id', None)
-                                    filtered_input.pop('parent_fk', None)
+                                    row_data['name'] = row_data.get('name', leaf_name) or leaf_name
+                                    row_data['parent'] = parent
+                                    row_data.pop('parent_id', None)
+                                    row_data.pop('parent_fk', None)
                                     for c in PATH_COLS:
-                                        filtered_input.pop(c, None)
+                                        row_data.pop(c, None)
 
-                            # 4) coerce booleans & decimals
-                            payload = _coerce_boolean_fields(model, filtered_input)
-                            payload = _quantize_decimal_fields(model, payload)
-
-                            # 5) create/update & save
-                            if 'id' in payload and payload['id']:
-                                instance = model.objects.get(id=payload['id'])
-                                for field, value in payload.items():
+                            if 'id' in row_data and row_data['id']:
+                                instance = model.objects.get(id=row_data['id'])
+                                for field, value in row_data.items():
                                     setattr(instance, field, value)
                                 action = 'update'
                             else:
-                                instance = model(**payload)
+                                instance = model(**row_data)
                                 action = 'create'
 
-                            if hasattr(instance, "full_clean"):
-                                instance.full_clean()
                             instance.save()
-
-                            if row_id:
-                                row_id_map[row_id] = instance
-
-                            msg = "ok"
-                            status_val = "success"
-                            if unknown_cols:
-                                status_val = "warning"
-                                msg += f" | Ignoring unknown columns: {', '.join(unknown_cols)}"
+                            row_id_map[row_id] = instance
 
                             results.append({
                                 "model": model_name,
                                 "__row_id": row_id,
-                                "status": status_val,
+                                "status": "success",
                                 "action": action,
                                 "data": safe_model_dict(instance, exclude_fields=['created_by', 'updated_by', 'is_deleted', 'is_active']),
-                                "message": msg
+                                "message": "ok"
                             })
 
                         except Exception as e:
@@ -622,9 +551,6 @@ class BulkImportExecute(APIView):
                 "errors": [str(e)]
             }, status=400)
 
-# -----------------------
-# Helpers for Reference sheet
-# -----------------------
 def get_dynamic_value(obj, field_name):
     """
     Dynamically fetch either an attribute or a computed value based on the @ convention.
@@ -637,19 +563,15 @@ def get_dynamic_value(obj, field_name):
         if callable(method):
             return method()
         else:
-            return None
+            return None  # or raise Exception(f"Method {method_name} not found")
     else:
         return getattr(obj, field_name, None)
 
-# -----------------------
-# Template download
-# -----------------------
 class BulkImportTemplateDownloadView(APIView):
     def get(self, request, tenant_id):
         wb = Workbook()
 
         # -------- Main sheets with templates --------
-        # NOTE: BankTransaction: removed entity; JournalEntry: added bank_designation_pending
         sheet_defs = {
             "Company": ["__row_id", "name", "subdomain"],
             "Currency": ["__row_id", "code", "name"],
@@ -669,7 +591,7 @@ class BulkImportTemplateDownloadView(APIView):
             "Invoice": ["__row_id", "name", "company_fk", "partner_fk", "invoice_type", "invoice_number", "invoice_date", "due_date", "status", "currency", "total_amount", "tax_amount", "discount_amount", "recurrence_rule", "recurrence_start_date", "recurrence_end_date", "description"],
             "InvoiceLine": ["__row_id", "name", "company_fk", "invoice_fk", "product_service_fk", "description", "quantity", "unit_price", "tax_amount"],
             "Transaction": ["__row_id", "company_fk", "date", "entity_fk", "description", "amount", "currency_fk"],
-            "JournalEntry": ["__row_id", "date", "company_fk", "transaction_fk", "account_fk", "bank_designation_pending", "cost_center_fk", "debit_amount", "credit_amount"],
+            "JournalEntry": ["__row_id", "date", "company_fk", "transaction_fk", "account_fk", "cost_center_fk", "debit_amount", "credit_amount"],
             "BankTransaction": ["__row_id", "company_fk", "bank_account_fk", "date", "amount", "description", "currency_fk", "reference_number"],
             "Employee": ["__row_id", "company_fk", "CPF", "name", "position_fk", "hire_date", "salary", "vacation_days", "is_active"],
             "Position": ["__row_id", "company_fk", "title", "description", "department", "hierarchy_level", "min_salary", "max_salary"],
@@ -681,7 +603,10 @@ class BulkImportTemplateDownloadView(APIView):
                                     "employer_cost_formula", "priority", "default_account"],
             "IntegrationRule": ["__row_id", "company_fk","name","description","trigger_event","execution_order","filter_conditions","rule","use_celery","is_active","last_run_at","times_executed"],
             "SubstitutionRule": ["__row_id", "company_fk","title","model_name","field_name","column_name","column_index","match_type","match_value","substitution_value","filter_conditions"],
+            
         }
+
+
 
         ws = wb.active
         ws.title = 'Company'
@@ -701,7 +626,7 @@ class BulkImportTemplateDownloadView(APIView):
             ("Company", Company.objects.all(), ["id", "name", "subdomain"]),
             ('Currency', Currency.objects.all(), ['id', 'code', 'name']),
             ('Bank', Bank.objects.all(), ['id', 'name', 'bank_code']),
-            ("BankAccount", BankAccount.objects.all(), ["id", "name", "branch_id", "account_number", "company_id", "entity_id", "currency_id", "bank_id", "balance_date", "balance"]),
+            ("BankAccount", BankAccount.objects.all(), ["id", "name", "branch_id", "account_number", "company_id", "entity_id", "currency_id", "bank_id", "balance_date", "balance"],),
             ('Entity', Entity.objects.filter(company_id=tenant_id), ['id', 'name', 'parent_id', '@path']),
             ('CostCenter', CostCenter.objects.filter(company_id=tenant_id), ['id', 'name']),
             ('Account', Account.objects.filter(company_id=tenant_id), ['id', 'name', 'account_code', 'parent_id', '@path', 'account_direction', 'bank_account_id', 'balance_date', 'balance']),
@@ -713,7 +638,7 @@ class BulkImportTemplateDownloadView(APIView):
             ('Invoice', Invoice.objects.filter(company_id=tenant_id), ['id', 'invoice_number', 'invoice_date']),
             ('Contract', Contract.objects.filter(company_id=tenant_id), ['id', 'contract_number', 'start_date']),
             ('Transaction', Transaction.objects.filter(company_id=tenant_id), ['id', 'date', 'entity_id', 'description', 'amount', 'state']),
-            ('JournalEntry', JournalEntry.objects.filter(company_id=tenant_id), ['id', 'transaction_id', 'account_id', 'bank_designation_pending', 'debit_amount', 'credit_amount', 'date']),
+            ('JournalEntry', JournalEntry.objects.filter(company_id=tenant_id), ['id', 'transaction_id', 'account_id', 'debit_amount', 'credit_amount', 'date']),
             ('BankTransaction', BankTransaction.objects.filter(company_id=tenant_id), ['id', 'bank_account_id', 'date', 'amount', 'description', "reference_number", "transaction_id", 'status']),
             ("Employee", Employee.objects.filter(company_id=tenant_id), ["id", "company_id", "CPF", "name", "position_id", "hire_date", "salary", "vacation_days", "is_active"]),
             ("Position", Position.objects.filter(company_id=tenant_id), ["id", "company_id", "title", "description", "department", "hierarchy_level", "min_salary", "max_salary"]),
@@ -725,6 +650,8 @@ class BulkImportTemplateDownloadView(APIView):
                                     "employer_cost_formula", "priority", "default_account"]),
             ("IntegrationRule", IntegrationRule.objects.filter(company_id=tenant_id), ["id", "company_id","name","description","trigger_event","execution_order","filter_conditions","rule","use_celery","is_active","last_run_at","times_executed"]),
             ("SubstitutionRule", SubstitutionRule.objects.filter(company_id=tenant_id), ["id", "company_id","title","model_name","field_name","column_name","column_index","match_type","match_value","substitution_value","filter_conditions"]),
+            
+            
         ]
 
         for title, queryset, columns in references:
