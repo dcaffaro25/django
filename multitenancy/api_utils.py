@@ -74,22 +74,18 @@ def _is_missing(v) -> bool:
     # Treat pandas/numpy NA, NaT, plain None/"", and 'NaT' string as missing
     if v is None or v == "":
         return True
-    # cheap guard for pandas without hard dependency
     try:
         import pandas as pd  # noqa
-        # pd.isna handles NaN and NaT
         if pd.isna(v):  # type: ignore[attr-defined]
             return True
     except Exception:
         pass
-    # float NaN without pandas
     try:
         import math
         if isinstance(v, float) and math.isnan(v):
             return True
     except Exception:
         pass
-    # common textual NaT
     if isinstance(v, str) and v.strip().lower() == "nat":
         return True
     return False
@@ -97,8 +93,7 @@ def _is_missing(v) -> bool:
 def _to_int_or_none_soft(v):
     if _is_missing(v):
         return None
-    # excel often gives 3.0 for ids
-    if isinstance(v, (int,)):
+    if isinstance(v, int):
         return int(v)
     if isinstance(v, float):
         return int(v) if float(v).is_integer() else None
@@ -169,7 +164,6 @@ def _canonicalize_row(model, row: Dict[str, Any]) -> Dict[str, Any]:
             vq = Decimal(str(v)).quantize(q, rounding=ROUND_HALF_UP)
             out[k] = str(vq)
         elif isinstance(f, models.DateField):
-            # Keep as ISO string if present; if something like Timestamp/NaT slipped, _is_missing would’ve caught
             out[k] = str(v)
         elif isinstance(f, models.ForeignKey):
             out[k] = _to_int_or_none_soft(v)
@@ -322,6 +316,12 @@ def _filter_unknown(model, row: Dict[str, Any]):
     return filtered, unknown
 
 def _resolve_fk(model, field_name: str, raw_value, row_id_map: Dict[str, Any]):
+    """
+    NaN-safe FK resolver:
+      - '__row_id' indirection (string key in row_id_map)
+      - missing-ish (NaN/NaT/None/"") -> None
+      - numeric-ish ('3', 3, 3.0, '3.0') -> int id
+    """
     # __row_id indirection
     if isinstance(raw_value, str) and raw_value in row_id_map:
         return row_id_map[raw_value]
@@ -331,16 +331,19 @@ def _resolve_fk(model, field_name: str, raw_value, row_id_map: Dict[str, Any]):
     if fk_model is None:
         raise ValueError(f"Field '{field_name}' is not a ForeignKey on {model.__name__}")
 
-    if raw_value in ("", None):
+    # Treat NaN/NaT/None/"" as missing
+    if _is_missing(raw_value):
         return None
 
-    if isinstance(raw_value, (int, float)) or (isinstance(raw_value, str) and raw_value.replace(".", "", 1).isdigit()):
-        fk_id = int(float(raw_value))
-        try:
-            return fk_model.objects.get(id=fk_id)
-        except fk_model.DoesNotExist:
-            raise ValueError(f"{fk_model.__name__} id={fk_id} not found for field '{field_name}'")
-    raise ValueError(f"Invalid FK reference format '{raw_value}' for field '{field_name}'")
+    # Numeric-ish id (handles '3', 3, 3.0, '3.0')
+    fk_id = _to_int_or_none_soft(raw_value)
+    if fk_id is None:
+        raise ValueError(f"Invalid FK reference format '{raw_value}' for field '{field_name}'")
+
+    try:
+        return fk_model.objects.get(id=fk_id)
+    except fk_model.DoesNotExist:
+        raise ValueError(f"{fk_model.__name__} id={fk_id} not found for field '{field_name}'")
 
 def _quantize_decimal_fields(model, payload: dict) -> dict:
     out = dict(payload)
@@ -501,7 +504,7 @@ class BulkImportPreview(APIView):
                                     action = 'create'
                                     print(f"[CREATE] New {model_name} instance")
 
-                                # Let model validations (including JE account/flag constraints) run:
+                                # Let model validations run:
                                 if hasattr(instance, "full_clean"):
                                     instance.full_clean()
                                 instance.save()

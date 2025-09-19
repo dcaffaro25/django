@@ -14,8 +14,14 @@ from django.apps import apps
 from django.conf import settings
 from django.core.exceptions import FieldDoesNotExist, ValidationError
 from django.core.mail import send_mail
-from django.db import (IntegrityError, DataError, DatabaseError, connection,
-                       models as dj_models, transaction)
+from django.db import (
+    IntegrityError,
+    DataError,
+    DatabaseError,
+    connection,
+    models as dj_models,
+    transaction,
+)
 from django.db.models import NOT_PROVIDED
 
 from core.utils.db_sequences import reset_pk_sequences
@@ -30,8 +36,12 @@ from .api_utils import (
     _resolve_parent_from_path_chain,
     _split_path,
     safe_model_dict,
-    table_fingerprint as api_table_fingerprint,  # kept for compatibility if you use it elsewhere
-    jaccard as api_jaccard,                       # kept for compatibility
+    # dedupe helpers (kept for compat if referenced elsewhere)
+    table_fingerprint as api_table_fingerprint,
+    jaccard as api_jaccard,
+    # NEW: NaN/NaT-safe helpers, used in _canonicalize_row below
+    _is_missing,
+    _to_int_or_none_soft,
 )
 
 # ----------------------------------------------------------------------
@@ -58,9 +68,11 @@ def execute_integration_rule(rule_id, payload):
 
 @shared_task
 def trigger_integration_event(company_id, event_name, payload):
-    rules = (IntegrationRule.objects
-             .filter(company_id=company_id, is_active=True, triggers__icontains=event_name)
-             .order_by('execution_order'))
+    rules = (
+        IntegrationRule.objects
+        .filter(company_id=company_id, is_active=True, triggers__icontains=event_name)
+        .order_by('execution_order')
+    )
     for rule in rules:
         if rule.use_celery:
             execute_integration_rule.delay(rule.id, payload)
@@ -329,7 +341,7 @@ IGNORE_FIELDS = {"id", "created_at", "updated_at", "created_by", "updated_by", "
 def _canonicalize_row(model, row: Dict[str, Any]) -> Dict[str, Any]:
     """
     Stable identity using "all non-volatile fields present in row & on model".
-    Folds *_fk into base name; quantizes DecimalFields; ISO for dates; ints for FK ids.
+    Folds *_fk into base name; quantizes DecimalFields; ISO for dates; NaN/NaT-safe FK ids.
     """
     field_by = {f.name: f for f in model._meta.get_fields() if hasattr(f, "attname")}
     allowed = set(field_by.keys())
@@ -337,7 +349,8 @@ def _canonicalize_row(model, row: Dict[str, Any]) -> Dict[str, Any]:
     # fold *_fk
     incoming = {}
     for k, v in row.items():
-        if k == "__row_id": continue
+        if k == "__row_id":
+            continue
         incoming[k[:-3] if k.endswith("_fk") else k] = v
 
     ident = {k for k in incoming.keys() if k in allowed and k not in IGNORE_FIELDS}
@@ -345,15 +358,22 @@ def _canonicalize_row(model, row: Dict[str, Any]) -> Dict[str, Any]:
     for k in sorted(ident):
         v = incoming.get(k)
         f = field_by.get(k)
+
+        # Normalize "missing-ish" values first (None, "", NaN, NaT, "NaT")
+        if _is_missing(v):
+            out[k] = None
+            continue
+
         if isinstance(f, dj_models.DecimalField):
             dp = int(getattr(f, 'decimal_places', 0) or 0)
             q = Decimal('1').scaleb(-dp)
-            v = None if v in (None, '') else Decimal(str(v)).quantize(q, rounding=ROUND_HALF_UP)
-            out[k] = (str(v) if v is not None else None)
+            vq = Decimal(str(v)).quantize(q, rounding=ROUND_HALF_UP)
+            out[k] = str(vq)
         elif isinstance(f, dj_models.DateField):
-            out[k] = str(v) if v is not None else None
+            # safe as ISO (we already filtered NaT above)
+            out[k] = str(v)
         elif isinstance(f, dj_models.ForeignKey):
-            out[k] = int(v) if v not in (None, "") else None
+            out[k] = _to_int_or_none_soft(v)  # NaN-safe FK id coercion
         else:
             out[k] = _norm_scalar(v)
     return out
@@ -406,7 +426,8 @@ def execute_import_job(
     One-shot import for all models in a file.
 
     Updated for:
-      - JournalEntry.bank_designation_pending support (booleans coerced; account may be null).
+      - JournalEntry.bank_designation_pending support (booleans coerced; account may be null
+        if your model-level constraint allows it).
       - BankTransaction without 'entity' (entity_* columns are ignored with a warning).
       - Safer error messages and dedupe checks.
     """
@@ -564,8 +585,8 @@ def execute_import_job(
             try:
                 filtered_input, _ = _filter_unknown(model, original_input)
                 payload = _normalize_payload_for_model(model, filtered_input, context_company_id=company_id)
-                payload = _coerce_boolean_fields(model, payload)       # <-- booleans (bank_designation_pending, etc.)
-                payload = _quantize_decimal_fields(model, payload)     # <-- decimals
+                payload = _coerce_boolean_fields(model, payload)       # booleans (bank_designation_pending, etc.)
+                payload = _quantize_decimal_fields(model, payload)     # decimals
 
                 # MPTT: keep name, defer parent resolution
                 if _is_mptt_model(model):
