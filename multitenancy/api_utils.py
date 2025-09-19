@@ -70,6 +70,47 @@ def _excel_safe(value):
     except Exception:
         return str(value)
 
+def _is_missing(v) -> bool:
+    # Treat pandas/numpy NA, NaT, plain None/"", and 'NaT' string as missing
+    if v is None or v == "":
+        return True
+    # cheap guard for pandas without hard dependency
+    try:
+        import pandas as pd  # noqa
+        # pd.isna handles NaN and NaT
+        if pd.isna(v):  # type: ignore[attr-defined]
+            return True
+    except Exception:
+        pass
+    # float NaN without pandas
+    try:
+        import math
+        if isinstance(v, float) and math.isnan(v):
+            return True
+    except Exception:
+        pass
+    # common textual NaT
+    if isinstance(v, str) and v.strip().lower() == "nat":
+        return True
+    return False
+
+def _to_int_or_none_soft(v):
+    if _is_missing(v):
+        return None
+    # excel often gives 3.0 for ids
+    if isinstance(v, (int,)):
+        return int(v)
+    if isinstance(v, float):
+        return int(v) if float(v).is_integer() else None
+    s = str(v).strip()
+    if s.isdigit():
+        return int(s)
+    try:
+        f = float(s)
+        return int(f) if f.is_integer() else None
+    except Exception:
+        return None
+
 # ----- lightweight fingerprint (used by template refs) -----
 import hashlib, json, re
 from decimal import Decimal, ROUND_HALF_UP
@@ -94,41 +135,57 @@ def _quantize_decimal(val, dp):
     q = Decimal("1").scaleb(-int(dp))
     return Decimal(str(val)).quantize(q, rounding=ROUND_HALF_UP)
 
-def canonicalize_row(model, row: Dict[str, Any]) -> Dict[str, Any]:
+def _canonicalize_row(model, row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Stable identity using "all non-volatile fields present in row & on model".
+    Folds *_fk into base name; quantizes DecimalFields; ISO for dates; ints for FK ids.
+    Treats NaN/NaT as missing (None).
+    """
     field_by = {f.name: f for f in model._meta.get_fields() if hasattr(f, "attname")}
-    allowed  = set(field_by.keys())
-    ident    = set(IDENTITY_FIELDS_MAP.get(model.__name__, [])) or \
-               {k for k in row.keys() if k in allowed and k not in IGNORE_FIELDS}
+    allowed = set(field_by.keys())
 
+    # fold *_fk
     incoming = {}
     for k, v in row.items():
-        if k == "__row_id": continue
-        incoming[k[:-3] if k.endswith("_fk") else k] = v
+        if k == "__row_id":
+            continue
+        base = k[:-3] if k.endswith("_fk") else k
+        incoming[base] = v
 
+    ident = {k for k in incoming.keys() if k in allowed and k not in IGNORE_FIELDS}
     out = {}
     for k in sorted(ident):
         v = incoming.get(k)
         f = field_by.get(k)
+
+        # normalize missing-ish first
+        if _is_missing(v):
+            out[k] = None
+            continue
+
         if isinstance(f, models.DecimalField):
-            v = _quantize_decimal(v, f.decimal_places)
-            out[k] = str(v) if v is not None else None
+            dp = int(getattr(f, "decimal_places", 0) or 0)
+            q = Decimal('1').scaleb(-dp)
+            vq = Decimal(str(v)).quantize(q, rounding=ROUND_HALF_UP)
+            out[k] = str(vq)
         elif isinstance(f, models.DateField):
-            out[k] = str(v) if v is not None else None
+            # Keep as ISO string if present; if something like Timestamp/NaT slipped, _is_missing would’ve caught
+            out[k] = str(v)
         elif isinstance(f, models.ForeignKey):
-            out[k] = int(v) if v not in (None, "") else None
+            out[k] = _to_int_or_none_soft(v)
         else:
             out[k] = _norm_scalar(v)
     return out
 
 def row_hash(model, row: Dict[str, Any]) -> str:
-    canon = canonicalize_row(model, row)
+    canon = _canonicalize_row(model, row)
     blob  = json.dumps(canon, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 def table_fingerprint(model, rows: List[Dict[str, Any]], sample_n: int = 200) -> Dict[str, Any]:
     rhashes = [row_hash(model, r) for r in rows]
     unique_sorted = sorted(set(rhashes))
-    cols = sorted(canonicalize_row(model, rows[0]).keys()) if rows else []
+    cols = sorted(_canonicalize_row(model, rows[0]).keys()) if rows else []
     header_blob = json.dumps(cols, separators=(",", ":"), sort_keys=True)
     concat = header_blob + "|" + "|".join(unique_sorted)
     thash  = hashlib.sha256(concat.encode("utf-8")).hexdigest()
