@@ -301,7 +301,7 @@ class BankTransactionSerializer(serializers.ModelSerializer):
     class Meta:
         model = BankTransaction
         fields = [
-            'id', 'company', 'bank_account', 'entity', 'currency', 'date', 
+            'id', 'company', 'bank_account', 'entity', 'entity_name', 'currency', 'date', 
             'description', 'amount', 'status', #'transaction_type',
             'is_deleted', 'updated_at', 'updated_by', 'reconciliation_status'
         ]
