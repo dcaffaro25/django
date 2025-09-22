@@ -104,40 +104,53 @@ def _to_bool(val, default=False):
         return default
     return str(val).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
+def _norm_row_key(v):
+    # normalize string-like row ids/FK tokens from Excel
+    if v is None:
+        return None
+    s = str(v)
+    s = s.replace("\u00A0", " ")  # non-breaking space
+    return s.strip()
+
 def _resolve_fk(model, field_name: str, raw_value, row_id_map: Dict[str, Any]):
     """
     Resolve a *_fk value to a model instance.
+
     Accepts:
-      - '__row_id' string referencing a previously created row in this same import
+      - '__row_id' token referencing a previously created row in this same import
       - numeric ID (int/float/'3'/'3.0')
     """
-    # __row_id indirection
-    if isinstance(raw_value, str) and raw_value in row_id_map:
-        return row_id_map[raw_value]
+    # 0) Normalize strings (trim spaces, NBSP, etc.)
+    if isinstance(raw_value, str):
+        raw_value_norm = _norm_row_key(raw_value)
+        # 1) __row_id indirection (after normalization)
+        if raw_value_norm in row_id_map:
+            return row_id_map[raw_value_norm]
+    else:
+        raw_value_norm = raw_value
 
-    # Check model field exists and is FK
-    try:
-        related_field = model._meta.get_field(field_name)
-    except FieldDoesNotExist:
-        raise ValueError(f"Unknown FK field '{field_name}' for model {model.__name__}")
-
-    fk_model = getattr(related_field, "related_model", None)
-    if fk_model is None:
-        raise ValueError(f"Field '{field_name}' is not a ForeignKey on {model.__name__}")
-
-    if raw_value in ("", None):
+    # 2) Treat missing-ish as None
+    if _is_missing(raw_value_norm):
         return None
 
-    # numeric id
-    if isinstance(raw_value, (int, float)) or (isinstance(raw_value, str) and raw_value.replace(".", "", 1).isdigit()):
-        fk_id = _to_int_or_none(raw_value)
+    # 3) Numeric id?
+    if isinstance(raw_value_norm, (int, float)) or (isinstance(raw_value_norm, str) and raw_value_norm.replace(".", "", 1).isdigit()):
+        fk_id = _to_int_or_none_soft(raw_value_norm)
         if fk_id is None:
             raise ValueError(f"Invalid FK id '{raw_value}' for field '{field_name}'")
+        try:
+            related_field = model._meta.get_field(field_name)
+        except Exception:
+            raise ValueError(f"Unknown FK field '{field_name}' for model {model.__name__}")
+        fk_model = getattr(related_field, "related_model", None)
+        if fk_model is None:
+            raise ValueError(f"Field '{field_name}' is not a ForeignKey on {model.__name__}")
         try:
             return fk_model.objects.get(id=fk_id)
         except fk_model.DoesNotExist:
             raise ValueError(f"{fk_model.__name__} id={fk_id} not found for field '{field_name}'")
 
+    # 4) Not a numeric id and not a known __row_id
     raise ValueError(f"Invalid FK reference format '{raw_value}' for field '{field_name}'")
 
 def _normalize_payload_for_model(model, payload: Dict[str, Any], *, context_company_id=None):
@@ -397,6 +410,44 @@ def _unknown_from_original_input(model, row_obj: Dict[str, Any]) -> List[str]:
     allowed = _allowed_keys(model)
     orig = row_obj.get("_original_input") or row_obj.get("payload") or {}
     return sorted([k for k in orig.keys() if k not in allowed and k != "__row_id"])
+
+# Decide create vs update; normalize id
+def _infer_action_and_clean_id(payload: Dict[str, Any], original_input: Dict[str, Any]):
+    """
+    Decide whether this row is a create or update.
+
+    Rules:
+      - If payload['id'] can be coerced cleanly to an integer (e.g., 5, '5', 5.0, '5.0'),
+        normalize it to int and return ("update", id, None).
+      - Otherwise treat it as create. If an unusable 'id' was present in original input,
+        return it as external_id for traceability.
+    """
+    def _coerce_pk(val):
+        if val is None or val == "":
+            return None
+        if isinstance(val, int):
+            return val
+        if isinstance(val, float):
+            return int(val) if float(val).is_integer() else None
+        s = str(val).strip()
+        try:
+            f = float(s)
+            return int(f) if f.is_integer() else None
+        except Exception:
+            return int(s) if s.isdigit() else None
+
+    external_id = None
+    pk = _coerce_pk(payload.get("id"))
+    if pk is not None:
+        payload["id"] = pk
+        return "update", pk, None
+
+    if "id" in payload:
+        if "id" in original_input and original_input["id"] not in ("", None):
+            external_id = str(original_input["id"])
+        payload.pop("id", None)
+
+    return "create", None, external_id
 
 # ----------------------------------------------------------------------
 # Core import executor
@@ -740,8 +791,10 @@ def execute_import_job(
                             instance.save()
 
                         if rid:
-                            row_map[rid] = instance
-                            global_row_map[rid] = instance  # <-- make visible to other sheets
+                            key = _norm_row_key(rid)
+                            if key:
+                                row_map[key] = instance
+                                global_row_map[key] = instance  # <-- make visible to other sheets
 
                         msg = "ok"
                         status_val = "success"
@@ -879,8 +932,10 @@ def execute_import_job(
                         instance.save()
 
                     if rid:
-                        row_map[rid] = instance
-                        global_row_map[rid] = instance  # <-- make visible to other sheets
+                        key = _norm_row_key(rid)
+                        if key:
+                            row_map[key] = instance
+                            global_row_map[key] = instance  # <-- make visible to other sheets
 
                     msg = "ok"
                     status_val = "success"
