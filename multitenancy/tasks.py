@@ -35,7 +35,7 @@ from .api_utils import (
     _resolve_parent_from_path_chain,
     _split_path,
     safe_model_dict,
-    # NaN/NaT-safe helpers used in canonicalization:
+    # NaN/NaT-safe helpers used in canonicalization / FK coercion:
     _is_missing,
     _to_int_or_none_soft,
 )
@@ -105,12 +105,11 @@ def _to_bool(val, default=False):
     return str(val).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 def _norm_row_key(v):
-    # normalize string-like row ids/FK tokens from Excel
+    """Normalize Excel-ish tokens used in __row_id / *_fk cells (trim + NBSP)."""
     if v is None:
         return None
-    s = str(v)
-    s = s.replace("\u00A0", " ")  # non-breaking space
-    return s.strip()
+    s = str(v).replace("\u00A0", " ").strip()
+    return s
 
 def _resolve_fk(model, field_name: str, raw_value, row_id_map: Dict[str, Any]):
     """
@@ -120,7 +119,7 @@ def _resolve_fk(model, field_name: str, raw_value, row_id_map: Dict[str, Any]):
       - '__row_id' token referencing a previously created row in this same import
       - numeric ID (int/float/'3'/'3.0')
     """
-    # 0) Normalize strings (trim spaces, NBSP, etc.)
+    # Normalize the raw token
     if isinstance(raw_value, str):
         raw_value_norm = _norm_row_key(raw_value)
         # 1) __row_id indirection (after normalization)
@@ -411,16 +410,11 @@ def _unknown_from_original_input(model, row_obj: Dict[str, Any]) -> List[str]:
     orig = row_obj.get("_original_input") or row_obj.get("payload") or {}
     return sorted([k for k in orig.keys() if k not in allowed and k != "__row_id"])
 
-# Decide create vs update; normalize id
+# --- create vs update ---
 def _infer_action_and_clean_id(payload: Dict[str, Any], original_input: Dict[str, Any]):
     """
-    Decide whether this row is a create or update.
-
-    Rules:
-      - If payload['id'] can be coerced cleanly to an integer (e.g., 5, '5', 5.0, '5.0'),
-        normalize it to int and return ("update", id, None).
-      - Otherwise treat it as create. If an unusable 'id' was present in original input,
-        return it as external_id for traceability.
+    If payload['id'] cleanly coerces to int -> ("update", id, None)
+    Else treat as create; if unusable 'id' existed in original input, return it as external_id.
     """
     def _coerce_pk(val):
         if val is None or val == "":
@@ -455,7 +449,7 @@ def _infer_action_and_clean_id(payload: Dict[str, Any], original_input: Dict[str
 
 DUP_CHECK_LAST_N = 10  # compare against last N snapshots per model
 
-# Simple dependency hint so parents come before children
+# Parent-first hints
 ORDER_HINT = {
     "Company": 10,
     "Currency": 10,
@@ -477,11 +471,6 @@ def execute_import_job(
 ) -> Dict[str, Any]:
     """
     One-shot import for all models in a file.
-
-    Updated for:
-      - Global __row_id map so cross-sheet FKs like JournalEntry.transaction_fk="t1" resolve.
-      - NaN/NaT-safe canonicalization to avoid "cannot convert float NaN to integer".
-      - Booleans/decimals coercion and basic dedupe fingerprints per sheet.
     """
 
     # --------------------------- file-level dedupe ---------------------------
@@ -706,7 +695,7 @@ def execute_import_job(
         prepared.append({"model": model_name, "rows": packed_rows, "had_error": had_err})
         models_in_order.append(model_name)
 
-    # make processing deterministic/parent-first
+    # enforce deterministic/parent-first
     models_in_order.sort(key=lambda m: ORDER_HINT.get(m, 1000))
 
     # ------------------------------ PREVIEW ------------------------------
@@ -764,6 +753,16 @@ def execute_import_job(
                             merged_map = {**global_row_map, **row_map}
                             payload[field_name] = _resolve_fk(model, field_name, fk_val, merged_map)
 
+                        # Extra guard for JournalEntry.transaction_fk
+                        if model.__name__ == "JournalEntry" and "transaction" in model._meta.fields_map:
+                            if "transaction" not in payload or payload.get("transaction") is None:
+                                raw_tok = original_input.get("transaction_fk")
+                                known = ", ".join(sorted(global_row_map.keys())) or "(none)"
+                                raise ValueError(
+                                    f"JournalEntry.transaction_fk='{raw_tok}' could not be resolved to a Transaction "
+                                    f"created in this import. Known __row_id keys: {known}"
+                                )
+
                         # Resolve MPTT parent
                         if _is_mptt_model(model):
                             path_val = _get_path_value(payload)
@@ -785,8 +784,12 @@ def execute_import_job(
                             else:
                                 instance = model(**payload)
 
+                            # Allow account to be null only when bank_designation_pending=True
                             if hasattr(instance, "full_clean"):
-                                instance.full_clean()
+                                if model.__name__ == "JournalEntry" and payload.get("bank_designation_pending", False):
+                                    instance.full_clean(exclude=["account"])
+                                else:
+                                    instance.full_clean()
 
                             instance.save()
 
@@ -794,7 +797,7 @@ def execute_import_job(
                             key = _norm_row_key(rid)
                             if key:
                                 row_map[key] = instance
-                                global_row_map[key] = instance  # <-- make visible to other sheets
+                                global_row_map[key] = instance  # visible to other sheets
 
                         msg = "ok"
                         status_val = "success"
@@ -905,6 +908,16 @@ def execute_import_job(
                         merged_map = {**global_row_map, **row_map}
                         payload[field_name] = _resolve_fk(model, field_name, fk_val, merged_map)
 
+                    # Extra guard for JournalEntry.transaction_fk
+                    if model.__name__ == "JournalEntry" and "transaction" in model._meta.fields_map:
+                        if "transaction" not in payload or payload.get("transaction") is None:
+                            raw_tok = original_input.get("transaction_fk")
+                            known = ", ".join(sorted(global_row_map.keys())) or "(none)"
+                            raise ValueError(
+                                f"JournalEntry.transaction_fk='{raw_tok}' could not be resolved to a Transaction "
+                                f"created in this import. Known __row_id keys: {known}"
+                            )
+
                     # MPTT parent chain
                     if _is_mptt_model(model):
                         path_val = _get_path_value(payload)
@@ -926,8 +939,12 @@ def execute_import_job(
                         else:
                             instance = model(**payload)
 
+                        # Allow account to be null only when bank_designation_pending=True
                         if hasattr(instance, "full_clean"):
-                            instance.full_clean()
+                            if model.__name__ == "JournalEntry" and payload.get("bank_designation_pending", False):
+                                instance.full_clean(exclude=["account"])
+                            else:
+                                instance.full_clean()
 
                         instance.save()
 
@@ -935,7 +952,7 @@ def execute_import_job(
                         key = _norm_row_key(rid)
                         if key:
                             row_map[key] = instance
-                            global_row_map[key] = instance  # <-- make visible to other sheets
+                            global_row_map[key] = instance  # visible to other sheets
 
                     msg = "ok"
                     status_val = "success"
