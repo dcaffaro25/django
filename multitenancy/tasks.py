@@ -1,4 +1,4 @@
-# multitenancy/tasks.py
+# tasks.py (multitenancy/tasks.py)
 from __future__ import annotations
 
 import hashlib
@@ -35,7 +35,7 @@ from .api_utils import (
     _resolve_parent_from_path_chain,
     _split_path,
     safe_model_dict,
-    # NaN/NaT-safe helpers used below:
+    # NaN/NaT-safe helpers used in canonicalization:
     _is_missing,
     _to_int_or_none_soft,
 )
@@ -46,6 +46,7 @@ from .api_utils import (
 
 @shared_task(bind=True, autoretry_for=(smtplib.SMTPException, ConnectionError), retry_backoff=True, max_retries=5)
 def send_user_invite_email(self, subject, message, to_email):
+    """Send user invite email with retry/backoff."""
     send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, [to_email], fail_silently=False)
 
 @shared_task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
@@ -103,8 +104,9 @@ def _to_bool(val, default=False):
         return default
     return str(val).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
+# Normalize string-like row ids/FK tokens (kills NBSP, trims)
+_WS_RE = re.compile(r"\s+")
 def _norm_row_key(v):
-    """Normalize Excel-ish tokens used in __row_id / *_fk cells (trim + NBSP)."""
     if v is None:
         return None
     s = str(v).replace("\u00A0", " ").strip()
@@ -118,35 +120,38 @@ def _resolve_fk(model, field_name: str, raw_value, row_id_map: Dict[str, Any]):
       - '__row_id' token referencing a previously created row in this same import
       - numeric ID (int/float/'3'/'3.0')
     """
-    # normalize
-    raw_norm = _norm_row_key(raw_value) if isinstance(raw_value, str) else raw_value
+    # Normalize string tokens (handles trailing spaces/NBSP from Excel)
+    val_norm = _norm_row_key(raw_value) if isinstance(raw_value, str) else raw_value
 
-    # __row_id indirection
-    if isinstance(raw_norm, str) and raw_norm in row_id_map:
-        return row_id_map[raw_norm]
-
-    # missing → None
-    if _is_missing(raw_norm):
+    # Treat missing-ish as None
+    if _is_missing(val_norm):
         return None
 
+    # __row_id indirection
+    if isinstance(val_norm, str) and val_norm in row_id_map:
+        return row_id_map[val_norm]
+
+    # Check target field
+    try:
+        related_field = model._meta.get_field(field_name)
+    except FieldDoesNotExist:
+        raise ValueError(f"Unknown FK field '{field_name}' for model {model.__name__}")
+
+    fk_model = getattr(related_field, "related_model", None)
+    if fk_model is None:
+        raise ValueError(f"Field '{field_name}' is not a ForeignKey on {model.__name__}")
+
     # numeric id?
-    if isinstance(raw_norm, (int, float)) or (isinstance(raw_norm, str) and raw_norm.replace(".", "", 1).isdigit()):
-        fk_id = _to_int_or_none_soft(raw_norm)
+    if isinstance(val_norm, (int, float)) or (isinstance(val_norm, str) and val_norm.replace(".", "", 1).isdigit()):
+        fk_id = _to_int_or_none_soft(val_norm)
         if fk_id is None:
             raise ValueError(f"Invalid FK id '{raw_value}' for field '{field_name}'")
-        try:
-            related_field = model._meta.get_field(field_name)
-        except Exception:
-            raise ValueError(f"Unknown FK field '{field_name}' for model {model.__name__}")
-        fk_model = getattr(related_field, "related_model", None)
-        if fk_model is None:
-            raise ValueError(f"Field '{field_name}' is not a ForeignKey on {model.__name__}")
         try:
             return fk_model.objects.get(id=fk_id)
         except fk_model.DoesNotExist:
             raise ValueError(f"{fk_model.__name__} id={fk_id} not found for field '{field_name}'")
 
-    # not numeric, not a known __row_id
+    # Not numeric and not found as __row_id
     raise ValueError(f"Invalid FK reference format '{raw_value}' for field '{field_name}'")
 
 def _normalize_payload_for_model(model, payload: Dict[str, Any], *, context_company_id=None):
@@ -175,7 +180,7 @@ def _normalize_payload_for_model(model, payload: Dict[str, Any], *, context_comp
     if "filter_conditions" in data:
         data["filter_conditions"] = _parse_json_or_empty(data.get("filter_conditions"))
 
-    # drop unknown keys except *_id and *_fk
+    # drop unknown keys except *_id matching real fields and *_fk (will be resolved later)
     for k in list(data.keys()):
         if k in ("id",):
             continue
@@ -188,6 +193,7 @@ def _normalize_payload_for_model(model, payload: Dict[str, Any], *, context_comp
     return data
 
 def _path_depth(row: Dict[str, Any]) -> int:
+    """Used to sort MPTT rows so parents come first."""
     for c in PATH_COLS:
         if c in row and row[c]:
             return len(str(row[c]).strip().replace(" > ", "\\").split("\\"))
@@ -222,57 +228,88 @@ def _row_observations(audit_by_rowid, row_id):
     return obs
 
 def _allowed_keys(model):
+    """
+    Accept base names (e.g., 'entity'), DB attnames (e.g., 'entity_id'),
+    and importer aliases '*_fk'. Also path cols, '__row_id', 'id'.
+    """
     names = set()
     for f in model._meta.fields:
         names.add(f.name)
         att = getattr(f, "attname", None)
         if att:
-            names.add(att)  # e.g. entity_id
+            names.add(att)  # e.g., 'entity_id'
     fk_aliases = {n + "_fk" for n in names}
     return names | fk_aliases | set(PATH_COLS) | {"__row_id", "id"}
 
 def _filter_unknown(model, row: Dict[str, Any]):
+    """Return (filtered_row, unknown_keys) keeping only allowed keys for this model."""
     allowed = _allowed_keys(model)
     filtered = {k: v for k, v in row.items() if k in allowed}
     unknown = sorted([k for k in row.keys() if k not in allowed and k != "__row_id"])
     return filtered, unknown
 
 def _preflight_missing_required(model, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Only flag truly required fields (concrete/not-null/no default/not auto/not timestamp).
+    Treat presence of either <field>, <field>_id, or <field>_fk as satisfying the requirement.
+    """
     errors = {}
+
+    # Build metadata for required fields and map base -> accepted keys
     required_fields = []
-    field_map = {}
+    field_map = {}  # base name -> {accepted keys}
     for f in model._meta.fields:
         if not hasattr(f, "attname"):
             continue
+
         is_auto_ts = (
             (hasattr(f, "auto_now") and getattr(f, "auto_now")) or
             (hasattr(f, "auto_now_add") and getattr(f, "auto_now_add"))
         )
         has_default = (getattr(f, "default", NOT_PROVIDED) is not NOT_PROVIDED)
-        if ((not f.null) and (not f.primary_key) and (not f.auto_created) and (not has_default) and (not is_auto_ts)):
+
+        if (
+            (not f.null)
+            and (not f.primary_key)
+            and (not f.auto_created)
+            and (not has_default)
+            and (not is_auto_ts)
+        ):
             required_fields.append(f)
+
         base = f.name
         attn = getattr(f, "attname", f.name)
-        field_map[base] = {base, attn, f"{base}_fk"}
+        accepted = {base, attn, f"{base}_fk"}
+        field_map[base] = accepted
 
     for i, row in enumerate(rows):
         rid = row.get("__row_id") or f"row{i+1}"
+        rid = _norm_row_key(rid)
         payload = {k: v for k, v in row.items() if k != "__row_id"}
+
         missing = []
         for f in required_fields:
             base = f.name
-            present = any((k in payload and payload.get(k) not in ("", None)) for k in field_map.get(base, {base}))
+            accepted_keys = field_map.get(base, {base})
+            present = False
+            for k in accepted_keys:
+                if k in payload and payload.get(k) not in ("", None):
+                    present = True
+                    break
             if not present:
                 missing.append(base)
+
         if missing:
             errors[rid] = {
                 "code": "E-PREFLIGHT",
                 "message": f"Missing required: {', '.join(sorted(missing))}",
                 "fields": {"missing": sorted(missing)},
             }
+
     return errors
 
 def _quantize_decimal_fields(model, payload: dict) -> dict:
+    """Quantize all DecimalField values to the model's decimal_places."""
     out = dict(payload)
     for f in model._meta.get_fields():
         if isinstance(f, dj_models.DecimalField):
@@ -284,6 +321,7 @@ def _quantize_decimal_fields(model, payload: dict) -> dict:
     return out
 
 def _coerce_boolean_fields(model, payload: dict) -> dict:
+    """Coerce stringy booleans to bool for BooleanFields."""
     out = dict(payload)
     for f in model._meta.get_fields():
         if isinstance(f, dj_models.BooleanField):
@@ -292,13 +330,11 @@ def _coerce_boolean_fields(model, payload: dict) -> dict:
                 out[name] = _to_bool(out[name])
     return out
 
-# --------- canonicalization & fingerprint ----------
-_WS_RE = re.compile(r"\s+")
-
+# --------- canonicalization & fingerprint for table-level dedupe ----------
 def _norm_scalar(val):
     if val is None: return None
     if isinstance(val, (bool, int)): return val
-    if isinstance(val, float): return float(str(val))
+    if isinstance(val, float): return float(str(val))  # reduce float noise
     if isinstance(val, Decimal): return str(val)
     s = str(val).strip()
     return _WS_RE.sub(" ", s)
@@ -306,29 +342,40 @@ def _norm_scalar(val):
 IGNORE_FIELDS = {"id", "created_at", "updated_at", "created_by", "updated_by", "is_deleted", "is_active"}
 
 def _canonicalize_row(model, row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Stable identity using "all non-volatile fields present in row & on model".
+    Folds *_fk into base name; quantizes DecimalFields; ISO for dates; NaN/NaT-safe FK ids.
+    """
     field_by = {f.name: f for f in model._meta.get_fields() if hasattr(f, "attname")}
     allowed = set(field_by.keys())
+
+    # fold *_fk
     incoming = {}
     for k, v in row.items():
         if k == "__row_id":
             continue
         incoming[k[:-3] if k.endswith("_fk") else k] = v
+
     ident = {k for k in incoming.keys() if k in allowed and k not in IGNORE_FIELDS}
     out = {}
     for k in sorted(ident):
         v = incoming.get(k)
         f = field_by.get(k)
+
+        # Normalize missing-ish values first (None, "", NaN, NaT, "NaT")
         if _is_missing(v):
             out[k] = None
             continue
+
         if isinstance(f, dj_models.DecimalField):
             dp = int(getattr(f, 'decimal_places', 0) or 0)
             q = Decimal('1').scaleb(-dp)
-            out[k] = str(Decimal(str(v)).quantize(q, rounding=ROUND_HALF_UP))
+            vq = Decimal(str(v)).quantize(q, rounding=ROUND_HALF_UP)
+            out[k] = str(vq)
         elif isinstance(f, dj_models.DateField):
             out[k] = str(v)
         elif isinstance(f, dj_models.ForeignKey):
-            out[k] = _to_int_or_none_soft(v)
+            out[k] = _to_int_or_none_soft(v)  # NaN-safe FK id coercion
         else:
             out[k] = _norm_scalar(v)
     return out
@@ -340,7 +387,7 @@ def _row_hash(model, row: Dict[str, Any]) -> str:
 
 def _table_fingerprint(model, rows: List[Dict[str, Any]], sample_n: int = 200) -> Dict[str, Any]:
     rhashes = [_row_hash(model, r) for r in rows]
-    unique_sorted = sorted(set(rhashes))
+    unique_sorted = sorted(set(rhashes))  # order-insensitive, dedup
     cols = sorted(_canonicalize_row(model, rows[0]).keys()) if rows else []
     header_blob = json.dumps(cols, separators=(",", ":"), sort_keys=True)
     concat = header_blob + "|" + "|".join(unique_sorted)
@@ -364,45 +411,13 @@ def _unknown_from_original_input(model, row_obj: Dict[str, Any]) -> List[str]:
     orig = row_obj.get("_original_input") or row_obj.get("payload") or {}
     return sorted([k for k in orig.keys() if k not in allowed and k != "__row_id"])
 
-# --- create vs update ---
-def _infer_action_and_clean_id(payload: Dict[str, Any], original_input: Dict[str, Any]):
-    """
-    If payload['id'] cleanly coerces to int -> ("update", id, None)
-    Else treat as create; if unusable 'id' existed in original input, return it as external_id.
-    """
-    def _coerce_pk(val):
-        if val is None or val == "":
-            return None
-        if isinstance(val, int):
-            return val
-        if isinstance(val, float):
-            return int(val) if float(val).is_integer() else None
-        s = str(val).strip()
-        try:
-            f = float(s)
-            return int(f) if f.is_integer() else None
-        except Exception:
-            return int(s) if s.isdigit() else None
-
-    external_id = None
-    pk = _coerce_pk(payload.get("id"))
-    if pk is not None:
-        payload["id"] = pk
-        return "update", pk, None
-
-    if "id" in payload:
-        if "id" in original_input and original_input["id"] not in ("", None):
-            external_id = str(original_input["id"])
-        payload.pop("id", None)
-
-    return "create", None, external_id
-
 # ----------------------------------------------------------------------
 # Core import executor
 # ----------------------------------------------------------------------
 
-DUP_CHECK_LAST_N = 10
+DUP_CHECK_LAST_N = 10  # compare against last N snapshots per model
 
+# Simple dependency hint so parents come before children
 ORDER_HINT = {
     "Company": 10,
     "Currency": 10,
@@ -415,6 +430,34 @@ ORDER_HINT = {
     "JournalEntry": 60,    # depends on Transaction
 }
 
+def _infer_action_and_clean_id(payload: Dict[str, Any], original_input: Dict[str, Any]):
+    """
+    Decide create/update, normalize 'id' for ORM, and carry external text id (if any).
+    Returns: (action: 'create'|'update', pk_or_none: Optional[int], external_id: Optional[str])
+    """
+    def _coerce_pk(val):
+        if val is None or val == "": return None
+        if isinstance(val, int): return val
+        if isinstance(val, float): return int(val) if float(val).is_integer() else None
+        s = str(val).strip()
+        if s.isdigit(): return int(s)
+        try:
+            f = float(s)
+            return int(f) if f.is_integer() else None
+        except Exception:
+            return None
+
+    ext_id = None
+    pk = _coerce_pk(payload.get("id"))
+    if pk is not None:
+        payload["id"] = pk
+        return "update", pk, None
+    if "id" in payload:
+        if "id" in original_input and original_input["id"] not in ("", None):
+            ext_id = str(original_input["id"])
+        payload.pop("id", None)
+    return "create", None, ext_id
+
 def execute_import_job(
     company_id: int,
     sheets: List[Dict[str, Any]],
@@ -422,8 +465,16 @@ def execute_import_job(
     *,
     file_meta: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
+    """
+    One-shot import for all models in a file.
 
-    # -------- file-level dedupe --------
+    - Global __row_id map so cross-sheet FKs like JournalEntry.transaction_fk="t1" resolve.
+    - NaN/NaT-safe canonicalization to avoid "cannot convert float NaN to integer".
+    - Booleans/decimals coercion and basic dedupe fingerprints per sheet.
+    - Never special-cases a model; model-level validation enforces invariants.
+    """
+
+    # --------------------------- file-level dedupe ---------------------------
     file_sha = (file_meta or {}).get("sha256")
     filename = (file_meta or {}).get("filename")
     file_size = (file_meta or {}).get("size")
@@ -452,7 +503,7 @@ def execute_import_job(
         ),
     }
 
-    # -------- prep per sheet --------
+    # --------------------------- prep per sheet ---------------------------
     prepared: List[Dict[str, Any]] = []
     models_in_order: List[str] = []
     any_prep_error = False
@@ -474,15 +525,17 @@ def execute_import_job(
         model = apps.get_model(app_label, model_name)
         raw_rows = sheet["rows"]
 
+        # substitutions + audit
         rows, audit = apply_substitutions(raw_rows, company_id=company_id, model_name=model_name, return_audit=True)
         audit_by_rowid = {}
         for ch in audit:
             audit_by_rowid.setdefault(ch.get("__row_id"), []).append(ch)
 
+        # MPTT: ensure parents first
         if _is_mptt_model(model):
             rows = sorted(rows, key=_path_depth)
 
-        # table fingerprint
+        # ---- table-level fingerprint (order-insensitive) ----
         fp = _table_fingerprint(model, rows)
         exact_table_dupe_of = (
             ImportSnapshot.objects
@@ -494,7 +547,7 @@ def execute_import_job(
         prev_snaps = list(
             ImportSnapshot.objects
             .filter(company_id=company_id, model_name=model_name)
-            .only("id","row_count","row_hash_sample","table_hash","file_sha256","created_at","filename")
+            .only("id", "row_count", "row_hash_sample", "table_hash", "file_sha256", "created_at", "filename")
             .order_by("-created_at")
         )[:DUP_CHECK_LAST_N]
 
@@ -533,13 +586,16 @@ def execute_import_job(
             ),
         }
 
+        # ---- preflight for missing required ----
         preflight_err = _preflight_missing_required(model, rows)
 
+        # ---- pack rows for downstream (message reflects unknown columns) ----
         packed_rows = []
         had_err = False
 
         for idx, row in enumerate(rows):
-            rid = row.get("__row_id") or f"row{idx+1}"
+            rid_raw = row.get("__row_id") or f"row{idx+1}"
+            rid = _norm_row_key(rid_raw)
             observations = _row_observations(audit_by_rowid, rid)
             original_input = {k: v for k, v in row.items() if k != "__row_id"}
 
@@ -549,6 +605,7 @@ def execute_import_job(
                 payload = _coerce_boolean_fields(model, payload)
                 payload = _quantize_decimal_fields(model, payload)
 
+                # MPTT: keep name, defer parent resolution
                 if _is_mptt_model(model):
                     path_val = _get_path_value(payload)
                     if path_val:
@@ -617,7 +674,9 @@ def execute_import_job(
                     tmp_payload = original_input
 
                 action, pk, ext_id = _infer_action_and_clean_id(dict(tmp_payload), original_input)
-                unknown_cols_now = _unknown_from_original_input(model, {"_original_input": original_input, "payload": tmp_payload})
+                unknown_cols_now = _unknown_from_original_input(model, {
+                    "_original_input": original_input, "payload": tmp_payload
+                })
                 base = err["summary"]
                 if unknown_cols_now:
                     base = f"{base} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
@@ -638,13 +697,15 @@ def execute_import_job(
         prepared.append({"model": model_name, "rows": packed_rows, "had_error": had_err})
         models_in_order.append(model_name)
 
-    # deterministic parent-first
+    # make processing deterministic/parent-first
     models_in_order.sort(key=lambda m: ORDER_HINT.get(m, 1000))
 
     # ------------------------------ PREVIEW ------------------------------
     if not commit:
         models_touched: List[Any] = []
         result_payload: List[Dict[str, Any]] = []
+
+        # Global __row_id map shared across ALL sheets
         global_row_map: Dict[str, Any] = {}
 
         with transaction.atomic():
@@ -664,8 +725,9 @@ def execute_import_job(
                 out_rows: List[Dict[str, Any]] = []
 
                 for row in rows:
-                    rid = row["__row_id"]
+                    rid = _norm_row_key(row["__row_id"])
 
+                    # If preflight already failed, surface it and skip DB interaction
                     if row.get("status") == "error" and row.get("preflight_error"):
                         out_rows.append({
                             "__row_id": rid,
@@ -686,14 +748,18 @@ def execute_import_job(
                     unknown_cols_now = _unknown_from_original_input(model, row)
 
                     try:
-                        # resolve *_fk with LOCAL + GLOBAL maps
+                        # Resolve *_fk using LOCAL + GLOBAL row maps (keys normalized)
                         for fk_key in [k for k in list(payload.keys()) if k.endswith("_fk")]:
                             field_name = fk_key[:-3]
                             fk_val = payload.pop(fk_key)
                             merged_map = {**global_row_map, **row_map}
+                            if isinstance(fk_val, str):
+                                print(f"[FK] {model.__name__}.{field_name} -> '{fk_val}' "
+                                      f"(norm='{_norm_row_key(fk_val)}'); "
+                                      f"known row_ids: {list(merged_map.keys())[:20]}{' ...' if len(merged_map)>20 else ''}")
                             payload[field_name] = _resolve_fk(model, field_name, fk_val, merged_map)
 
-                        # MPTT parent
+                        # Resolve MPTT parent
                         if _is_mptt_model(model):
                             path_val = _get_path_value(payload)
                             if path_val:
@@ -702,6 +768,7 @@ def execute_import_job(
                                 payload['parent'] = parent
                                 payload.pop('parent_id', None)
 
+                        # Coerce booleans/decimals just before save
                         payload = _coerce_boolean_fields(model, payload)
                         payload = _quantize_decimal_fields(model, payload)
 
@@ -714,22 +781,13 @@ def execute_import_job(
                                 instance = model(**payload)
 
                             if hasattr(instance, "full_clean"):
-                                try:
-                                    instance.full_clean()
-                                except ValidationError as ve:
-                                    # Generic retry: if pending (bank_designation_pending True) and account is the only null error, skip it
-                                    if payload.get("bank_designation_pending") and "account" in (ve.message_dict or {}):
-                                        instance.full_clean(exclude=["account"])
-                                    else:
-                                        raise
+                                instance.full_clean()
 
                             instance.save()
 
                         if rid:
-                            key = _norm_row_key(rid)
-                            if key:
-                                row_map[key] = instance
-                                global_row_map[key] = instance
+                            row_map[rid] = instance
+                            global_row_map[rid] = instance  # <-- make visible to other sheets
 
                         msg = "ok"
                         status_val = "success"
@@ -769,10 +827,16 @@ def execute_import_job(
                     "result": out_rows
                 })
 
+            # Roll back all side-effects and reset sequences
             transaction.savepoint_rollback(outer_sp)
             reset_pk_sequences(models_touched)
 
-        return {"committed": False, "reason": "preview", "file_info": file_info, "imports": result_payload}
+        return {
+            "committed": False,
+            "reason": "preview",
+            "file_info": file_info,
+            "imports": result_payload
+        }
 
     # ------------------------------ COMMIT ------------------------------
     if any_prep_error:
@@ -786,6 +850,8 @@ def execute_import_job(
     models_touched: List[Any] = []
     result_payload: List[Dict[str, Any]] = []
     any_row_error = False
+
+    # Global __row_id map shared across ALL sheets
     global_row_map: Dict[str, Any] = {}
 
     with transaction.atomic():
@@ -804,8 +870,9 @@ def execute_import_job(
             rows = next(b["rows"] for b in prepared if b["model"] == model_name)
 
             for row in rows:
-                rid = row["__row_id"]
+                rid = _norm_row_key(row["__row_id"])
 
+                # Skip rows that already failed preflight
                 if row.get("status") == "error" and row.get("preflight_error"):
                     row.update({
                         "status": "error",
@@ -824,12 +891,18 @@ def execute_import_job(
                 unknown_cols_now = _unknown_from_original_input(model, row)
 
                 try:
+                    # Resolve *_fk using LOCAL + GLOBAL row maps (keys normalized)
                     for fk_key in [k for k in list(payload.keys()) if k.endswith("_fk")]:
                         field_name = fk_key[:-3]
                         fk_val = payload.pop(fk_key)
                         merged_map = {**global_row_map, **row_map}
+                        if isinstance(fk_val, str):
+                            print(f"[FK] {model.__name__}.{field_name} -> '{fk_val}' "
+                                  f"(norm='{_norm_row_key(fk_val)}'); "
+                                  f"known row_ids: {list(merged_map.keys())[:20]}{' ...' if len(merged_map)>20 else ''}")
                         payload[field_name] = _resolve_fk(model, field_name, fk_val, merged_map)
 
+                    # MPTT parent chain
                     if _is_mptt_model(model):
                         path_val = _get_path_value(payload)
                         if path_val:
@@ -838,6 +911,7 @@ def execute_import_job(
                             payload['parent'] = parent
                             payload.pop('parent_id', None)
 
+                    # Coerce booleans/decimals just before save
                     payload = _coerce_boolean_fields(model, payload)
                     payload = _quantize_decimal_fields(model, payload)
 
@@ -850,21 +924,13 @@ def execute_import_job(
                             instance = model(**payload)
 
                         if hasattr(instance, "full_clean"):
-                            try:
-                                instance.full_clean()
-                            except ValidationError as ve:
-                                if payload.get("bank_designation_pending") and "account" in (ve.message_dict or {}):
-                                    instance.full_clean(exclude=["account"])
-                                else:
-                                    raise
+                            instance.full_clean()
 
                         instance.save()
 
                     if rid:
-                        key = _norm_row_key(rid)
-                        if key:
-                            row_map[key] = instance
-                            global_row_map[key] = instance
+                        row_map[rid] = instance
+                        global_row_map[rid] = instance  # <-- make visible to other sheets
 
                     msg = "ok"
                     status_val = "success"
@@ -909,7 +975,7 @@ def execute_import_job(
                 "imports": result_payload
             }
 
-        # persist snapshots
+        # ---------- Persist snapshots per sheet (commit success only) ----------
         for item in result_payload:
             model_name = item["model"]
             app_label = MODEL_APP_MAP[model_name]
@@ -932,9 +998,13 @@ def execute_import_job(
                 jaccard_to_prev=closest.get("jaccard"),
             )
 
-        return {"committed": True, "file_info": file_info, "imports": result_payload}
+        return {
+            "committed": True,
+            "file_info": file_info,
+            "imports": result_payload
+        }
 
-# Celery entrypoint
+# Celery entrypoint: one task per file
 @shared_task
 def run_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool) -> Dict[str, Any]:
     return execute_import_job(company_id, sheets, commit)
