@@ -1,7 +1,6 @@
 # api_utils.py
 import csv
 import io
-import re
 import pandas as pd
 from django.apps import apps
 from django.db import transaction
@@ -30,12 +29,7 @@ from hr.models import Employee, Position, TimeTracking, KPI, Bonus, RecurringAdj
 
 import json
 from datetime import datetime, date, time, timezone
-from decimal import Decimal, ROUND_HALF_UP
-from typing import Dict, Any, List, Tuple
-
-# ----------------------------------------------------------------------
-# Small helpers
-# ----------------------------------------------------------------------
+from decimal import Decimal
 
 def _to_bool(v, default=False):
     if isinstance(v, bool):
@@ -43,13 +37,6 @@ def _to_bool(v, default=False):
     if v is None:
         return default
     return str(v).strip().lower() in {"1","true","t","yes","y","on"}
-
-# normalize string-like row ids/FK tokens from Excel (trim, kill NBSP)
-def _norm_row_key(v):
-    if v is None:
-        return None
-    s = str(v).replace("\u00A0", " ").strip()
-    return s
 
 def _excel_safe(value):
     # None is fine
@@ -67,7 +54,7 @@ def _excel_safe(value):
         except Exception:
             return str(value)
 
-    # Datetime: make naive
+    # Datetime: make naive (Excel/openpyxl dislikes tz-aware)
     if isinstance(value, datetime):
         if value.tzinfo is not None:
             value = value.astimezone(timezone.utc).replace(tzinfo=None)
@@ -84,6 +71,7 @@ def _excel_safe(value):
         return str(value)
 
 def _is_missing(v) -> bool:
+    # Treat pandas/numpy NA, NaT, plain None/"", and 'NaT' string as missing
     if v is None or v == "":
         return True
     try:
@@ -119,15 +107,23 @@ def _to_int_or_none_soft(v):
         return None
 
 # ----- lightweight fingerprint (used by template refs) -----
-import hashlib, json as _json, re as _re
-from decimal import Decimal as _D, ROUND_HALF_UP as _RHU
-from typing import List as _List, Dict as _Dict, Any as _Any
+import hashlib, json, re
+from decimal import Decimal, ROUND_HALF_UP
+from typing import List, Dict, Any
 from django.db import models
 
-_WHITESPACE_RE = _re.compile(r"\s+")
+_WHITESPACE_RE = re.compile(r"\s+")
 
 IDENTITY_FIELDS_MAP = {}
 IGNORE_FIELDS = {"id","created_at","updated_at","created_by","updated_by","is_deleted","is_active"}
+
+_WS_RE = re.compile(r"\s+")
+
+def _norm_row_key(v):
+    if v is None:
+        return None
+    s = str(v).replace("\u00A0", " ").strip()  # collapse NBSP, trim
+    return s
 
 def _norm_scalar(val):
     if val is None: return None
@@ -139,10 +135,10 @@ def _norm_scalar(val):
 
 def _quantize_decimal(val, dp):
     if val in (None, ""): return None
-    q = _D("1").scaleb(-int(dp))
-    return _D(str(val)).quantize(q, rounding=_RHU)
+    q = Decimal("1").scaleb(-int(dp))
+    return Decimal(str(val)).quantize(q, rounding=ROUND_HALF_UP)
 
-def _canonicalize_row(model, row: _Dict[str, _Any]) -> _Dict[str, _Any]:
+def _canonicalize_row(model, row: Dict[str, Any]) -> Dict[str, Any]:
     """
     Stable identity using "all non-volatile fields present in row & on model".
     Folds *_fk into base name; quantizes DecimalFields; ISO for dates; ints for FK ids.
@@ -151,6 +147,7 @@ def _canonicalize_row(model, row: _Dict[str, _Any]) -> _Dict[str, _Any]:
     field_by = {f.name: f for f in model._meta.get_fields() if hasattr(f, "attname")}
     allowed = set(field_by.keys())
 
+    # fold *_fk
     incoming = {}
     for k, v in row.items():
         if k == "__row_id":
@@ -164,14 +161,15 @@ def _canonicalize_row(model, row: _Dict[str, _Any]) -> _Dict[str, _Any]:
         v = incoming.get(k)
         f = field_by.get(k)
 
+        # normalize missing-ish first
         if _is_missing(v):
             out[k] = None
             continue
 
         if isinstance(f, models.DecimalField):
             dp = int(getattr(f, "decimal_places", 0) or 0)
-            q  = _D("1").scaleb(-dp)
-            vq = _D(str(v)).quantize(q, rounding=_RHU)
+            q = Decimal('1').scaleb(-dp)
+            vq = Decimal(str(v)).quantize(q, rounding=ROUND_HALF_UP)
             out[k] = str(vq)
         elif isinstance(f, models.DateField):
             out[k] = str(v)
@@ -181,16 +179,16 @@ def _canonicalize_row(model, row: _Dict[str, _Any]) -> _Dict[str, _Any]:
             out[k] = _norm_scalar(v)
     return out
 
-def row_hash(model, row: _Dict[str, _Any]) -> str:
+def row_hash(model, row: Dict[str, Any]) -> str:
     canon = _canonicalize_row(model, row)
-    blob  = _json.dumps(canon, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    blob  = json.dumps(canon, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
-def table_fingerprint(model, rows: _List[_Dict[str, _Any]], sample_n: int = 200) -> _Dict[str, _Any]:
+def table_fingerprint(model, rows: List[Dict[str, Any]], sample_n: int = 200) -> Dict[str, Any]:
     rhashes = [row_hash(model, r) for r in rows]
     unique_sorted = sorted(set(rhashes))
     cols = sorted(_canonicalize_row(model, rows[0]).keys()) if rows else []
-    header_blob = _json.dumps(cols, separators=(",", ":"), sort_keys=True)
+    header_blob = json.dumps(cols, separators=(",", ":"), sort_keys=True)
     concat = header_blob + "|" + "|".join(unique_sorted)
     thash  = hashlib.sha256(concat.encode("utf-8")).hexdigest()
     return {
@@ -327,12 +325,12 @@ def _filter_unknown(model, row: Dict[str, Any]):
 
 def _resolve_fk(model, field_name: str, raw_value, row_id_map: Dict[str, Any]):
     """
-    NaN/NaT-safe FK resolver:
-      - '__row_id' indirection (string key in row_id_map, normalized)
+    NaN-safe FK resolver:
+      - '__row_id' indirection (string key in row_id_map)
       - missing-ish (NaN/NaT/None/"") -> None
       - numeric-ish ('3', 3, 3.0, '3.0') -> int id
     """
-    # __row_id token
+    # __row_id indirection
     if isinstance(raw_value, str):
         key = _norm_row_key(raw_value)
         if key in row_id_map:
@@ -408,6 +406,20 @@ MODEL_APP_MAP = {
     "RecurringAdjustment": "hr",
 }
 
+# ---- cross-sheet processing order (so Transactions come before JournalEntries) ----
+ORDER_HINT = {
+    "Company": 10,
+    "Currency": 10,
+    "Entity": 20,
+    "Bank": 20,
+    "BankAccount": 30,
+    "Account": 40,
+    "CostCenter": 40,
+    "Transaction": 50,   # parent
+    "JournalEntry": 60,  # depends on Transaction
+    # others default to 1000
+}
+
 def safe_model_dict(instance, exclude_fields=None):
     data = model_to_dict(instance)
     exclude_fields = exclude_fields or []
@@ -433,8 +445,7 @@ class BulkImportPreview(APIView):
 
             preview_data = {}
             errors = []
-            # Global map across sheets
-            row_id_map: Dict[str, Any] = {}
+            row_id_map = {}
 
             company_id = request.tenant.id if hasattr(request, 'tenant') else None
 
@@ -443,324 +454,53 @@ class BulkImportPreview(APIView):
                 print("[DEBUG] Started transaction with savepoint.")
                 model_preview = []
 
-                for model_name, df in xls.items():
-                    if model_name != "References":
-                        print(f"\n[INFO] Processing sheet: {model_name}")
-                        app_label = MODEL_APP_MAP.get(model_name)
+                # ---- process in a deterministic, dependency-aware order ----
+                ordered_names = sorted(
+                    [n for n in xls.keys() if n != "References"],
+                    key=lambda n: ORDER_HINT.get(n, 1000)
+                )
 
-                        if not app_label:
-                            msg = f"Unknown model: {model_name}"
-                            print("[ERROR]", msg)
-                            errors.append({"model": model_name, "row": None, "field": None, "message": msg})
-                            continue
-
-                        model = apps.get_model(app_label, model_name)
-
-                        # Keep ancestors first if 'path' given on MPTT models
-                        df = _sort_df_by_path_depth_if_mptt(model, df)
-
-                        # First pass + deferred queue if FK tokens not known yet
-                        deferred: List[Tuple[int, pd.Series]] = []
-
-                        for i, row in df.iterrows():
-                            raw = row.dropna().to_dict()
-                            row_id_raw = raw.pop('__row_id', None)
-                            row_id = _norm_row_key(row_id_raw)
-                            action = None
-                            instance = None
-
-                            print(f"[ROW] {model_name} __row_id={row_id!r}")
-
-                            try:
-                                # 1) drop unknown keys (but keep *_fk for resolution)
-                                filtered_input, unknown_cols = _filter_unknown(model, raw)
-
-                                # 2) detect unresolved *_fk that use tokens (e.g., 't1') not yet in map
-                                fk_fields = {k: v for k, v in filtered_input.items() if k.endswith('_fk')}
-                                unresolved = False
-                                for fk_field, fk_ref in fk_fields.items():
-                                    # if token-like string and not numeric and not yet mapped -> defer
-                                    if isinstance(fk_ref, str):
-                                        key = _norm_row_key(fk_ref)
-                                        if _to_int_or_none_soft(fk_ref) is None and key not in row_id_map:
-                                            print(f"[DEFER] {model_name} __row_id={row_id!r} because {fk_field}={fk_ref!r} not in map yet")
-                                            unresolved = True
-                                            break
-                                if unresolved:
-                                    deferred.append((i, row))
-                                    continue
-
-                                # 3) resolve *_fk
-                                for fk_field, fk_ref in fk_fields.items():
-                                    field_name = fk_field[:-3]
-                                    print(f"[FK] resolving {model_name}.{field_name} <- {fk_ref!r} (norm={_norm_row_key(fk_ref)!r})")
-                                    fk_instance = _resolve_fk(model, field_name, fk_ref, row_id_map)
-                                    filtered_input[field_name] = fk_instance
-                                    del filtered_input[fk_field]
-
-                                # 4) MPTT: derive name/parent from path
-                                if _is_mptt_model(model):
-                                    path_val = _get_path_value(filtered_input)
-                                    if path_val:
-                                        parts = _split_path(path_val)
-                                        if not parts:
-                                            raise ValueError(f"{model_name}: empty path.")
-                                        leaf_name = parts[-1]
-                                        parent = None
-                                        if len(parts) > 1:
-                                            parent = _resolve_parent_from_path_chain(model, parts[:-1])
-                                        filtered_input['name'] = filtered_input.get('name', leaf_name) or leaf_name
-                                        filtered_input['parent'] = parent
-                                        filtered_input.pop('parent_id', None)
-                                        filtered_input.pop('parent_fk', None)
-                                        for c in PATH_COLS:
-                                            filtered_input.pop(c, None)
-
-                                # 5) coerce booleans & decimals
-                                payload = _coerce_boolean_fields(model, filtered_input)
-                                payload = _quantize_decimal_fields(model, payload)
-
-                                # 6) create/update
-                                if 'id' in payload and payload['id']:
-                                    instance = model.objects.get(id=payload['id'])
-                                    for field, value in payload.items():
-                                        setattr(instance, field, value)
-                                    action = 'update'
-                                    print(f"[UPDATE] {model_name} ID {payload['id']}")
-                                else:
-                                    instance = model(**payload)
-                                    action = 'create'
-                                    print(f"[CREATE] New {model_name} instance")
-
-                                # 7) full_clean with smart exclude for pending bank designation
-                                exclude = []
-                                # generic: if model has the flag and it's True and account missing, skip 'account'
-                                if hasattr(instance, "bank_designation_pending") and getattr(instance, "bank_designation_pending"):
-                                    if getattr(instance, "account_id", None) in (None, ""):
-                                        exclude.append("account")
-                                if hasattr(instance, "full_clean"):
-                                    instance.full_clean(exclude=exclude or None)
-
-                                instance.save()
-                                print(f"[SAVE] {model_name} row saved successfully.")
-
-                                if row_id:
-                                    row_id_map[row_id] = instance
-                                    print(f"[MAP] __row_id {row_id_raw!r} (norm={row_id!r}) -> {model_name} id={instance.pk}")
-
-                                msg = "ok"
-                                if unknown_cols:
-                                    msg += f" | Ignoring unknown columns: {', '.join(unknown_cols)}"
-
-                                model_preview.append({
-                                    "model": model_name,
-                                    "__row_id": row_id,
-                                    "status": "success",
-                                    "action": action,
-                                    "data": model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active']),
-                                    "message": msg
-                                })
-                            except Exception as e:
-                                error = f"{model_name} row {i}: {str(e)}"
-                                print("[ERROR]", error)
-                                model_preview.append({
-                                    "model": model_name,
-                                    "__row_id": row_id,
-                                    "status": "error",
-                                    "action": action,
-                                    "data": {},
-                                    "message": str(e)
-                                })
-                                errors.append({"model": model_name, "row": i, "field": None, "message": str(e)})
-
-                        # ---- retry any deferred rows now that more __row_id are mapped ----
-                        if deferred:
-                            print(f"[DEFER] Retrying {len(deferred)} deferred rows for {model_name}")
-                        progress = True
-                        while deferred and progress:
-                            progress = False
-                            still: List[Tuple[int, pd.Series]] = []
-                            for i, row in deferred:
-                                raw = row.dropna().to_dict()
-                                row_id_raw = raw.pop('__row_id', None)
-                                row_id = _norm_row_key(row_id_raw)
-                                action = None
-                                instance = None
-                                try:
-                                    filtered_input, unknown_cols = _filter_unknown(model, raw)
-                                    fk_fields = {k: v for k, v in filtered_input.items() if k.endswith('_fk')}
-                                    # if still unresolved, keep deferring
-                                    unresolved = False
-                                    for fk_field, fk_ref in fk_fields.items():
-                                        if isinstance(fk_ref, str):
-                                            key = _norm_row_key(fk_ref)
-                                            if _to_int_or_none_soft(fk_ref) is None and key not in row_id_map:
-                                                unresolved = True
-                                                break
-                                    if unresolved:
-                                        still.append((i, row))
-                                        continue
-
-                                    for fk_field, fk_ref in fk_fields.items():
-                                        field_name = fk_field[:-3]
-                                        fk_instance = _resolve_fk(model, field_name, fk_ref, row_id_map)
-                                        filtered_input[field_name] = fk_instance
-                                        del filtered_input[fk_field]
-
-                                    if _is_mptt_model(model):
-                                        path_val = _get_path_value(filtered_input)
-                                        if path_val:
-                                            parts = _split_path(path_val)
-                                            if not parts:
-                                                raise ValueError(f"{model_name}: empty path.")
-                                            leaf_name = parts[-1]
-                                            parent = None
-                                            if len(parts) > 1:
-                                                parent = _resolve_parent_from_path_chain(model, parts[:-1])
-                                            filtered_input['name'] = filtered_input.get('name', leaf_name) or leaf_name
-                                            filtered_input['parent'] = parent
-                                            filtered_input.pop('parent_id', None)
-                                            filtered_input.pop('parent_fk', None)
-                                            for c in PATH_COLS:
-                                                filtered_input.pop(c, None)
-
-                                    payload = _coerce_boolean_fields(model, filtered_input)
-                                    payload = _quantize_decimal_fields(model, payload)
-
-                                    if 'id' in payload and payload['id']:
-                                        instance = model.objects.get(id=payload['id'])
-                                        for field, value in payload.items():
-                                            setattr(instance, field, value)
-                                        action = 'update'
-                                    else:
-                                        instance = model(**payload)
-                                        action = 'create'
-
-                                    exclude = []
-                                    if hasattr(instance, "bank_designation_pending") and getattr(instance, "bank_designation_pending"):
-                                        if getattr(instance, "account_id", None) in (None, ""):
-                                            exclude.append("account")
-                                    if hasattr(instance, "full_clean"):
-                                        instance.full_clean(exclude=exclude or None)
-
-                                    instance.save()
-
-                                    if row_id:
-                                        row_id_map[row_id] = instance
-                                        print(f"[MAP] __row_id {row_id_raw!r} (norm={row_id!r}) -> {model_name} id={instance.pk}")
-
-                                    msg = "ok"
-                                    if unknown_cols:
-                                        msg += f" | Ignoring unknown columns: {', '.join(unknown_cols)}"
-                                    model_preview.append({
-                                        "model": model_name,
-                                        "__row_id": row_id,
-                                        "status": "success",
-                                        "action": action,
-                                        "data": model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active']),
-                                        "message": msg
-                                    })
-                                    progress = True
-                                except Exception as e:
-                                    print("[ERROR][DEFER]", f"{model_name} row {i}: {e}")
-                                    still.append((i, row))
-                            deferred = still
-
-                        # any still-deferred become errors
-                        for i, row in deferred:
-                            rid = _norm_row_key(row.get('__row_id'))
-                            msg = f"Unresolved __row_id dependency for {model_name} row {i}; check token references."
-                            model_preview.append({
-                                "model": model_name,
-                                "__row_id": rid,
-                                "status": "error",
-                                "action": None,
-                                "data": {},
-                                "message": msg
-                            })
-                            errors.append({"model": model_name, "row": i, "field": None, "message": msg})
-
-                    preview_data = model_preview
-
-                transaction.savepoint_rollback(savepoint)
-                print("[INFO] Rolled back transaction after preview.")
-
-            return Response({
-                "success": not errors,
-                "preview": preview_data,
-                "errors": errors if errors else []
-            })
-
-        except Exception as e:
-            print("[FATAL ERROR]", str(e))
-            errors = [{"model": None, "row": None, "field": None, "message": str(e)}]
-            return Response({"success": False, "preview": [], "errors": errors})
-
-# -----------------------
-# Execute endpoint (persists)
-# -----------------------
-class BulkImportExecute(APIView):
-    def post(self, request, *args, **kwargs):
-        try:
-            file = request.FILES['file']
-            print("[INFO] File received:", file.name)
-
-            xls = pd.read_excel(file, sheet_name=None)
-            print(f"[INFO] Loaded {len(xls)} sheets from Excel.")
-
-            # Global row map across *all* sheets
-            row_id_map: Dict[str, Any] = {}
-            results = []
-            errors = []
-
-            with transaction.atomic():
-                for model_name, df in xls.items():
+                for model_name in ordered_names:
+                    df = xls[model_name]
                     print(f"\n[INFO] Processing sheet: {model_name}")
                     app_label = MODEL_APP_MAP.get(model_name)
 
                     if not app_label:
-                        errors.append({"model": model_name, "message": f"Unknown model: {model_name}"})
+                        msg = f"Unknown model: {model_name}"
+                        print("[ERROR]", msg)
+                        errors.append({"model": model_name, "row": None, "field": None, "message": msg})
                         continue
 
                     model = apps.get_model(app_label, model_name)
 
-                    # Optional: ensure ancestors first when path is present
+                    # Keep ancestors first if 'path' given on MPTT models
                     df = _sort_df_by_path_depth_if_mptt(model, df)
 
-                    deferred: List[Tuple[int, pd.Series]] = []
-
                     for i, row in df.iterrows():
+                        print(f"[DEBUG] Processing row {i} of model {model_name}")
                         raw = row.dropna().to_dict()
-                        row_id_raw = raw.pop('__row_id', None)
-                        row_id = _norm_row_key(row_id_raw)
+                        row_id = raw.pop('__row_id', None)
                         action = None
+                        instance = None
                         try:
-                            # 1) filter unknown columns (warn, don't fail)
+                            # 1) drop unknown keys (but keep *_fk for resolution)
                             filtered_input, unknown_cols = _filter_unknown(model, raw)
 
-                            # 2) detect unresolved *_fk tokens
+                            # 2) resolve *_fk
                             fk_fields = {k: v for k, v in filtered_input.items() if k.endswith('_fk')}
-                            unresolved = False
-                            for fk_field, fk_ref in fk_fields.items():
-                                if isinstance(fk_ref, str):
-                                    key = _norm_row_key(fk_ref)
-                                    if _to_int_or_none_soft(fk_ref) is None and key not in row_id_map:
-                                        print(f"[DEFER] {model_name} __row_id={row_id!r} because {fk_field}={fk_ref!r} not in map yet")
-                                        unresolved = True
-                                        break
-                            if unresolved:
-                                deferred.append((i, row))
-                                continue
-
-                            # 3) resolve *_fk
                             for fk_field, fk_ref in fk_fields.items():
                                 field_name = fk_field[:-3]
-                                print(f"[FK] resolving {model_name}.{field_name} <- {fk_ref!r} (norm={_norm_row_key(fk_ref)!r})")
-                                fk_instance = _resolve_fk(model, field_name, fk_ref, row_id_map)
+                                print(f"  Resolving FK for {field_name} -> {fk_ref}")
+                                try:
+                                    fk_instance = _resolve_fk(model, field_name, fk_ref, row_id_map)
+                                except Exception as e:
+                                    error_msg = f"FK reference '{fk_ref}' not found for field '{field_name}' in model {model_name}: {str(e)}"
+                                    print("[ERROR]", error_msg)
+                                    raise ValueError(error_msg)
                                 filtered_input[field_name] = fk_instance
                                 del filtered_input[fk_field]
 
-                            # 4) MPTT chain
+                            # 3) MPTT: derive name/parent from path
                             if _is_mptt_model(model):
                                 path_val = _get_path_value(filtered_input)
                                 if path_val:
@@ -778,11 +518,158 @@ class BulkImportExecute(APIView):
                                     for c in PATH_COLS:
                                         filtered_input.pop(c, None)
 
-                            # 5) coerce booleans & decimals
+                            # 4) coerce booleans & decimals
                             payload = _coerce_boolean_fields(model, filtered_input)
                             payload = _quantize_decimal_fields(model, payload)
 
-                            # 6) create/update & save
+                            # 5) create/update
+                            if 'id' in payload and payload['id']:
+                                instance = model.objects.get(id=payload['id'])
+                                for field, value in payload.items():
+                                    setattr(instance, field, value)
+                                action = 'update'
+                                print(f"[UPDATE] {model_name} ID {payload['id']}")
+                            else:
+                                instance = model(**payload)
+                                action = 'create'
+                                print(f"[CREATE] New {model_name} instance")
+
+                            # Let model validations run:
+                            if hasattr(instance, "full_clean"):
+                                instance.full_clean()
+                            instance.save()
+                            print(f"[SAVE] {model_name} row saved successfully.")
+
+                            if row_id:
+                                rid = _norm_row_key(row_id)
+                                row_id_map[rid] = instance
+                                # (optional) also store original to be extra defensive:
+                                row_id_map[row_id] = instance
+                                #row_id_map[row_id] = instance
+                                print(f"[MAP] __row_id '{row_id}' bound to ID {instance.pk}")
+
+                            msg = "ok"
+                            if unknown_cols:
+                                msg += f" | Ignoring unknown columns: {', '.join(unknown_cols)}"
+
+                            model_preview.append({
+                                "model": model_name,
+                                "__row_id": row_id,
+                                "status": "success",
+                                "action": action,
+                                "data": model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active']),
+                                "message": msg
+                            })
+                        except Exception as e:
+                            error = f"{model_name} row {i}: {str(e)}"
+                            print("[ERROR]", error)
+                            model_preview.append({
+                                "model": model_name,
+                                "__row_id": row_id,
+                                "status": "error",
+                                "action": action,
+                                "data": {},
+                                "message": str(e)
+                            })
+                            errors.append({"model": model_name, "row": i, "field": None, "message": str(e)})
+
+                preview_data = model_preview
+                transaction.savepoint_rollback(savepoint)
+                print("[INFO] Rolled back transaction after preview.")
+
+            return Response({
+                "success": not errors,
+                "preview": preview_data,
+                "errors": errors if errors else []
+            })
+
+        except Exception as e:
+            print("[FATAL ERROR]", str(e))
+            errors.append({"model": locals().get("model_name"), "row": locals().get("i"), "field": None, "message": str(e)})
+            return Response({"success": False, "preview": [], "errors": errors})
+
+# -----------------------
+# Execute endpoint (persists)
+# -----------------------
+class BulkImportExecute(APIView):
+    def post(self, request, *args, **kwargs):
+        try:
+            file = request.FILES['file']
+            print("[INFO] File received:", file.name)
+
+            xls = pd.read_excel(file, sheet_name=None)
+            print(f"[INFO] Loaded {len(xls)} sheets from Excel.")
+
+            row_id_map = {}
+            results = []
+            errors = []
+
+            with transaction.atomic():
+                # ---- process in a deterministic, dependency-aware order ----
+                ordered_names = sorted(
+                    [n for n in xls.keys() if n != "References"],
+                    key=lambda n: ORDER_HINT.get(n, 1000)
+                )
+
+                for model_name in ordered_names:
+                    df = xls[model_name]
+                    print(f"\n[INFO] Processing sheet: {model_name}")
+                    app_label = MODEL_APP_MAP.get(model_name)
+
+                    if not app_label:
+                        errors.append({"model": model_name, "message": f"Unknown model: {model_name}"})
+                        continue
+
+                    model = apps.get_model(app_label, model_name)
+
+                    # Optional: ensure ancestors first when path is present
+                    df = _sort_df_by_path_depth_if_mptt(model, df)
+
+                    for i, row in df.iterrows():
+                        raw = row.dropna().to_dict()
+                        row_id = raw.pop('__row_id', None)
+                        action = None
+                        try:
+                            # 1) filter unknown columns (warn, don't fail)
+                            filtered_input, unknown_cols = _filter_unknown(model, raw)
+
+                            # 2) resolve *_fk
+                            fk_fields = {k: v for k, v in filtered_input.items() if k.endswith('_fk')}
+                            for fk_field, fk_ref in fk_fields.items():
+                                field_name = fk_field[:-3]
+                                print(f"  Resolving FK for {field_name} -> {fk_ref}")
+                                try:
+                                    fk_instance = _resolve_fk(model, field_name, fk_ref, row_id_map)
+                                except Exception as e:
+                                    error_msg = f"FK reference '{fk_ref}' not found for field '{field_name}' in model {model_name}: {str(e)}"
+                                    print("[ERROR]", error_msg)
+                                    raise ValueError(error_msg)
+                                filtered_input[field_name] = fk_instance
+                                del filtered_input[fk_field]
+
+                            # 3) MPTT chain
+                            if _is_mptt_model(model):
+                                path_val = _get_path_value(filtered_input)
+                                if path_val:
+                                    parts = _split_path(path_val)
+                                    if not parts:
+                                        raise ValueError(f"{model_name}: empty path.")
+                                    leaf_name = parts[-1]
+                                    parent = None
+                                    if len(parts) > 1:
+                                        parent = _resolve_parent_from_path_chain(model, parts[:-1])
+                                    filtered_input['name'] = filtered_input.get('name', leaf_name) or leaf_name
+                                    filtered_input['parent'] = parent
+                                    filtered_input.pop('parent_id', None)
+                                    filtered_input.pop('parent_fk', None)
+                                    for c in PATH_COLS:
+                                        filtered_input.pop(c, None)
+
+                            # 4) coerce booleans & decimals
+                            payload = _coerce_boolean_fields(model, filtered_input)
+                            payload = _quantize_decimal_fields(model, payload)
+
+                            # 5) create/update & save
                             if 'id' in payload and payload['id']:
                                 instance = model.objects.get(id=payload['id'])
                                 for field, value in payload.items():
@@ -792,19 +679,16 @@ class BulkImportExecute(APIView):
                                 instance = model(**payload)
                                 action = 'create'
 
-                            # 7) validation with smart exclude (pending bank designation)
-                            exclude = []
-                            if hasattr(instance, "bank_designation_pending") and getattr(instance, "bank_designation_pending"):
-                                if getattr(instance, "account_id", None) in (None, ""):
-                                    exclude.append("account")
                             if hasattr(instance, "full_clean"):
-                                instance.full_clean(exclude=exclude or None)
-
+                                instance.full_clean()
                             instance.save()
 
                             if row_id:
+                                rid = _norm_row_key(row_id)
+                                row_id_map[rid] = instance
+                                # (optional) also store original to be extra defensive:
                                 row_id_map[row_id] = instance
-                                print(f"[MAP] __row_id {row_id_raw!r} (norm={row_id!r}) -> {model_name} id={instance.pk}")
+                                #row_id_map[row_id] = instance
 
                             msg = "ok"
                             status_val = "success"
@@ -829,117 +713,6 @@ class BulkImportExecute(APIView):
                                 "message": str(e)
                             })
                             errors.append(str(e))
-
-                    # ---- retry deferred after parents exist ----
-                    if deferred:
-                        print(f"[DEFER] Retrying {len(deferred)} deferred rows for {model_name}")
-                    progress = True
-                    while deferred and progress:
-                        progress = False
-                        still: List[Tuple[int, pd.Series]] = []
-                        for i, row in deferred:
-                            raw = row.dropna().to_dict()
-                            row_id_raw = raw.pop('__row_id', None)
-                            row_id = _norm_row_key(row_id_raw)
-                            action = None
-                            try:
-                                filtered_input, unknown_cols = _filter_unknown(model, raw)
-                                fk_fields = {k: v for k, v in filtered_input.items() if k.endswith('_fk')}
-                                unresolved = False
-                                for fk_field, fk_ref in fk_fields.items():
-                                    if isinstance(fk_ref, str):
-                                        key = _norm_row_key(fk_ref)
-                                        if _to_int_or_none_soft(fk_ref) is None and key not in row_id_map:
-                                            unresolved = True
-                                            break
-                                if unresolved:
-                                    still.append((i, row))
-                                    continue
-
-                                for fk_field, fk_ref in fk_fields.items():
-                                    field_name = fk_field[:-3]
-                                    fk_instance = _resolve_fk(model, field_name, fk_ref, row_id_map)
-                                    filtered_input[field_name] = fk_instance
-                                    del filtered_input[fk_field]
-
-                                if _is_mptt_model(model):
-                                    path_val = _get_path_value(filtered_input)
-                                    if path_val:
-                                        parts = _split_path(path_val)
-                                        if not parts:
-                                            raise ValueError(f"{model_name}: empty path.")
-                                        leaf_name = parts[-1]
-                                        parent = None
-                                        if len(parts) > 1:
-                                            parent = _resolve_parent_from_path_chain(model, parts[:-1])
-                                        filtered_input['name'] = filtered_input.get('name', leaf_name) or leaf_name
-                                        filtered_input['parent'] = parent
-                                        filtered_input.pop('parent_id', None)
-                                        filtered_input.pop('parent_fk', None)
-                                        for c in PATH_COLS:
-                                            filtered_input.pop(c, None)
-
-                                payload = _coerce_boolean_fields(model, filtered_input)
-                                payload = _quantize_decimal_fields(model, payload)
-
-                                if 'id' in payload and payload['id']:
-                                    instance = model.objects.get(id=payload['id'])
-                                    for field, value in payload.items():
-                                        setattr(instance, field, value)
-                                    action = 'update'
-                                else:
-                                    instance = model(**payload)
-                                    action = 'create'
-
-                                exclude = []
-                                if hasattr(instance, "bank_designation_pending") and getattr(instance, "bank_designation_pending"):
-                                    if getattr(instance, "account_id", None) in (None, ""):
-                                        exclude.append("account")
-                                if hasattr(instance, "full_clean"):
-                                    instance.full_clean(exclude=exclude or None)
-
-                                instance.save()
-
-                                if row_id:
-                                    row_id_map[row_id] = instance
-                                    print(f"[MAP] __row_id {row_id_raw!r} (norm={row_id!r}) -> {model_name} id={instance.pk}")
-
-                                msg = "ok"
-                                status_val = "success"
-                                if unknown_cols:
-                                    status_val = "warning"
-                                    msg += f" | Ignoring unknown columns: {', '.join(unknown_cols)}"
-
-                                results.append({
-                                    "model": model_name,
-                                    "__row_id": row_id,
-                                    "status": status_val,
-                                    "action": action,
-                                    "data": safe_model_dict(instance, exclude_fields=['created_by', 'updated_by', 'is_deleted', 'is_active']),
-                                    "message": msg
-                                })
-                                progress = True
-                            except Exception as e:
-                                still.append((i, row))
-                                results.append({
-                                    "model": model_name,
-                                    "__row_id": row_id,
-                                    "status": "error",
-                                    "message": str(e)
-                                })
-                                errors.append(str(e))
-                        deferred = still
-
-                    for i, row in deferred:
-                        rid = _norm_row_key(row.get('__row_id'))
-                        msg = f"Unresolved __row_id dependency for {model_name} row {i}; check token references."
-                        results.append({
-                            "model": model_name,
-                            "__row_id": rid,
-                            "status": "error",
-                            "message": msg
-                        })
-                        errors.append(msg)
 
             return Response({
                 "success": not errors,
