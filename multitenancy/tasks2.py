@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import smtplib
+from copy import deepcopy
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -35,7 +36,10 @@ from .api_utils import (
     _resolve_parent_from_path_chain,
     _split_path,
     safe_model_dict,
-    # NaN/NaT-safe helpers used in canonicalization:
+    # dedupe helpers (kept for compat if referenced elsewhere)
+    table_fingerprint as api_table_fingerprint,
+    jaccard as api_jaccard,
+    # NEW: NaN/NaT-safe helpers, used in _canonicalize_row below
     _is_missing,
     _to_int_or_none_soft,
 )
@@ -236,8 +240,11 @@ def _filter_unknown(model, row: Dict[str, Any]):
 
 def _preflight_missing_required(model, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """
-    Only flag truly required fields (concrete/not-null/no default/not auto/not timestamp).
+    Only flag truly required fields (concrete/not-null/no default/not auto/ not timestamp).
     Treat presence of either <field>, <field>_id, or <field>_fk as satisfying the requirement.
+    NOTE: If your model uses a CheckConstraint (e.g., account is nullable when
+          bank_designation_pending=True), that is enforced at save-time and will
+          appear as a CHECK violation if broken. This is intentional.
     """
     errors = {}
 
@@ -306,7 +313,10 @@ def _quantize_decimal_fields(model, payload: dict) -> dict:
     return out
 
 def _coerce_boolean_fields(model, payload: dict) -> dict:
-    """Coerce stringy booleans to bool for BooleanFields."""
+    """
+    Coerce stringy booleans to bool for BooleanFields,
+    e.g., 'true','1','yes' → True.
+    """
     out = dict(payload)
     for f in model._meta.get_fields():
         if isinstance(f, dj_models.BooleanField):
@@ -349,7 +359,7 @@ def _canonicalize_row(model, row: Dict[str, Any]) -> Dict[str, Any]:
         v = incoming.get(k)
         f = field_by.get(k)
 
-        # Normalize missing-ish values first (None, "", NaN, NaT, "NaT")
+        # Normalize "missing-ish" values first (None, "", NaN, NaT, "NaT")
         if _is_missing(v):
             out[k] = None
             continue
@@ -360,6 +370,7 @@ def _canonicalize_row(model, row: Dict[str, Any]) -> Dict[str, Any]:
             vq = Decimal(str(v)).quantize(q, rounding=ROUND_HALF_UP)
             out[k] = str(vq)
         elif isinstance(f, dj_models.DateField):
+            # safe as ISO (we already filtered NaT above)
             out[k] = str(v)
         elif isinstance(f, dj_models.ForeignKey):
             out[k] = _to_int_or_none_soft(v)  # NaN-safe FK id coercion
@@ -404,19 +415,6 @@ def _unknown_from_original_input(model, row_obj: Dict[str, Any]) -> List[str]:
 
 DUP_CHECK_LAST_N = 10  # compare against last N snapshots per model
 
-# Simple dependency hint so parents come before children
-ORDER_HINT = {
-    "Company": 10,
-    "Currency": 10,
-    "Entity": 20,
-    "Bank": 20,
-    "BankAccount": 30,
-    "Account": 40,
-    "CostCenter": 40,
-    "Transaction": 50,     # parent of JournalEntry
-    "JournalEntry": 60,    # depends on Transaction
-}
-
 def execute_import_job(
     company_id: int,
     sheets: List[Dict[str, Any]],
@@ -428,9 +426,10 @@ def execute_import_job(
     One-shot import for all models in a file.
 
     Updated for:
-      - Global __row_id map so cross-sheet FKs like JournalEntry.transaction_fk="t1" resolve.
-      - NaN/NaT-safe canonicalization to avoid "cannot convert float NaN to integer".
-      - Booleans/decimals coercion and basic dedupe fingerprints per sheet.
+      - JournalEntry.bank_designation_pending support (booleans coerced; account may be null
+        if your model-level constraint allows it).
+      - BankTransaction without 'entity' (entity_* columns are ignored with a warning).
+      - Safer error messages and dedupe checks.
     """
 
     # --------------------------- file-level dedupe ---------------------------
@@ -461,6 +460,32 @@ def execute_import_job(
             } if exact_file_dupe_of else None
         ),
     }
+
+    # --------------------------- local helpers ---------------------------
+    def _infer_action_and_clean_id(payload: Dict[str, Any], original_input: Dict[str, Any]):
+        """Decide create/update, normalize 'id' for ORM."""
+        def _coerce_pk(val):
+            if val is None or val == "": return None
+            if isinstance(val, int): return val
+            if isinstance(val, float): return int(val) if float(val).is_integer() else None
+            s = str(val).strip()
+            if s.isdigit(): return int(s)
+            try:
+                f = float(s)
+                return int(f) if f.is_integer() else None
+            except Exception:
+                return None
+
+        ext_id = None
+        pk = _coerce_pk(payload.get("id"))
+        if pk is not None:
+            payload["id"] = pk
+            return "update", pk, None
+        if "id" in payload:
+            if "id" in original_input and original_input["id"] not in ("", None):
+                ext_id = str(original_input["id"])
+            payload.pop("id", None)
+        return "create", None, ext_id
 
     # --------------------------- prep per sheet ---------------------------
     prepared: List[Dict[str, Any]] = []
@@ -506,7 +531,7 @@ def execute_import_job(
         prev_snaps = list(
             ImportSnapshot.objects
             .filter(company_id=company_id, model_name=model_name)
-            .only("id", "row_count", "row_hash_sample", "table_hash", "file_sha256", "created_at", "filename")
+            .only("id","row_count","row_hash_sample","table_hash","file_sha256","created_at","filename")
             .order_by("-created_at")
         )[:DUP_CHECK_LAST_N]
 
@@ -560,8 +585,8 @@ def execute_import_job(
             try:
                 filtered_input, _ = _filter_unknown(model, original_input)
                 payload = _normalize_payload_for_model(model, filtered_input, context_company_id=company_id)
-                payload = _coerce_boolean_fields(model, payload)
-                payload = _quantize_decimal_fields(model, payload)
+                payload = _coerce_boolean_fields(model, payload)       # booleans (bank_designation_pending, etc.)
+                payload = _quantize_decimal_fields(model, payload)     # decimals
 
                 # MPTT: keep name, defer parent resolution
                 if _is_mptt_model(model):
@@ -655,16 +680,10 @@ def execute_import_job(
         prepared.append({"model": model_name, "rows": packed_rows, "had_error": had_err})
         models_in_order.append(model_name)
 
-    # make processing deterministic/parent-first
-    models_in_order.sort(key=lambda m: ORDER_HINT.get(m, 1000))
-
     # ------------------------------ PREVIEW ------------------------------
     if not commit:
-        models_touched: List[Any] = []
-        result_payload: List[Dict[str, Any]] = []
-
-        # Global __row_id map shared across ALL sheets
-        global_row_map: Dict[str, Any] = {}
+        models_touched = []
+        result_payload = []
 
         with transaction.atomic():
             if connection.vendor == "postgresql":
@@ -678,9 +697,9 @@ def execute_import_job(
                 model = apps.get_model(app_label, model_name)
                 models_touched.append(model)
 
-                row_map: Dict[str, Any] = {}
+                row_map = {}
                 rows = next(b["rows"] for b in prepared if b["model"] == model_name)
-                out_rows: List[Dict[str, Any]] = []
+                out_rows = []
 
                 for row in rows:
                     rid = row["__row_id"]
@@ -706,12 +725,11 @@ def execute_import_job(
                     unknown_cols_now = _unknown_from_original_input(model, row)
 
                     try:
-                        # Resolve *_fk using LOCAL + GLOBAL row maps
+                        # Resolve *_fk
                         for fk_key in [k for k in list(payload.keys()) if k.endswith("_fk")]:
                             field_name = fk_key[:-3]
                             fk_val = payload.pop(fk_key)
-                            merged_map = {**global_row_map, **row_map}
-                            payload[field_name] = _resolve_fk(model, field_name, fk_val, merged_map)
+                            payload[field_name] = _resolve_fk(model, field_name, fk_val, row_map)
 
                         # Resolve MPTT parent
                         if _is_mptt_model(model):
@@ -741,7 +759,6 @@ def execute_import_job(
 
                         if rid:
                             row_map[rid] = instance
-                            global_row_map[rid] = instance  # <-- make visible to other sheets
 
                         msg = "ok"
                         status_val = "success"
@@ -805,9 +822,6 @@ def execute_import_job(
     result_payload: List[Dict[str, Any]] = []
     any_row_error = False
 
-    # Global __row_id map shared across ALL sheets
-    global_row_map: Dict[str, Any] = {}
-
     with transaction.atomic():
         if connection.vendor == "postgresql":
             with connection.cursor() as cur:
@@ -820,7 +834,7 @@ def execute_import_job(
             model = apps.get_model(app_label, model_name)
             models_touched.append(model)
 
-            row_map: Dict[str, Any] = {}
+            row_map = {}
             rows = next(b["rows"] for b in prepared if b["model"] == model_name)
 
             for row in rows:
@@ -845,12 +859,11 @@ def execute_import_job(
                 unknown_cols_now = _unknown_from_original_input(model, row)
 
                 try:
-                    # Resolve *_fk using LOCAL + GLOBAL row maps
+                    # Resolve *_fk
                     for fk_key in [k for k in list(payload.keys()) if k.endswith("_fk")]:
                         field_name = fk_key[:-3]
                         fk_val = payload.pop(fk_key)
-                        merged_map = {**global_row_map, **row_map}
-                        payload[field_name] = _resolve_fk(model, field_name, fk_val, merged_map)
+                        payload[field_name] = _resolve_fk(model, field_name, fk_val, row_map)
 
                     # MPTT parent chain
                     if _is_mptt_model(model):
@@ -880,7 +893,6 @@ def execute_import_job(
 
                     if rid:
                         row_map[rid] = instance
-                        global_row_map[rid] = instance  # <-- make visible to other sheets
 
                     msg = "ok"
                     status_val = "success"
