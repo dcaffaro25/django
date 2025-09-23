@@ -40,6 +40,13 @@ from .api_utils import (
     # NaN/NaT-safe helpers used in canonicalization:
     _is_missing,
     _to_int_or_none_soft,
+    _to_int_or_none,
+    _parse_json_or_empty,
+    _to_bool,
+    _norm_row_key,
+    _path_depth,
+    
+    
 )
 
 # ----------------------------------------------------------------------
@@ -87,38 +94,7 @@ def trigger_integration_event(company_id, event_name, payload):
 # Import helpers
 # ----------------------------------------------------------------------
 
-def _to_int_or_none(x):
-    if x in ("", None):
-        return None
-    try:
-        return int(float(x))
-    except Exception:
-        return None
 
-def _parse_json_or_empty(v):
-    if v in ("", None):
-        return {}
-    if isinstance(v, dict):
-        return v
-    try:
-        return json.loads(v)
-    except Exception:
-        return {}
-
-def _to_bool(val, default=False):
-    if isinstance(val, bool):
-        return val
-    if val is None:
-        return default
-    return str(val).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
-
-# Normalize string-like row ids/FK tokens (kills NBSP, trims)
-_WS_RE = re.compile(r"\s+")
-def _norm_row_key(v):
-    if v is None:
-        return None
-    s = str(v).replace("\u00A0", " ").strip()
-    return s
 
 def _resolve_fk(model, field_name: str, raw_value, row_id_map: Dict[str, Any]):
     """
@@ -200,12 +176,7 @@ def _normalize_payload_for_model(model, payload: Dict[str, Any], *, context_comp
 
     return data
 
-def _path_depth(row: Dict[str, Any]) -> int:
-    """Used to sort MPTT rows so parents come first."""
-    for c in PATH_COLS:
-        if c in row and row[c]:
-            return len(str(row[c]).strip().replace(" > ", "\\").split("\\"))
-    return 0
+
 
 def _friendly_db_message(exc: Exception) -> str:
     cause = getattr(exc, "__cause__", None)
@@ -339,6 +310,7 @@ def _coerce_boolean_fields(model, payload: dict) -> dict:
     return out
 
 # --------- canonicalization & fingerprint for table-level dedupe ----------
+_WS_RE = re.compile(r"\s+")
 def _norm_scalar(val):
     if val is None: return None
     if isinstance(val, (bool, int)): return val
@@ -789,17 +761,32 @@ def execute_import_job(
                         payload = _quantize_decimal_fields(model, payload)
 
                         with transaction.atomic():
+                            # Build instance
                             if action == "update":
                                 instance = model.objects.select_for_update().get(id=payload["id"])
                                 for f, v in payload.items():
                                     setattr(instance, f, v)
                             else:
                                 instance = model(**payload)
-
-                            if hasattr(instance, "full_clean"):
-                                instance.full_clean()
-
-                            instance.save()
+                        
+                            # --- Save first so model auto-behavior runs (e.g. JournalEntry auto-assigns account) ---
+                            sp = transaction.savepoint()
+                            try:
+                                instance.save()  # runs model.save(), DB constraints checked at flush
+                        
+                                # Validate after model logic. This can still raise (e.g. unique/clean).
+                                if hasattr(instance, "full_clean"):
+                                    instance.full_clean()
+                        
+                                # Optional: if your clean_fields actually mutates values you want persisted,
+                                # you can save once more. In your models, save() already quantizes, so it’s safe
+                                # to skip. If you want it:
+                                # instance.save()
+                        
+                                transaction.savepoint_release(sp)
+                            except Exception:
+                                transaction.savepoint_rollback(sp)
+                                raise
 
                         if rid:
                             row_map[rid] = instance
@@ -941,17 +928,29 @@ def execute_import_job(
                     payload = _quantize_decimal_fields(model, payload)
 
                     with transaction.atomic():
+                        # Build instance
                         if action == "update":
                             instance = model.objects.select_for_update().get(id=payload["id"])
                             for f, v in payload.items():
                                 setattr(instance, f, v)
                         else:
                             instance = model(**payload)
-
-                        if hasattr(instance, "full_clean"):
-                            instance.full_clean()
-
-                        instance.save()
+                    
+                        # --- Save first to allow model.save() to populate/normalize fields ---
+                        sp = transaction.savepoint()
+                        try:
+                            instance.save()
+                    
+                            if hasattr(instance, "full_clean"):
+                                instance.full_clean()
+                    
+                            # Optional second save to persist any clean_fields mutations:
+                            # instance.save()
+                    
+                            transaction.savepoint_release(sp)
+                        except Exception:
+                            transaction.savepoint_rollback(sp)
+                            raise
 
                     if rid:
                         row_map[rid] = instance

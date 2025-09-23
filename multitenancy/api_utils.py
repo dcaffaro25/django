@@ -36,20 +36,47 @@ from typing import Dict, Any, List, Tuple
 # ----------------------------------------------------------------------
 # Small helpers
 # ----------------------------------------------------------------------
+def _to_int_or_none(x):
+    if x in ("", None):
+        return None
+    try:
+        return int(float(x))
+    except Exception:
+        return None
 
-def _to_bool(v, default=False):
-    if isinstance(v, bool):
+def _parse_json_or_empty(v):
+    if v in ("", None):
+        return {}
+    if isinstance(v, dict):
         return v
-    if v is None:
-        return default
-    return str(v).strip().lower() in {"1","true","t","yes","y","on"}
+    try:
+        return json.loads(v)
+    except Exception:
+        return {}
 
-# normalize string-like row ids/FK tokens from Excel (trim, kill NBSP)
+def _to_bool(val, default=False):
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return default
+    return str(val).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+# Normalize string-like row ids/FK tokens (kills NBSP, trims)
+
 def _norm_row_key(v):
     if v is None:
         return None
     s = str(v).replace("\u00A0", " ").strip()
     return s
+
+
+def _path_depth(row: Dict[str, Any]) -> int:
+    """Used to sort MPTT rows so parents come first."""
+    for c in PATH_COLS:
+        if c in row and row[c]:
+            return len(str(row[c]).strip().replace(" > ", "\\").split("\\"))
+    return 0
+
 
 def _excel_safe(value):
     # None is fine
