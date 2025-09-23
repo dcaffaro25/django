@@ -1129,7 +1129,7 @@ def execute_import_job(
                     file_sha256=file_sha,
                     filename=filename,
                     jaccard_to_prev=closest.get("jaccard"),
-                })
+                )
 
             dt = int((time.monotonic() - t0) * 1000)
             logger.info("import_end", **_log_extra(elapsed_ms=dt, committed=True))
