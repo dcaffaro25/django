@@ -270,8 +270,8 @@ def _row_observations(audit_by_rowid, row_id):
         if ch.get("field") == "__row_id":
             continue
         obs.append(
-            f"campo '{chg['field']}' alterado de '{chg['old']}' para '{chg['new']}' "
-            f"(regra id={chg['rule_id']}')".replace("chg", "chg")  # no-op to keep lints calm
+            f"campo '{ch.get('field')}' alterado de '{ch.get('old')}' para '{ch.get('new')}' "
+            f"(regra id={ch.get('rule_id')})"
         )
     return obs
 
