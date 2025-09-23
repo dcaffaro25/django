@@ -56,6 +56,14 @@ from .api_utils import (
 logger = logging.getLogger("importer")
 sql_logger = logging.getLogger("importer.sql")
 
+# Reserved LogRecord attribute names — MUST NOT be in `extra`
+_RESERVED_LOG_ATTRS = {
+    "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
+    "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
+    "created", "msecs", "relativeCreated", "thread", "threadName", "process",
+    "processName", "asctime", "message", "stacklevel"
+}
+
 # Per-run contextual fields (propagated via logger.extra)
 _run_id_ctx = ContextVar("run_id", default="-")
 _company_ctx = ContextVar("company_id", default="-")
@@ -63,13 +71,17 @@ _model_ctx = ContextVar("model", default="-")
 _row_ctx = ContextVar("row_id", default="-")
 
 def _log_extra(**kw):
+    # Sanitize any accidental reserved keys passed in
+    cleaned = {}
+    for k, v in kw.items():
+        cleaned[("ctx_" + k) if k in _RESERVED_LOG_ATTRS else k] = v
     return {
         "extra": {
             "run_id": _run_id_ctx.get(),
             "company_id": _company_ctx.get(),
             "model": _model_ctx.get(),
             "row_id": _row_ctx.get(),
-            **kw,
+            **cleaned,
         }
     }
 
@@ -254,12 +266,12 @@ def _friendly_db_message(exc: Exception) -> str:
 
 def _row_observations(audit_by_rowid, row_id):
     obs = []
-    for chg in audit_by_rowid.get(row_id, []):
-        if chg.get("field") == "__row_id":
+    for ch in audit_by_rowid.get(row_id, []):
+        if ch.get("field") == "__row_id":
             continue
         obs.append(
             f"campo '{chg['field']}' alterado de '{chg['old']}' para '{chg['new']}' "
-            f"(regra id={chg['rule_id']}')"
+            f"(regra id={chg['rule_id']}')".replace("chg", "chg")  # no-op to keep lints calm
         )
     return obs
 
@@ -549,7 +561,7 @@ def execute_import_job(
 
     logger.info(
         "import_start",
-        **_log_extra(commit=bool(commit), filename=filename, file_sha=file_sha, sheet_count=len(sheets))
+        **_log_extra(commit=bool(commit), import_filename=filename, file_sha=file_sha, sheet_count=len(sheets))
     )
 
     t0 = time.monotonic()
@@ -1117,7 +1129,7 @@ def execute_import_job(
                     file_sha256=file_sha,
                     filename=filename,
                     jaccard_to_prev=closest.get("jaccard"),
-                )
+                })
 
             dt = int((time.monotonic() - t0) * 1000)
             logger.info("import_end", **_log_extra(elapsed_ms=dt, committed=True))
