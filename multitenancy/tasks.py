@@ -152,26 +152,27 @@ def _sanity_check_required_fks(model, payload: Dict[str, Any], original_input: D
         token = original_input.get(f"{base}_fk", None)
         # Only care if they provided a *_fk token that isn't obviously missing
         # Note: float("nan") is not equal to itself, so we detect NaNs via this trick.
-        if token is None or token == "":
-            try:
-                if isinstance(token, float) and token != token:
-                    # Skip NaN tokens
-                    continue
-            except Exception:
-                pass
-        # If a token is present, determine whether the payload contains a resolved object
-        if token not in (None, ""):
-            value = None
-            # Check by the field's name
-            if base in payload:
-                value = payload.get(base)
-            else:
-                # Check by attname (e.g., ``company_id``)
-                attname = getattr(f, "attname", None)
-                if attname:
-                    value = payload.get(attname)
-            if value is None:
-                issues.append((base, token))
+        missing_token = token is None or token == ""
+        if not missing_token:
+            # Treat float('nan') as missing as well
+            if isinstance(token, float) and token != token:
+                missing_token = True
+        if missing_token:
+            continue
+        # Determine if the foreign key has been resolved in the normalized payload.
+        # The importer stores FK values under either the field name (e.g. 'transaction')
+        # or the underlying attname (e.g. 'transaction_id').  We check both.
+        value = None
+        # Prefer the field name if presents
+        if base in payload:
+            value = payload.get(base)
+        else:
+            attname = getattr(f, "attname", None)
+            if attname:
+                value = payload.get(attname)
+        # If still None, the FK is unresolved.
+        if value is None:
+            issues.append((base, token))
     return issues
 
 
