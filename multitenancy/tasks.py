@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import smtplib
+import logging
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -39,6 +41,12 @@ from .api_utils import (
     _is_missing,
     _to_int_or_none_soft,
 )
+
+# ----------------------------------------------------------------------
+# Logging / verbosity
+# ----------------------------------------------------------------------
+logger = logging.getLogger(__name__)
+IMPORT_VERBOSE_FK = os.getenv("IMPORT_VERBOSE_FK", "0").lower() in {"1", "true", "yes", "y", "on"}
 
 # ----------------------------------------------------------------------
 # Email helpers
@@ -681,6 +689,12 @@ def execute_import_job(
                 if unknown_cols_now:
                     base = f"{base} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
 
+                # Server-side error log (prep)
+                logger.error(
+                    "[IMPORT][PREP][EXC] model=%s row_id=%s action=%s err=%s payload=%s original=%s",
+                    model_name, rid, action, base, repr(tmp_payload), repr(original_input), exc_info=True
+                )
+
                 packed_rows.append({
                     "__row_id": rid,
                     "status": "error",
@@ -753,10 +767,12 @@ def execute_import_job(
                             field_name = fk_key[:-3]
                             fk_val = payload.pop(fk_key)
                             merged_map = {**global_row_map, **row_map}
-                            if isinstance(fk_val, str):
-                                print(f"[FK] {model.__name__}.{field_name} -> '{fk_val}' "
-                                      f"(norm='{_norm_row_key(fk_val)}'); "
-                                      f"known row_ids: {list(merged_map.keys())[:20]}{' ...' if len(merged_map)>20 else ''}")
+                            if IMPORT_VERBOSE_FK and isinstance(fk_val, str):
+                                logger.debug(
+                                    "[FK] %s.%s -> %r (norm=%r); known row_ids: %s%s",
+                                    model.__name__, field_name, fk_val, _norm_row_key(fk_val),
+                                    list(merged_map.keys())[:20], " ..." if len(merged_map) > 20 else ""
+                                )
                             payload[field_name] = _resolve_fk(model, field_name, fk_val, merged_map)
 
                         # Resolve MPTT parent
@@ -810,6 +826,13 @@ def execute_import_job(
                         base = err.get("summary") or _friendly_db_message(e)
                         if unknown_cols_now:
                             base = f"{base} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
+
+                        # NEW: server-side log with stack & row context
+                        logger.error(
+                            "[IMPORT][PREVIEW][EXC] model=%s row_id=%s action=%s err=%s payload=%s original=%s",
+                            model_name, rid, action, base, repr(payload), repr(original_input), exc_info=True
+                        )
+
                         out_rows.append({
                             "__row_id": rid,
                             "status": "error",
@@ -896,10 +919,12 @@ def execute_import_job(
                         field_name = fk_key[:-3]
                         fk_val = payload.pop(fk_key)
                         merged_map = {**global_row_map, **row_map}
-                        if isinstance(fk_val, str):
-                            print(f"[FK] {model.__name__}.{field_name} -> '{fk_val}' "
-                                  f"(norm='{_norm_row_key(fk_val)}'); "
-                                  f"known row_ids: {list(merged_map.keys())[:20]}{' ...' if len(merged_map)>20 else ''}")
+                        if IMPORT_VERBOSE_FK and isinstance(fk_val, str):
+                            logger.debug(
+                                "[FK] %s.%s -> %r (norm=%r); known row_ids: %s%s",
+                                model.__name__, field_name, fk_val, _norm_row_key(fk_val),
+                                list(merged_map.keys())[:20], " ..." if len(merged_map) > 20 else ""
+                            )
                         payload[field_name] = _resolve_fk(model, field_name, fk_val, merged_map)
 
                     # MPTT parent chain
@@ -951,6 +976,13 @@ def execute_import_job(
                     base = err.get("summary") or _friendly_db_message(e)
                     if unknown_cols_now:
                         base = f"{base} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
+
+                    # NEW: server-side log with stack & row context
+                    logger.error(
+                        "[IMPORT][COMMIT][EXC] model=%s row_id=%s action=%s err=%s payload=%s original=%s",
+                        model_name, rid, action, base, repr(payload), repr(original_input), exc_info=True
+                    )
+
                     row.update({
                         "status": "error",
                         "action": action,
