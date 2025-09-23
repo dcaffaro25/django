@@ -145,7 +145,7 @@ def _sanity_check_required_fks(model, payload: Dict[str, Any], original_input: D
     issues: List[Tuple[str, Any]] = []
     for f in model._meta.get_fields():
         # Skip anything that's not a ForeignKey or is nullable
-        if not isinstance(f, model.ForeignKey) or getattr(f, "null", False):
+        if not isinstance(f, dj_models.ForeignKey) or getattr(f, "null", False):
             continue
 
         base = f.name
