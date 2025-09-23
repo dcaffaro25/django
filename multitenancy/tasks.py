@@ -772,15 +772,20 @@ def execute_import_job(
                             # --- Save first so model auto-behavior runs (e.g. JournalEntry auto-assigns account) ---
                             sp = transaction.savepoint()
                             try:
-                                instance.save()
+                                if action == "update":
+                                    instance = model.objects.select_for_update().get(id=payload["id"])
+                                    for f, v in payload.items():
+                                        setattr(instance, f, v)
+                                else:
+                                    instance = model(**payload)
                             
+                                # IMPORTANT: clean before save so DateFields stop being strings
                                 if hasattr(instance, "full_clean"):
-                                    instance.full_clean()
+                                    instance.full_clean()  # runs field.clean -> to_python, your clean_fields, etc.
                             
-                                # Optional: persist clean_fields mutations with a second save
-                                # instance.save()
+                                instance.save()  # may rely on properly-typed fields (like your date check)
                             
-                                transaction.savepoint_commit(sp)   # <-- fix: commit, not release
+                                transaction.savepoint_commit(sp)
                             except Exception:
                                 transaction.savepoint_rollback(sp)
                                 raise
@@ -936,15 +941,20 @@ def execute_import_job(
                         # --- Save first to allow model.save() to populate/normalize fields ---
                         sp = transaction.savepoint()
                         try:
-                            instance.save()
+                            if action == "update":
+                                instance = model.objects.select_for_update().get(id=payload["id"])
+                                for f, v in payload.items():
+                                    setattr(instance, f, v)
+                            else:
+                                instance = model(**payload)
                         
+                            # IMPORTANT: clean before save so DateFields stop being strings
                             if hasattr(instance, "full_clean"):
-                                instance.full_clean()
+                                instance.full_clean()  # runs field.clean -> to_python, your clean_fields, etc.
                         
-                            # Optional: persist clean_fields mutations with a second save
-                            # instance.save()
+                            instance.save()  # may rely on properly-typed fields (like your date check)
                         
-                            transaction.savepoint_commit(sp)   # <-- fix: commit, not release
+                            transaction.savepoint_commit(sp)
                         except Exception:
                             transaction.savepoint_rollback(sp)
                             raise
