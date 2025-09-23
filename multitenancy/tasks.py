@@ -1,6 +1,6 @@
 # tasks.py (multitenancy/tasks.py)
 from __future__ import annotations
-
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -49,6 +49,14 @@ from .api_utils import (
     _norm_row_key,
     _path_depth,
 )
+
+import logging
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple, List
+
+from django.db import transaction as db_txn, models
+from django.core.exceptions import ValidationError
 
 # ----------------------------------------------------------------------
 # Logging / verbosity
@@ -211,6 +219,49 @@ def trigger_integration_event(company_id, event_name, payload):
 # Import helpers
 # ----------------------------------------------------------------------
 
+@dataclass
+class PendingRef:
+    """Represents an FK pointing to a row created in this run (unsaved pk)."""
+    model: type
+    token: str  # e.g. 't1'
+
+@dataclass
+class ImportContext:
+    run_id: str
+    company_id: int
+    commit: bool
+    # row_map keeps unsaved instances keyed by sheet token per model, e.g. row_map["Transaction"]["t1"] = instance
+    row_map: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {})
+    # pk_map keeps resolved PKs when available (commit mode or existing ids)
+    pk_map: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {})
+
+def _log(level: int, msg: str, ic: ImportContext, *, model: str = "-", row_id: str = "-", **fields):
+    # always include context so the formatter has these keys
+    extra = {"run_id": ic.run_id, "company": ic.company_id, "model": model, "row_id": row_id, **fields}
+    logger.log(level, msg, extra=extra)
+
+class RateLimitFilter(logging.Filter):
+    # naive per-message throttle to avoid Railway 500 logs/sec drop
+    def __init__(self, burst=200, cache=None):
+        super().__init__()
+        self.cache = {} if cache is None else cache
+        self.burst = burst
+    def filter(self, record):
+        key = getattr(record, "msg", "")
+        count = self.cache.get(key, 0)
+        if count >= self.burst:
+            return False
+        self.cache[key] = count + 1
+        return True
+
+
+
+def _stringify_instance(obj: models.Model) -> str:
+    try:
+        return str(obj)
+    except Exception:
+        return f"{obj.__class__.__name__}(id={getattr(obj, 'pk', None)})"
+
 def _register_row_token(global_map_inst: Dict[str, Any],
                         global_map_pk: Dict[str, int],
                         rid: str,
@@ -245,67 +296,94 @@ def _resolve_token_from_maps(token: str,
         return global_pk[token]
     return None
 
-def _resolve_fk(model, field_name: str, raw_value, row_id_map: Dict[str, Any]):
-    """
-    Resolve a *_fk value to a model instance (or integer PK).
+def _get_field_and_remote_model(model_cls, field_name: str):
+    field = model_cls._meta.get_field(field_name)
+    rel = getattr(field, "remote_field", None)
+    if rel is None or rel.model is None:
+        raise LookupError(f"{model_cls.__name__}.{field_name} is not a ForeignKey")
+    remote_model = rel.model
+    remote_name = remote_model._meta.object_name
+    return field, remote_model, remote_name
 
+def _remember_row(ic: ImportContext, model_name: str, token: str, instance: Any):
+    ic.row_map.setdefault(model_name, {})[token] = instance
+    _log(logging.INFO, f"Mapped __row_id '{token}' -> {model_name}(id={getattr(instance, 'pk', None)})",
+         ic, model=model_name, row_id=token)
+
+def _resolve_fk(model_cls, field_name: str, raw_value: Any, row_id_map: Optional[Dict[str, Any]] = None) -> Any:
+    """
     Accepts:
-      - '__row_id' token referencing a previously created row in this same import (e.g., 't1')
-      - numeric ID (int/float/'3'/'3.0')
-      - values we stored in row maps can be either model instances or integers (PKs)
+      - instance of the remote model  -> returns the instance (OK to assign to FK)
+      - primary key as int/str        -> returns int(pk)
+      - token (e.g., 't1', 'Transaction:t1') -> resolved via row_id_map to instance or pk
+    Returns a value directly assignable to the model's FK field (instance or pk).
     """
-    # Normalize (Excel often gives stray spaces/non-breaking spaces)
-    val_norm = _norm_row_key(raw_value) if isinstance(raw_value, str) else raw_value
-
-    # Treat missing-ish as None (empty cell etc.)
-    if _is_missing(val_norm):
+    if raw_value in (None, ""):
         return None
 
-    # 1) Token from our live maps (global/local)
-    if isinstance(val_norm, str) and val_norm in row_id_map:
-        resolved = row_id_map[val_norm]
-        # We accept instances or integer PKs in the map:
-        try:
-            related_field = model._meta.get_field(field_name)
-        except FieldDoesNotExist:
-            raise ValueError(f"Unknown FK field '{field_name}' for model {model.__name__}")
-        fk_model = getattr(related_field, "related_model", None)
-        if fk_model is None:
-            raise ValueError(f"Field '{field_name}' is not a ForeignKey on {model.__name__}")
+    field, remote_model, remote_name = _get_field_and_remote_model(model_cls, field_name)
 
-        # If the map holds the instance, return it.
-        if hasattr(resolved, "pk"):
-            return resolved
-        # If the map holds the PK, fetch the instance
-        if isinstance(resolved, int):
-            try:
-                return fk_model.objects.get(id=resolved)
-            except fk_model.DoesNotExist:
-                raise ValueError(f"{fk_model.__name__} id={resolved} (from token {val_norm!r}) not found for field '{field_name}'")
-        # Defensive: unknown type stored in row map
-        raise ValueError(f"Row map entry for token {val_norm!r} is not an instance or PK integer")
+    # already an instance?
+    if isinstance(raw_value, remote_model):
+        return raw_value
 
-    # 2) Numeric id?
-    if isinstance(val_norm, (int, float)) or (isinstance(val_norm, str) and val_norm.replace(".", "", 1).isdigit()):
-        fk_id = _to_int_or_none_soft(val_norm)
-        if fk_id is None:
-            raise ValueError(f"Invalid FK id '{raw_value}' for field '{field_name}'")
-        # Validate existence
-        try:
-            related_field = model._meta.get_field(field_name)
-        except FieldDoesNotExist:
-            raise ValueError(f"Unknown FK field '{field_name}' for model {model.__name__}")
-        fk_model = getattr(related_field, "related_model", None)
-        if fk_model is None:
-            raise ValueError(f"Field '{field_name}' is not a ForeignKey on {model.__name__}")
-        try:
-            return fk_model.objects.get(id=fk_id)
-        except fk_model.DoesNotExist:
-            raise ValueError(f"{fk_model.__name__} id={fk_id} not found for field '{field_name}'")
+    # primary key as int?
+    if isinstance(raw_value, int):
+        return raw_value
 
-    # 3) Anything else -> invalid token format
-    raise ValueError(f"Invalid FK reference format '{raw_value}' for field '{field_name}'")
+    # primary key as numeric string?
+    if isinstance(raw_value, str) and raw_value.strip().isdigit():
+        return int(raw_value.strip())
+
+    # token lookup in provided row-id map(s)
+    token = str(raw_value).strip()
+    norm_token = _norm_row_key(token)
+    maps = row_id_map or {}
+
+    # direct token
+    candidate = maps.get(norm_token)
+    if candidate is None and ":" in token:
+        # allow "Model:token" form
+        maybe_model, maybe_token = token.split(":", 1)
+        if maybe_model.strip() == remote_name:
+            candidate = maps.get(_norm_row_key(maybe_token.strip()))
+
+    # if we found something, normalize return type
+    if candidate is not None:
+        if isinstance(candidate, remote_model):
+            return candidate
+        if isinstance(candidate, int):
+            return candidate
+        # sometimes callers stash pk under an instance-like wrapper; try to pick pk
+        pk = getattr(candidate, "pk", getattr(candidate, "id", None))
+        if pk is not None:
+            return pk
+
+        # fallthrough → bad candidate type
+        raise ValueError(
+            f"Resolved token {token!r} for {model_cls.__name__}.{field_name} but got unsupported type "
+            f"{type(candidate).__name__}"
+        )
+
+    # Could not resolve token
+    known = list(maps.keys())
+    preview = ", ".join(known[:20]) + (" ..." if len(known) > 20 else "")
+    logger.error(
+        "Unresolved FK token for %s.%s | token=%r | known_row_ids=[%s]",
+        model_cls.__name__, field_name, token, preview, **_log_extra()
+    )
+    raise ValueError(
+        f"Invalid FK reference format {token!r} for field '{field_name}'. "
+        f"Expected numeric id, instance of {remote_name}, or a run token present in known __row_id keys."
+    )
     
+def _build_instance(model_cls: type, payload: dict) -> models.Model:
+    return model_cls(**payload)
+
+def _full_clean_preview(instance: models.Model, exclude_fields: List[str]):
+    # Skip `validate_unique` in preview to avoid DB queries/false errors.
+    instance.full_clean(exclude=exclude_fields, validate_unique=False)
+
 def _normalize_payload_for_model(model, payload: Dict[str, Any], *, context_company_id=None):
     """
     - map company_fk -> company_id / tenant_id if model has those fields
@@ -563,18 +641,7 @@ def _unknown_from_original_input(model, row_obj: Dict[str, Any]) -> List[str]:
 
 DUP_CHECK_LAST_N = 10  # compare against last N snapshots per model
 
-# Simple dependency hint so parents come before children
-ORDER_HINT = {
-    "Company": 10,
-    "Currency": 10,
-    "Entity": 20,
-    "Bank": 20,
-    "BankAccount": 30,
-    "Account": 40,
-    "CostCenter": 40,
-    "Transaction": 50,     # parent of JournalEntry
-    "JournalEntry": 60,    # depends on Transaction
-}
+
 
 def _infer_action_and_clean_id(payload: Dict[str, Any], original_input: Dict[str, Any]):
     """
@@ -613,7 +680,11 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
     - Booleans/decimals coercion and basic dedupe fingerprints per sheet.
     - Never special-cases a model; model-level validation enforces invariants.
     """
+    ORDER_HINT = {name: i for i, name in enumerate(MODEL_APP_MAP.keys())}
+    
     run_id = uuid.uuid4().hex[:8]
+    ic = ImportContext(run_id=run_id, company_id=company_id, commit=commit)
+    
     _run_id_ctx.set(run_id)
     _company_ctx.set(str(company_id))
     _model_ctx.set("-")
@@ -626,6 +697,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
     file_size = (file_meta or {}).get("size")
 
     exact_file_dupe_of: Optional[ImportSnapshot] = None
+    
     if file_sha:
         exact_file_dupe_of = (
             ImportSnapshot.objects
@@ -967,13 +1039,13 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                                         global_row_map_inst, global_row_map_pk
                                     )
             
+                                merged_maps = {**global_row_map_inst, **row_map_inst}
+
                                 if candidate is not None:
-                                    # candidate may be instance or PK int; _resolve_fk accepts both via row_id_map hack
-                                    payload[field_name] = _resolve_fk(model, field_name, candidate, {})
+                                    payload[field_name] = _resolve_fk(model, field_name, candidate, merged_maps)
                                 else:
-                                    # maybe it is numeric id
-                                    payload[field_name] = _resolve_fk(model, field_name, fk_val, {})
-            
+                                    payload[field_name] = _resolve_fk(model, field_name, fk_val, merged_maps)
+                                
                                 # Log resolution result (only if it was a string token)
                                 if isinstance(fk_val, str):
                                     resolved_obj = payload[field_name]
@@ -1005,7 +1077,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                                                 "Rescuing misplaced token in %s.%s: %r",
                                                 model.__name__, base, val, **_log_extra()
                                             )
-                                            payload[base] = _resolve_fk(model, base, candidate, {})
+                                            payload[base] = _resolve_fk(model, base, candidate, {**global_row_map_inst, **row_map_inst})
                                         else:
                                             # leave as-is; full_clean will complain and we’ll show a clear error
                                             pass
