@@ -132,6 +132,21 @@ class _SlowSQL:
 # Email helpers
 # ----------------------------------------------------------------------
 
+def _sanity_check_required_fks(model, payload: dict, original_input: dict, merged_map_keys: list[str]) -> list[tuple[str, Any]]:
+    """
+    Return a list of (field_name, token) for non-nullable FKs that were provided as <field>_fk
+    in the original input but remain unresolved (payload[<field>] is None).
+    """
+    issues = []
+    for f in model._meta.get_fields():
+        if isinstance(f, dj_models.ForeignKey) and getattr(f, "null", False) is False:
+            base = f.name
+            token = original_input.get(f"{base}_fk", None)
+            # Only care if they *provided* an _fk but we didn't resolve it
+            if token not in (None, "", float("nan")) and payload.get(base) is None:
+                issues.append((base, token))
+    return issues
+
 @shared_task(bind=True, autoretry_for=(smtplib.SMTPException, ConnectionError), retry_backoff=True, max_retries=5)
 def send_user_invite_email(self, subject, message, to_email):
     """Send user invite email with retry/backoff."""
@@ -561,7 +576,7 @@ def execute_import_job(
 
     logger.info(
         "import_start",
-        **_log_extra(commit=bool(commit), import_filename=filename, file_sha=file_sha, sheet_count=len(sheets))
+        **_log_extra(commit=bool(commit), import_filename=filename, file_sha=file_sha, file_size=file_size, sheet_count=len(sheets))
     )
 
     t0 = time.monotonic()
@@ -655,9 +670,13 @@ def execute_import_job(
                     } if best_match else None
                 ),
             }
+            if verbose:
+                logger.debug("dup_info", **_log_extra(**dup_infos[model_name]))
 
             # ---- preflight for missing required ----
             preflight_err = _preflight_missing_required(model, rows)
+            if preflight_err and verbose:
+                logger.debug("preflight_summary", **_log_extra(missing_required=len(preflight_err)))
 
             # ---- pack rows for downstream (message reflects unknown columns) ----
             packed_rows = []
@@ -690,14 +709,18 @@ def execute_import_job(
                             payload.pop('parent_fk', None)
                             for c in PATH_COLS:
                                 payload.pop(c, None)
+                            if verbose:
+                                logger.debug("mptt_path_folded", **_log_extra(path_value=path_val, parent_chain=parts[:-1], leaf=leaf))
 
                     action, pk, ext_id = _infer_action_and_clean_id(payload, original_input)
                     if verbose:
-                        logger.debug("row_pre", **_log_extra(action=action))
+                        logger.debug("row_pre", **_log_extra(action=action, has_unknown_cols=False))
 
                     unknown_cols_now = _unknown_from_original_input(model, {
                         "_original_input": original_input, "payload": payload
                     })
+                    if unknown_cols_now and verbose:
+                        logger.debug("row_unknown_cols", **_log_extra(count=len(unknown_cols_now), cols=unknown_cols_now[:30]))
 
                     if rid in preflight_err:
                         msg = preflight_err[rid]["message"]
@@ -808,6 +831,10 @@ def execute_import_job(
                     rows = next(b["rows"] for b in prepared if b["model"] == model_name)
                     out_rows: List[Dict[str, Any]] = []
 
+                    if verbose:
+                        logger.debug("model_begin_preview", **_log_extra(rows=len(rows),
+                                                                       global_map_size=len(global_row_map)))
+
                     for row in rows:
                         rid = _norm_row_key(row["__row_id"])
                         _row_ctx.set(rid)
@@ -824,6 +851,8 @@ def execute_import_job(
                                 "observations": row.get("observations", []),
                                 "external_id": row.get("external_id"),
                             })
+                            if verbose:
+                                logger.debug("row_skip_preflight", **_log_extra())
                             continue
 
                         payload = dict(row.get("payload") or {})
@@ -846,6 +875,18 @@ def execute_import_job(
                                     )
                                 payload[field_name] = _resolve_fk(model, field_name, fk_val, merged_map)
 
+                            # Optional rescue: wrong column used (token put directly under base FK)
+                            for f in model._meta.get_fields():
+                                if isinstance(f, dj_models.ForeignKey) and getattr(f, "null", False) is False:
+                                    base = f.name
+                                    val = payload.get(base)
+                                    if isinstance(val, str):
+                                        merged_map = {**global_row_map, **row_map}
+                                        if IMPORT_VERBOSE_FK:
+                                            logger.debug("[FK][RESCUE] %s.%s had string token %r; attempting row-id resolution",
+                                                         model.__name__, base, val)
+                                        payload[base] = _resolve_fk(model, base, val, merged_map)
+
                             # Resolve MPTT parent
                             if _is_mptt_model(model):
                                 path_val = _get_path_value(payload)
@@ -854,10 +895,33 @@ def execute_import_job(
                                     parent = _resolve_parent_from_path_chain(model, parts[:-1]) if len(parts) > 1 else None
                                     payload['parent'] = parent
                                     payload.pop('parent_id', None)
+                                    if verbose:
+                                        logger.debug("mptt_parent_resolved", **_log_extra(parent_chain=parts[:-1],
+                                                                                           has_parent=bool(parent)))
+
+                            # --- sanity check unresolved non-nullable FKs that had *_fk in input ---
+                            merged_keys = list(({**global_row_map, **row_map}).keys())
+                            issues = _sanity_check_required_fks(model, payload, original_input, merged_keys)
+                            if issues:
+                                for base, token in issues:
+                                    logger.warning(
+                                        "[FK][UNRESOLVED] %s.%s token=%r norm=%r known_row_ids=%s",
+                                        model.__name__, base, token,
+                                        _norm_row_key(token) if isinstance(token, str) else token,
+                                        merged_keys[:50],
+                                        **_log_extra()
+                                    )
+                                raise ValidationError({
+                                    base: [f"Unresolved FK token {token!r}. Known __row_id keys (first 50): {merged_keys[:50]}"]
+                                    for base, token in issues
+                                })
 
                             # Coerce booleans/decimals just before save
                             payload = _coerce_boolean_fields(model, payload)
                             payload = _quantize_decimal_fields(model, payload)
+
+                            if verbose:
+                                logger.debug("row_payload_before_clean", **_log_extra(keys=sorted(payload.keys())[:40]))
 
                             with transaction.atomic():
                                 # Build instance
@@ -925,6 +989,10 @@ def execute_import_job(
                                 "external_id": row.get("external_id"),
                             })
 
+                    if verbose:
+                        logger.debug("model_end_preview", **_log_extra(local_map_size=len(row_map),
+                                                                       global_map_size=len(global_row_map)))
+
                     result_payload.append({
                         "model": model_name,
                         "dup_info": dup_infos.get(model_name),
@@ -978,6 +1046,10 @@ def execute_import_job(
                 row_map: Dict[str, Any] = {}
                 rows = next(b["rows"] for b in prepared if b["model"] == model_name)
 
+                if verbose:
+                    logger.debug("model_begin_commit", **_log_extra(rows=len(rows),
+                                                                    global_map_size=len(global_row_map)))
+
                 for row in rows:
                     rid = _norm_row_key(row["__row_id"])
                     _row_ctx.set(rid)
@@ -1016,6 +1088,18 @@ def execute_import_job(
                                 )
                             payload[field_name] = _resolve_fk(model, field_name, fk_val, merged_map)
 
+                        # Optional rescue: wrong column used (token put directly under base FK)
+                        for f in model._meta.get_fields():
+                            if isinstance(f, dj_models.ForeignKey) and getattr(f, "null", False) is False:
+                                base = f.name
+                                val = payload.get(base)
+                                if isinstance(val, str):
+                                    merged_map = {**global_row_map, **row_map}
+                                    if IMPORT_VERBOSE_FK:
+                                        logger.debug("[FK][RESCUE] %s.%s had string token %r; attempting row-id resolution",
+                                                     model.__name__, base, val)
+                                    payload[base] = _resolve_fk(model, base, val, merged_map)
+
                         # MPTT parent chain
                         if _is_mptt_model(model):
                             path_val = _get_path_value(payload)
@@ -1024,10 +1108,33 @@ def execute_import_job(
                                 parent = _resolve_parent_from_path_chain(model, parts[:-1]) if len(parts) > 1 else None
                                 payload['parent'] = parent
                                 payload.pop('parent_id', None)
+                                if verbose:
+                                    logger.debug("mptt_parent_resolved", **_log_extra(parent_chain=parts[:-1],
+                                                                                       has_parent=bool(parent)))
+
+                        # --- sanity check unresolved non-nullable FKs that had *_fk in input ---
+                        merged_keys = list(({**global_row_map, **row_map}).keys())
+                        issues = _sanity_check_required_fks(model, payload, original_input, merged_keys)
+                        if issues:
+                            for base, token in issues:
+                                logger.warning(
+                                    "[FK][UNRESOLVED] %s.%s token=%r norm=%r known_row_ids=%s",
+                                    model.__name__, base, token,
+                                    _norm_row_key(token) if isinstance(token, str) else token,
+                                    merged_keys[:50],
+                                    **_log_extra()
+                                )
+                            raise ValidationError({
+                                base: [f"Unresolved FK token {token!r}. Known __row_id keys (first 50): {merged_keys[:50]}"]
+                                for base, token in issues
+                            })
 
                         # Coerce booleans/decimals just before save
                         payload = _coerce_boolean_fields(model, payload)
                         payload = _quantize_decimal_fields(model, payload)
+
+                        if verbose:
+                            logger.debug("row_payload_before_clean", **_log_extra(keys=sorted(payload.keys())[:40]))
 
                         with transaction.atomic():
                             # Build instance
@@ -1090,6 +1197,10 @@ def execute_import_job(
                             "error": {**err, "summary": base},
                         })
 
+                if verbose:
+                    logger.debug("model_end_commit", **_log_extra(local_map_size=len(row_map),
+                                                                  global_map_size=len(global_row_map)))
+
                 result_payload.append({
                     "model": model_name,
                     "dup_info": dup_infos.get(model_name),
@@ -1119,6 +1230,10 @@ def execute_import_job(
                 fp = _table_fingerprint(model, rows_src)
 
                 closest = (item.get("dup_info") or {}).get("closest_match") or {}
+                if verbose:
+                    logger.debug("snapshot_prepare", **_log_extra(model=model_name,
+                                                                  row_count=fp["row_count"],
+                                                                  col_count=len(fp["colnames"])))
                 ImportSnapshot.objects.create(
                     company_id=company_id,
                     model_name=model_name,
