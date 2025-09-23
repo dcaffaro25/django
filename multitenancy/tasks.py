@@ -551,13 +551,7 @@ def _infer_action_and_clean_id(payload: Dict[str, Any], original_input: Dict[str
         payload.pop("id", None)
     return "create", None, ext_id
 
-def execute_import_job(
-    company_id: int,
-    sheets: List[Dict[str, Any]],
-    commit: bool,
-    *,
-    file_meta: Optional[Dict[str, Any]] = None
-) -> Dict[str, Any]:
+def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool, *, file_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     One-shot import for all models in a file.
 
@@ -566,7 +560,6 @@ def execute_import_job(
     - Booleans/decimals coercion and basic dedupe fingerprints per sheet.
     - Never special-cases a model; model-level validation enforces invariants.
     """
-    # Per-run setup
     run_id = uuid.uuid4().hex[:8]
     _run_id_ctx.set(run_id)
     _company_ctx.set(str(company_id))
@@ -847,7 +840,6 @@ def execute_import_job(
                 if connection.vendor == "postgresql":
                     with connection.cursor() as cur:
                         cur.execute("SET CONSTRAINTS ALL IMMEDIATE")
-
                 outer_sp = transaction.savepoint()
 
                 for model_name in models_in_order:
@@ -861,14 +853,14 @@ def execute_import_job(
                     out_rows: List[Dict[str, Any]] = []
 
                     if verbose:
-                        logger.debug("model_begin_preview", **_log_extra(rows=len(rows),
-                                                                       global_map_size=len(global_row_map)))
+                        logger.debug("model_begin_preview", **_log_extra(rows=len(rows), global_map_size=len(global_row_map)))
 
                     for row in rows:
-                        rid = _norm_row_key(row["__row_id"])
+                        rid_raw = row.get("__row_id") or f"row{len(out_rows)+1}"
+                        rid = _norm_row_key(rid_raw)
                         _row_ctx.set(rid)
 
-                        # If preflight already failed, surface it and skip DB interaction
+                        # Skip if a preflight error was already recorded
                         if row.get("status") == "error" and row.get("preflight_error"):
                             out_rows.append({
                                 "__row_id": rid,
@@ -887,106 +879,132 @@ def execute_import_job(
                         payload = dict(row.get("payload") or {})
                         original_input = row.get("_original_input") or payload.copy()
                         action = row.get("action") or "create"
-
                         unknown_cols_now = _unknown_from_original_input(model, row)
 
                         try:
-                            # Resolve *_fk using LOCAL + GLOBAL row maps (keys normalized)
+                            # Resolve all foreign key token fields (e.g., "transaction_fk" -> actual instance)
                             for fk_key in [k for k in list(payload.keys()) if k.endswith("_fk")]:
                                 field_name = fk_key[:-3]
                                 fk_val = payload.pop(fk_key)
                                 merged_map = {**global_row_map, **row_map}
-                                if IMPORT_VERBOSE_FK and isinstance(fk_val, str):
-                                    logger.debug(
-                                        "[FK] %s.%s -> %r (norm=%r); known row_ids: %s%s",
-                                        model.__name__, field_name, fk_val, _norm_row_key(fk_val),
-                                        list(merged_map.keys())[:20], " ..." if len(merged_map) > 20 else ""
+                                if isinstance(fk_val, str):
+                                    # Log attempt to resolve the FK token
+                                    keys_list = list(merged_map.keys())
+                                    keys_preview = ", ".join(keys_list[:20])
+                                    if len(keys_list) > 20:
+                                        keys_preview += " ..."
+                                    logger.info(
+                                        "Resolving FK for %s.%s: token=%r, known_keys=[%s]",
+                                        model.__name__, field_name, fk_val, keys_preview
                                     )
+                                # Resolve the FK token to an instance or ID
                                 payload[field_name] = _resolve_fk(model, field_name, fk_val, merged_map)
+                                # Log the outcome of the resolution
+                                if isinstance(fk_val, str):
+                                    resolved_obj = payload[field_name]
+                                    if resolved_obj is None:
+                                        logger.warning(
+                                            "FK token %r for %s.%s could not be resolved (no matching __row_id found)",
+                                            fk_val, model.__name__, field_name
+                                        )
+                                    else:
+                                        logger.info(
+                                            "FK token %r resolved to %s(id=%s) for %s.%s",
+                                            fk_val,
+                                            resolved_obj.__class__.__name__,
+                                            getattr(resolved_obj, "id", None),
+                                            model.__name__,
+                                            field_name
+                                        )
 
-                            # Optional rescue: wrong column used (token put directly under base FK)
+                            # Optional rescue: if a token was mistakenly placed in a base FK field instead of *_fk
                             for f in model._meta.get_fields():
                                 if isinstance(f, dj_models.ForeignKey) and getattr(f, "null", False) is False:
                                     base = f.name
                                     val = payload.get(base)
                                     if isinstance(val, str):
                                         merged_map = {**global_row_map, **row_map}
-                                        if IMPORT_VERBOSE_FK:
-                                            logger.debug("[FK][RESCUE] %s.%s had string token %r; attempting row-id resolution",
-                                                         model.__name__, base, val)
+                                        logger.warning(  # always log, since this is a likely user mistake
+                                            "Found raw token %r in field '%s' for %s; attempting resolution via __row_id map",
+                                            val, base, model.__name__
+                                        )
                                         payload[base] = _resolve_fk(model, base, val, merged_map)
+                                        if payload[base] is None:
+                                            logger.warning(
+                                                "Failed to resolve token %r for required field %s.%s",
+                                                val, model.__name__, base
+                                            )
 
-                            # Resolve MPTT parent
+                            # Resolve MPTT parent (if applicable)
                             if _is_mptt_model(model):
                                 path_val = _get_path_value(payload)
                                 if path_val:
                                     parts = _split_path(path_val)
                                     parent = _resolve_parent_from_path_chain(model, parts[:-1]) if len(parts) > 1 else None
-                                    payload['parent'] = parent
-                                    payload.pop('parent_id', None)
+                                    payload["parent"] = parent
+                                    payload.pop("parent_id", None)
                                     if verbose:
-                                        logger.debug("mptt_parent_resolved", **_log_extra(parent_chain=parts[:-1],
-                                                                                           has_parent=bool(parent)))
+                                        logger.debug("mptt_parent_resolved", **_log_extra(parent_chain=parts[:-1], has_parent=bool(parent)))
 
-                            # --- sanity check unresolved non-nullable FKs that had *_fk in input ---
-                            merged_keys = list(({**global_row_map, **row_map}).keys())
+                            # Sanity-check: any required FK still unresolved?
+                            merged_keys = list({**global_row_map, **row_map}.keys())
                             issues = _sanity_check_required_fks(model, payload, original_input, merged_keys)
                             if issues:
                                 for base, token in issues:
-                                    logger.warning(
-                                        "[FK][UNRESOLVED] %s.%s token=%r norm=%r known_row_ids=%s",
-                                        model.__name__, base, token,
-                                        _norm_row_key(token) if isinstance(token, str) else token,
-                                        merged_keys[:50],
-                                        **_log_extra()
+                                    logger.error(
+                                        "Unresolved FK token %r for required field %s.%s (known keys: %s)",
+                                        token, model.__name__, base, merged_keys[:50]
                                     )
                                 raise ValidationError({
-                                    base: [f"Unresolved FK token {token!r}. Known __row_id keys (first 50): {merged_keys[:50]}"]
+                                    base: [f"Unresolved FK token {token!r}. Known __row_id keys: {merged_keys[:50]}"]
                                     for base, token in issues
                                 })
 
-                            # Coerce booleans/decimals just before save
+                            # Coerce booleans and decimals before saving
                             payload = _coerce_boolean_fields(model, payload)
                             payload = _quantize_decimal_fields(model, payload)
 
                             if verbose:
                                 logger.debug("row_payload_before_clean", **_log_extra(keys=sorted(payload.keys())[:40]))
 
+                            # Save the instance (within an inner savepoint)
                             with transaction.atomic():
-                                # Build instance
                                 if action == "update":
                                     instance = model.objects.select_for_update().get(id=payload["id"])
                                     for f, v in payload.items():
                                         setattr(instance, f, v)
                                 else:
                                     instance = model(**payload)
-
-                                # --- Clean first so DateFields stop being strings ---
                                 sp = transaction.savepoint()
                                 try:
                                     if hasattr(instance, "full_clean"):
                                         instance.full_clean()
-                                    instance.save()  # may rely on properly-typed fields (like date checks)
+                                    instance.save()
                                     transaction.savepoint_commit(sp)
                                 except Exception:
                                     transaction.savepoint_rollback(sp)
                                     raise
 
+                            # Map this new instance to its __row_id for cross-sheet references
                             if rid:
                                 row_map[rid] = instance
-                                global_row_map[rid] = instance  # <-- make visible to other sheets
+                                global_row_map[rid] = instance
+                                logger.info(
+                                    "Mapped __row_id '%s' -> %s(id=%s)",
+                                    rid, model.__name__, getattr(instance, "id", None)
+                                )
 
                             msg = "ok"
                             status_val = "success"
                             if unknown_cols_now and row.get("status") != "error":
                                 status_val = "warning"
-                                msg = f"{msg} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
+                                msg += " | Ignoring unknown columns: " + ", ".join(unknown_cols_now)
 
                             out_rows.append({
                                 "__row_id": rid,
                                 "status": status_val,
                                 "action": action,
-                                "data": safe_model_dict(instance, exclude_fields=['created_by','updated_by','is_deleted','is_active']),
+                                "data": safe_model_dict(instance, exclude_fields=['created_by', 'updated_by', 'is_deleted', 'is_active']),
                                 "message": msg,
                                 "observations": row.get("observations", []),
                                 "external_id": row.get("external_id"),
@@ -995,32 +1013,29 @@ def execute_import_job(
                                 logger.debug("row_ok", **_log_extra(action=action, status=status_val))
 
                         except Exception as e:
+                            # Capture exception details
                             err = exception_to_dict(e, include_stack=False)
-                            base = err.get("summary") or _friendly_db_message(e)
+                            base_msg = err.get("summary") or _friendly_db_message(e)
                             if unknown_cols_now:
-                                base = f"{base} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
-
+                                base_msg += " | Ignoring unknown columns: " + ", ".join(unknown_cols_now)
                             logger.error(
                                 "[IMPORT][PREVIEW][EXC] model=%s row_id=%s action=%s err=%s",
-                                model_name, rid, action, base,
-                                exc_info=True,
-                                **_log_extra()
+                                model_name, rid, action, base_msg,
+                                exc_info=True, **_log_extra()
                             )
-
                             out_rows.append({
                                 "__row_id": rid,
                                 "status": "error",
                                 "action": action,
                                 "data": original_input,
-                                "message": base,
-                                "error": {**err, "summary": base},
+                                "message": base_msg,
+                                "error": {**err, "summary": base_msg},
                                 "observations": row.get("observations", []),
                                 "external_id": row.get("external_id"),
                             })
 
                     if verbose:
-                        logger.debug("model_end_preview", **_log_extra(local_map_size=len(row_map),
-                                                                       global_map_size=len(global_row_map)))
+                        logger.debug("model_end_preview", **_log_extra(local_map_size=len(row_map), global_map_size=len(global_row_map)))
 
                     result_payload.append({
                         "model": model_name,
@@ -1028,7 +1043,7 @@ def execute_import_job(
                         "result": out_rows
                     })
 
-                # Roll back all side-effects and reset sequences
+                # Roll back the preview transaction (nothing is actually committed in preview)
                 transaction.savepoint_rollback(outer_sp)
                 reset_pk_sequences(models_touched)
 
