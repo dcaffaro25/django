@@ -132,20 +132,48 @@ class _SlowSQL:
 # Email helpers
 # ----------------------------------------------------------------------
 
-def _sanity_check_required_fks(model, payload: dict, original_input: dict, merged_map_keys: list[str]) -> list[tuple[str, Any]]:
+def _sanity_check_required_fks(model, payload: Dict[str, Any], original_input: Dict[str, Any], merged_map_keys: List[str]) -> List[Tuple[str, Any]]:
     """
     Return a list of (field_name, token) for non-nullable FKs that were provided as <field>_fk
     in the original input but remain unresolved (payload[<field>] is None).
+
+    The original implementation looked only for the base field name in the normalized payload,
+    which can cause false positives when the importer saves resolved foreign keys under the
+    underlying attname (e.g., ``company_id``).  This version checks both the field name and
+    the attname for a resolved value.
     """
-    issues = []
+    issues: List[Tuple[str, Any]] = []
     for f in model._meta.get_fields():
-        if isinstance(f, dj_models.ForeignKey) and getattr(f, "null", False) is False:
-            base = f.name
-            token = original_input.get(f"{base}_fk", None)
-            # Only care if they *provided* an _fk but we didn't resolve it
-            if token not in (None, "", float("nan")) and payload.get(base) is None:
+        # Skip anything that's not a ForeignKey or is nullable
+        if not isinstance(f, model.ForeignKey) or getattr(f, "null", False):
+            continue
+
+        base = f.name
+        token = original_input.get(f"{base}_fk", None)
+        # Only care if they provided a *_fk token that isn't obviously missing
+        # Note: float("nan") is not equal to itself, so we detect NaNs via this trick.
+        if token is None or token == "":
+            try:
+                if isinstance(token, float) and token != token:
+                    # Skip NaN tokens
+                    continue
+            except Exception:
+                pass
+        # If a token is present, determine whether the payload contains a resolved object
+        if token not in (None, ""):
+            value = None
+            # Check by the field's name
+            if base in payload:
+                value = payload.get(base)
+            else:
+                # Check by attname (e.g., ``company_id``)
+                attname = getattr(f, "attname", None)
+                if attname:
+                    value = payload.get(attname)
+            if value is None:
                 issues.append((base, token))
     return issues
+
 
 @shared_task(bind=True, autoretry_for=(smtplib.SMTPException, ConnectionError), retry_backoff=True, max_retries=5)
 def send_user_invite_email(self, subject, message, to_email):

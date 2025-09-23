@@ -63,12 +63,21 @@ def _to_bool(val, default=False):
 
 # Normalize string-like row ids/FK tokens (kills NBSP, trims)
 
-def _norm_row_key(v):
+def _norm_row_key2(v):
     if v is None:
         return None
     s = str(v).replace("\u00A0", " ").strip()
+
     return s
 
+def _norm_row_key(key: Any) -> Any:
+    """
+    Normalize a row key from an import sheet.  Strings are stripped of surrounding
+    whitespace and converted to lower case.  Non-strings are returned unchanged.
+    """
+    if isinstance(key, str):
+        return key.strip().lower()
+    return key
 
 def _path_depth(row: Dict[str, Any]) -> int:
     """Used to sort MPTT rows so parents come first."""
