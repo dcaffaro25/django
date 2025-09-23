@@ -772,18 +772,15 @@ def execute_import_job(
                             # --- Save first so model auto-behavior runs (e.g. JournalEntry auto-assigns account) ---
                             sp = transaction.savepoint()
                             try:
-                                instance.save()  # runs model.save(), DB constraints checked at flush
-                        
-                                # Validate after model logic. This can still raise (e.g. unique/clean).
+                                instance.save()
+                            
                                 if hasattr(instance, "full_clean"):
                                     instance.full_clean()
-                        
-                                # Optional: if your clean_fields actually mutates values you want persisted,
-                                # you can save once more. In your models, save() already quantizes, so it’s safe
-                                # to skip. If you want it:
+                            
+                                # Optional: persist clean_fields mutations with a second save
                                 # instance.save()
-                        
-                                transaction.savepoint_release(sp)
+                            
+                                transaction.savepoint_commit(sp)   # <-- fix: commit, not release
                             except Exception:
                                 transaction.savepoint_rollback(sp)
                                 raise
@@ -940,14 +937,14 @@ def execute_import_job(
                         sp = transaction.savepoint()
                         try:
                             instance.save()
-                    
+                        
                             if hasattr(instance, "full_clean"):
                                 instance.full_clean()
-                    
-                            # Optional second save to persist any clean_fields mutations:
+                        
+                            # Optional: persist clean_fields mutations with a second save
                             # instance.save()
-                    
-                            transaction.savepoint_release(sp)
+                        
+                            transaction.savepoint_commit(sp)   # <-- fix: commit, not release
                         except Exception:
                             transaction.savepoint_rollback(sp)
                             raise
