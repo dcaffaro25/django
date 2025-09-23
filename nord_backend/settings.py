@@ -16,6 +16,81 @@ from datetime import timedelta
 
 import logging
 
+DEBUG = True
+
+class SlowOnlyFilter(logging.Filter):
+    def __init__(self, threshold_ms=200):
+        super().__init__()
+        self.threshold = float(threshold_ms) / 1000.0  # seconds
+
+    def filter(self, record):
+        # django.db.backends logs include `duration` in seconds
+        dur = getattr(record, "duration", None)
+        return dur is not None and dur >= self.threshold
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "logfmt": {"format": "%(levelname)s %(asctime)s %(name)s msg=%(message)s run_id=%(run_id)s company=%(company_id)s model=%(model)s row_id=%(row_id)s"},
+        # Or use json if you prefer
+        # "json": {"()": "pythonjsonlogger.jsonlogger.JsonFormatter", "fmt": "%(levelname)s %(asctime)s %(name)s %(message)s %(run_id)s %(company_id)s %(model)s %(row_id)s"},
+    },
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "formatter": "logfmt"},
+    },
+    "loggers": {
+        # Your importer logs only
+        "importer": {"handlers": ["console"], "level": "INFO", "propagate": False},
+        # Optional: show only slow SQL (keep global DB logs quiet)
+        "importer.sql": {"handlers": ["console"], "level": "INFO", "propagate": False},
+        # Keep Django DB logs quiet globally
+        "django.db.backends": {"handlers": ["console"], "level": "WARNING", "propagate": False},
+    },
+}
+
+'''
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "filters": {
+        "slow_only": {"()": "core.logging.SlowOnlyFilter", "threshold_ms": 200},
+        "require_debug_true": {"()": "django.utils.log.RequireDebugTrue"},
+    },
+    "formatters": {
+        "default": {"format": "[%(levelname)s] %(asctime)s %(name)s:%(lineno)d %(message)s"},
+        "db_compact": {"format": "[SQL] %(duration).3fs %(sql)s; params=%(params)s"},
+    },
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "formatter": "default"},
+        # only show SQL when DEBUG is True (for local dev)
+        "db_console_debug": {
+            "class": "logging.StreamHandler",
+            "level": "DEBUG",
+            "filters": ["require_debug_true"],
+            "formatter": "db_compact",
+        },
+        # show only slow SQL in prod
+        "db_console_slow": {
+            "class": "logging.StreamHandler",
+            "level": "INFO",
+            "filters": ["slow_only"],
+            "formatter": "db_compact",
+        },
+    },
+    "loggers": {
+        "django": {"handlers": ["console"], "level": "INFO", "propagate": True},
+        "django.db.backends": {
+            # When DEBUG=True you'll see all queries via db_console_debug
+            # When DEBUG=False you'll only see slow ones via db_console_slow
+            "handlers": ["db_console_debug", "db_console_slow"],
+            "level": "DEBUG",
+            "propagate": False,
+        },
+    },
+}
+'''
+'''
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -32,14 +107,15 @@ LOGGING = {
         },
     },
     "loggers": {
+        "django": {"handlers": ["console"], "level": "INFO" if not DEBUG else "DEBUG"},
         "django.db.backends": {
             "handlers": ["console"],
-            "level": "DEBUG",
+            "level": "WARNING",
             "propagate": False,
         },
     },
 }
-
+'''
 APPEND_SLASH = True  # keep this; helps GET/HEAD without slash
 
 # Feature flag for Retool authentication
@@ -57,7 +133,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = 'django-insecure-rc^*w^w&6g9_(uvx#6s*bnt!w)l0rdi%!l7mv#y%uc&x%wo5pk'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+
 
 ALLOWED_HOSTS = ["*"]
 

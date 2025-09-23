@@ -7,6 +7,9 @@ import os
 import re
 import smtplib
 import logging
+import time
+import uuid
+from contextvars import ContextVar
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -45,15 +48,73 @@ from .api_utils import (
     _to_bool,
     _norm_row_key,
     _path_depth,
-    
-    
 )
 
 # ----------------------------------------------------------------------
 # Logging / verbosity
 # ----------------------------------------------------------------------
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("importer")
+sql_logger = logging.getLogger("importer.sql")
+
+# Per-run contextual fields (propagated via logger.extra)
+_run_id_ctx = ContextVar("run_id", default="-")
+_company_ctx = ContextVar("company_id", default="-")
+_model_ctx = ContextVar("model", default="-")
+_row_ctx = ContextVar("row_id", default="-")
+
+def _log_extra(**kw):
+    return {
+        "extra": {
+            "run_id": _run_id_ctx.get(),
+            "company_id": _company_ctx.get(),
+            "model": _model_ctx.get(),
+            "row_id": _row_ctx.get(),
+            **kw,
+        }
+    }
+
+def _import_debug_enabled() -> bool:
+    # Prefer settings flag; fallback to env
+    val = getattr(settings, "IMPORT_DEBUG", None)
+    if val is None:
+        val = os.getenv("IMPORT_DEBUG", "0")
+    return str(val).lower() in {"1", "true", "yes", "y", "on"}
+
 IMPORT_VERBOSE_FK = os.getenv("IMPORT_VERBOSE_FK", "0").lower() in {"1", "true", "yes", "y", "on"}
+
+class _SlowSQL:
+    """Capture slow queries during an import run only (keeps global DB logs quiet)."""
+    def __init__(self, threshold_ms: int = 200):
+        self.threshold = threshold_ms / 1000.0
+        self._cm = None
+
+    def __enter__(self):
+        try:
+            def wrapper(execute, sql, params, many, context):
+                t0 = time.monotonic()
+                try:
+                    return execute(sql, params, many, context)
+                finally:
+                    dt = time.monotonic() - t0
+                    if dt >= self.threshold:
+                        # keep the log lean; params may be large/noisy
+                        sql_logger.info(
+                            "slow_sql",
+                            **_log_extra(duration_ms=int(dt * 1000), many=bool(many), sql=sql[:1000])
+                        )
+            self._cm = connection.execute_wrapper(wrapper)
+            self._cm.__enter__()
+        except Exception:
+            # Older Django versions or non-standard backends: just no-op
+            self._cm = None
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self._cm:
+                self._cm.__exit__(exc_type, exc, tb)
+        finally:
+            return False
 
 # ----------------------------------------------------------------------
 # Email helpers
@@ -93,8 +154,6 @@ def trigger_integration_event(company_id, event_name, payload):
 # ----------------------------------------------------------------------
 # Import helpers
 # ----------------------------------------------------------------------
-
-
 
 def _resolve_fk(model, field_name: str, raw_value, row_id_map: Dict[str, Any]):
     """
@@ -175,8 +234,6 @@ def _normalize_payload_for_model(model, payload: Dict[str, Any], *, context_comp
                 data.pop(k, None)
 
     return data
-
-
 
 def _friendly_db_message(exc: Exception) -> str:
     cause = getattr(exc, "__cause__", None)
@@ -453,6 +510,13 @@ def execute_import_job(
     - Booleans/decimals coercion and basic dedupe fingerprints per sheet.
     - Never special-cases a model; model-level validation enforces invariants.
     """
+    # Per-run setup
+    run_id = uuid.uuid4().hex[:8]
+    _run_id_ctx.set(run_id)
+    _company_ctx.set(str(company_id))
+    _model_ctx.set("-")
+    _row_ctx.set("-")
+    verbose = _import_debug_enabled()
 
     # --------------------------- file-level dedupe ---------------------------
     file_sha = (file_meta or {}).get("sha256")
@@ -483,213 +547,405 @@ def execute_import_job(
         ),
     }
 
-    # --------------------------- prep per sheet ---------------------------
-    prepared: List[Dict[str, Any]] = []
-    models_in_order: List[str] = []
-    any_prep_error = False
-    dup_infos: Dict[str, Dict[str, Any]] = {}
+    logger.info(
+        "import_start",
+        **_log_extra(commit=bool(commit), filename=filename, file_sha=file_sha, sheet_count=len(sheets))
+    )
 
-    for sheet in sheets:
-        model_name = sheet["model"]
-        app_label = MODEL_APP_MAP.get(model_name)
-        if not app_label:
-            prepared.append({
-                "model": model_name,
-                "rows": [],
-                "had_error": True,
-                "sheet_error": f"MODEL_APP_MAP missing entry for '{model_name}'",
-            })
-            any_prep_error = True
-            continue
+    t0 = time.monotonic()
+    with _SlowSQL(threshold_ms=200):
+        # --------------------------- prep per sheet ---------------------------
+        prepared: List[Dict[str, Any]] = []
+        models_in_order: List[str] = []
+        any_prep_error = False
+        dup_infos: Dict[str, Dict[str, Any]] = {}
 
-        model = apps.get_model(app_label, model_name)
-        raw_rows = sheet["rows"]
+        for sheet in sheets:
+            model_name = sheet["model"]
+            _model_ctx.set(model_name)
 
-        # substitutions + audit
-        rows, audit = apply_substitutions(raw_rows, company_id=company_id, model_name=model_name, return_audit=True)
-        audit_by_rowid = {}
-        for ch in audit:
-            audit_by_rowid.setdefault(ch.get("__row_id"), []).append(ch)
-
-        # MPTT: ensure parents first
-        if _is_mptt_model(model):
-            rows = sorted(rows, key=_path_depth)
-
-        # ---- table-level fingerprint (order-insensitive) ----
-        fp = _table_fingerprint(model, rows)
-        exact_table_dupe_of = (
-            ImportSnapshot.objects
-            .filter(company_id=company_id, model_name=model_name, table_hash=fp["table_hash"], row_count=fp["row_count"])
-            .order_by("-created_at")
-            .first()
-        )
-
-        prev_snaps = list(
-            ImportSnapshot.objects
-            .filter(company_id=company_id, model_name=model_name)
-            .only("id", "row_count", "row_hash_sample", "table_hash", "file_sha256", "created_at", "filename")
-            .order_by("-created_at")
-        )[:DUP_CHECK_LAST_N]
-
-        curr_set = set(fp["row_hashes"])
-        best_match: Optional[Tuple[ImportSnapshot, float]] = None
-        for s in prev_snaps:
-            prev_set = set(s.row_hash_sample or [])
-            sim = _jaccard(curr_set, prev_set) if prev_set else 0.0
-            if (best_match is None) or (sim > best_match[1]):
-                best_match = (s, sim)
-
-        dup_infos[model_name] = {
-            "table_row_count": fp["row_count"],
-            "table_hash": fp["table_hash"],
-            "exact_table_duplicate": bool(exact_table_dupe_of),
-            "exact_table_duplicate_of": (
-                {
-                    "snapshot_id": exact_table_dupe_of.id,
-                    "created_at": exact_table_dupe_of.created_at.isoformat(),
-                    "row_count": exact_table_dupe_of.row_count,
-                    "table_hash": exact_table_dupe_of.table_hash,
-                    "file_sha256": exact_table_dupe_of.file_sha256,
-                    "filename": exact_table_dupe_of.filename,
-                } if exact_table_dupe_of else None
-            ),
-            "closest_match": (
-                {
-                    "snapshot_id": best_match[0].id,
-                    "created_at": best_match[0].created_at.isoformat(),
-                    "row_count": best_match[0].row_count,
-                    "table_hash": best_match[0].table_hash,
-                    "file_sha256": best_match[0].file_sha256,
-                    "filename": best_match[0].filename,
-                    "jaccard": round(float(best_match[1]), 6),
-                } if best_match else None
-            ),
-        }
-
-        # ---- preflight for missing required ----
-        preflight_err = _preflight_missing_required(model, rows)
-
-        # ---- pack rows for downstream (message reflects unknown columns) ----
-        packed_rows = []
-        had_err = False
-
-        for idx, row in enumerate(rows):
-            rid_raw = row.get("__row_id") or f"row{idx+1}"
-            rid = _norm_row_key(rid_raw)
-            observations = _row_observations(audit_by_rowid, rid)
-            original_input = {k: v for k, v in row.items() if k != "__row_id"}
-
-            try:
-                filtered_input, _ = _filter_unknown(model, original_input)
-                payload = _normalize_payload_for_model(model, filtered_input, context_company_id=company_id)
-                payload = _coerce_boolean_fields(model, payload)
-                payload = _quantize_decimal_fields(model, payload)
-
-                # MPTT: keep name, defer parent resolution
-                if _is_mptt_model(model):
-                    path_val = _get_path_value(payload)
-                    if path_val:
-                        parts = _split_path(path_val)
-                        if not parts:
-                            raise ValueError(f"{model_name}: empty path.")
-                        leaf = parts[-1]
-                        payload['name'] = payload.get('name', leaf) or leaf
-                        payload.pop('parent_id', None)
-                        payload.pop('parent_fk', None)
-                        for c in PATH_COLS:
-                            payload.pop(c, None)
-
-                action, pk, ext_id = _infer_action_and_clean_id(payload, original_input)
-
-                unknown_cols_now = _unknown_from_original_input(model, {
-                    "_original_input": original_input, "payload": payload
+            app_label = MODEL_APP_MAP.get(model_name)
+            if not app_label:
+                logger.error(
+                    "sheet_app_missing",
+                    **_log_extra(error=f"MODEL_APP_MAP missing entry for '{model_name}'")
+                )
+                prepared.append({
+                    "model": model_name,
+                    "rows": [],
+                    "had_error": True,
+                    "sheet_error": f"MODEL_APP_MAP missing entry for '{model_name}'",
                 })
+                any_prep_error = True
+                continue
 
-                if rid in preflight_err:
-                    msg = preflight_err[rid]["message"]
+            model = apps.get_model(app_label, model_name)
+            raw_rows = sheet["rows"]
+            logger.info("sheet_start", **_log_extra(row_count=len(raw_rows)))
+
+            # substitutions + audit
+            rows, audit = apply_substitutions(raw_rows, company_id=company_id, model_name=model_name, return_audit=True)
+            audit_by_rowid = {}
+            for ch in audit:
+                audit_by_rowid.setdefault(ch.get("__row_id"), []).append(ch)
+
+            # MPTT: ensure parents first
+            if _is_mptt_model(model):
+                rows = sorted(rows, key=_path_depth)
+
+            # ---- table-level fingerprint (order-insensitive) ----
+            fp = _table_fingerprint(model, rows)
+            exact_table_dupe_of = (
+                ImportSnapshot.objects
+                .filter(company_id=company_id, model_name=model_name, table_hash=fp["table_hash"], row_count=fp["row_count"])
+                .order_by("-created_at")
+                .first()
+            )
+
+            prev_snaps = list(
+                ImportSnapshot.objects
+                .filter(company_id=company_id, model_name=model_name)
+                .only("id", "row_count", "row_hash_sample", "table_hash", "file_sha256", "created_at", "filename")
+                .order_by("-created_at")
+            )[:DUP_CHECK_LAST_N]
+
+            curr_set = set(fp["row_hashes"])
+            best_match: Optional[Tuple[ImportSnapshot, float]] = None
+            for s in prev_snaps:
+                prev_set = set(s.row_hash_sample or [])
+                sim = _jaccard(curr_set, prev_set) if prev_set else 0.0
+                if (best_match is None) or (sim > best_match[1]):
+                    best_match = (s, sim)
+
+            dup_infos[model_name] = {
+                "table_row_count": fp["row_count"],
+                "table_hash": fp["table_hash"],
+                "exact_table_duplicate": bool(exact_table_dupe_of),
+                "exact_table_duplicate_of": (
+                    {
+                        "snapshot_id": exact_table_dupe_of.id,
+                        "created_at": exact_table_dupe_of.created_at.isoformat(),
+                        "row_count": exact_table_dupe_of.row_count,
+                        "table_hash": exact_table_dupe_of.table_hash,
+                        "file_sha256": exact_table_dupe_of.file_sha256,
+                        "filename": exact_table_dupe_of.filename,
+                    } if exact_table_dupe_of else None
+                ),
+                "closest_match": (
+                    {
+                        "snapshot_id": best_match[0].id,
+                        "created_at": best_match[0].created_at.isoformat(),
+                        "row_count": best_match[0].row_count,
+                        "table_hash": best_match[0].table_hash,
+                        "file_sha256": best_match[0].file_sha256,
+                        "filename": best_match[0].filename,
+                        "jaccard": round(float(best_match[1]), 6),
+                    } if best_match else None
+                ),
+            }
+
+            # ---- preflight for missing required ----
+            preflight_err = _preflight_missing_required(model, rows)
+
+            # ---- pack rows for downstream (message reflects unknown columns) ----
+            packed_rows = []
+            had_err = False
+
+            for idx, row in enumerate(rows):
+                rid_raw = row.get("__row_id") or f"row{idx+1}"
+                rid = _norm_row_key(rid_raw)
+                _row_ctx.set(rid)
+
+                observations = _row_observations(audit_by_rowid, rid)
+                original_input = {k: v for k, v in row.items() if k != "__row_id"}
+
+                try:
+                    filtered_input, _ = _filter_unknown(model, original_input)
+                    payload = _normalize_payload_for_model(model, filtered_input, context_company_id=company_id)
+                    payload = _coerce_boolean_fields(model, payload)
+                    payload = _quantize_decimal_fields(model, payload)
+
+                    # MPTT: keep name, defer parent resolution
+                    if _is_mptt_model(model):
+                        path_val = _get_path_value(payload)
+                        if path_val:
+                            parts = _split_path(path_val)
+                            if not parts:
+                                raise ValueError(f"{model_name}: empty path.")
+                            leaf = parts[-1]
+                            payload['name'] = payload.get('name', leaf) or leaf
+                            payload.pop('parent_id', None)
+                            payload.pop('parent_fk', None)
+                            for c in PATH_COLS:
+                                payload.pop(c, None)
+
+                    action, pk, ext_id = _infer_action_and_clean_id(payload, original_input)
+                    if verbose:
+                        logger.debug("row_pre", **_log_extra(action=action))
+
+                    unknown_cols_now = _unknown_from_original_input(model, {
+                        "_original_input": original_input, "payload": payload
+                    })
+
+                    if rid in preflight_err:
+                        msg = preflight_err[rid]["message"]
+                        if unknown_cols_now:
+                            msg = f"{msg} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
+                        row_obj = {
+                            "__row_id": rid,
+                            "status": "error",
+                            "preflight_error": {**preflight_err[rid], "message": msg},
+                            "message": msg,
+                            "payload": payload,
+                            "_original_input": original_input,
+                            "observations": observations,
+                            "action": action,
+                            "external_id": ext_id,
+                        }
+                        had_err = True
+                    else:
+                        status_val = "ok"
+                        msg = "validated"
+                        if unknown_cols_now:
+                            status_val = "warning"
+                            msg = f"{msg} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
+                        row_obj = {
+                            "__row_id": rid,
+                            "status": status_val,
+                            "message": msg,
+                            "payload": payload,
+                            "_original_input": original_input,
+                            "observations": observations,
+                            "action": action,
+                            "external_id": ext_id,
+                        }
+
+                    packed_rows.append(row_obj)
+
+                except Exception as e:
+                    had_err = True
+                    err = exception_to_dict(e, include_stack=False)
+                    if not err.get("summary"):
+                        err["summary"] = _friendly_db_message(e)
+                    try:
+                        tmp_filtered, _ = _filter_unknown(model, original_input)
+                        tmp_payload = _normalize_payload_for_model(model, tmp_filtered, context_company_id=company_id)
+                        tmp_payload = _coerce_boolean_fields(model, tmp_payload)
+                        tmp_payload = _quantize_decimal_fields(model, tmp_payload)
+                    except Exception:
+                        tmp_payload = original_input
+
+                    action, pk, ext_id = _infer_action_and_clean_id(dict(tmp_payload), original_input)
+                    unknown_cols_now = _unknown_from_original_input(model, {
+                        "_original_input": original_input, "payload": tmp_payload
+                    })
+                    base = err["summary"]
                     if unknown_cols_now:
-                        msg = f"{msg} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
-                    row_obj = {
+                        base = f"{base} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
+
+                    logger.error(
+                        "[IMPORT][PREP][EXC] model=%s row_id=%s action=%s err=%s",
+                        model_name, rid, action, base,
+                        exc_info=True,
+                        **_log_extra()
+                    )
+
+                    packed_rows.append({
                         "__row_id": rid,
                         "status": "error",
-                        "preflight_error": {**preflight_err[rid], "message": msg},
-                        "message": msg,
-                        "payload": payload,
+                        "payload": tmp_payload,
                         "_original_input": original_input,
                         "observations": observations,
+                        "message": base,
+                        "error": {**err, "summary": base},
                         "action": action,
                         "external_id": ext_id,
-                    }
-                    had_err = True
-                else:
-                    status_val = "ok"
-                    msg = "validated"
-                    if unknown_cols_now:
-                        status_val = "warning"
-                        msg = f"{msg} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
-                    row_obj = {
-                        "__row_id": rid,
-                        "status": status_val,
-                        "message": msg,
-                        "payload": payload,
-                        "_original_input": original_input,
-                        "observations": observations,
-                        "action": action,
-                        "external_id": ext_id,
-                    }
+                    })
 
-                packed_rows.append(row_obj)
+            any_prep_error = any_prep_error or had_err
+            prepared.append({"model": model_name, "rows": packed_rows, "had_error": had_err})
+            models_in_order.append(model_name)
+            logger.info("sheet_end", **_log_extra(had_error=bool(had_err)))
 
-            except Exception as e:
-                had_err = True
-                err = exception_to_dict(e, include_stack=False)
-                if not err.get("summary"):
-                    err["summary"] = _friendly_db_message(e)
-                try:
-                    tmp_filtered, _ = _filter_unknown(model, original_input)
-                    tmp_payload = _normalize_payload_for_model(model, tmp_filtered, context_company_id=company_id)
-                    tmp_payload = _coerce_boolean_fields(model, tmp_payload)
-                    tmp_payload = _quantize_decimal_fields(model, tmp_payload)
-                except Exception:
-                    tmp_payload = original_input
+        # make processing deterministic/parent-first
+        models_in_order.sort(key=lambda m: ORDER_HINT.get(m, 1000))
+        logger.info("order_resolved", **_log_extra(models=models_in_order))
 
-                action, pk, ext_id = _infer_action_and_clean_id(dict(tmp_payload), original_input)
-                unknown_cols_now = _unknown_from_original_input(model, {
-                    "_original_input": original_input, "payload": tmp_payload
-                })
-                base = err["summary"]
-                if unknown_cols_now:
-                    base = f"{base} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
+        # ------------------------------ PREVIEW ------------------------------
+        if not commit:
+            models_touched: List[Any] = []
+            result_payload: List[Dict[str, Any]] = []
 
-                # Server-side error log (prep)
-                logger.error(
-                    "[IMPORT][PREP][EXC] model=%s row_id=%s action=%s err=%s payload=%s original=%s",
-                    model_name, rid, action, base, repr(tmp_payload), repr(original_input), exc_info=True
-                )
+            # Global __row_id map shared across ALL sheets
+            global_row_map: Dict[str, Any] = {}
 
-                packed_rows.append({
-                    "__row_id": rid,
-                    "status": "error",
-                    "payload": tmp_payload,
-                    "_original_input": original_input,
-                    "observations": observations,
-                    "message": base,
-                    "error": {**err, "summary": base},
-                    "action": action,
-                    "external_id": ext_id,
-                })
+            with transaction.atomic():
+                if connection.vendor == "postgresql":
+                    with connection.cursor() as cur:
+                        cur.execute("SET CONSTRAINTS ALL IMMEDIATE")
 
-        any_prep_error = any_prep_error or had_err
-        prepared.append({"model": model_name, "rows": packed_rows, "had_error": had_err})
-        models_in_order.append(model_name)
+                outer_sp = transaction.savepoint()
 
-    # make processing deterministic/parent-first
-    models_in_order.sort(key=lambda m: ORDER_HINT.get(m, 1000))
+                for model_name in models_in_order:
+                    _model_ctx.set(model_name)
+                    app_label = MODEL_APP_MAP[model_name]
+                    model = apps.get_model(app_label, model_name)
+                    models_touched.append(model)
 
-    # ------------------------------ PREVIEW ------------------------------
-    if not commit:
+                    row_map: Dict[str, Any] = {}
+                    rows = next(b["rows"] for b in prepared if b["model"] == model_name)
+                    out_rows: List[Dict[str, Any]] = []
+
+                    for row in rows:
+                        rid = _norm_row_key(row["__row_id"])
+                        _row_ctx.set(rid)
+
+                        # If preflight already failed, surface it and skip DB interaction
+                        if row.get("status") == "error" and row.get("preflight_error"):
+                            out_rows.append({
+                                "__row_id": rid,
+                                "status": "error",
+                                "action": row.get("action"),
+                                "data": row.get("_original_input") or row.get("payload") or {},
+                                "message": row["preflight_error"]["message"],
+                                "error": row["preflight_error"],
+                                "observations": row.get("observations", []),
+                                "external_id": row.get("external_id"),
+                            })
+                            continue
+
+                        payload = dict(row.get("payload") or {})
+                        original_input = row.get("_original_input") or payload.copy()
+                        action = row.get("action") or "create"
+
+                        unknown_cols_now = _unknown_from_original_input(model, row)
+
+                        try:
+                            # Resolve *_fk using LOCAL + GLOBAL row maps (keys normalized)
+                            for fk_key in [k for k in list(payload.keys()) if k.endswith("_fk")]:
+                                field_name = fk_key[:-3]
+                                fk_val = payload.pop(fk_key)
+                                merged_map = {**global_row_map, **row_map}
+                                if IMPORT_VERBOSE_FK and isinstance(fk_val, str):
+                                    logger.debug(
+                                        "[FK] %s.%s -> %r (norm=%r); known row_ids: %s%s",
+                                        model.__name__, field_name, fk_val, _norm_row_key(fk_val),
+                                        list(merged_map.keys())[:20], " ..." if len(merged_map) > 20 else ""
+                                    )
+                                payload[field_name] = _resolve_fk(model, field_name, fk_val, merged_map)
+
+                            # Resolve MPTT parent
+                            if _is_mptt_model(model):
+                                path_val = _get_path_value(payload)
+                                if path_val:
+                                    parts = _split_path(path_val)
+                                    parent = _resolve_parent_from_path_chain(model, parts[:-1]) if len(parts) > 1 else None
+                                    payload['parent'] = parent
+                                    payload.pop('parent_id', None)
+
+                            # Coerce booleans/decimals just before save
+                            payload = _coerce_boolean_fields(model, payload)
+                            payload = _quantize_decimal_fields(model, payload)
+
+                            with transaction.atomic():
+                                # Build instance
+                                if action == "update":
+                                    instance = model.objects.select_for_update().get(id=payload["id"])
+                                    for f, v in payload.items():
+                                        setattr(instance, f, v)
+                                else:
+                                    instance = model(**payload)
+
+                                # --- Clean first so DateFields stop being strings ---
+                                sp = transaction.savepoint()
+                                try:
+                                    if hasattr(instance, "full_clean"):
+                                        instance.full_clean()
+                                    instance.save()  # may rely on properly-typed fields (like date checks)
+                                    transaction.savepoint_commit(sp)
+                                except Exception:
+                                    transaction.savepoint_rollback(sp)
+                                    raise
+
+                            if rid:
+                                row_map[rid] = instance
+                                global_row_map[rid] = instance  # <-- make visible to other sheets
+
+                            msg = "ok"
+                            status_val = "success"
+                            if unknown_cols_now and row.get("status") != "error":
+                                status_val = "warning"
+                                msg = f"{msg} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
+
+                            out_rows.append({
+                                "__row_id": rid,
+                                "status": status_val,
+                                "action": action,
+                                "data": safe_model_dict(instance, exclude_fields=['created_by','updated_by','is_deleted','is_active']),
+                                "message": msg,
+                                "observations": row.get("observations", []),
+                                "external_id": row.get("external_id"),
+                            })
+                            if verbose:
+                                logger.debug("row_ok", **_log_extra(action=action, status=status_val))
+
+                        except Exception as e:
+                            err = exception_to_dict(e, include_stack=False)
+                            base = err.get("summary") or _friendly_db_message(e)
+                            if unknown_cols_now:
+                                base = f"{base} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
+
+                            logger.error(
+                                "[IMPORT][PREVIEW][EXC] model=%s row_id=%s action=%s err=%s",
+                                model_name, rid, action, base,
+                                exc_info=True,
+                                **_log_extra()
+                            )
+
+                            out_rows.append({
+                                "__row_id": rid,
+                                "status": "error",
+                                "action": action,
+                                "data": original_input,
+                                "message": base,
+                                "error": {**err, "summary": base},
+                                "observations": row.get("observations", []),
+                                "external_id": row.get("external_id"),
+                            })
+
+                    result_payload.append({
+                        "model": model_name,
+                        "dup_info": dup_infos.get(model_name),
+                        "result": out_rows
+                    })
+
+                # Roll back all side-effects and reset sequences
+                transaction.savepoint_rollback(outer_sp)
+                reset_pk_sequences(models_touched)
+
+            dt = int((time.monotonic() - t0) * 1000)
+            logger.info("import_end", **_log_extra(elapsed_ms=dt, committed=False, reason="preview"))
+            return {
+                "committed": False,
+                "reason": "preview",
+                "file_info": file_info,
+                "imports": result_payload
+            }
+
+        # ------------------------------ COMMIT ------------------------------
+        if any_prep_error:
+            dt = int((time.monotonic() - t0) * 1000)
+            logger.info("import_end", **_log_extra(elapsed_ms=dt, committed=False, reason="prep_errors"))
+            return {
+                "committed": False,
+                "reason": "prep_errors",
+                "file_info": file_info,
+                "imports": [{"model": b["model"], "dup_info": dup_infos.get(b["model"]), "result": b["rows"]} for b in prepared],
+            }
+
         models_touched: List[Any] = []
         result_payload: List[Dict[str, Any]] = []
+        any_row_error = False
 
         # Global __row_id map shared across ALL sheets
         global_row_map: Dict[str, Any] = {}
@@ -702,29 +958,30 @@ def execute_import_job(
             outer_sp = transaction.savepoint()
 
             for model_name in models_in_order:
+                _model_ctx.set(model_name)
                 app_label = MODEL_APP_MAP[model_name]
                 model = apps.get_model(app_label, model_name)
                 models_touched.append(model)
 
                 row_map: Dict[str, Any] = {}
                 rows = next(b["rows"] for b in prepared if b["model"] == model_name)
-                out_rows: List[Dict[str, Any]] = []
 
                 for row in rows:
                     rid = _norm_row_key(row["__row_id"])
+                    _row_ctx.set(rid)
 
-                    # If preflight already failed, surface it and skip DB interaction
+                    # Skip rows that already failed preflight
                     if row.get("status") == "error" and row.get("preflight_error"):
-                        out_rows.append({
-                            "__row_id": rid,
+                        row.update({
                             "status": "error",
                             "action": row.get("action"),
                             "data": row.get("_original_input") or row.get("payload") or {},
                             "message": row["preflight_error"]["message"],
                             "error": row["preflight_error"],
-                            "observations": row.get("observations", []),
-                            "external_id": row.get("external_id"),
                         })
+                        any_row_error = True
+                        if verbose:
+                            logger.debug("row_skip_preflight_error", **_log_extra())
                         continue
 
                     payload = dict(row.get("payload") or {})
@@ -747,7 +1004,7 @@ def execute_import_job(
                                 )
                             payload[field_name] = _resolve_fk(model, field_name, fk_val, merged_map)
 
-                        # Resolve MPTT parent
+                        # MPTT parent chain
                         if _is_mptt_model(model):
                             path_val = _get_path_value(payload)
                             if path_val:
@@ -768,23 +1025,13 @@ def execute_import_job(
                                     setattr(instance, f, v)
                             else:
                                 instance = model(**payload)
-                        
-                            # --- Save first so model auto-behavior runs (e.g. JournalEntry auto-assigns account) ---
+
+                            # --- Clean first so model.save() sees proper types ---
                             sp = transaction.savepoint()
                             try:
-                                if action == "update":
-                                    instance = model.objects.select_for_update().get(id=payload["id"])
-                                    for f, v in payload.items():
-                                        setattr(instance, f, v)
-                                else:
-                                    instance = model(**payload)
-                            
-                                # IMPORTANT: clean before save so DateFields stop being strings
                                 if hasattr(instance, "full_clean"):
-                                    instance.full_clean()  # runs field.clean -> to_python, your clean_fields, etc.
-                            
-                                instance.save()  # may rely on properly-typed fields (like your date check)
-                            
+                                    instance.full_clean()
+                                instance.save()
                                 transaction.savepoint_commit(sp)
                             except Exception:
                                 transaction.savepoint_rollback(sp)
@@ -800,247 +1047,85 @@ def execute_import_job(
                             status_val = "warning"
                             msg = f"{msg} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
 
-                        out_rows.append({
-                            "__row_id": rid,
+                        row.update({
                             "status": status_val,
                             "action": action,
                             "data": safe_model_dict(instance, exclude_fields=['created_by','updated_by','is_deleted','is_active']),
                             "message": msg,
-                            "observations": row.get("observations", []),
-                            "external_id": row.get("external_id"),
                         })
+                        if verbose:
+                            logger.debug("row_ok", **_log_extra(action=action, status=status_val))
 
                     except Exception as e:
+                        any_row_error = True
                         err = exception_to_dict(e, include_stack=False)
                         base = err.get("summary") or _friendly_db_message(e)
                         if unknown_cols_now:
                             base = f"{base} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
 
-                        # NEW: server-side log with stack & row context
                         logger.error(
-                            "[IMPORT][PREVIEW][EXC] model=%s row_id=%s action=%s err=%s payload=%s original=%s",
-                            model_name, rid, action, base, repr(payload), repr(original_input), exc_info=True
+                            "[IMPORT][COMMIT][EXC] model=%s row_id=%s action=%s err=%s",
+                            model_name, rid, action, base,
+                            exc_info=True,
+                            **_log_extra()
                         )
 
-                        out_rows.append({
-                            "__row_id": rid,
+                        row.update({
                             "status": "error",
                             "action": action,
                             "data": original_input,
                             "message": base,
                             "error": {**err, "summary": base},
-                            "observations": row.get("observations", []),
-                            "external_id": row.get("external_id"),
                         })
 
                 result_payload.append({
                     "model": model_name,
                     "dup_info": dup_infos.get(model_name),
-                    "result": out_rows
+                    "result": rows
                 })
 
-            # Roll back all side-effects and reset sequences
-            transaction.savepoint_rollback(outer_sp)
-            reset_pk_sequences(models_touched)
+            if any_row_error:
+                transaction.savepoint_rollback(outer_sp)
+                reset_pk_sequences(models_touched)
+                dt = int((time.monotonic() - t0) * 1000)
+                logger.info("import_end", **_log_extra(elapsed_ms=dt, committed=False, reason="row_errors"))
+                return {
+                    "committed": False,
+                    "reason": "row_errors",
+                    "file_info": file_info,
+                    "imports": result_payload
+                }
 
-        return {
-            "committed": False,
-            "reason": "preview",
-            "file_info": file_info,
-            "imports": result_payload
-        }
+            # ---------- Persist snapshots per sheet (commit success only) ----------
+            for item in result_payload:
+                model_name = item["model"]
+                app_label = MODEL_APP_MAP[model_name]
+                model = apps.get_model(app_label, model_name)
 
-    # ------------------------------ COMMIT ------------------------------
-    if any_prep_error:
-        return {
-            "committed": False,
-            "reason": "prep_errors",
-            "file_info": file_info,
-            "imports": [{"model": b["model"], "dup_info": dup_infos.get(b["model"]), "result": b["rows"]} for b in prepared],
-        }
+                pre = next(b for b in prepared if b["model"] == model_name)
+                rows_src = [r.get("_original_input") or r.get("payload") or {} for r in pre["rows"]]
+                fp = _table_fingerprint(model, rows_src)
 
-    models_touched: List[Any] = []
-    result_payload: List[Dict[str, Any]] = []
-    any_row_error = False
+                closest = (item.get("dup_info") or {}).get("closest_match") or {}
+                ImportSnapshot.objects.create(
+                    company_id=company_id,
+                    model_name=model_name,
+                    row_count=fp["row_count"],
+                    colnames=fp["colnames"],
+                    row_hash_sample=fp["row_hashes"][:200],
+                    table_hash=fp["table_hash"],
+                    file_sha256=file_sha,
+                    filename=filename,
+                    jaccard_to_prev=closest.get("jaccard"),
+                )
 
-    # Global __row_id map shared across ALL sheets
-    global_row_map: Dict[str, Any] = {}
-
-    with transaction.atomic():
-        if connection.vendor == "postgresql":
-            with connection.cursor() as cur:
-                cur.execute("SET CONSTRAINTS ALL IMMEDIATE")
-
-        outer_sp = transaction.savepoint()
-
-        for model_name in models_in_order:
-            app_label = MODEL_APP_MAP[model_name]
-            model = apps.get_model(app_label, model_name)
-            models_touched.append(model)
-
-            row_map: Dict[str, Any] = {}
-            rows = next(b["rows"] for b in prepared if b["model"] == model_name)
-
-            for row in rows:
-                rid = _norm_row_key(row["__row_id"])
-
-                # Skip rows that already failed preflight
-                if row.get("status") == "error" and row.get("preflight_error"):
-                    row.update({
-                        "status": "error",
-                        "action": row.get("action"),
-                        "data": row.get("_original_input") or row.get("payload") or {},
-                        "message": row["preflight_error"]["message"],
-                        "error": row["preflight_error"],
-                    })
-                    any_row_error = True
-                    continue
-
-                payload = dict(row.get("payload") or {})
-                original_input = row.get("_original_input") or payload.copy()
-                action = row.get("action") or "create"
-
-                unknown_cols_now = _unknown_from_original_input(model, row)
-
-                try:
-                    # Resolve *_fk using LOCAL + GLOBAL row maps (keys normalized)
-                    for fk_key in [k for k in list(payload.keys()) if k.endswith("_fk")]:
-                        field_name = fk_key[:-3]
-                        fk_val = payload.pop(fk_key)
-                        merged_map = {**global_row_map, **row_map}
-                        if IMPORT_VERBOSE_FK and isinstance(fk_val, str):
-                            logger.debug(
-                                "[FK] %s.%s -> %r (norm=%r); known row_ids: %s%s",
-                                model.__name__, field_name, fk_val, _norm_row_key(fk_val),
-                                list(merged_map.keys())[:20], " ..." if len(merged_map) > 20 else ""
-                            )
-                        payload[field_name] = _resolve_fk(model, field_name, fk_val, merged_map)
-
-                    # MPTT parent chain
-                    if _is_mptt_model(model):
-                        path_val = _get_path_value(payload)
-                        if path_val:
-                            parts = _split_path(path_val)
-                            parent = _resolve_parent_from_path_chain(model, parts[:-1]) if len(parts) > 1 else None
-                            payload['parent'] = parent
-                            payload.pop('parent_id', None)
-
-                    # Coerce booleans/decimals just before save
-                    payload = _coerce_boolean_fields(model, payload)
-                    payload = _quantize_decimal_fields(model, payload)
-
-                    with transaction.atomic():
-                        # Build instance
-                        if action == "update":
-                            instance = model.objects.select_for_update().get(id=payload["id"])
-                            for f, v in payload.items():
-                                setattr(instance, f, v)
-                        else:
-                            instance = model(**payload)
-                    
-                        # --- Save first to allow model.save() to populate/normalize fields ---
-                        sp = transaction.savepoint()
-                        try:
-                            if action == "update":
-                                instance = model.objects.select_for_update().get(id=payload["id"])
-                                for f, v in payload.items():
-                                    setattr(instance, f, v)
-                            else:
-                                instance = model(**payload)
-                        
-                            # IMPORTANT: clean before save so DateFields stop being strings
-                            if hasattr(instance, "full_clean"):
-                                instance.full_clean()  # runs field.clean -> to_python, your clean_fields, etc.
-                        
-                            instance.save()  # may rely on properly-typed fields (like your date check)
-                        
-                            transaction.savepoint_commit(sp)
-                        except Exception:
-                            transaction.savepoint_rollback(sp)
-                            raise
-
-                    if rid:
-                        row_map[rid] = instance
-                        global_row_map[rid] = instance  # <-- make visible to other sheets
-
-                    msg = "ok"
-                    status_val = "success"
-                    if unknown_cols_now and row.get("status") != "error":
-                        status_val = "warning"
-                        msg = f"{msg} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
-
-                    row.update({
-                        "status": status_val,
-                        "action": action,
-                        "data": safe_model_dict(instance, exclude_fields=['created_by','updated_by','is_deleted','is_active']),
-                        "message": msg,
-                    })
-
-                except Exception as e:
-                    any_row_error = True
-                    err = exception_to_dict(e, include_stack=False)
-                    base = err.get("summary") or _friendly_db_message(e)
-                    if unknown_cols_now:
-                        base = f"{base} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
-
-                    # NEW: server-side log with stack & row context
-                    logger.error(
-                        "[IMPORT][COMMIT][EXC] model=%s row_id=%s action=%s err=%s payload=%s original=%s",
-                        model_name, rid, action, base, repr(payload), repr(original_input), exc_info=True
-                    )
-
-                    row.update({
-                        "status": "error",
-                        "action": action,
-                        "data": original_input,
-                        "message": base,
-                        "error": {**err, "summary": base},
-                    })
-
-            result_payload.append({
-                "model": model_name,
-                "dup_info": dup_infos.get(model_name),
-                "result": rows
-            })
-
-        if any_row_error:
-            transaction.savepoint_rollback(outer_sp)
-            reset_pk_sequences(models_touched)
+            dt = int((time.monotonic() - t0) * 1000)
+            logger.info("import_end", **_log_extra(elapsed_ms=dt, committed=True))
             return {
-                "committed": False,
-                "reason": "row_errors",
+                "committed": True,
                 "file_info": file_info,
                 "imports": result_payload
             }
-
-        # ---------- Persist snapshots per sheet (commit success only) ----------
-        for item in result_payload:
-            model_name = item["model"]
-            app_label = MODEL_APP_MAP[model_name]
-            model = apps.get_model(app_label, model_name)
-
-            pre = next(b for b in prepared if b["model"] == model_name)
-            rows_src = [r.get("_original_input") or r.get("payload") or {} for r in pre["rows"]]
-            fp = _table_fingerprint(model, rows_src)
-
-            closest = (item.get("dup_info") or {}).get("closest_match") or {}
-            ImportSnapshot.objects.create(
-                company_id=company_id,
-                model_name=model_name,
-                row_count=fp["row_count"],
-                colnames=fp["colnames"],
-                row_hash_sample=fp["row_hashes"][:200],
-                table_hash=fp["table_hash"],
-                file_sha256=file_sha,
-                filename=filename,
-                jaccard_to_prev=closest.get("jaccard"),
-            )
-
-        return {
-            "committed": True,
-            "file_info": file_info,
-            "imports": result_payload
-        }
 
 # Celery entrypoint: one task per file
 @shared_task

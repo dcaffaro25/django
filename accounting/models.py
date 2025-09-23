@@ -5,7 +5,7 @@ from django.db import models
 #from multitenancy.models import BaseModel, TenantAwareBaseModel#Company, CustomUser, Entity
 from datetime import timedelta
 from django.db.models import Q, Sum, CheckConstraint
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from itertools import combinations
 from django.apps import apps
 from django.core.exceptions import ValidationError
@@ -16,7 +16,10 @@ from mptt.models import MPTTModel, TreeForeignKey
 from mptt.managers import TreeManager
 from multitenancy.models import Company, CustomUser
 from django.conf import settings
-from decimal import Decimal, ROUND_HALF_UP
+
+
+
+from django.utils.dateparse import parse_date  # only needed if you keep saves without full_clean()
 
 class Currency(BaseModel):
     code = models.CharField(max_length=3, unique=True)
@@ -296,16 +299,22 @@ class Transaction(TenantAwareBaseModel):
     #função de entuba de sugere as as journal entries que deveriam ser criadas com base no historico e numa tabela de regras de de-para cadastradas. e checar consistencia.
     #modelo de contratos com cliente, entidade, data inicio, data fim, valor, recorrencia, regra ajuste preço.
     
+
+
+
 class JournalEntry(TenantAwareBaseModel):
     transaction = models.ForeignKey(Transaction, related_name='journal_entries', on_delete=models.CASCADE)
-    account = models.ForeignKey(Account, on_delete=models.CASCADE)
+    account = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True)
     cost_center = models.ForeignKey(CostCenter, on_delete=models.CASCADE, null=True, blank=True)
     debit_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     credit_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
-    state = models.CharField(max_length=10, choices=[('pending', 'Pending'), ('posted', 'Posted'), ('canceled', 'Canceled')], default='pending')
+    state = models.CharField(
+        max_length=10,
+        choices=[('pending', 'Pending'), ('posted', 'Posted'), ('canceled', 'Canceled')],
+        default='pending',
+    )
     date = models.DateField(null=True, blank=True)
-    
-    # NEW: allow creating a cash line without knowing the bank-specific GL yet
+
     bank_designation_pending = models.BooleanField(
         default=False,
         db_index=True,
@@ -321,96 +330,102 @@ class JournalEntry(TenantAwareBaseModel):
             models.Index(fields=['bank_designation_pending']),
         ]
         constraints = [
-            # Either it's pending designation OR an account must be present
             CheckConstraint(
                 name="je_pending_or_account_present",
                 check=Q(bank_designation_pending=True) | Q(account__isnull=False),
             ),
+            # (Optional but recommended) enforce only one side set at DB level:
+            # CheckConstraint(
+            #     name="je_one_side_only",
+            #     check=(Q(debit_amount__isnull=False, credit_amount__isnull=True) |
+            #            Q(debit_amount__isnull=True, credit_amount__isnull=False)),
+            # ),
+            # (Optional) non-negative amounts at DB level:
+            # CheckConstraint(
+            #     name="je_non_negative",
+            #     check=(Q(debit_amount__gte=0) | Q(debit_amount__isnull=True)) &
+            #           (Q(credit_amount__gte=0) | Q(credit_amount__isnull=True)),
+            # ),
         ]
-    
+
+    def clean(self):
+        super().clean()
+
+        # Require account unless it's explicitly pending designation
+        if not self.bank_designation_pending and self.account_id is None:
+            raise ValidationError({"account": "Account is required unless bank_designation_pending is True."})
+
+        # Normalize/ensure date relative to transaction here so it also runs in preview (full_clean)
+        if not self.date:
+            self.date = self.transaction.date
+        # If someone bypasses full_clean and sets a string:
+        if isinstance(self.date, str):
+            parsed = parse_date(self.date)
+            if parsed:
+                self.date = parsed
+        if self.date and self.transaction_id and self.date < self.transaction.date:
+            raise ValidationError({"date": "Journal entry date cannot be earlier than the transaction date"})
+
+        # Validate amounts (DB constraints optional; model guard still nice)
+        if (self.debit_amount and self.debit_amount < 0) or (self.credit_amount and self.credit_amount < 0):
+            raise ValidationError("Amounts cannot be negative")
+        if self.debit_amount and self.credit_amount:
+            raise ValidationError("Only one of debit_amount or credit_amount can be set")
+        if self.debit_amount is None and self.credit_amount is None:
+            raise ValidationError("Either debit_amount or credit_amount must be set")
+
     def clean_fields(self, exclude=None):
         exclude = set(exclude or [])
         if 'debit_amount' not in exclude and self.debit_amount is not None:
-            # go through str() to kill binary float artifacts; then force 2dp
             self.debit_amount = Decimal(str(self.debit_amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-        
         if 'credit_amount' not in exclude and self.credit_amount is not None:
-            # go through str() to kill binary float artifacts; then force 2dp
             self.credit_amount = Decimal(str(self.credit_amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-        
         super().clean_fields(exclude=exclude)
-    
-    def save(self, *args, **kwargs):
-        # === validations you already have ===
-        if (self.debit_amount and self.debit_amount < 0) or (self.credit_amount and self.credit_amount < 0):
-            raise ValueError('Amounts cannot be negative')
-        if self.debit_amount and self.credit_amount:
-            raise ValueError('Only one of debit_amount or credit_amount can be set')
-        if self.debit_amount is None and self.credit_amount is None:
-            raise ValueError('Either debit_amount or credit_amount must be set')
-        
-        if not self.date:
-            self.date = self.transaction.date
-        if self.date < self.transaction.date:
-            raise ValueError('Journal entry date cannot be earlier than the transaction date')
 
-        # === auto-behavior for the pending flag ===
-        # If account has a concrete bank_account, it's designated (turn the flag off)
+    def save(self, *args, **kwargs):
+        # Ensure model logic runs even if saved outside the importer/admin
+        # (Your importer already calls full_clean(); this just adds safety.)
+        self.full_clean()
+
+        # Auto-behavior for the pending flag/designation:
         if self.account and getattr(self.account, "bank_account_id", None):
             self.bank_designation_pending = False
 
-        # If pending and account is empty, auto-route to the standard "pending" clearing account
         if self.bank_designation_pending and self.account_id is None:
             # Lazy import to avoid circulars
             from accounting.services.bank_structs import ensure_pending_bank_structs
-            # Pick currency from the transaction
             pending_ba, pending_gl = ensure_pending_bank_structs(
                 company_id=self.company_id,
                 currency_id=self.transaction.currency_id
             )
             self.account_id = pending_gl.id  # stays pending until reconciliation promotes it
 
-
-
+        # clean_fields already quantized; this is harmless but redundant—keep if you like:
         if self.debit_amount is not None:
             self.debit_amount = Decimal(str(self.debit_amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-        
         if self.credit_amount is not None:
             self.credit_amount = Decimal(str(self.credit_amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-        
-        super().save(*args, **kwargs)
-    
 
-    
+        return super().save(*args, **kwargs)
+
     def __str__(self):
-        return f'{self.transaction.date} - {self.transaction.amount} - {self.account.account_code} - {self.transaction.description}'
-    
-
+        acct_code = self.account.account_code if self.account_id else "pending-bank"
+        return f'{self.transaction.date} - {self.transaction.amount} - {acct_code} - {self.transaction.description}'
 
     def get_amount(self):
-        return self.debit_amount if self.debit_amount else self.credit_amount
-    
+        return self.debit_amount if self.debit_amount is not None else self.credit_amount
+
     def get_effective_amount(self):
-        # If the account has an account_direction field, use it; otherwise, default to 1.
-        direction = self.account.account_direction if self.account and self.account.account_direction else 1
-        #considers a debit in a positive direction account is positive.
-        #print(self)
-        #print(self.debit_amount, self.credit_amount)
-        amount = 0
-        if self.debit_amount:
-            amount= self.debit_amount
-        elif self.credit_amount:
-            amount= -self.credit_amount
-        #amount = self.debit_amount if self.debit_amount else -self.credit_amount
+        direction = self.account.account_direction if (self.account and self.account.account_direction) else 1
+        amount = Decimal('0')
+        if self.debit_amount is not None:
+            amount = self.debit_amount
+        elif self.credit_amount is not None:
+            amount = -self.credit_amount
         return amount * direction
-    
+
     def get_balance(self):
-        return self.debit_amount if self.debit_amount else -self.credit_amount
-    
-    @property
-    def has_designated_bank(self) -> bool:
-        return bool(self.account and getattr(self.account, "bank_account_id", None))
-    
+        return self.debit_amount if self.debit_amount is not None else (-self.credit_amount)
 
 class Rule(models.Model):
     name = models.CharField(max_length=100)
