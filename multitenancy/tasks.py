@@ -310,71 +310,70 @@ def _remember_row(ic: ImportContext, model_name: str, token: str, instance: Any)
     _log(logging.INFO, f"Mapped __row_id '{token}' -> {model_name}(id={getattr(instance, 'pk', None)})",
          ic, model=model_name, row_id=token)
 
-def _resolve_fk(model_cls, field_name: str, raw_value: Any, row_id_map: Optional[Dict[str, Any]] = None) -> Any:
+def _assign_fk_value(model_cls, field_name: str, resolved_value: Any, payload: dict) -> None:
     """
-    Accepts:
-      - instance of the remote model  -> returns the instance (OK to assign to FK)
-      - primary key as int/str        -> returns int(pk)
-      - token (e.g., 't1', 'Transaction:t1') -> resolved via row_id_map to instance or pk
-    Returns a value directly assignable to the model's FK field (instance or pk).
+    Assign resolved FK value into payload using either base field (instance) or attname (pk int).
+    """
+    field = model_cls._meta.get_field(field_name)
+    attname = getattr(field, "attname", field_name)
+    if isinstance(resolved_value, int):
+        payload.pop(field_name, None)           # avoid "entity=9"
+        payload[attname] = resolved_value       # use "entity_id=9"
+    else:
+        payload[field_name] = resolved_value    # instance goes to relation field
+        payload.pop(attname, None)
+
+def _resolve_fk(model_cls, field_name: str, raw_value: Any, row_id_map: Dict[str, Any]) -> Any:
+    """
+    Return a value suitable for assignment via _assign_fk_value:
+      - int PK   -> will be written to <attname> (e.g. entity_id)
+      - instance -> will be written to <field>   (e.g. entity)
+      - token    -> looked up in row_id_map (instance or int expected)
     """
     if raw_value in (None, ""):
         return None
 
-    field, remote_model, remote_name = _get_field_and_remote_model(model_cls, field_name)
+    field = model_cls._meta.get_field(field_name)
+    remote_model = getattr(field, "remote_field", None).model if getattr(field, "remote_field", None) else None
+    known_tokens = list(row_id_map.keys())
 
-    # already an instance?
-    if isinstance(raw_value, remote_model):
+    # Instance?
+    if isinstance(raw_value, models.Model):
+        if remote_model and not isinstance(raw_value, remote_model):
+            raise ValueError(f"{model_cls.__name__}.{field_name} expects {remote_model.__name__} instance, got {raw_value.__class__.__name__}")
         return raw_value
 
-    # primary key as int?
-    if isinstance(raw_value, int):
-        return raw_value
+    # int or "123"?
+    if isinstance(raw_value, int) or (isinstance(raw_value, str) and raw_value.strip().isdigit()):
+        return int(raw_value)
 
-    # primary key as numeric string?
-    if isinstance(raw_value, str) and raw_value.strip().isdigit():
-        return int(raw_value.strip())
+    # token form (e.g., "t1" or "Model:t1")
+    token = _norm_row_key(str(raw_value).strip())
+    candidate = row_id_map.get(token)
 
-    # token lookup in provided row-id map(s)
-    token = str(raw_value).strip()
-    norm_token = _norm_row_key(token)
-    maps = row_id_map or {}
-
-    # direct token
-    candidate = maps.get(norm_token)
     if candidate is None and ":" in token:
-        # allow "Model:token" form
         maybe_model, maybe_token = token.split(":", 1)
-        if maybe_model.strip() == remote_name:
-            candidate = maps.get(_norm_row_key(maybe_token.strip()))
+        candidate = row_id_map.get(_norm_row_key(maybe_token))
 
-    # if we found something, normalize return type
     if candidate is not None:
-        if isinstance(candidate, remote_model):
+        # Accept instance or int pk
+        if isinstance(candidate, models.Model):
+            if remote_model and not isinstance(candidate, remote_model):
+                # If it’s a different model but has a PK, fall back to pk when possible
+                pk = getattr(candidate, "pk", None)
+                if isinstance(pk, int):
+                    return pk
+                raise ValueError(f"Token {token!r} resolved to {candidate.__class__.__name__}, incompatible with {remote_model.__name__}")
             return candidate
         if isinstance(candidate, int):
             return candidate
-        # sometimes callers stash pk under an instance-like wrapper; try to pick pk
-        pk = getattr(candidate, "pk", getattr(candidate, "id", None))
-        if pk is not None:
-            return pk
 
-        # fallthrough → bad candidate type
-        raise ValueError(
-            f"Resolved token {token!r} for {model_cls.__name__}.{field_name} but got unsupported type "
-            f"{type(candidate).__name__}"
-        )
-
-    # Could not resolve token
-    known = list(maps.keys())
-    preview = ", ".join(known[:20]) + (" ..." if len(known) > 20 else "")
-    logger.error(
-        "Unresolved FK token for %s.%s | token=%r | known_row_ids=[%s]",
-        model_cls.__name__, field_name, token, preview, **_log_extra()
-    )
+    # No luck
+    preview = ", ".join(known_tokens[:20]) + (" ..." if len(known_tokens) > 20 else "")
     raise ValueError(
-        f"Invalid FK reference format {token!r} for field '{field_name}'. "
-        f"Expected numeric id, instance of {remote_name}, or a run token present in known __row_id keys."
+        f"Invalid FK reference format {raw_value!r} for field '{field_name}'. "
+        f"Expected numeric id, instance of {remote_model.__name__ if remote_model else 'related model'}, "
+        f"or a run token present in known __row_id keys [{preview}]"
     )
     
 def _build_instance(model_cls: type, payload: dict) -> models.Model:
@@ -1042,9 +1041,24 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                                 merged_maps = {**global_row_map_inst, **row_map_inst}
 
                                 if candidate is not None:
-                                    payload[field_name] = _resolve_fk(model, field_name, candidate, merged_maps)
+                                    resolved = _resolve_fk(model, field_name, candidate, {})
                                 else:
-                                    payload[field_name] = _resolve_fk(model, field_name, fk_val, merged_maps)
+                                    resolved = _resolve_fk(model, field_name, fk_val, {})
+                                
+                                _assign_fk_value(model, field_name, resolved, payload)
+                                
+                                # Optional helpful log:
+                                try:
+                                    field = model._meta.get_field(field_name)
+                                    attname = getattr(field, "attname", field_name)
+                                    where = field_name if not isinstance(resolved, int) else attname
+                                    rrepr = _stringify_instance(resolved) if isinstance(resolved, models.Model) else resolved
+                                    logger.info(
+                                        "Resolved %s.%s token=%r -> %s=%r",
+                                        model.__name__, field_name, fk_val, where, rrepr, **_log_extra()
+                                    )
+                                except Exception:
+                                    pass
                                 
                                 # Log resolution result (only if it was a string token)
                                 if isinstance(fk_val, str):
@@ -1077,7 +1091,8 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                                                 "Rescuing misplaced token in %s.%s: %r",
                                                 model.__name__, base, val, **_log_extra()
                                             )
-                                            payload[base] = _resolve_fk(model, base, candidate, {**global_row_map_inst, **row_map_inst})
+                                            resolved = _resolve_fk(model, base, candidate, {**global_row_map_inst, **row_map_inst})
+                                            _assign_fk_value(model, base, resolved, payload)
                                         else:
                                             # leave as-is; full_clean will complain and we’ll show a clear error
                                             pass
@@ -1290,7 +1305,8 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                                     if IMPORT_VERBOSE_FK:
                                         logger.debug("[FK][RESCUE] %s.%s had string token %r; attempting row-id resolution",
                                                      model.__name__, base, val)
-                                    payload[base] = _resolve_fk(model, base, val, merged_map)
+                                    resolved = _resolve_fk(model, base, val, merged_map)
+                                    _assign_fk_value(model, field_name, resolved, payload)
 
                         # MPTT parent chain
                         if _is_mptt_model(model):
