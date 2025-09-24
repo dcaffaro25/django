@@ -13,7 +13,7 @@ from collections import defaultdict, deque
 from contextvars import ContextVar
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 from celery import shared_task
 from django.apps import apps
@@ -54,8 +54,8 @@ from .api_utils import (
 logger = logging.getLogger("importer")
 sql_logger = logging.getLogger("importer.sql")
 
+# Avoid mixing our structured extras into gunicorn.access records
 try:
-    # Keep gunicorn.access from reformatting our structured "extra" fields
     logging.getLogger("gunicorn.access").propagate = False
 except Exception:
     pass
@@ -233,42 +233,6 @@ def _assign_fk_value(model_cls, field_name: str, resolved_value: Any, payload: d
         return field_name, resolved_value
 
 
-def _resolve_fk(model_cls, field_name: str, raw_value: Any) -> Any:
-    """
-    Accepts:
-      - Model instance
-      - integer id (or stringified integer)
-      - token string (we don't resolve here)
-    Returns:
-      - instance or int id
-    Raises:
-      - ValueError for invalid formats
-    """
-    if raw_value in (None, ""):
-        return None
-
-    field = model_cls._meta.get_field(field_name)
-    remote_model = getattr(field, "remote_field", None).model if getattr(field, "remote_field", None) else None
-
-    # direct model instance
-    if isinstance(raw_value, Model):
-        if remote_model and not isinstance(raw_value, remote_model):
-            raise ValueError(f"{model_cls.__name__}.{field_name} expects {remote_model.__name__} instance, got {raw_value.__class__.__name__}")
-        return raw_value
-
-    # direct numeric id
-    if isinstance(raw_value, int) or (isinstance(raw_value, str) and str(raw_value).strip().isdigit()):
-        return int(raw_value)
-
-    # token-ish – leave resolution to SAVE pass
-    if isinstance(raw_value, str):
-        s = str(raw_value).strip()
-        if s:
-            return s  # token; will be handled as deferred if needed
-
-    raise ValueError(f"Invalid FK reference {raw_value!r} for '{field_name}'")
-
-
 def _normalize_payload_for_model(model, payload: Dict[str, Any], *, context_company_id=None):
     data = dict(payload)
     field_names = {f.name for f in model._meta.get_fields() if getattr(f, "concrete", False)}
@@ -328,18 +292,16 @@ def _filter_unknown(model, row: Dict[str, Any]):
 
 
 def _preflight_missing_required(model, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """
-    Only checks for required fields that are *not FK tokens slated for deferral*.
-    The actual FK token resolution happens during the SAVE pass.
-    """
     errors = {}
-    # Collect required fields (non-null, no default, not auto)
     required_fields = []
     field_map = {}
     for f in model._meta.fields:
         if not hasattr(f, "attname"):
             continue
-        is_auto_ts = ((getattr(f, "auto_now", False)) or (getattr(f, "auto_now_add", False)))
+        is_auto_ts = (
+            (hasattr(f, "auto_now") and getattr(f, "auto_now")) or
+            (hasattr(f, "auto_now_add") and getattr(f, "auto_now_add"))
+        )
         has_default = (getattr(f, "default", NOT_PROVIDED) is not NOT_PROVIDED)
         if (not f.null) and (not f.primary_key) and (not f.auto_created) and (not has_default) and (not is_auto_ts):
             required_fields.append(f)
@@ -349,7 +311,8 @@ def _preflight_missing_required(model, rows: List[Dict[str, Any]]) -> Dict[str, 
         field_map[base] = accepted
 
     for i, row in enumerate(rows):
-        rid = _norm_row_key(row.get("__row_id") or f"row{i+1}")
+        rid = row.get("__row_id") or f"row{i+1}"
+        rid = _norm_row_key(rid)
         payload = {k: v for k, v in row.items() if k != "__row_id"}
 
         missing = []
@@ -478,8 +441,31 @@ def _unknown_from_original_input(model, row_obj: Dict[str, Any]) -> List[str]:
 
 
 # --------------------------------------------------------------------------------------
-# Simple helpers for actions / tokens
+# Planning: tokens & dependency graph
 # --------------------------------------------------------------------------------------
+def _is_numeric_id(token: str | int | None) -> bool:
+    if token is None:
+        return False
+    if isinstance(token, int):
+        return True
+    s = str(token).strip()
+    return s.isdigit()
+
+
+@dataclass
+class PlannedRow:
+    model_name: str
+    rid: str            # normalized __row_id (token or numeric str)
+    is_token: bool      # True if rid is not purely numeric
+    action: str         # "create" or "update"
+    payload: Dict[str, Any]
+    original_input: Dict[str, Any]
+    observations: List[str]
+    unknown_cols_now: List[str]
+    preflight_error: Optional[Dict[str, Any]]
+    parents: Set[str]   # tokens this row depends on (subset of all tokens in file)
+
+
 def _infer_action_and_clean_id(payload: Dict[str, Any], original_input: Dict[str, Any]):
     def _coerce_pk(val):
         if val is None or val == "":
@@ -509,48 +495,131 @@ def _infer_action_and_clean_id(payload: Dict[str, Any], original_input: Dict[str
     return "create", None, ext_id
 
 
-# --------------------------------------------------------------------------------------
-# Topological sort (used for tokens within a group)
-# --------------------------------------------------------------------------------------
-def _toposort_nodes(nodes: List[str], depends_on: Dict[str, set], tie_break_key) -> List[str]:
-    all_nodes = set(nodes)
-    for n in list(depends_on.keys()):
-        all_nodes.add(n)
-        all_nodes |= set(depends_on[n])
+def _build_dependency_graph(prepared_by_model: Dict[str, List[PlannedRow]]) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]], Dict[str, PlannedRow]]:
+    """
+    Returns:
+      parents_of[child] = set(parent_tokens)
+      children_of[parent] = set(child_rids)
+      rows_by_rid
+    """
+    rows_by_rid: Dict[str, PlannedRow] = {}
+    all_rids: Set[str] = set()
+    token_set: Set[str] = set()
 
-    indeg = {n: 0 for n in all_nodes}
-    adj = {n: set() for n in all_nodes}
-    for a in all_nodes:
-        for b in depends_on.get(a, set()):
-            if b in all_nodes:
-                adj[b].add(a)  # b -> a
-                indeg[a] += 1
+    for m, rows in prepared_by_model.items():
+        for r in rows:
+            rows_by_rid[r.rid] = r
+            all_rids.add(r.rid)
+            if r.is_token:
+                token_set.add(r.rid)
 
-    q = deque(sorted([n for n in all_nodes if indeg[n] == 0], key=tie_break_key))
+    parents_of: Dict[str, Set[str]] = defaultdict(set)
+    children_of: Dict[str, Set[str]] = defaultdict(set)
+
+    # Build edges ONLY when *_fk references a token that exists in this file
+    for m, rows in prepared_by_model.items():
+        app_label = MODEL_APP_MAP[m]
+        model = apps.get_model(app_label, m)
+        fk_fields = [f for f in model._meta.get_fields() if isinstance(f, dj_models.ForeignKey)]
+        fk_names = [f.name for f in fk_fields]
+
+        for r in rows:
+            parents = set()
+            oi = r.original_input
+
+            # Explicit *_fk columns
+            for base in fk_names:
+                v = oi.get(f"{base}_fk")
+                if v in (None, ""):
+                    continue
+                # numeric id? => no token edge
+                if _is_numeric_id(v):
+                    continue
+                # token value
+                tok = _norm_row_key(str(v))
+                if tok in token_set:
+                    parents.add(tok)
+
+            # Rescue: token typed into base field string
+            for base in fk_names:
+                base_val = r.payload.get(base)
+                if isinstance(base_val, str) and not _is_numeric_id(base_val):
+                    tok = _norm_row_key(base_val)
+                    if tok in token_set:
+                        parents.add(tok)
+
+            # MPTT path parent tokens are handled via explicit *_fk if you emit them;
+            # if you need path-string→token discovery, plug it here.
+
+            r.parents = parents
+            for p in parents:
+                parents_of[r.rid].add(p)
+                children_of[p].add(r.rid)
+
+    # Ensure all rids appear in maps
+    for rid in all_rids:
+        parents_of.setdefault(rid, set())
+        children_of.setdefault(rid, set())
+
+    return parents_of, children_of, rows_by_rid
+
+
+def _connected_components(nodes: Set[str], undirected_adj: Dict[str, Set[str]]) -> List[Set[str]]:
+    """Return list of sets (each a connected component)."""
+    seen: Set[str] = set()
+    components: List[Set[str]] = []
+    for n in nodes:
+        if n in seen:
+            continue
+        comp = set()
+        stack = [n]
+        seen.add(n)
+        while stack:
+            u = stack.pop()
+            comp.add(u)
+            for v in undirected_adj.get(u, set()):
+                if v not in seen:
+                    seen.add(v)
+                    stack.append(v)
+        components.append(comp)
+    return components
+
+
+def _toposort_group(group_nodes: Set[str], parents_of: Dict[str, Set[str]], rows_by_rid: Dict[str, PlannedRow], order_hint: Dict[str, int]) -> Tuple[List[str], bool]:
+    """
+    Kahn's algorithm over this group's nodes.
+    Returns (order, acyclic)
+    Tie-break using model order hint, then by original appearance (rid).
+    """
+    indeg = {n: 0 for n in group_nodes}
+    for child in group_nodes:
+        indeg[child] = len([p for p in parents_of.get(child, set()) if p in group_nodes])
+    # model hint
+    def key_fn(rid: str):
+        m = rows_by_rid[rid].model_name
+        return (order_hint.get(m, 10_000), rid)
+
+    q = deque(sorted([n for n in group_nodes if indeg[n] == 0], key=key_fn))
     out: List[str] = []
     while q:
         u = q.popleft()
         out.append(u)
-        for v in sorted(adj[u], key=tie_break_key):
-            indeg[v] -= 1
-            if indeg[v] == 0:
-                q.append(v)
-
-    # If cycle, just fall back to tie-break order for the remaining nodes
-    if len(out) != len(all_nodes):
-        rem = [n for n in all_nodes if n not in out]
-        out.extend(sorted(rem, key=tie_break_key))
-
-    # Return only requested nodes in produced order
-    final = [n for n in out if n in set(nodes)]
-    for n in nodes:
-        if n not in final:
-            final.append(n)
-    return final
+        # reduce indegree of children in this group
+        # build reverse: for efficiency, derive children from parents_of
+        for v in group_nodes:
+            if u in parents_of.get(v, set()):
+                indeg[v] -= 1
+                if indeg[v] == 0:
+                    q.append(v)
+    acyclic = (len(out) == len(group_nodes))
+    if not acyclic:
+        # return partial order; caller will treat as cycle
+        pass
+    return out, acyclic
 
 
 # --------------------------------------------------------------------------------------
-# Core import executor — per-group savepoints with FK deferral
+# Core: plan → group → order → materialize (savepoint per group)
 # --------------------------------------------------------------------------------------
 DUP_CHECK_LAST_N = 10
 
@@ -604,20 +673,10 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
     t0 = time.monotonic()
     with _SlowSQL(threshold_ms=200):
         # ---------------- PREP ----------------
-        prepared: List[Dict[str, Any]] = []
-        models_in_order: List[str] = []
         dup_infos: Dict[str, Dict[str, Any]] = {}
-
-        # run-wide instance + pk maps (for token staging; pk entries are populated only during per-group saves)
-        global_row_map_inst: Dict[str, Any] = {}  # token -> instance (possibly unsaved)
-        global_row_map_pk: Dict[str, int] = {}    # token -> pk (only after save)
-
-        # For grouping and ordering
-        staged_by_token: Dict[str, Dict[str, Any]] = {}  # token -> row_bundle skeleton (filled later)
-        token_to_model: Dict[str, str] = {}
-        token_insertion_index: Dict[str, int] = {}  # stable tie-break across whole file
-
-        insertion_counter = 0
+        prepared_by_model: Dict[str, List[PlannedRow]] = {}
+        models_in_file: List[str] = []
+        any_prep_error = False
 
         for sheet in sheets:
             model_name = sheet["model"]
@@ -626,7 +685,8 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
             app_label = MODEL_APP_MAP.get(model_name)
             if not app_label:
                 logger.error("sheet_app_missing", **_log_extra(error=f"MODEL_APP_MAP missing entry for '{model_name}'"))
-                prepared.append({"model": model_name, "rows": [], "had_error": True, "sheet_error": f"MODEL_APP_MAP missing entry for '{model_name}'"})
+                prepared_by_model.setdefault(model_name, [])
+                any_prep_error = True
                 continue
 
             model = apps.get_model(app_label, model_name)
@@ -691,8 +751,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
             }
 
             preflight_err = _preflight_missing_required(model, rows)
-
-            packed_rows = []
+            prepared_rows: List[PlannedRow] = []
             had_err = False
 
             for idx, row in enumerate(rows):
@@ -723,7 +782,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                     payload = _coerce_boolean_fields(model, payload)
                     payload = _quantize_decimal_fields(model, payload)
 
-                    action, pk, ext_id = _infer_action_and_clean_id(payload, original_input)
+                    action, _, _ = _infer_action_and_clean_id(payload, original_input)
                     unknown_cols_now = _unknown_from_original_input(model, {"_original_input": original_input, "payload": payload})
 
                     status_val = "ok"
@@ -731,27 +790,27 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                     if unknown_cols_now:
                         status_val = "warning"
                         msg = f"{msg} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
+                    pe = None
                     if rid in preflight_err:
                         status_val = "error"
                         msg = preflight_err[rid]["message"]
+                        pe = preflight_err[rid]
                         if unknown_cols_now:
                             msg = f"{msg} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
 
-                    row_obj = {
-                        "__row_id": rid,
-                        "status": status_val,
-                        "message": msg,
-                        "payload": payload,
-                        "_original_input": original_input,
-                        "observations": observations,
-                        "action": action,
-                        "external_id": ext_id,
-                    }
-                    if status_val == "error":
-                        row_obj["preflight_error"] = preflight_err[rid]
-                        had_err = True
-
-                    packed_rows.append(row_obj)
+                    pr = PlannedRow(
+                        model_name=model_name,
+                        rid=rid,
+                        is_token=not _is_numeric_id(rid),
+                        action=action,
+                        payload=payload,
+                        original_input=original_input,
+                        observations=observations,
+                        unknown_cols_now=unknown_cols_now,
+                        preflight_error=pe,
+                        parents=set(),
+                    )
+                    prepared_rows.append(pr)
 
                 except Exception as e:
                     had_err = True
@@ -762,424 +821,349 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                     tmp_payload = _normalize_payload_for_model(model, tmp_filtered, context_company_id=company_id)
                     tmp_payload = _coerce_boolean_fields(model, tmp_payload)
                     tmp_payload = _quantize_decimal_fields(model, tmp_payload)
-                    action, pk, ext_id = _infer_action_and_clean_id(dict(tmp_payload), original_input)
+                    action, _, _ = _infer_action_and_clean_id(dict(tmp_payload), original_input)
                     unknown_cols_now = _unknown_from_original_input(model, {"_original_input": original_input, "payload": tmp_payload})
                     base = err["summary"]
                     if unknown_cols_now:
                         base = f"{base} | Ignoring unknown columns: {', '.join(unknown_cols_now)}"
-
                     logger.error(
                         "[IMPORT][PREP][EXC] model=%s row_id=%s action=%s err=%s",
-                        model_name,
-                        rid,
-                        action,
-                        base,
-                        exc_info=True,
-                        **_log_extra(),
+                        model_name, rid, action, base, exc_info=True, **_log_extra()
                     )
-                    packed_rows.append({
-                        "__row_id": rid,
-                        "status": "error",
-                        "payload": tmp_payload,
-                        "_original_input": original_input,
-                        "observations": observations,
-                        "message": base,
-                        "error": {**err, "summary": base},
-                        "action": action,
-                        "external_id": ext_id,
-                    })
+                    # Record as a PlannedRow with preflight_error so it will be reported
+                    prepared_rows.append(PlannedRow(
+                        model_name=model_name,
+                        rid=rid,
+                        is_token=not _is_numeric_id(rid),
+                        action=action,
+                        payload=tmp_payload,
+                        original_input=original_input,
+                        observations=observations,
+                        unknown_cols_now=unknown_cols_now,
+                        preflight_error={"code": "PREP_EXCEPTION", "message": base, "error": err},
+                        parents=set(),
+                    ))
 
-            prepared.append({"model": model_name, "rows": packed_rows, "had_error": had_err})
-            models_in_order.append(model_name)
+            prepared_by_model[model_name] = prepared_rows
+            models_in_file.append(model_name)
+            any_prep_error = any_prep_error or had_err
             logger.info("sheet_end", **_log_extra(had_error=bool(had_err)))
 
-        # Stable baseline model order
-        models_in_order = sorted(models_in_order, key=lambda m: ORDER_HINT.get(m, 1000))
-        logger.info("order_resolved", **_log_extra(models=models_in_order))
+        models_in_file = sorted(models_in_file, key=lambda m: ORDER_HINT.get(m, 1000))
+        logger.info("order_resolved", **_log_extra(models=models_in_file))
 
-        # ---------------- BUILD (stage instances, collect token deps) ----------------
-        # Outputs by model for the final API response
-        row_outputs_by_model: Dict[str, List[Dict[str, Any]]] = {m: [] for m in models_in_order}
-
-        # Keep a simple undirected graph to build groups and a directed depends_on for topo inside the group
-        undirected_adj: Dict[str, set] = defaultdict(set)  # token <-> token (for connected components)
-        token_depends_on: Dict[str, set] = defaultdict(set)  # dependent_token -> {provider_tokens}
-
-        # Track models touched for sequence reset
-        models_touched: set = set()
-
-        insertion_counter = 0
-
-        for model_name in models_in_order:
-            _model_ctx.set(model_name)
-            app_label = MODEL_APP_MAP[model_name]
-            model = apps.get_model(app_label, model_name)
-            models_touched.add(model)
-
-            rows = next(b["rows"] for b in prepared if b["model"] == model_name)
-
-            logger.debug(
-                "model_begin_build_validate",
-                **_log_extra(rows=len(rows), global_map_inst_size=len(global_row_map_inst), global_map_pk_size=len(global_row_map_pk)),
-            )
-
-            local_row_map_inst: Dict[str, Any] = {}
-            local_row_map_pk: Dict[str, int] = {}
-
-            for row in rows:
-                rid = _norm_row_key(row["__row_id"])
-                _row_ctx.set(rid)
-
-                # Carry through preflight errors directly to output
-                if row.get("status") == "error" and row.get("preflight_error"):
-                    row_outputs_by_model[model_name].append({
-                        "__row_id": rid,
-                        "status": "error",
-                        "action": row.get("action"),
-                        "data": row.get("_original_input") or row.get("payload") or {},
-                        "message": row["preflight_error"]["message"],
-                        "error": row["preflight_error"],
-                        "observations": row.get("observations", []),
-                        "external_id": row.get("external_id"),
-                    })
-                    continue
-
-                payload = dict(row.get("payload") or {})
-                original_input = row.get("_original_input") or {}
-                action = row.get("action") or "create"
-                unknown_cols_now = _unknown_from_original_input(model, row)
-
-                logger.debug("row_input_data", **_log_extra(data=original_input))
-                logger.debug("row_payload_before_resolution", **_log_extra(payload=payload))
-
-                try:
-                    deferred_fks: List[Tuple[str, str]] = []  # (field_name, token_string)
-
-                    fk_keys = [k for k in list(payload.keys()) if k.endswith("_fk")]
-                    if fk_keys:
-                        logger.debug(
-                            "fk_keys_detected",
-                            **_log_extra(keys=fk_keys),
-                        )
-                        logger.debug(
-                            "fk_context_before_resolution",
-                            **_log_extra(
-                                local_map_inst=_repr_map_inst(local_row_map_inst),
-                                local_map_pk=dict(local_row_map_pk),
-                                global_map_inst=_repr_map_inst(global_row_map_inst),
-                                global_row_map_pk=dict(global_row_map_pk),
-                            ),
-                        )
-
-                    # Resolve each *_fk key into either an id, instance, or a deferred token
-                    for fk_key in fk_keys:
-                        base = fk_key[:-3]
-                        raw = payload.pop(fk_key)
-                        field = model._meta.get_field(base)
-                        attname = getattr(field, "attname", base)
-
-                        if _is_missing(raw):
-                            payload[attname] = None
-                            continue
-
-                        resolved = _resolve_fk(model, base, raw)
-
-                        # If resolved is a str and not a digit, treat it as a token => DEFER
-                        if isinstance(resolved, str) and (not resolved.isdigit()):
-                            token_norm = _norm_row_key(resolved)
-                            deferred_fks.append((base, token_norm))
-                            payload.pop(base, None)
-                            payload[attname] = None
-
-                            # Graph: dependent rid depends on provider token_norm
-                            undirected_adj[rid].add(token_norm)
-                            undirected_adj[token_norm].add(rid)
-                            token_depends_on[rid].add(token_norm)
-                            logger.debug("fk_deferred", **_log_extra(field=base, token=resolved, reason="token placeholder"))
-                        else:
-                            # assign either integer id or instance
-                            where, assigned = _assign_fk_value(model, base, resolved, payload)
-                            logger.debug(
-                                "fk_resolved",
-                                **_log_extra(
-                                    field=base,
-                                    assigned_to=where,
-                                    value=_stringify_instance(assigned) if isinstance(assigned, Model) else assigned,
+        # If we are committing and already have prep-time errors, return early
+        if commit and any(
+            any(pr.preflight_error for pr in prepared_by_model[m])
+            for m in models_in_file
+        ):
+            dt = int((time.monotonic() - t0) * 1000)
+            logger.info("import_end", **_log_extra(elapsed_ms=dt, committed=False, reason="prep_errors"))
+            return {
+                "committed": False,
+                "reason": "prep_errors",
+                "file_info": file_info,
+                "imports": [
+                    {
+                        "model": m,
+                        "dup_info": dup_infos.get(m),
+                        "result": [
+                            {
+                                "__row_id": pr.rid,
+                                "status": ("error" if pr.preflight_error else "warning" if pr.unknown_cols_now else "ok"),
+                                "action": pr.action,
+                                "data": pr.original_input or pr.payload or {},
+                                "message": (pr.preflight_error or {}).get("message") if pr.preflight_error else (
+                                    "validated" + (f" | Ignoring unknown columns: {', '.join(pr.unknown_cols_now)}" if pr.unknown_cols_now else "")
                                 ),
-                            )
-
-                    # Rescue base-field token misuse: transaction="t1"
-                    for f in model._meta.get_fields():
-                        if isinstance(f, dj_models.ForeignKey):
-                            base = f.name
-                            val = payload.get(base)
-                            if isinstance(val, str) and (not val.isdigit()):
-                                tok = _norm_row_key(val)
-                                deferred_fks.append((base, tok))
-                                payload.pop(base, None)
-                                payload[getattr(f, "attname", base)] = None
-                                undirected_adj[rid].add(tok)
-                                undirected_adj[tok].add(rid)
-                                token_depends_on[rid].add(tok)
-                                logger.warning("fk_rescue_base_field", **_log_extra(field=base, token=val))
-
-                    # MPTT support
-                    if _is_mptt_model(model):
-                        path_val = _get_path_value(payload)
-                        if path_val:
-                            parts = _split_path(path_val)
-                            parent = _resolve_parent_from_path_chain(model, parts[:-1]) if len(parts) > 1 else None
-                            payload["parent"] = parent
-                            payload.pop("parent_id", None)
-                            logger.debug("mptt_parent_resolved", **_log_extra(parent=_stringify_instance(parent) if parent else None))
-
-                    # Important: DO NOT raise on missing required FK if it was deferred
-                    # We validate with excluded fields below and bind in SAVE pass.
-                    logger.debug("row_payload_after_resolution", **_log_extra(payload=payload))
-
-                    # Build (unsaved) instance
-                    instance = model(**payload)
-
-                    # Validate with deferred FKs excluded
-                    if hasattr(instance, "full_clean"):
-                        exclude = []
-                        for base, _tok in deferred_fks:
-                            exclude.append(base)
-                            f = model._meta.get_field(base)
-                            att = getattr(f, "attname", base)
-                            if att != base:
-                                exclude.append(att)
-                        instance.full_clean(exclude=exclude or None)
-
-                    # Stage
-                    bundle = {
-                        "row_id": rid,
-                        "instance": instance,
-                        "payload_used": payload,
-                        "original_input": original_input,
-                        "action": action,
-                        "deferred_fks": deferred_fks,  # list[(field, token)]
-                        "model_name": model_name,
+                                "error": (pr.preflight_error or {}).get("error"),
+                                "observations": pr.observations,
+                                "external_id": None,
+                            }
+                            for pr in prepared_by_model[m]
+                        ]
                     }
-                    token_to_model[rid] = model_name
-                    token_insertion_index[rid] = insertion_counter
-                    insertion_counter += 1
-                    staged_by_token[rid] = bundle
+                    for m in models_in_file
+                ],
+            }
 
-                    _register_row_token(local_row_map_inst, {}, rid, instance)
-                    _register_row_token(global_row_map_inst, {}, rid, instance)
+        # ---------------- PLAN: Graph & Groups ----------------
+        parents_of, children_of, rows_by_rid = _build_dependency_graph(prepared_by_model)
 
-                    logger.debug(
-                        "row_token_staged",
-                        **_log_extra(
-                            token=rid,
-                            instance=_stringify_instance(instance),
-                            local_map_inst=_repr_map_inst(local_row_map_inst),
-                            global_map_inst=_repr_map_inst(global_row_map_inst),
-                        ),
-                    )
+        # undirected adjacency for grouping
+        undirected_adj: Dict[str, Set[str]] = defaultdict(set)
+        all_nodes: Set[str] = set(rows_by_rid.keys())
+        for child, parents in parents_of.items():
+            for p in parents:
+                undirected_adj[child].add(p)
+                undirected_adj[p].add(child)
+        for n in all_nodes:
+            undirected_adj.setdefault(n, set())
 
-                    row_outputs_by_model[model_name].append({
-                        "__row_id": rid,
-                        "status": "pending",
-                        "action": action,
-                        "data": payload,
-                        "message": "validated",
-                        "observations": row.get("observations", []),
-                        "external_id": row.get("external_id"),
-                    })
+        groups: List[Set[str]] = _connected_components(all_nodes, undirected_adj)
 
-                except Exception as e:
-                    err = exception_to_dict(e, include_stack=False)
-                    base_msg = err.get("summary") or str(e)
-                    if unknown_cols_now:
-                        base_msg += " | Ignoring unknown columns: " + ", ".join(unknown_cols_now)
-                    logger.error(
-                        "[IMPORT][BUILD][EXC] model=%s row_id=%s action=%s err=%s",
-                        model_name,
-                        rid,
-                        action,
-                        base_msg,
-                        exc_info=True,
-                        **_log_extra(),
-                    )
-                    row_outputs_by_model[model_name].append({
-                        "__row_id": rid,
+        # ---------------- EXECUTE GROUPS ----------------
+        # final outputs organized by model
+        row_outputs_by_model: Dict[str, List[Dict[str, Any]]] = {m: [] for m in models_in_file}
+        models_touched: Set[str] = set()
+
+        # For preview mode we will reset sequences at the end for all touched models
+        for gi, group in enumerate(groups, start=1):
+            # Topo order within the group
+            order, acyclic = _toposort_group(group, parents_of, rows_by_rid, ORDER_HINT)
+            if not acyclic:
+                # mark all rows in this group as cycle error
+                msg = "Detected cyclic token dependencies inside the group; provide a numeric id for at least one side or split the cycle."
+                for rid in sorted(group):
+                    pr = rows_by_rid[rid]
+                    _model_ctx.set(pr.model_name); _row_ctx.set(pr.rid)
+                    row_outputs_by_model[pr.model_name].append({
+                        "__row_id": pr.rid,
                         "status": "error",
-                        "action": action,
-                        "data": original_input,
-                        "message": base_msg,
-                        "error": {**err, "summary": base_msg},
-                        "observations": row.get("observations", []),
-                        "external_id": row.get("external_id"),
+                        "action": pr.action,
+                        "data": pr.original_input or pr.payload or {},
+                        "message": msg,
+                        "observations": pr.observations,
+                        "external_id": None,
                     })
-
-            logger.debug(
-                "model_end_build_validate",
-                **_log_extra(
-                    local_map_inst_size=len(local_row_map_inst),
-                    global_map_inst_size=len(global_row_map_inst),
-                ),
-            )
-
-        # ---------------- GROUPING (connected components on tokens) ----------------
-        # Only consider tokens that are currently "pending"
-        pending_tokens = {
-            r["__row_id"]
-            for m in models_in_order
-            for r in row_outputs_by_model[m]
-            if r.get("status") == "pending"
-        }
-
-        # Ensure we include isolated tokens too
-        for tok in pending_tokens:
-            undirected_adj.setdefault(tok, set())
-
-        # Build connected components
-        groups: List[List[str]] = []
-        seen = set()
-        for start in sorted(pending_tokens, key=lambda t: (ORDER_HINT.get(token_to_model.get(t, ""), 1000), token_insertion_index.get(t, 10_000_000))):
-            if start in seen:
                 continue
-            comp = []
-            q = deque([start])
-            seen.add(start)
-            while q:
-                u = q.popleft()
-                comp.append(u)
-                for v in undirected_adj.get(u, set()):
-                    if (v in pending_tokens) and (v not in seen):
-                        seen.add(v)
-                        q.append(v)
-            groups.append(comp)
 
-        logger.info("group_count", **_log_extra(groups=len(groups)))
+            # Early structural check: any parent token missing from this import?
+            # (Shouldn't happen due to graph build, but keep a guard)
+            missing_refs = []
+            for rid in order:
+                for p in rows_by_rid[rid].parents:
+                    if p not in rows_by_rid:
+                        missing_refs.append((rid, p))
+            if missing_refs:
+                for rid, p in missing_refs:
+                    pr = rows_by_rid[rid]
+                    _model_ctx.set(pr.model_name); _row_ctx.set(pr.rid)
+                    msg = f"Token {p!r} referenced by row {rid!r} ({pr.model_name}) not found in this import."
+                    row_outputs_by_model[pr.model_name].append({
+                        "__row_id": pr.rid,
+                        "status": "error",
+                        "action": pr.action,
+                        "data": pr.original_input or pr.payload or {},
+                        "message": msg,
+                        "observations": pr.observations,
+                        "external_id": None,
+                    })
+                continue
 
-        # ---------------- SAVE (per-group savepoints) ----------------
-        models_touched_final: set = set()
+            logger.info("group_begin", **_log_extra(group_index=gi, size=len(group), order=order))
 
-        for comp in groups:
-            # order inside the group by token-level topo (providers before dependents),
-            # tie-break by model order then by insertion index
-            def _tie_key(tok: str):
-                return (ORDER_HINT.get(token_to_model.get(tok, ""), 1000), token_insertion_index.get(tok, 10_000_000), tok)
+            # Group savepoint
+            group_failed = False
+            failed_tokens: Set[str] = set()
+            failure_messages_by_token: Dict[str, str] = {}
+            saved_instances_by_token: Dict[str, Model] = {}
+            # Keep track of outputs for this group so we can adjust messages if rolled back
+            group_outputs: List[Tuple[str, str, Dict[str, Any]]] = []  # (model_name, rid, output_dict)
 
-            ordered_tokens = _toposort_nodes(comp, token_depends_on, _tie_key)
-
-            # Open a group savepoint
             with transaction.atomic():
                 sp = transaction.savepoint()
-                _model_ctx.set(",".join(sorted({token_to_model.get(t, "?") for t in ordered_tokens})))
-                logger.info("group_begin", **_log_extra(size=len(ordered_tokens), tokens=ordered_tokens))
-
-                group_failed = False
-                error_summary = None
-                saved_tokens_this_group: List[str] = []
-
                 try:
-                    for tok in ordered_tokens:
-                        bundle = staged_by_token.get(tok)
-                        if not bundle:
-                            # Should not happen for pending tokens; skip defensively
+                    for rid in order:
+                        pr = rows_by_rid[rid]
+                        _model_ctx.set(pr.model_name); _row_ctx.set(pr.rid)
+
+                        # If row had preflight error, just report and mark group failed
+                        if pr.preflight_error:
+                            out = {
+                                "__row_id": pr.rid,
+                                "status": "error",
+                                "action": pr.action,
+                                "data": pr.original_input or pr.payload or {},
+                                "message": pr.preflight_error.get("message") or "Preflight error",
+                                "error": pr.preflight_error.get("error"),
+                                "observations": pr.observations,
+                                "external_id": None,
+                            }
+                            group_outputs.append((pr.model_name, pr.rid, out))
+                            group_failed = True
+                            failed_tokens.add(pr.rid)
+                            failure_messages_by_token[pr.rid] = out["message"]
                             continue
 
-                        model_name = bundle["model_name"]
-                        app_label = MODEL_APP_MAP[model_name]
-                        model = apps.get_model(app_label, model_name)
-                        instance = bundle["instance"]
-                        deferred_fks: List[Tuple[str, str]] = bundle["deferred_fks"]
+                        # If already failed (parent), mark as blocked
+                        blocking_parents = [p for p in pr.parents if p in failed_tokens]
+                        if group_failed and blocking_parents:
+                            msg = f"Parent row(s) {', '.join(sorted(blocking_parents))} failed; unable to validate or save this child."
+                            out = {
+                                "__row_id": pr.rid,
+                                "status": "error",
+                                "action": pr.action,
+                                "data": pr.original_input or pr.payload or {},
+                                "message": msg,
+                                "observations": pr.observations,
+                                "external_id": None,
+                            }
+                            group_outputs.append((pr.model_name, pr.rid, out))
+                            continue
 
-                        _model_ctx.set(model_name)
-                        _row_ctx.set(tok)
+                        # Resolve FKs to PKs (no deferrals)
+                        app_label = MODEL_APP_MAP[pr.model_name]
+                        model = apps.get_model(app_label, pr.model_name)
+                        models_touched.add(pr.model_name)
 
-                        # Bind deferred FKs using pks from tokens saved earlier in THIS or previous groups
-                        for base, ref_token in deferred_fks:
-                            f = model._meta.get_field(base)
-                            attname = getattr(f, "attname", base)
-                            ref_t = _norm_row_key(ref_token)
-                            pkv = global_row_map_pk.get(ref_t)
-                            if not isinstance(pkv, int):
-                                # Can't bind token -> missing provider
-                                msg = f"Could not resolve deferred FK token {ref_token!r} to a saved id"
-                                logger.error("[IMPORT][GROUP][FK_RESOLVE_MISSING] %s", msg, **_log_extra())
-                                raise ValidationError({base: [msg]})
-                            setattr(instance, attname, pkv)
-                            logger.debug("fk_deferred_bound", **_log_extra(field=base, token=ref_token, assigned_id=pkv))
+                        payload = dict(pr.payload)
+                        # fill company/tenant already handled in normalize
 
-                        if hasattr(instance, "full_clean"):
-                            instance.full_clean()
+                        # FK resolution using *_fk or rescued tokens
+                        fk_fields = [f for f in model._meta.get_fields() if isinstance(f, dj_models.ForeignKey)]
+                        for f in fk_fields:
+                            base = f.name
+                            att = getattr(f, "attname", base)
+                            raw = pr.original_input.get(f"{base}_fk", None)
+                            if raw in ("", None):
+                                # Perhaps base field contains value (id or token)
+                                v = payload.get(base, payload.get(att))
+                                if isinstance(v, str) and not _is_numeric_id(v):
+                                    tok = _norm_row_key(v)
+                                    if tok in saved_instances_by_token:
+                                        payload.pop(base, None)
+                                        payload[att] = getattr(saved_instances_by_token[tok], "pk", None)
+                                # else leave as-is (id or null)
+                            else:
+                                # has explicit *_fk
+                                if _is_numeric_id(raw):
+                                    payload.pop(base, None)
+                                    payload[att] = int(raw)
+                                else:
+                                    tok = _norm_row_key(str(raw))
+                                    if tok in saved_instances_by_token:
+                                        payload.pop(base, None)
+                                        payload[att] = getattr(saved_instances_by_token[tok], "pk", None)
+                                    else:
+                                        # Should not happen due to topo order; treat as structural error
+                                        msg = f"Internal planning error: unmet dependency {tok!r} for field {base!r}."
+                                        out = {
+                                            "__row_id": pr.rid,
+                                            "status": "error",
+                                            "action": pr.action,
+                                            "data": pr.original_input or pr.payload or {},
+                                            "message": msg,
+                                            "observations": pr.observations,
+                                            "external_id": None,
+                                        }
+                                        group_outputs.append((pr.model_name, pr.rid, out))
+                                        group_failed = True
+                                        failed_tokens.add(pr.rid)
+                                        failure_messages_by_token[pr.rid] = msg
+                                        break
+                        if pr.rid in failed_tokens:
+                            continue  # already marked due to structural unmet dep
 
-                        instance.save()
-                        models_touched_final.add(model)
+                        # MPTT parent resolution from path (if any)
+                        if _is_mptt_model(model):
+                            path_val = _get_path_value(payload)
+                            if path_val:
+                                parts = _split_path(path_val)
+                                parent = _resolve_parent_from_path_chain(model, parts[:-1]) if len(parts) > 1 else None
+                                payload["parent"] = parent
+                                payload.pop("parent_id", None)
 
-                        # ensure PK is captured for downstream bindings in the same group
-                        _register_row_token(global_row_map_inst, global_row_map_pk, tok, instance)
-                        saved_tokens_this_group.append(tok)
+                        # Build, validate, save
+                        try:
+                            instance = model(**payload)
+                            if hasattr(instance, "full_clean"):
+                                instance.full_clean()
+                            instance.save()
+                            saved_instances_by_token[pr.rid] = instance  # works for tokens and numeric ids (for uniformity)
 
-                        # finalize output for this row
-                        out_list = row_outputs_by_model[model_name]
-                        for r in out_list:
-                            if r.get("__row_id") == tok and r.get("status") == "pending":
-                                r["status"] = "success"
-                                r["action"] = ("update" if getattr(instance, "id", None) else "create")
-                                data = safe_model_dict(
+                            out = {
+                                "__row_id": pr.rid,
+                                "status": "success",
+                                "action": ("update" if getattr(instance, "id", None) else pr.action),
+                                "data": safe_model_dict(
                                     instance,
                                     exclude_fields=["created_by", "updated_by", "is_deleted", "is_active"],
-                                )
-                                # Make sure id is present (even in preview)
-                                data["id"] = getattr(instance, "pk", data.get("id"))
-                                r["data"] = data
-                                r["message"] = "ok"
-                                logger.debug("row_saved_output", **_log_extra(output=r["data"]))
-                                break
+                                ),
+                                "message": "ok" if not pr.unknown_cols_now else "ok | Ignoring unknown columns: " + ", ".join(pr.unknown_cols_now),
+                                "observations": pr.observations,
+                                "external_id": None,
+                            }
+                            group_outputs.append((pr.model_name, pr.rid, out))
 
-                except Exception as e:
-                    group_failed = True
-                    err = exception_to_dict(e, include_stack=False)
-                    error_summary = err.get("summary") or str(e)
-                    logger.error("[IMPORT][GROUP][EXC] %s", error_summary, exc_info=True, **_log_extra())
-                    transaction.savepoint_rollback(sp)
+                        except Exception as e:
+                            err = exception_to_dict(e, include_stack=False)
+                            base_msg = err.get("summary") or str(e)
+                            if pr.unknown_cols_now:
+                                base_msg += " | Ignoring unknown columns: " + ", ".join(pr.unknown_cols_now)
+                            logger.error(
+                                "[IMPORT][GROUP][EXC] model=%s row_id=%s action=%s err=%s",
+                                pr.model_name, pr.rid, pr.action, base_msg, exc_info=True, **_log_extra()
+                            )
+                            out = {
+                                "__row_id": pr.rid,
+                                "status": "error",
+                                "action": pr.action,
+                                "data": pr.original_input or pr.payload or {},
+                                "message": base_msg,
+                                "error": {**err, "summary": base_msg},
+                                "observations": pr.observations,
+                                "external_id": None,
+                            }
+                            group_outputs.append((pr.model_name, pr.rid, out))
+                            group_failed = True
+                            failed_tokens.add(pr.rid)
+                            failure_messages_by_token[pr.rid] = base_msg
 
-                    # Mark all *pending* rows in this group as error
-                    for tok in comp:
-                        bundle = staged_by_token.get(tok)
-                        if not bundle:
-                            continue
-                        model_name = bundle["model_name"]
-                        out_list = row_outputs_by_model[model_name]
-                        for r in out_list:
-                            if r.get("__row_id") == tok and r.get("status") == "pending":
-                                r["status"] = "error"
-                                r["message"] = error_summary or "Aborted due to previous error"
-                    # Remove any pks that were registered for this group (they no longer exist)
-                    for tok in saved_tokens_this_group:
-                        global_row_map_pk.pop(tok, None)
-
-                else:
-                    # No exceptions: if preview, rollback; if commit, keep
-                    if commit:
+                    # Group end: decide savepoint fate
+                    if commit and not group_failed:
                         transaction.savepoint_commit(sp)
                     else:
                         transaction.savepoint_rollback(sp)
-                        # Remove this group's PK entries (they were rolled back)
-                        for tok in saved_tokens_this_group:
-                            global_row_map_pk.pop(tok, None)
+                        # Adjust messages for commit=True failure (rolled back success)
+                        if commit and group_failed:
+                            failed_list = sorted(list(failed_tokens))
+                            rolled_msg = f"Rolled back due to error in group (failed: {', '.join(failed_list)})."
+                            # flip any success rows in this group to error with rollback message
+                            for i, (mname, rid, out) in enumerate(group_outputs):
+                                if out.get("status") == "success":
+                                    out["status"] = "error"
+                                    out["message"] = rolled_msg
+                                    group_outputs[i] = (mname, rid, out)
+                        # In preview, keep 'success' (we show would-be state) and sequences will be reset later
 
-                logger.info("group_end", **_log_extra(size=len(ordered_tokens), failed=group_failed))
+                except Exception as e:
+                    transaction.savepoint_rollback(sp)
+                    # catastrophic error in group execution; mark all as error
+                    err = exception_to_dict(e, include_stack=False)
+                    base_msg = err.get("summary") or str(e)
+                    for rid in order:
+                        pr = rows_by_rid[rid]
+                        out = {
+                            "__row_id": pr.rid,
+                            "status": "error",
+                            "action": pr.action,
+                            "data": pr.original_input or pr.payload or {},
+                            "message": "Aborted due to unexpected error: " + base_msg,
+                            "error": err,
+                            "observations": pr.observations,
+                            "external_id": None,
+                        }
+                        group_outputs.append((pr.model_name, pr.rid, out))
 
-        # ---------------- SNAPSHOTS & SEQUENCES ----------------
+                # Flush group outputs into global per-model list
+                for mname, rid, out in group_outputs:
+                    row_outputs_by_model[mname].append(out)
+
+        # Snapshots (only if commit True)
         if commit:
-            # Snapshots reflect original inputs (by model)
-            for model_name in models_in_order:
-                app_label = MODEL_APP_MAP[model_name]
-                model = apps.get_model(app_label, model_name)
-                pre = next(b for b in prepared if b["model"] == model_name)
-                rows_src = [r.get("_original_input") or r.get("payload") or {} for r in pre["rows"]]
+            for m in models_in_file:
+                pre_rows = prepared_by_model.get(m, [])
+                if not pre_rows:
+                    continue
+                app_label = MODEL_APP_MAP[m]
+                model = apps.get_model(app_label, m)
+                rows_src = [pr.original_input or pr.payload or {} for pr in pre_rows]
                 fp = _table_fingerprint(model, rows_src)
-                closest = (dup_infos.get(model_name) or {}).get("closest_match") or {}
+                closest = (dup_infos.get(m) or {}).get("closest_match") or {}
                 ImportSnapshot.objects.create(
                     company_id=company_id,
-                    model_name=model_name,
+                    model_name=m,
                     row_count=fp["row_count"],
                     colnames=fp["colnames"],
                     row_hash_sample=fp["row_hashes"][:200],
@@ -1188,30 +1172,33 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                     filename=filename,
                     jaccard_to_prev=closest.get("jaccard"),
                 )
-        else:
-            # In preview, sequences may have advanced; reset to current max(id)
+
+        # Reset sequences if this was a preview
+        if not commit and models_in_file:
             try:
-                reset_pk_sequences([apps.get_model(MODEL_APP_MAP[m], m) for m in models_in_order])
+                reset_pk_sequences([apps.get_model(MODEL_APP_MAP[m], m) for m in models_in_file])
             except Exception:
-                logger.warning("sequence_reset_failed", **_log_extra(models=models_in_order))
+                logger.warning("reset_pk_sequences_failed", **_log_extra(models=models_in_file))
 
         # ---------------- RESPONSE ----------------
         result_payload: List[Dict[str, Any]] = []
-        for model_name in models_in_order:
+        for m in models_in_file:
             result_payload.append({
-                "model": model_name,
-                "dup_info": dup_infos.get(model_name),
-                "result": row_outputs_by_model.get(model_name, []),
+                "model": m,
+                "dup_info": dup_infos.get(m),
+                "result": row_outputs_by_model.get(m, []),
             })
 
         dt = int((time.monotonic() - t0) * 1000)
         logger.info("import_end", **_log_extra(elapsed_ms=dt, committed=bool(commit)))
 
+        committed_flag = bool(commit) and all(
+            all(r.get("status") == "success" for r in (row_outputs_by_model.get(m) or []))
+            for m in models_in_file
+        )
+
         return {
-            "committed": bool(commit) and all(
-                all(r.get("status") == "success" for r in (row_outputs_by_model.get(m) or []))
-                for m in models_in_order
-            ),
+            "committed": committed_flag,
             "reason": (None if commit else "preview"),
             "file_info": file_info,
             "imports": result_payload,
