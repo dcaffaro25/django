@@ -17,6 +17,7 @@ from datetime import timedelta
 import logging
 
 DEBUG = True
+IMPORT_DEBUG = True
 
 class SlowOnlyFilter(logging.Filter):
     def __init__(self, threshold_ms=200):
@@ -32,53 +33,59 @@ LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
-        "logfmt": {"format": "%(levelname)s %(asctime)s %(name)s msg=%(message)s run_id=%(run_id)s company=%(company_id)s model=%(model)s row_id=%(row_id)s"},
-        # Or use json if you prefer
-        # "json": {"()": "pythonjsonlogger.jsonlogger.JsonFormatter", "fmt": "%(levelname)s %(asctime)s %(name)s %(message)s %(run_id)s %(company_id)s %(model)s %(row_id)s"},
-    },
-    "handlers": {
-        "console": {"class": "logging.StreamHandler", "formatter": "logfmt"},
-    },
-    "loggers": {
-        # Your importer logs only
-        "importer": {"handlers": ["console"], "level": "INFO", "propagate": False},
-        # Optional: show only slow SQL (keep global DB logs quiet)
-        "importer.sql": {"handlers": ["console"], "level": "INFO", "propagate": False},
-        # Keep Django DB logs quiet globally
-        "django.db.backends": {"handlers": ["console"], "level": "WARNING", "propagate": False},
-    },
-}
-
-LOGGING = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {
-        "simple": {
-            "format": "%(levelname)s %(asctime)s %(name)s %(message)s | run_id=%(run_id)s company=%(company_id)s model=%(model)s row_id=%(row_id)s"
+        # Context formatter ONLY for our importer logs
+        "ctx": {
+            "format": "%(levelname)s %(asctime)s importer %(message)s | run_id=%(run_id)s company=%(company_id)s model=%(model)s row_id=%(row_id)s"
+        },
+        # Plain formatter for everything else
+        "plain": {
+            "format": "%(levelname)s %(asctime)s %(name)s %(message)s"
+        },
+        # Gunicorn access format (no extra fields!)
+        "gunicorn_access": {
+            "format": '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s"'
         },
     },
     "handlers": {
-        "console": {
+        "console_plain": {
             "class": "logging.StreamHandler",
-            "level": "DEBUG",
-            "formatter": "simple",
+            "formatter": "plain",
+            "level": "INFO",
+        },
+        "console_ctx": {
+            "class": "logging.StreamHandler",
+            "formatter": "ctx",
+            "level": "DEBUG",   # show our _vlog DEBUG when IMPORT_DEBUG=0, INFO when IMPORT_DEBUG=1
+        },
+        "gunicorn_access": {
+            "class": "logging.StreamHandler",
+            "formatter": "gunicorn_access",
+            "level": "INFO",
         },
     },
     "loggers": {
-        # our importer logs
+        # Our importer — the only one that uses the ctx formatter
         "importer": {
-            "handlers": ["console"],
+            "handlers": ["console_ctx"],
             "level": "DEBUG",
             "propagate": False,
         },
-        "importer.sql": {
-            "handlers": ["console"],
+        # Keep gunicorn logs separate so they don't expect run_id/company_id etc.
+        "gunicorn.error": {
+            "handlers": ["console_plain"],
             "level": "INFO",
             "propagate": False,
         },
-        # useful when running under gunicorn
-        "gunicorn.error": {"handlers": ["console"], "level": "INFO", "propagate": True},
-        "gunicorn.access": {"handlers": ["console"], "level": "INFO", "propagate": True},
+        "gunicorn.access": {
+            "handlers": ["gunicorn_access"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        # Django default
+        "django": {
+            "handlers": ["console_plain"],
+            "level": "INFO",
+        },
     },
 }
 
