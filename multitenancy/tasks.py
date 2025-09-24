@@ -18,6 +18,9 @@ from django.core.mail import send_mail
 from django.db import transaction, models as dj_models
 from django.forms.models import model_to_dict
 
+# ⬇️ Substitutions engine (kept local; no api_utils dependency)
+from multitenancy.formula_engine import apply_substitutions
+
 # --------------------------------------------------------------------------------------
 # Minimal logging
 # --------------------------------------------------------------------------------------
@@ -336,6 +339,17 @@ def _safe_model_dict(instance, exclude_fields=None) -> dict:
     return data
 
 
+def _row_observations(audit_by_rowid: Dict[Any, List[dict]], rid_norm: Any) -> List[str]:
+    obs: List[str] = []
+    for ch in audit_by_rowid.get(rid_norm, []):
+        if ch.get("field") == "__row_id":
+            continue
+        obs.append(
+            f"campo '{ch.get('field')}' alterado de '{ch.get('old')}' para '{ch.get('new')}' (regra id={ch.get('rule_id')})"
+        )
+    return obs
+
+
 @dataclass
 class RowResult:
     __row_id: Optional[str]
@@ -352,13 +366,15 @@ def run_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool) 
 
 def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool) -> Dict[str, Any]:
     """
-    Very small importer:
-    - Iterates sheets
-    - For each row, filters unknown keys
+    Very small importer with substitutions:
+    - Per sheet: apply_substitutions (returns rows + audit)
+    - Iterates rows
+    - Filters unknown keys
     - Applies company context
     - Resolves *_fk (numeric id or __row_id token)
     - Supports MPTT via 'path'/'Caminho' (parents first; will error if missing)
     - create vs update based on 'id'
+    - Attaches per-row substitution observations
     """
     run_id = uuid.uuid4().hex[:8]
     logger.info("import_start run_id=%s commit=%s sheet_count=%d", run_id, bool(commit), len(sheets))
@@ -374,10 +390,9 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
 
         for sheet in sheets:
             model_name = sheet.get("model")
-            rows = sheet.get("rows") or []
-            app_label = MODEL_APP_MAP.get(model_name)
             outputs_by_model.setdefault(model_name or "Unknown", [])
 
+            app_label = MODEL_APP_MAP.get(model_name)
             if not app_label:
                 msg = f"Unknown model '{model_name}'"
                 logger.error(msg)
@@ -387,11 +402,26 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                     "action": None,
                     "data": {},
                     "message": msg,
+                    "observations": [],
                 })
                 continue
 
             model = apps.get_model(app_label, model_name)
-            logger.info("processing sheet '%s' rows=%d", model_name, len(rows))
+            raw_rows: List[Dict[str, Any]] = sheet.get("rows") or []
+
+            # ---------- substitutions + audit ----------
+            rows, audit = apply_substitutions(
+                raw_rows,
+                company_id=company_id,
+                model_name=model_name,
+                return_audit=True
+            )
+            audit_by_rowid: Dict[Any, List[dict]] = {}
+            for ch in (audit or []):
+                key_norm = _norm_row_key(ch.get("__row_id"))
+                audit_by_rowid.setdefault(key_norm, []).append(ch)
+
+            logger.info("processing sheet '%s' rows=%d (after substitutions)", model_name, len(rows))
 
             # If MPTT and path present, sort parents first
             if _is_mptt_model(model):
@@ -467,6 +497,8 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         "action": action,
                         "data": _safe_model_dict(instance, exclude_fields=["created_by", "updated_by", "is_deleted", "is_active"]),
                         "message": msg,
+                        "observations": _row_observations(audit_by_rowid, rid),
+                        "external_id": None,
                     })
 
                 except Exception as e:
@@ -476,6 +508,8 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         "action": None,
                         "data": raw,
                         "message": str(e),
+                        "observations": _row_observations(audit_by_rowid, rid),
+                        "external_id": None,
                     })
                     logger.exception("row error on %s rid=%s: %s", model_name, rid, e)
 
