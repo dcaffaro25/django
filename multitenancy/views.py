@@ -631,7 +631,7 @@ class BulkImportAPIView(APIView):
         file_meta = {"sha256": file_sha256, "size": size, "filename": getattr(up, "name", None)}
         
         if use_celery:
-            async_res = run_import_job.delay(company_id, sheets, commit, file_meta)
+            async_res = run_import_job.delay(company_id, sheets, commit)#, file_meta)
             return Response({"task_id": async_res.id, "message": "Import scheduled"},
                             status=status.HTTP_202_ACCEPTED)
 
