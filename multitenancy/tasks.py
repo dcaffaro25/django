@@ -1,15 +1,16 @@
-# tasks.py (multitenancy/tasks.py)
+# multitenancy/tasks.py
 from __future__ import annotations
-from dataclasses import dataclass, field
+
 import hashlib
 import json
+import logging
 import os
 import re
 import smtplib
-import logging
 import time
 import uuid
 from contextvars import ContextVar
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,14 +20,14 @@ from django.conf import settings
 from django.core.exceptions import FieldDoesNotExist, ValidationError
 from django.core.mail import send_mail
 from django.db import (
-    IntegrityError,
     DataError,
     DatabaseError,
+    IntegrityError,
     connection,
     models as dj_models,
     transaction,
 )
-from django.db.models import NOT_PROVIDED
+from django.db.models import NOT_PROVIDED, Model
 
 from core.utils.db_sequences import reset_pk_sequences
 from core.utils.exception_utils import exception_to_dict
@@ -37,44 +38,41 @@ from .api_utils import (
     PATH_COLS,
     _get_path_value,
     _is_mptt_model,
+    _norm_row_key,
+    _parse_json_or_empty,
+    _path_depth,
     _resolve_parent_from_path_chain,
     _split_path,
-    safe_model_dict,
-    # NaN/NaT-safe helpers used in canonicalization:
-    _is_missing,
-    _to_int_or_none_soft,
-    _to_int_or_none,
-    _parse_json_or_empty,
     _to_bool,
-    _norm_row_key,
-    _path_depth,
+    _to_int_or_none,
+    _to_int_or_none_soft,
+    _is_missing,
+    safe_model_dict,
 )
 
-from django.db import models
-
-# ----------------------------------------------------------------------
-# Logging / verbosity
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# Logging setup (defensive against gunicorn's access formatter)
+# --------------------------------------------------------------------------------------
 logger = logging.getLogger("importer")
 sql_logger = logging.getLogger("importer.sql")
 
-# avoid our formatter touching gunicorn access logs
 try:
     logging.getLogger("gunicorn.access").propagate = False
 except Exception:
     pass
 
-# context vars for log records
 _run_id_ctx = ContextVar("run_id", default="-")
 _company_ctx = ContextVar("company_id", default="-")
 _model_ctx = ContextVar("model", default="-")
 _row_ctx = ContextVar("row_id", default="-")
+
 
 def _import_debug_enabled() -> bool:
     val = getattr(settings, "IMPORT_DEBUG", None)
     if val is None:
         val = os.getenv("IMPORT_DEBUG", "0")
     return str(val).lower() in {"1", "true", "yes", "y", "on"}
+
 
 def _log_extra(**kw):
     return {
@@ -88,6 +86,7 @@ def _log_extra(**kw):
         }
     }
 
+
 class _EnsureCtxKeysFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         for k in ("run_id", "company", "company_id", "model", "row_id"):
@@ -95,7 +94,7 @@ class _EnsureCtxKeysFilter(logging.Filter):
                 setattr(record, k, "-")
         return True
 
-# attach dedicated handler/formatter to avoid KeyError issues
+
 if not logger.handlers:
     h = logging.StreamHandler()
     fmt = logging.Formatter(
@@ -118,6 +117,7 @@ if not sql_logger.handlers:
 
 IMPORT_VERBOSE_FK = os.getenv("IMPORT_VERBOSE_FK", "0").lower() in {"1", "true", "yes", "y", "on"}
 
+
 class _SlowSQL:
     def __init__(self, threshold_ms: int = 200):
         self.threshold = threshold_ms / 1000.0
@@ -132,10 +132,7 @@ class _SlowSQL:
                 finally:
                     dt = time.monotonic() - t0
                     if dt >= self.threshold:
-                        sql_logger.info(
-                            "slow_sql",
-                            **_log_extra(duration_ms=int(dt * 1000), many=bool(many), sql=str(sql)[:1000])
-                        )
+                        sql_logger.info("slow_sql", **_log_extra(duration_ms=int(dt * 1000), many=bool(many), sql=str(sql)[:1000]))
             self._cm = connection.execute_wrapper(wrapper)
             self._cm.__enter__()
         except Exception:
@@ -149,31 +146,35 @@ class _SlowSQL:
         finally:
             return False
 
-# ----------------------------------------------------------------------
+
+# --------------------------------------------------------------------------------------
 # Email helpers
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 @shared_task(bind=True, autoretry_for=(smtplib.SMTPException, ConnectionError), retry_backoff=True, max_retries=5)
 def send_user_invite_email(self, subject, message, to_email):
     send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, [to_email], fail_silently=False)
+
 
 @shared_task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
 def send_user_email(self, subject, message, to_email):
     send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, [to_email], fail_silently=False)
 
-# ----------------------------------------------------------------------
+
+# --------------------------------------------------------------------------------------
 # Integration triggers
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 @shared_task
 def execute_integration_rule(rule_id, payload):
     rule = IntegrationRule.objects.get(pk=rule_id)
     return rule.run_rule(payload)
+
 
 @shared_task
 def trigger_integration_event(company_id, event_name, payload):
     rules = (
         IntegrationRule.objects
         .filter(company_id=company_id, is_active=True, triggers__icontains=event_name)
-        .order_by('execution_order')
+        .order_by("execution_order")
     )
     for rule in rules:
         if rule.use_celery:
@@ -181,37 +182,39 @@ def trigger_integration_event(company_id, event_name, payload):
         else:
             execute_integration_rule(rule.id, payload)
 
-# ----------------------------------------------------------------------
+
+# --------------------------------------------------------------------------------------
 # Import helpers
-# ----------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 @dataclass
 class ImportContext:
     run_id: str
     company_id: int
     commit: bool
 
-def _stringify_instance(obj: models.Model) -> str:
+
+def _stringify_instance(obj: Model) -> str:
     try:
         return f"{obj.__class__.__name__}(id={getattr(obj, 'pk', None)})"
     except Exception:
         return f"{obj.__class__.__name__}(id=?)"
 
+
 def _repr_map_inst(m: Dict[str, Any]) -> Dict[str, Any]:
     out = {}
     for k, v in m.items():
-        out[k] = _stringify_instance(v) if isinstance(v, models.Model) else v
+        out[k] = _stringify_instance(v) if isinstance(v, Model) else v
     return out
 
-def _register_row_token(global_row_map_inst: Dict[str, Any],
-                        global_row_map_pk: Dict[str, int],
-                        rid: str,
-                        instance: Any):
+
+def _register_row_token(global_row_map_inst: Dict[str, Any], global_row_map_pk: Dict[str, int], rid: str, instance: Any):
     if not rid:
         return
     pk = getattr(instance, "pk", None)
     global_row_map_inst[rid] = instance
     if isinstance(pk, int):
         global_row_map_pk[rid] = pk
+
 
 def _resolve_token_from_maps(token: str,
                              local_inst: Dict[str, Any],
@@ -228,6 +231,7 @@ def _resolve_token_from_maps(token: str,
         return global_pk[token]
     return None
 
+
 def _assign_fk_value(model_cls, field_name: str, resolved_value: Any, payload: dict) -> tuple[str, Any]:
     field = model_cls._meta.get_field(field_name)
     attname = getattr(field, "attname", field_name)
@@ -240,15 +244,15 @@ def _assign_fk_value(model_cls, field_name: str, resolved_value: Any, payload: d
         payload.pop(attname, None)
         return field_name, resolved_value
 
+
 def _resolve_fk(model_cls, field_name: str, raw_value: Any, row_id_map: Dict[str, Any]) -> Any:
     if raw_value in (None, ""):
         return None
 
     field = model_cls._meta.get_field(field_name)
     remote_model = getattr(field, "remote_field", None).model if getattr(field, "remote_field", None) else None
-    known_tokens = list(row_id_map.keys())
 
-    if isinstance(raw_value, models.Model):
+    if isinstance(raw_value, Model):
         if remote_model and not isinstance(raw_value, remote_model):
             raise ValueError(f"{model_cls.__name__}.{field_name} expects {remote_model.__name__} instance, got {raw_value.__class__.__name__}")
         return raw_value
@@ -264,7 +268,7 @@ def _resolve_fk(model_cls, field_name: str, raw_value: Any, row_id_map: Dict[str
         candidate = row_id_map.get(_norm_row_key(maybe_token))
 
     if candidate is not None:
-        if isinstance(candidate, models.Model):
+        if isinstance(candidate, Model):
             if remote_model and not isinstance(candidate, remote_model):
                 pk = getattr(candidate, "pk", None)
                 if isinstance(pk, int):
@@ -274,12 +278,8 @@ def _resolve_fk(model_cls, field_name: str, raw_value: Any, row_id_map: Dict[str
         if isinstance(candidate, int):
             return candidate
 
-    preview = ", ".join(known_tokens[:20]) + (" ..." if len(known_tokens) > 20 else "")
-    raise ValueError(
-        f"Invalid FK reference {raw_value!r} for '{field_name}'. "
-        f"Expected id, {remote_model.__name__ if remote_model else 'related model'} instance, "
-        f"or __row_id present in [{preview}]"
-    )
+    raise ValueError(f"Invalid FK reference {raw_value!r} for '{field_name}'")
+
 
 def _normalize_payload_for_model(model, payload: Dict[str, Any], *, context_company_id=None):
     data = dict(payload)
@@ -291,6 +291,7 @@ def _normalize_payload_for_model(model, payload: Dict[str, Any], *, context_comp
             data["company_id"] = _to_int_or_none(fk_val)
         elif "tenant" in field_names:
             data["tenant_id"] = _to_int_or_none(fk_val)
+
     if context_company_id and "company" in field_names:
         data["company_id"] = context_company_id
 
@@ -299,6 +300,7 @@ def _normalize_payload_for_model(model, payload: Dict[str, Any], *, context_comp
     if "filter_conditions" in data:
         data["filter_conditions"] = _parse_json_or_empty(data.get("filter_conditions"))
 
+    # strip unknowns except *_fk aliases
     for k in list(data.keys()):
         if k in ("id",):
             continue
@@ -309,15 +311,15 @@ def _normalize_payload_for_model(model, payload: Dict[str, Any], *, context_comp
                 data.pop(k, None)
     return data
 
+
 def _row_observations(audit_by_rowid, row_id):
     obs = []
     for ch in audit_by_rowid.get(row_id, []):
         if ch.get("field") == "__row_id":
             continue
-        obs.append(
-            f"campo '{ch.get('field')}' alterado de '{ch.get('old')}' para '{ch.get('new')}' (regra id={ch.get('rule_id')})"
-        )
+        obs.append(f"campo '{ch.get('field')}' alterado de '{ch.get('old')}' para '{ch.get('new')}' (regra id={ch.get('rule_id')})")
     return obs
+
 
 def _allowed_keys(model):
     names = set()
@@ -329,11 +331,13 @@ def _allowed_keys(model):
     fk_aliases = {n + "_fk" for n in names}
     return names | fk_aliases | set(PATH_COLS) | {"__row_id", "id"}
 
+
 def _filter_unknown(model, row: Dict[str, Any]):
     allowed = _allowed_keys(model)
     filtered = {k: v for k, v in row.items() if k in allowed}
     unknown = sorted([k for k in row.keys() if k not in allowed and k != "__row_id"])
     return filtered, unknown
+
 
 def _preflight_missing_required(model, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     errors = {}
@@ -374,40 +378,47 @@ def _preflight_missing_required(model, rows: List[Dict[str, Any]]) -> Dict[str, 
             }
     return errors
 
-# ---- added (missing) helpers ----
+
 def _quantize_decimal_fields(model, payload: dict) -> dict:
-    """Quantize all DecimalField values to the model's decimal_places."""
     out = dict(payload)
     for f in model._meta.get_fields():
         if isinstance(f, dj_models.DecimalField):
-            name = getattr(f, 'attname', f.name)
-            if name in out and out[name] not in (None, ''):
-                dp = int(getattr(f, 'decimal_places', 0) or 0)
-                q = Decimal('1').scaleb(-dp)
+            name = getattr(f, "attname", f.name)
+            if name in out and out[name] not in (None, ""):
+                dp = int(getattr(f, "decimal_places", 0) or 0)
+                q = Decimal("1").scaleb(-dp)
                 out[name] = Decimal(str(out[name])).quantize(q, rounding=ROUND_HALF_UP)
     return out
 
+
 def _coerce_boolean_fields(model, payload: dict) -> dict:
-    """Coerce stringy booleans to True/False for BooleanFields."""
     out = dict(payload)
     for f in model._meta.get_fields():
         if isinstance(f, dj_models.BooleanField):
-            name = getattr(f, 'attname', f.name)
+            name = getattr(f, "attname", f.name)
             if name in out:
                 out[name] = _to_bool(out[name])
     return out
-# ---------------------------------
+
 
 _WS_RE = re.compile(r"\s+")
+
+
 def _norm_scalar(val):
-    if val is None: return None
-    if isinstance(val, (bool, int)): return val
-    if isinstance(val, float): return float(str(val))
-    if isinstance(val, Decimal): return str(val)
+    if val is None:
+        return None
+    if isinstance(val, (bool, int)):
+        return val
+    if isinstance(val, float):
+        return float(str(val))
+    if isinstance(val, Decimal):
+        return str(val)
     s = str(val).strip()
     return _WS_RE.sub(" ", s)
 
+
 IGNORE_FIELDS = {"id", "created_at", "updated_at", "created_by", "updated_by", "is_deleted", "is_active"}
+
 
 def _canonicalize_row(model, row: Dict[str, Any]) -> Dict[str, Any]:
     field_by = {f.name: f for f in model._meta.get_fields() if hasattr(f, "attname")}
@@ -426,8 +437,8 @@ def _canonicalize_row(model, row: Dict[str, Any]) -> Dict[str, Any]:
             out[k] = None
             continue
         if isinstance(f, dj_models.DecimalField):
-            dp = int(getattr(f, 'decimal_places', 0) or 0)
-            q = Decimal('1').scaleb(-dp)
+            dp = int(getattr(f, "decimal_places", 0) or 0)
+            q = Decimal("1").scaleb(-dp)
             vq = Decimal(str(v)).quantize(q, rounding=ROUND_HALF_UP)
             out[k] = str(vq)
         elif isinstance(f, dj_models.DateField):
@@ -438,10 +449,12 @@ def _canonicalize_row(model, row: Dict[str, Any]) -> Dict[str, Any]:
             out[k] = _norm_scalar(v)
     return out
 
+
 def _row_hash(model, row: Dict[str, Any]) -> str:
     c = _canonicalize_row(model, row)
     blob = json.dumps(c, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
 
 def _table_fingerprint(model, rows: List[Dict[str, Any]], sample_n: int = 200) -> Dict[str, Any]:
     rhashes = [_row_hash(model, r) for r in rows]
@@ -458,18 +471,23 @@ def _table_fingerprint(model, rows: List[Dict[str, Any]], sample_n: int = 200) -
         "table_hash": thash,
     }
 
+
 def _jaccard(a: set[str], b: set[str]) -> float:
-    if not a and not b: return 1.0
-    if not a or not b:  return 0.0
-    inter = len(a & b); uni = len(a | b)
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    uni = len(a | b)
     return inter / uni
+
 
 def _unknown_from_original_input(model, row_obj: Dict[str, Any]) -> List[str]:
     allowed = _allowed_keys(model)
     orig = row_obj.get("_original_input") or row_obj.get("payload") or {}
     return sorted([k for k in orig.keys() if k not in allowed and k != "__row_id"])
 
-# ---------- FK sanity that checks *_fk was present but unresolved ----------
+
 def _sanity_check_required_fks(model, payload: Dict[str, Any], original_input: Dict[str, Any], merged_map_keys: List[str]) -> List[Tuple[str, Any]]:
     issues: List[Tuple[str, Any]] = []
     for f in model._meta.get_fields():
@@ -485,18 +503,24 @@ def _sanity_check_required_fks(model, payload: Dict[str, Any], original_input: D
             issues.append((base, token))
     return issues
 
-# ----------------------------------------------------------------------
-# Core import executor with ONE file-level savepoint
-# ----------------------------------------------------------------------
+
+# --------------------------------------------------------------------------------------
+# Core import executor — ONE savepoint for the entire file with FK deferral
+# --------------------------------------------------------------------------------------
 DUP_CHECK_LAST_N = 10
+
 
 def _infer_action_and_clean_id(payload: Dict[str, Any], original_input: Dict[str, Any]):
     def _coerce_pk(val):
-        if val is None or val == "": return None
-        if isinstance(val, int): return val
-        if isinstance(val, float): return int(val) if float(val).is_integer() else None
+        if val is None or val == "":
+            return None
+        if isinstance(val, int):
+            return val
+        if isinstance(val, float):
+            return int(val) if float(val).is_integer() else None
         s = str(val).strip()
-        if s.isdigit(): return int(s)
+        if s.isdigit():
+            return int(s)
         try:
             f = float(s)
             return int(f) if f.is_integer() else None
@@ -514,6 +538,12 @@ def _infer_action_and_clean_id(payload: Dict[str, Any], original_input: Dict[str
         payload.pop("id", None)
     return "create", None, ext_id
 
+
+@shared_task
+def run_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool) -> Dict[str, Any]:
+    return execute_import_job(company_id, sheets, commit)
+
+
 def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool, *, file_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     ORDER_HINT = {name: i for i, name in enumerate(MODEL_APP_MAP.keys())}
 
@@ -522,9 +552,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
     _company_ctx.set(str(company_id))
     _model_ctx.set("-")
     _row_ctx.set("-")
-    verbose = _import_debug_enabled()
 
-    # file metadata & dedupe header
     file_sha = (file_meta or {}).get("sha256")
     filename = (file_meta or {}).get("filename")
     file_size = (file_meta or {}).get("size")
@@ -556,7 +584,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
 
     t0 = time.monotonic()
     with _SlowSQL(threshold_ms=200):
-        # ---------- PREPARATION ----------
+        # ---------------- PREP ----------------
         prepared: List[Dict[str, Any]] = []
         models_in_order: List[str] = []
         any_prep_error = False
@@ -659,9 +687,9 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                             if not parts:
                                 raise ValueError(f"{model_name}: empty path.")
                             leaf = parts[-1]
-                            payload['name'] = payload.get('name', leaf) or leaf
-                            payload.pop('parent_id', None)
-                            payload.pop('parent_fk', None)
+                            payload["name"] = payload.get("name", leaf) or leaf
+                            payload.pop("parent_id", None)
+                            payload.pop("parent_fk", None)
                             for c in PATH_COLS:
                                 payload.pop(c, None)
 
@@ -734,7 +762,6 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
         models_in_order.sort(key=lambda m: ORDER_HINT.get(m, 1000))
         logger.info("order_resolved", **_log_extra(models=models_in_order))
 
-        # Early exit if prep failures and we're committing (no DB side effects yet)
         if commit and any_prep_error:
             dt = int((time.monotonic() - t0) * 1000)
             logger.info("import_end", **_log_extra(elapsed_ms=dt, committed=False, reason="prep_errors"))
@@ -745,19 +772,15 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                 "imports": [{"model": b["model"], "dup_info": dup_infos.get(b["model"]), "result": b["rows"]} for b in prepared],
             }
 
-        # ---------- ONE FILE-LEVEL TRANSACTION + SAVEPOINT ----------
+        # ---------------- ONE FILE-LEVEL TXN + SAVEPOINT ----------------
         models_touched: List[Any] = []
         result_payload: List[Dict[str, Any]] = []
 
-        # global token maps (instances + pks) across the entire file
         global_row_map_inst: Dict[str, Any] = {}
         global_row_map_pk: Dict[str, int] = {}
 
-        # staging area of built (unsaved) instances to run full_clean first
-        built_instances_by_model: Dict[str, List[Tuple[str, Any, Dict[str, Any], Dict[str, Any]]]] = {}
-        # tuple per row: (row_id, instance, payload_used, original_input)
-
-        # capture row-level outputs/errors here before save; reused for commit/preview
+        # staged rows: per model, list of dict(row_id, instance, payload_used, original_input, deferred_fks)
+        built_by_model: Dict[str, List[Dict[str, Any]]] = {}
         row_outputs_by_model: Dict[str, List[Dict[str, Any]]] = {m: [] for m in models_in_order}
 
         with transaction.atomic():
@@ -765,10 +788,9 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                 with connection.cursor() as cur:
                     cur.execute("SET CONSTRAINTS ALL IMMEDIATE")
 
-            file_sp = transaction.savepoint()
-
+            sp = transaction.savepoint()
             try:
-                # -------- Pass 1: BUILD + VALIDATE (no DB writes) --------
+                # ------------ PASS 1: BUILD (FK resolution + deferred FK handling) ------------
                 for model_name in models_in_order:
                     _model_ctx.set(model_name)
                     app_label = MODEL_APP_MAP[model_name]
@@ -776,21 +798,25 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                     models_touched.append(model)
 
                     rows = next(b["rows"] for b in prepared if b["model"] == model_name)
-                    built_instances_by_model[model_name] = []
+                    built_by_model[model_name] = []
 
-                    # local maps per model
-                    row_map_inst: Dict[str, Any] = {}
-                    row_map_pk: Dict[str, int] = {}
+                    local_row_map_inst: Dict[str, Any] = {}
+                    local_row_map_pk: Dict[str, int] = {}
 
-                    logger.debug("model_begin_build_validate", **_log_extra(rows=len(rows),
-                                                                            global_map_inst_size=len(global_row_map_inst),
-                                                                            global_map_pk_size=len(global_row_map_pk)))
+                    logger.debug(
+                        "model_begin_build_validate",
+                        **_log_extra(
+                            rows=len(rows),
+                            global_map_inst_size=len(global_row_map_inst),
+                            global_map_pk_size=len(global_row_map_pk),
+                        ),
+                    )
 
-                    for idx, row in enumerate(rows):
+                    for row in rows:
                         rid = _norm_row_key(row["__row_id"])
                         _row_ctx.set(rid)
 
-                        # Preflight error rows are carried through
+                        # carry through preflight errors
                         if row.get("status") == "error" and row.get("preflight_error"):
                             row_outputs_by_model[model_name].append({
                                 "__row_id": rid,
@@ -813,52 +839,99 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         logger.debug("row_payload_before_resolution", **_log_extra(payload=payload))
 
                         try:
-                            # Resolve *_fk against accumulated maps
+                            deferred_fks: List[Tuple[str, str]] = []  # (field_name, token_string)
+
                             fk_keys = [k for k in list(payload.keys()) if k.endswith("_fk")]
                             if fk_keys:
-                                logger.debug("fk_keys_detected", **_log_extra(keys=fk_keys))
-                                logger.debug("fk_context_before_resolution",
-                                             **_log_extra(
-                                                 local_map_inst=_repr_map_inst(row_map_inst),
-                                                 local_map_pk=dict(row_map_pk),
-                                                 global_map_inst=_repr_map_inst(global_row_map_inst),
-                                                 global_map_pk=dict(global_row_map_pk),
-                                             ))
-                            for fk_key in fk_keys:
-                                field_name = fk_key[:-3]
-                                fk_val = payload.pop(fk_key)
-                                if _is_missing(fk_val):
-                                    payload[field_name] = None
-                                    continue
-                                tok = _norm_row_key(fk_val) if isinstance(fk_val, str) else fk_val
-                                logger.debug("fk_resolve_attempt", **_log_extra(field=field_name, token=fk_val, token_norm=tok))
-                                candidate = None
-                                if isinstance(fk_val, str):
-                                    candidate = _resolve_token_from_maps(tok, row_map_inst, row_map_pk, global_row_map_inst, global_row_map_pk)
-                                if candidate is not None:
-                                    resolved = _resolve_fk(model, field_name, candidate, {})
-                                else:
-                                    resolved = _resolve_fk(model, field_name, fk_val, {})
-                                where, assigned = _assign_fk_value(model, field_name, resolved, payload)
-                                logger.debug("fk_resolved", **_log_extra(field=field_name, assigned_to=where,
-                                                                         value=_stringify_instance(assigned) if isinstance(assigned, models.Model) else assigned))
+                                logger.debug(
+                                    "fk_keys_detected",
+                                    **_log_extra(keys=fk_keys),
+                                )
+                                logger.debug(
+                                    "fk_context_before_resolution",
+                                    **_log_extra(
+                                        local_map_inst=_repr_map_inst(local_row_map_inst),
+                                        local_map_pk=dict(local_row_map_pk),
+                                        global_map_inst=_repr_map_inst(global_row_map_inst),
+                                        global_row_map_pk=dict(global_row_map_pk),
+                                    ),
+                                )
 
-                            # Rescue misplaced tokens in base field
+                            for fk_key in fk_keys:
+                                base = fk_key[:-3]
+                                raw = payload.pop(fk_key)
+                                if _is_missing(raw):
+                                    # explicit NULL
+                                    payload[getattr(model._meta.get_field(base), "attname", base)] = None
+                                    continue
+
+                                token_norm = _norm_row_key(raw) if isinstance(raw, str) else raw
+                                logger.debug("fk_resolve_attempt", **_log_extra(field=base, token=raw, token_norm=token_norm))
+                                candidate = None
+                                if isinstance(raw, str):
+                                    candidate = _resolve_token_from_maps(
+                                        token_norm, local_row_map_inst, local_row_map_pk, global_row_map_inst, global_row_map_pk
+                                    )
+
+                                if candidate is not None:
+                                    resolved = _resolve_fk(model, base, candidate, {})
+                                else:
+                                    # allow direct id as string/number
+                                    resolved = _resolve_fk(model, base, raw, {})
+
+                                field = model._meta.get_field(base)
+                                attname = getattr(field, "attname", base)
+
+                                # If resolved is an instance without PK yet => DEFER
+                                if isinstance(resolved, Model) and getattr(resolved, "pk", None) is None:
+                                    deferred_fks.append((base, token_norm if isinstance(token_norm, str) else str(token_norm)))
+                                    payload.pop(base, None)
+                                    payload[attname] = None  # keep attname None until save pass
+                                    logger.debug(
+                                        "fk_deferred",
+                                        **_log_extra(field=base, token=raw, reason="related instance has no PK yet"),
+                                    )
+                                else:
+                                    where, assigned = _assign_fk_value(model, base, resolved, payload)
+                                    logger.debug(
+                                        "fk_resolved",
+                                        **_log_extra(
+                                            field=base,
+                                            assigned_to=where,
+                                            value=_stringify_instance(assigned) if isinstance(assigned, Model) else assigned,
+                                        ),
+                                    )
+
+                            # rescue misplaced tokens typed into base field
                             for f in model._meta.get_fields():
-                                if isinstance(f, dj_models.ForeignKey) and getattr(f, "null", False) is False:
+                                if isinstance(f, dj_models.ForeignKey) and not getattr(f, "null", False):
                                     base = f.name
                                     val = payload.get(base)
                                     if isinstance(val, str):
                                         token = _norm_row_key(val)
-                                        candidate = _resolve_token_from_maps(token, row_map_inst, row_map_pk, global_row_map_inst, global_row_map_pk)
+                                        candidate = _resolve_token_from_maps(
+                                            token, local_row_map_inst, local_row_map_pk, global_row_map_inst, global_row_map_pk
+                                        )
                                         if candidate is not None:
                                             logger.warning("fk_rescue_base_field", **_log_extra(field=base, token=val))
-                                            resolved = _resolve_fk(model, base, candidate, {**global_row_map_inst, **row_map_inst})
-                                            where, assigned = _assign_fk_value(model, base, resolved, payload)
-                                            logger.debug("fk_rescued", **_log_extra(field=base, assigned_to=where,
-                                                                                    value=_stringify_instance(assigned) if isinstance(assigned, models.Model) else assigned))
+                                            resolved = _resolve_fk(model, base, candidate, {})
+                                            if isinstance(resolved, Model) and getattr(resolved, "pk", None) is None:
+                                                deferred_fks.append((base, token))
+                                                payload.pop(base, None)
+                                                payload[getattr(f, "attname", base)] = None
+                                                logger.debug("fk_deferred", **_log_extra(field=base, token=val, reason="rescued unsaved related"))
+                                            else:
+                                                where, assigned = _assign_fk_value(model, base, resolved, payload)
+                                                logger.debug(
+                                                    "fk_rescued",
+                                                    **_log_extra(
+                                                        field=base,
+                                                        assigned_to=where,
+                                                        value=_stringify_instance(assigned) if isinstance(assigned, Model) else assigned,
+                                                    ),
+                                                )
 
-                            # MPTT parent
+                            # MPTT support
                             if _is_mptt_model(model):
                                 path_val = _get_path_value(payload)
                                 if path_val:
@@ -868,8 +941,14 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                                     payload.pop("parent_id", None)
                                     logger.debug("mptt_parent_resolved", **_log_extra(parent=_stringify_instance(parent) if parent else None))
 
-                            # Sanity check unresolved required *_fk
-                            issues = _sanity_check_required_fks(model, payload, original_input, list({**global_row_map_inst, **row_map_inst}.keys()))
+                            # sanity check: if user provided *_fk but we deferred, skip complaining now
+                            issues = [
+                                (base, tok)
+                                for (base, tok) in _sanity_check_required_fks(
+                                    model, payload, original_input, list({**global_row_map_inst, **local_row_map_inst}.keys())
+                                )
+                                if all(base != d_base for (d_base, _) in deferred_fks)
+                            ]
                             if issues:
                                 for base, token in issues:
                                     logger.error("fk_unresolved_required", **_log_extra(field=base, token=token))
@@ -877,28 +956,41 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
 
                             logger.debug("row_payload_after_resolution", **_log_extra(payload=payload))
 
-                            # Build instance (unsaved) and validate
-                            if action == "update":
-                                instance = model(**payload)
-                            else:
-                                instance = model(**payload)
+                            # build instance (unsaved)
+                            instance = model(**payload)
 
+                            # validate; if we deferred any FK, exclude its attnames from validation for now
                             if hasattr(instance, "full_clean"):
-                                instance.full_clean()
+                                exclude = []
+                                if deferred_fks:
+                                    for base, _ in deferred_fks:
+                                        f = model._meta.get_field(base)
+                                        exclude.append(getattr(f, "attname", base))
+                                instance.full_clean(exclude=exclude or None)
 
-                            # keep in memory for the save pass
-                            built_instances_by_model[model_name].append((rid, instance, payload, original_input))
+                            # stage
+                            built_by_model[model_name].append({
+                                "row_id": rid,
+                                "instance": instance,
+                                "payload_used": payload,
+                                "original_input": original_input,
+                                "action": action,
+                                "deferred_fks": deferred_fks,  # list[(field, token)]
+                            })
 
-                            # register token maps with the instance
-                            if rid:
-                                _register_row_token(row_map_inst, row_map_pk, rid, instance)
-                                _register_row_token(global_row_map_inst, global_row_map_pk, rid, instance)
-                                logger.debug("row_token_staged",
-                                             **_log_extra(token=rid, instance=_stringify_instance(instance),
-                                                          local_map_inst=_repr_map_inst(row_map_inst),
-                                                          global_map_inst=_repr_map_inst(global_row_map_inst)))
+                            # register token (instance only; pk will be added after save)
+                            _register_row_token(local_row_map_inst, local_row_map_pk, rid, instance)
+                            _register_row_token(global_row_map_inst, global_row_map_pk, rid, instance)
+                            logger.debug(
+                                "row_token_staged",
+                                **_log_extra(
+                                    token=rid,
+                                    instance=_stringify_instance(instance),
+                                    local_map_inst=_repr_map_inst(local_row_map_inst),
+                                    global_map_inst=_repr_map_inst(global_row_map_inst),
+                                ),
+                            )
 
-                            # optimistic output for now (will be finalized after save pass)
                             row_outputs_by_model[model_name].append({
                                 "__row_id": rid,
                                 "status": "pending",
@@ -914,8 +1006,15 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                             base_msg = err.get("summary") or str(e)
                             if unknown_cols_now:
                                 base_msg += " | Ignoring unknown columns: " + ", ".join(unknown_cols_now)
-                            logger.error("[IMPORT][BUILD][EXC] model=%s row_id=%s action=%s err=%s", model_name, rid, action, base_msg, exc_info=True, **_log_extra())
-
+                            logger.error(
+                                "[IMPORT][BUILD][EXC] model=%s row_id=%s action=%s err=%s",
+                                model_name,
+                                rid,
+                                action,
+                                base_msg,
+                                exc_info=True,
+                                **_log_extra(),
+                            )
                             row_outputs_by_model[model_name].append({
                                 "__row_id": rid,
                                 "status": "error",
@@ -927,48 +1026,74 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                                 "external_id": row.get("external_id"),
                             })
 
-                    logger.debug("model_end_build_validate", **_log_extra(local_map_inst_size=len(row_map_inst),
-                                                                          global_map_inst_size=len(global_row_map_inst)))
+                    logger.debug(
+                        "model_end_build_validate",
+                        **_log_extra(
+                            local_map_inst_size=len(local_row_map_inst),
+                            global_map_inst_size=len(global_row_map_inst),
+                        ),
+                    )
 
-                # If any row has 'error' so far, abort before save pass
-                any_error_before_save = any(
-                    any(r.get("status") == "error" for r in row_outputs_by_model[m])
-                    for m in models_in_order
-                )
-                if any_error_before_save:
+                # abort before save if any row errored
+                if any(any(r.get("status") == "error" for r in row_outputs_by_model[m]) for m in models_in_order):
                     raise RuntimeError("validation_errors_before_save")
 
-                # -------- Pass 2: SAVE (single savepoint for the whole file) --------
+                # ------------ PASS 2: SAVE (fill deferred FKs first) ------------
                 for model_name in models_in_order:
                     _model_ctx.set(model_name)
                     app_label = MODEL_APP_MAP[model_name]
                     model = apps.get_model(app_label, model_name)
 
-                    staged = built_instances_by_model.get(model_name, [])
+                    staged = built_by_model.get(model_name, [])
                     logger.debug("model_begin_save_pass", **_log_extra(staged_rows=len(staged)))
 
-                    for (rid, instance, payload_used, original_input) in staged:
+                    for row_bundle in staged:
+                        rid = row_bundle["row_id"]
+                        instance = row_bundle["instance"]
+                        deferred_fks: List[Tuple[str, str]] = row_bundle["deferred_fks"]
                         _row_ctx.set(rid or "-")
+
+                        # resolve deferred FKs now that dependent models likely have PKs
+                        for base, token in deferred_fks:
+                            f = model._meta.get_field(base)
+                            attname = getattr(f, "attname", base)
+                            cand = _resolve_token_from_maps(token, {}, {}, global_row_map_inst, global_row_map_pk)
+                            if isinstance(cand, Model):
+                                pkv = getattr(cand, "pk", None)
+                            else:
+                                pkv = cand
+                            if not isinstance(pkv, int):
+                                raise ValidationError({base: [f"Could not resolve deferred FK token {token!r} to a saved id"]})
+                            setattr(instance, attname, pkv)
+                            logger.debug("fk_deferred_bound", **_log_extra(field=base, token=token, assigned_id=pkv))
+
                         action = "update" if getattr(instance, "id", None) else "create"
                         logger.debug("row_save_attempt_file_scope", **_log_extra(action=action))
+
                         if hasattr(instance, "full_clean"):
-                            instance.full_clean()
+                            instance.full_clean()  # full validation now that FKs are bound
                         instance.save()
+
+                        # update global maps with actual PK after save
                         if rid:
                             _register_row_token(global_row_map_inst, global_row_map_pk, rid, instance)
-                        out_list = row_outputs_by_model[model_name]
-                        for r in out_list:
+
+                        # finalize output
+                        for r in row_outputs_by_model[model_name]:
                             if r.get("__row_id") == rid and r.get("status") == "pending":
                                 r["status"] = "success"
                                 r["action"] = action
-                                r["data"] = safe_model_dict(instance, exclude_fields=['created_by', 'updated_by', 'is_deleted', 'is_active'])
+                                r["data"] = safe_model_dict(
+                                    instance,
+                                    exclude_fields=["created_by", "updated_by", "is_deleted", "is_active"],
+                                )
                                 r["message"] = "ok"
                                 logger.debug("row_saved_output", **_log_extra(output=r["data"]))
                                 break
 
                     logger.debug("model_end_save_pass", **_log_extra())
 
-                # -------- Persist snapshots only for COMMIT (success) --------
+                # snapshots only if commit True
                 if commit:
                     for model_name in models_in_order:
                         app_label = MODEL_APP_MAP[model_name]
@@ -990,13 +1115,13 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         )
 
                 if commit:
-                    transaction.savepoint_commit(file_sp)
+                    transaction.savepoint_commit(sp)
                 else:
-                    transaction.savepoint_rollback(file_sp)
+                    transaction.savepoint_rollback(sp)
                     reset_pk_sequences([apps.get_model(MODEL_APP_MAP[m], m) for m in models_in_order])
 
             except Exception as e:
-                transaction.savepoint_rollback(file_sp)
+                transaction.savepoint_rollback(sp)
                 if not commit:
                     reset_pk_sequences([apps.get_model(MODEL_APP_MAP[m], m) for m in models_in_order])
 
@@ -1010,7 +1135,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                             r["status"] = "error"
                             r["message"] = "Aborted due to previous error"
 
-        # ---------- BUILD RESPONSE ----------
+        # ---------------- RESPONSE ----------------
         for model_name in models_in_order:
             result_payload.append({
                 "model": model_name,
@@ -1028,10 +1153,5 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
             ),
             "reason": (None if commit else "preview"),
             "file_info": file_info,
-            "imports": result_payload
+            "imports": result_payload,
         }
-
-# Celery entrypoint
-@shared_task
-def run_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool) -> Dict[str, Any]:
-    return execute_import_job(company_id, sheets, commit)
