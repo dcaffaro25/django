@@ -9,6 +9,7 @@ import re
 import smtplib
 import time
 import uuid
+from collections import defaultdict, deque
 from contextvars import ContextVar
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
@@ -56,6 +57,7 @@ from .api_utils import (
 logger = logging.getLogger("importer")
 sql_logger = logging.getLogger("importer.sql")
 
+# Silence gunicorn.access propagation so our structured "extra" doesn't collide
 try:
     logging.getLogger("gunicorn.access").propagate = False
 except Exception:
@@ -210,10 +212,11 @@ def _repr_map_inst(m: Dict[str, Any]) -> Dict[str, Any]:
 def _register_row_token(global_row_map_inst: Dict[str, Any], global_row_map_pk: Dict[str, int], rid: str, instance: Any):
     if not rid:
         return
+    key = _norm_row_key(rid)
     pk = getattr(instance, "pk", None)
-    global_row_map_inst[rid] = instance
+    global_row_map_inst[key] = instance
     if isinstance(pk, int):
-        global_row_map_pk[rid] = pk
+        global_row_map_pk[key] = pk
 
 
 def _resolve_token_from_maps(token: str,
@@ -505,6 +508,50 @@ def _sanity_check_required_fks(model, payload: Dict[str, Any], original_input: D
 
 
 # --------------------------------------------------------------------------------------
+# Topological sort for SAVE pass (parents before dependents)
+# --------------------------------------------------------------------------------------
+def _toposort_models(nodes: List[str], depends_on: Dict[str, set], order_hint: Dict[str, int]) -> List[str]:
+    # Build indegree map
+    all_nodes = set(nodes) | set(depends_on.keys())
+    for k in list(depends_on.keys()):
+        all_nodes |= set(depends_on[k])
+
+    indeg = {n: 0 for n in all_nodes}
+    adj = {n: set() for n in all_nodes}
+    for a, bs in depends_on.items():
+        for b in bs:
+            if b not in all_nodes:
+                continue
+            adj[b].add(a)     # edge: b -> a (b must come before a)
+            indeg[a] += 1
+
+    # initial queue: nodes with indegree 0, stable by hint
+    q = deque(sorted([n for n in all_nodes if indeg[n] == 0], key=lambda x: order_hint.get(x, 10_000)))
+    out: List[str] = []
+    while q:
+        u = q.popleft()
+        out.append(u)
+        for v in sorted(adj[u], key=lambda x: order_hint.get(x, 10_000)):
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                q.append(v)
+
+    if len(out) != len(all_nodes):
+        # cycle or missing nodes: fallback to hint order while preserving original filter
+        logger.warning("model_toposort_cycle_or_missing", **_log_extra(all_nodes=sorted(list(all_nodes))))
+        # keep original nodes but stable by hint
+        out = sorted(list(all_nodes), key=lambda x: order_hint.get(x, 10_000))
+
+    # return only nodes actually present in `nodes` in topo order
+    present = [n for n in out if n in nodes]
+    # plus any stragglers not discovered (keep deterministic)
+    for n in nodes:
+        if n not in present:
+            present.append(n)
+    return present
+
+
+# --------------------------------------------------------------------------------------
 # Core import executor — ONE savepoint for the entire file with FK deferral
 # --------------------------------------------------------------------------------------
 DUP_CHECK_LAST_N = 10
@@ -546,6 +593,10 @@ def run_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool) 
 
 def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool, *, file_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     ORDER_HINT = {name: i for i, name in enumerate(MODEL_APP_MAP.keys())}
+
+    # run-scoped maps used for the entire file
+    global_row_map_inst: Dict[str, Any] = {}
+    global_row_map_pk: Dict[str, int] = {}
 
     run_id = uuid.uuid4().hex[:8]
     _run_id_ctx.set(run_id)
@@ -759,7 +810,8 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
             models_in_order.append(model_name)
             logger.info("sheet_end", **_log_extra(had_error=bool(had_err)))
 
-        models_in_order.sort(key=lambda m: ORDER_HINT.get(m, 1000))
+        # Keep a deterministic baseline order before topo-sort
+        models_in_order = sorted(models_in_order, key=lambda m: ORDER_HINT.get(m, 1000))
         logger.info("order_resolved", **_log_extra(models=models_in_order))
 
         if commit and any_prep_error:
@@ -776,12 +828,12 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
         models_touched: List[Any] = []
         result_payload: List[Dict[str, Any]] = []
 
-        global_row_map_inst: Dict[str, Any] = {}
-        global_row_map_pk: Dict[str, int] = {}
-
         # staged rows: per model, list of dict(row_id, instance, payload_used, original_input, deferred_fks)
         built_by_model: Dict[str, List[Dict[str, Any]]] = {}
         row_outputs_by_model: Dict[str, List[Dict[str, Any]]] = {m: [] for m in models_in_order}
+
+        # dependency graph (populated during BUILD when we actually defer FKs)
+        model_depends_on: Dict[str, set] = defaultdict(set)
 
         with transaction.atomic():
             if connection.vendor == "postgresql":
@@ -811,6 +863,9 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                             global_map_pk_size=len(global_row_map_pk),
                         ),
                     )
+
+                    # Track which remote models this model deferred to (for topo sort)
+                    deferred_to_remote_models: set[str] = set()
 
                     for row in rows:
                         rid = _norm_row_key(row["__row_id"])
@@ -843,10 +898,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
 
                             fk_keys = [k for k in list(payload.keys()) if k.endswith("_fk")]
                             if fk_keys:
-                                logger.debug(
-                                    "fk_keys_detected",
-                                    **_log_extra(keys=fk_keys),
-                                )
+                                logger.debug("fk_keys_detected", **_log_extra(keys=fk_keys))
                                 logger.debug(
                                     "fk_context_before_resolution",
                                     **_log_extra(
@@ -887,6 +939,12 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                                     deferred_fks.append((base, token_norm if isinstance(token_norm, str) else str(token_norm)))
                                     payload.pop(base, None)
                                     payload[attname] = None  # keep attname None until save pass
+                                    # record dependency for topo sort
+                                    try:
+                                        remote_m = field.remote_field.model
+                                        deferred_to_remote_models.add(remote_m.__name__)
+                                    except Exception:
+                                        pass
                                     logger.debug(
                                         "fk_deferred",
                                         **_log_extra(field=base, token=raw, reason="related instance has no PK yet"),
@@ -919,6 +977,11 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                                                 deferred_fks.append((base, token))
                                                 payload.pop(base, None)
                                                 payload[getattr(f, "attname", base)] = None
+                                                try:
+                                                    remote_m = f.remote_field.model
+                                                    deferred_to_remote_models.add(remote_m.__name__)
+                                                except Exception:
+                                                    pass
                                                 logger.debug("fk_deferred", **_log_extra(field=base, token=val, reason="rescued unsaved related"))
                                             else:
                                                 where, assigned = _assign_fk_value(model, base, resolved, payload)
@@ -964,11 +1027,9 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                                 exclude = []
                                 if deferred_fks:
                                     for base, _ in deferred_fks:
-                                        f = model._meta.get_field(base)
-                                        # full_clean() excludes by FIELD NAME, not attname
                                         exclude.append(base)
-                                        # optional: also exclude attname; harmless if present
-                                        att = getattr(f, "attname", base)
+                                        f = model._meta.get_field(base)
+                                        att = getattr(f, "attname", base)  # e.g. "transaction_id"
                                         if att != base:
                                             exclude.append(att)
                                 instance.full_clean(exclude=exclude or None)
@@ -1031,6 +1092,11 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                                 "external_id": row.get("external_id"),
                             })
 
+                    # Merge model-level dependencies discovered via deferrals
+                    if deferred_to_remote_models:
+                        model_depends_on[model_name] |= deferred_to_remote_models
+                        logger.debug("model_deferred_dependencies", **_log_extra(depends_on=sorted(list(deferred_to_remote_models))))
+
                     logger.debug(
                         "model_end_build_validate",
                         **_log_extra(
@@ -1043,8 +1109,12 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                 if any(any(r.get("status") == "error" for r in row_outputs_by_model[m]) for m in models_in_order):
                     raise RuntimeError("validation_errors_before_save")
 
-                # ------------ PASS 2: SAVE (fill deferred FKs first) ------------
-                for model_name in models_in_order:
+                # Compute save order from discovered dependencies (parents before dependents)
+                save_order = _toposort_models(models_in_order, model_depends_on, ORDER_HINT)
+                logger.info("save_order_resolved", **_log_extra(save_order=save_order, depends_on={k: sorted(list(v)) for k, v in model_depends_on.items()}))
+
+                # ------------ PASS 2: SAVE (bind deferred FKs now that parents have PKs) ------------
+                for model_name in save_order:
                     _model_ctx.set(model_name)
                     app_label = MODEL_APP_MAP[model_name]
                     model = apps.get_model(app_label, model_name)
@@ -1062,12 +1132,18 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         for base, token in deferred_fks:
                             f = model._meta.get_field(base)
                             attname = getattr(f, "attname", base)
-                            cand = _resolve_token_from_maps(token, {}, {}, global_row_map_inst, global_row_map_pk)
+                            tok = _norm_row_key(token)
+                            cand = _resolve_token_from_maps(tok, {}, {}, global_row_map_inst, global_row_map_pk)
                             if isinstance(cand, Model):
                                 pkv = getattr(cand, "pk", None)
                             else:
                                 pkv = cand
                             if not isinstance(pkv, int):
+                                logger.error(
+                                    "[IMPORT][FILE][FK_RESOLVE_MISSING] Could not resolve deferred FK token %r for field %r",
+                                    token, base,
+                                    **_log_extra(map_pk_keys=sorted(list(global_row_map_pk.keys()))[:50])
+                                )
                                 raise ValidationError({base: [f"Could not resolve deferred FK token {token!r} to a saved id"]})
                             setattr(instance, attname, pkv)
                             logger.debug("fk_deferred_bound", **_log_extra(field=base, token=token, assigned_id=pkv))
@@ -1082,18 +1158,21 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         # update global maps with actual PK after save
                         if rid:
                             _register_row_token(global_row_map_inst, global_row_map_pk, rid, instance)
-                        
+
+                        # log a small sample of the token->pk map for visibility
+                        map_keys = sorted(list(global_row_map_pk.keys()))
+                        sample = {k: global_row_map_pk[k] for k in map_keys[:10]}
                         logger.debug(
                             "post_save_map_state",
                             **_log_extra(
                                 model_saved=model_name,
                                 token_saved=rid,
                                 instance_repr=str(instance),
-                                global_map_inst=_repr_map_inst(global_row_map_inst),
-                                global_row_map_pk=dict(global_row_map_pk),
+                                map_pk_keys=map_keys[:50],
+                                map_pk_sample=sample,
                             ),
                         )
-                        
+
                         # finalize output
                         for r in row_outputs_by_model[model_name]:
                             if r.get("__row_id") == rid and r.get("status") == "pending":
@@ -1111,7 +1190,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
 
                 # snapshots only if commit True
                 if commit:
-                    for model_name in models_in_order:
+                    for model_name in save_order:
                         app_label = MODEL_APP_MAP[model_name]
                         model = apps.get_model(app_label, model_name)
                         pre = next(b for b in prepared if b["model"] == model_name)
