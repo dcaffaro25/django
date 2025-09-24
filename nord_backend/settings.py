@@ -49,6 +49,39 @@ LOGGING = {
     },
 }
 
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "simple": {
+            "format": "%(levelname)s %(asctime)s %(name)s %(message)s | run_id=%(run_id)s company=%(company_id)s model=%(model)s row_id=%(row_id)s"
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "level": "DEBUG",
+            "formatter": "simple",
+        },
+    },
+    "loggers": {
+        # our importer logs
+        "importer": {
+            "handlers": ["console"],
+            "level": "DEBUG",
+            "propagate": False,
+        },
+        "importer.sql": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        # useful when running under gunicorn
+        "gunicorn.error": {"handlers": ["console"], "level": "INFO", "propagate": True},
+        "gunicorn.access": {"handlers": ["console"], "level": "INFO", "propagate": True},
+    },
+}
+
 '''
 LOGGING = {
     "version": 1,
