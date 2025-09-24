@@ -311,7 +311,13 @@ def _apply_fk_inputs(model, payload: dict, original_input: dict, saved_by_token:
         if raw in (None, ""):
             out[base] = None
             continue
-        out[base] = _resolve_fk_on_field(model, base, raw, saved_by_token)
+        # Resolve token or ID
+        resolved_obj = _resolve_fk_on_field(model, base, raw, saved_by_token)
+        if isinstance(resolved_obj, dj_models.Model):
+            # Use the PK for assignment to avoid 'null' issues on unsaved instances
+            out[f"{base}_id"] = resolved_obj.pk
+        else:
+            out[base] = resolved_obj  # for numeric IDs, _resolve_fk_on_field returns the object or raises
 
     # Rescue: token in base field
     for f in model._meta.get_fields():

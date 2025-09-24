@@ -43,7 +43,7 @@ LOGGING = {
         },
         # Gunicorn access format (no extra fields!)
         "gunicorn_access": {
-            "format": '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s"'
+            "format": '%(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s"'
         },
     },
     "handlers": {
