@@ -965,7 +965,12 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                                 if deferred_fks:
                                     for base, _ in deferred_fks:
                                         f = model._meta.get_field(base)
-                                        exclude.append(getattr(f, "attname", base))
+                                        # full_clean() excludes by FIELD NAME, not attname
+                                        exclude.append(base)
+                                        # optional: also exclude attname; harmless if present
+                                        att = getattr(f, "attname", base)
+                                        if att != base:
+                                            exclude.append(att)
                                 instance.full_clean(exclude=exclude or None)
 
                             # stage
@@ -1077,7 +1082,18 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         # update global maps with actual PK after save
                         if rid:
                             _register_row_token(global_row_map_inst, global_row_map_pk, rid, instance)
-
+                        
+                        logger.debug(
+                            "post_save_map_state",
+                            **_log_extra(
+                                model_saved=model_name,
+                                token_saved=rid,
+                                instance_repr=str(instance),
+                                global_map_inst=_repr_map_inst(global_row_map_inst),
+                                global_row_map_pk=dict(global_row_map_pk),
+                            ),
+                        )
+                        
                         # finalize output
                         for r in row_outputs_by_model[model_name]:
                             if r.get("__row_id") == rid and r.get("status") == "pending":
