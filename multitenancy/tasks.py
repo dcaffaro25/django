@@ -137,7 +137,7 @@ class _SlowSQL:
                         )
 
             self._cm = connection.execute_wrapper(wrapper)
-            self._cm.__enter__()
+            self._cm.__enter__()  # type: ignore
         except Exception:
             self._cm = None
         return self
@@ -145,7 +145,7 @@ class _SlowSQL:
     def __exit__(self, exc_type, exc, tb):
         try:
             if self._cm:
-                self._cm.__exit__(exc_type, exc, tb)
+                self._cm.__exit__(exc_type, exc, tb)  # type: ignore
         finally:
             return False
 
@@ -548,9 +548,6 @@ def _build_dependency_graph(prepared_by_model: Dict[str, List[PlannedRow]]) -> T
                     if tok in token_set:
                         parents.add(tok)
 
-            # MPTT path parent tokens are handled via explicit *_fk if you emit them;
-            # if you need path-string→token discovery, plug it here.
-
             r.parents = parents
             for p in parents:
                 parents_of[r.rid].add(p)
@@ -594,7 +591,7 @@ def _toposort_group(group_nodes: Set[str], parents_of: Dict[str, Set[str]], rows
     indeg = {n: 0 for n in group_nodes}
     for child in group_nodes:
         indeg[child] = len([p for p in parents_of.get(child, set()) if p in group_nodes])
-    # model hint
+
     def key_fn(rid: str):
         m = rows_by_rid[rid].model_name
         return (order_hint.get(m, 10_000), rid)
@@ -604,18 +601,65 @@ def _toposort_group(group_nodes: Set[str], parents_of: Dict[str, Set[str]], rows
     while q:
         u = q.popleft()
         out.append(u)
-        # reduce indegree of children in this group
-        # build reverse: for efficiency, derive children from parents_of
         for v in group_nodes:
             if u in parents_of.get(v, set()):
                 indeg[v] -= 1
                 if indeg[v] == 0:
                     q.append(v)
     acyclic = (len(out) == len(group_nodes))
-    if not acyclic:
-        # return partial order; caller will treat as cycle
-        pass
     return out, acyclic
+
+
+# --------------------------- NEW: FK application helper ---------------------------
+
+def _apply_fk_inputs_into_attnames(
+    model, payload: Dict[str, Any], original_input: Dict[str, Any], saved_by_token: Dict[str, Model]
+) -> None:
+    """
+    For each ForeignKey on `model`, interpret original_input['<base>_fk'] if present:
+      - numeric -> put into payload['<base>_id']
+      - token   -> look up saved_by_token[token].pk and put into payload['<base>_id']
+    Also 'rescue' if the base field itself contains a token string.
+    Finally, REMOVE any '<base>_fk' leftovers from payload (and any stray *_fk).
+    """
+    fk_fields = [f for f in model._meta.get_fields() if isinstance(f, dj_models.ForeignKey)]
+
+    for f in fk_fields:
+        base = f.name
+        att = getattr(f, "attname", base)
+
+        # Prefer explicit *_fk from the original input (what user actually passed)
+        raw = original_input.get(f"{base}_fk", None)
+
+        if raw not in (None, ""):
+            if _is_numeric_id(raw):
+                # Existing PK in DB
+                payload.pop(base, None)
+                payload[att] = int(raw)
+            else:
+                tok = _norm_row_key(str(raw))
+                if tok in saved_by_token:
+                    payload.pop(base, None)
+                    payload[att] = getattr(saved_by_token[tok], "pk", None)
+                else:
+                    # Planning should have ordered parents before; if not present, we'll fail validation later.
+                    pass
+        else:
+            # 'Rescue' a token typed into the base field
+            v = payload.get(base, payload.get(att))
+            if isinstance(v, str) and not _is_numeric_id(v):
+                tok = _norm_row_key(v)
+                if tok in saved_by_token:
+                    payload.pop(base, None)
+                    payload[att] = getattr(saved_by_token[tok], "pk", None)
+
+        # Always remove *_fk key from payload in case normalization kept it
+        payload.pop(f"{base}_fk", None)
+
+    # Defensive: purge any remaining *_fk that don't correspond to real FK fields
+    for k in list(payload.keys()):
+        if k.endswith("_fk"):
+            payload.pop(k, None)
 
 
 # --------------------------------------------------------------------------------------
@@ -830,7 +874,6 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         "[IMPORT][PREP][EXC] model=%s row_id=%s action=%s err=%s",
                         model_name, rid, action, base, exc_info=True, **_log_extra()
                     )
-                    # Record as a PlannedRow with preflight_error so it will be reported
                     prepared_rows.append(PlannedRow(
                         model_name=model_name,
                         rid=rid,
@@ -852,7 +895,6 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
         models_in_file = sorted(models_in_file, key=lambda m: ORDER_HINT.get(m, 1000))
         logger.info("order_resolved", **_log_extra(models=models_in_file))
 
-        # If we are committing and already have prep-time errors, return early
         if commit and any(
             any(pr.preflight_error for pr in prepared_by_model[m])
             for m in models_in_file
@@ -890,7 +932,6 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
         # ---------------- PLAN: Graph & Groups ----------------
         parents_of, children_of, rows_by_rid = _build_dependency_graph(prepared_by_model)
 
-        # undirected adjacency for grouping
         undirected_adj: Dict[str, Set[str]] = defaultdict(set)
         all_nodes: Set[str] = set(rows_by_rid.keys())
         for child, parents in parents_of.items():
@@ -903,16 +944,12 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
         groups: List[Set[str]] = _connected_components(all_nodes, undirected_adj)
 
         # ---------------- EXECUTE GROUPS ----------------
-        # final outputs organized by model
         row_outputs_by_model: Dict[str, List[Dict[str, Any]]] = {m: [] for m in models_in_file}
         models_touched: Set[str] = set()
 
-        # For preview mode we will reset sequences at the end for all touched models
         for gi, group in enumerate(groups, start=1):
-            # Topo order within the group
             order, acyclic = _toposort_group(group, parents_of, rows_by_rid, ORDER_HINT)
             if not acyclic:
-                # mark all rows in this group as cycle error
                 msg = "Detected cyclic token dependencies inside the group; provide a numeric id for at least one side or split the cycle."
                 for rid in sorted(group):
                     pr = rows_by_rid[rid]
@@ -928,8 +965,6 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                     })
                 continue
 
-            # Early structural check: any parent token missing from this import?
-            # (Shouldn't happen due to graph build, but keep a guard)
             missing_refs = []
             for rid in order:
                 for p in rows_by_rid[rid].parents:
@@ -953,13 +988,11 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
 
             logger.info("group_begin", **_log_extra(group_index=gi, size=len(group), order=order))
 
-            # Group savepoint
             group_failed = False
             failed_tokens: Set[str] = set()
             failure_messages_by_token: Dict[str, str] = {}
             saved_instances_by_token: Dict[str, Model] = {}
-            # Keep track of outputs for this group so we can adjust messages if rolled back
-            group_outputs: List[Tuple[str, str, Dict[str, Any]]] = []  # (model_name, rid, output_dict)
+            group_outputs: List[Tuple[str, str, Dict[str, Any]]] = []
 
             with transaction.atomic():
                 sp = transaction.savepoint()
@@ -968,7 +1001,6 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         pr = rows_by_rid[rid]
                         _model_ctx.set(pr.model_name); _row_ctx.set(pr.rid)
 
-                        # If row had preflight error, just report and mark group failed
                         if pr.preflight_error:
                             out = {
                                 "__row_id": pr.rid,
@@ -986,7 +1018,6 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                             failure_messages_by_token[pr.rid] = out["message"]
                             continue
 
-                        # If already failed (parent), mark as blocked
                         blocking_parents = [p for p in pr.parents if p in failed_tokens]
                         if group_failed and blocking_parents:
                             msg = f"Parent row(s) {', '.join(sorted(blocking_parents))} failed; unable to validate or save this child."
@@ -1002,58 +1033,14 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                             group_outputs.append((pr.model_name, pr.rid, out))
                             continue
 
-                        # Resolve FKs to PKs (no deferrals)
                         app_label = MODEL_APP_MAP[pr.model_name]
                         model = apps.get_model(app_label, pr.model_name)
                         models_touched.add(pr.model_name)
 
                         payload = dict(pr.payload)
-                        # fill company/tenant already handled in normalize
 
-                        # FK resolution using *_fk or rescued tokens
-                        fk_fields = [f for f in model._meta.get_fields() if isinstance(f, dj_models.ForeignKey)]
-                        for f in fk_fields:
-                            base = f.name
-                            att = getattr(f, "attname", base)
-                            raw = pr.original_input.get(f"{base}_fk", None)
-                            if raw in ("", None):
-                                # Perhaps base field contains value (id or token)
-                                v = payload.get(base, payload.get(att))
-                                if isinstance(v, str) and not _is_numeric_id(v):
-                                    tok = _norm_row_key(v)
-                                    if tok in saved_instances_by_token:
-                                        payload.pop(base, None)
-                                        payload[att] = getattr(saved_instances_by_token[tok], "pk", None)
-                                # else leave as-is (id or null)
-                            else:
-                                # has explicit *_fk
-                                if _is_numeric_id(raw):
-                                    payload.pop(base, None)
-                                    payload[att] = int(raw)
-                                else:
-                                    tok = _norm_row_key(str(raw))
-                                    if tok in saved_instances_by_token:
-                                        payload.pop(base, None)
-                                        payload[att] = getattr(saved_instances_by_token[tok], "pk", None)
-                                    else:
-                                        # Should not happen due to topo order; treat as structural error
-                                        msg = f"Internal planning error: unmet dependency {tok!r} for field {base!r}."
-                                        out = {
-                                            "__row_id": pr.rid,
-                                            "status": "error",
-                                            "action": pr.action,
-                                            "data": pr.original_input or pr.payload or {},
-                                            "message": msg,
-                                            "observations": pr.observations,
-                                            "external_id": None,
-                                        }
-                                        group_outputs.append((pr.model_name, pr.rid, out))
-                                        group_failed = True
-                                        failed_tokens.add(pr.rid)
-                                        failure_messages_by_token[pr.rid] = msg
-                                        break
-                        if pr.rid in failed_tokens:
-                            continue  # already marked due to structural unmet dep
+                        # --------- FK resolution (no deferrals) + strip *_fk ----------
+                        _apply_fk_inputs_into_attnames(model, payload, pr.original_input, saved_instances_by_token)
 
                         # MPTT parent resolution from path (if any)
                         if _is_mptt_model(model):
@@ -1064,13 +1051,12 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                                 payload["parent"] = parent
                                 payload.pop("parent_id", None)
 
-                        # Build, validate, save
                         try:
                             instance = model(**payload)
                             if hasattr(instance, "full_clean"):
                                 instance.full_clean()
                             instance.save()
-                            saved_instances_by_token[pr.rid] = instance  # works for tokens and numeric ids (for uniformity)
+                            saved_instances_by_token[pr.rid] = instance
 
                             out = {
                                 "__row_id": pr.rid,
@@ -1110,26 +1096,21 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                             failed_tokens.add(pr.rid)
                             failure_messages_by_token[pr.rid] = base_msg
 
-                    # Group end: decide savepoint fate
                     if commit and not group_failed:
                         transaction.savepoint_commit(sp)
                     else:
                         transaction.savepoint_rollback(sp)
-                        # Adjust messages for commit=True failure (rolled back success)
                         if commit and group_failed:
                             failed_list = sorted(list(failed_tokens))
                             rolled_msg = f"Rolled back due to error in group (failed: {', '.join(failed_list)})."
-                            # flip any success rows in this group to error with rollback message
                             for i, (mname, rid, out) in enumerate(group_outputs):
                                 if out.get("status") == "success":
                                     out["status"] = "error"
                                     out["message"] = rolled_msg
                                     group_outputs[i] = (mname, rid, out)
-                        # In preview, keep 'success' (we show would-be state) and sequences will be reset later
 
                 except Exception as e:
                     transaction.savepoint_rollback(sp)
-                    # catastrophic error in group execution; mark all as error
                     err = exception_to_dict(e, include_stack=False)
                     base_msg = err.get("summary") or str(e)
                     for rid in order:
@@ -1146,11 +1127,9 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         }
                         group_outputs.append((pr.model_name, pr.rid, out))
 
-                # Flush group outputs into global per-model list
                 for mname, rid, out in group_outputs:
                     row_outputs_by_model[mname].append(out)
 
-        # Snapshots (only if commit True)
         if commit:
             for m in models_in_file:
                 pre_rows = prepared_by_model.get(m, [])
@@ -1173,14 +1152,12 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                     jaccard_to_prev=closest.get("jaccard"),
                 )
 
-        # Reset sequences if this was a preview
         if not commit and models_in_file:
             try:
                 reset_pk_sequences([apps.get_model(MODEL_APP_MAP[m], m) for m in models_in_file])
             except Exception:
                 logger.warning("reset_pk_sequences_failed", **_log_extra(models=models_in_file))
 
-        # ---------------- RESPONSE ----------------
         result_payload: List[Dict[str, Any]] = []
         for m in models_in_file:
             result_payload.append({
