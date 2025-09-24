@@ -1,4 +1,5 @@
 # multitenancy/tasks.py
+
 from __future__ import annotations
 
 import logging
@@ -24,6 +25,7 @@ from multitenancy.formula_engine import apply_substitutions
 # --------------------------------------------------------------------------------------
 # Minimal logging
 # --------------------------------------------------------------------------------------
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     h = logging.StreamHandler()
@@ -35,25 +37,24 @@ if not logger.handlers:
 # --------------------------------------------------------------------------------------
 # Email helpers (kept)
 # --------------------------------------------------------------------------------------
+
 @shared_task(bind=True, autoretry_for=(smtplib.SMTPException, ConnectionError), retry_backoff=True, max_retries=5)
 def send_user_invite_email(self, subject: str, message: str, to_email: str):
     send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, [to_email], fail_silently=False)
-
 
 @shared_task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
 def send_user_email(self, subject: str, message: str, to_email: str):
     send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, [to_email], fail_silently=False)
 
-
 # --------------------------------------------------------------------------------------
 # Simple integration trigger (kept)
 # --------------------------------------------------------------------------------------
+
 @shared_task
 def execute_integration_rule(rule_id: int, payload: dict):
     from multitenancy.models import IntegrationRule  # local import to avoid heavy imports on module load
     rule = IntegrationRule.objects.get(pk=rule_id)
     return rule.run_rule(payload)
-
 
 @shared_task
 def trigger_integration_event(company_id: int, event_name: str, payload: dict):
@@ -69,9 +70,8 @@ def trigger_integration_event(company_id: int, event_name: str, payload: dict):
         else:
             execute_integration_rule(rule.id, payload)
 
-
 # --------------------------------------------------------------------------------------
-# Barebones importer (no dependency on api_utils.py)
+# Barebones importer (with improved ordering and FK handling)
 # --------------------------------------------------------------------------------------
 
 # Map Excel sheet names -> app labels
@@ -116,7 +116,6 @@ PATH_SEP = " > "
 
 _WS_RE = re.compile(r"\s+")
 
-
 def _is_missing(v) -> bool:
     if v is None or v == "":
         return True
@@ -130,8 +129,8 @@ def _is_missing(v) -> bool:
         return True
     return False
 
-
 def _to_int_or_none_soft(v):
+    """Convert value to int if possible, otherwise None (non-strict)."""
     if _is_missing(v):
         return None
     if isinstance(v, int):
@@ -147,7 +146,6 @@ def _to_int_or_none_soft(v):
     except Exception:
         return None
 
-
 def _to_bool(val, default=False):
     if isinstance(val, bool):
         return val
@@ -155,34 +153,32 @@ def _to_bool(val, default=False):
         return default
     return str(val).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
-
 def _norm_row_key(key: Any) -> Any:
+    """Normalize a __row_id token for consistent lookup (strip, lower, remove nbsp)."""
     if isinstance(key, str):
         return key.replace("\u00A0", " ").strip().lower()
     return key
-
 
 def _is_mptt_model(model) -> bool:
     # simple heuristic: has _mptt_meta and a "parent" field
     return hasattr(model, "_mptt_meta") and any(f.name == "parent" for f in model._meta.fields)
 
-
 def _get_path_value(d: Dict[str, Any]) -> Optional[str]:
+    """Extract the 'path' or 'Caminho' value from a row dict, if present and non-empty."""
     for c in PATH_COLS:
         v = d.get(c)
         if isinstance(v, str) and v.strip():
             return v.strip()
     return None
 
-
 def _split_path(path_str: str) -> List[str]:
+    """Split a path string by the defined separator into a list of parts."""
     return [p.strip() for p in str(path_str).split(PATH_SEP) if p and p.strip()]
 
-
 def _path_depth(row: Dict[str, Any]) -> int:
+    """Calculate hierarchy depth of an MPTT path, for sorting parent before children."""
     p = _get_path_value(row)
     return len(_split_path(p)) if p else 0
-
 
 def _resolve_parent_from_path_chain(model, chain: List[str]):
     """
@@ -198,8 +194,8 @@ def _resolve_parent_from_path_chain(model, chain: List[str]):
         parent = inst
     return parent
 
-
 def _allowed_keys(model) -> set:
+    """Determine which keys are allowed for the given model (field names, attnames, and FK aliases)."""
     names = set()
     for f in model._meta.fields:
         names.add(f.name)
@@ -210,15 +206,15 @@ def _allowed_keys(model) -> set:
     # allow path helper + id + __row_id and company_fk convenience
     return names | fk_aliases | set(PATH_COLS) | {"__row_id", "id", "company_fk"}
 
-
 def _filter_unknown(model, row: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """Filter out keys that are not recognized fields or special aliases for the model."""
     allowed = _allowed_keys(model)
     filtered = {k: v for k, v in row.items() if k in allowed}
     unknown = sorted([k for k in row.keys() if k not in allowed and k != "__row_id"])
     return filtered, unknown
 
-
 def _coerce_boolean_fields(model, payload: dict) -> dict:
+    """Convert any BooleanField values in payload to proper booleans."""
     out = dict(payload)
     for f in model._meta.get_fields():
         if isinstance(f, dj_models.BooleanField):
@@ -227,8 +223,8 @@ def _coerce_boolean_fields(model, payload: dict) -> dict:
                 out[name] = _to_bool(out[name])
     return out
 
-
 def _quantize_decimal_fields(model, payload: dict) -> dict:
+    """Round/quantize DecimalField values in payload to the correct decimal places."""
     out = dict(payload)
     for f in model._meta.get_fields():
         if isinstance(f, dj_models.DecimalField):
@@ -238,7 +234,6 @@ def _quantize_decimal_fields(model, payload: dict) -> dict:
                 q = Decimal("1").scaleb(-dp)
                 out[name] = Decimal(str(out[name])).quantize(q, rounding=ROUND_HALF_UP)
     return out
-
 
 def _attach_company_context(model, payload: dict, company_id: Optional[int]) -> dict:
     """
@@ -252,7 +247,7 @@ def _attach_company_context(model, payload: dict, company_id: Optional[int]) -> 
 
     # explicit overrides
     if "company_id" in out or "company" in out or "company_fk" in out:
-        # if they provided company_fk, convert to company_id if it's numeric
+        # if provided company_fk, convert to company_id if numeric
         if "company_fk" in out:
             cid = _to_int_or_none_soft(out.get("company_fk"))
             if cid:
@@ -263,14 +258,13 @@ def _attach_company_context(model, payload: dict, company_id: Optional[int]) -> 
     out["company_id"] = int(company_id)
     return out
 
-
 def _resolve_fk_on_field(model, field_name: str, raw_value, token_map: Dict[str, Any]):
     """
-    Resolve a ForeignKey for `field_name`.
-    - If raw_value is a string token and exists in token_map -> return that instance
-    - If raw_value numeric-ish -> fetch by id
-    - None/"" -> None
-    Return the *instance* (safe to assign to FK field).
+    Resolve a ForeignKey for `field_name` given a raw reference value.
+    - If raw_value is a string token (like __row_id) and exists in token_map -> return that instance.
+    - If raw_value is numeric-ish -> fetch by id from the related model.
+    - If raw_value is missing/empty -> return None.
+    Returns the *instance* of the related model, or raises an error if not found.
     """
     if _is_missing(raw_value):
         return None
@@ -281,11 +275,11 @@ def _resolve_fk_on_field(model, field_name: str, raw_value, token_map: Dict[str,
         if tok in token_map:
             return token_map[tok]
 
+    # If not a token, treat as a numeric ID reference
     related_field = model._meta.get_field(field_name)
     fk_model = getattr(related_field, "related_model", None)
     if fk_model is None:
         raise ValueError(f"Field '{field_name}' is not a ForeignKey on {model.__name__}")
-
     fk_id = _to_int_or_none_soft(raw_value)
     if fk_id is None:
         raise ValueError(f"Invalid FK reference '{raw_value}' for field '{field_name}'")
@@ -294,32 +288,35 @@ def _resolve_fk_on_field(model, field_name: str, raw_value, token_map: Dict[str,
     except fk_model.DoesNotExist:
         raise ValueError(f"{fk_model.__name__} id={fk_id} not found for field '{field_name}'")
 
-
 def _apply_fk_inputs(model, payload: dict, original_input: dict, saved_by_token: Dict[str, Any]) -> dict:
     """
-    Interpret '<field>_fk' keys (if present) into actual FK instances on '<field>'.
-    Also rescue tokens typed directly into the base field (string matching a saved token).
+    Interpret '<field>_fk' keys in payload into actual FK instances or IDs on '<field>'.
+    Also handles the case where a base field contains a token directly.
     """
     out = dict(payload)
 
-    # First pass: explicit *_fk keys
+    # First pass: handle explicit *_fk keys by replacing them with actual foreign key assignments
     for k in list(out.keys()):
         if not k.endswith("_fk"):
             continue
-        base = k[:-3]
+        base = k[:-3]  # e.g., "transaction_fk" -> base "transaction"
         raw = out.pop(k, None)
         if raw in (None, ""):
             out[base] = None
             continue
-        # Resolve token or ID
+        # Resolve token or ID to model instance
         resolved_obj = _resolve_fk_on_field(model, base, raw, saved_by_token)
         if isinstance(resolved_obj, dj_models.Model):
-            # Use the PK for assignment to avoid 'null' issues on unsaved instances
+            if resolved_obj.pk is None:
+                # Found a referenced object that is not saved (no PK)
+                raise ValueError(f"Foreign key '{base}' reference '{raw}' is not yet saved (missing ID).")
+            # Use the PK for assignment to avoid issues with unsaved instances
             out[f"{base}_id"] = resolved_obj.pk
         else:
-            out[base] = resolved_obj  # for numeric IDs, _resolve_fk_on_field returns the object or raises
+            # If resolution returned a non-model (it normally returns a model or None), assign directly
+            out[base] = resolved_obj
 
-    # Rescue: token in base field
+    # Second pass: rescue scenario where a token might be in the base field (e.g., "transaction": "t1")
     for f in model._meta.get_fields():
         if isinstance(f, dj_models.ForeignKey):
             base = f.name
@@ -327,25 +324,29 @@ def _apply_fk_inputs(model, payload: dict, original_input: dict, saved_by_token:
             if isinstance(v, str) and not v.isdigit():
                 tok = _norm_row_key(v)
                 if tok in saved_by_token:
-                    out[base] = saved_by_token[tok]
+                    resolved_obj = saved_by_token[tok]
+                    if resolved_obj.pk is None:
+                        raise ValueError(f"Foreign key '{base}' reference '{v}' is not yet saved (missing ID).")
+                    # Assign the actual instance or ID
+                    out[base] = resolved_obj
 
     return out
 
-
 def _safe_model_dict(instance, exclude_fields=None) -> dict:
+    """Serialize model instance to dict, converting related fields to their IDs for clarity."""
     data = model_to_dict(instance)
     exclude_fields = set(exclude_fields or [])
     for field in exclude_fields:
         data.pop(field, None)
-    # Convert relations to ids for readability
+    # Convert relation fields to their id values for readability
     for field in instance._meta.fields:
         if field.is_relation:
             name = field.name
             data[name] = getattr(instance, f"{name}_id", None)
     return data
 
-
 def _row_observations(audit_by_rowid: Dict[Any, List[dict]], rid_norm: Any) -> List[str]:
+    """Collect substitution rule observations for a given row (by normalized __row_id)."""
     obs: List[str] = []
     for ch in audit_by_rowid.get(rid_norm, []):
         if ch.get("field") == "__row_id":
@@ -355,7 +356,6 @@ def _row_observations(audit_by_rowid: Dict[Any, List[dict]], rid_norm: Any) -> L
         )
     return obs
 
-
 @dataclass
 class RowResult:
     __row_id: Optional[str]
@@ -364,35 +364,31 @@ class RowResult:
     data: dict
     message: str
 
-
 @shared_task
 def run_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool) -> Dict[str, Any]:
+    """Celery task wrapper for execute_import_job."""
     return execute_import_job(company_id, sheets, commit)
-
 
 def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool) -> Dict[str, Any]:
     """
-    Very small importer with substitutions:
-    - Per sheet: apply_substitutions (returns rows + audit)
-    - Iterates rows
-    - Filters unknown keys
-    - Applies company context
-    - Resolves *_fk (numeric id or __row_id token)
-    - Supports MPTT via 'path'/'Caminho' (parents first; will error if missing)
-    - create vs update based on 'id'
-    - Attaches per-row substitution observations
+    Import data from multiple sheets (each a list of row dicts for a specific model).
+    Applies substitution rules, then creates/updates instances in the database.
+    If `commit` is False, rolls back all changes after validation (preview mode).
     """
     run_id = uuid.uuid4().hex[:8]
     logger.info("import_start run_id=%s commit=%s sheet_count=%d", run_id, bool(commit), len(sheets))
 
-    # Global token map across *all* sheets
-    saved_by_token: Dict[str, Any] = {}
+    # Sort sheets by defined model order to ensure dependencies are respected (e.g., Transaction before JournalEntry)
+    model_order = {name: idx for idx, name in enumerate(MODEL_APP_MAP.keys())}
+    sheets.sort(key=lambda s: model_order.get(s.get("model"), len(model_order)))
+    logger.debug("Sorted sheet order: %s", [s.get("model") for s in sheets])
+
     outputs_by_model: Dict[str, List[dict]] = {}
+    saved_by_token: Dict[str, Any] = {}  # Global token map across all sheets for FK resolution
 
     t0 = time.monotonic()
     with transaction.atomic():
-        # roll back everything if preview
-        savepoint = transaction.savepoint()
+        savepoint = transaction.savepoint()  # mark the start for potential rollback
 
         for sheet in sheets:
             model_name = sheet.get("model")
@@ -415,7 +411,7 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
             model = apps.get_model(app_label, model_name)
             raw_rows: List[Dict[str, Any]] = sheet.get("rows") or []
 
-            # ---------- substitutions + audit ----------
+            # Apply substitution rules for this sheet (returns transformed rows + audit log)
             rows, audit = apply_substitutions(
                 raw_rows,
                 company_id=company_id,
@@ -429,23 +425,23 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
 
             logger.info("processing sheet '%s' rows=%d (after substitutions)", model_name, len(rows))
 
-            # If MPTT and path present, sort parents first
+            # If model is hierarchical (MPTT), sort rows by path depth so parents come before children
             if _is_mptt_model(model):
                 rows = sorted(rows, key=_path_depth)
 
-            for idx, row in enumerate(rows):
+            # Process each row in the current sheet
+            for row in rows:
                 raw = dict(row or {})
                 rid_raw = raw.pop("__row_id", None)
                 rid = _norm_row_key(rid_raw)
-
                 try:
-                    # 1) unknowns filtered (but keep *_fk)
+                    # 1) Filter out unknown columns (but keep *_fk for now)
                     filtered, unknown = _filter_unknown(model, raw)
 
-                    # 2) company context (if model has company)
+                    # 2) Attach company context if applicable
                     filtered = _attach_company_context(model, filtered, company_id)
 
-                    # 3) MPTT: derive name/parent from path (if provided)
+                    # 3) MPTT handling: derive 'name' and 'parent' from 'path' if provided
                     if _is_mptt_model(model):
                         path_val = _get_path_value(filtered)
                         if path_val:
@@ -458,22 +454,24 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                                 parent = _resolve_parent_from_path_chain(model, parts[:-1])
                             filtered["name"] = filtered.get("name", leaf) or leaf
                             filtered["parent"] = parent
+                            # Remove helper path fields after use
                             filtered.pop("parent_id", None)
                             filtered.pop("parent_fk", None)
                             for c in PATH_COLS:
                                 filtered.pop(c, None)
 
-                    # 4) FK application: handle *_fk + token rescue
+                    # 4) Resolve ForeignKey inputs: handle *_fk fields and token references
                     filtered = _apply_fk_inputs(model, filtered, raw, saved_by_token)
 
-                    # 5) coercions
+                    # 5) Coerce boolean fields to proper bool types
                     filtered = _coerce_boolean_fields(model, filtered)
+                    # 6) Quantize decimal fields to correct precision
                     filtered = _quantize_decimal_fields(model, filtered)
 
-                    # 6) create/update
+                    # 7) Create or update the model instance
                     action = "create"
-                    instance = None
                     if "id" in filtered and filtered["id"]:
+                        # Update existing instance
                         pk = _to_int_or_none_soft(filtered["id"])
                         if not pk:
                             raise ValueError("Invalid 'id' for update")
@@ -482,21 +480,22 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                             setattr(instance, k, v)
                         action = "update"
                     else:
+                        # Create new instance
                         instance = model(**filtered)
 
-                    # 7) validate & save
+                    # 8) Validate and save the instance
                     if hasattr(instance, "full_clean"):
-                        instance.full_clean()
+                        instance.full_clean()  # This will catch fields like transaction if null
                     instance.save()
 
-                    # 8) register token
+                    # 9) If this row had a __row_id token, save the instance in the token map for references
                     if rid:
                         saved_by_token[rid] = instance
 
+                    # 10) Prepare success output
                     msg = "ok"
                     if unknown:
                         msg += f" | Ignoring unknown columns: {', '.join(unknown)}"
-
                     outputs_by_model[model_name].append({
                         "__row_id": rid,
                         "status": "success",
@@ -508,6 +507,8 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                     })
 
                 except Exception as e:
+                    # Log the row-level error and include original data for context
+                    logger.exception("row error on %s rid=%s: %s", model_name, rid, e)
                     outputs_by_model[model_name].append({
                         "__row_id": rid,
                         "status": "error",
@@ -517,9 +518,8 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         "observations": _row_observations(audit_by_rowid, rid),
                         "external_id": None,
                     })
-                    logger.exception("row error on %s rid=%s: %s", model_name, rid, e)
 
-        # Preview? roll back changes
+        # Roll back all changes if this is a preview (commit=False), otherwise commit the transaction
         committed_flag = bool(commit)
         if not commit:
             transaction.savepoint_rollback(savepoint)
