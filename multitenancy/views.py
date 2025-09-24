@@ -636,7 +636,7 @@ class BulkImportAPIView(APIView):
                             status=status.HTTP_202_ACCEPTED)
 
         # Synchronous
-        result = execute_import_job(company_id, sheets, commit, file_meta=file_meta)
+        result = execute_import_job(company_id, sheets, commit)#, file_meta=file_meta)
 
         # Final safety: scrub any NaN/±Inf that may have been produced downstream
         result = _scrub_json(result)
