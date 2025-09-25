@@ -4,6 +4,7 @@ from django.apps import apps
 from django.utils.timezone import now
 from django.db import transaction
 
+PENDING_ENTITY_NAME = "PENDING"
 PENDING_BANK_NAME = "PENDING"
 PENDING_BANKACCOUNT_NAME = "Pending BankAccount"
 PENDING_BANKACCOUNT_NUMBER = "PENDING"
@@ -33,11 +34,18 @@ def ensure_pending_bank_structs(company_id, *, currency_id=None):
     BankAccount = _get_model("BankAccount")
     Account = _get_model("Account")
     Currency = _get_model("Currency")
-
+    Entity = _get_model("Entity")
+    
     # pick a currency if not given (first one as a fallback)
     if currency_id is None:
         currency_id = Currency.objects.values_list("id", flat=True).order_by("id").first()
-
+    
+    entity, _ = Entity.objects.get_or_create(
+        company_id=company_id,
+        name=PENDING_ENTITY_NAME,
+        defaults={}
+    )
+    
     bank, _ = Bank.objects.get_or_create(
         #company_id=company_id,
         name=PENDING_BANK_NAME,
@@ -55,7 +63,8 @@ def ensure_pending_bank_structs(company_id, *, currency_id=None):
             balance=Decimal("0.00"),
             balance_date=now().date(),
             account_type="pending",
-            entity_id=None,  # set to None if you allow; else choose a default entity for the company
+            entity = entity,
+            #entity_id=entity_id,  # set to None if you allow; else choose a default entity for the company
         ),
     )
 
