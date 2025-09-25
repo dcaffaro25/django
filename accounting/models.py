@@ -288,6 +288,7 @@ class Transaction(TenantAwareBaseModel):
     def save(self, *args, **kwargs):
         if self.amount is not None:
             self.amount = Decimal(str(self.amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        return super().save(*args, **kwargs)
     
     def check_balance(self):
         sum([entry.debit_amount for entry in self.journal_entries.all()]) - sum(
