@@ -39,7 +39,7 @@ def ensure_pending_bank_structs(company_id, *, currency_id=None):
         currency_id = Currency.objects.values_list("id", flat=True).order_by("id").first()
 
     bank, _ = Bank.objects.get_or_create(
-        company_id=company_id,
+        #company_id=company_id,
         name=PENDING_BANK_NAME,
         defaults={}
     )
