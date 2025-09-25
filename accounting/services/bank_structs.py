@@ -30,11 +30,11 @@ def ensure_pending_bank_structs(company_id, *, currency_id=None):
       - a GL Account linked to that pending BankAccount (clearing account)
     Returns (pending_bank_account, pending_gl_account)
     """
-    Bank = _get_model("Bank")
-    BankAccount = _get_model("BankAccount")
-    Account = _get_model("Account")
-    Currency = _get_model("Currency")
-    Entity = _get_model("Entity")
+    Bank = apps.get_model("accounting", "Bank")
+    BankAccount = apps.get_model("accounting", "BankAccount")
+    Account = apps.get_model("accounting", "Account")
+    Currency = apps.get_model("accounting", "Currency")
+    Entity = apps.get_model("multitenancy", "Entity")
     
     # pick a currency if not given (first one as a fallback)
     if currency_id is None:
