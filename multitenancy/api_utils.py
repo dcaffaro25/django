@@ -235,7 +235,10 @@ class BulkImportPreview(APIView):
                             row_id = row_data.pop('__row_id', None)
                             print("  Raw (substituted) data:", row_data)
                             print("  __row_id:", row_id)
-
+                            
+                            if not row_data.get('id'):
+                                row_data.pop('id', None)
+                            
                             # Predefine to avoid UnboundLocal in error path
                             instance = None
                             action = 'create'
@@ -246,22 +249,26 @@ class BulkImportPreview(APIView):
                                 fk_fields = {k: v for k, v in row_data.items() if k.endswith('_fk')}
                                 for fk_field, fk_ref in fk_fields.items():
                                     field_name = fk_field[:-3]
+                                    related_field = model._meta.get_field(field_name)
+                                    fk_model = related_field.related_model
                                     print(f"  Resolving FK for {field_name} -> {fk_ref}")
-
-                                    # Try resolving from __row_id map first
-                                    if isinstance(fk_ref, str) and fk_ref in row_id_map:
-                                        fk_instance = row_id_map[fk_ref]
-                                    # If numeric (int or numeric string), try to fetch the actual object from DB
-                                    elif isinstance(fk_ref, (int, float)) or (isinstance(fk_ref, str) and fk_ref.isdigit()):
-                                        related_field = model._meta.get_field(field_name)
-                                        fk_model = related_field.related_model
-                                        fk_instance = fk_model.objects.get(id=int(fk_ref))
-                                    elif fk_ref is None:
-                                        # Keep same behavior: raise to show a meaningful error
-                                        raise ValueError(f"Invalid FK reference format: {fk_ref}")
-                                    else:
+                                    
+                                    if fk_ref is None:
+                                        # allow null only if the FK is nullable
+                                        if getattr(related_field, 'null', False):
+                                            row_data[field_name] = None
+                                            fk_mappings[field_name] = {"source": None, "resolved_id": None}
+                                            del row_data[fk_field]
+                                            continue
                                         raise ValueError(f"Invalid FK reference format: {fk_ref}")
                                     
+                                    # Try resolving from __row_id map first
+                                    if isinstance(fk_ref, str) and fk_ref in row_id_map:
+                                        fk_instance = row_id_map[fk_ref]          # we store instances in the map
+                                    elif isinstance(fk_ref, (int, float)) or (isinstance(fk_ref, str) and fk_ref.isdigit()):
+                                        fk_instance = fk_model.objects.get(pk=int(fk_ref))
+                                    else:
+                                        raise ValueError(f"Invalid FK reference format: {fk_ref}")
                                 
                                     row_data[field_name] = fk_instance
                                     del row_data[fk_field]
@@ -280,20 +287,32 @@ class BulkImportPreview(APIView):
                                     print(f"[CREATE] New {model_name} instance")
     
                                 instance.save()
-                                instance.refresh_from_db()
+                                
+                                # --- only refresh if we actually have a PK (prevents “matching query does not exist”)
+                                if instance.pk:
+                                    try:
+                                        instance.refresh_from_db()
+                                    except model.DoesNotExist:
+                                        # very defensive: don’t blow up preview if manager filters hide it
+                                        pass
+                                
                                 print(f"[SAVE] {model_name} row saved successfully.")
     
                                 if row_id:
                                     row_id_map[row_id] = instance
                                     print(f"[MAP] __row_id '{row_id}' bound to ID {instance.pk}")
-    
+                                
+                                # --- force 'id' into the preview data (model_to_dict often omits AutoField)
+                                data_dict = model_to_dict(instance, exclude=['created_by','updated_by','is_deleted','is_active'])
+                                data_dict['id'] = instance.pk
+                                
                                 #model_preview.append({'action': action, 'data': row_data, '__row_id': row_id})
                                 model_preview.append({
                                     'model': model_name, 
                                     '__row_id': row_id, 
                                     'status': 'success', 
                                     'action': action, 
-                                    'data': _json_safe(model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active'])), 
+                                    'data': _json_safe(data_dict), 
                                     "message": "ok",
                                     "observations": _row_observations(audit_by_rowid, row_id),
                                     'mappings': _json_safe(fk_mappings),
