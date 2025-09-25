@@ -257,7 +257,7 @@ class BulkImportPreview(APIView):
                             if not row_data.get('id'):
                                 row_data.pop('id', None)
                             
-                            filtered, unknown = _filter_unknown(model, row_data)
+                            row_data, unknown = _filter_unknown(model, row_data)
 
                             # 10) success output
                             msg = "ok"
