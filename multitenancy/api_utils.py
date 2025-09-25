@@ -241,29 +241,32 @@ class BulkImportPreview(APIView):
                             action = 'create'
                             
                             try:
+                                fk_mappings = {}
                                 # Handle FK fields
                                 fk_fields = {k: v for k, v in row_data.items() if k.endswith('_fk')}
                                 for fk_field, fk_ref in fk_fields.items():
                                     field_name = fk_field[:-3]
                                     print(f"  Resolving FK for {field_name} -> {fk_ref}")
-                                    try:
-                                        # Try resolving from __row_id map first
-                                        if isinstance(fk_ref, str) and fk_ref in row_id_map:
-                                            fk_instance = row_id_map[fk_ref]
-                                        # If numeric (int or numeric string), try to fetch the actual object from DB
-                                        elif isinstance(fk_ref, (int, float)) or (isinstance(fk_ref, str) and fk_ref.isdigit()):
-                                            related_field = model._meta.get_field(field_name)
-                                            fk_model = related_field.related_model
-                                            fk_instance = fk_model.objects.get(id=int(fk_ref))
-                                        else:
-                                            raise ValueError(f"Invalid FK reference format: {fk_ref}")
-                                    except Exception as e:
-                                        error_msg = f"FK reference '{fk_ref}' not found for field '{field_name}' in model {model_name}: {str(e)}"
-                                        print("[ERROR]", error_msg)
-                                        raise ValueError(error_msg)
+
+                                    # Try resolving from __row_id map first
+                                    if isinstance(fk_ref, str) and fk_ref in row_id_map:
+                                        fk_instance = row_id_map[fk_ref]
+                                    # If numeric (int or numeric string), try to fetch the actual object from DB
+                                    elif isinstance(fk_ref, (int, float)) or (isinstance(fk_ref, str) and fk_ref.isdigit()):
+                                        related_field = model._meta.get_field(field_name)
+                                        fk_model = related_field.related_model
+                                        fk_instance = fk_model.objects.get(id=int(fk_ref))
+                                    elif fk_ref is None:
+                                        # Keep same behavior: raise to show a meaningful error
+                                        raise ValueError(f"Invalid FK reference format: {fk_ref}")
+                                    else:
+                                        raise ValueError(f"Invalid FK reference format: {fk_ref}")
+                                    
                                 
                                     row_data[field_name] = fk_instance
                                     del row_data[fk_field]
+                                    fk_mappings[field_name] = {"source": fk_ref, "resolved_id": fk_instance.pk}
+                                    
     
                                 if 'id' in row_data and row_data['id']:
                                     instance = model.objects.get(id=row_data['id'])
@@ -292,6 +295,7 @@ class BulkImportPreview(APIView):
                                     'data': _json_safe(model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active'])), 
                                     "message": "ok",
                                     "observations": _row_observations(audit_by_rowid, row_id),
+                                    'mappings': _json_safe(fk_mappings),
                                 })
                                 
                             except Exception as e:
@@ -310,6 +314,7 @@ class BulkImportPreview(APIView):
                                     'data': _json_safe(data_payload),
                                     "message": str(e),
                                     "observations": _row_observations(audit_by_rowid, row_id),
+                                    'mappings': _json_safe(fk_mappings),
                                 })
                                 errors.append({"model": model_name, "row": i, "field": None, "message": str(e)})
                 preview_data = model_preview
