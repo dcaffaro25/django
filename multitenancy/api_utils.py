@@ -359,6 +359,7 @@ class BulkImportPreview(APIView):
                                 'status': 'success', 
                                 'action': action, 
                                 'data': _json_safe(data_dict), 
+                                'row_data': _json_safe(row_data),
                                 "message": msg,
                                 "observations": _row_observations(audit_by_rowid, row_id),
                                 'mappings': _json_safe(fk_mappings),
