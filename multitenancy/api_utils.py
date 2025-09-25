@@ -27,6 +27,7 @@ from hr.models import Employee, Position, TimeTracking, KPI, Bonus, RecurringAdj
 
 from multitenancy.formula_engine import apply_substitutions
 
+from django.db.models import Model, QuerySet
 
 import re
 
@@ -122,6 +123,29 @@ MODEL_APP_MAP = {
     
     # Add other model-app mappings as needed
 }
+
+def _json_safe(obj):
+    """Convert arbitrary Python/Django objects into JSON-serializable structures."""
+    if isinstance(obj, Model):
+        return obj.pk
+    if isinstance(obj, QuerySet):
+        return [_json_safe(x) for x in obj]
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_safe(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    # pandas Timestamp
+    try:
+        import pandas as pd  # already present in your file
+        if isinstance(obj, pd.Timestamp):
+            return obj.to_pydatetime().isoformat()
+    except Exception:
+        pass
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, Decimal):
+        return str(obj)
+    return obj
 
 def safe_model_dict(instance, exclude_fields=None):
     data = model_to_dict(instance)
@@ -265,7 +289,7 @@ class BulkImportPreview(APIView):
                                     '__row_id': row_id, 
                                     'status': 'success', 
                                     'action': action, 
-                                    'data': model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active']), 
+                                    'data': _json_safe(model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active'])), 
                                     "message": "ok",
                                     "observations": _row_observations(audit_by_rowid, row_id),
                                 })
@@ -283,7 +307,7 @@ class BulkImportPreview(APIView):
                                     '__row_id': row_id,
                                     'status': 'error',
                                     'action': action,
-                                    'data': data_payload,
+                                    'data': _json_safe(data_payload),
                                     "message": str(e),
                                     "observations": _row_observations(audit_by_rowid, row_id),
                                 })
