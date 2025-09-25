@@ -173,6 +173,24 @@ def _row_observations(audit_by_rowid: Dict[Any, List[dict]], rid_norm: Any) -> L
         )
     return obs
 
+def _allowed_keys(model) -> set:
+    names = set()
+    for f in model._meta.fields:
+        names.add(f.name)
+        att = getattr(f, "attname", None)
+        if att:
+            names.add(att)  # e.g. entity_id
+    fk_aliases = {n + "_fk" for n in names}
+    # allow path helper + id + __row_id and company_fk convenience
+    return names | fk_aliases | set(PATH_COLS) | {"__row_id", "id", "company_fk"}
+
+
+def _filter_unknown(model, row: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    allowed = _allowed_keys(model)
+    filtered = {k: v for k, v in row.items() if k in allowed}
+    unknown = sorted([k for k in row.keys() if k not in allowed and k != "__row_id"])
+    return filtered, unknown
+
 class BulkImportPreview(APIView):
     def post(self, request, *args, **kwargs):
         
@@ -239,6 +257,13 @@ class BulkImportPreview(APIView):
                             if not row_data.get('id'):
                                 row_data.pop('id', None)
                             
+                            filtered, unknown = _filter_unknown(model, row_data)
+
+                            # 10) success output
+                            msg = "ok"
+                            if unknown:
+                                msg += f" | Ignoring unknown columns: {', '.join(unknown)}"
+                                
                             # Predefine to avoid UnboundLocal in error path
                             instance = None
                             action = 'create'
@@ -313,7 +338,7 @@ class BulkImportPreview(APIView):
                                     'status': 'success', 
                                     'action': action, 
                                     'data': _json_safe(data_dict), 
-                                    "message": "ok",
+                                    "message": msg,
                                     "observations": _row_observations(audit_by_rowid, row_id),
                                     'mappings': _json_safe(fk_mappings),
                                     'row_id_map': _json_safe(row_id_map),
