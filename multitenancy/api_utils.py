@@ -283,7 +283,7 @@ class BulkImportPreview(APIView):
                                 print(f"[SAVE] {model_name} row saved successfully.")
     
                                 if row_id:
-                                    row_id_map[row_id] = instance
+                                    row_id_map[row_id] = instance.pk
                                     print(f"[MAP] __row_id '{row_id}' bound to ID {instance.pk}")
     
                                 #model_preview.append({'action': action, 'data': row_data, '__row_id': row_id})
