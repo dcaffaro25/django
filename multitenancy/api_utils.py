@@ -15,15 +15,32 @@ from django.http import HttpResponse
 from openpyxl import Workbook
 from django.forms.models import model_to_dict
 from django.utils.timezone import now
-from multitenancy.models import Company, Entity
+from multitenancy.models import Company, Entity, IntegrationRule, SubstitutionRule
 from accounting.models import Currency, Bank, BankAccount, Account, CostCenter, Transaction, JournalEntry, BankTransaction
 from core.models import FinancialIndex, IndexQuote, FinancialIndexQuoteForecast
 from billing.models import (
     BusinessPartnerCategory, BusinessPartner,
     ProductServiceCategory, ProductService,
     Contract, Invoice, InvoiceLine)
+from hr.models import Employee, Position, TimeTracking, KPI, Bonus, RecurringAdjustment
 
 from multitenancy.formula_engine import apply_substitutions
+
+
+import re
+
+
+
+
+
+
+
+
+
+import json
+from datetime import datetime, date, time, timezone
+from decimal import Decimal, ROUND_HALF_UP
+
 
 def success_response(data, message="Success"):
     return Response({"status": "success", "data": data, "message": message})
@@ -644,3 +661,268 @@ class BulkImportTemplateDownloadView(APIView):
             content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             headers={'Content-Disposition': f'attachment; filename="{filename}"'},
         )
+    
+    
+    
+    
+# ----------------------------------------------------------------------
+# Small helpers
+# ----------------------------------------------------------------------
+def _to_int_or_none(x):
+    if x in ("", None):
+        return None
+    try:
+        return int(float(x))
+    except Exception:
+        return None
+
+def _parse_json_or_empty(v):
+    if v in ("", None):
+        return {}
+    if isinstance(v, dict):
+        return v
+    try:
+        return json.loads(v)
+    except Exception:
+        return {}
+
+def _to_bool(val, default=False):
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return default
+    return str(val).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+# Normalize string-like row ids/FK tokens (kills NBSP, trims)
+
+def _norm_row_key2(v):
+    if v is None:
+        return None
+    s = str(v).replace("\u00A0", " ").strip()
+
+    return s
+
+def _norm_row_key(key: Any) -> Any:
+    """
+    Normalize a row key from an import sheet.  Strings are stripped of surrounding
+    whitespace and converted to lower case.  Non-strings are returned unchanged.
+    """
+    if isinstance(key, str):
+        return key.strip().lower()
+    return key
+
+def _path_depth(row: Dict[str, Any]) -> int:
+    """Used to sort MPTT rows so parents come first."""
+    for c in PATH_COLS:
+        if c in row and row[c]:
+            return len(str(row[c]).strip().replace(" > ", "\\").split("\\"))
+    return 0
+
+
+def _excel_safe(value):
+    # None is fine
+    if value is None:
+        return None
+
+    # Simple scalars
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    # Decimal -> float (or str if you prefer exactness)
+    if isinstance(value, Decimal):
+        try:
+            return float(value)
+        except Exception:
+            return str(value)
+
+    # Datetime: make naive
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+
+    # Dates/times are OK as-is
+    if isinstance(value, (date, time)):
+        return value
+
+    # dict/list/other -> JSON string
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    except Exception:
+        return str(value)
+
+def _is_missing(v) -> bool:
+    if v is None or v == "":
+        return True
+    try:
+        import pandas as pd  # noqa
+        if pd.isna(v):  # type: ignore[attr-defined]
+            return True
+    except Exception:
+        pass
+    try:
+        import math
+        if isinstance(v, float) and math.isnan(v):
+            return True
+    except Exception:
+        pass
+    if isinstance(v, str) and v.strip().lower() == "nat":
+        return True
+    return False
+
+def _to_int_or_none_soft(v):
+    if _is_missing(v):
+        return None
+    if isinstance(v, int):
+        return int(v)
+    if isinstance(v, float):
+        return int(v) if float(v).is_integer() else None
+    s = str(v).strip()
+    if s.isdigit():
+        return int(s)
+    try:
+        f = float(s)
+        return int(f) if f.is_integer() else None
+    except Exception:
+        return None
+
+# ----- lightweight fingerprint (used by template refs) -----
+import hashlib, json as _json, re as _re
+from decimal import Decimal as _D, ROUND_HALF_UP as _RHU
+from typing import List as _List, Dict as _Dict, Any as _Any
+from django.db import models
+
+_WHITESPACE_RE = _re.compile(r"\s+")
+
+IDENTITY_FIELDS_MAP = {}
+IGNORE_FIELDS = {"id","created_at","updated_at","created_by","updated_by","is_deleted","is_active"}
+
+def _norm_scalar(val):
+    if val is None: return None
+    if isinstance(val, (bool, int)): return val
+    if isinstance(val, float): return float(str(val))
+    if isinstance(val, Decimal): return str(val)
+    s = str(val).strip()
+    return _WHITESPACE_RE.sub(" ", s)
+
+def _quantize_decimal(val, dp):
+    if val in (None, ""): return None
+    q = _D("1").scaleb(-int(dp))
+    return _D(str(val)).quantize(q, rounding=_RHU)
+
+def _canonicalize_row(model, row: _Dict[str, _Any]) -> _Dict[str, _Any]:
+    """
+    Stable identity using "all non-volatile fields present in row & on model".
+    Folds *_fk into base name; quantizes DecimalFields; ISO for dates; ints for FK ids.
+    Treats NaN/NaT as missing (None).
+    """
+    field_by = {f.name: f for f in model._meta.get_fields() if hasattr(f, "attname")}
+    allowed = set(field_by.keys())
+
+    incoming = {}
+    for k, v in row.items():
+        if k == "__row_id":
+            continue
+        base = k[:-3] if k.endswith("_fk") else k
+        incoming[base] = v
+
+    ident = {k for k in incoming.keys() if k in allowed and k not in IGNORE_FIELDS}
+    out = {}
+    for k in sorted(ident):
+        v = incoming.get(k)
+        f = field_by.get(k)
+
+        if _is_missing(v):
+            out[k] = None
+            continue
+
+        if isinstance(f, models.DecimalField):
+            dp = int(getattr(f, "decimal_places", 0) or 0)
+            q  = _D("1").scaleb(-dp)
+            vq = _D(str(v)).quantize(q, rounding=_RHU)
+            out[k] = str(vq)
+        elif isinstance(f, models.DateField):
+            out[k] = str(v)
+        elif isinstance(f, models.ForeignKey):
+            out[k] = _to_int_or_none_soft(v)
+        else:
+            out[k] = _norm_scalar(v)
+    return out
+
+def row_hash(model, row: _Dict[str, _Any]) -> str:
+    canon = _canonicalize_row(model, row)
+    blob  = _json.dumps(canon, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+def table_fingerprint(model, rows: _List[_Dict[str, _Any]], sample_n: int = 200) -> _Dict[str, _Any]:
+    rhashes = [row_hash(model, r) for r in rows]
+    unique_sorted = sorted(set(rhashes))
+    cols = sorted(_canonicalize_row(model, rows[0]).keys()) if rows else []
+    header_blob = _json.dumps(cols, separators=(",", ":"), sort_keys=True)
+    concat = header_blob + "|" + "|".join(unique_sorted)
+    thash  = hashlib.sha256(concat.encode("utf-8")).hexdigest()
+    return {
+        "row_count": len(rows),
+        "colnames": cols,
+        "row_hashes": unique_sorted,
+        "row_hash_sample": unique_sorted[:sample_n],
+        "table_hash": thash,
+    }
+
+def jaccard(a: set[str], b: set[str]) -> float:
+    if not a and not b: return 1.0
+    if not a or not b:  return 0.0
+    inter = len(a & b); union = len(a | b)
+    return inter / union
+
+# -----------------------
+# MPTT PATH SUPPORT (generic)
+# -----------------------
+PATH_COLS = ("path", "Caminho")
+PATH_SEPARATOR = " > "
+
+def _is_mptt_model(model) -> bool:
+    return hasattr(model, "_mptt_meta") and any(f.name == "parent" for f in model._meta.fields) and any(f.name == "name" for f in model._meta.fields)
+
+def _get_path_value(row_dict):
+    for c in PATH_COLS:
+        val = row_dict.get(c)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+def _split_path(path_str):
+    return [p.strip() for p in str(path_str).split(PATH_SEPARATOR) if p and p.strip()]
+
+def _sort_df_by_path_depth_if_mptt(model, df):
+    if not _is_mptt_model(model):
+        return df
+    if not any(col in df.columns for col in PATH_COLS):
+        return df
+    df = df.copy()
+    def depth(row):
+        p = _get_path_value(row.dropna().to_dict())
+        return len(_split_path(p)) if p else 0
+    df["_depth"] = df.apply(depth, axis=1)
+    df.sort_values(by=["_depth"], inplace=True, kind="stable")
+    df.drop(columns=["_depth"], inplace=True)
+    return df
+
+def _resolve_parent_from_path_chain(model, parts):
+    parent = None
+    for idx, node_name in enumerate(parts):
+        inst = model.objects.filter(name=node_name, parent=parent).first()
+        if not inst:
+            missing = " > ".join(parts[: idx + 1])
+            raise ValueError(f"{model.__name__}: missing ancestor '{missing}'. Provide this row before its children.")
+        parent = inst
+    return parent
+
+# -----------------------
+# Small REST helpers
+# -----------------------
+def success_response(data, message="Success"):
+    return Response({"status": "success", "data": data, "message": message})
+
+def error_response(message, status_code=400):
+    return Response({"status": "error", "message": message}, status=status_code)
