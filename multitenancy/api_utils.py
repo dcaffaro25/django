@@ -9,6 +9,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework import status
 from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict
 
 from io import BytesIO
 from django.http import HttpResponse
@@ -150,6 +151,12 @@ def _row_observations(audit_by_rowid: Dict[Any, List[dict]], rid_norm: Any) -> L
 
 class BulkImportPreview(APIView):
     def post(self, request, *args, **kwargs):
+        
+        model_name = None
+        i = None
+        errors = []           # make available to outer except
+        preview_data = {}     # keep same var used below
+        
         try:
             company_id = request.data.get("company_id") or getattr(request.user, "company_id", None)
             if not company_id:
@@ -161,10 +168,8 @@ class BulkImportPreview(APIView):
             xls = pd.read_excel(file, sheet_name=None)
             print(f"[INFO] Loaded {len(xls)} sheets from Excel.")
 
-            preview_data = {}
-            errors = []
             row_id_map = {}
-
+            
             with transaction.atomic():
                 savepoint = transaction.savepoint()
                 print("[DEBUG] Started transaction with savepoint.")
@@ -193,7 +198,7 @@ class BulkImportPreview(APIView):
                         )
 
                         
-                        audit_by_rowid: Dict[Any, List[dict]] = {}
+                        audit_by_rowid: Dict[Any, List[dict]] = defaultdict(list)
                         for ch in (audit or []):
                             audit_by_rowid[ch.get("__row_id")].append(ch)
                         
@@ -206,6 +211,10 @@ class BulkImportPreview(APIView):
                             row_id = row_data.pop('__row_id', None)
                             print("  Raw (substituted) data:", row_data)
                             print("  __row_id:", row_id)
+
+                            # Predefine to avoid UnboundLocal in error path
+                            instance = None
+                            action = 'create'
                             
                             try:
                                 # Handle FK fields
@@ -232,7 +241,6 @@ class BulkImportPreview(APIView):
                                     row_data[field_name] = fk_instance
                                     del row_data[fk_field]
     
-                            
                                 if 'id' in row_data and row_data['id']:
                                     instance = model.objects.get(id=row_data['id'])
                                     for field, value in row_data.items():
@@ -260,19 +268,30 @@ class BulkImportPreview(APIView):
                                     'data': model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active']), 
                                     "message": "ok",
                                     "observations": _row_observations(audit_by_rowid, row_id),
-                                    })
+                                })
                                 
-                                #model_to_dict(instance)
                             except Exception as e:
                                 error = f"{model_name} row {i}: {str(e)}"
                                 print("[ERROR]", error)
-                                model_preview.append({'model': model_name, '__row_id': row_id, 'status': 'error', 'action': action, 'data': model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active']), "message": str(e)})
-                                #errors.append(error)
+                                # Make model_to_dict safe in error path
+                                try:
+                                    data_payload = model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active']) if instance else row_data
+                                except Exception:
+                                    data_payload = row_data
+                                model_preview.append({
+                                    'model': model_name,
+                                    '__row_id': row_id,
+                                    'status': 'error',
+                                    'action': action,
+                                    'data': data_payload,
+                                    "message": str(e),
+                                    "observations": _row_observations(audit_by_rowid, row_id),
+                                })
                                 errors.append({"model": model_name, "row": i, "field": None, "message": str(e)})
-                    preview_data = model_preview
+                preview_data = model_preview
     
-                    transaction.savepoint_rollback(savepoint)
-                    print("[INFO] Rolled back transaction after preview.")
+                transaction.savepoint_rollback(savepoint)
+                print("[INFO] Rolled back transaction after preview.")
 
             return Response({
                 "success": not errors,
@@ -282,9 +301,14 @@ class BulkImportPreview(APIView):
 
         except Exception as e:
             print("[FATAL ERROR]", str(e))
-            errors.append({"model": model_name, "row": i, "field": None, "message": str(e)})
+            safe_model = model_name if model_name is not None else "Unknown"
+            safe_row = i if i is not None else None
+            # if something blew up before errors existed, keep shape consistent
+            if not errors:
+                errors = []
+            errors.append({"model": safe_model, "row": safe_row, "field": None, "message": str(e)})
             return Response({"success": False, "preview": [], "errors": errors})#, status=status.HTTP_400_BAD_REQUEST)
-
+        
 
 class BulkImportExecute(APIView):
     def post(self, request, *args, **kwargs):
