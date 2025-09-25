@@ -184,6 +184,7 @@ class BulkImportPreview(APIView):
                         #model_preview = []
                         
                         raw_rows = df.where(pd.notnull(df), None).to_dict(orient="records")
+                        
                         rows, audit = apply_substitutions(
                             raw_rows,
                             company_id=company_id,
@@ -194,15 +195,18 @@ class BulkImportPreview(APIView):
                         
                         audit_by_rowid: Dict[Any, List[dict]] = {}
                         for ch in (audit or []):
-                            key_norm = ch.get("__row_id")
-                            audit_by_rowid.setdefault(key_norm, []).append(ch)
-                            
-                        for i, row in df.iterrows():
+                            audit_by_rowid[ch.get("__row_id")].append(ch)
+                        
+                        
+                        
+                        for i, row_data in enumerate(rows):
                             print(f"[DEBUG] Processing row {i} of model {model_name}")
-                            row_data = row.dropna().to_dict()
+                            # row_data already has substitutions applied; normalize Nones and drop NaNs if any
+                            row_data = {k: (None if (isinstance(v, float) and pd.isna(v)) else v) for k, v in (row_data or {}).items()}
                             row_id = row_data.pop('__row_id', None)
-                            print("  Raw data:", row_data)
+                            print("  Raw (substituted) data:", row_data)
                             print("  __row_id:", row_id)
+                            
                             try:
                                 # Handle FK fields
                                 fk_fields = {k: v for k, v in row_data.items() if k.endswith('_fk')}
