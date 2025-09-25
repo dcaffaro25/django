@@ -199,6 +199,7 @@ class BulkImportPreview(APIView):
         errors = []           # make available to outer except
         preview_data = {}     # keep same var used below
         
+        
         try:
             company_id = request.data.get("company_id") or getattr(request.user, "company_id", None)
             if not company_id:
@@ -210,160 +211,182 @@ class BulkImportPreview(APIView):
             xls = pd.read_excel(file, sheet_name=None)
             print(f"[INFO] Loaded {len(xls)} sheets from Excel.")
 
+            PREFERRED_ORDER = [
+                "Company", "Entity", "Currency", "Account", "CostCenter",
+                "Transaction", "JournalEntry"
+            ]
+            sheet_names = [n for n in xls.keys() if n != "References"]
+            order_index = {name: i for i, name in enumerate(PREFERRED_ORDER)}
+            sheet_names_sorted = sorted(sheet_names, key=lambda n: order_index.get(n, 999))
+
             row_id_map = {}
+            row_id_pk: Dict[str, int] = {}
             
             with transaction.atomic():
                 savepoint = transaction.savepoint()
                 print("[DEBUG] Started transaction with savepoint.")
                 model_preview = []
-                for model_name, df in xls.items():
-                    if model_name != "References":
-                        print(f"\n[INFO] Processing sheet: {model_name}")
-                        app_label = MODEL_APP_MAP.get(model_name)
-    
-                        if not app_label:
-                            msg = f"Unknown model: {model_name}"
-                            print("[ERROR]", msg)
-                            errors.append({"model": model_name, "row": None, "field": None, "message": f"Unknown model: {model_name}"})
-                            continue
-    
-                        model = apps.get_model(app_label, model_name)
-                        #model_preview = []
-                        
-                        raw_rows = df.where(pd.notnull(df), None).to_dict(orient="records")
-                        
-                        rows, audit = apply_substitutions(
-                            raw_rows,
-                            company_id=company_id,
-                            model_name=model_name,
-                            return_audit=True,
-                        )
+                for model_name in sheet_names_sorted:
+                    df = xls[model_name]
 
-                        
-                        audit_by_rowid: Dict[Any, List[dict]] = defaultdict(list)
-                        for ch in (audit or []):
-                            audit_by_rowid[ch.get("__row_id")].append(ch)
-                        
-                        
-                        
-                        for i, row_data in enumerate(rows):
-                            print(f"[DEBUG] Processing row {i} of model {model_name}")
-                            # row_data already has substitutions applied; normalize Nones and drop NaNs if any
-                            row_data = {k: (None if (isinstance(v, float) and pd.isna(v)) else v) for k, v in (row_data or {}).items()}
-                            row_id = row_data.pop('__row_id', None)
-                            print("  Raw (substituted) data:", row_data)
-                            print("  __row_id:", row_id)
-                            
-                            if not row_data.get('id'):
-                                row_data.pop('id', None)
-                            
-                            row_data, unknown = _filter_unknown(model, row_data)
+                    print(f"\n[INFO] Processing sheet: {model_name}")
+                    app_label = MODEL_APP_MAP.get(model_name)
 
-                            # 10) success output
-                            msg = "ok"
-                            if unknown:
-                                msg += f" | Ignoring unknown columns: {', '.join(unknown)}"
-                                
-                            # Predefine to avoid UnboundLocal in error path
-                            instance = None
-                            action = 'create'
+                    if not app_label:
+                        msg = f"Unknown model: {model_name}"
+                        print("[ERROR]", msg)
+                        errors.append({"model": model_name, "row": None, "field": None, "message": f"Unknown model: {model_name}"})
+                        continue
+
+                    model = apps.get_model(app_label, model_name)
+                    #model_preview = []
+                    
+                    raw_rows = df.where(pd.notnull(df), None).to_dict(orient="records")
+                    
+                    rows, audit = apply_substitutions(
+                        raw_rows,
+                        company_id=company_id,
+                        model_name=model_name,
+                        return_audit=True,
+                    )
+
+                    
+                    audit_by_rowid: Dict[Any, List[dict]] = defaultdict(list)
+                    for ch in (audit or []):
+                        audit_by_rowid[ch.get("__row_id")].append(ch)
+                    
+                    
+                    
+                    for i, row_data in enumerate(rows):
+                        print(f"[DEBUG] Processing row {i} of model {model_name}")
+                        # row_data already has substitutions applied; normalize Nones and drop NaNs if any
+                        row_data = {k: (None if (isinstance(v, float) and pd.isna(v)) else v) for k, v in (row_data or {}).items()}
+                        row_id = row_data.pop('__row_id', None)
+                        print("  Raw (substituted) data:", row_data)
+                        print("  __row_id:", row_id)
+                        
+                        if not row_data.get('id'):
+                            row_data.pop('id', None)
+                        
+                        row_data, unknown = _filter_unknown(model, row_data)
+
+                        # 10) success output
+                        msg = "ok"
+                        if unknown:
+                            msg += f" | Ignoring unknown columns: {', '.join(unknown)}"
                             
-                            try:
-                                fk_mappings = {}
-                                # Handle FK fields
-                                fk_fields = {k: v for k, v in row_data.items() if k.endswith('_fk')}
-                                for fk_field, fk_ref in fk_fields.items():
-                                    field_name = fk_field[:-3]
-                                    related_field = model._meta.get_field(field_name)
-                                    fk_model = related_field.related_model
-                                    print(f"  Resolving FK for {field_name} -> {fk_ref}")
-                                    
-                                    if fk_ref is None:
-                                        # allow null only if the FK is nullable
-                                        if getattr(related_field, 'null', False):
-                                            row_data[field_name] = None
-                                            fk_mappings[field_name] = {"source": None, "resolved_id": None}
-                                            del row_data[fk_field]
-                                            continue
-                                        raise ValueError(f"Invalid FK reference format: {fk_ref}")
-                                    
-                                    # Try resolving from __row_id map first
-                                    if isinstance(fk_ref, str) and fk_ref in row_id_map:
-                                        fk_instance = row_id_map[fk_ref]          # we store instances in the map
-                                    elif isinstance(fk_ref, (int, float)) or (isinstance(fk_ref, str) and fk_ref.isdigit()):
-                                        fk_instance = fk_model.objects.get(pk=int(fk_ref))
-                                    else:
-                                        raise ValueError(f"Invalid FK reference format: {fk_ref}")
+                        # Predefine to avoid UnboundLocal in error path
+                        instance = None
+                        action = 'create'
+                        
+                        try:
+                            fk_mappings = {}
+                            # Handle FK fields
+                            fk_fields = {k: v for k, v in row_data.items() if k.endswith('_fk')}
+                            for fk_field, fk_ref in fk_fields.items():
+                                field_name = fk_field[:-3]
+                                related_field = model._meta.get_field(field_name)
+                                fk_model = related_field.related_model
+                                print(f"  Resolving FK for {field_name} -> {fk_ref}")
                                 
-                                    row_data[field_name] = fk_instance
-                                    del row_data[fk_field]
-                                    fk_mappings[field_name] = {"source": fk_ref, "resolved_id": fk_instance.pk}
-                                    
-    
-                                if 'id' in row_data and row_data['id']:
-                                    instance = model.objects.get(id=row_data['id'])
-                                    for field, value in row_data.items():
-                                        setattr(instance, field, value)
-                                    action = 'update'
-                                    print(f"[UPDATE] {model_name} ID {row_data['id']}")
+                                if fk_ref is None:
+                                    # allow null only if the FK is nullable
+                                    if getattr(related_field, 'null', False):
+                                        row_data[field_name] = None
+                                        fk_mappings[field_name] = {"source": None, "resolved_id": None}
+                                        del row_data[fk_field]
+                                        continue
+                                    raise ValueError(f"Invalid FK reference format: {fk_ref}")
+                                '''
+                                # Try resolving from __row_id map first
+                                if isinstance(fk_ref, str) and fk_ref in row_id_map:
+                                    fk_instance = row_id_map[fk_ref]          # we store instances in the map
+                                elif isinstance(fk_ref, (int, float)) or (isinstance(fk_ref, str) and fk_ref.isdigit()):
+                                    fk_instance = fk_model.objects.get(pk=int(fk_ref))
                                 else:
-                                    instance = model(**row_data)
-                                    action = 'create'
-                                    print(f"[CREATE] New {model_name} instance")
-    
-                                instance.save()
+                                    raise ValueError(f"Invalid FK reference format: {fk_ref}")
+                                '''
+                                # resolve by __row_id first
+                                if isinstance(fk_ref, str) and fk_ref in row_id_pk:
+                                    fk_pk = row_id_pk[fk_ref]
+                                    fk_instance = fk_model.objects.get(pk=fk_pk)
+                                elif isinstance(fk_ref, (int, float)) or (isinstance(fk_ref, str) and fk_ref.isdigit()):
+                                    fk_instance = fk_model.objects.get(pk=int(fk_ref))
+                                else:
+                                    raise ValueError(
+                                        f"Unresolved FK '{field_name}': __row_id '{fk_ref}' not found. "
+                                        f"Ensure the referenced sheet/row appears earlier (dependency order)."
+                                    )
                                 
-                                # --- only refresh if we actually have a PK (prevents “matching query does not exist”)
-                                if instance.pk:
-                                    try:
-                                        instance.refresh_from_db()
-                                    except model.DoesNotExist:
-                                        # very defensive: don’t blow up preview if manager filters hide it
-                                        pass
+                                row_data[field_name] = fk_instance
+                                del row_data[fk_field]
+                                fk_mappings[field_name] = {"source": fk_ref, "resolved_id": fk_instance.pk}
                                 
-                                print(f"[SAVE] {model_name} row saved successfully.")
-    
-                                if row_id:
-                                    row_id_map[row_id] = instance
-                                    print(f"[MAP] __row_id '{row_id}' bound to ID {instance.pk}")
+
+                            if 'id' in row_data and row_data['id']:
+                                instance = model.objects.get(id=row_data['id'])
+                                for field, value in row_data.items():
+                                    setattr(instance, field, value)
+                                action = 'update'
+                                print(f"[UPDATE] {model_name} ID {row_data['id']}")
+                            else:
+                                instance = model(**row_data)
+                                action = 'create'
+                                print(f"[CREATE] New {model_name} instance")
+
+                            instance.save()
+                            
+                            # --- only refresh if we actually have a PK (prevents “matching query does not exist”)
+                            if not instance.pk:
+                                raise RuntimeError(f"Save returned no PK for {model_name} row {i}")
+                            if row_id:
+                                row_id_pk[row_id] = int(instance.pk)
+                                row_id_map[row_id] = instance
+                                print(f"[MAP] __row_id '{row_id}' bound to ID {instance.pk}")
+                            
+                            print(f"[SAVE] {model_name} row saved successfully.")
+
                                 
-                                # --- force 'id' into the preview data (model_to_dict often omits AutoField)
-                                data_dict = model_to_dict(instance, exclude=['created_by','updated_by','is_deleted','is_active'])
-                                data_dict['id'] = instance.pk
-                                
-                                #model_preview.append({'action': action, 'data': row_data, '__row_id': row_id})
-                                model_preview.append({
-                                    'model': model_name, 
-                                    '__row_id': row_id, 
-                                    'status': 'success', 
-                                    'action': action, 
-                                    'data': _json_safe(data_dict), 
-                                    "message": msg,
-                                    "observations": _row_observations(audit_by_rowid, row_id),
-                                    'mappings': _json_safe(fk_mappings),
-                                    'row_id_map': _json_safe(row_id_map),
-                                })
-                                
-                            except Exception as e:
-                                error = f"{model_name} row {i}: {str(e)}"
-                                print("[ERROR]", error)
-                                # Make model_to_dict safe in error path
-                                try:
-                                    data_payload = model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active']) if instance else row_data
-                                except Exception:
-                                    data_payload = row_data
-                                model_preview.append({
-                                    'model': model_name,
-                                    '__row_id': row_id,
-                                    'status': 'error',
-                                    'action': action,
-                                    'data': _json_safe(data_payload),
-                                    "message": str(e),
-                                    "observations": _row_observations(audit_by_rowid, row_id),
-                                    'mappings': _json_safe(fk_mappings),
-                                    'row_id_map': _json_safe(row_id_map),
-                                })
-                                errors.append({"model": model_name, "row": i, "field": None, "message": str(e)})
+                            # --- force 'id' into the preview data (model_to_dict often omits AutoField)
+                            data_dict = model_to_dict(instance, exclude=['created_by','updated_by','is_deleted','is_active'])
+                            data_dict['id'] = instance.pk
+                            if not data_dict.get('id'): data_dict['id'] = instance.pk
+                            
+                            #model_preview.append({'action': action, 'data': row_data, '__row_id': row_id})
+                            model_preview.append({
+                                'model': model_name, 
+                                '__row_id': row_id, 
+                                'status': 'success', 
+                                'action': action, 
+                                'data': _json_safe(data_dict), 
+                                "message": msg,
+                                "observations": _row_observations(audit_by_rowid, row_id),
+                                'mappings': _json_safe(fk_mappings),
+                                'row_id_map': _json_safe(row_id_map),
+                                "row_id_pk": _json_safe(row_id_pk),
+                            })
+                            
+                        except Exception as e:
+                            error = f"{model_name} row {i}: {str(e)}"
+                            print("[ERROR]", error)
+                            # Make model_to_dict safe in error path
+                            try:
+                                data_payload = model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active']) if instance else row_data
+                            except Exception:
+                                data_payload = row_data
+                            model_preview.append({
+                                'model': model_name,
+                                '__row_id': row_id,
+                                'status': 'error',
+                                'action': action,
+                                'data': _json_safe(data_payload),
+                                "message": str(e),
+                                "observations": _row_observations(audit_by_rowid, row_id),
+                                'mappings': _json_safe(fk_mappings),
+                                'row_id_map': _json_safe(row_id_map),
+                                "row_id_pk": _json_safe(row_id_pk),
+                            })
+                            errors.append({"model": model_name, "row": i, "field": None, "message": str(e)})
                 preview_data = model_preview
     
                 transaction.savepoint_rollback(savepoint)
