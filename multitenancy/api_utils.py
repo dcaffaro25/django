@@ -296,7 +296,8 @@ class BulkImportPreview(APIView):
                                     'data': _json_safe(model_to_dict(instance, exclude=['created_by', 'updated_by', 'is_deleted', 'is_active'])), 
                                     "message": "ok",
                                     "observations": _row_observations(audit_by_rowid, row_id),
-                                    'mappings': _json_safe(row_id_map),#fk_mappings),
+                                    'mappings': _json_safe(fk_mappings),
+                                    'row_id_map': _json_safe(row_id_map),
                                 })
                                 
                             except Exception as e:
@@ -315,7 +316,8 @@ class BulkImportPreview(APIView):
                                     'data': _json_safe(data_payload),
                                     "message": str(e),
                                     "observations": _row_observations(audit_by_rowid, row_id),
-                                    'mappings': _json_safe(row_id_map),#fk_mappings),
+                                    'mappings': _json_safe(fk_mappings),
+                                    'row_id_map': _json_safe(row_id_map),
                                 })
                                 errors.append({"model": model_name, "row": i, "field": None, "message": str(e)})
                 preview_data = model_preview
