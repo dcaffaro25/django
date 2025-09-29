@@ -11,16 +11,19 @@ from accounting.services.bank_structs import (
     ensure_gl_account_for_bank,
 )
 
-def _dbg(tag, **k):
-    # compact single-line prints so logs stay readable
-    parts = [f"{kk}={vv}" for kk, vv in k.items()]
-    print(f"[recon:{tag}] " + " ".join(parts))
+
 
 class ReconciliationService:
     """
     Service layer for reconciliation logic.
     """
-
+    
+    @staticmethod
+    def _dbg(tag, **k):
+        # compact single-line prints so logs stay readable
+        parts = [f"{kk}={vv}" for kk, vv in k.items()]
+        print(f"[recon:{tag}] " + " ".join(parts))
+        
     @staticmethod
     def match_many_to_many_with_set2(data, tenant_id=None, *, auto_match_100=False):
         """
