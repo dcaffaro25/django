@@ -11,6 +11,11 @@ from accounting.services.bank_structs import (
     ensure_gl_account_for_bank,
 )
 
+def _dbg(tag, **k):
+    # compact single-line prints so logs stay readable
+    parts = [f"{kk}={vv}" for kk, vv in k.items()]
+    print(f"[recon:{tag}] " + " ".join(parts))
+
 class ReconciliationService:
     """
     Service layer for reconciliation logic.
@@ -27,10 +32,21 @@ class ReconciliationService:
         #max_suggestions = int(data.get("max_suggestions", 5))
         max_group_size = int(data.get("max_group_size", 1))
         strategy = data.get("strategy", "Exact 1-to-1")
-
+        min_conf = float(data.get("min_confidence", 0))
+        
         bank_ids = data.get("bank_ids", [])
         book_ids = data.get("book_ids", [])
-
+        
+        ReconciliationService._dbg("input",
+            amount_tolerance=amount_tolerance,
+            date_tolerance_days=date_tolerance_days,
+            max_group_size=max_group_size,
+            strategy=strategy,
+            min_conf=min_conf,
+            bank_ids=len(data.get("bank_ids", []) or []),
+            book_ids=len(data.get("book_ids", []) or []),
+        )
+        
         candidate_bank = BankTransaction.objects.exclude(
             reconciliations__status__in=['matched', 'approved']
         )
@@ -44,7 +60,12 @@ class ReconciliationService:
             candidate_book = candidate_book.filter(transaction_id__in=book_ids)
 
         candidate_book = candidate_book.filter(account__bank_account__isnull=False)
-
+        
+        ReconciliationService._dbg("candidates_qs",
+            bank_qs_count=candidate_bank.count(),
+            book_qs_count=candidate_book.count(),
+        )
+        
         candidate_bank = list(candidate_bank)
         candidate_book = list(candidate_book)
 
@@ -56,25 +77,38 @@ class ReconciliationService:
             exact_matches, candidate_bank, candidate_book = ReconciliationService.get_exact_matches(
                 candidate_bank, candidate_book
             )
+            
+            ReconciliationService._dbg("exact_done",
+                exact=len(exact_matches), bank_left=len(candidate_bank), book_left=len(candidate_book)
+            )
+            
         if strategy in ["fuzzy", "optimized"]:
             fuzzy_matches = ReconciliationService.get_fuzzy_matches(
                 candidate_bank, candidate_book, amount_tolerance, date_tolerance_days
             )
+            
+            ReconciliationService._dbg("fuzzy_done", fuzzy=len(fuzzy_matches))
+            
         if strategy in ["many-to-many", "optimized"] and max_group_size>1 :
             group_matches = ReconciliationService.get_group_matches(
                 candidate_bank, candidate_book, amount_tolerance, date_tolerance_days, max_group_size
             )
-
+            
+            ReconciliationService._dbg("group_done", groups=len(group_matches))
+            
         #combined = (exact_matches + fuzzy_matches + group_matches)#[:max_suggestions]
         
-        min_conf = float(data.get("min_confidence", 0))
+        
         combined = [s for s in (exact_matches + fuzzy_matches + group_matches)
-                    if float(s.get("confidence_score", 0)) >= min_conf]
+                if float(s.get("confidence_score", 0)) >= min_conf]
+        ReconciliationService._dbg("combined", total=len(combined))
         
         auto_info = {"enabled": bool(auto_match_100), "applied": 0, "skipped": 0, "details": []}
         if auto_match_100:
             auto_info = ReconciliationService._apply_auto_matches_100(combined, tenant_id)
-
+            
+            ReconciliationService._dbg("auto100", applied=auto_info["applied"], skipped=auto_info["skipped"])
+            
         return {"suggestions": combined, "auto_match": auto_info}
     
     @staticmethod
@@ -189,62 +223,104 @@ class ReconciliationService:
     
     @staticmethod
     def get_exact_matches(banks, books):
+        ReconciliationService._dbg("exact_start", banks=len(banks), books=len(books))
         exact_matches = []
         matched_bank_ids = set()
         matched_book_transaction_ids = set()
-
+    
         bank_account_linked_accounts = set(
             Account.objects.filter(bank_account__isnull=False).values_list('id', flat=True)
         )
-
+        ReconciliationService._dbg("exact_accounts", linked_accounts=len(bank_account_linked_accounts))
+    
         book_transactions = defaultdict(list)
         for entry in books:
             if entry.account_id in bank_account_linked_accounts:
                 book_transactions[entry.transaction.id].append(entry)
-
+    
         for bank_tx in banks:
             for transaction_id, entries in book_transactions.items():
                 if transaction_id in matched_book_transaction_ids:
                     continue
-
+    
                 transaction_amount = sum(
                     (e.debit_amount or Decimal('0')) - (e.credit_amount or Decimal('0'))
                     for e in entries
                 )
-
-                if abs(transaction_amount) == abs(bank_tx.amount) and entries[0].transaction.date == bank_tx.date:
-                    if (transaction_amount > 0 and bank_tx.amount > 0) or (transaction_amount < 0 and bank_tx.amount < 0):
-                        matched_bank_ids.add(bank_tx.id)
-                        matched_book_transaction_ids.add(transaction_id)
-
-                        exact_matches.append(
-                            ReconciliationService.format_suggestion_output(
-                                "1-to-1 Exact",
-                                [bank_tx],
-                                [entries[0]],
-                                confidence_score=1.0,
-                            )
+                same_day = (entries[0].transaction.date == bank_tx.date)
+                same_sign = ((transaction_amount > 0 and bank_tx.amount > 0) or
+                             (transaction_amount < 0 and bank_tx.amount < 0))
+                amt_match = (abs(transaction_amount) == abs(bank_tx.amount))
+    
+                if not amt_match or not same_day or not same_sign:
+                    # log near misses to see what's off
+                    if abs(abs(transaction_amount) - abs(bank_tx.amount)) <= Decimal("0.10"):
+                        ReconciliationService._dbg("exact_near",
+                            bank_id=bank_tx.id, txn_id=transaction_id,
+                            bank_amt=str(bank_tx.amount), book_amt=str(transaction_amount),
+                            same_day=same_day, same_sign=same_sign
                         )
-                        break
-
+                    continue
+    
+                matched_bank_ids.add(bank_tx.id)
+                matched_book_transaction_ids.add(transaction_id)
+                exact_matches.append(
+                    ReconciliationService.format_suggestion_output(
+                        "1-to-1 Exact", [bank_tx], [entries[0]], confidence_score=1.0
+                    )
+                )
+                break
+    
+        ReconciliationService._dbg("exact_end",
+            exact=len(exact_matches),
+            bank_left=sum(1 for tx in banks if tx.id not in matched_bank_ids),
+            book_left=sum(1 for e in books if e.transaction.id not in matched_book_transaction_ids),
+        )
+    
         remaining_bank = [tx for tx in banks if tx.id not in matched_bank_ids]
         remaining_book = [entry for entry in books if entry.transaction.id not in matched_book_transaction_ids]
-
         return exact_matches, remaining_bank, remaining_book
 
     @staticmethod
     def get_fuzzy_matches(banks, books, amount_tolerance, date_tolerance):
+        ReconciliationService._dbg("fuzzy_start",
+            banks=len(banks), books=len(books),
+            amount_tol=str(amount_tolerance), date_tol=date_tolerance
+        )
         fuzzy_matches = []
+        # Track best pair per bank for diagnostics
+        best_for_bank = {}
     
         for bank_tx, book_tx in product(banks, books):
-            amount_diff = abs(bank_tx.amount - book_tx.get_effective_amount())
+            bank_amt = bank_tx.amount
+            book_amt = book_tx.get_effective_amount()
     
-            # ✅ compare against JournalEntry.date (fallback to Transaction.date)
+            if bank_amt is None or book_amt is None:
+                ReconciliationService._dbg("skip_amt_none", bank_id=bank_tx.id, book_id=book_tx.id)
+                continue
+    
             book_date = book_tx.date or (book_tx.transaction.date if book_tx.transaction else None)
             if book_date is None or bank_tx.date is None:
-                continue  # or decide a default behavior
+                ReconciliationService._dbg("skip_date_none",
+                    bank_id=bank_tx.id, book_id=book_tx.id,
+                    bank_date=bank_tx.date, book_date=book_date
+                )
+                continue
     
+            amount_diff = abs(bank_amt - book_amt)
             date_diff = abs((bank_tx.date - book_date).days)
+    
+            # remember closests per bank even if outside tolerance
+            key = bank_tx.id
+            prev = best_for_bank.get(key)
+            score_tuple = (amount_diff, date_diff)
+            if prev is None or score_tuple < prev[0]:
+                best_for_bank[key] = (score_tuple, {
+                    "bank_id": bank_tx.id, "book_id": book_tx.id,
+                    "bank_amt": str(bank_amt), "book_amt": str(book_amt),
+                    "amount_diff": str(amount_diff), "date_diff": date_diff,
+                    "bank_date": bank_tx.date, "book_date": book_date,
+                })
     
             if amount_diff <= amount_tolerance and date_diff <= date_tolerance:
                 confidence = ReconciliationService.calculate_confidence(
@@ -256,78 +332,102 @@ class ReconciliationService:
                     )
                 )
     
+        # Emit a short digest of the closest non-matching pairs (helps spot 57k case)
+        for _, info in list(best_for_bank.values())[:20]:
+            ReconciliationService._dbg("closest_pair",
+                bank_id=info["bank_id"], book_id=info["book_id"],
+                bank_amt=info["bank_amt"], book_amt=info["book_amt"],
+                amount_diff=info["amount_diff"], date_diff=info["date_diff"],
+                bank_date=info["bank_date"], book_date=info["book_date"]
+            )
+    
+        ReconciliationService._dbg("fuzzy_end", fuzzy=len(fuzzy_matches))
         fuzzy_matches.sort(key=lambda x: x['confidence_score'], reverse=True)
         return fuzzy_matches
 
     @staticmethod
     def get_group_matches(banks, books, amount_tolerance, date_tolerance, max_group_size=2,
                           matcher=None, description_threshold=0.5, min_confidence_improvement=0.01):
+        ReconciliationService._dbg("group_start",
+            banks=len(banks), books=len(books),
+            amount_tol=str(amount_tolerance), date_tol=date_tolerance,
+            max_group_size=max_group_size
+        )
         group_matches = []
         seen_matches = set()
-        atomic_matches = {}
-
+    
         banks = sorted(banks, key=lambda x: x.date)
         books = sorted(books, key=lambda x: x.date)
-
+    
         bank_dates = [tx.date for tx in banks]
         book_dates = [tx.date for tx in books]
-
+    
         for bank_tx in banks:
             start_date = bank_tx.date - timedelta(days=date_tolerance)
             end_date = bank_tx.date + timedelta(days=date_tolerance)
-
+    
             bank_start = bisect_left(bank_dates, start_date)
             bank_end = bisect_right(bank_dates, end_date)
             bank_group = banks[bank_start:bank_end]
-
+    
             book_start = bisect_left(book_dates, start_date)
             book_end = bisect_right(book_dates, end_date)
             book_group = books[book_start:book_end]
-
+    
             for i in range(1, min(len(bank_group), max_group_size) + 1):
                 for bank_combo in combinations(bank_group, i):
                     sum_bank = sum(tx.amount for tx in bank_combo)
-
+    
                     for j in range(1, min(len(book_group), max_group_size) + 1):
                         for book_combo in combinations(book_group, j):
-                            book_amounts = [
-                                e.get_effective_amount() for e in book_combo
-                                if e.get_effective_amount() is not None
-                            ]
+                            book_amounts = [e.get_effective_amount() for e in book_combo if e.get_effective_amount() is not None]
                             if not book_amounts:
                                 continue
                             sum_book = sum(book_amounts)
                             amount_diff = abs(sum_bank - sum_book)
                             if round(amount_diff, 6) > amount_tolerance:
+                                # log near misses
+                                if amount_diff <= (amount_tolerance * 3 if amount_tolerance else Decimal("0.10")):
+                                    ReconciliationService._dbg("group_amt_miss",
+                                        bank_ids=[tx.id for tx in bank_combo],
+                                        book_ids=[e.id for e in book_combo],
+                                        sum_bank=str(sum_bank), sum_book=str(sum_book),
+                                        amount_diff=str(amount_diff)
+                                    )
                                 continue
-
+    
                             dates = [tx.date for tx in bank_combo] + [e.date for e in book_combo]
                             if (max(dates) - min(dates)).days > date_tolerance:
+                                ReconciliationService._dbg("group_date_miss",
+                                    bank_ids=[tx.id for tx in bank_combo],
+                                    book_ids=[e.id for e in book_combo],
+                                    span_days=(max(dates) - min(dates)).days,
+                                    date_tol=date_tolerance
+                                )
                                 continue
-
+    
                             avg_date_diff = sum(
-                                abs((tx.date - e.date).days)
-                                for tx in bank_combo for e in book_combo
+                                abs((tx.date - e.date).days) for tx in bank_combo for e in book_combo
                             ) / (len(bank_combo) * len(book_combo))
-
+    
                             confidence = ReconciliationService.calculate_confidence(
                                 amount_diff, avg_date_diff, amount_tolerance, date_tolerance
                             )
-
+    
                             bank_ids = tuple(sorted(tx.id for tx in bank_combo))
                             book_ids = tuple(sorted(e.id for e in book_combo))
                             match_key = (bank_ids, book_ids)
-
                             if match_key in seen_matches:
                                 continue
                             seen_matches.add(match_key)
-
+    
                             group_matches.append(
                                 ReconciliationService.format_suggestion_output(
                                     "many-to-many", bank_combo, book_combo, confidence
                                 )
                             )
-
+    
+        ReconciliationService._dbg("group_end", groups=len(group_matches))
         group_matches.sort(key=lambda x: x['confidence_score'], reverse=True)
         return group_matches
 
