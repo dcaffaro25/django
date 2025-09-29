@@ -25,7 +25,7 @@ class ReconciliationService:
         amount_tolerance = Decimal(str(data.get("amount_tolerance", "0")))
         date_tolerance_days = int(data.get("date_tolerance_days", 2))
         #max_suggestions = int(data.get("max_suggestions", 5))
-        max_group_size = int(data.get("max_group_size", 5))
+        max_group_size = int(data.get("max_group_size", 1))
         strategy = data.get("strategy", "Exact 1-to-1")
 
         bank_ids = data.get("bank_ids", [])
@@ -60,7 +60,7 @@ class ReconciliationService:
             fuzzy_matches = ReconciliationService.get_fuzzy_matches(
                 candidate_bank, candidate_book, amount_tolerance, date_tolerance_days
             )
-        if strategy in ["many-to-many", "optimized"]:
+        if strategy in ["many-to-many", "optimized"] and max_group_size>1 :
             group_matches = ReconciliationService.get_group_matches(
                 candidate_bank, candidate_book, amount_tolerance, date_tolerance_days, max_group_size
             )

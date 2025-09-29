@@ -247,7 +247,7 @@ class ReconciliationConfigAdmin(PlainAdmin):
     list_display = ("id", "scope", "name", "company", "user", "is_default", "updated_at")
     list_filter = ("scope", "is_default", "company")
     autocomplete_fields = ("company", "user")
-    search_fields = ("name", "description", "company__name")#, "user__username")
+    search_fields = ("name", "description", "company__name", "user__username")
 
 @admin.register(ReconciliationTask)
 class ReconciliationTaskAdmin(PlainAdmin):
