@@ -65,7 +65,11 @@ class ReconciliationService:
                 candidate_bank, candidate_book, amount_tolerance, date_tolerance_days, max_group_size
             )
 
-        combined = (exact_matches + fuzzy_matches + group_matches)#[:max_suggestions]
+        #combined = (exact_matches + fuzzy_matches + group_matches)#[:max_suggestions]
+        
+        min_conf = float(data.get("min_confidence", 0))
+        combined = [s for s in (exact_matches + fuzzy_matches + group_matches)
+                    if float(s.get("confidence_score", 0)) >= min_conf]
         
         auto_info = {"enabled": bool(auto_match_100), "applied": 0, "skipped": 0, "details": []}
         if auto_match_100:
@@ -231,11 +235,17 @@ class ReconciliationService:
     @staticmethod
     def get_fuzzy_matches(banks, books, amount_tolerance, date_tolerance):
         fuzzy_matches = []
-
+    
         for bank_tx, book_tx in product(banks, books):
             amount_diff = abs(bank_tx.amount - book_tx.get_effective_amount())
-            date_diff = abs((bank_tx.date - book_tx.transaction.date).days)
-
+    
+            # ✅ compare against JournalEntry.date (fallback to Transaction.date)
+            book_date = book_tx.date or (book_tx.transaction.date if book_tx.transaction else None)
+            if book_date is None or bank_tx.date is None:
+                continue  # or decide a default behavior
+    
+            date_diff = abs((bank_tx.date - book_date).days)
+    
             if amount_diff <= amount_tolerance and date_diff <= date_tolerance:
                 confidence = ReconciliationService.calculate_confidence(
                     amount_diff, date_diff, amount_tolerance, date_tolerance
@@ -245,7 +255,7 @@ class ReconciliationService:
                         "1-to-1 fuzzy", [bank_tx], [book_tx], confidence
                     )
                 )
-
+    
         fuzzy_matches.sort(key=lambda x: x['confidence_score'], reverse=True)
         return fuzzy_matches
 
