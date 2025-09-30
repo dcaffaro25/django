@@ -375,7 +375,7 @@ class ReconciliationService:
             for book_tx in books:
                 bank_amt = bank_tx.amount
                 book_amt = book_tx.get_effective_amount()
-
+                
                 if bank_amt is None or book_amt is None:
                     skip["amt_none"] += 1
                     if log_all:

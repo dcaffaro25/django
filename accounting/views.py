@@ -564,37 +564,9 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return response.Response(serializer.data)
     
     @action(detail=False, methods=['post'])
-    def finalize_reconciliation_matches(self, request, tenant_id):
+    def finalize_reconciliation_matches(self, request, *args, **kwargs):
         """
-        Endpoint to finalize reconciliations from a list of matches.
-    
-        Expected JSON payload:
-        {
-            "matches": [
-                {
-                    "bank_transaction_ids": [1321, 1322],
-                    "journal_entry_ids": [101, 102]
-                },
-                {
-                    "bank_transaction_ids": [1331],
-                    "journal_entry_ids": [103]
-                }
-            ],
-            "adjustment_side": "bank",  // "bank", "journal", or "none"
-            "reference": "Reconciliation batch 1",
-            "notes": "Matched using high confidence scores"
-        }
-        
-        For each match:
-          - The system loads the provided bank transactions and journal entries.
-          - It computes the difference between the bank total and the journal total.
-          - If an adjustment is requested (adjustment_side != "none") and the difference is nonzero,
-            an adjustment record is automatically created on the chosen side (bank or journal) so that
-            the totals are balanced.
-          - The final difference is then evaluated: if zero, status is set to "matched"; otherwise, "pending".
-          - The provided reference and notes are stored (with additional matching details appended).
-          
-        The endpoint returns a list of created reconciliation record IDs.
+        Finalize a batch of reconciliation matches (optionally creating an adjustment on one side).
         """
         data = request.data
         matches = data.get("matches", [])
@@ -613,17 +585,25 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     problems.append({"reason": "empty_ids", "match": match})
                     continue
     
-                # (Optional) savepoint so a single failure doesn't roll back the whole batch
+                # OPTIONAL: guard against re-using rows already matched/approved
+                if BankTransaction.objects.filter(
+                    id__in=bank_ids, reconciliations__status__in=["matched", "approved"]
+                ).exists() or JournalEntry.objects.filter(
+                    id__in=journal_ids, reconciliations__status__in=["matched", "approved"]
+                ).exists():
+                    problems.append({"reason": "already_reconciled", "bank_ids": bank_ids, "journal_ids": journal_ids})
+                    continue
+    
                 sp = db_tx.savepoint()
                 try:
-                    # Lock rows we will attach to avoid concurrent reconciliation
+                    # Lock rows
                     bank_qs = (BankTransaction.objects
                                .select_for_update()
                                .select_related("bank_account", "currency")
                                .filter(id__in=bank_ids))
                     je_qs = (JournalEntry.objects
                              .select_for_update()
-                             .select_related("account", "account__bank_account", "transaction")
+                             .select_related("account", "account__bank_account", "transaction", "transaction__currency")
                              .filter(id__in=journal_ids))
     
                     bank_txs = list(bank_qs)
@@ -633,7 +613,7 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                         db_tx.savepoint_commit(sp)
                         continue
     
-                    # Company consistency
+                    # Company & currency consistency
                     company_set = {bt.company_id for bt in bank_txs} | {je.company_id for je in journal_entries}
                     if len(company_set) != 1:
                         problems.append({"reason": "mixed_company", "bank_ids": bank_ids, "journal_ids": journal_ids})
@@ -641,39 +621,51 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                         continue
                     company_id = next(iter(company_set))
     
-                    # Currency consistency (simple guard; adjust if you support FX)
-                    currency_set = {bt.currency_id for bt in bank_txs} | {je.transaction.currency_id for je in journal_entries if je.transaction_id}
+                    currency_set = {bt.currency_id for bt in bank_txs} | {
+                        je.transaction.currency_id for je in journal_entries if je.transaction_id
+                    }
                     if len(currency_set) != 1:
                         problems.append({"reason": "mixed_currency", "bank_ids": bank_ids, "journal_ids": journal_ids})
                         db_tx.savepoint_commit(sp)
                         continue
+                    currency_id = next(iter(currency_set))
     
-                    # Ensure "pending" structures exist (used if any JE was created with bank_designation_pending)
-                    pending_ba, pending_gl = ensure_pending_bank_structs(company_id, currency_id=bank_txs[0].currency_id)
+                    # Ensure pending scaffolding exists
+                    pending_ba, pending_gl = ensure_pending_bank_structs(company_id, currency_id=currency_id)
     
-                    # Sums
+                    # Totals
                     sum_bank = sum((bt.amount for bt in bank_txs), Decimal("0"))
                     sum_journal = sum(((je.get_effective_amount() or Decimal("0")) for je in journal_entries), Decimal("0"))
                     diff = sum_bank - sum_journal
     
+                    # If match spans multiple bank accounts, we will NOT create bank-side adjustments.
+                    bank_account_set = {bt.bank_account_id for bt in bank_txs if bt.bank_account_id}
+    
                     # Adjustment (optional)
-                    if adjustment_side != "none" and diff != 0:
+                    if adjustment_side != "none" and diff != Decimal("0"):
                         if adjustment_side == "bank":
-                            # Make bank total equal journal total
-                            adjustment_amount = sum_journal - sum_bank  # <-- define it!
-                            bt0 = bank_txs[0]
-                            adj_bt = BankTransaction.objects.create(
-                                company_id=company_id,
-                                bank_account=bt0.bank_account,
-                                date=bt0.date,
-                                currency=bt0.currency,
-                                amount=adjustment_amount,
-                                description="Adjustment record for reconciliation",
-                                status="pending",
-                                tx_hash="adjustment_for_rec",
-                            )
-                            bank_txs.append(adj_bt)
-                            sum_bank += adjustment_amount
+                            if len(bank_account_set) != 1:
+                                problems.append({
+                                    "reason": "cannot_adjust_bank_with_multiple_accounts",
+                                    "bank_account_ids": list(bank_account_set),
+                                    "bank_ids": bank_ids, "journal_ids": journal_ids,
+                                })
+                            else:
+                                # Make bank total equal journal total
+                                adjustment_amount = sum_journal - sum_bank
+                                bt0 = bank_txs[0]
+                                adj_bt = BankTransaction.objects.create(
+                                    company_id=company_id,
+                                    bank_account=bt0.bank_account,
+                                    date=bt0.date,
+                                    currency=bt0.currency,
+                                    amount=adjustment_amount,
+                                    description="Adjustment record for reconciliation",
+                                    status="pending",
+                                    tx_hash="adjustment_for_rec",
+                                )
+                                bank_txs.append(adj_bt)
+                                sum_bank += adjustment_amount
     
                         elif adjustment_side == "journal":
                             # Make journal total equal bank total
@@ -684,19 +676,20 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                             adj_je = JournalEntry.objects.create(
                                 company_id=company_id,
                                 transaction=je0.transaction,
-                                account=je0.account or pending_gl,  # if blank, put it through pending GL
+                                account=pending_gl if (je0.account is None or getattr(je0.account, "bank_account_id", None) is None) else je0.account,
                                 cost_center=je0.cost_center,
                                 debit_amount=debit_amount,
                                 credit_amount=credit_amount,
                                 state="pending",
                                 date=je0.date or je0.transaction.date,
+                                bank_designation_pending=True,  # ensure later promotion
                             )
                             journal_entries.append(adj_je)
                             sum_journal += adjustment_amount
     
                     # Final status
                     final_diff = sum_bank - sum_journal
-                    rec_status = "matched" if final_diff == 0 else "pending"
+                    rec_status = "matched" if final_diff == Decimal("0") else "pending"
     
                     # Create Reconciliation
                     bank_ids_str = ", ".join(str(x.id) for x in bank_txs)
@@ -714,21 +707,18 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     created_ids.append(rec.id)
     
                     # Promote pending JEs to the specific bank GL (only if a single bank_account is involved)
-                    bank_account_set = {bt.bank_account_id for bt in bank_txs if bt.bank_account_id}
                     if len(bank_account_set) == 1:
                         target_ba_id = next(iter(bank_account_set))
                         target_ba = next(bt.bank_account for bt in bank_txs if bt.bank_account_id == target_ba_id)
                         target_gl = ensure_gl_account_for_bank(company_id, target_ba)
     
                         for je in journal_entries:
-                            # Move lines that came through the pending path or were explicitly left blank
                             acct_ba_id = getattr(je.account, "bank_account_id", None) if je.account_id else None
                             if acct_ba_id == pending_ba.id or je.account_id is None or getattr(je, "bank_designation_pending", False):
                                 updates = {}
                                 if je.account_id != target_gl.id:
                                     je.account_id = target_gl.id
                                     updates["account"] = target_gl.id
-                                # Flip the pending marker off if present
                                 if hasattr(je, "bank_designation_pending") and je.bank_designation_pending:
                                     je.bank_designation_pending = False
                                     updates["bank_designation_pending"] = False
