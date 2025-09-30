@@ -647,13 +647,13 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     try:
                         bank_qs = (BankTransaction.objects
                                    .select_for_update()
-                                   .select_related("bank_account", "currency")
-                                   .filter(id__in=bank_ids))
+                                   #.select_related("bank_account", "currency")
+                                   .filter(id__in=bank_ids).select_for_update(of=('self',)))
                         je_qs = (JournalEntry.objects
                                  .select_for_update()
-                                 .select_related("account", "account__bank_account",
-                                                 "transaction", "transaction__currency")
-                                 .filter(id__in=journal_ids))
+                                 #.select_related("account", "account__bank_account",
+                                 #                "transaction", "transaction__currency")
+                                 .filter(id__in=journal_ids).select_for_update(of=('self',)))
 
                         bank_txs = list(bank_qs)
                         journal_entries = list(je_qs)
