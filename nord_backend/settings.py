@@ -89,6 +89,14 @@ LOGGING = {
     },
 }
 
+LOGGING["handlers"]["console_plain"]["level"] = "DEBUG"
+
+LOGGING["loggers"]["recon"] = {
+    "handlers": ["console_plain"],
+    "level": "DEBUG",           # was INFO
+    "propagate": False,
+}
+
 '''
 LOGGING = {
     "version": 1,
