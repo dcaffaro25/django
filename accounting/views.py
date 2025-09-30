@@ -35,6 +35,7 @@ from multitenancy.api_utils import _to_bool
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters as drf_filters
 from .filters import BankTransactionFilter, TransactionFilter
+from django.db import transaction as db_tx
 
 # Currency ViewSet
 class CurrencyViewSet(viewsets.ModelViewSet):
