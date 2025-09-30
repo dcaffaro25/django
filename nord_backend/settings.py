@@ -33,17 +33,15 @@ LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
-        # Context formatter ONLY for our importer logs
         "ctx": {
             "format": "%(levelname)s %(asctime)s importer %(message)s | run_id=%(run_id)s company=%(company_id)s model=%(model)s row_id=%(row_id)s"
         },
-        # Plain formatter for everything else
         "plain": {
             "format": "%(levelname)s %(asctime)s %(name)s %(message)s"
         },
-        # Gunicorn access format (no extra fields!)
+        # IMPORTANT: let Gunicorn build the access line; we just print it.
         "gunicorn_access": {
-            "format": '%(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s"'
+            "format": "%(message)s"
         },
     },
     "handlers": {
@@ -55,7 +53,7 @@ LOGGING = {
         "console_ctx": {
             "class": "logging.StreamHandler",
             "formatter": "ctx",
-            "level": "DEBUG",   # show our _vlog DEBUG when IMPORT_DEBUG=0, INFO when IMPORT_DEBUG=1
+            "level": "DEBUG",
         },
         "gunicorn_access": {
             "class": "logging.StreamHandler",
@@ -64,13 +62,11 @@ LOGGING = {
         },
     },
     "loggers": {
-        # Our importer — the only one that uses the ctx formatter
         "importer": {
             "handlers": ["console_ctx"],
             "level": "DEBUG",
             "propagate": False,
         },
-        # Keep gunicorn logs separate so they don't expect run_id/company_id etc.
         "gunicorn.error": {
             "handlers": ["console_plain"],
             "level": "INFO",
@@ -81,7 +77,6 @@ LOGGING = {
             "level": "INFO",
             "propagate": False,
         },
-        # Django default
         "django": {
             "handlers": ["console_plain"],
             "level": "INFO",
