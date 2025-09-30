@@ -44,6 +44,8 @@ from rest_framework.response import Response
 from accounting.models import BankTransaction, JournalEntry, Reconciliation
 from accounting.services.bank_structs import ensure_pending_bank_structs, ensure_gl_account_for_bank
 
+import logging
+log = logging.getLogger("recon")  # or logging.getLogger(__name__)
 
 def _dbg(tag, **k):  # keep logs consistent with the service
     parts = " ".join(f"{kk}={vv}" for kk, vv in k.items())
