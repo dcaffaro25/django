@@ -81,6 +81,11 @@ LOGGING = {
             "handlers": ["console_plain"],
             "level": "INFO",
         },
+        "recon": {
+            "handlers": ["console_plain"],
+            "level": "DEBUG",   # or INFO in prod
+            "propagate": False,
+        },
     },
 }
 
