@@ -418,12 +418,13 @@ class JournalEntry(TenantAwareBaseModel):
 
     def get_effective_amount(self):
         direction = self.account.account_direction if (self.account and self.account.account_direction) else 1
-        amount = Decimal('0')
-        if self.debit_amount is not None:
-            amount = self.debit_amount
-        elif self.credit_amount is not None:
-            amount = -self.credit_amount
-        return amount * direction
+        if self.debit_amount is not None and self.debit_amount != 0:
+            base = self.debit_amount
+        elif self.credit_amount is not None and self.credit_amount != 0:
+            base = -self.credit_amount
+        else:
+            base = Decimal('0')
+        return base * direction
 
     def get_balance(self):
         return self.debit_amount if self.debit_amount is not None else (-self.credit_amount)
