@@ -248,12 +248,36 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     if len(seen) >= max_unique:
                         break
                 return " | ".join(seen)
-
-            bank_description = _collapse_desc(banks, lambda b: b.description)
-            book_description = _collapse_desc(
+            
+            def get_bank_transaction_summary(bank_items):
+                lines = []
+                for tx in bank_items:
+                    lines.append(f"ID: {tx.id}, Date: {tx.date}, Amount: {tx.amount}, Desc: {tx.description}")
+                return "\n".join(lines)
+        
+            def get_journal_entries_summary(book_items):
+                lines = []
+                for entry in book_items:
+                    account_code = entry.account.account_code if entry.account_id else "N/A"
+                    account_name = entry.account.name if entry.account_id else "N/A"
+                    direction = "DEBIT" if entry.debit_amount else "CREDIT"
+                    eff = entry.get_effective_amount()
+                    desc = entry.transaction.description if entry.transaction_id else ""
+                    lines.append(
+                        f"ID: {entry.transaction.id if entry.transaction_id else entry.id}, "
+                        f"Date: {entry.date}, JE: {direction} {eff} - "
+                        f"({account_code}) {account_name}, Desc: {desc}"
+                    )
+                return "\n".join(lines)
+            
+            bank_description = get_bank_transaction_summary(#_collapse_desc(
+                banks, lambda b: b.description)
+            book_description = get_journal_entries_summary(#_collapse_desc(
                 books, lambda je: (je.transaction.description if je.transaction_id else None)
             )
-
+            
+            
+            
             results.append({
                 "reconciliation_id": rec.id,
                 "bank_ids": bank_ids,
