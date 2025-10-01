@@ -271,9 +271,9 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 return "\n".join(lines)
             
             bank_description = get_bank_transaction_summary(#_collapse_desc(
-                banks, lambda b: b.description)
+                banks)#, lambda b: b.description)
             book_description = get_journal_entries_summary(#_collapse_desc(
-                books, lambda je: (je.transaction.description if je.transaction_id else None)
+                books#, lambda je: (je.transaction.description if je.transaction_id else None)
             )
             
             
