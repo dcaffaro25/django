@@ -45,6 +45,24 @@ from accounting.models import BankTransaction, JournalEntry, Reconciliation
 from accounting.services.bank_structs import ensure_pending_bank_structs, ensure_gl_account_for_bank
 
 import logging
+
+from datetime import date
+from django.db.models import Prefetch
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework import status
+
+from accounting.models import Reconciliation, BankTransaction, JournalEntry
+
+def _mean_date(dates):
+    """Return the average (mean) of a list of date objects, or None."""
+    ds = [d for d in dates if d]
+    if not ds:
+        return None
+    avg_ord = sum(d.toordinal() for d in ds) / len(ds)
+    # round to nearest day for stability
+    return date.fromordinal(int(round(avg_ord)))
+
 log = logging.getLogger("recon")  # or logging.getLogger(__name__)
 
 def _dbg(tag, **k):  # keep logs consistent with the service
@@ -161,7 +179,100 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             )
         
         return generic_bulk_delete(self, ids)
+    
+    @action(methods=['get'], detail=False, url_path='summaries')
+    def summaries(self, request, *args, **kwargs):
+        """
+        Return reconciliations in a compact, 'matches-like' format.
 
+        Query params:
+          - status: comma-separated list of statuses (default: matched,approved)
+        """
+        status_param = request.query_params.get("status", "matched,approved")
+        wanted_status = [s.strip() for s in status_param.split(",") if s.strip()]
+
+        qs = self.filter_queryset(
+            self.get_queryset().filter(status__in=wanted_status)
+        )
+
+        # Prefetch to avoid N+1 queries
+        bank_qs = BankTransaction.objects.select_related(
+            "bank_account", "bank_account__entity", "currency"
+        )
+        book_qs = JournalEntry.objects.select_related(
+            "account", "account__bank_account",
+            "transaction", "transaction__entity", "transaction__currency"
+        )
+
+        qs = qs.prefetch_related(
+            Prefetch("bank_transactions", queryset=bank_qs),
+            Prefetch("journal_entries", queryset=book_qs),
+        )
+
+        # Pagination support
+        page = self.paginate_queryset(qs)
+        recs = page if page is not None else qs
+
+        results = []
+        for rec in recs:
+            banks = list(rec.bank_transactions.all())
+            books = list(rec.journal_entries.all())
+
+            bank_ids = [b.id for b in banks]
+            book_ids = [j.id for j in books]
+
+            # sums
+            bank_sum = sum((b.amount or 0) for b in banks)
+            book_sum = 0
+            for je in books:
+                eff = je.get_effective_amount()
+                if eff is not None:
+                    book_sum += eff
+
+            # signed difference (bank - book)
+            difference = bank_sum - book_sum
+
+            # average dates
+            bank_avg = _mean_date([b.date for b in banks])
+            # prefer entry.date, fall back to transaction.date
+            book_dates = [je.date or (je.transaction.date if je.transaction_id else None) for je in books]
+            book_avg = _mean_date(book_dates)
+
+            # descriptions (collapse duplicates; short, readable)
+            def _collapse_desc(items, getter, max_unique=5):
+                seen = []
+                for it in items:
+                    txt = getter(it)
+                    if txt and txt not in seen:
+                        seen.append(txt)
+                    if len(seen) >= max_unique:
+                        break
+                return " | ".join(seen)
+
+            bank_description = _collapse_desc(banks, lambda b: b.description)
+            book_description = _collapse_desc(
+                books, lambda je: (je.transaction.description if je.transaction_id else None)
+            )
+
+            results.append({
+                "reconciliation_id": rec.id,
+                "bank_ids": bank_ids,
+                "book_ids": book_ids,
+                "bank_description": bank_description,
+                "book_description": book_description,
+                "bank_sum_value": float(bank_sum),
+                "book_sum_value": float(book_sum),
+                "difference": float(difference),
+                "bank_avg_date": bank_avg.isoformat() if bank_avg else None,
+                "book_avg_date": book_avg.isoformat() if book_avg else None,
+                "reference": rec.reference,
+                "notes": rec.notes,
+            })
+
+        if page is not None:
+            return self.get_paginated_response(results)
+        return Response(results, status=status.HTTP_200_OK)
+    
 # Transaction ViewSet
 class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     #queryset = Transaction.objects.select_related('company').prefetch_related('journal_entries')

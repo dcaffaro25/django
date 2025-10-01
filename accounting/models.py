@@ -21,6 +21,8 @@ from django.conf import settings
 
 from django.utils.dateparse import parse_date  # only needed if you keep saves without full_clean()
 
+
+
 class Currency(BaseModel):
     code = models.CharField(max_length=3, unique=True)
     name = models.CharField(max_length=100)
@@ -517,6 +519,8 @@ class ReconciliationTask(models.Model):
 
     def __str__(self):
         return f"ReconciliationTask {self.task_id} ({self.status})"
+
+
 
 class Reconciliation(TenantAwareBaseModel):
     """
