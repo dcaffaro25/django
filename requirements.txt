@@ -39,3 +39,5 @@ celery[redis]==5.3.6
 django-celery-results==2.5.1
 flower==2.0.1
 backoff==2.2.1
+"IntegrationRule": "multitenancy",
+"SubstitutionRule": "multitenancy",
