@@ -16,7 +16,7 @@ from mptt.models import MPTTModel, TreeForeignKey
 from mptt.managers import TreeManager
 from multitenancy.models import Company, CustomUser
 from django.conf import settings
-
+from pgvector.django import VectorField, HnswIndex
 
 
 from django.utils.dateparse import parse_date  # only needed if you keep saves without full_clean()
@@ -159,12 +159,26 @@ class Account(TenantAwareBaseModel, MPTTModel):
     
     objects = TreeManager()
     
+    account_description_embedding = VectorField(
+        dimensions=768, 
+        help_text="Vector embeddings (embeddinggemma:300m) of the account content",
+        null=True, blank=True)
+
+    
     class MPTTMeta:
         order_insertion_by = ['account_code']    
 
     class Meta:
         unique_together = ('company', 'account_code', 'name')
-        
+        indexes = [
+            HnswIndex(
+                name="acct_emb_hnsw",
+                fields=["account_description_embedding"],
+                m=16,
+                ef_construction=64,
+                opclasses=["vector_cosine_ops"],
+            )
+            ]
     def __str__(self):
         return f'({self.id}) {self.company} - {self.account_code} - {self.get_path()}'
     
@@ -269,9 +283,22 @@ class Transaction(TenantAwareBaseModel):
     state = models.CharField(max_length=50, default='pending')  # e.g., 'pending', 'posted'
     balance_validated = models.BooleanField(default=False)  # <-- NEW FIELD
     rules = models.ManyToManyField('Rule', blank=True)
-
+    
+    description_embedding = VectorField(
+        dimensions=768, 
+        help_text="Vector embeddings (embeddinggemma:300m) of the description content",
+        null=True, blank=True)
+    
+    
     class Meta:
         indexes = [
+            HnswIndex(
+                name="tx_desc_emb_hnsw",
+                fields=["description_embedding"],
+                m=16,
+                ef_construction=64,
+                opclasses=["vector_cosine_ops"],
+            ),
             models.Index(fields=['date']),
             models.Index(fields=['entity']),
             models.Index(fields=['state']),
@@ -464,6 +491,14 @@ class BankTransaction(TenantAwareBaseModel):
     balance_validated = models.BooleanField(default=False)  # <-- NEW FIELD
     tx_hash = models.CharField(max_length=64, blank=True, null=True, db_index=True)
     
+    description_embedding = VectorField(
+        dimensions=768, 
+        help_text="Vector embeddings (embeddinggemma:300m) of the bank transaction content",
+        null=True, blank=True)
+
+      
+
+    
     @property
     def entity(self):
         # returns Entity instance
@@ -487,6 +522,13 @@ class BankTransaction(TenantAwareBaseModel):
 
     class Meta:
         indexes = [
+            HnswIndex(
+                name="bank_desc_emb_hnsw",
+                fields=["description_embedding"],
+                m=16,
+                ef_construction=64,
+                opclasses=["vector_cosine_ops"],
+            ),
             models.Index(fields=['date']),
             models.Index(fields=['bank_account']),     # keep this; used in joins
             models.Index(fields=['amount']),

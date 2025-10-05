@@ -104,6 +104,8 @@ MODEL_APP_MAP = {
     "CostCenter": "accounting",
     "Entity": "multitenancy",
     "Company": "multitenancy",
+    "IntegrationRule": "multitenancy",
+    "SubstitutionRule": "multitenancy",
     "Currency": "accounting",
     "Bank": "accounting",
     "BankAccount": "accounting",
@@ -723,6 +725,8 @@ class BulkImportTemplateDownloadView(APIView):
             "Transaction": ["__row_id", "company_fk", "date", "entity_fk", "description", "amount", "currency_fk"],
             "JournalEntry": ["__row_id", "date", "company_fk", "transaction_fk", "account_fk", "cost_center_fk", "debit_amount", "credit_amount"],
             "BankTransaction": ["__row_id", "company_fk", "entity_fk", "bank_account_fk", "date", "amount", "description", "currency_fk", "transaction_type", "check_number", "reference_number", "payee", "memo", "account_number", "routing_number", "transaction_id"],
+            "IntegrationRule": ["__row_id", "company_fk","name","description","trigger_event","execution_order","filter_conditions","rule","use_celery","is_active","last_run_at","times_executed"],
+            "SubstitutionRule": ["__row_id", "company_fk","title","model_name","field_name","column_name","column_index","match_type","match_value","substitution_value","filter_conditions"],
         }
 
         ws = wb.active
@@ -757,6 +761,8 @@ class BulkImportTemplateDownloadView(APIView):
             ('Transaction', Transaction.objects.filter(company_id=tenant_id), ['id', 'date', 'entity_id', 'description', 'amount', 'state']),
             ('JournalEntry', JournalEntry.objects.filter(company_id=tenant_id), ['id', 'transaction_id', 'account_id', 'debit_amount', 'credit_amount', 'date']),
             ('BankTransaction', BankTransaction.objects.filter(company_id=tenant_id), ['id', 'entity_id', 'bank_account_id', 'date', 'amount', 'description', 'transaction_type', 'status']),
+            ("IntegrationRule", IntegrationRule.objects.filter(company_id=tenant_id), ["id", "company_id","name","description","trigger_event","execution_order","filter_conditions","rule","use_celery","is_active","last_run_at","times_executed"]),
+            ("SubstitutionRule", SubstitutionRule.objects.filter(company_id=tenant_id), ["id", "company_id","title","model_name","field_name","column_name","column_index","match_type","match_value","substitution_value","filter_conditions"]),
         ]
 
         for title, queryset, columns in references:

@@ -97,73 +97,7 @@ LOGGING["loggers"]["recon"] = {
     "propagate": False,
 }
 
-'''
-LOGGING = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "filters": {
-        "slow_only": {"()": "core.logging.SlowOnlyFilter", "threshold_ms": 200},
-        "require_debug_true": {"()": "django.utils.log.RequireDebugTrue"},
-    },
-    "formatters": {
-        "default": {"format": "[%(levelname)s] %(asctime)s %(name)s:%(lineno)d %(message)s"},
-        "db_compact": {"format": "[SQL] %(duration).3fs %(sql)s; params=%(params)s"},
-    },
-    "handlers": {
-        "console": {"class": "logging.StreamHandler", "formatter": "default"},
-        # only show SQL when DEBUG is True (for local dev)
-        "db_console_debug": {
-            "class": "logging.StreamHandler",
-            "level": "DEBUG",
-            "filters": ["require_debug_true"],
-            "formatter": "db_compact",
-        },
-        # show only slow SQL in prod
-        "db_console_slow": {
-            "class": "logging.StreamHandler",
-            "level": "INFO",
-            "filters": ["slow_only"],
-            "formatter": "db_compact",
-        },
-    },
-    "loggers": {
-        "django": {"handlers": ["console"], "level": "INFO", "propagate": True},
-        "django.db.backends": {
-            # When DEBUG=True you'll see all queries via db_console_debug
-            # When DEBUG=False you'll only see slow ones via db_console_slow
-            "handlers": ["db_console_debug", "db_console_slow"],
-            "level": "DEBUG",
-            "propagate": False,
-        },
-    },
-}
-'''
-'''
-LOGGING = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {
-        "verbose": {
-            "format": "[%(levelname)s] %(asctime)s %(name)s:%(lineno)d %(message)s",
-            "datefmt": "%Y-%m-%d %H:%M:%S",
-        },
-    },
-    "handlers": {
-        "console": {
-            "class": "logging.StreamHandler",
-            "formatter": "verbose",
-        },
-    },
-    "loggers": {
-        "django": {"handlers": ["console"], "level": "INFO" if not DEBUG else "DEBUG"},
-        "django.db.backends": {
-            "handlers": ["console"],
-            "level": "WARNING",
-            "propagate": False,
-        },
-    },
-}
-'''
+
 APPEND_SLASH = True  # keep this; helps GET/HEAD without slash
 
 # Feature flag for Retool authentication
@@ -211,6 +145,7 @@ INSTALLED_APPS = [
     'billing',
     'ML',
     'django_celery_results',
+    'pgvector.django',
 ]
 
 MIDDLEWARE = [
@@ -266,14 +201,34 @@ REST_FRAMEWORK = {
 
 # Database
 # https://docs.djangoproject.com/en/4.0/ref/settings/#databases
+#postgresql://postgres:OpiRdctRUwIVWoFbhOnfBQLmIPDarkXG@caboose.proxy.rlwy.net:11644/railway
 
+#postgresql://postgres:RredJeomPHdFbnFgXgIWSWxAQLkvbTRg@switchyard.proxy.rlwy.net:45690/railway
+#postgres://postgres:a9X9kk28TgaZC_HCHo9iMawHs.ywEbvK@switchback.proxy.rlwy.net:17976/railway
+#postgresql://postgres:kxHcvhsqrtHzyStXGoNxyBKwRTJmuJkY@yamanote.proxy.rlwy.net:13795/railway
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": "railway",
+        "USER": "postgres",
+        "PASSWORD": "a9X9kk28TgaZC_HCHo9iMawHs.ywEbvK",
+        "HOST": "switchback.proxy.rlwy.net",
+        "PORT": "17976",          # ← must match the public URL port
+        #"OPTIONS": {"sslmode": "require"},
+    },
+    "old": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": "railway",
+        "USER": "postgres",
+        "PASSWORD": "kxHcvhsqrtHzyStXGoNxyBKwRTJmuJkY",
+        "HOST": "yamanote.proxy.rlwy.net",
+        "PORT": "13795",          # ← must match the public URL port
+        #"OPTIONS": {"sslmode": "require"},
     }
 }
 
+
+#if os.getenv("RAILWAY_ENVIRONMENT"):
 if os.environ.get('PGDATABASE'):
     DATABASES = {
         'default': {
