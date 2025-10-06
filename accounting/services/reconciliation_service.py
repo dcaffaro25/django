@@ -97,7 +97,7 @@ class MatchConfig:
         date_tol = int(data.get("date_tolerance_days", 2))
         max_gsize = int(data.get("max_group_size", 1))
         min_conf = float(data.get("min_confidence", 0))
-        max_sug = int(data.get("max_suggestions", 100))
+        max_sug = int(data.get("max_suggestions", 10000))
         log_all = bool(data.get("log_all") or os.getenv("RECON_LOG_ALL") == "1")
         return cls(
             strategy=strategy,
