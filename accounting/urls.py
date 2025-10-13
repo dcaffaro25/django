@@ -2,6 +2,7 @@
 
 from django.urls import re_path, include
 from rest_framework.routers import DefaultRouter
+from django.urls import path
 from .views import (
     CurrencyViewSet,
     AccountViewSet,
@@ -20,6 +21,13 @@ from .views import (
     ReconciliationTaskViewSet,
     ReconciliationViewSet,
     ReconciliationConfigViewSet,
+)
+from .views import (
+    EmbeddingBackfillView,
+    EmbeddingTaskStatusView,
+    EmbeddingTaskCancelView,
+    EmbeddingHealthView,
+    EmbeddingMissingCountsView,
 )
 from multitenancy.views import EntityViewSet, EntityMiniViewSet, EntityTreeView, EntityDynamicTransposedView
 
@@ -61,4 +69,9 @@ urlpatterns = [
 
     re_path(r'^entities-dynamic-transposed/?$', EntityDynamicTransposedView.as_view(), name='entity-dynamic-transposed'),
     re_path(r'^entity-tree/(?P<company_id>\d+)/?$', EntityTreeView.as_view(), name='entity-tree'),
+    path("embeddings/backfill/", EmbeddingBackfillView.as_view(), name="embeddings-backfill"),
+    path("embeddings/tasks/<str:task_id>/", EmbeddingTaskStatusView.as_view(), name="embeddings-task-status"),
+    path("embeddings/tasks/<str:task_id>/cancel/", EmbeddingTaskCancelView.as_view(), name="embeddings-task-cancel"),
+    path("embeddings/health/", EmbeddingHealthView.as_view(), name="embeddings-health"),
+    path("embeddings/missing-counts/", EmbeddingMissingCountsView.as_view(), name="embeddings-missing-counts"),
 ]

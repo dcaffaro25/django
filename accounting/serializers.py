@@ -425,3 +425,20 @@ class ResolvedReconciliationConfigSerializer(serializers.ModelSerializer):
         if obj.scope == "company_user" and obj.company and obj.user:
             return f"Company+User Shortcut ({obj.company.name} | {obj.user.username})"
         return obj.scope
+    
+class StartEmbeddingBackfillSerializer(serializers.Serializer):
+    per_model_limit = serializers.IntegerField(required=False, min_value=1)
+    sync = serializers.BooleanField(required=False, default=False)
+
+
+class TaskIdSerializer(serializers.Serializer):
+    task_id = serializers.CharField()
+
+
+class TaskStatusSerializer(serializers.Serializer):
+    task_id = serializers.CharField()
+    state = serializers.CharField()
+    ready = serializers.BooleanField()
+    successful = serializers.BooleanField()
+    result = serializers.JSONField(required=False, allow_null=True)
+    error = serializers.CharField(required=False, allow_blank=True)

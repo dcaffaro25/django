@@ -54,6 +54,29 @@ from rest_framework import status
 
 from accounting.models import Reconciliation, BankTransaction, JournalEntry
 
+# accounting/views_embeddings.py
+from __future__ import annotations
+
+import logging
+
+from celery import current_app
+from celery.result import AsyncResult
+from django.db.models import Q
+from rest_framework.permissions import IsAdminUser
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.views import APIView
+
+from .models import Account, BankTransaction, Transaction
+from .serializers import (
+    StartEmbeddingBackfillSerializer,
+    TaskIdSerializer,
+    TaskStatusSerializer,
+)
+from .tasks import generate_missing_embeddings, embed_texts
+
+
+
 def _mean_date(dates):
     """Return the average (mean) of a list of date objects, or None."""
     ds = [d for d in dates if d]
@@ -1724,6 +1747,138 @@ class ReconciliationConfigViewSet(viewsets.ModelViewSet):
         serializer = ResolvedReconciliationConfigSerializer(qs, many=True)
         return Response(serializer.data)
 
+
+class EmbeddingBackfillView(APIView):
+    """
+    POST /api/embeddings/backfill/
+    Body: { "per_model_limit": 2000, "sync": false }
+
+    - sync=true runs the task inline (useful for quick tests)
+    - sync=false enqueues a Celery job and returns task_id
+    """
+    permission_classes = [IsAdminUser]
+
+    def post(self, request):
+        ser = StartEmbeddingBackfillSerializer(data=request.data or {})
+        ser.is_valid(raise_exception=True)
+        per_model_limit = ser.validated_data.get("per_model_limit")
+        sync = ser.validated_data.get("sync", False)
+
+        if sync:
+            # Run inline (blocking HTTP request) — good for verification.
+            result = generate_missing_embeddings(per_model_limit=per_model_limit)
+            return Response(
+                {"mode": "sync", "result": result},
+                status=status.HTTP_200_OK,
+            )
+
+        # Enqueue async via Celery
+        task = generate_missing_embeddings.apply_async(
+            kwargs={"per_model_limit": per_model_limit}
+        )
+        payload = {"task_id": task.id, "state": task.state, "mode": "async"}
+        return Response(payload, status=status.HTTP_202_ACCEPTED)
+
+
+class EmbeddingTaskStatusView(APIView):
+    """
+    GET /api/embeddings/tasks/<task_id>/
+    """
+    permission_classes = [IsAdminUser]
+
+    def get(self, request, task_id: str):
+        _ = TaskIdSerializer(data={"task_id": task_id})
+        _.is_valid(raise_exception=True)
+
+        res: AsyncResult = current_app.AsyncResult(task_id)
+        data = {
+            "task_id": task_id,
+            "state": res.state,
+            "ready": res.ready(),
+            "successful": False,
+        }
+
+        if res.ready():
+            if res.successful():
+                data["successful"] = True
+                data["result"] = res.result
+            else:
+                # res.result may be an Exception
+                data["error"] = str(res.result)
+
+        out = TaskStatusSerializer(data).data
+        return Response(out, status=status.HTTP_200_OK)
+
+
+class EmbeddingTaskCancelView(APIView):
+    """
+    POST /api/embeddings/tasks/<task_id>/cancel/
+    """
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, task_id: str):
+        _ = TaskIdSerializer(data={"task_id": task_id})
+        _.is_valid(raise_exception=True)
+
+        # terminate=True sends a signal to stop a running worker task
+        current_app.control.revoke(task_id, terminate=True)
+        return Response({"task_id": task_id, "revoked": True}, status=status.HTTP_200_OK)
+
+
+class EmbeddingHealthView(APIView):
+    """
+    GET /api/embeddings/health/
+    Calls the proxy once and reports vector length & latency.
+    """
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        import time
+        t0 = time.perf_counter()
+        try:
+            vecs = embed_texts(["health check ok"])
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            dim = len(vecs[0]) if vecs and isinstance(vecs[0], list) else 0
+            ok = bool(dim)
+            return Response(
+                {"ok": ok, "dim": dim, "latency_ms": duration_ms},
+                status=status.HTTP_200_OK if ok else status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except Exception as e:
+            log.exception("Embedding health failed: %s", e)
+            return Response(
+                {"ok": False, "error": str(e)},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+
+class EmbeddingMissingCountsView(APIView):
+    """
+    GET /api/embeddings/missing-counts/
+    Quick visibility into how much there is to backfill.
+    """
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        tx = Transaction.objects.filter(
+            Q(description_embedding__isnull=True) | Q(description_embedding=[])
+        ).count()
+        btx = BankTransaction.objects.filter(
+            Q(description_embedding__isnull=True) | Q(description_embedding=[])
+        ).count()
+        acc = Account.objects.filter(
+            Q(account_description_embedding__isnull=True)
+            | Q(account_description_embedding=[])
+        ).count()
+        return Response(
+            {
+                "transactions_missing": tx,
+                "bank_transactions_missing": btx,
+                "accounts_missing": acc,
+                "total_missing": tx + btx + acc,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 # Transaction Schema Endpoint
 @api_view(['GET'])
