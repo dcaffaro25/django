@@ -442,3 +442,24 @@ class TaskStatusSerializer(serializers.Serializer):
     successful = serializers.BooleanField()
     result = serializers.JSONField(required=False, allow_null=True)
     error = serializers.CharField(required=False, allow_blank=True)
+    
+class EmbedTestSerializer(serializers.Serializer):
+    texts = serializers.ListField(
+        child=serializers.CharField(allow_blank=True, allow_null=True),
+        required=True
+    )
+    base_url = serializers.URLField(required=False)
+    path = serializers.CharField(required=False, default="/api/embeddings")
+    model = serializers.CharField(required=False, default="embeddinggemma:300m")
+    timeout_s = serializers.FloatField(required=False, default=20.0)
+    dim = serializers.IntegerField(required=False, default=768)
+    api_key = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+class BackfillSerializer(serializers.Serializer):
+    per_model_limit = serializers.IntegerField(required=False, min_value=1)
+    base_url = serializers.URLField(required=False)
+    path = serializers.CharField(required=False, default="/api/embeddings")
+    model = serializers.CharField(required=False, default="embeddinggemma:300m")
+    timeout_s = serializers.FloatField(required=False, default=20.0)
+    dim = serializers.IntegerField(required=False, default=768)
+    api_key = serializers.CharField(required=False, allow_blank=True, allow_null=True)

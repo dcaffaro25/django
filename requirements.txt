@@ -40,3 +40,4 @@ django-celery-results==2.5.1
 flower==2.0.1
 backoff==2.2.1
 pgvector>=0.2.4
+requests>=2.32.3

@@ -29,6 +29,7 @@ from .views import (
     EmbeddingHealthView,
     EmbeddingMissingCountsView,
 )
+from .views import EmbeddingsHealth, EmbeddingsTestView, EmbeddingsBackfillView
 from multitenancy.views import EntityViewSet, EntityMiniViewSet, EntityTreeView, EntityDynamicTransposedView
 
 # Router that accepts with/without trailing slash
@@ -74,4 +75,7 @@ urlpatterns = [
     path("embeddings/tasks/<str:task_id>/cancel/", EmbeddingTaskCancelView.as_view(), name="embeddings-task-cancel"),
     path("embeddings/health/", EmbeddingHealthView.as_view(), name="embeddings-health"),
     path("embeddings/missing-counts/", EmbeddingMissingCountsView.as_view(), name="embeddings-missing-counts"),
+    #path("embeddings/health/", EmbeddingsHealth.as_view(), name="embed-health"),
+    path("embeddings/test/", EmbeddingsTestView.as_view(), name="embed-test"),
+    path("embeddings/backfill/", EmbeddingsBackfillView.as_view(), name="embed-backfill"),
 ]

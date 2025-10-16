@@ -1,7 +1,20 @@
+from __future__ import annotations
 from celery import shared_task
 from .services.reconciliation_service import ReconciliationService
 from .models import ReconciliationTask
+import logging
+import os
+from typing import Callable, List, Optional, Sequence
 
+import requests
+from celery import shared_task
+from django.db import transaction
+from django.db.models import Q
+
+from .services.reconciliation_service import ReconciliationService
+from .models import Account, BankTransaction, Transaction, ReconciliationTask
+
+log = logging.getLogger(__name__)
 @shared_task(bind=True)
 def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=False):
     task_obj = ReconciliationTask.objects.get(id=db_id)
@@ -20,160 +33,163 @@ def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=Fa
         raise
 
 
-"""
-Celery tasks for generating and updating vector embeddings via the
-Railway Auth Proxy -> Embedding Gemma (Ollama-compatible) service.
+# Env defaults
+DEF_BASE_URL   = os.getenv("EMBED_BASE_URL", "https://embedding-service.up.railway.app")
+DEF_PATH       = os.getenv("EMBED_PATH", "/api/embeddings")
+DEF_API_KEY    = os.getenv("EMBED_API_KEY")  # optional
+DEF_MODEL      = os.getenv("EMBED_MODEL", "nomic-embed-text")
+DEF_TIMEOUT    = float(os.getenv("EMBED_TIMEOUT_S", "30"))
+DEF_DIM        = int(os.getenv("EMBED_DIM", "768"))
+DEF_BATCH_SIZE = max(1, int(os.getenv("EMBED_BATCH_SIZE", "128")))
+DEF_LIMIT      = max(1, int(os.getenv("EMBED_LIMIT_PER_MODEL", "2000")))
+DEF_KEEP_ALIVE = os.getenv("EMBED_KEEP_ALIVE", "45m")
+NUM_THREAD  = int(os.getenv("EMBED_NUM_THREAD", "8"))
 
-Environment variables expected in the Celery/Django worker:
-  EMBED_BASE_URL   # e.g. "http://auth-proxy.railway.internal:80"
-  EMBED_API_KEY    # the same value you configured in the proxy (API_KEY)
-  EMBED_MODEL      # default: "embeddinggemma:300m"
-  EMBED_TIMEOUT_S  # default: 20
-  EMBED_DIM        # default: 768
-  EMBED_BATCH_SIZE # default: 128
-  EMBED_LIMIT_PER_MODEL # per run limit, default: 2000
-"""
-
-from __future__ import annotations
-
-import os
-import math
-import logging
-from typing import Iterable, List, Sequence, Optional, Callable
-
-import requests
-from celery import shared_task
-from django.db.models import Q
-from django.db import transaction
-
-from .models import Account, BankTransaction, Transaction
-
-log = logging.getLogger(__name__)
-
-# -------- Configuration --------
-EMBED_BASE_URL   = os.getenv("EMBED_BASE_URL", "http://auth-proxy.railway.internal:80")
-EMBED_PATH       = os.getenv("EMBED_PATH", "/api/embeddings")
-EMBED_URL        = EMBED_BASE_URL.rstrip("/") + EMBED_PATH
-EMBED_API_KEY    = os.getenv("EMBED_API_KEY")
-EMBED_MODEL      = os.getenv("EMBED_MODEL", "embeddinggemma:300m")
-EMBED_TIMEOUT    = float(os.getenv("EMBED_TIMEOUT_S", "20"))
-EMBED_DIM        = int(os.getenv("EMBED_DIM", "768"))
-BATCH_SIZE       = max(1, int(os.getenv("EMBED_BATCH_SIZE", "128")))
-LIMIT_PER_MODEL  = max(1, int(os.getenv("EMBED_LIMIT_PER_MODEL", "2000")))
-
-# Single shared session (connection pooling)
-_session = requests.Session()
-# Primary auth header for the proxy
-if EMBED_API_KEY:
-    _session.headers.update({"x-api-key": EMBED_API_KEY})
-# Keep Bearer for compatibility with other gateways (harmless if unused)
-if EMBED_API_KEY:
-    _session.headers.update({"Authorization": f"Bearer {EMBED_API_KEY}"})
-_session.headers.update({"content-type": "application/json"})
-
-
-# -------- Helpers --------
-def _chunk(seq: Sequence, size: int) -> Iterable[Sequence]:
-    for i in range(0, len(seq), size):
-        yield seq[i : i + size]
-
-def _fit_dim(vec: Sequence[float] | None, dim: int) -> Optional[List[float]]:
-    if vec is None:
-        return None
-    if len(vec) == dim:
-        return list(vec)
-    if len(vec) > dim:
-        # Truncate excess dimensions (safer than failing)
-        return list(vec[:dim])
-    # Pad with zeros if shorter
-    return list(vec) + [0.0] * (dim - len(vec))
-
-def _normalize_text(s: str | None) -> str:
+def _nz(s: Optional[str]) -> str:
     return " ".join((s or "").split()).strip()
 
 def _account_text(a: Account) -> str:
     parts = [a.name, a.description, a.key_words, a.examples]
-    return " | ".join(p for p in map(_normalize_text, parts) if p)
+    return " | ".join(p for p in map(_nz, parts) if p)
 
 def _tx_text(t: Transaction) -> str:
-    # Enrich with amount & date helps clustering
-    return _normalize_text(f"{t.description or ''} | amount={t.amount} | date={t.date}")
+    return _nz(f"{t.description or ''} | amount={t.amount} | date={t.date}")
 
 def _bank_text(b: BankTransaction) -> str:
-    return _normalize_text(f"{b.description or ''} | amount={b.amount} | date={b.date}")
+    return _nz(f"{b.description or ''} | amount={b.amount} | date={b.date}")
 
-def _parse_embeddings(resp_json) -> List[List[float]]:
+
+class EmbeddingClient:
     """
-    Supports both:
-      {"embeddings": [[...], [...], ...]}
-      {"data": [{"embedding":[...]}, ...]}
+    Calls an Ollama-compatible /api/embeddings endpoint.
+    Tries batch {'input': [...]} first, falls back to per-item {'prompt': '...'}.
+    Supports response shapes: {"embedding":[...]}, {"embeddings":[...]}, {"data":[{"embedding":[...]}...]}
     """
-    if isinstance(resp_json, dict):
-        if "embeddings" in resp_json and isinstance(resp_json["embeddings"], list):
-            return resp_json["embeddings"]
-        if "data" in resp_json and isinstance(resp_json["data"], list):
-            out = []
-            for row in resp_json["data"]:
-                if isinstance(row, dict) and "embedding" in row:
-                    out.append(row["embedding"])
-            if out:
-                return out
-    raise ValueError(f"Unexpected embeddings response schema: {resp_json!r}")
+    def __init__(
+        self,
+        base_url: str = DEF_BASE_URL,
+        path: str = DEF_PATH,
+        model: str = DEF_MODEL,
+        api_key: Optional[str] = DEF_API_KEY,
+        timeout_s: float = DEF_TIMEOUT,
+        dim: int = DEF_DIM,
+        extra_headers: Optional[dict] = None,
+    ):
+        self.url = (base_url.rstrip("/") + path) if path else base_url.rstrip("/")
+        self.model = model
+        self.timeout = timeout_s
+        self.dim = dim
+
+        self.session = requests.Session()
+        self.session.headers.update({"content-type": "application/json"})
+        if api_key:
+            self.session.headers.update({
+                "Authorization": f"Bearer {api_key}",
+                "X-API-Key": api_key,
+            })
+        if extra_headers:
+            self.session.headers.update(extra_headers)
+
+    @staticmethod
+    def _fit_dim(vec: Sequence[float] | None, dim: int) -> Optional[List[float]]:
+        if vec is None:
+            return None
+        if len(vec) == dim:
+            return list(vec)
+        if len(vec) > dim:
+            return list(vec[:dim])
+        return list(vec) + [0.0] * (dim - len(vec))
+
+    @staticmethod
+    def _parse_json(resp_json):
+        if isinstance(resp_json, dict):
+            if "embeddings" in resp_json and isinstance(resp_json["embeddings"], list):
+                return resp_json["embeddings"]
+            if "data" in resp_json and isinstance(resp_json["data"], list):
+                out = []
+                for row in resp_json["data"]:
+                    if isinstance(row, dict) and "embedding" in row:
+                        out.append(row["embedding"])
+                if out:
+                    return out
+            if "embedding" in resp_json and isinstance(resp_json["embedding"], list):
+                return [resp_json["embedding"]]  # single vector wrapped into list
+        raise ValueError(f"Unexpected embedding response: {resp_json!r}")
+
+    def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        # Try batch first
+        '''
+        try:
+            r = self.session.post(
+                self.url, 
+                json={
+                    "model": self.model, 
+                    "prompt": texts, 
+                    "options": {"num_thread": NUM_THREAD},
+                    "keep_alive": DEF_KEEP_ALIVE
+                    }, 
+                timeout=self.timeout)
+            
+            r.raise_for_status()
+            vectors = self._parse_json(r.json())
+            if len(vectors) == len(texts) and all(vectors):
+                return [self._fit_dim(v, self.dim) for v in vectors]
+        except Exception:
+            pass  # fall back to per-item
+        '''
+        # Fallback: per-item 'prompt' (works reliably with embeddinggemma)
+        out: List[List[float]] = []
+        for t in texts:
+            t = _nz(t)
+            if not t:
+                out.append([]); continue
+            rr = self.session.post(self.url, json={"model": self.model, "prompt": t, "options": {"num_thread": NUM_THREAD}, "keep_alive": DEF_KEEP_ALIVE}, timeout=self.timeout)
+            rr.raise_for_status()
+            vv = self._parse_json(rr.json())
+            if not vv or not vv[0]:
+                raise RuntimeError("Embedding service returned empty vector")
+            out.append(self._fit_dim(vv[0], self.dim))
+        return out
+        
+
+# Module-level default client + thin wrappers for reuse in views/tests
+_default_client = EmbeddingClient()
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
-    """
-    Calls the proxy -> Ollama /api/embeddings with Gemma model.
-    Returns a list of vectors aligned with 'texts'.
-    """
-    if not texts:
-        return []
-    if not EMBED_API_KEY:
-        raise RuntimeError("EMBED_API_KEY is not set, cannot call embedding service.")
+    return _default_client.embed_texts(texts)
 
-    payload = {"model": EMBED_MODEL, "input": texts}
-
-    r = _session.post(EMBED_URL, json=payload, timeout=EMBED_TIMEOUT)
-    r.raise_for_status()
-    vectors = _parse_embeddings(r.json())
-
-    if len(vectors) != len(texts):
-        # Defensive: keep alignment guarantees
-        raise RuntimeError(f"Embedding count mismatch: got {len(vectors)} for {len(texts)} inputs.")
-
-    # Fit dimension for pgvector field
-    return [ _fit_dim(v, EMBED_DIM) for v in vectors ]
+def embed_one(text: str) -> List[float]:
+    vecs = _default_client.embed_texts([text])
+    if not vecs or not vecs[0]:
+        raise RuntimeError("empty embedding from backend")
+    return vecs[0]
 
 
 def _update_embeddings_qs(
+    client: EmbeddingClient,
     instances: List,
     make_text: Callable[[object], str],
     field_name: str,
+    batch_size: int,
 ) -> int:
-    """
-    Batch-embeds 'instances' and writes vectors to 'field_name'.
-    """
     if not instances:
         return 0
 
     updated = 0
-    # Build text payloads
-    texts = [make_text(obj) for obj in instances]
-    # Replace empty texts with a single space to avoid API errors; we will skip saving if empty.
-    text_mask = [bool(t) for t in texts]
-    texts_to_embed = [t if t else " " for t in texts]
+    texts = [make_text(obj) or " " for obj in instances]
 
-    for block in _chunk(list(range(len(instances))), BATCH_SIZE):
-        block_texts = [texts_to_embed[i] for i in block]
-        # Call API for the block
-        vectors = embed_texts(block_texts)
+    for i in range(0, len(instances), batch_size):
+        block_idx = list(range(i, min(i + batch_size, len(instances))))
+        block_texts = [texts[j] for j in block_idx]
+        vectors = client.embed_texts(block_texts)
 
         with transaction.atomic():
-            for idx, vec in zip(block, vectors):
-                if not text_mask[idx]:
-                    continue  # skip empty original text
-                obj = instances[idx]
-                if vec is None:
+            for idx, vec in zip(block_idx, vectors):
+                if not vec:
                     continue
+                obj = instances[idx]
                 try:
                     setattr(obj, field_name, vec)
                     obj.save(update_fields=[field_name])
@@ -181,11 +197,9 @@ def _update_embeddings_qs(
                 except Exception as e:
                     log.warning("Failed saving embedding for %s id=%s: %s",
                                 obj.__class__.__name__, getattr(obj, "id", None), e)
-
     return updated
 
 
-# -------- Celery task --------
 @shared_task(
     bind=True,
     autoretry_for=(requests.RequestException, RuntimeError),
@@ -193,45 +207,55 @@ def _update_embeddings_qs(
     retry_kwargs={"max_retries": 5},
     soft_time_limit=600,
 )
-def generate_missing_embeddings(self, per_model_limit: int | None = None) -> dict:
-    """
-    Periodic task that scans for rows missing embeddings and backfills them.
-    Limits are applied per model to keep each run bounded.
-    """
-    limit = int(per_model_limit or LIMIT_PER_MODEL)
+def generate_missing_embeddings(self, per_model_limit: Optional[int] = None, client_opts: Optional[dict] = None) -> dict:
+    limit = int(per_model_limit or DEF_LIMIT)
 
-    # ---- Transactions ----
-    tx_qs = (Transaction.objects
-             .filter(Q(description_embedding__isnull=True) | Q(description_embedding=[]))
-             .order_by("id")
-             .only("id", "description", "amount", "date")[:limit])
-    tx_list = list(tx_qs)
-    tx_updated = _update_embeddings_qs(tx_list, _tx_text, "description_embedding")
+    co = client_opts or {}
+    client = EmbeddingClient(
+        base_url=co.get("base_url", DEF_BASE_URL),
+        path=co.get("path", DEF_PATH),
+        model=co.get("model", DEF_MODEL),
+        api_key=co.get("api_key", DEF_API_KEY),
+        timeout_s=float(co.get("timeout_s", DEF_TIMEOUT)),
+        dim=int(co.get("dim", DEF_DIM)),
+        extra_headers=co.get("extra_headers"),
+    )
 
-    # ---- Bank Transactions ----
-    btx_qs = (BankTransaction.objects
-              .filter(Q(description_embedding__isnull=True) | Q(description_embedding=[]))
-              .order_by("id")
-              .only("id", "description", "amount", "date")[:limit])
-    btx_list = list(btx_qs)
-    btx_updated = _update_embeddings_qs(btx_list, _bank_text, "description_embedding")
+    # Transactions (only check NULL; pgvector won’t store empty lists)
+    tx_list = list(
+        Transaction.objects
+        .filter(description_embedding__isnull=True)
+        .order_by("id")
+        .only("id", "description", "amount", "date")[:limit]
+    )
+    tx_updated = _update_embeddings_qs(client, tx_list, _tx_text, "description_embedding", DEF_BATCH_SIZE)
 
-    # ---- Accounts ----
-    acc_qs = (Account.objects
-              .filter(Q(account_description_embedding__isnull=True) | Q(account_description_embedding=[]))
-              .order_by("id")
-              .only("id", "name", "description", "key_words", "examples")[:limit])
-    acc_list = list(acc_qs)
-    acc_updated = _update_embeddings_qs(acc_list, _account_text, "account_description_embedding")
+    # Bank transactions
+    btx_list = list(
+        BankTransaction.objects
+        .filter(description_embedding__isnull=True)
+        .order_by("id")
+        .only("id", "description", "amount", "date")[:limit]
+    )
+    btx_updated = _update_embeddings_qs(client, btx_list, _bank_text, "description_embedding", DEF_BATCH_SIZE)
 
-    result = {
+    # Accounts
+    acc_list = list(
+        Account.objects
+        .filter(account_description_embedding__isnull=True)
+        .order_by("id")
+        .only("id", "name", "description", "key_words", "examples")[:limit]
+    )
+    acc_updated = _update_embeddings_qs(client, acc_list, _account_text, "account_description_embedding", DEF_BATCH_SIZE)
+
+    out = {
         "transactions_updated": tx_updated,
         "bank_transactions_updated": btx_updated,
         "accounts_updated": acc_updated,
-        "batch_size": BATCH_SIZE,
-        "dim": EMBED_DIM,
-        "model": EMBED_MODEL,
-        "url": EMBED_URL,
+        "model": client.model,
+        "url": client.url,
+        "dim": client.dim,
+        "batch_size": DEF_BATCH_SIZE,
     }
-    log.info("Embedding backfill result: %s", result)
-    return result
+    log.info("Embedding backfill result: %s", out)
+    return out
