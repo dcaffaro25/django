@@ -430,30 +430,29 @@ class StartEmbeddingBackfillSerializer(serializers.Serializer):
     per_model_limit = serializers.IntegerField(required=False, min_value=1)
     sync = serializers.BooleanField(required=False, default=False)
 
+class EmbedTestSerializer(serializers.Serializer):
+    texts = serializers.ListField(child=serializers.CharField(), allow_empty=False)
+    # Optional overrides
+    base_url  = serializers.CharField(required=False)
+    path      = serializers.CharField(required=False)
+    model     = serializers.CharField(required=False)
+    timeout_s = serializers.FloatField(required=False)
+    dim       = serializers.IntegerField(required=False)
+    api_key   = serializers.CharField(required=False, allow_blank=True)
+    num_thread = serializers.IntegerField(required=False)
+    keep_alive = serializers.CharField(required=False)
 
 class TaskIdSerializer(serializers.Serializer):
     task_id = serializers.CharField()
-
 
 class TaskStatusSerializer(serializers.Serializer):
     task_id = serializers.CharField()
     state = serializers.CharField()
     ready = serializers.BooleanField()
     successful = serializers.BooleanField()
-    result = serializers.JSONField(required=False, allow_null=True)
-    error = serializers.CharField(required=False, allow_blank=True)
-    
-class EmbedTestSerializer(serializers.Serializer):
-    texts = serializers.ListField(
-        child=serializers.CharField(allow_blank=True, allow_null=True),
-        required=True
-    )
-    base_url = serializers.URLField(required=False)
-    path = serializers.CharField(required=False, default="/api/embeddings")
-    model = serializers.CharField(required=False, default="embeddinggemma:300m")
-    timeout_s = serializers.FloatField(required=False, default=20.0)
-    dim = serializers.IntegerField(required=False, default=768)
-    api_key = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    result = serializers.JSONField(required=False)
+    error = serializers.CharField(required=False)
+    mode = serializers.CharField(required=False)
 
 class BackfillSerializer(serializers.Serializer):
     per_model_limit = serializers.IntegerField(required=False, min_value=1)

@@ -83,7 +83,8 @@ from .serializers import (
     TaskIdSerializer,
     TaskStatusSerializer,
 )
-from .tasks import generate_missing_embeddings, embed_one#, embed_texts
+from .services.embedding_client import EmbeddingClient, _embed_url
+from .tasks import generate_missing_embeddings
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -92,7 +93,7 @@ from django.conf import settings
 
 #from .permissions import HasEmbeddingsApiKey  # or AllowAny for testing if you prefer
 from .serializers import EmbedTestSerializer, BackfillSerializer
-from accounting.tasks import EmbeddingClient, generate_missing_embeddings
+
 
 def _mean_date(dates):
     """Return the average (mean) of a list of date objects, or None."""
@@ -1765,172 +1766,25 @@ class ReconciliationConfigViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
-class EmbeddingBackfillView(APIView):
-    """
-    POST /api/embeddings/backfill/
-    Body: { "per_model_limit": 2000, "sync": false }
-
-    - sync=true runs the task inline (useful for quick tests)
-    - sync=false enqueues a Celery job and returns task_id
-    """
-    permission_classes = [IsAdminUser]
-
-    def post(self, request):
-        ser = StartEmbeddingBackfillSerializer(data=request.data or {})
-        ser.is_valid(raise_exception=True)
-        per_model_limit = ser.validated_data.get("per_model_limit")
-        sync = ser.validated_data.get("sync", False)
-
-        if sync:
-            # Run inline (blocking HTTP request) — good for verification.
-            result = generate_missing_embeddings(per_model_limit=per_model_limit)
-            return Response(
-                {"mode": "sync", "result": result},
-                status=status.HTTP_200_OK,
-            )
-
-        # Enqueue async via Celery
-        task = generate_missing_embeddings.apply_async(
-            kwargs={"per_model_limit": per_model_limit}
-        )
-        payload = {"task_id": task.id, "state": task.state, "mode": "async"}
-        return Response(payload, status=status.HTTP_202_ACCEPTED)
-
-def _parse_embeddings(payload: Dict[str, Any]) -> List[List[float]]:
-    """
-    Accepts either:
-      {"embeddings": [[...], [...]]}
-    or
-      {"data": [{"embedding":[...]}, ...]}
-    """
-    if isinstance(payload, dict):
-        if isinstance(payload.get("embeddings"), list):
-            return payload["embeddings"]
-        if isinstance(payload.get("data"), list):
-            out = []
-            for row in payload["data"]:
-                if isinstance(row, dict) and isinstance(row.get("embedding"), list):
-                    out.append(row["embedding"])
-            if out:
-                return out
-    return []
-
-
-class EmbeddingTaskStatusView(APIView):
-    """
-    GET /api/embeddings/tasks/<task_id>/
-    """
-    permission_classes = [IsAdminUser]
-    
-    def get(self, request, task_id: str):
-        _ = TaskIdSerializer(data={"task_id": task_id})
-        _.is_valid(raise_exception=True)
-
-        res: AsyncResult = current_app.AsyncResult(task_id)
-        data = {
-            "task_id": task_id,
-            "state": res.state,
-            "ready": res.ready(),
-            "successful": False,
-        }
-
-        if res.ready():
-            if res.successful():
-                data["successful"] = True
-                data["result"] = res.result
-            else:
-                # res.result may be an Exception
-                data["error"] = str(res.result)
-
-        out = TaskStatusSerializer(data).data
-        return Response(out, status=status.HTTP_200_OK)
-
-
-class EmbeddingTaskCancelView(APIView):
-    """
-    POST /api/embeddings/tasks/<task_id>/cancel/
-    """
-    permission_classes = [IsAdminUser]
-
-    def post(self, request, task_id: str):
-        _ = TaskIdSerializer(data={"task_id": task_id})
-        _.is_valid(raise_exception=True)
-
-        # terminate=True sends a signal to stop a running worker task
-        current_app.control.revoke(task_id, terminate=True)
-        return Response({"task_id": task_id, "revoked": True}, status=status.HTTP_200_OK)
-
-
-def _extract_vectors(body: Dict[str, Any]) -> List[List[float]]:
-    """
-    Accepts common embedding response shapes and normalizes to list of vectors.
-    """
-    if not isinstance(body, dict):
-        return []
-
-    # 1) {"embedding": [..]}  (single)
-    emb = body.get("embedding")
-    if isinstance(emb, list) and emb and isinstance(emb[0], (int, float)):
-        return [emb]
-
-    # 2) {"embeddings": [[..], ..]}  (multi) or {"embeddings":[..]} (single)
-    embs = body.get("embeddings")
-    if isinstance(embs, list) and embs:
-        if embs and isinstance(embs[0], list):
-            return embs
-        if embs and isinstance(embs[0], (int, float)):
-            return [embs]
-
-    # 3) {"data":[{"embedding":[..]}, ...]}
-    data = body.get("data")
-    if isinstance(data, list):
-        out = []
-        for row in data:
-            if isinstance(row, dict) and isinstance(row.get("embedding"), list):
-                out.append(row["embedding"])
-        if out:
-            return out
-
-    return []
-EMBED_URL = "https://auth-proxy-production-0615.up.railway.app/api/embeddings"
-DEF_BASE_URL   = os.getenv("EMBED_BASE_URL", "https://embedding-service.up.railway.app")
-DEF_PATH       = os.getenv("EMBED_PATH", "/api/embeddings")
-
-EMBED_MODEL = "nomic-embed-text"
-EMBED_TIMEOUT_S    = 300
-EMBED_DIM        = 768
-EMBED_BATCH_SIZE=128
-EMBED_LIMIT_PER_MODEL=2000
-
-
 class EmbeddingHealthView(APIView):
     permission_classes = []  # open for quick checks
 
     def get(self, request, tenant_id=None):
-        import time
-        base = "https://embedding-service.up.railway.app"
-        client = EmbeddingClient(
-            base_url=base,
-            path="/api/embeddings",
-            model=EMBED_MODEL,
-            api_key=None,
-            timeout_s=300,
-            dim=768,
-            #prefer_prompt=True,          # <-- important
-        )
+        client = EmbeddingClient()
         t0 = time.perf_counter()
         try:
             vecs = client.embed_texts(["health check ok"])
             latency_ms = int((time.perf_counter() - t0) * 1000)
             dim = len(vecs[0]) if vecs and isinstance(vecs[0], list) else 0
-            ok = (dim == 768)
+            ok = (dim == settings.EMBED_DIM)
             return Response(
                 {
                     "ok": ok,
                     "dim": dim,
                     "latency_ms": latency_ms,
-                    "endpoint": f"{base}/api/embeddings",
-                    "model": EMBED_MODEL,
+                    "endpoint": _embed_url(),
+                    "model": client.model,
+                    "used_internal": bool(settings.EMBED_INTERNAL_HOST),
                 },
                 status=status.HTTP_200_OK if ok else status.HTTP_503_SERVICE_UNAVAILABLE,
             )
@@ -1941,31 +1795,20 @@ class EmbeddingHealthView(APIView):
                     "ok": False,
                     "error": str(e),
                     "latency_ms": latency_ms,
-                    "endpoint": f"{base}/api/embeddings",
-                    "model": EMBED_MODEL,
+                    "endpoint": _embed_url(),
+                    "model": settings.EMBED_MODEL,
+                    "used_internal": bool(settings.EMBED_INTERNAL_HOST),
                 },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
-
 class EmbeddingMissingCountsView(APIView):
-    """
-    GET /api/embeddings/missing-counts/
-    Quick visibility into how much there is to backfill.
-    """
     permission_classes = [IsAdminUser]
 
     def get(self, request):
-        tx = Transaction.objects.filter(
-            Q(description_embedding__isnull=True) | Q(description_embedding=[])
-        ).count()
-        btx = BankTransaction.objects.filter(
-            Q(description_embedding__isnull=True) | Q(description_embedding=[])
-        ).count()
-        acc = Account.objects.filter(
-            Q(account_description_embedding__isnull=True)
-            | Q(account_description_embedding=[])
-        ).count()
+        tx  = Transaction.objects.filter(description_embedding__isnull=True).count()
+        btx = BankTransaction.objects.filter(description_embedding__isnull=True).count()
+        acc = Account.objects.filter(account_description_embedding__isnull=True).count()
         return Response(
             {
                 "transactions_missing": tx,
@@ -1976,174 +1819,73 @@ class EmbeddingMissingCountsView(APIView):
             status=status.HTTP_200_OK,
         )
 
-class EmbeddingsHealth(APIView):
-    permission_classes = []  # AllowAny if you want this open; otherwise use HasEmbeddingsApiKey
+class EmbeddingBackfillView(APIView):
+    """
+    POST /api/embeddings/backfill/
+    Body: {"per_model_limit": 500, "sync": false}
+    """
+    permission_classes = [IsAdminUser]
 
-    def get(self, request, tenant_id=None):
-        return Response({"ok": True, "service": "embeddings-api"})
+    def post(self, request):
+        ser = StartEmbeddingBackfillSerializer(data=request.data or {})
+        ser.is_valid(raise_exception=True)
+        per_model_limit = ser.validated_data.get("per_model_limit")
+        sync = ser.validated_data.get("sync", False)
+
+        if sync:
+            result = generate_missing_embeddings(per_model_limit=per_model_limit)
+            out = {"mode": "sync", "result": result}
+            return Response(out, status=status.HTTP_200_OK)
+
+        task = generate_missing_embeddings.apply_async(kwargs={"per_model_limit": per_model_limit})
+        out = {"task_id": task.id, "state": task.state, "mode": "async"}
+        return Response(out, status=status.HTTP_202_ACCEPTED)
+
+class EmbeddingTaskStatusView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request, task_id: str):
+        _ = TaskIdSerializer(data={"task_id": task_id})
+        _.is_valid(raise_exception=True)
+        res: AsyncResult = current_app.AsyncResult(task_id)
+        data = {
+            "task_id": task_id,
+            "state": res.state,
+            "ready": res.ready(),
+            "successful": res.successful() if res.ready() else False,
+        }
+        if res.ready():
+            if res.successful():
+                data["result"] = res.result
+            else:
+                data["error"] = str(res.result)
+        out = TaskStatusSerializer(data).data
+        return Response(out, status=status.HTTP_200_OK)
 
 class EmbeddingsTestView(APIView):
     """
-    POST /4/embeddings/test/
-    {
-      "texts": ["hello world", "banana"],
-      "base_url": "https://embedding-gemma-production.up.railway.app",
-      "path": "/api/embeddings",
-      "model": "embeddinggemma:300m"
-    }
+    POST /api/embeddings/test/
+    { "texts": ["hello", "banana"] }  # optional overrides also supported
     """
-    permission_classes = []#HasEmbeddingsApiKey]
+    permission_classes = []  # lock down if needed
 
     def post(self, request):
         ser = EmbedTestSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
-        data = ser.validated_data
-
-        client = EmbeddingClient(
-            base_url=data.get("base_url") or getattr(settings, "EMBED_BASE_URL", "http://auth-proxy.railway.internal:80"),
-            path=data.get("path", "/api/embeddings"),
-            model=data.get("model", "embeddinggemma:300m"),
-            api_key=data.get("api_key") or getattr(settings, "EMBED_API_KEY", None),
-            timeout_s=float(data.get("timeout_s", 20.0)),
-            dim=int(data.get("dim", 768)),
-        )
-
-        vectors = client.embed_texts([t or " " for t in data["texts"]])
-        return Response({"count": len(vectors), "embeddings": vectors}, status=status.HTTP_200_OK)
-
-class EmbeddingsBackfillView(APIView):
-    """
-    POST /4/embeddings/backfill/
-    { "per_model_limit": 500,
-      "base_url": "https://embedding-gemma-production.up.railway.app",
-      "path": "/api/embeddings",
-      "model": "embeddinggemma:300m"
-    }
-    """
-    permission_classes = []#HasEmbeddingsApiKey]
-
-    def post(self, request):
-        ser = BackfillSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
         d = ser.validated_data
 
-        client_opts = {
-            "base_url": d.get("base_url") or getattr(settings, "EMBED_BASE_URL", None),
-            "path": d.get("path", "/api/embeddings"),
-            "model": d.get("model", "embeddinggemma:300m"),
-            "timeout_s": d.get("timeout_s", 20.0),
-            "dim": d.get("dim", 768),
-            "api_key": d.get("api_key") or getattr(settings, "EMBED_API_KEY", None),
-        }
-        task = generate_missing_embeddings.apply_async(kwargs={
-            "per_model_limit": d.get("per_model_limit"),
-            "client_opts": client_opts
-        })
-        return Response({"task_id": task.id}, status=status.HTTP_202_ACCEPTED)
-
-# Transaction Schema Endpoint
-@api_view(['GET'])
-def transaction_schema(request, tenant_id=None):
-    #tenant_id = request.query_params.get('company_id')  # Get the current tenant's company ID
-    #if not company_id:
-    #    return Response({"error": "company_id is required"}, status=400)
-
-    companies = Company.objects.filter(subdomain=tenant_id).values_list('id', 'name')
-    currencies = Currency.objects.all().values_list('code', 'name')
-
-    schema = {
-        "type": "object",
-        "properties": {
-            "company": {
-                "type": "string",
-                "title": "Company",
-                "enum": [company[0] for company in companies],
-                "enumNames": [company[1] for company in companies]
-            },
-            "date": {
-                "type": "string",
-                "format": "date",
-                "title": "Date"
-            },
-            "description": {
-                "type": "string",
-                "title": "Description"
-            },
-            "amount": {
-                "type": "number",
-                "title": "Amount"
-            },
-            "currency": {
-                "type": "string",
-                "title": "Currency",
-                "enum": [currency[0] for currency in currencies],
-                "enumNames": [currency[1] for currency in currencies]
-            },
-            "state": {
-                "type": "string",
-                "title": "State",
-                "enum": ["pending", "posted", "canceled"]
-            }
-        },
-        "required": ["company", "date", "amount", "currency", "state"]
-    }
-
-    ui_schema = {
-        "company": {"ui:widget": "select"},
-        "currency": {"ui:widget": "select"},
-        "state": {"ui:widget": "radio"}
-    }
-
-    return Response({"schema": schema, "uiSchema": ui_schema})
-
-# Journal Entry Schema Endpoint
-@api_view(['GET'])
-def journal_entry_schema(request, tenant_id=None):
-    transactions = Transaction.objects.all().values_list('id', 'description')
-    accounts = Account.objects.all().values_list('id', 'name')
-    
-    schema = {
-        "type": "object",
-        "properties": {
-            "transaction": {
-                "type": "string",
-                "title": "Transaction",
-                "enum": [transaction[0] for transaction in transactions],
-                "enumNames": [transaction[1] for transaction in transactions]
-            },
-            "account": {
-                "type": "string",
-                "title": "Account",
-                "enum": [account[0] for account in accounts],
-                "enumNames": [account[1] for account in accounts]
-            },
-            "debit_amount": {
-                "type": "number",
-                "title": "Debit Amount"
-            },
-            "credit_amount": {
-                "type": "number",
-                "title": "Credit Amount"
-            },
-            "state": {
-                "type": "string",
-                "title": "State",
-                "enum": ["pending", "posted", "canceled"]
-            }
-        },
-        "required": ["transaction", "account"]
-    }
-    
-    ui_schema = {
-        "transaction": {
-            "ui:widget": "select"
-        },
-        "account": {
-            "ui:widget": "select"
-        },
-        "state": {
-            "ui:widget": "select"
-        }
-    }
-    
-    return Response({"schema": schema, "uiSchema": ui_schema})
+        client = EmbeddingClient(
+            base_url=d.get("base_url"),
+            path=d.get("path"),
+            model=d.get("model"),
+            timeout_s=d.get("timeout_s"),
+            dim=d.get("dim"),
+            api_key=d.get("api_key"),
+            num_thread=d.get("num_thread"),
+            keep_alive=d.get("keep_alive"),
+        )
+        vecs = client.embed_texts(d["texts"])
+        return Response(
+            {"count": len(vecs), "dim": len(vecs[0]) if vecs else 0, "embeddings": vecs, "endpoint": client.url},
+            status=status.HTTP_200_OK,
+        )

@@ -16,8 +16,6 @@ from .views import (
     AccountSummaryView,
     ReconciliationViewSet,
     UnreconciledDashboardView,
-    transaction_schema,
-    journal_entry_schema,
     ReconciliationTaskViewSet,
     ReconciliationViewSet,
     ReconciliationConfigViewSet,
@@ -25,11 +23,10 @@ from .views import (
 from .views import (
     EmbeddingBackfillView,
     EmbeddingTaskStatusView,
-    EmbeddingTaskCancelView,
     EmbeddingHealthView,
     EmbeddingMissingCountsView,
 )
-from .views import EmbeddingsHealth, EmbeddingsTestView, EmbeddingsBackfillView
+from .views import EmbeddingHealthView, EmbeddingMissingCountsView, EmbeddingBackfillView, EmbeddingTaskStatusView, EmbeddingsTestView
 from multitenancy.views import EntityViewSet, EntityMiniViewSet, EntityTreeView, EntityDynamicTransposedView
 
 # Router that accepts with/without trailing slash
@@ -64,18 +61,13 @@ urlpatterns = [
     re_path(r'^transactions/filtered/?$', TransactionViewSet.as_view({'get': 'filtered'}), name='transaction-filtered'),
 
     re_path(r'^reconciliation-dashboard/?$', UnreconciledDashboardView.as_view(), name='reconciliation-dashboard'),
-    re_path(r'^schema/transaction/?$', transaction_schema, name='transaction-schema'),
-    re_path(r'^schema/journal-entry/?$', journal_entry_schema, name='journal-entry-schema'),
     re_path(r'^account_summary/?$', AccountSummaryView.as_view(), name='account-summary'),
 
     re_path(r'^entities-dynamic-transposed/?$', EntityDynamicTransposedView.as_view(), name='entity-dynamic-transposed'),
     re_path(r'^entity-tree/(?P<company_id>\d+)/?$', EntityTreeView.as_view(), name='entity-tree'),
-    path("embeddings/backfill/", EmbeddingBackfillView.as_view(), name="embeddings-backfill"),
-    path("embeddings/tasks/<str:task_id>/", EmbeddingTaskStatusView.as_view(), name="embeddings-task-status"),
-    path("embeddings/tasks/<str:task_id>/cancel/", EmbeddingTaskCancelView.as_view(), name="embeddings-task-cancel"),
     path("embeddings/health/", EmbeddingHealthView.as_view(), name="embeddings-health"),
     path("embeddings/missing-counts/", EmbeddingMissingCountsView.as_view(), name="embeddings-missing-counts"),
-    #path("embeddings/health/", EmbeddingsHealth.as_view(), name="embed-health"),
-    path("embeddings/test/", EmbeddingsTestView.as_view(), name="embed-test"),
-    path("embeddings/backfill/", EmbeddingsBackfillView.as_view(), name="embed-backfill"),
+    path("embeddings/backfill/", EmbeddingBackfillView.as_view(), name="embeddings-backfill"),
+    path("embeddings/tasks/<str:task_id>/", EmbeddingTaskStatusView.as_view(), name="embeddings-task-status"),
+    path("embeddings/test/", EmbeddingsTestView.as_view(), name="embeddings-test"),
 ]

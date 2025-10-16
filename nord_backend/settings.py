@@ -268,6 +268,24 @@ CELERY_TASK_TIME_LIMIT = CELERY_TASK_T_LIMIT*60       # 15 minutes
 IMPORT_MAX_BATCH_SIZE = 1000
 INTEGRATION_MAX_BATCH_SIZE = 500
 
+
+# ---- Embeddings config (single-source) ----
+EMBED_INTERNAL_HOST = os.getenv("EMBED_INTERNAL_HOST")  # e.g. "embedding-service.railway.internal"
+EMBED_PORT          = int(os.getenv("EMBED_PORT", "11434"))
+EMBED_BASE_URL      = os.getenv("EMBED_BASE_URL", "https://embedding-service.up.railway.app")   # optional fallback for local/testing
+EMBED_PATH          = os.getenv("EMBED_PATH", "/api/embeddings")
+
+EMBED_MODEL         = os.getenv("EMBED_MODEL", "nomic-embed-text")
+EMBED_DIM           = int(os.getenv("EMBED_DIM", "768"))
+EMBED_TIMEOUT_S     = float(os.getenv("EMBED_TIMEOUT_S", "300"))
+EMBED_NUM_THREAD    = int(os.getenv("EMBED_NUM_THREAD", "8"))
+EMBED_KEEP_ALIVE    = os.getenv("EMBED_KEEP_ALIVE", "45m")
+EMBED_BATCH_SIZE    = max(1, int(os.getenv("EMBED_BATCH_SIZE", "128")))
+EMBED_LIMIT_PER_MODEL = max(1, int(os.getenv("EMBED_LIMIT_PER_MODEL", "2000")))
+EMBED_API_KEY       = os.getenv("EMBED_API_KEY")  # optional; not needed for internal by default
+
+
+
 # Password validation
 # https://docs.djangoproject.com/en/4.0/ref/settings/#auth-password-validators
 
