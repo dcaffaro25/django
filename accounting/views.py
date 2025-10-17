@@ -1805,7 +1805,7 @@ class EmbeddingHealthView(APIView):
 class EmbeddingMissingCountsView(APIView):
     permission_classes = [IsAdminUser]
 
-    def get(self, request):
+    def get(self, request, tenant_id=None):
         tx  = Transaction.objects.filter(description_embedding__isnull=True).count()
         btx = BankTransaction.objects.filter(description_embedding__isnull=True).count()
         acc = Account.objects.filter(account_description_embedding__isnull=True).count()
@@ -1826,7 +1826,7 @@ class EmbeddingBackfillView(APIView):
     """
     permission_classes = [IsAdminUser]
 
-    def post(self, request):
+    def post(self, request, tenant_id=None):
         ser = StartEmbeddingBackfillSerializer(data=request.data or {})
         ser.is_valid(raise_exception=True)
         per_model_limit = ser.validated_data.get("per_model_limit")
@@ -1844,7 +1844,7 @@ class EmbeddingBackfillView(APIView):
 class EmbeddingTaskStatusView(APIView):
     permission_classes = [IsAdminUser]
 
-    def get(self, request, task_id: str):
+    def get(self, request, task_id: str, tenant_id=None):
         _ = TaskIdSerializer(data={"task_id": task_id})
         _.is_valid(raise_exception=True)
         res: AsyncResult = current_app.AsyncResult(task_id)
@@ -1869,7 +1869,7 @@ class EmbeddingsTestView(APIView):
     """
     permission_classes = []  # lock down if needed
 
-    def post(self, request):
+    def post(self, request, tenant_id=None):
         ser = EmbedTestSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         d = ser.validated_data
