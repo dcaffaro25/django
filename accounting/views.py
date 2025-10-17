@@ -93,6 +93,7 @@ from django.conf import settings
 
 #from .permissions import HasEmbeddingsApiKey  # or AllowAny for testing if you prefer
 from .serializers import EmbedTestSerializer, BackfillSerializer
+from django.core.cache import cache
 
 
 def _mean_date(dates):
@@ -1841,26 +1842,202 @@ class EmbeddingBackfillView(APIView):
         out = {"task_id": task.id, "state": task.state, "mode": "async"}
         return Response(out, status=status.HTTP_202_ACCEPTED)
 
+STATE_MAP = {
+    "PENDING":  "PENDING",
+    "RECEIVED": "RECEIVED",
+    "SENT":     "SENT",
+    "STARTED":  "STARTED",
+    "PROGRESS": "PROGRESS",   # our custom state while updating meta
+    "RETRY":    "RETRY",
+    "SUCCESS":  "SUCCESS",
+    "FAILURE":  "FAILURE",
+    "REVOKED":  "REVOKED",
+}
+
+def _friendly_state(celery_state: str) -> str:
+    return STATE_MAP.get(celery_state or "PENDING", "PENDING")
+
+def _parse_json_field(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            return json.loads(value)
+        except Exception:
+            return {"raw": value}
+    return None
+
+def _runtime_seconds(start: Optional[datetime], end: Optional[datetime]) -> Optional[float]:
+    if not start or not end:
+        return None
+    return (end - start).total_seconds()
+
+class EmbeddingJobsListView(APIView):
+    """
+    GET /api/embeddings/jobs/?limit=25&status=any&include_active=1
+
+    - Returns the latest finished/failed/canceled embedding jobs from django-celery-results
+    - If include_active=1, also includes currently running/queued jobs (via Celery inspect)
+    - status filter (optional): any | success | failure | revoked
+    """
+    permission_classes = [IsAdminUser]
+
+    def get(self, request, tenant_id=None):
+        limit = int(request.query_params.get("limit", 25))
+        status_filter = (request.query_params.get("status") or "any").lower()
+        include_active = request.query_params.get("include_active") in ("1", "true", "yes")
+
+        qs = TaskResult.objects.filter(task_name=EMBED_TASK_NAME).order_by("-date_done", "-date_created")
+        if status_filter == "success":
+            qs = qs.filter(status="SUCCESS")
+        elif status_filter == "failure":
+            qs = qs.filter(status="FAILURE")
+        elif status_filter == "revoked":
+            qs = qs.filter(status="REVOKED")
+        # else: "any" -> no extra filter
+
+        qs = qs[:limit]
+
+        finished: List[Dict[str, Any]] = []
+        for tr in qs:
+            result = _parse_json_field(tr.result)
+            meta = _parse_json_field(tr.meta)
+            # Celery stores created/done; "started" may not be persisted; pull from meta if our task saved it
+            started_at = None
+            if meta and isinstance(meta, dict):
+                ts = meta.get("started_at")
+                if isinstance(ts, (int, float)):
+                    started_at = datetime.fromtimestamp(ts, tz=timezone.utc)
+
+            item = {
+                "task_id": tr.task_id,
+                "task_name": tr.task_name,
+                "status": tr.status,
+                "status_friendly": _friendly_state(tr.status),
+                "created_at": tr.date_created,
+                "started_at": started_at,
+                "done_at": tr.date_done,
+                "runtime_s": _runtime_seconds(started_at or tr.date_created, tr.date_done),
+                "worker": tr.worker,
+                "queue": tr.queue,
+                "result": result if tr.status == "SUCCESS" else None,
+                "error": tr.traceback if tr.status == "FAILURE" else None,
+                "progress": meta,   # will contain our final meta snapshot if we saved it before success
+            }
+            finished.append(item)
+
+        response_payload = {
+            "count": len(finished),
+            "finished": EmbeddingJobSerializer(finished, many=True).data,
+        }
+
+        if include_active:
+            active_list: List[Dict[str, Any]] = []
+            try:
+                insp = current_app.control.inspect()
+                # active = running; reserved = queued locally on workers
+                active = insp.active() or {}
+                reserved = insp.reserved() or {}
+
+                def _collect(tasks_by_worker: Dict[str, List[Dict[str, Any]]], state_label: str):
+                    for worker, tasks in tasks_by_worker.items():
+                        for t in tasks:
+                            if t.get("name") != EMBED_TASK_NAME:
+                                continue
+                            tid = t.get("id")
+                            ar = AsyncResult(tid)
+                            info = ar.info or {}
+                            meta = info if isinstance(info, dict) else {}
+                            # try to read the progress meta we update in the task
+                            started_at = None
+                            if meta:
+                                ts = meta.get("started_at")
+                                if isinstance(ts, (int, float)):
+                                    started_at = datetime.fromtimestamp(ts, tz=timezone.utc)
+
+                            active_list.append({
+                                "task_id": tid,
+                                "task_name": EMBED_TASK_NAME,
+                                "status": state_label,
+                                "status_friendly": _friendly_state(state_label.upper()),
+                                "created_at": None,
+                                "started_at": started_at,
+                                "done_at": None,
+                                "runtime_s": _runtime_seconds(started_at, datetime.now(tz=timezone.utc)),
+                                "worker": worker,
+                                "queue": (t.get("delivery_info") or {}).get("routing_key"),
+                                "result": None,
+                                "error": None,
+                                "progress": meta or None,
+                            })
+
+                _collect(active, "STARTED")
+                _collect(reserved, "PENDING")
+            except Exception:
+                # If inspect isn’t available, just omit live section
+                active_list = []
+
+            response_payload["active"] = EmbeddingJobSerializer(active_list, many=True).data
+            response_payload["active_count"] = len(active_list)
+
+        return Response(response_payload, status=status.HTTP_200_OK)
+
 class EmbeddingTaskStatusView(APIView):
     permission_classes = [IsAdminUser]
 
     def get(self, request, task_id: str, tenant_id=None):
-        _ = TaskIdSerializer(data={"task_id": task_id})
-        _.is_valid(raise_exception=True)
         res: AsyncResult = current_app.AsyncResult(task_id)
-        data = {
+        celery_state = res.state or "PENDING"
+        friendly = STATE_MAP.get(celery_state, celery_state.lower())
+        info = {}
+        try:
+            # meta we set via update_state(...)
+            info = res.info or {}
+        except Exception:
+            info = {}
+
+        # rollup progress if present
+        progress = {
+            "totals": info.get("totals"),
+            "done": info.get("done"),
+            "remaining": info.get("remaining"),
+            "done_all": info.get("done_all"),
+            "remaining_all": info.get("remaining_all"),
+            "last_batch": info.get("last_batch"),
+            "errors": info.get("errors"),
+            "model": info.get("model"),
+            "url": info.get("url"),
+            "batch_size": info.get("batch_size"),
+            "started_at": info.get("started_at"),
+            "finished_at": info.get("finished_at"),
+        }
+
+        payload = {
             "task_id": task_id,
-            "state": res.state,
+            "state": celery_state,
+            "status": friendly,
             "ready": res.ready(),
             "successful": res.successful() if res.ready() else False,
+            "progress": progress,
+            "result": info.get("result") if celery_state == "SUCCESS" else None,
+            "error": str(res.result) if celery_state == "FAILURE" else None,
         }
-        if res.ready():
-            if res.successful():
-                data["result"] = res.result
-            else:
-                data["error"] = str(res.result)
-        out = TaskStatusSerializer(data).data
-        return Response(out, status=status.HTTP_200_OK)
+        return Response(payload, status=status.HTTP_200_OK)
+
+class EmbeddingTaskCancelView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, task_id: str):
+        # ask the running task to stop at next safe point
+        cache.set(f"embed:cancel:{task_id}", True, timeout=60*60)  # 1h is plenty
+
+        # also tell Celery to revoke; terminate=False for graceful stop,
+        # flip to True if you need hard kill (may interrupt DB writes).
+        current_app.control.revoke(task_id, terminate=False)
+
+        return Response({"task_id": task_id, "requested_cancel": True}, status=status.HTTP_200_OK)
 
 class EmbeddingsTestView(APIView):
     """

@@ -13,3 +13,7 @@ app.config_from_object("django.conf:settings", namespace="CELERY")
 app.autodiscover_tasks()
 
 broker_connection_retry_on_startup = True
+
+app.conf.task_track_started = True          # emit STARTED
+app.conf.worker_send_task_events = True     # better state events
+app.conf.task_send_sent_event = True

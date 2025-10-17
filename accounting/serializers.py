@@ -462,3 +462,18 @@ class BackfillSerializer(serializers.Serializer):
     timeout_s = serializers.FloatField(required=False, default=20.0)
     dim = serializers.IntegerField(required=False, default=768)
     api_key = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    
+class EmbeddingJobSerializer(serializers.Serializer):
+    task_id = serializers.CharField()
+    task_name = serializers.CharField()
+    status = serializers.CharField()            # Celery state string (SUCCESS/FAILURE/STARTED/...)
+    status_friendly = serializers.CharField()   # human form (complete/error/running/...)
+    created_at = serializers.DateTimeField(allow_null=True)
+    started_at = serializers.DateTimeField(allow_null=True)
+    done_at = serializers.DateTimeField(allow_null=True)
+    runtime_s = serializers.FloatField(allow_null=True)
+    worker = serializers.CharField(allow_null=True)
+    queue = serializers.CharField(allow_null=True)
+    result = serializers.JSONField(allow_null=True)    # your task's return dict (on success)
+    error = serializers.CharField(allow_null=True)     # traceback or error string (on failure)
+    progress = serializers.JSONField(allow_null=True)  # live meta if available
