@@ -94,7 +94,7 @@ from django.conf import settings
 #from .permissions import HasEmbeddingsApiKey  # or AllowAny for testing if you prefer
 from .serializers import EmbedTestSerializer, BackfillSerializer
 from django.core.cache import cache
-
+from core.models import Job
 
 def _mean_date(dates):
     """Return the average (mean) of a list of date objects, or None."""
@@ -1962,42 +1962,7 @@ class EmbeddingJobsListView(APIView):
             payload["active"] = active
             payload["active_count"] = len(active)
 
-        # ---- Fallback (optional): if no Job rows exist yet, try django-celery-results ----
-        if not finished and TaskResult is not None:
-            try:
-                tr_qs = TaskResult.objects.filter(task_name__icontains="generate_missing_embeddings").order_by("-date_done", "-date_created")[:limit]
-                legacy = []
-                for tr in tr_qs:
-                    result = _parse_json_field(tr.result)
-                    meta = _parse_json_field(tr.meta)
-                    started_at = None
-                    if isinstance(meta, dict) and isinstance(meta.get("started_at"), (int, float)):
-                        started_at = datetime.fromtimestamp(meta["started_at"], tz=timezone.utc)
-                    legacy.append({
-                        "task_id": tr.task_id,
-                        "state": _friendly_state(tr.status),
-                        "status_friendly": _friendly_state(tr.status),
-                        "kind": kind,
-                        "queue": tr.queue,
-                        "worker": tr.worker,
-                        "created_at": tr.date_created,
-                        "enqueued_at": tr.date_created,
-                        "started_at": started_at,
-                        "finished_at": tr.date_done,
-                        "runtime_s": _runtime_seconds(started_at or tr.date_created, tr.date_done),
-                        "result": result if tr.status == "SUCCESS" else None,
-                        "error": tr.traceback if tr.status == "FAILURE" else None,
-                        "percent": None,
-                        "total": None,
-                        "done": None,
-                        "by_category": meta,
-                        "tenant_id": None,
-                    })
-                if legacy:
-                    payload["finished"] = legacy
-                    payload["count"] = len(legacy)
-            except Exception:
-                pass
+        
 
         return Response(payload, status=status.HTTP_200_OK)
 
