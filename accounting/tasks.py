@@ -209,7 +209,7 @@ def generate_missing_embeddings(self, per_model_limit: Optional[int] = None, cli
         "model": client.model,
         "url": client.url,
         "dim": client.dim,
-        "batch_size": DEF_BATCH_SIZE,
+        "batch_size": settings.EMBED_BATCH_SIZE,
         "total_requested": total,
         "total_done": done,
     }
