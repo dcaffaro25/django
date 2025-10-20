@@ -1,10 +1,27 @@
 from rest_framework import serializers
-from .models import FinancialIndex, IndexQuote, FinancialIndexQuoteForecast
+from .models import FinancialIndex, IndexQuote, FinancialIndexQuoteForecast, Job
 
 # core/serializers.py
 from rest_framework import serializers
 from core.models import ActionEvent
 from django_celery_results.models import TaskResult
+
+class JobSerializer(serializers.ModelSerializer):
+    percent = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Job
+        fields = [
+            "id", "task_id", "task_name", "queue", "worker", "kind",
+            "tenant_id", "created_by", "state",
+            "created_at", "enqueued_at", "started_at", "finished_at",
+            "eta", "expires", "retries", "max_retries", "priority",
+            "total", "done", "percent", "by_category",
+            "meta", "result", "error",
+        ]
+
+    def get_percent(self, obj):
+        return obj.percent
 
 class ActionEventSerializer(serializers.ModelSerializer):
     actor_name = serializers.SerializerMethodField()

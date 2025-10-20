@@ -26,7 +26,17 @@ from .services.embedding_client import EmbeddingClient
 log = logging.getLogger(__name__)
 
 CANCEL_KEY_PREFIX = "embed:cancel:"  # cache key for graceful cancel
-
+STATE_MAP = {
+    "PENDING":  "PENDING",
+    "RECEIVED": "RECEIVED",
+    "SENT":     "SENT",
+    "STARTED":  "STARTED",
+    "PROGRESS": "PROGRESS",   # our custom state while updating meta
+    "RETRY":    "RETRY",
+    "SUCCESS":  "SUCCESS",
+    "FAILURE":  "FAILURE",
+    "REVOKED":  "REVOKED",
+}
 @shared_task(bind=True)
 def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=False):
     task_obj = ReconciliationTask.objects.get(id=db_id)
@@ -123,6 +133,40 @@ def _bump_progress(meta: dict, cat: str, n: int):
 def _check_cancel(self) -> bool:
     return bool(cache.get(f"{CANCEL_KEY_PREFIX}{self.request.id}"))
 
+def _job_update(task, **fields):
+    """Best-effort Job row update for this Celery task."""
+    try:
+        Job.objects.filter(task_id=task.request.id).update(**fields)
+    except Exception:
+        pass
+
+def _progress_meta(totals_by_cat, done_by_cat):
+    total_all = sum(totals_by_cat.values())
+    done_all = sum(done_by_cat.values())
+    return {
+        "totals": totals_by_cat,
+        "done": done_by_cat,
+        "remaining": {k: max(totals_by_cat[k] - done_by_cat.get(k, 0), 0) for k in totals_by_cat},
+        "done_all": done_all,
+        "remaining_all": max(total_all - done_all, 0),
+    }
+
+def _publish_progress(task, totals_by_cat, done_by_cat, extra=None):
+    meta = _progress_meta(totals_by_cat, done_by_cat)
+    if extra:
+        meta.update(extra)
+    # 1) Celery (for live polling)
+    task.update_state(state="PROGRESS", meta=meta)
+    # 2) DB row (for dashboards)
+    _job_update(
+        task,
+        state=STATE_MAP["PROGRESS"],
+        total=sum(totals_by_cat.values()),
+        done=sum(done_by_cat.values()),
+        by_category=meta,
+        meta=extra or None,
+    )
+
 @shared_task(
     bind=True,
     autoretry_for=(Exception,),
@@ -135,7 +179,7 @@ def generate_missing_embeddings(self, per_model_limit: Optional[int] = None, cli
     Job.objects.filter(task_id=self.request.id).update(kind="embeddings.backfill")
     
     limit = int(per_model_limit or settings.EMBED_LIMIT_PER_MODEL)
-
+    
     client = EmbeddingClient(
         model=(client_opts or {}).get("model", settings.EMBED_MODEL),
         timeout_s=(client_opts or {}).get("timeout_s", settings.EMBED_TIMEOUT_S),

@@ -9,8 +9,11 @@ from dateutil.rrule import rrulestr
 from django.db import models
 from django.conf import settings
 from .constants import STATE_MAP, ALL_STATES
+from django.contrib.auth import get_user_model
 
-class Job(TenantAwareBaseModel):
+User = get_user_model()
+
+class Job(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
     # Celery identifiers
@@ -22,11 +25,13 @@ class Job(TenantAwareBaseModel):
     # free-form kind
     kind      = models.CharField(max_length=64, default="other", db_index=True)
 
+    tenant_id   = models.CharField(max_length=64, null=True, blank=True)
+    created_by  = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
 
     state     = models.CharField(max_length=16, choices=[(s, s) for s in ALL_STATES],
                                  default=STATE_MAP["PENDING"], db_index=True)
 
-
+    created_at  = models.DateTimeField(auto_now_add=True)
     enqueued_at = models.DateTimeField(null=True, blank=True)
     started_at  = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
@@ -50,7 +55,7 @@ class Job(TenantAwareBaseModel):
         indexes = [
             models.Index(fields=["state", "-created_at"]),
             models.Index(fields=["kind", "-created_at"]),
-            #models.Index(fields=["tenant_id", "-created_at"]),
+            models.Index(fields=["tenant_id", "-created_at"]),
         ]
 
     @property
@@ -58,7 +63,6 @@ class Job(TenantAwareBaseModel):
         if not self.total or self.done is None or self.total <= 0:
             return None
         return round(100.0 * min(self.done, self.total) / float(self.total), 1)
-    
     
 class ActionEvent(models.Model):
     LEVELS = [("info","info"),("warning","warning"),("error","error")]

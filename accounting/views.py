@@ -1804,7 +1804,7 @@ class EmbeddingHealthView(APIView):
             )
 
 class EmbeddingMissingCountsView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = []#IsAdminUser]
 
     def get(self, request, tenant_id=None):
         tx  = Transaction.objects.filter(description_embedding__isnull=True).count()
@@ -1821,29 +1821,39 @@ class EmbeddingMissingCountsView(APIView):
         )
 
 class EmbeddingBackfillView(APIView):
-    """
-    POST /api/embeddings/backfill/
-    Body: {"per_model_limit": 500, "sync": false}
-    """
-    permission_classes = [IsAdminUser]
+    permission_classes = []#permissions.IsAdminUser]
 
-    def post(self, request, tenant_id=None):
-        ser = StartEmbeddingBackfillSerializer(data=request.data or {})
-        ser.is_valid(raise_exception=True)
-        per_model_limit = ser.validated_data.get("per_model_limit")
-        sync = ser.validated_data.get("sync", False)
+    def post(self, request):
+        # you can keep your serializer; here we focus on headers + optional pre-totals
+        per_model_limit = int(request.data.get("per_model_limit") or 2000)
+        client_opts = request.data.get("client_opts") or {}
 
-        if sync:
-            result = generate_missing_embeddings(per_model_limit=per_model_limit)
-            out = {"mode": "sync", "result": result}
-            return Response(out, status=status.HTTP_200_OK)
-
+        # enqueue with helpful headers
+        headers = {
+            "job_kind": "embeddings",
+            "tenant_id": getattr(request.user, "company_id", None),
+            "user_id": getattr(request.user, "id", None),
+        }
         task = generate_missing_embeddings.apply_async(
-                kwargs={"per_model_limit": per_model_limit},
-                headers={"job_kind": "embeddings.backfill", "tenant_id": tenant_id}
+            kwargs={"per_model_limit": per_model_limit, "client_opts": client_opts},
+            headers=headers,
+        )
+
+        # (optional) prime totals right away, so UI has a target immediately
+        try:
+            totals = {
+                "transactions": Transaction.objects.filter(description_embedding__isnull=True)[:per_model_limit].count(),
+                "bank_transactions": BankTransaction.objects.filter(description_embedding__isnull=True)[:per_model_limit].count(),
+                "accounts": Account.objects.filter(account_description_embedding__isnull=True)[:per_model_limit].count(),
+            }
+            Job.objects.filter(task_id=task.id).update(
+                total=sum(totals.values()),
+                by_category={"totals": totals, "done": {"transactions": 0, "bank_transactions": 0, "accounts": 0}},
             )
-        out = {"task_id": task.id, "state": task.state, "mode": "async"}
-        return Response(out, status=status.HTTP_202_ACCEPTED)
+        except Exception:
+            pass
+
+        return Response({"task_id": task.id, "state": task.state, "mode": "async"}, status=status.HTTP_202_ACCEPTED)
 
 STATE_MAP = {
     "PENDING":  "PENDING",
@@ -1914,120 +1924,81 @@ def _job_to_dict(j: Job) -> Dict[str, Any]:
 
 class EmbeddingJobsListView(APIView):
     """
-    GET /api/embeddings/jobs/?limit=25&status=any&include_active=1&kind=embeddings.backfill&tenant_id=...
-
-    - status: any | success | failure | revoked
-    - include_active: 0/1 (or true/false)
-    - kind: optional filter (defaults to 'embeddings.backfill')
-    - tenant_id: optional filter
+    GET /api/embeddings/jobs/?limit=25&status=any&kind=embeddings&include_active=1
     """
-    permission_classes = [IsAdminUser]
+    permission_classes = []#permissions.IsAdminUser]
 
     def get(self, request, tenant_id=None):
         limit = int(request.query_params.get("limit", 25))
-        limit = max(1, min(limit, 200))
-        status_filter = (request.query_params.get("status") or "any").lower()
-        include_active = str(request.query_params.get("include_active", "0")).lower() in ("1", "true", "yes")
-        kind = request.query_params.get("kind") or EMBED_KIND_DEFAULT
-        tenant_q = request.query_params.get("tenant_id") or tenant_id
+        status_filter = (request.query_params.get("status") or "any").upper()
+        kind = request.query_params.get("kind") or "embeddings"
+        include_active = request.query_params.get("include_active") in ("1", "true", "yes")
 
-        # ---- Finished jobs from Job table ----
-        qs = Job.objects.filter(kind=kind, state__in=FINISHED_STATES)
-        if status_filter == "success":
-            qs = qs.filter(state=STATE_MAP["SUCCESS"])
-        elif status_filter == "failure":
-            qs = qs.filter(state=STATE_MAP["FAILURE"])
-        elif status_filter == "revoked":
-            qs = qs.filter(state=STATE_MAP["REVOKED"])
-        # else: any -> leave as is
+        qs = Job.objects.filter(kind=kind).order_by("-created_at")
 
-        if tenant_q:
-            qs = qs.filter(tenant_id=tenant_q)
+        if status_filter != "ANY":
+            qs = qs.filter(state=status_filter)
 
-        finished_qs = qs.order_by("-finished_at", "-created_at")[:limit]
-        finished = [_job_to_dict(j) for j in finished_qs]
+        finished = list(qs[:limit])
+        data = {"count": len(finished), "finished": JobSerializer(finished, many=True).data}
 
-        payload = {
-            "count": len(finished),
-            "finished": finished,
-        }
-
-        # ---- Optionally include active jobs from Job table ----
         if include_active:
-            active_qs = Job.objects.filter(kind=kind, state__in=ACTIVE_STATES)
-            if tenant_q:
-                active_qs = active_qs.filter(tenant_id=tenant_q)
-            active_qs = active_qs.order_by("-started_at", "-enqueued_at", "-created_at")[:limit]
-            active = [_job_to_dict(j) for j in active_qs]
-            payload["active"] = active
-            payload["active_count"] = len(active)
+            active_states = ("PENDING", "SENT", "RECEIVED", "STARTED", "RETRY", "PROGRESS")
+            active = Job.objects.filter(kind=kind, state__in=active_states).order_by("-created_at")
+            data["active"] = JobSerializer(active, many=True).data
+            data["active_count"] = active.count()
 
-        
-
-        return Response(payload, status=status.HTTP_200_OK)
+        return Response(data, status=status.HTTP_200_OK)
 
 
 class EmbeddingTaskStatusView(APIView):
-    """
-    GET /api/embeddings/jobs/<task_id>/
-    """
-    permission_classes = [IsAdminUser]
+    permission_classes = []#permissions.IsAdminUser]
 
-    def get(self, request, task_id: str, tenant_id=None):
-        # Preferred: our Job table
+    def get(self, request, task_id, tenant_id=None):
         try:
-            j = Job.objects.get(task_id=task_id)
-            data = _job_to_dict(j)
-            return Response(data, status=status.HTTP_200_OK)
+            job = Job.objects.get(task_id=task_id)
         except Job.DoesNotExist:
-            pass
+            # still return Celery state, if any
+            ar = AsyncResult(task_id)
+            return Response({
+                "task_id": task_id,
+                "state": ar.state or "PENDING",
+                "status": STATE_MAP.get(ar.state or "PENDING", "PENDING"),
+                "ready": ar.ready(),
+                "successful": ar.successful() if ar.ready() else False,
+            }, status=status.HTTP_200_OK)
 
-        # Fallback: Celery state only
-        res: AsyncResult = current_app.AsyncResult(task_id)
-        celery_state = (res.state or "PENDING").upper()
-        friendly = _friendly_state(celery_state)
-
-        info = {}
-        try:
-            info = res.info or {}
-        except Exception:
-            info = {}
-
-        # If your task put rich progress into meta, expose the common keys
-        progress = {
-            "total": info.get("total"),
-            "done": info.get("done"),
-            "percent": info.get("percent"),
-            "by_category": info.get("by_category"),
-        }
-
-        payload = {
-            "task_id": task_id,
-            "state": friendly,
-            "status_friendly": friendly,
-            "ready": res.ready(),
-            "successful": res.successful() if res.ready() else False,
-            "progress": progress if any(v is not None for v in progress.values()) else None,
-            "result": info.get("result") if friendly == STATE_MAP["SUCCESS"] else None,
-            "error": str(res.result) if friendly == STATE_MAP["FAILURE"] else None,
-        }
-
-
-
+        # overlay live state from Celery (if different)
+        ar = AsyncResult(task_id)
+        live_state = ar.state or job.state
+        info = ar.info if isinstance(ar.info, dict) else {}
+        payload = JobSerializer(job).data
+        payload.update({
+            "state": live_state,
+            "status": STATE_MAP.get(live_state, live_state),
+            "ready": ar.ready(),
+            "successful": ar.successful() if ar.ready() else (job.state == "SUCCESS"),
+            "progress": {
+                "totals": (job.by_category or {}).get("totals"),
+                "done": (job.by_category or {}).get("done"),
+                "remaining": (job.by_category or {}).get("remaining"),
+                "done_all": (job.by_category or {}).get("done_all"),
+                "remaining_all": (job.by_category or {}).get("remaining_all"),
+            },
+        })
         return Response(payload, status=status.HTTP_200_OK)
 
 class EmbeddingTaskCancelView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = []#permissions.IsAdminUser]
 
-    def post(self, request, task_id: str):
-        # ask the running task to stop at next safe point
-        cache.set(f"embed:cancel:{task_id}", True, timeout=60*60)  # 1h is plenty
-
-        # also tell Celery to revoke; terminate=False for graceful stop,
-        # flip to True if you need hard kill (may interrupt DB writes).
-        current_app.control.revoke(task_id, terminate=False)
-
-        return Response({"task_id": task_id, "requested_cancel": True}, status=status.HTTP_200_OK)
+    def post(self, request, task_id, tenant_id=None):
+        current_app.control.revoke(task_id, terminate=True)
+        Job.objects.filter(task_id=task_id).update(
+            state=STATE_MAP["REVOKED"],
+            finished_at=now(),
+            error="revoked",
+        )
+        return Response({"task_id": task_id, "revoked": True}, status=status.HTTP_200_OK)
 
 class EmbeddingsTestView(APIView):
     """

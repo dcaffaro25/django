@@ -8,13 +8,7 @@ from celery.signals import (
 from .models import Job
 from .constants import STATE_MAP
 from django.utils.timezone import now
-
-
-
-# Prefer an unscoped manager if your model exposes one (recommended)
-JOB_QS = getattr(Job, "all_objects", None) or Job.objects   # all_objects should be a plain models.Manager()
-
-Company = apps.get_model("multitenancy", "Company")
+from typing import Optional, Union
 
 
 def _header(headers, key, default=None):
@@ -23,138 +17,88 @@ def _header(headers, key, default=None):
     except Exception:
         return default
 
-
-def _extract_tenant_id(headers, request=None):
-    """
-    Pull company/tenant from Celery headers first;
-    fall back to request headers if present.
-    """
-    tid = _header(headers, "tenant_id") or _header(headers, "company_id")
-    if tid:
-        return tid
-    if request:
-        h = getattr(request, "headers", {}) or {}
-        tid = h.get("tenant_id") or h.get("company_id")
-    return tid
-
-
-def _update_or_create_job(task_id: str, company_id: str | int | None, **defaults):
-    """
-    Upsert a Job row with tenant scoping. If company_id is missing, we still
-    save a record keyed only by task_id (useful for late headers), but you
-    should strive to always pass tenant_id when applying tasks.
-    """
-    lookup = {"task_id": task_id}
-    if company_id:
-        lookup["company_id"] = company_id
-        defaults.setdefault("company_id", company_id)
-    JOB_QS.update_or_create(**lookup, defaults=defaults)
-
-
-def _update_job(task_id: str, company_id: str | int | None, **fields):
-    """
-    Update with tenant scope when we have it; otherwise update by task_id only.
-    """
-    qs = JOB_QS.filter(task_id=task_id)
-    if company_id:
-        qs = qs.filter(company_id=company_id)
-    qs.update(**fields)
-
+def _safe_json(obj):
+    try:
+        json.dumps(obj)
+        return obj
+    except Exception:
+        # last resort so we can still show something in the UI
+        return {"repr": repr(obj)}
 
 @after_task_publish.connect
 def job_after_publish(sender=None, headers=None, body=None, **kwargs):
     task_id = _header(headers, "id") or kwargs.get("task_id")
     if not task_id:
         return
-
-    tenant_id = _extract_tenant_id(headers)
-    kind = _header(headers, "job_kind", sender or "")
-    queue = (
-        kwargs.get("routing_key")
-        or (kwargs.get("properties") or {}).get("delivery_info", {}).get("routing_key")
+    Job.objects.update_or_create(
+        task_id=task_id,
+        defaults={
+            "task_name": sender or "",
+            "state": STATE_MAP["SENT"],
+            "kind": _header(headers, "job_kind", sender or "other"),
+            "tenant_id": _header(headers, "tenant_id"),
+            "created_by_id": _header(headers, "user_id"),
+            "queue": (kwargs.get("routing_key") or
+                      (kwargs.get("properties") or {}).get("delivery_info", {}).get("routing_key")),
+            "enqueued_at": now(),
+        },
     )
-
-    _update_or_create_job(
-        task_id,
-        tenant_id,
-        task_name=(sender or ""),
-        state=STATE_MAP["SENT"],
-        kind=kind,
-        queue=queue,
-        enqueued_at=now(),
-    )
-
 
 @task_prerun.connect
 def job_task_prerun(sender=None, task_id=None, task=None, **kwargs):
     req = getattr(task, "request", None)
     headers = getattr(req, "headers", {}) if req else {}
-    tenant_id = _extract_tenant_id(headers, request=req)
-    kind = _header(headers, "job_kind", sender.name if sender else "")
-    worker = getattr(req, "hostname", None)
-    retries = getattr(req, "retries", 0)
-    queue = getattr(req, "routing_key", None)
-
-    _update_or_create_job(
-        task_id,
-        tenant_id,
-        task_name=(sender.name if sender else ""),
-        kind=kind,
+    Job.objects.update_or_create(
+        task_id=task_id,
+        defaults={
+            "task_name": sender.name if sender else "",
+            "kind": _header(headers, "job_kind", sender.name if sender else "other"),
+            "tenant_id": _header(headers, "tenant_id"),
+            "created_by_id": _header(headers, "user_id"),
+        },
     )
-    _update_job(
-        task_id,
-        tenant_id,
+    Job.objects.filter(task_id=task_id).update(
         state=STATE_MAP["STARTED"],
         started_at=now(),
-        worker=worker,
-        queue=queue,
-        retries=retries,
+        worker=getattr(req, "hostname", None),
+        queue=getattr(req, "routing_key", None),
+        retries=getattr(req, "retries", 0),
+        max_retries=getattr(req, "max_retries", 0),
+        priority=(getattr(req, "delivery_info", {}) or {}).get("priority"),
+        eta=getattr(req, "eta", None),
+        expires=getattr(req, "expires", None),
     )
-
 
 @task_retry.connect
 def job_task_retry(sender=None, request=None, reason=None, einfo=None, **kwargs):
     if not request:
         return
-    tenant_id = _extract_tenant_id(getattr(request, "headers", {}), request=request)
-    _update_job(
-        request.id,
-        tenant_id,
+    Job.objects.filter(task_id=request.id).update(
         state=STATE_MAP["RETRY"],
         retries=getattr(request, "retries", 0),
     )
 
-
 @task_success.connect
 def job_task_success(sender=None, result=None, task_id=None, **kwargs):
-    # No headers on this signal; update by task_id alone
-    _update_job(
-        task_id,
-        company_id=None,
+    Job.objects.filter(task_id=task_id).update(
         state=STATE_MAP["SUCCESS"],
         finished_at=now(),
-        result=result,
+        result=_safe_json(result),
     )
-
 
 @task_failure.connect
 def job_task_failure(sender=None, task_id=None, exception=None, einfo=None, **kwargs):
-    _update_job(
-        task_id,
-        company_id=None,
+    Job.objects.filter(task_id=task_id).update(
         state=STATE_MAP["FAILURE"],
         finished_at=now(),
         error=str(exception) if exception else None,
     )
 
-
 @task_revoked.connect
 def job_task_revoked(sender=None, request=None, terminated=None, signum=None, expired=None, **kwargs):
     if not request:
         return
-    _update_job(
-        request.id,
-        company_id=None,
+    Job.objects.filter(task_id=request.id).update(
         state=STATE_MAP["REVOKED"],
         finished_at=now(),
         error="revoked",
