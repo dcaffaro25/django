@@ -7,3 +7,4 @@ class CoreConfig(AppConfig):
     
     def ready(self):
         from . import admin_autoregister  # noqa: F401
+        from . import celery_hooks
