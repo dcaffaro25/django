@@ -13,6 +13,9 @@ from django.conf import settings
 import os
 
 
+from core.utils.jobs import job_progress
+from core.models import Job
+
 import requests
 
 
@@ -128,6 +131,9 @@ def _check_cancel(self) -> bool:
     soft_time_limit=600,
 )
 def generate_missing_embeddings(self, per_model_limit: Optional[int] = None, client_opts: Optional[dict] = None) -> dict:
+    from core.models import Job
+    Job.objects.filter(task_id=self.request.id).update(kind="embeddings.backfill")
+    
     limit = int(per_model_limit or settings.EMBED_LIMIT_PER_MODEL)
 
     client = EmbeddingClient(
@@ -142,78 +148,69 @@ def generate_missing_embeddings(self, per_model_limit: Optional[int] = None, cli
         extra_headers=(client_opts or {}).get("extra_headers"),
     )
     
-    # ---- initialize progress & totals ----
-    totals = _count_missing()
-    prog = _prog_template(totals)
-    self.update_state(state=states.STARTED, meta=prog)
-    
-    # helpers
-    def process_category(cat_name: str, qs, text_fn: Callable[[object], str], field_name: str) -> int:
-        if _check_cancel(self):
-            prog["status"] = "canceled"
-            self.update_state(state=states.REVOKED, meta=prog)
-            raise Ignore()
+    # Build querysets
+    tx_qs  = Transaction.objects.filter(description_embedding__isnull=True).order_by("id").only("id","description","amount","date")[:limit]
+    btx_qs = BankTransaction.objects.filter(description_embedding__isnull=True).order_by("id").only("id","description","amount","date")[:limit]
+    acc_qs = Account.objects.filter(account_description_embedding__isnull=True).order_by("id").only("id","name","description","key_words","examples")[:limit]
 
-        objs = list(qs.order_by("id")[:limit])
-        updated_total = 0
+    tx_list, btx_list, acc_list = list(tx_qs), list(btx_qs), list(acc_qs)
 
+    # Totals for progress
+    totals = {
+        "transactions": len(tx_list),
+        "bank_transactions": len(btx_list),
+        "accounts": len(acc_list),
+    }
+    total = sum(totals.values())
+    done = 0
+    by_cat_done = {"transactions": 0, "bank_transactions": 0, "accounts": 0}
+
+    # Initial progress snapshot
+    job_progress(self, done=done, total=total, by_category={**totals, **{f"{k}_done":0 for k in totals}})
+
+    # Process each category in batches; update progress per batch
+    def _run_cat(objs, text_fn, field_name, key):
+        nonlocal done, by_cat_done
+        if not objs:
+            return 0
+        updated = 0
         for i in range(0, len(objs), settings.EMBED_BATCH_SIZE):
-            if _check_cancel(self):
-                prog["status"] = "canceled"
-                self.update_state(state=states.REVOKED, meta=prog)
-                raise Ignore()
-
             block = objs[i:i+settings.EMBED_BATCH_SIZE]
-            texts = [text_fn(o) or " " for o in block]
-            try:
-                vectors = client.embed_texts(texts)
-            except Exception as e:
-                prog["errors"].append({"category": cat_name, "index_start": i, "err": str(e), "ts": time.time()})
-                # keep going; just no update bump for this batch
-                self.update_state(state="PROGRESS", meta=prog)
-                continue
-
-            batch_updated = 0
+            vectors = client.embed_texts([text_fn(o) or " " for o in block])
             with transaction.atomic():
-                for obj, vec in zip(block, vectors):
-                    if not vec:  # skip empties
+                for o, vec in zip(block, vectors):
+                    if not vec:
                         continue
-                    try:
-                        setattr(obj, field_name, vec)
-                        obj.save(update_fields=[field_name])
-                        batch_updated += 1
-                    except Exception as se:
-                        prog["errors"].append({"category": cat_name, "obj_id": getattr(obj, "id", None), "err": str(se), "ts": time.time()})
+                    setattr(o, field_name, vec)
+                    o.save(update_fields=[field_name])
+                    updated += 1
+                    done += 1
+                    by_cat_done[key] += 1
+            # progress tick
+            by_snapshot = {
+                "transactions": totals["transactions"],
+                "transactions_done": by_cat_done["transactions"],
+                "bank_transactions": totals["bank_transactions"],
+                "bank_transactions_done": by_cat_done["bank_transactions"],
+                "accounts": totals["accounts"],
+                "accounts_done": by_cat_done["accounts"],
+            }
+            job_progress(self, done=done, total=total, by_category=by_snapshot)
+        return updated
 
-            updated_total += batch_updated
-            _bump_progress(prog, cat_name, batch_updated)
-            self.update_state(state="PROGRESS", meta=prog)
+    tx_updated  = _run_cat(tx_list,  _tx_text,   "description_embedding",          "transactions")
+    btx_updated = _run_cat(btx_list, _bank_text, "description_embedding",          "bank_transactions")
+    acc_updated = _run_cat(acc_list, _account_text, "account_description_embedding","accounts")
 
-        return updated_total
-    
-        # ---- process each category ----
-        tx_qs  = Transaction.objects.filter(description_embedding__isnull=True).only("id", "description", "amount", "date")
-        btx_qs = BankTransaction.objects.filter(description_embedding__isnull=True).only("id", "description", "amount", "date")
-        acc_qs = Account.objects.filter(account_description_embedding__isnull=True).only("id", "name", "description", "key_words", "examples")
-    
-        tx_upd  = process_category("transactions",       tx_qs,  _tx_text,    "description_embedding")
-        btx_upd = process_category("bank_transactions",  btx_qs, _bank_text,   "description_embedding")
-        acc_upd = process_category("accounts",           acc_qs, _account_text,"account_description_embedding")
-    
-        result = {
-            "transactions_updated": tx_upd,
-            "bank_transactions_updated": btx_upd,
-            "accounts_updated": acc_upd,
-            "model": client.model,
-            "url": client.url,
-            "dim": client.dim,
-            "batch_size": settings.EMBED_BATCH_SIZE,
-            "duration_s": round(time.time() - prog["started_at"], 3),
-        }
-    
-        prog["status"] = "completed"
-        prog["finished_at"] = time.time()
-        prog["result"] = result
-        self.update_state(state=states.SUCCESS, meta=prog)
-        log.info("Embedding backfill result: %s", result)
-        return result
+    result = {
+        "transactions_updated": tx_updated,
+        "bank_transactions_updated": btx_updated,
+        "accounts_updated": acc_updated,
+        "model": client.model,
+        "url": client.url,
+        "dim": client.dim,
+        "batch_size": DEF_BATCH_SIZE,
+        "total_requested": total,
+        "total_done": done,
+    }
+    return result

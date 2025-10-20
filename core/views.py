@@ -31,8 +31,83 @@ from django_celery_results.models import TaskResult
 from django.conf import settings
 
 # import your Celery app
-from celery import app as celery_app
+from celery import app as celery_app, current_app
+from .models import Job
 
+class JobStatusView(APIView):
+    permission_classes = [permissions.IsAdminUser]
+
+    def get(self, request, task_id: str):
+        try:
+            job = Job.objects.get(task_id=task_id)
+            payload = {
+                "task_id": job.task_id,
+                "state": job.state,        # one of your STATE_MAP values
+                "kind": job.kind,
+                "queue": job.queue,
+                "worker": job.worker,
+                "created_at": job.created_at,
+                "enqueued_at": job.enqueued_at,
+                "started_at": job.started_at,
+                "finished_at": job.finished_at,
+                "retries": job.retries,
+                "max_retries": job.max_retries,
+                "total": job.total,
+                "done": job.done,
+                "percent": job.percent,
+                "by_category": job.by_category,
+                "result": job.result if job.state == "SUCCESS" else None,
+                "error": job.error if job.state in ("FAILURE","REVOKED") else None,
+            }
+            return Response(payload, status=200)
+        except Job.DoesNotExist:
+            # fallback to raw celery state if we somehow missed hooks
+            res = current_app.AsyncResult(task_id)
+            return Response(
+                {"task_id": task_id, "state": res.state or "PENDING"},
+                status=200
+            )
+
+class JobListView(APIView):
+    permission_classes = [permissions.IsAdminUser]
+
+    def get(self, request):
+        qs = Job.objects.all().order_by("-created_at")
+        if kind := request.query_params.get("kind"):
+            qs = qs.filter(kind=kind)
+        if state := request.query_params.get("state"):
+            qs = qs.filter(state=state)
+        if tenant_id := request.query_params.get("tenant_id"):
+            qs = qs.filter(tenant_id=tenant_id)
+
+        limit = int(request.query_params.get("limit", 50))
+        qs = qs[:max(1, min(limit, 200))]
+
+        data = [{
+            "task_id": j.task_id,
+            "state": j.state,
+            "kind": j.kind,
+            "queue": j.queue,
+            "worker": j.worker,
+            "created_at": j.created_at,
+            "started_at": j.started_at,
+            "finished_at": j.finished_at,
+            "percent": j.percent,
+            "total": j.total,
+            "done": j.done,
+            "by_category": j.by_category,
+            "error": j.error if j.state in ("FAILURE","REVOKED") else None,
+        } for j in qs]
+        return Response({"results": data}, status=200)
+    
+    
+class JobCancelView(APIView):
+    permission_classes = [permissions.IsAdminUser]
+    def post(self, request, task_id: str):
+        current_app.control.revoke(task_id, terminate=True)
+        # state will flip to REVOKED by signal
+        return Response({"task_id": task_id, "revoked": True}, status=200)
+    
 
 class ActivityFeedView(ListAPIView):
     """Latest actions (admin-like). Query params: company_id, level, limit, since_hours."""

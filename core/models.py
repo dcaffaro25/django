@@ -1,5 +1,6 @@
+import uuid
 from django.db import models
-from multitenancy.models import BaseModel
+from multitenancy.models import BaseModel, TenantAwareBaseModel
 from datetime import datetime
 from typing import List, Optional
 from dateutil.rrule import rrulestr
@@ -7,7 +8,58 @@ from dateutil.rrule import rrulestr
 # core/models.py
 from django.db import models
 from django.conf import settings
+from .constants import STATE_MAP, ALL_STATES
 
+class Job(TenantAwareBaseModel):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    # Celery identifiers
+    task_id   = models.CharField(max_length=100, unique=True, db_index=True)
+    task_name = models.CharField(max_length=255)
+    queue     = models.CharField(max_length=100, null=True, blank=True)
+    worker    = models.CharField(max_length=200, null=True, blank=True)
+
+    # free-form kind
+    kind      = models.CharField(max_length=64, default="other", db_index=True)
+
+
+    state     = models.CharField(max_length=16, choices=[(s, s) for s in ALL_STATES],
+                                 default=STATE_MAP["PENDING"], db_index=True)
+
+
+    enqueued_at = models.DateTimeField(null=True, blank=True)
+    started_at  = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    eta         = models.DateTimeField(null=True, blank=True)
+    expires     = models.DateTimeField(null=True, blank=True)
+    retries     = models.PositiveIntegerField(default=0)
+    max_retries = models.PositiveIntegerField(default=0)
+    priority    = models.IntegerField(null=True, blank=True)
+
+    # progress
+    total       = models.PositiveIntegerField(null=True, blank=True)
+    done        = models.PositiveIntegerField(null=True, blank=True)
+    by_category = models.JSONField(null=True, blank=True)
+
+    # misc
+    meta   = models.JSONField(null=True, blank=True)
+    result = models.JSONField(null=True, blank=True)
+    error  = models.TextField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["state", "-created_at"]),
+            models.Index(fields=["kind", "-created_at"]),
+            #models.Index(fields=["tenant_id", "-created_at"]),
+        ]
+
+    @property
+    def percent(self):
+        if not self.total or self.done is None or self.total <= 0:
+            return None
+        return round(100.0 * min(self.done, self.total) / float(self.total), 1)
+    
+    
 class ActionEvent(models.Model):
     LEVELS = [("info","info"),("warning","warning"),("error","error")]
     company_id     = models.IntegerField(db_index=True)

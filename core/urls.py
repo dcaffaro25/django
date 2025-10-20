@@ -11,7 +11,7 @@ from .views import (
 # core/urls.py
 from django.urls import path
 from core.views import ActivityFeedView, CeleryQueuesView, CeleryResultsView, CeleryTaskControlView
-
+from .views import JobStatusView, JobListView, JobCancelView
 
 router = DefaultRouter()
 router.trailing_slash = r'/?'
@@ -31,4 +31,7 @@ urlpatterns = [
     path("api/celery/queues/", CeleryQueuesView.as_view(), name="celery-queues"),
     path("api/celery/results/", CeleryResultsView.as_view(), name="celery-results"),
     path("api/celery/tasks/<uuid:task_id>/<str:action>/", CeleryTaskControlView.as_view(), name="celery-task-control"),
+    path("jobs/", JobListView.as_view()),
+    path("jobs/<str:task_id>/", JobStatusView.as_view()),
+    path("jobs/<str:task_id>/cancel/", JobCancelView.as_view()),
 ]

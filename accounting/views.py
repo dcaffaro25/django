@@ -1838,7 +1838,10 @@ class EmbeddingBackfillView(APIView):
             out = {"mode": "sync", "result": result}
             return Response(out, status=status.HTTP_200_OK)
 
-        task = generate_missing_embeddings.apply_async(kwargs={"per_model_limit": per_model_limit})
+        task = generate_missing_embeddings.apply_async(
+                kwargs={"per_model_limit": per_model_limit},
+                headers={"job_kind": "embeddings.backfill", "tenant_id": tenant_id}
+            )
         out = {"task_id": task.id, "state": task.state, "mode": "async"}
         return Response(out, status=status.HTTP_202_ACCEPTED)
 
