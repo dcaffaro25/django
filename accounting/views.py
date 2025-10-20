@@ -95,6 +95,7 @@ from django.conf import settings
 from .serializers import EmbedTestSerializer, BackfillSerializer
 from django.core.cache import cache
 from core.models import Job
+from core.serializers import JobSerializer
 
 def _mean_date(dates):
     """Return the average (mean) of a list of date objects, or None."""
@@ -1823,7 +1824,7 @@ class EmbeddingMissingCountsView(APIView):
 class EmbeddingBackfillView(APIView):
     permission_classes = []#permissions.IsAdminUser]
 
-    def post(self, request):
+    def post(self, request, tenant_id=None):
         # you can keep your serializer; here we focus on headers + optional pre-totals
         per_model_limit = int(request.data.get("per_model_limit") or 2000)
         client_opts = request.data.get("client_opts") or {}
