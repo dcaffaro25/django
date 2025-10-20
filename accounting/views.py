@@ -2012,14 +2012,7 @@ class EmbeddingTaskStatusView(APIView):
             "error": str(res.result) if friendly == STATE_MAP["FAILURE"] else None,
         }
 
-        # Last fallback: django-celery-results row (if present)
-        if TaskResult is not None:
-            try:
-                tr = TaskResult.objects.get(task_id=task_id)
-                payload.setdefault("created_at", tr.date_created)
-                payload.setdefault("finished_at", tr.date_done)
-            except TaskResult.DoesNotExist:
-                pass
+
 
         return Response(payload, status=status.HTTP_200_OK)
 
