@@ -69,7 +69,7 @@ def _is_exact_match(
     outflows often have opposite sign to book entries.
     """
     return (
-        abs(_q2(bank_amount)) == abs(_q2(txn_amount))
+        _q2(bank_amount) == _q2(txn_amount)
         and book_date
         and bank_date
         and abs((bank_date - book_date).days) <= date_tol_days
