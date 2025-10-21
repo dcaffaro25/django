@@ -2,6 +2,7 @@ import requests
 from typing import Any, Dict, List, Optional, Sequence
 from django.conf import settings
 from urllib.parse import urljoin, urlparse
+import json
 
 class EmbeddingClient:
     """Calls Service A (Embeddings) /api/embeddings. Optimized for nomic-embed-text."""
@@ -77,35 +78,41 @@ class EmbeddingClient:
 
 
 class LlmClient:
-    """Local LLM on Service B (Ollama /api/generate)."""
-    def __init__(self, base_url, path="/api/generate", model="llama3.2:3b-instruct:q4_K_M",
-                 timeout=20, headers=None):
-        self.base_url = self._normalize_base(base_url)
-        self.url = urljoin(self.base_url + "/", (path or "/api/generate").lstrip("/"))
+    def __init__(self, base_url, path="/api/generate", model="llama3.2:3b-instruct-q4_K_M",
+                 timeout=180, headers=None):
+        if "://" not in base_url:
+            base_url = "http://" + base_url
+        self.url = urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
         self.model = model
         self.timeout = timeout
-
         self.sess = requests.Session()
         self.sess.headers.update({"content-type": "application/json"})
         if headers:
             self.sess.headers.update(headers)
 
-    @staticmethod
-    def _normalize_base(u: str) -> str:
-        if not u:
-            raise ValueError("LLM base URL is not configured")
-        # Auto-add scheme when missing
-        if "://" not in u:
-            u = "http://" + u
-        return u.rstrip("/")
-
-    def generate(self, prompt: str, temperature=0.2, num_predict=400, keep_alive="30m"):
+    def generate(self, prompt: str, temperature=0.2, num_predict=300, keep_alive="45m"):
         payload = {
             "model": self.model,
             "prompt": prompt,
             "options": {"temperature": temperature, "num_predict": num_predict},
             "keep_alive": keep_alive,
+            "stream": True,
         }
-        r = self.sess.post(self.url, json=payload, timeout=self.timeout)
-        r.raise_for_status()
-        return r.json()
+        text_parts = []
+        # split connect/read timeouts; bigger read for generation
+        with self.sess.post(self.url, json=payload, timeout=(5, self.timeout), stream=True) as r:
+            r.raise_for_status()
+            for line in r.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if "response" in obj:
+                    text_parts.append(obj["response"])
+                if obj.get("error"):
+                    raise RuntimeError(obj["error"])
+                if obj.get("done"):
+                    break
+        return {"response": "".join(text_parts), "done": True}
