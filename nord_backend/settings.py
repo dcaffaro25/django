@@ -290,9 +290,15 @@ EMBED_SVC_URL = EMBED_BASE_URL  # Service A
 EMBED_TIMEOUT = float(os.getenv("EMBED_TIMEOUT", "15"))      # per request
 EMBED_KEEP    = EMBED_KEEP_ALIVE
 
-LLM_BASE_URL  = os.getenv("LLM_BASE_URL", "http://localhost:11434")  # local Ollama on Service B
+LLM_BASE_URL  = os.getenv("LLM_BASE_URL", "https://chat-service-production-d54a.up.railway.app")  # local Ollama on Service B
+LLM_GENERATE_PATH = os.getenv("LLM_GENERATE_PATH", "/api/generate")
 LLM_MODEL     = os.getenv("LLM_MODEL", "llama3.2:3b-instruct:q4_K_M")
 LLM_TIMEOUT   = float(os.getenv("LLM_TIMEOUT", "30"))
+
+LLM_BASE_URL      = os.getenv("LLM_BASE_URL", "http://chat-service.railway.internal:11434")
+LLM_GENERATE_PATH = os.getenv("LLM_GENERATE_PATH", "/api/generate")
+LLM_MODEL         = os.getenv("LLM_MODEL", "llama3.2:3b-instruct:q4_K_M")
+LLM_TIMEOUT_S     = float(os.getenv("LLM_TIMEOUT_S", "25"))
 
 # Password validation
 # https://docs.djangoproject.com/en/4.0/ref/settings/#auth-password-validators

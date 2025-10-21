@@ -20,30 +20,27 @@ class ChatAskView(APIView):
     permission_classes = [IsAdminUser]
 
     def post(self, request):
-        ser = AskSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-        q = ser.validated_data["query"]
-        k_each = ser.validated_data.get("k_each", 8)
-        temperature = ser.validated_data.get("temperature", 0.2)
-        num_predict = ser.validated_data.get("num_predict", 400)
+        q = request.data.get("query") or ""
+        temperature = float(request.data.get("temperature", 0.2))
+        num_predict = int(request.data.get("num_predict", 400))
 
-        emb = EmbeddingClient()
-        llm = LlmClient()
+        llm = LlmClient(
+            base_url=getattr(settings, "LLM_BASE_URL"),
+            path=getattr(settings, "LLM_GENERATE_PATH", "/api/generate"),
+            model=getattr(settings, "LLM_MODEL", "llama3.2:3b-instruct:q4_K_M"),
+            timeout=getattr(settings, "LLM_TIMEOUT_S", 25),
+        )
 
-        # 1) Embed query via Service A
-        qvec = embed_query(q, emb)
-
-        # 2) Vector search in our DB
-        hits = topk_union(qvec, k_each=k_each)
-        context, citations = build_context(hits)
-
-        # 3) Compose prompt for local LLM
-        prompt = f"{SYSTEM_PROMPT}\n\nContext:\n{context}\n\nUser: {q}\nAssistant:"
-        answer = llm.generate(prompt, temperature=temperature, num_predict=num_predict)
-
-        return Response({
-            "answer": answer.strip(),
-            "citations": citations,
-            "retrieval": {k: len(v) for k, v in hits.items()},
-            "model": settings.LLM_MODEL,
-        }, status=status.HTTP_200_OK)
+        try:
+            out = llm.generate(q, temperature=temperature, num_predict=num_predict)
+            return Response({"success": True, "raw": out}, status=200)
+        except Exception as e:
+            return Response(
+                {
+                    "success": False,
+                    "error": str(e),
+                    "hint": "Check LLM_BASE_URL includes http:// or https:// and the service is reachable.",
+                    "resolved_url": llm.url,
+                },
+                status=502,
+            )

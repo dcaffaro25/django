@@ -1,6 +1,7 @@
 import requests
 from typing import Any, Dict, List, Optional, Sequence
 from django.conf import settings
+from urllib.parse import urljoin, urlparse
 
 class EmbeddingClient:
     """Calls Service A (Embeddings) /api/embeddings. Optimized for nomic-embed-text."""
@@ -77,31 +78,34 @@ class EmbeddingClient:
 
 class LlmClient:
     """Local LLM on Service B (Ollama /api/generate)."""
-    def __init__(self,
-                 base_url: str = settings.LLM_BASE_URL,
-                 model: str = settings.LLM_MODEL,
-                 timeout_s: float = settings.LLM_TIMEOUT,
-                 keep_alive: str = settings.EMBED_KEEP):
-        self.url = base_url.rstrip("/") + "/api/generate"
+    def __init__(self, base_url, path="/api/generate", model="llama3.2:3b-instruct:q4_K_M",
+                 timeout=20, headers=None):
+        self.base_url = self._normalize_base(base_url)
+        self.url = urljoin(self.base_url + "/", (path or "/api/generate").lstrip("/"))
         self.model = model
-        self.timeout = timeout_s
-        self.keep_alive = keep_alive
+        self.timeout = timeout
+
         self.sess = requests.Session()
         self.sess.headers.update({"content-type": "application/json"})
+        if headers:
+            self.sess.headers.update(headers)
 
-    def generate(self, prompt: str, **opts) -> str:
+    @staticmethod
+    def _normalize_base(u: str) -> str:
+        if not u:
+            raise ValueError("LLM base URL is not configured")
+        # Auto-add scheme when missing
+        if "://" not in u:
+            u = "http://" + u
+        return u.rstrip("/")
+
+    def generate(self, prompt: str, temperature=0.2, num_predict=400, keep_alive="30m"):
         payload = {
             "model": self.model,
             "prompt": prompt,
-            "keep_alive": self.keep_alive,
-            "options": {
-                "temperature": opts.get("temperature", 0.2),
-                "num_predict": opts.get("num_predict", 400),
-            },
-            "stream": False,
+            "options": {"temperature": temperature, "num_predict": num_predict},
+            "keep_alive": keep_alive,
         }
         r = self.sess.post(self.url, json=payload, timeout=self.timeout)
         r.raise_for_status()
-        data = r.json()
-        # Ollama returns either {'response': '...'} or chunks when stream=true
-        return data.get("response") or data.get("text") or ""
+        return r.json()
