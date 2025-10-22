@@ -97,6 +97,24 @@ LOGGING["loggers"]["recon"] = {
     "propagate": False,
 }
 
+LOGGING["loggers"]["chat"] = {
+    "handlers": ["console_plain"],
+    "level": "DEBUG",
+    "propagate": False,
+}
+LOGGING["loggers"]["chat.view"] = {
+    "handlers": ["console_plain"],
+    "level": "DEBUG",
+    "propagate": False,
+}
+LOGGING["loggers"]["chat.llm"] = {
+    "handlers": ["console_plain"],
+    "level": "DEBUG",
+    "propagate": False,
+}
+# Optional: see requests→urllib3 connection lines (INFO is usually enough)
+import logging as _pylog
+_pylog.getLogger("urllib3.connectionpool").setLevel(_pylog.INFO)
 
 APPEND_SLASH = True  # keep this; helps GET/HEAD without slash
 

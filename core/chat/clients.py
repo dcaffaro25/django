@@ -1,11 +1,10 @@
-import requests
+import json, socket, time, logging, uuid, requests
 from typing import Any, Dict, List, Optional, Sequence
 from django.conf import settings
 from urllib.parse import urljoin, urlparse
-import json
-import logging
-import uuid
-import time
+
+
+
 
 log = logging.getLogger("chat.llm")
 
@@ -82,47 +81,87 @@ class EmbeddingClient:
         return self.embed_many([text])[0]
 
 
-class LlmClient:
-    """
-    Thin client for an Ollama-compatible /api/generate.
-    - Streams JSONL and stitches tokens.
-    - Emits timing metrics: connect_ms, ttfb_ms, stream_ms, total_ms
-    - Logs key steps with a request_id so you can grep logs across services.
-    """
+def _fast_probe(base_url: str, timeout_s: float = 3.0) -> dict:
+    out = {"ok": False, "url": base_url}
+    if "://" not in base_url:
+        base_url = "http://" + base_url
+    base_url = base_url.rstrip("/")
+    pu = urlparse(base_url)
+    host = pu.hostname
+    port = pu.port or (443 if pu.scheme == "https" else 80)
 
-    def __init__(
-        self,
-        base_url: str,
-        path: str = "/api/generate",
-        model: str = "llama3.2:3b-instruct-q4_K_M",
-        timeout: float = 180.0,
-        headers: Optional[Dict[str, str]] = None,
-    ):
-        if not base_url:
-            raise ValueError("LLM base URL is not configured")
+    # TCP check
+    try:
+        t0 = time.perf_counter()
+        with socket.create_connection((host, port), timeout=timeout_s):
+            out["tcp_ms"] = int((time.perf_counter() - t0) * 1000)
+            out["tcp_ok"] = True
+    except Exception as e:
+        out["tcp_ok"] = False
+        out["tcp_err"] = str(e)
+        return out
+
+    # /api/version
+    try:
+        t1 = time.perf_counter()
+        r = requests.get(f"{base_url}/api/version", timeout=timeout_s)
+        out["ver_ms"] = int((time.perf_counter() - t1) * 1000)
+        out["http_code"] = r.status_code
+        out["ok"] = 200 <= r.status_code < 300
+        out["body"] = r.text[:200]
+    except Exception as e:
+        out["http_err"] = str(e)
+    return out
+
+
+class LlmClient:
+    """Ollama /api/generate with detailed debug logging."""
+    def __init__(self, base_url, path="/api/generate", model="llama3.2:3b-instruct-q4_K_M",
+                 timeout=300, headers=None):
+        raw_base = base_url
         if "://" not in base_url:
-            base_url = "http://" + base_url  # auto-scheme for railway.internal
-        self.url = urljoin(base_url.rstrip("/") + "/", (path or "/api/generate").lstrip("/"))
+            base_url = "http://" + base_url
+        self.base_url = base_url.rstrip("/")
+        self.url = urljoin(self.base_url + "/", (path or "/api/generate").lstrip("/"))
         self.model = model
-        self.timeout = float(timeout)
+        self.timeout = timeout
 
         self.sess = requests.Session()
         self.sess.headers.update({"content-type": "application/json"})
         if headers:
             self.sess.headers.update(headers)
 
-        log.debug("LlmClient init url=%s model=%s timeout_s=%.1f", self.url, self.model, self.timeout)
+        log.debug("LlmClient init raw_base=%s base_url=%s url=%s model=%s timeout=%s",
+                  raw_base, self.base_url, self.url, self.model, self.timeout)
 
-    def generate(
-        self,
-        prompt: str,
-        temperature: float = 0.2,
-        num_predict: int = 300,
-        keep_alive: str = "45m",
-        request_id: Optional[str] = None,
-        debug: bool = False,
-    ) -> Dict[str, Any]:
-        rid = request_id or str(uuid.uuid4())
+    def generate(self, prompt: str, temperature=0.2, num_predict=300, keep_alive="45m"):
+        req_id = uuid.uuid4().hex[:8]
+
+        # 0) quick readiness probe
+        probe = _fast_probe(self.base_url, timeout_s=3.0)
+        log.info("[llm %s] probe=%s", req_id, probe)
+        if not probe.get("ok"):
+            raise RuntimeError(f"LLM upstream not ready: {probe}")
+
+        # 1) tiny warmup (non-stream) to avoid first-hit slowness
+        warm_payload = {
+            "model": self.model,
+            "prompt": "ping",
+            "options": {"temperature": 0.0, "num_predict": 4},
+            "keep_alive": keep_alive,
+            "stream": False,
+        }
+        tw0 = time.perf_counter()
+        try:
+            r0 = self.sess.post(self.url, json=warm_payload, timeout=(5, 20))
+            r0.raise_for_status()
+            log.info("[llm %s] warmup ok code=%s in %.1f ms",
+                     req_id, r0.status_code, (time.perf_counter()-tw0)*1000)
+        except Exception as e:
+            log.exception("[llm %s] warmup failed after %.1f ms", req_id, (time.perf_counter()-tw0)*1000)
+            raise RuntimeError(f"LLM warmup failed: {e}")
+
+        # 2) real streamed call
         payload = {
             "model": self.model,
             "prompt": prompt,
@@ -130,97 +169,45 @@ class LlmClient:
             "keep_alive": keep_alive,
             "stream": True,
         }
+        connect_timeout, read_timeout = 5, self.timeout
+        log.info("[llm %s] POST %s model=%s prompt_chars=%d temp=%.2f num_predict=%d",
+                 req_id, self.url, self.model, len(prompt), temperature, num_predict)
 
-        # Split connect/read timeouts: (connect, read)
-        connect_timeout = 5.0
-        read_timeout = max(self.timeout, 5.0)
-
-        log.info(
-            "[%s] LLM call begin url=%s model=%s temp=%.2f num_predict=%s",
-            rid, self.url, self.model, temperature, num_predict
-        )
-
+        text_parts = []
+        bytes_seen = 0
         t0 = time.perf_counter()
-        first_headers = None
-        first_chunk_at = None
-        tok_count = 0
-        bytes_in = 0
-        parts: List[str] = []
-        done_reason = None
-        backend_metrics: Dict[str, Any] = {}
-
         try:
             with self.sess.post(self.url, json=payload, timeout=(connect_timeout, read_timeout), stream=True) as r:
                 r.raise_for_status()
-                first_headers = time.perf_counter()
-                log.debug("[%s] headers ok status=%s", rid, r.status_code)
-
-                for raw in r.iter_lines(decode_unicode=True):
-                    if raw is None or raw == "":
+                for line in r.iter_lines(decode_unicode=True):
+                    if not line:
                         continue
-                    if first_chunk_at is None:
-                        first_chunk_at = time.perf_counter()
-                        log.debug("[%s] first chunk arrived", rid)
-
-                    bytes_in += len(raw)
+                    bytes_seen += len(line)
+                    # log periodic progress
+                    if bytes_seen and bytes_seen % 8192 < 100:
+                        log.debug("[llm %s] stream progress bytes=%d", req_id, bytes_seen)
                     try:
-                        obj = json.loads(raw)
+                        obj = json.loads(line)
                     except Exception:
-                        # If a noisy line occurs, skip but keep counting
-                        log.warning("[%s] non-JSON stream line skipped: %r", rid, raw[:120])
                         continue
-
                     if "response" in obj:
-                        tok = obj["response"]
-                        parts.append(tok)
-                        tok_count += 1
-
-                    # Ollama returns metrics on the 'done' record
-                    if obj.get("done"):
-                        done_reason = obj.get("done_reason")
-                        for k in ("load_duration", "prompt_eval_duration", "eval_duration", "total_duration",
-                                  "eval_count", "prompt_eval_count"):
-                            if k in obj:
-                                backend_metrics[k] = obj[k]
-                        break
-
+                        text_parts.append(obj["response"])
                     if obj.get("error"):
+                        log.error("[llm %s] error in stream: %s", req_id, obj["error"])
                         raise RuntimeError(obj["error"])
-
-        except Exception as e:
-            t_end = time.perf_counter()
-            connect_ms = round((first_headers - t0) * 1000, 1) if first_headers else None
-            ttfb_ms = round((first_chunk_at - first_headers) * 1000, 1) if first_headers and first_chunk_at else None
-            total_ms = round((t_end - t0) * 1000, 1)
-            log.error(
-                "[%s] LLM error: %s | url=%s model=%s connect_ms=%s ttfb_ms=%s total_ms=%s bytes=%s toks=%s",
-                rid, e, self.url, self.model, connect_ms, ttfb_ms, total_ms, bytes_in, tok_count,
-                exc_info=True,
-            )
+                    if obj.get("done"):
+                        break
+        except requests.exceptions.ReadTimeout:
+            elapsed = time.perf_counter() - t0
+            log.exception("[llm %s] ReadTimeout after %.1fs (bytes=%d)", req_id, elapsed, bytes_seen)
+            raise
+        except Exception:
+            elapsed = time.perf_counter() - t0
+            log.exception("[llm %s] exception during stream after %.1fs (bytes=%d)", req_id, elapsed, bytes_seen)
             raise
 
-        t_end = time.perf_counter()
-        connect_ms = round((first_headers - t0) * 1000, 1) if first_headers else None
-        ttfb_ms = round((first_chunk_at - first_headers) * 1000, 1) if first_headers and first_chunk_at else None
-        stream_ms = round((t_end - (first_chunk_at or first_headers or t0)) * 1000, 1)
-        total_ms = round((t_end - t0) * 1000, 1)
-
-        log.info(
-            "[%s] LLM done ok reason=%s toks=%s bytes=%s connect_ms=%s ttfb_ms=%s stream_ms=%s total_ms=%s",
-            rid, done_reason, tok_count, bytes_in, connect_ms, ttfb_ms, stream_ms, total_ms
-        )
-
-        out = {"response": "".join(parts), "done": True, "done_reason": done_reason}
-        if debug:
-            out["metrics"] = {
-                "connect_ms": connect_ms,
-                "ttfb_ms": ttfb_ms,
-                "stream_ms": stream_ms,
-                "total_ms": total_ms,
-                "bytes_in": bytes_in,
-                "tokens": tok_count,
-                "backend": backend_metrics,
-                "url": self.url,
-                "model": self.model,
-            }
-        return out
+        total_ms = (time.perf_counter() - t0) * 1000
+        resp = "".join(text_parts)
+        log.info("[llm %s] done in %.1f ms, bytes=%d, out_chars=%d",
+                 req_id, total_ms, bytes_seen, len(resp))
+        return {"response": resp, "done": True}

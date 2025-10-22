@@ -7,8 +7,7 @@ from django.conf import settings
 from .serializers import AskSerializer
 from .clients import EmbeddingClient, LlmClient
 from .retrieval import embed_query, topk_union, build_context
-import logging
-import time
+import time, logging, uuid
 
 log = logging.getLogger("chat.view")
 
@@ -49,61 +48,66 @@ def _want_debug(request) -> bool:
         return True
     return bool(getattr(settings, "DEBUG", False))  # optional
 
+vlog = logging.getLogger("chat.view")
+
 class ChatAskView(APIView):
     permission_classes = [IsAdminUser]
 
     def post(self, request):
-        t0 = time.perf_counter()
-        q = (request.data.get("query") or "").strip()
+        req_id = request.headers.get("X-Request-Id") or uuid.uuid4().hex[:8]
+        q = request.data.get("query") or ""
         temperature = float(request.data.get("temperature", 0.2))
         num_predict = int(request.data.get("num_predict", 256))
-        debug_resp = _want_debug(request)
-
-        # Log the incoming request (safe fields only)
-        log.info(
-            "chat.ask begin user=%s qlen=%s temp=%.2f num_predict=%s",
-            getattr(request.user, "id", None), len(q), temperature, num_predict
-        )
-        log.debug(
-            "LLM config base=%s path=%s model=%s timeout_s=%s",
-            getattr(settings, "LLM_BASE_URL", None),
-            getattr(settings, "LLM_GENERATE_PATH", "/api/generate"),
-            getattr(settings, "LLM_MODEL", None),
-            getattr(settings, "LLM_TIMEOUT_S", None),
-        )
 
         llm = LlmClient(
             base_url=getattr(settings, "LLM_BASE_URL"),
             path=getattr(settings, "LLM_GENERATE_PATH", "/api/generate"),
             model=getattr(settings, "LLM_MODEL", "llama3.2:3b-instruct-q4_K_M"),
-            timeout=getattr(settings, "LLM_TIMEOUT_S", 180),
+            timeout=getattr(settings, "LLM_TIMEOUT_S", 300),
         )
 
+        vlog.info("[chat %s] ask qchars=%d temp=%.2f num_predict=%d url=%s model=%s",
+                  req_id, len(q), temperature, num_predict, llm.url, llm.model)
+
+        t0 = time.perf_counter()
         try:
-            out = llm.generate(
-                q,
-                temperature=temperature,
-                num_predict=num_predict,
-                request_id=request.headers.get("X-Request-Id"),
-                debug=debug_resp,
-            )
-            t1 = time.perf_counter()
-            log.info("chat.ask ok dur_ms=%s", round((t1 - t0) * 1000, 1))
-
-            body = {"success": True, "response": out.get("response", "")}
-            if debug_resp:
-                body["debug"] = out.get("metrics", {})
-            return Response(body, status=status.HTTP_200_OK)
-
+            out = llm.generate(q, temperature=temperature, num_predict=num_predict)
+            dur_ms = (time.perf_counter() - t0) * 1000
+            preview = (out["response"] or "")[:160]
+            vlog.info("[chat %s] ok in %.1f ms preview=%r", req_id, dur_ms, preview)
+            return Response({"success": True, "response": out["response"], "ms": int(dur_ms)}, status=200)
         except Exception as e:
-            t1 = time.perf_counter()
-            log.exception("chat.ask error dur_ms=%s", round((t1 - t0) * 1000, 1))
+            dur_ms = (time.perf_counter() - t0) * 1000
+            vlog.exception("[chat %s] ERROR in %.1f ms url=%s model=%s", req_id, dur_ms, llm.url, llm.model)
             return Response(
                 {
                     "success": False,
                     "error": str(e),
-                    "resolved_url": getattr(llm, "url", None),
-                    "model": getattr(llm, "model", None),
+                    "resolved_url": llm.url,
+                    "base_url": llm.base_url,
+                    "model": llm.model,
+                    "ms": int(dur_ms),
+                    "request_id": req_id,
                 },
-                status=status.HTTP_502_BAD_GATEWAY,
+                status=502,
             )
+        
+class ChatDiagView(APIView):
+    permission_classes = []  # temporarily open; restrict later
+
+    def get(self, request):
+        from .clients import _fast_probe, LlmClient
+        llm = LlmClient(
+            base_url=getattr(settings, "LLM_BASE_URL"),
+            path=getattr(settings, "LLM_GENERATE_PATH", "/api/generate"),
+            model=getattr(settings, "LLM_MODEL", "llama3.2:3b-instruct-q4_K_M"),
+            timeout=10,
+        )
+        probe = _fast_probe(llm.base_url, timeout_s=3.0)
+        return Response({
+            "LLM_BASE_URL": getattr(settings, "LLM_BASE_URL"),
+            "resolved_base": llm.base_url,
+            "resolved_url": llm.url,
+            "model": llm.model,
+            "probe": probe,
+        })
