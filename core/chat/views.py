@@ -79,7 +79,7 @@ class ChatAskView(APIView):
         options     = body.get("options") or {}
 
         llm = LlmClient(
-            base_url=getattr(settings, "LLM_BASE_URL", "http://chat-service.railway.internal:11434"),
+            base_url="http://chat-service.railway.internal:11434",#getattr(settings, "LLM_BASE_URL", "http://chat-service.railway.internal:11434"),
             path=getattr(settings, "LLM_GENERATE_PATH", "/api/generate"),
             model=model,
             timeout=float(getattr(settings, "LLM_TIMEOUT_S", 120.0)),
