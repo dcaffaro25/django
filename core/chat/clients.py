@@ -136,76 +136,71 @@ class LlmClient:
 
     def generate(self, prompt: str, temperature=0.2, num_predict=300, keep_alive="45m"):
         req_id = uuid.uuid4().hex[:8]
-
-        # 0) quick readiness probe
+    
         probe = _fast_probe(self.base_url, timeout_s=3.0)
         log.info("[llm %s] probe=%s", req_id, probe)
         if not probe.get("ok"):
             raise RuntimeError(f"LLM upstream not ready: {probe}")
-
-        # 1) tiny warmup (non-stream) to avoid first-hit slowness
+    
+        # ---- WARMUP (best-effort) ----
         warm_payload = {
             "model": self.model,
             "prompt": "ping",
-            "options": {"temperature": 0.0, "num_predict": 4},
+            "options": {"temperature": 0.0, "num_predict": 1},
             "keep_alive": keep_alive,
             "stream": False,
         }
         tw0 = time.perf_counter()
         try:
-            r0 = self.sess.post(self.url, json=warm_payload, timeout=(5, 20))
+            # give cold-load real time to finish (connect 5s, read 120s)
+            r0 = self.sess.post(self.url, json=warm_payload, timeout=(5, 120))
             r0.raise_for_status()
-            log.info("[llm %s] warmup ok code=%s in %.1f ms",
-                     req_id, r0.status_code, (time.perf_counter()-tw0)*1000)
+            log.info("[llm %s] warmup ok in %.1f ms", req_id, (time.perf_counter()-tw0)*1000)
         except Exception as e:
-            log.exception("[llm %s] warmup failed after %.1f ms", req_id, (time.perf_counter()-tw0)*1000)
-            raise RuntimeError(f"LLM warmup failed: {e}")
-
-        # 2) real streamed call
+            # DO NOT abort; just log and proceed to main call
+            log.warning("[llm %s] warmup skipped (%s) after %.1f ms",
+                        req_id, str(e), (time.perf_counter()-tw0)*1000)
+    
+        # ---- REAL STREAMED CALL ----
         payload = {
             "model": self.model,
             "prompt": prompt,
-            "options": {"temperature": temperature, "num_predict": num_predict},
+            "options": {
+                "temperature": temperature,
+                "num_predict": num_predict,
+                # threads can help on CPU; wire via env if you like
+                # "num_thread": int(os.getenv("LLM_NUM_THREAD", "8")),
+                # keep other options minimal for reliability
+            },
             "keep_alive": keep_alive,
             "stream": True,
         }
-        connect_timeout, read_timeout = 5, self.timeout
+        connect_timeout, read_timeout = 5, self.timeout  # e.g. 300s
         log.info("[llm %s] POST %s model=%s prompt_chars=%d temp=%.2f num_predict=%d",
                  req_id, self.url, self.model, len(prompt), temperature, num_predict)
-
-        text_parts = []
-        bytes_seen = 0
+    
+        text_parts, bytes_seen = [], 0
         t0 = time.perf_counter()
-        try:
-            with self.sess.post(self.url, json=payload, timeout=(connect_timeout, read_timeout), stream=True) as r:
-                r.raise_for_status()
-                for line in r.iter_lines(decode_unicode=True):
-                    if not line:
-                        continue
-                    bytes_seen += len(line)
-                    # log periodic progress
-                    if bytes_seen and bytes_seen % 8192 < 100:
-                        log.debug("[llm %s] stream progress bytes=%d", req_id, bytes_seen)
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-                    if "response" in obj:
-                        text_parts.append(obj["response"])
-                    if obj.get("error"):
-                        log.error("[llm %s] error in stream: %s", req_id, obj["error"])
-                        raise RuntimeError(obj["error"])
-                    if obj.get("done"):
-                        break
-        except requests.exceptions.ReadTimeout:
-            elapsed = time.perf_counter() - t0
-            log.exception("[llm %s] ReadTimeout after %.1fs (bytes=%d)", req_id, elapsed, bytes_seen)
-            raise
-        except Exception:
-            elapsed = time.perf_counter() - t0
-            log.exception("[llm %s] exception during stream after %.1fs (bytes=%d)", req_id, elapsed, bytes_seen)
-            raise
-
+        with self.sess.post(self.url, json=payload, timeout=(connect_timeout, read_timeout), stream=True) as r:
+            r.raise_for_status()
+            for line in r.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                bytes_seen += len(line)
+                if bytes_seen and bytes_seen % 8192 < 100:
+                    log.debug("[llm %s] stream progress bytes=%d", req_id, bytes_seen)
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if "response" in obj:
+                    text_parts.append(obj["response"])
+                if obj.get("error"):
+                    log.error("[llm %s] stream error: %s", req_id, obj["error"])
+                    raise RuntimeError(obj["error"])
+                if obj.get("done"):
+                    break
+    
         total_ms = (time.perf_counter() - t0) * 1000
         resp = "".join(text_parts)
         log.info("[llm %s] done in %.1f ms, bytes=%d, out_chars=%d",
