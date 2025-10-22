@@ -6,7 +6,7 @@ from django.conf import settings
 
 from .serializers import AskSerializer
 from .clients import EmbeddingClient, LlmClient
-from .retrieval import embed_query, topk_union, build_context, should_use_rag, retrieve_context
+from .retrieval import embed_query, topk_union, build_context, should_use_rag, retrieve_context, json_safe
 import time, logging, uuid
 
 
@@ -132,30 +132,32 @@ class ChatAskView(APIView):
                 options=options,
             )
             ms = int((time.perf_counter() - t0) * 1000)
-            return Response(
-                {
-                    "success": True,
-                    "model": model,
-                    "mode": mode,
-                    "used_rag": use_rag,
-                    "citations": citations,
-                    "response": result.get("response", ""),
-                    "latency_ms": ms,
-                    "raw": result.get("raw"),  # useful for debugging non-stream
-                },
+            
+            payload = {
+                "success": True,
+                "model": model,
+                "mode": mode,
+                "used_rag": use_rag,
+                "citations": citations,
+                "response": result.get("response", ""),
+                "latency_ms": ms,
+                "raw": result.get("raw"),  # useful for debugging non-stream
+            }
+            
+            return Response(json_safe(payload),
                 status=status.HTTP_200_OK,
             )
         except Exception as e:
             log.exception("[chat] LLM error")
-            return Response(
-                {
+            payload = {
                     "success": False,
                     "error": str(e),
                     "base_url": llm.base_url,
                     "url": llm.url,
                     "model": model,
                     "used_rag": use_rag,
-                },
+                }
+            return Response(json_safe(payload),
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
