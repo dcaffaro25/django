@@ -309,15 +309,17 @@ EMBED_TIMEOUT = float(os.getenv("EMBED_TIMEOUT", "15"))      # per request
 EMBED_KEEP    = EMBED_KEEP_ALIVE
 
 LLM_BASE_URL  = os.getenv("LLM_BASE_URL", "https://chat-service-production-d54a.up.railway.app")  # local Ollama on Service B
-LLM_GENERATE_PATH = os.getenv("LLM_GENERATE_PATH", "/api/generate")
-LLM_MODEL     = os.getenv("LLM_MODEL", "llama3.2:3b-instruct-q4_K_M")
 LLM_TIMEOUT   = float(os.getenv("LLM_TIMEOUT", "30"))
 
 LLM_BASE_URL      = os.getenv("LLM_BASE_URL", "http://chat-service.railway.internal:11434")
 LLM_BASE_URL  = "https://chat-service-production-d54a.up.railway.app"
 LLM_GENERATE_PATH = os.getenv("LLM_GENERATE_PATH", "/api/generate")
-LLM_MODEL         = os.getenv("LLM_MODEL", "llama3.2:3b-instruct-q4_K_M")
+LLM_MODEL         = os.getenv("LLM_MODEL", "llama3.2:1b-instruct-q4_K_M")
+LLM_NUM_THREAD = int(os.getenv("LLM_NUM_THREAD", "6"))
 LLM_TIMEOUT_S     = float(os.getenv("LLM_TIMEOUT_S", "25"))
+
+LLM_ENABLE_PROBE  = os.getenv("LLM_ENABLE_PROBE", "0") in ("1","true","yes")
+LLM_ENABLE_WARMUP = os.getenv("LLM_ENABLE_WARMUP", "0") in ("1","true","yes")
 
 # Password validation
 # https://docs.djangoproject.com/en/4.0/ref/settings/#auth-password-validators

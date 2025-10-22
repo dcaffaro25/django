@@ -114,95 +114,113 @@ def _fast_probe(base_url: str, timeout_s: float = 3.0) -> dict:
     return out
 
 
+def _truncate(s: str, n: int = 800) -> str:
+    if not isinstance(s, str):
+        return ""
+    return s if len(s) <= n else s[:n] + f"... ({len(s)} chars)"
+
 class LlmClient:
-    """Ollama /api/generate with detailed debug logging."""
-    def __init__(self, base_url, path="/api/generate", model="llama3.2:3b-instruct-q4_K_M",
-                 timeout=300, headers=None):
-        raw_base = base_url
+    """Ollama /api/generate with detailed debug logging; works with stream or non-stream."""
+    def __init__(
+        self,
+        base_url: str,
+        path: str = "/api/generate",
+        model: str | None = None,
+        timeout: float = 60.0,
+        keep_alive: str | None = None,
+        default_options: dict | None = None,
+        headers: dict | None = None,
+    ):
+        # Normalize base URL
         if "://" not in base_url:
             base_url = "http://" + base_url
         self.base_url = base_url.rstrip("/")
         self.url = urljoin(self.base_url + "/", (path or "/api/generate").lstrip("/"))
-        self.model = model
-        self.timeout = timeout
+
+        self.model = model or getattr(settings, "LLM_MODEL", "llama3.2:3b-instruct-q4_K_M")
+        self.timeout = float(timeout or getattr(settings, "LLM_TIMEOUT_S", 60.0))
+        self.keep_alive = keep_alive or getattr(settings, "LLM_KEEP_ALIVE", "30m")
+        self.default_options = default_options or {
+            "temperature": 0.2,
+            "num_predict": 256,
+            # "num_thread": int(getattr(settings, "LLM_NUM_THREAD", 8)),  # optional
+        }
 
         self.sess = requests.Session()
         self.sess.headers.update({"content-type": "application/json"})
         if headers:
             self.sess.headers.update(headers)
 
-        log.debug("LlmClient init raw_base=%s base_url=%s url=%s model=%s timeout=%s",
-                  raw_base, self.base_url, self.url, self.model, self.timeout)
+        log.debug(
+            "LlmClient init base=%s url=%s model=%s timeout=%.1f keep=%s",
+            self.base_url, self.url, self.model, self.timeout, self.keep_alive
+        )
 
-    def generate(self, prompt: str, temperature=0.2, num_predict=300, keep_alive="45m"):
+    def _merge_options(self, caller_opts: dict | None) -> dict:
+        merged = dict(self.default_options)
+        if caller_opts:
+            merged.update({k: v for k, v in caller_opts.items() if v is not None})
+        return merged
+
+    def generate(
+        self,
+        prompt: str,
+        stream: bool | None = None,
+        keep_alive: str | None = None,
+        options: dict | None = None,
+        connect_timeout: float = 5.0,
+        read_timeout: float | None = None,
+    ):
         req_id = uuid.uuid4().hex[:8]
-    
-        probe = _fast_probe(self.base_url, timeout_s=3.0)
-        log.info("[llm %s] probe=%s", req_id, probe)
-        if not probe.get("ok"):
-            raise RuntimeError(f"LLM upstream not ready: {probe}")
-    
-        # ---- WARMUP (best-effort) ----
-        warm_payload = {
-            "model": self.model,
-            "prompt": "ping",
-            "options": {"temperature": 0.0, "num_predict": 1},
-            "keep_alive": keep_alive,
-            "stream": False,
-        }
-        tw0 = time.perf_counter()
-        try:
-            # give cold-load real time to finish (connect 5s, read 120s)
-            r0 = self.sess.post(self.url, json=warm_payload, timeout=(5, 120))
-            r0.raise_for_status()
-            log.info("[llm %s] warmup ok in %.1f ms", req_id, (time.perf_counter()-tw0)*1000)
-        except Exception as e:
-            # DO NOT abort; just log and proceed to main call
-            log.warning("[llm %s] warmup skipped (%s) after %.1f ms",
-                        req_id, str(e), (time.perf_counter()-tw0)*1000)
-    
-        # ---- REAL STREAMED CALL ----
+
+        # Effective params (non-stream by default: good for Retool)
+        effective_model = self.model
+        effective_stream = bool(stream) if stream is not None else False
+        effective_keep = keep_alive or self.keep_alive
+        effective_options = self._merge_options(options)
+        read_timeout = float(read_timeout or self.timeout)
+
         payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "options": {
-                "temperature": temperature,
-                "num_predict": num_predict,
-                # threads can help on CPU; wire via env if you like
-                # "num_thread": int(os.getenv("LLM_NUM_THREAD", "8")),
-                # keep other options minimal for reliability
-            },
-            "keep_alive": keep_alive,
-            "stream": False,
+            "model": effective_model,
+            "prompt": prompt or "",
+            "options": effective_options,
+            "keep_alive": effective_keep,
+            "stream": effective_stream,
         }
-        
-        payload = {
-              "model": "llama3.2:3b-instruct-q4_K_M",
-              "prompt": "Explain like I'm five: what is 1+1?",
-              "stream": False,
-              "keep_alive": "30m",
-              "options": {
-                "num_predict": 32,
-                "temperature": 0.1,
-                "top_p": 0.9,
-                "num_thread": 8
-              }
-            }
-        
-        connect_timeout, read_timeout = 5, self.timeout  # e.g. 300s
-        log.info("[llm %s] POST %s model=%s prompt_chars=%d temp=%.2f num_predict=%d",
-                 req_id, self.url, self.model, len(prompt), temperature, num_predict)
-    
-        text_parts, bytes_seen = [], 0
+
+        if log.isEnabledFor(logging.INFO):
+            log.info(
+                "[llm %s] POST %s model=%s stream=%s keep=%s opts=%s prompt(%.0f)='%s'",
+                req_id, self.url, effective_model, effective_stream, effective_keep,
+                json.dumps({k: v for k, v in effective_options.items()}, separators=(",", ":")),
+                float(len(payload["prompt"])), _truncate(payload["prompt"], 300)
+            )
+
         t0 = time.perf_counter()
+
+        # If you **don’t** want server streaming, don’t ask requests to stream.
+        if not effective_stream:
+            r = self.sess.post(self.url, json=payload, timeout=(connect_timeout, read_timeout))
+            r.raise_for_status()
+            data = r.json()
+            total_ms = (time.perf_counter() - t0) * 1000.0
+            resp = data.get("response", "")
+            log.info("[llm %s] 200 OK non-stream in %.1f ms, out_chars=%d", req_id, total_ms, len(resp))
+            return {
+                "response": resp,
+                "done": bool(data.get("done", True)),
+                "raw": data,
+                "ms": total_ms,
+            }
+
+        # Streaming branch (NDJSON). Retool won’t display partials, but we support it.
+        text_parts, bytes_seen = [], 0
         with self.sess.post(self.url, json=payload, timeout=(connect_timeout, read_timeout), stream=True) as r:
             r.raise_for_status()
             for line in r.iter_lines(decode_unicode=True):
                 if not line:
                     continue
                 bytes_seen += len(line)
-                if bytes_seen and bytes_seen % 8192 < 100:
-                    log.debug("[llm %s] stream progress bytes=%d", req_id, bytes_seen)
                 try:
                     obj = json.loads(line)
                 except Exception:
@@ -214,9 +232,9 @@ class LlmClient:
                     raise RuntimeError(obj["error"])
                 if obj.get("done"):
                     break
-    
-        total_ms = (time.perf_counter() - t0) * 1000
+
+        total_ms = (time.perf_counter() - t0) * 1000.0
         resp = "".join(text_parts)
-        log.info("[llm %s] done in %.1f ms, bytes=%d, out_chars=%d",
+        log.info("[llm %s] 200 OK stream in %.1f ms, bytes=%d, out_chars=%d",
                  req_id, total_ms, bytes_seen, len(resp))
-        return {"response": resp, "done": True}
+        return {"response": resp, "done": True, "ms": total_ms}

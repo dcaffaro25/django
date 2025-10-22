@@ -51,45 +51,68 @@ def _want_debug(request) -> bool:
 vlog = logging.getLogger("chat.view")
 
 class ChatAskView(APIView):
+    """
+    POST /api/chat/ask/
+    Body (any field optional; present fields override defaults):
+    {
+      "model": "llama3.2:1b-instruct-q4_K_M",
+      "prompt": "Explain like I'm five: what is 1+1?",
+      "stream": false,
+      "keep_alive": "30m",
+      "options": {
+        "num_predict": 32,
+        "temperature": 0.1,
+        "top_p": 0.9,
+        "num_thread": 8
+      }
+    }
+    """
     permission_classes = [IsAdminUser]
 
     def post(self, request):
-        req_id = request.headers.get("X-Request-Id") or uuid.uuid4().hex[:8]
-        q = request.data.get("query") or ""
-        temperature = float(request.data.get("temperature", 0.2))
-        num_predict = int(request.data.get("num_predict", 256))
+        body = request.data or {}
+
+        prompt      = body.get("prompt", "") or ""
+        model       = body.get("model") or getattr(settings, "LLM_MODEL", "llama3.2:1b-instruct-q4_K_M")
+        stream      = body.get("stream")  # may be True/False/None
+        keep_alive  = body.get("keep_alive") or getattr(settings, "LLM_KEEP_ALIVE", "30m")
+        options     = body.get("options") or {}
 
         llm = LlmClient(
-            base_url=getattr(settings, "LLM_BASE_URL"),
+            base_url=getattr(settings, "LLM_BASE_URL", "http://chat-service.railway.internal:11434"),
             path=getattr(settings, "LLM_GENERATE_PATH", "/api/generate"),
-            model=getattr(settings, "LLM_MODEL", "llama3.2:3b-instruct-q4_K_M"),
-            timeout=getattr(settings, "LLM_TIMEOUT_S", 300),
+            model=model,
+            timeout=float(getattr(settings, "LLM_TIMEOUT_S", 120.0)),
         )
 
-        vlog.info("[chat %s] ask qchars=%d temp=%.2f num_predict=%d url=%s model=%s",
-                  req_id, len(q), temperature, num_predict, llm.url, llm.model)
+        log.info(
+            "[chat] ask model=%s stream=%s keep=%s opts=%s prompt_len=%d",
+            model, stream, keep_alive, options, len(prompt)
+        )
 
-        t0 = time.perf_counter()
         try:
-            out = llm.generate(q, temperature=temperature, num_predict=num_predict)
-            dur_ms = (time.perf_counter() - t0) * 1000
-            preview = (out["response"] or "")[:160]
-            vlog.info("[chat %s] ok in %.1f ms preview=%r", req_id, dur_ms, preview)
-            return Response({"success": True, "response": out["response"], "ms": int(dur_ms)}, status=200)
+            result = llm.generate(
+                prompt=prompt,
+                stream=stream,
+                keep_alive=keep_alive,
+                options=options,
+            )
+            # Retool expects a single JSON response (no SSE), so we return the final payload
+            return Response(
+                {"success": True, "model": model, **result},
+                status=status.HTTP_200_OK,
+            )
         except Exception as e:
-            dur_ms = (time.perf_counter() - t0) * 1000
-            vlog.exception("[chat %s] ERROR in %.1f ms url=%s model=%s", req_id, dur_ms, llm.url, llm.model)
+            log.exception("[chat] LLM error")
             return Response(
                 {
                     "success": False,
                     "error": str(e),
-                    "resolved_url": llm.url,
                     "base_url": llm.base_url,
-                    "model": llm.model,
-                    "ms": int(dur_ms),
-                    "request_id": req_id,
+                    "url": llm.url,
+                    "model": model,
                 },
-                status=502,
+                status=status.HTTP_502_BAD_GATEWAY,
             )
         
 class ChatDiagView(APIView):
@@ -102,6 +125,8 @@ class ChatDiagView(APIView):
             path=getattr(settings, "LLM_GENERATE_PATH", "/api/generate"),
             model=getattr(settings, "LLM_MODEL", "llama3.2:3b-instruct-q4_K_M"),
             timeout=10,
+            #enable_probe=False,     # <- set from env if you like
+            #enable_warmup=False,    # <- set from env if you like
         )
         probe = _fast_probe(llm.base_url, timeout_s=3.0)
         return Response({
