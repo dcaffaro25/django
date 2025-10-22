@@ -173,8 +173,22 @@ class LlmClient:
                 # keep other options minimal for reliability
             },
             "keep_alive": keep_alive,
-            "stream": True,
+            "stream": False,
         }
+        
+        payload = {
+              "model": "llama3.2:3b-instruct-q4_K_M",
+              "prompt": "Explain like I'm five: what is 1+1?",
+              "stream": False,
+              "keep_alive": "30m",
+              "options": {
+                "num_predict": 32,
+                "temperature": 0.1,
+                "top_p": 0.9,
+                "num_thread": 8
+              }
+            }
+        
         connect_timeout, read_timeout = 5, self.timeout  # e.g. 300s
         log.info("[llm %s] POST %s model=%s prompt_chars=%d temp=%.2f num_predict=%d",
                  req_id, self.url, self.model, len(prompt), temperature, num_predict)
