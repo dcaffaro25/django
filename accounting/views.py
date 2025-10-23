@@ -96,6 +96,7 @@ from .serializers import EmbedTestSerializer, BackfillSerializer, EmbeddingSearc
 from django.core.cache import cache
 from core.models import Job
 from core.serializers import JobSerializer
+from pgvector.django import CosineDistance
 
 def _mean_date(dates):
     """Return the average (mean) of a list of date objects, or None."""
