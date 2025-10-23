@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Tuple, Optional
 from django.db.models import F, Q
 from pgvector.django import CosineDistance
 from accounting.models import Transaction, BankTransaction, Account
-from .clients import EmbeddingClient
+from accounting.services.embedding_client import EmbeddingClient
 
 
 log = logging.getLogger("chat.rag")
@@ -67,31 +67,52 @@ def _nz(s: Optional[str]) -> str:
 def embed_query(query: str, emb: EmbeddingClient) -> List[float]:
     return emb.embed_one(query)
 
-def search_transactions(qvec, k=10):
+def search_transactions(qvec, company=None, k=10):
+
+    qs = Transaction.objects.filter(
+        description_embedding__isnull=False
+    ).exclude(
+        description_embedding=[]
+    )
+    if company is not None:
+        qs = qs.filter(company=company)
+
     return (
-        Transaction.objects
-        .filter(description_embedding__isnull=False)
-        .annotate(score=CosineDistance("description_embedding", qvec))
-        .order_by("score")[:k]
-        .values("id", "description", "amount", "date", "score")
+        qs.annotate(score=CosineDistance("description_embedding", qvec))
+          .order_by("score")[:k]
+          .values("id", "description", "amount", "date", "score")
     )
 
-def search_bank_transactions(qvec, k=10):
+def search_bank_transactions(qvec, company=None, k=10):
+
+    qs = BankTransaction.objects.filter(
+        description_embedding__isnull=False
+    ).exclude(
+        description_embedding=[]
+    )
+    if company is not None:
+        qs = qs.filter(company=company)
+
     return (
-        BankTransaction.objects
-        .filter(description_embedding__isnull=False)
-        .annotate(score=CosineDistance("description_embedding", qvec))
-        .order_by("score")[:k]
-        .values("id", "description", "amount", "date", "score")
+        qs.annotate(score=CosineDistance("description_embedding", qvec))
+          .order_by("score")[:k]
+          .values("id", "description", "amount", "date", "score")
     )
 
-def search_accounts(qvec, k=10):
+def search_accounts(qvec, company=None, k=10):
+
+    qs = Account.objects.filter(
+        account_description_embedding__isnull=False
+    ).exclude(
+        account_description_embedding=[]
+    )
+    if company is not None:
+        qs = qs.filter(company=company)
+
     return (
-        Account.objects
-        .filter(account_description_embedding__isnull=False)
-        .annotate(score=CosineDistance("account_description_embedding", qvec))
-        .order_by("score")[:k]
-        .values("id", "name", "description", "score")
+        qs.annotate(score=CosineDistance("account_description_embedding", qvec))
+          .order_by("score")[:k]
+          .values("id", "name", "description", "score")
     )
 
 def topk_union(qvec: List[float], company=None, k_each: int = 8) -> Dict[str, List[Dict[str, Any]]]:

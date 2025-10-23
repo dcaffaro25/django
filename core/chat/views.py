@@ -5,10 +5,28 @@ from rest_framework import status
 from django.conf import settings
 
 from .serializers import AskSerializer
-from .clients import EmbeddingClient, LlmClient
+from .clients import LlmClient
+from accounting.services.embedding_client import EmbeddingClient
 from .retrieval import embed_query, topk_union, build_context, should_use_rag, retrieve_context, json_safe
 import time, logging, uuid
 
+import json, math, time, uuid, unicodedata
+from decimal import Decimal
+from typing import Any, Dict, List, Optional, Tuple
+
+from django.conf import settings
+from django.db.models import Q
+from django.utils.timezone import now
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+
+from pgvector.django import CosineDistance
+
+from accounting.models import Transaction, BankTransaction, Account
+from accounting.services.embedding_client import EmbeddingClient
+from .clients import LlmClient  # your existing Ollama client
+import logging
 
 log = logging.getLogger("chat.view")
 
@@ -51,13 +69,13 @@ def _want_debug(request) -> bool:
 
 vlog = logging.getLogger("chat.view")
 
-class ChatAskView(APIView):
+class ChatAskView3(APIView):
     """
     POST /api/chat/ask/
     Body (any field optional; present fields override defaults):
     {
       "model": "llama3.2:1b-instruct-q4_K_M",
-      "prompt": "Explain like I'm five: what is 1+1?",
+      "prompt": "summary of the latest transactions involving Bradesco?",
       "stream": false,
       "keep_alive": "30m",
       "options": {
@@ -66,10 +84,10 @@ class ChatAskView(APIView):
         "top_p": 0.9,
         "num_thread": 8
       },
-      "mode": "auto" | "rag" | "no_rag"
+      "mode": "rag"
     }
     """
-    permission_classes = [IsAdminUser]
+    permission_classes = []#[IsAdminUser]
 
     def post(self, request):
         body = request.data or {}
@@ -178,7 +196,7 @@ class ChatAskView_NoContext(APIView):
       }
     }
     """
-    permission_classes = [IsAdminUser]
+    permission_classes = []#[IsAdminUser]
 
     def post(self, request):
         body = request.data or {}
@@ -247,3 +265,242 @@ class ChatDiagView(APIView):
             "model": llm.model,
             "probe": probe,
         })
+    
+    # -------------------------
+# Small utilities
+# -------------------------
+
+def _json_safe_val(v: Any) -> Any:
+    if isinstance(v, float):
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return float(v)
+    if isinstance(v, Decimal):
+        return float(v)
+    if isinstance(v, dict):
+        return {k: _json_safe_val(v[k]) for k in v}
+    if isinstance(v, list):
+        return [_json_safe_val(x) for x in v]
+    return v
+
+def json_safe(d: Dict[str, Any]) -> Dict[str, Any]:
+    return _json_safe_val(d)
+
+def _company_pk(company):
+    if company is None:
+        return None
+    return getattr(company, "id", company)
+
+def _snippet(s: Optional[str], n: int = 160) -> str:
+    if not s:
+        return ""
+    return s if len(s) <= n else (s[:n] + "…")
+
+def _strip_accents(txt: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFD", txt)
+        if unicodedata.category(c) != "Mn"
+    )
+
+# -------------------------
+# RAG retrieval (Top-K by pgvector)
+# -------------------------
+
+def _search_qs(model, vec, vector_field: str, k: int, value_fields: List[str], company=None) -> List[Dict[str, Any]]:
+    """Shared search utility (mirrors your EmbeddingsSearchView)."""
+    if not vec:
+        return []
+
+    qs = model.objects.filter(**{f"{vector_field}__isnull": False})
+    cid = _company_pk(company)
+    if cid is not None and hasattr(model, "company_id"):
+        qs = qs.filter(company_id=cid)
+
+    qs = (
+        qs.annotate(score=CosineDistance(vector_field, vec))
+          .order_by("score")
+          .values(*value_fields, "score")[:k]
+    )
+
+    out = []
+    for r in qs:
+        score = float(r["score"])
+        out.append({
+            **{f: r[f] for f in value_fields},
+            "score": score,
+            "similarity": 1.0 - score,
+        })
+    return out
+
+def retrieve_context(
+    query: str,
+    emb: EmbeddingClient,
+    company=None,
+    k_each: int = 8,
+    min_similarity: float = 0.10,
+    max_chars: int = 6000,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Build context block and citations, similar to your working EmbeddingsSearchView."""
+    t0 = time.perf_counter()
+    qvec = emb.embed_one(query or " ")
+    emb_ms = int((time.perf_counter() - t0) * 1000)
+
+    # fetch neighbors
+    t1 = time.perf_counter()
+    tx = _search_qs(Transaction, qvec, "description_embedding", k_each,
+                    ["id", "description", "amount", "date"], company)
+    btx = _search_qs(BankTransaction, qvec, "description_embedding", k_each,
+                     ["id", "description", "amount", "date"], company)
+    acc = _search_qs(Account, qvec, "account_description_embedding", k_each,
+                     ["id", "name", "description"], company)
+    search_ms = int((time.perf_counter() - t1) * 1000)
+
+    # apply threshold
+    tx = [r for r in tx if r["similarity"] >= min_similarity]
+    btx = [r for r in btx if r["similarity"] >= min_similarity]
+    acc = [r for r in acc if r["similarity"] >= min_similarity]
+
+    # assemble text context
+    lines, cites = [], []
+    for r in tx:
+        lines.append(f"[TX#{r['id']} sim={r['similarity']:.3f}] {r['date']} ${r['amount']} {_snippet(r.get('description'))}")
+        cites.append({"type": "transaction", "id": r["id"], "similarity": float(r["similarity"])})
+    for r in btx:
+        lines.append(f"[BKT#{r['id']} sim={r['similarity']:.3f}] {r['date']} ${r['amount']} {_snippet(r.get('description'))}")
+        cites.append({"type": "bank_transaction", "id": r["id"], "similarity": float(r["similarity"])})
+    for r in acc:
+        lines.append(f"[ACC#{r['id']} sim={r['similarity']:.3f}] {r['name']} {_snippet(r.get('description'))}")
+        cites.append({"type": "account", "id": r["id"], "similarity": float(r["similarity"])})
+
+    ctx = "\n".join(lines)
+    if len(ctx) > max_chars:
+        ctx = ctx[:max_chars] + "\n..."
+
+    log.info(
+        "chat.rag q='%s' ctx_len=%d cites=%d timings_ms=%s",
+        _snippet(query, 120), len(ctx), len(cites), {"embed": emb_ms, "search": search_ms}
+    )
+    return ctx, cites
+
+def should_use_rag(prompt: str) -> bool:
+    """Simple heuristic: use RAG when the user likely refers to internal data."""
+    p = (prompt or "").lower()
+    return any(
+        kw in p for kw in (
+            "transaction", "transactions", "bank", "banco", "fatura",
+            "lançamento", "extrato", "conta", "account", "receipt", "sumário",
+            "resumo", "trend", "trends", "últimos", "recentes", "pagamento",
+            "payment", "valor", "despesa", "receita", "vendas", "notas"
+        )
+    )
+
+# -------------------------
+# ChatAsk endpoint
+# -------------------------
+
+class ChatAskView(APIView):
+    """
+    POST /api/chat/ask/
+    {
+      "model": "llama3.2:1b-instruct-q4_K_M",
+      "prompt": "summary of the latest transactions involving Bradesco?",
+      "stream": false,
+      "keep_alive": "30m",
+      "options": {"num_predict": 32, "temperature": 0.1, "top_p": 0.9, "num_thread": 8},
+      "mode": "rag",               # "rag" | "no_rag" | "auto"
+      "min_similarity": 0.10,      # optional
+      "k_each": 8                  # optional
+    }
+    """
+    permission_classes = []  # add IsAdminUser / tenant guard as needed
+
+    def post(self, request):
+        body = request.data or {}
+
+        # Inputs / overrides
+        prompt         = body.get("prompt", "") or ""
+        model          = body.get("model") or getattr(settings, "LLM_MODEL", "llama3.2:1b-instruct-q4_K_M")
+        stream         = body.get("stream")  # True/False/None
+        keep_alive     = body.get("keep_alive") or getattr(settings, "LLM_KEEP_ALIVE", "30m")
+        options        = body.get("options") or {}
+        mode           = (body.get("mode") or "auto").lower()
+        min_similarity = float(body.get("min_similarity", 0.10))
+        k_each         = int(body.get("k_each", 8))
+
+        # Tenant/company (adapt to your middleware)
+        company = getattr(request, "company", None)
+
+        # Clients
+        emb = EmbeddingClient(
+            # Use your internal embedding service defaults (already handled inside client)
+            model=getattr(settings, "EMBED_MODEL", "nomic-embed-text"),
+            timeout_s=float(getattr(settings, "EMBED_TIMEOUT_S", 30)),
+            dim=int(getattr(settings, "EMBED_DIM", 768)),
+            keep_alive=getattr(settings, "EMBED_KEEP_ALIVE", "45m"),
+        )
+        llm = LlmClient(
+            base_url=getattr(settings, "LLM_BASE_URL", "http://chat-service.railway.internal:11434"),
+            path=getattr(settings, "LLM_GENERATE_PATH", "/api/generate"),
+            model=model,
+            timeout=float(getattr(settings, "LLM_TIMEOUT_S", 120.0)),
+        )
+
+        use_rag = (mode == "rag") or (mode == "auto" and should_use_rag(prompt))
+        log.info(
+            "[chat] mode=%s use_rag=%s model=%s stream=%s keep=%s opts=%s prompt_len=%d",
+            mode, use_rag, model, stream, keep_alive,
+            json.dumps(options, separators=(",", ":")), len(prompt)
+        )
+
+        final_prompt = prompt
+        citations: List[Dict[str, Any]] = []
+
+        if use_rag:
+            try:
+                ctx, citations = retrieve_context(
+                    prompt, emb=emb, company=company, k_each=k_each, min_similarity=min_similarity
+                )
+                final_prompt = (
+                    f"{SYSTEM_PROMPT}\n\n"
+                    f"# Context (internal knowledge)\n{ctx}\n\n"
+                    f"# User question\n{prompt}\n\n"
+                    f"# Your answer\n"
+                )
+            except Exception as e:
+                log.exception("[chat] RAG failed; falling back to no_rag: %s", e)
+                use_rag = False
+                final_prompt = prompt
+
+        t0 = time.perf_counter()
+        try:
+            result = llm.generate(
+                prompt=final_prompt,
+                stream=stream,
+                keep_alive=keep_alive,
+                options=options,
+            )
+            ms = int((time.perf_counter() - t0) * 1000)
+
+            payload = {
+                "success": True,
+                "model": model,
+                "mode": mode,
+                "used_rag": use_rag,
+                "citations": citations,     # already JSON-safe values
+                "response": result.get("response", ""),
+                "latency_ms": ms,
+                "raw": result.get("raw"),   # only present for non-stream in our client
+            }
+            return Response(json_safe(payload), status=status.HTTP_200_OK)
+
+        except Exception as e:
+            log.exception("[chat] LLM error")
+            payload = {
+                "success": False,
+                "error": str(e),
+                "base_url": getattr(llm, "base_url", None),
+                "url": getattr(llm, "url", None),
+                "model": model,
+                "used_rag": use_rag,
+            }
+            return Response(json_safe(payload), status=status.HTTP_502_BAD_GATEWAY)

@@ -137,7 +137,7 @@ class LlmClient:
         self.base_url = base_url.rstrip("/")
         self.url = urljoin(self.base_url + "/", (path or "/api/generate").lstrip("/"))
 
-        self.model = model or getattr(settings, "LLM_MODEL", "llama3.2:3b-instruct-q4_K_M")
+        self.model = model or getattr(settings, "LLM_MODEL", "llama3.2:1b-instruct-q4_K_M")
         self.timeout = float(timeout or getattr(settings, "LLM_TIMEOUT_S", 60.0))
         self.keep_alive = keep_alive or getattr(settings, "LLM_KEEP_ALIVE", "30m")
         self.default_options = default_options or {

@@ -98,6 +98,8 @@ from core.models import Job
 from core.serializers import JobSerializer
 from pgvector.django import CosineDistance
 
+from core.chat.retrieval import _vec_stats, _snippet, _strip_accents, json_safe
+
 def _mean_date(dates):
     """Return the average (mean) of a list of date objects, or None."""
     ds = [d for d in dates if d]
@@ -2045,9 +2047,9 @@ def _search_qs(model, vec, field_name: str, k: int, values: list[str]):
 
 
 class EmbeddingsSearchView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = []#]IsAdminUser]
 
-    def post(self, request):
+    def post(self, request, tenant_id=None):
         body = request.data or {}
         query = (body.get("query") or "").strip()
         k_each = int(body.get("k_each", 8))
