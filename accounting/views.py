@@ -2090,6 +2090,8 @@ class EmbeddingSemanticSearchView(APIView):
         try:
             emb = EmbeddingClient(model=model_override) if model_override else EmbeddingClient()
             qvec = emb.embed_one(q)
+            if not qvec:
+                return Response({"detail": "Embedding service returned empty vector for query."}, status=400)
         except Exception as e:
             return Response(
                 {"ok": False, "error": f"embedding_failed: {e}"},
@@ -2100,13 +2102,13 @@ class EmbeddingSemanticSearchView(APIView):
         # --- 2) Build base querysets with optional tenant filter & exclude empty vectors
         tx_qs = Transaction.objects.filter(
             Q(description_embedding__isnull=False)
-        ).exclude(description_embedding=[])
+        )
         btx_qs = BankTransaction.objects.filter(
             Q(description_embedding__isnull=False)
-        ).exclude(description_embedding=[])
+        )
         acc_qs = Account.objects.filter(
             Q(account_description_embedding__isnull=False)
-        ).exclude(account_description_embedding=[])
+        )
 
         if company_id is not None:
             tx_qs = tx_qs.filter(company_id=company_id)

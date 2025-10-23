@@ -54,7 +54,7 @@ def embed_query(query: str, emb: EmbeddingClient) -> List[float]:
 def search_transactions(qvec, k=10):
     return (
         Transaction.objects
-        .filter(~Q(description_embedding=[]), description_embedding__isnull=False)
+        .filter(description_embedding__isnull=False)
         .annotate(score=CosineDistance("description_embedding", qvec))
         .order_by("score")[:k]
         .values("id", "description", "amount", "date", "score")
@@ -63,7 +63,7 @@ def search_transactions(qvec, k=10):
 def search_bank_transactions(qvec, k=10):
     return (
         BankTransaction.objects
-        .filter(~Q(description_embedding=[]), description_embedding__isnull=False)
+        .filter(description_embedding__isnull=False)
         .annotate(score=CosineDistance("description_embedding", qvec))
         .order_by("score")[:k]
         .values("id", "description", "amount", "date", "score")
@@ -72,7 +72,7 @@ def search_bank_transactions(qvec, k=10):
 def search_accounts(qvec, k=10):
     return (
         Account.objects
-        .filter(~Q(account_description_embedding=[]), account_description_embedding__isnull=False)
+        .filter(account_description_embedding__isnull=False)
         .annotate(score=CosineDistance("account_description_embedding", qvec))
         .order_by("score")[:k]
         .values("id", "name", "description", "score")
