@@ -7,6 +7,13 @@ from multitenancy.serializers import CompanyMiniSerializer, EntityMiniSerializer
 from django.core.exceptions import ObjectDoesNotExist
 
 
+class EmbeddingSearchSerializer(serializers.Serializer):
+    query = serializers.CharField()
+    k_each = serializers.IntegerField(default=10, min_value=1, max_value=100)
+    company_id = serializers.IntegerField(required=False)
+    min_similarity = serializers.FloatField(required=False, min_value=0.0, max_value=1.0)
+    model = serializers.CharField(required=False)  # optional override (e.g., "nomic-embed-text")
+
 class CurrencySerializer(serializers.ModelSerializer):
     class Meta:
         model = Currency

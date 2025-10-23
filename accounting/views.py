@@ -92,7 +92,7 @@ from rest_framework import status
 from django.conf import settings
 
 #from .permissions import HasEmbeddingsApiKey  # or AllowAny for testing if you prefer
-from .serializers import EmbedTestSerializer, BackfillSerializer
+from .serializers import EmbedTestSerializer, BackfillSerializer, EmbeddingSearchSerializer
 from django.core.cache import cache
 from core.models import Job
 from core.serializers import JobSerializer
@@ -2026,5 +2026,126 @@ class EmbeddingsTestView(APIView):
         vecs = client.embed_texts(d["texts"])
         return Response(
             {"count": len(vecs), "dim": len(vecs[0]) if vecs else 0, "embeddings": vecs, "endpoint": client.url},
+            status=status.HTTP_200_OK,
+        )
+    
+def _search_qs(
+    *, qs, vec_field: str, qvec: List[float], k: int, min_similarity: Optional[float]
+) -> List[Dict[str, Any]]:
+    """
+    Attach cosine distance, filter by min_similarity if provided,
+    order by distance asc (nearest first), slice, and project fields.
+    Returns list of dict with 'distance' and derived 'similarity'.
+    """
+    # NOTE: CosineDistance returns distance = (1 - cosine_similarity)
+    qs = qs.annotate(distance=CosineDistance(vec_field, qvec))
+
+    if min_similarity is not None:
+        # similarity >= X  <=>  distance <= 1 - X
+        qs = qs.filter(distance__lte=1.0 - float(min_similarity))
+
+    qs = qs.order_by("distance")[:k]
+    rows = list(qs.values())  # includes annotated distance
+    for r in rows:
+        d = float(r.get("distance", 0.0))
+        r["distance"] = round(d, 6)
+        r["similarity"] = round(max(0.0, 1.0 - d), 6)
+    return rows
+
+
+class EmbeddingSemanticSearchView(APIView):
+    """
+    POST /api/embeddings/search/
+    {
+      "query": "bradesco card fee reversal",
+      "k_each": 8,
+      "company_id": 123,          # optional tenant filter
+      "min_similarity": 0.55,     # optional threshold 0..1
+      "model": "nomic-embed-text" # optional override
+    }
+
+    Response:
+    {
+      "ok": true,
+      "meta": {...},
+      "transactions": [...],
+      "bank_transactions": [...],
+      "accounts": [...]
+    }
+    """
+    permission_classes = [IsAdminUser]
+
+    def post(self, request):
+        ser = EmbeddingSearchSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        q = ser.validated_data["query"]
+        k_each = ser.validated_data.get("k_each", 10)
+        company_id = ser.validated_data.get("company_id")
+        min_sim = ser.validated_data.get("min_similarity")
+        model_override = ser.validated_data.get("model")
+
+        # --- 1) Embed the query
+        t0 = time.perf_counter()
+        try:
+            emb = EmbeddingClient(model=model_override) if model_override else EmbeddingClient()
+            qvec = emb.embed_one(q)
+        except Exception as e:
+            return Response(
+                {"ok": False, "error": f"embedding_failed: {e}"},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        t_embed_ms = int((time.perf_counter() - t0) * 1000)
+
+        # --- 2) Build base querysets with optional tenant filter & exclude empty vectors
+        tx_qs = Transaction.objects.filter(
+            Q(description_embedding__isnull=False)
+        ).exclude(description_embedding=[])
+        btx_qs = BankTransaction.objects.filter(
+            Q(description_embedding__isnull=False)
+        ).exclude(description_embedding=[])
+        acc_qs = Account.objects.filter(
+            Q(account_description_embedding__isnull=False)
+        ).exclude(account_description_embedding=[])
+
+        if company_id is not None:
+            tx_qs = tx_qs.filter(company_id=company_id)
+            btx_qs = btx_qs.filter(company_id=company_id)
+            acc_qs = acc_qs.filter(company_id=company_id)
+
+        # --- 3) Search (pgvector nearest by cosine distance)
+        t1 = time.perf_counter()
+
+        # Choose explicit value set to keep payload lean
+        tx_qs = tx_qs.values("id", "description", "amount", "date", "company_id")
+        btx_qs = btx_qs.values("id", "description", "amount", "date", "company_id")
+        acc_qs = acc_qs.values("id", "name", "description", "company_id")
+
+        transactions = _search_qs(
+            qs=tx_qs, vec_field="description_embedding", qvec=qvec, k=k_each, min_similarity=min_sim
+        )
+        bank_transactions = _search_qs(
+            qs=btx_qs, vec_field="description_embedding", qvec=qvec, k=k_each, min_similarity=min_sim
+        )
+        accounts = _search_qs(
+            qs=acc_qs, vec_field="account_description_embedding", qvec=qvec, k=k_each, min_similarity=min_sim
+        )
+
+        t_search_ms = int((time.perf_counter() - t1) * 1000)
+
+        return Response(
+            {
+                "ok": True,
+                "meta": {
+                    "query": q,
+                    "k_each": k_each,
+                    "company_id": company_id,
+                    "min_similarity": min_sim,
+                    "model": model_override or None,
+                    "timings_ms": {"embed": t_embed_ms, "search": t_search_ms},
+                },
+                "transactions": transactions,
+                "bank_transactions": bank_transactions,
+                "accounts": accounts,
+            },
             status=status.HTTP_200_OK,
         )
