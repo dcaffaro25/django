@@ -125,11 +125,11 @@ class LlmClient:
         self,
         base_url: str,
         path: str = "/api/generate",
-        model: str | None = None,
+        model: Optional[str] = None,
         timeout: float = 60.0,
-        keep_alive: str | None = None,
-        default_options: dict | None = None,
-        headers: dict | None = None,
+        keep_alive: Optional[str] = None,
+        default_options: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
     ):
         # Normalize base URL
         if "://" not in base_url:
@@ -156,7 +156,7 @@ class LlmClient:
             self.base_url, self.url, self.model, self.timeout, self.keep_alive
         )
 
-    def _merge_options(self, caller_opts: dict | None) -> dict:
+    def _merge_options(self, caller_opts: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         merged = dict(self.default_options)
         if caller_opts:
             merged.update({k: v for k, v in caller_opts.items() if v is not None})
@@ -165,11 +165,11 @@ class LlmClient:
     def generate(
         self,
         prompt: str,
-        stream: bool | None = None,
-        keep_alive: str | None = None,
-        options: dict | None = None,
+        stream: Optional[bool] = None,
+        keep_alive: Optional[str] = None,
+        options: Optional[Dict[str, Any]] = None,
         connect_timeout: float = 5.0,
-        read_timeout: float | None = None,
+        read_timeout: Optional[float] = None,
     ):
         req_id = uuid.uuid4().hex[:8]
 

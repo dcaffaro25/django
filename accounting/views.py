@@ -2075,12 +2075,12 @@ class EmbeddingSemanticSearchView(APIView):
     """
     permission_classes = [IsAdminUser]
 
-    def post(self, request):
+    def post(self, request, tenant_id=None):
         ser = EmbeddingSearchSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         q = ser.validated_data["query"]
         k_each = ser.validated_data.get("k_each", 10)
-        company_id = ser.validated_data.get("company_id")
+        company_id = tenant_id
         min_sim = ser.validated_data.get("min_similarity")
         model_override = ser.validated_data.get("model")
 
