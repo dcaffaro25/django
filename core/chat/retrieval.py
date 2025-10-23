@@ -1,12 +1,12 @@
 import re
 import time
-import logging
+import logging, math, unicodedata
 from typing import List, Dict, Any, Tuple, Optional
 from django.db.models import F, Q
 from pgvector.django import CosineDistance
 from accounting.models import Transaction, BankTransaction, Account
 from .clients import EmbeddingClient
-import math
+
 
 log = logging.getLogger("chat.rag")
 
@@ -16,6 +16,22 @@ RAG_KEYWORDS = [
     "spend", "expense", "revenue", "income", "trend", "summary", "summaries",
     "total", "sum", "avg", "average", "median", "month", "quarter", "year",
 ]
+
+def _vec_stats(v):
+    if not v:
+        return {"len": 0}
+    n = len(v)
+    norm = math.sqrt(sum(x*x for x in v))
+    head = [round(x, 6) for x in v[:8]]
+    return {"len": n, "norm": round(norm, 6), "head": head}
+
+def _snippet(s, n=80):
+    s = s or ""
+    return s if len(s) <= n else s[:n] + "…"
+
+def _strip_accents(s: str) -> str:
+    # Diagnostic helper: try accent-less variant of the query too
+    return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
 
 def json_safe(obj):
     if isinstance(obj, float):

@@ -2030,125 +2030,161 @@ class EmbeddingsTestView(APIView):
             status=status.HTTP_200_OK,
         )
     
-def _search_qs(
-    *, qs, vec_field: str, qvec: List[float], k: int, min_similarity: Optional[float]
-) -> List[Dict[str, Any]]:
-    """
-    Attach cosine distance, filter by min_similarity if provided,
-    order by distance asc (nearest first), slice, and project fields.
-    Returns list of dict with 'distance' and derived 'similarity'.
-    """
-    # NOTE: CosineDistance returns distance = (1 - cosine_similarity)
-    qs = qs.annotate(distance=CosineDistance(vec_field, qvec))
-
-    if min_similarity is not None:
-        # similarity >= X  <=>  distance <= 1 - X
-        qs = qs.filter(distance__lte=1.0 - float(min_similarity))
-
-    qs = qs.order_by("distance")[:k]
-    rows = list(qs.values())  # includes annotated distance
+def _search_qs(model, vec, field_name: str, k: int, values: list[str]):
+    qs = (model.objects
+          .filter(**{f"{field_name}__isnull": False})
+          .annotate(score=CosineDistance(field_name, vec))
+          .order_by("score")[:k])
+    rows = list(qs.values(*values, "score"))
+    # Attach similarity = 1 - distance (pgvector cosine distance = 1 - cosine similarity)
     for r in rows:
-        d = float(r.get("distance", 0.0))
-        r["distance"] = round(d, 6)
-        r["similarity"] = round(max(0.0, 1.0 - d), 6)
+        dist = float(r["score"])
+        r["similarity"] = 1.0 - dist
+        r["score"] = dist
     return rows
 
 
-class EmbeddingSemanticSearchView(APIView):
-    """
-    POST /api/embeddings/search/
-    {
-      "query": "bradesco card fee reversal",
-      "k_each": 8,
-      "company_id": 123,          # optional tenant filter
-      "min_similarity": 0.55,     # optional threshold 0..1
-      "model": "nomic-embed-text" # optional override
-    }
-
-    Response:
-    {
-      "ok": true,
-      "meta": {...},
-      "transactions": [...],
-      "bank_transactions": [...],
-      "accounts": [...]
-    }
-    """
+class EmbeddingsSearchView(APIView):
     permission_classes = [IsAdminUser]
 
-    def post(self, request, tenant_id=None):
-        ser = EmbeddingSearchSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-        q = ser.validated_data["query"]
-        k_each = ser.validated_data.get("k_each", 10)
-        company_id = tenant_id
-        min_sim = ser.validated_data.get("min_similarity")
-        model_override = ser.validated_data.get("model")
+    def post(self, request):
+        body = request.data or {}
+        query = (body.get("query") or "").strip()
+        k_each = int(body.get("k_each", 8))
+        min_similarity = float(body.get("min_similarity", 0.10))
+        debug_mode = body.get("debug") in (True, "true", "1") or request.query_params.get("debug") in ("1", "true", "yes")
 
-        # --- 1) Embed the query
-        t0 = time.perf_counter()
+        # Build embedding (also try an accent-less variant to diagnose)
+        emb = EmbeddingClient()
+        qvec = []
+        qvec_noacc = []
+        timings = {}
         try:
-            emb = EmbeddingClient(model=model_override) if model_override else EmbeddingClient()
-            qvec = emb.embed_one(q)
-            if not qvec:
-                return Response({"detail": "Embedding service returned empty vector for query."}, status=400)
+            import time
+            t0 = time.perf_counter()
+            qvec = emb.embed_one(query or " ")
+            timings["embed"] = int((time.perf_counter() - t0) * 1000)
+
+            if query and query != _strip_accents(query):
+                qvec_noacc = emb.embed_one(_strip_accents(query))
         except Exception as e:
-            return Response(
-                {"ok": False, "error": f"embedding_failed: {e}"},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            log.exception("embed error")
+            return Response({"ok": False, "error": str(e)}, status=502)
+
+        # Corpus coverage
+        tx_n  = Transaction.objects.filter(description_embedding__isnull=False).count()
+        btx_n = BankTransaction.objects.filter(description_embedding__isnull=False).count()
+        acc_n = Account.objects.filter(account_description_embedding__isnull=False).count()
+
+        # TopK (raw)
+        def _search_all(vec):
+            rows = {}
+            t1 = time.perf_counter()
+            rows["transactions"] = _search_qs(
+                Transaction, vec, "description_embedding", k_each,
+                ["id", "description", "amount", "date"]
             )
-        t_embed_ms = int((time.perf_counter() - t0) * 1000)
+            rows["bank_transactions"] = _search_qs(
+                BankTransaction, vec, "description_embedding", k_each,
+                ["id", "description", "amount", "date"]
+            )
+            rows["accounts"] = _search_qs(
+                Account, vec, "account_description_embedding", k_each,
+                ["id", "name", "description"]
+            )
+            timings["search"] = int((time.perf_counter() - t1) * 1000)
+            return rows
 
-        # --- 2) Build base querysets with optional tenant filter & exclude empty vectors
-        tx_qs = Transaction.objects.filter(
-            Q(description_embedding__isnull=False)
+        hits_raw = _search_all(qvec)
+        # Also compute with accent-less query (for comparison) if we produced it
+        hits_raw_noacc = _search_all(qvec_noacc) if qvec_noacc else None
+
+        # Filter by min_similarity
+        def _apply_threshold(rows):
+            out = {}
+            for bucket, items in rows.items():
+                out[bucket] = [
+                    {**r, "description": _snippet(r.get("description") or r.get("name"))}
+                    for r in items if r["similarity"] >= min_similarity
+                ]
+            return out
+
+        hits = _apply_threshold(hits_raw)
+        hits_noacc = _apply_threshold(hits_raw_noacc) if hits_raw_noacc else None
+
+        # Log key debug lines
+        log.info(
+            "emb.search q='%s' len=%d qstats=%s tx=%d btx=%d acc=%d min_sim=%.3f k=%d",
+            _snippet(query, 120), len(qvec), _vec_stats(qvec), tx_n, btx_n, acc_n, min_similarity, k_each
         )
-        btx_qs = BankTransaction.objects.filter(
-            Q(description_embedding__isnull=False)
-        )
-        acc_qs = Account.objects.filter(
-            Q(account_description_embedding__isnull=False)
-        )
+        if qvec_noacc:
+            log.info("emb.search noacc='%s' qstats=%s", _strip_accents(query), _vec_stats(qvec_noacc))
 
-        if company_id is not None:
-            tx_qs = tx_qs.filter(company_id=company_id)
-            btx_qs = btx_qs.filter(company_id=company_id)
-            acc_qs = acc_qs.filter(company_id=company_id)
+        # Show handful of raw neighbors per bucket (even if below threshold)
+        for bucket in ("transactions", "bank_transactions", "accounts"):
+            sample = hits_raw[bucket][:3]
+            log.debug("raw.%s: %s", bucket, [
+                {
+                    "id": r["id"],
+                    "sim": round(r["similarity"], 4),
+                    "dist": round(r["score"], 4),
+                    "text": _snippet(r.get("description") or r.get("name"), 100)
+                } for r in sample
+            ])
 
-        # --- 3) Search (pgvector nearest by cosine distance)
-        t1 = time.perf_counter()
+        # Optional lexical sanity check (does DB contain the term?)
+        lexical = None
+        if debug_mode and query:
+            term = query if len(query) >= 3 else None
+            if term:
+                lexical = {
+                    "tx_like":  list(Transaction.objects.filter(description__icontains=term).values("id","description")[:3]),
+                    "btx_like": list(BankTransaction.objects.filter(description__icontains=term).values("id","description")[:3]),
+                    "acc_like": list(Account.objects.filter(Q(name__icontains=term) | Q(description__icontains=term)).values("id","name","description")[:3]),
+                }
 
-        # Choose explicit value set to keep payload lean
-        tx_qs = tx_qs.values("id", "description", "amount", "date", "company_id")
-        btx_qs = btx_qs.values("id", "description", "amount", "date", "company_id")
-        acc_qs = acc_qs.values("id", "name", "description", "company_id")
-
-        transactions = _search_qs(
-            qs=tx_qs, vec_field="description_embedding", qvec=qvec, k=k_each, min_similarity=min_sim
-        )
-        bank_transactions = _search_qs(
-            qs=btx_qs, vec_field="description_embedding", qvec=qvec, k=k_each, min_similarity=min_sim
-        )
-        accounts = _search_qs(
-            qs=acc_qs, vec_field="account_description_embedding", qvec=qvec, k=k_each, min_similarity=min_sim
-        )
-
-        t_search_ms = int((time.perf_counter() - t1) * 1000)
-
-        return Response(
-            {
-                "ok": True,
-                "meta": {
-                    "query": q,
-                    "k_each": k_each,
-                    "company_id": company_id,
-                    "min_similarity": min_sim,
-                    "model": model_override or None,
-                    "timings_ms": {"embed": t_embed_ms, "search": t_search_ms},
-                },
-                "transactions": transactions,
-                "bank_transactions": bank_transactions,
-                "accounts": accounts,
+        # Build response
+        resp = {
+            "ok": True,
+            "meta": {
+                "query": query,
+                "k_each": k_each,
+                "min_similarity": min_similarity,
+                "model": emb.model,
+                "timings_ms": timings,
+                "counts": {"transactions": tx_n, "bank_transactions": btx_n, "accounts": acc_n},
             },
-            status=status.HTTP_200_OK,
-        )
+            "transactions": hits["transactions"],
+            "bank_transactions": hits["bank_transactions"],
+            "accounts": hits["accounts"],
+        }
+
+        if debug_mode:
+            resp["debug"] = {
+                "query_stats": _vec_stats(qvec),
+                "query_noacc_stats": _vec_stats(qvec_noacc) if qvec_noacc else None,
+                "raw_top": {
+                    "transactions": [
+                        {"id": r["id"], "sim": r["similarity"], "dist": r["score"], "text": _snippet(r.get("description") or "", 120)}
+                        for r in hits_raw["transactions"][:5]
+                    ],
+                    "bank_transactions": [
+                        {"id": r["id"], "sim": r["similarity"], "dist": r["score"], "text": _snippet(r.get("description") or "", 120)}
+                        for r in hits_raw["bank_transactions"][:5]
+                    ],
+                    "accounts": [
+                        {"id": r["id"], "sim": r["similarity"], "dist": r["score"], "text": _snippet(r.get("name") or r.get("description") or "", 120)}
+                        for r in hits_raw["accounts"][:5]
+                    ],
+                },
+                "lexical_samples": lexical,
+                "note": "similarity = 1 - cosine_distance (pgvector). If everything is < threshold, try lowering min_similarity.",
+            }
+            if hits_noacc is not None:
+                resp["debug"]["accentless_top"] = {
+                    "transactions": hits_noacc["transactions"][:5],
+                    "bank_transactions": hits_noacc["bank_transactions"][:5],
+                    "accounts": hits_noacc["accounts"][:5],
+                }
+
+        return Response(resp, status=status.HTTP_200_OK)
