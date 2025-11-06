@@ -779,7 +779,7 @@ class BulkImportTemplateDownloadView(APIView):
             for row_idx, obj in enumerate(queryset, start=3):
                 for col_idx, field in enumerate(columns):
                     value = get_dynamic_value(obj, field)
-                    ref_ws.cell(row=row_idx, column=start_col + col_idx, value=value)
+                    ref_ws.cell(row=row_idx, column=start_col + col_idx, value=_excel_safe(value))
 
             col_position += len(columns) + 1  # Move to next table
 
