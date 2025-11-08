@@ -164,6 +164,8 @@ INSTALLED_APPS = [
     'ML',
     'django_celery_results',
     'pgvector.django',
+    'npl',              # nova app do pipeline
+    'feedback',         # app de feedback supervisionado
 ]
 
 MIDDLEWARE = [
