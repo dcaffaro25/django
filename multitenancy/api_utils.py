@@ -30,7 +30,7 @@ from multitenancy.formula_engine import apply_substitutions
 from django.db.models import Model, QuerySet
 
 import re
-
+from decimal import Decimal, InvalidOperation
 
 
 
@@ -165,6 +165,46 @@ def safe_model_dict(instance, exclude_fields=None):
 
     return data
 
+def _normalize_row_id_token(v):
+    """Remove NBSP, trim e devolve string."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return str(v)
+    return str(v).replace("\u00A0", " ").strip()
+
+_ROWID_NUMERIC_RE = re.compile(r"^\d+(?:\.0+)?$")
+
+def _rowid_to_int_strict(v):
+    """
+    Retorna int se o token do __row_id representar um inteiro puro (ex: 1181 ou 1181.0).
+    Caso contrário, retorna None (trataremos como CREATE).
+    """
+    if v is None:
+        return None
+    s = _normalize_row_id_token(v)
+    if not s:
+        return None
+    # 1) match de padrão numérico (aceita .0, .00 etc)
+    if _ROWID_NUMERIC_RE.fullmatch(s):
+        # tenta Decimal primeiro para evitar float weirdness
+        try:
+            d = Decimal(s)
+            return int(d)  # 1181.0 -> 1181
+        except (InvalidOperation, ValueError):
+            try:
+                return int(float(s))
+            except Exception:
+                return None
+    # 2) tipos numéricos já vindos como int/float
+    if isinstance(v, (int, float)):
+        try:
+            f = float(v)
+            return int(f) if f.is_integer() else None
+        except Exception:
+            return None
+    return None
+
 def _rowid_to_int(row_id):
     """Usa seu _to_int_or_none_soft para permitir '12', 12.0 etc."""
     return _to_int_or_none_soft(row_id)
@@ -267,7 +307,9 @@ class BulkImportPreview(APIView):
                         print(f"[DEBUG] Processing row {i} of model {model_name}")
                         # row_data already has substitutions applied; normalize Nones and drop NaNs if any
                         row_data = {k: (None if (isinstance(v, float) and pd.isna(v)) else v) for k, v in (row_data or {}).items()}
-                        row_id = row_data.pop('__row_id', None)
+                        row_id_raw = row_data.pop('__row_id', None)
+                        row_id = _normalize_row_id_token(row_id_raw)  # <--- normaliza NBSP/espacos
+                        print("  __row_id (raw):", repr(row_id_raw), "-> normalized:", repr(row_id))
                         print("  Raw (substituted) data:", row_data)
                         print("  __row_id:", row_id)
                         
@@ -317,23 +359,21 @@ class BulkImportPreview(APIView):
                                 fk_mappings[field_name] = {"source": fk_ref, "resolved_id": fk_instance.pk}
                         
                             # ------- DECISÃO PELO __row_id -------
-                            int_id = _rowid_to_int(row_id)
+                            int_id = _rowid_to_int_strict(row_id)
                             if int_id is not None:
                                 # __row_id numérico -> EDIT
                                 try:
                                     instance = model.objects.get(pk=int_id)
                                 except model.DoesNotExist:
                                     raise ValueError(f"__row_id '{row_id}' indica edição (id={int_id}), mas o registro não existe.")
-                                # aplica as alterações (ignora 'id' no payload, usamos o do __row_id)
                                 for field, value in row_data.items():
-                                    if field == 'id':
+                                    if field == 'id':  # nunca sobrescreva o id
                                         continue
                                     setattr(instance, field, value)
                                 action = 'edit'
                                 print(f"[EDIT] {model_name} ID {int_id} (via __row_id)")
-                        
                             elif 'id' in row_data and row_data['id']:
-                                # fallback: se o usuário trouxe a coluna 'id'
+                                # fallback via coluna 'id'
                                 try:
                                     instance = model.objects.get(id=row_data['id'])
                                 except model.DoesNotExist:
@@ -342,18 +382,17 @@ class BulkImportPreview(APIView):
                                     setattr(instance, field, value)
                                 action = 'edit'
                                 print(f"[EDIT] {model_name} ID {row_data['id']} (via coluna id)")
-                        
                             else:
-                                # criar novo
                                 instance = model(**row_data)
                                 action = 'create'
                                 print(f"[CREATE] New {model_name} instance")
-                        
+                            
                             instance.save()
+                            
                         
                             if not instance.pk:
                                 raise RuntimeError(f"Save returned no PK for {model_name} row {i}")
-                            if row_id:
+                            if row_id is not None:
                                 row_id_pk[str(row_id)] = int(instance.pk)
                                 row_id_map[str(row_id)] = instance
                                 print(f"[MAP] __row_id '{row_id}' bound to ID {instance.pk}")
@@ -446,7 +485,8 @@ class BulkImportExecute(APIView):
 
                     for i, row in df.iterrows():
                         row_data = row.dropna().to_dict()
-                        row_id = row_data.pop('__row_id', None)
+                        row_id_raw = row_data.pop('__row_id', None)
+                        row_id = _normalize_row_id_token(row_id_raw)
                         try:
                             # Handle FK fields
                             fk_fields = {k: v for k, v in row_data.items() if k.endswith('_fk')}
@@ -472,9 +512,8 @@ class BulkImportExecute(APIView):
                                 row_data[field_name] = fk_instance
                                 del row_data[fk_field]
 
-                            int_id = _rowid_to_int(row_id)
+                            int_id = _rowid_to_int_strict(row_id)
                             if int_id is not None:
-                                # __row_id numérico -> EDIT
                                 try:
                                     instance = model.objects.get(pk=int_id)
                                 except model.DoesNotExist:
@@ -484,19 +523,17 @@ class BulkImportExecute(APIView):
                                         continue
                                     setattr(instance, field, value)
                                 action = 'edit'
+                            elif 'id' in row_data and row_data['id']:
+                                try:
+                                    instance = model.objects.get(id=row_data['id'])
+                                except model.DoesNotExist:
+                                    raise ValueError(f"ID {row_data['id']} (coluna 'id') não encontrado para edição.")
+                                for field, value in row_data.items():
+                                    setattr(instance, field, value)
+                                action = 'edit'
                             else:
-                                # fallback via coluna 'id'
-                                if 'id' in row_data and row_data['id']:
-                                    try:
-                                        instance = model.objects.get(id=row_data['id'])
-                                    except model.DoesNotExist:
-                                        raise ValueError(f"ID {row_data['id']} (coluna 'id') não encontrado para edição.")
-                                    for field, value in row_data.items():
-                                        setattr(instance, field, value)
-                                    action = 'edit'
-                                else:
-                                    instance = model(**row_data)
-                                    action = 'create'
+                                instance = model(**row_data)
+                                action = 'create'
                             
                             instance.save()
                             row_id_map[str(row_id)] = instance
