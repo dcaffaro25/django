@@ -205,6 +205,28 @@ def _rowid_to_int_strict(v):
             return None
     return None
 
+# Accepts: "1181", "1181.0", "-1181", "-1181.000"
+_ROWID_DECISION_RE = re.compile(r"^(-?\d+)(?:\.0+)?$")
+
+def classify_row_id(token: Any) -> tuple[str, Optional[int]]:
+    """
+    Returns ('create', None) | ('edit', id) | ('delete', id)
+    - strings with any letters → create
+    - positive int (or int.0) → edit(id)
+    - negative int (or -int.0) → delete(abs(id))
+    """
+    s = _normalize_row_id_token(token)
+    if not s:
+        return ("create", None)
+    m = _ROWID_DECISION_RE.fullmatch(s)
+    if not m:
+        # has letters or other chars → create
+        return ("create", None)
+    val = int(m.group(1))
+    if val < 0:
+        return ("delete", abs(val))
+    return ("edit", val)
+
 def _rowid_to_int(row_id):
     """Usa seu _to_int_or_none_soft para permitir '12', 12.0 etc."""
     return _to_int_or_none_soft(row_id)
@@ -254,7 +276,13 @@ class BulkImportPreview(APIView):
             file = request.FILES['file']
             print("[INFO] File received:", file.name)
 
-            xls = pd.read_excel(file, sheet_name=None)
+            xls = pd.read_excel(
+                    file,
+                    sheet_name=None,
+                    converters={
+                        "__row_id": lambda x: None if pd.isna(x) else str(x).replace("\u00A0", " ").strip()
+                    },
+                )
             print(f"[INFO] Loaded {len(xls)} sheets from Excel.")
 
             PREFERRED_ORDER = [
@@ -358,41 +386,48 @@ class BulkImportPreview(APIView):
                                 del row_data[fk_field]
                                 fk_mappings[field_name] = {"source": fk_ref, "resolved_id": fk_instance.pk}
                         
-                            # ------- DECISÃO PELO __row_id -------
-                            int_id = _rowid_to_int_strict(row_id)
-                            if int_id is not None:
-                                # __row_id numérico -> EDIT
+                            # ------- DECISION BY __row_id (create/edit/delete) -------
+                            decision, rid = classify_row_id(row_id)
+                            
+                            if decision == "edit":
+                                # __row_id numeric positive → EDIT
                                 try:
-                                    instance = model.objects.get(pk=int_id)
+                                    instance = model.objects.get(pk=rid)
                                 except model.DoesNotExist:
-                                    raise ValueError(f"__row_id '{row_id}' indica edição (id={int_id}), mas o registro não existe.")
+                                    raise ValueError(f"__row_id '{row_id}' indicates edit (id={rid}), but record does not exist.")
                                 for field, value in row_data.items():
-                                    if field == 'id':  # nunca sobrescreva o id
+                                    if field == 'id':  # do not overwrite id
                                         continue
                                     setattr(instance, field, value)
                                 action = 'edit'
-                                print(f"[EDIT] {model_name} ID {int_id} (via __row_id)")
-                            elif 'id' in row_data and row_data['id']:
-                                # fallback via coluna 'id'
-                                try:
-                                    instance = model.objects.get(id=row_data['id'])
-                                except model.DoesNotExist:
-                                    raise ValueError(f"ID {row_data['id']} (coluna 'id') não encontrado para edição.")
-                                for field, value in row_data.items():
-                                    setattr(instance, field, value)
-                                action = 'edit'
-                                print(f"[EDIT] {model_name} ID {row_data['id']} (via coluna id)")
+                                print(f"[EDIT] {model_name} ID {rid} (via __row_id)")
+                            
+                            elif decision == "delete":
+                                # __row_id numeric negative → DELETE (preview-only: verify and mark)
+                                exists = model.objects.filter(pk=rid).exists()
+                                if not exists:
+                                    raise ValueError(f"__row_id '{row_id}' indicates delete (id={rid}), but record does not exist.")
+                                action = 'delete'
+                                instance = model.objects.get(pk=rid)  # only to show data in preview; no delete here
+                                print(f"[DELETE:PREVIEW] {model_name} ID {rid}")
+                            
                             else:
+                                # CREATE
+                                # (fallback: if user also filled 'id', ignore it on create)
+                                row_data.pop('id', None)
                                 instance = model(**row_data)
                                 action = 'create'
                                 print(f"[CREATE] New {model_name} instance")
                             
-                            instance.save()
+                            # Persist (preview runs inside a savepoint and is rolled back later)
+                            if action != 'delete':
+                                instance.save()
+                            else:
+                                # For preview of delete, don't call .delete() (we'll do it in Execute)
+                                pass
                             
-                        
-                            if not instance.pk:
-                                raise RuntimeError(f"Save returned no PK for {model_name} row {i}")
-                            if row_id is not None:
+                            # map row_id to pk for later FKs (use string key)
+                            if row_id is not None and action != 'delete':
                                 row_id_pk[str(row_id)] = int(instance.pk)
                                 row_id_map[str(row_id)] = instance
                                 print(f"[MAP] __row_id '{row_id}' bound to ID {instance.pk}")
@@ -465,7 +500,13 @@ class BulkImportExecute(APIView):
             file = request.FILES['file']
             print("[INFO] File received:", file.name)
 
-            xls = pd.read_excel(file, sheet_name=None)
+            xls = pd.read_excel(
+                    file,
+                    sheet_name=None,
+                    converters={
+                        "__row_id": lambda x: None if pd.isna(x) else str(x).replace("\u00A0", " ").strip()
+                    },
+                )
             print(f"[INFO] Loaded {len(xls)} sheets from Excel.")
 
             row_id_map = {}
@@ -512,38 +553,40 @@ class BulkImportExecute(APIView):
                                 row_data[field_name] = fk_instance
                                 del row_data[fk_field]
 
-                            int_id = _rowid_to_int_strict(row_id)
-                            if int_id is not None:
+                            decision, rid = classify_row_id(row_id)
+
+                            if decision == "edit":
                                 try:
-                                    instance = model.objects.get(pk=int_id)
+                                    instance = model.objects.get(pk=rid)
                                 except model.DoesNotExist:
-                                    raise ValueError(f"__row_id '{row_id}' indica edição (id={int_id}), mas o registro não existe.")
+                                    raise ValueError(f"__row_id '{row_id}' indicates edit (id={rid}), but record does not exist.")
                                 for field, value in row_data.items():
                                     if field == 'id':
                                         continue
                                     setattr(instance, field, value)
                                 action = 'edit'
-                            elif 'id' in row_data and row_data['id']:
-                                try:
-                                    instance = model.objects.get(id=row_data['id'])
-                                except model.DoesNotExist:
-                                    raise ValueError(f"ID {row_data['id']} (coluna 'id') não encontrado para edição.")
-                                for field, value in row_data.items():
-                                    setattr(instance, field, value)
-                                action = 'edit'
+                                instance.save()
+                            
+                            elif decision == "delete":
+                                ok, _ = model.objects.filter(pk=rid).delete()
+                                if ok == 0:
+                                    raise ValueError(f"__row_id '{row_id}' indicates delete (id={rid}), but record does not exist.")
+                                action = 'delete'
+                                instance = None  # no instance to return
+                            
                             else:
+                                # CREATE
+                                row_data.pop('id', None)
                                 instance = model(**row_data)
                                 action = 'create'
-                            
-                            instance.save()
-                            row_id_map[str(row_id)] = instance
+                                instance.save()
                             
                             results.append({
                                 "model": model_name,
                                 "__row_id": row_id,
                                 "status": "success",
-                                "action": action,  # 'edit' ou 'create'
-                                "data": safe_model_dict(instance, exclude_fields=['created_by', 'updated_by', 'is_deleted', 'is_active']),
+                                "action": action,
+                                "data": None if instance is None else safe_model_dict(instance, exclude_fields=['created_by', 'updated_by', 'is_deleted', 'is_active']),
                                 "message": "ok"
                             })
 
