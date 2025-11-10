@@ -16,8 +16,21 @@ from typing import Any, Dict, Iterable, List, Tuple, Optional
 from django.conf import settings
 
 from . import models
+from docling.document_converter import DocumentConverter
+import json
 
-
+def convert_with_docling(pdf_path: str) -> dict:
+    """
+    Converte um PDF usando Docling e retorna o JSON estruturado.
+    """
+    converter = DocumentConverter()
+    # Etapa 2: converte o documento
+    result = converter.convert(pdf_path)
+    # Etapa 3: obtém o objeto DoclingDocument
+    doc = result.document
+    # Etapa 4: exporta para JSON (string)
+    json_str = doc.export_to_json()
+    return json.loads(json_str)
 
 def _split_anchors(text: str) -> List[str]:
     """Divide o campo de âncoras em uma lista, ignorando vazios e espaços."""

@@ -20,6 +20,14 @@ import pytesseract
 from celery import shared_task, group
 from django.db import transaction
 from django.utils import timezone
+from django.conf import settings
+from decimal import Decimal
+from .utils import convert_with_docling, extract_process_number, classify_document_type
+
+
+import warnings
+
+from . import models, utils
 
 try:
     import pdfminer.high_level as pdfminer_high
@@ -54,104 +62,152 @@ def _run_tesseract(image_bytes: bytes, lang: str = 'por+eng', psm: int = 3) -> s
 
 @shared_task
 def ocr_pipeline_task(document_id: int) -> None:
-    """Perform OCR on the given document and classify its type.
+    """
+    Executa o OCR e a classificação inicial de um documento.
 
-    The pipeline performs multi‑engine OCR per page: it uses pdfminer.six to
-    extract native text, then applies Tesseract with two different profiles.
-    For each page, the best result is chosen based on heuristics (presence of
-    legal tokens, density of characters, invalid character ratio).  The
-    aggregated text and metadata are saved to the Document model.  A simple
-    heuristic classifier assigns a preliminary document type.
+    - Converte o PDF usando Docling sempre que possível.
+    - Se Docling falhar, aplica OCR multi-engine (pdfminer + Tesseract).
+    - Atualiza campos de texto OCR e metadados.
+    - Extrai o número do processo e vincula ao documento (criando um Process se necessário).
+    - Classifica o doc_type com base em âncoras.
+    - Enfileira tarefas seguintes: weak labelling, mapping events, embeddings e indexação.
     """
     document = models.Document.objects.get(pk=document_id)
-    file_path = document.file.path
-    per_page_results: List[Dict[str, Any]] = []
-    aggregated_text_parts: List[str] = []
-    # Extract text with pdfminer if available
-    pdf_text: List[str] = []
-    if pdfminer_high:
-        try:
-            # Extract text per page using high level API
-            text = pdfminer_high.extract_text(file_path)
-            pdf_text = text.split('\f')  # pages separated by form feed
-        except Exception as e:
-            logger.exception("pdfminer extraction failed: %s", e)
-    # Use pdfplumber for layout and image extraction
-    if pdfplumber:
-        with pdfplumber.open(file_path) as pdf:
-            for page_index, page in enumerate(pdf.pages):
-                best_text = ''
-                candidates: List[Dict[str, Any]] = []
-                native = pdf_text[page_index].strip() if page_index < len(pdf_text) else ''
-                if native:
-                    candidates.append({
-                        'engine': 'pdfminer',
-                        'profile': 'native',
-                        'text': native,
-                        'confidence': 1.0,
-                    })
-                # Render page to image and apply Tesseract
-                img = page.to_image(resolution=200)
-                buf = io.BytesIO()
-                img.save(buf, format='PNG')
-                image_bytes = buf.getvalue()
-                # Profile A (default)
-                text_a = _run_tesseract(image_bytes, lang='por+eng', psm=3)
-                candidates.append({
-                    'engine': 'tesseract', 'profile': 'A', 'text': text_a, 'confidence': 0.8,
-                })
-                # Profile B (strong for image)
-                text_b = _run_tesseract(image_bytes, lang='por+eng', psm=6)
-                candidates.append({
-                    'engine': 'tesseract', 'profile': 'B', 'text': text_b, 'confidence': 0.7,
-                })
-                # Select best candidate based on heuristics
-                best_candidate = None
-                best_score = -1.0
-                for c in candidates:
-                    text_c = c['text']
-                    if not text_c:
-                        continue
-                    # Compute metrics: ratio of invalid chars, presence of legal tokens
-                    invalid_ratio = sum(1 for ch in text_c if not ch.isprintable()) / max(len(text_c), 1)
-                    legal_tokens = sum(1 for token in ["art.", "§", "CPC"] if token in text_c)
-                    score = c['confidence'] + legal_tokens - invalid_ratio
-                    if score > best_score:
-                        best_score = score
-                        best_candidate = c
-                if best_candidate is None:
-                    best_candidate = {'engine': 'unknown', 'profile': '', 'text': '', 'confidence': 0.0}
-                per_page_results.append(best_candidate)
-                aggregated_text_parts.append(best_candidate.get('text', ''))
-    # Save OCR results
-    full_text = '\n\n'.join(aggregated_text_parts)
-    document.ocr_text = full_text
-    document.num_pages = len(per_page_results)
-    document.ocr_data = per_page_results
-    document.text_hash = _compute_text_hash(full_text)
-    # Simple document type classification heuristic
-    doc_type, confidence = utils.classify_document_type(full_text)
-    document.doc_type = doc_type
-    document.doctype_confidence = confidence
-    # Tenta extrair o número do processo
+    pdf_path = document.file.path
+
+    full_text = ""
+    ocr_data = {}
     try:
-        process_number = utils.extract_process_number(full_text)
+        # Tenta converter com Docling
+        parsed_doc = convert_with_docling(pdf_path)
+        # Concatena textos dos blocos
+        full_text = "\n".join(block["text"] for block in parsed_doc.get("blocks", []))
+        ocr_data = parsed_doc
+        logger.info("Docling processou %s com sucesso", document_id)
     except Exception as e:
-        logger.warning("process number extraction failed for doc %s: %s", document.id, e)
-        process_number = None
-    
+        logger.warning("Docling falhou para %s: %s; recorrendo ao OCR multi-engine",
+                       document_id, e)
+        # Fallback: OCR multi-engine
+        aggregated_text_parts = []
+        per_page_results = []
+        # Extração de texto nativo com pdfminer (pode falhar silenciosamente)
+        pdf_text = []
+        try:
+            from pdfminer.high_level import extract_text
+            text = extract_text(pdf_path)
+            pdf_text = text.split("\f")
+        except Exception as e_miner:
+            logger.warning("pdfminer falhou para %s: %s", document_id, e_miner)
+
+        try:
+            import pdfplumber
+            from PIL import Image
+            import pytesseract
+        except ImportError as ie:
+            logger.error("Dependências de OCR não estão instaladas: %s", ie)
+            pdfplumber = None
+
+        if pdfplumber:
+            try:
+                # Suprime alertas de cores inválidas em PDFs corrompidos
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore", message="Cannot set gray non-stroke color"
+                    )
+                    with pdfplumber.open(pdf_path) as pdf:
+                        for idx, page in enumerate(pdf.pages):
+                            try:
+                                native = pdf_text[idx].strip() if idx < len(pdf_text) else ""
+                                candidates = []
+                                if native:
+                                    candidates.append({
+                                        "engine": "pdfminer",
+                                        "profile": "native",
+                                        "text": native,
+                                        "confidence": 1.0,
+                                    })
+                                # Renderiza página para imagem (200 dpi)
+                                img = page.to_image(resolution=200)
+                                buf = io.BytesIO()
+                                img.save(buf, format="PNG")
+                                image_bytes = buf.getvalue()
+                                # Perfil A (psm 3)
+                                text_a = pytesseract.image_to_string(
+                                    Image.open(io.BytesIO(image_bytes)),
+                                    lang="por+eng",
+                                    config="--psm 3"
+                                )
+                                candidates.append({
+                                    "engine": "tesseract",
+                                    "profile": "A",
+                                    "text": text_a,
+                                    "confidence": 0.8,
+                                })
+                                # Perfil B (psm 6)
+                                text_b = pytesseract.image_to_string(
+                                    Image.open(io.BytesIO(image_bytes)),
+                                    lang="por+eng",
+                                    config="--psm 6"
+                                )
+                                candidates.append({
+                                    "engine": "tesseract",
+                                    "profile": "B",
+                                    "text": text_b,
+                                    "confidence": 0.7,
+                                })
+                                # Seleciona o candidato com mais tokens jurídicos, menos caracteres inválidos etc.
+                                best = max(
+                                    candidates,
+                                    key=lambda c: (
+                                        c["confidence"]
+                                        + sum(1 for t in ["art.", "§", "CPC"] if t in c["text"])
+                                        - sum(1 for ch in c["text"] if not ch.isprintable())
+                                    ),
+                                    default={"engine": "", "profile": "", "text": "", "confidence": 0.0},
+                                )
+                                per_page_results.append(best)
+                                aggregated_text_parts.append(best["text"])
+                            except Exception as e_page:
+                                logger.warning("Erro ao processar página %s do doc %s: %s",
+                                               idx, document_id, e_page)
+                                continue
+            except Exception as e_plumber:
+                logger.exception("Falha ao abrir PDF com pdfplumber para %s: %s", document_id, e_plumber)
+
+        full_text = "\n\n".join(aggregated_text_parts)
+        ocr_data = {"pages": per_page_results}
+
+    # Atualiza o documento com o texto OCR e dados completos
+    document.ocr_text = full_text
+    document.ocr_data = ocr_data
+
+    # Classifica o tipo de documento e confiança
+    doc_type, doc_confidence = classify_document_type(full_text)
+    document.doc_type = doc_type
+    document.doctype_confidence = doc_confidence
+
+    # Extrai o número do processo, criando/vinculando Process
+    process_number = extract_process_number(full_text)
     if process_number:
-        # Cria ou recupera o processo e associa ao documento
         process, _ = models.Process.objects.get_or_create(case_number=process_number)
         document.process = process
         document.process_number_raw = process_number
         document.no_process_found = False
     else:
         document.no_process_found = True
-    
-    document.save()
-    # Aciona rotinas subsequentes (extração de spans, etc.)
-    weak_labelling_task.delay(document.id)
+
+    # Salva todas as alterações atomicamente
+    with transaction.atomic():
+        document.save()
+
+    # Enfileira ou executa diretamente as tarefas subsequentes
+    try:
+        from kombu.exceptions import OperationalError
+        # Weak labelling: extrai spans e sugere E-codes
+        weak_labelling_task.delay(document.id)
+    except OperationalError:
+        # Sem broker (ex.: ambiente local) => executa inline
+        weak_labelling_task(document.id)
 
 
 @shared_task

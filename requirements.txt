@@ -47,6 +47,5 @@ pytesseract>=0.3
 pillow>=10.0
 sentence-transformers>=2.2
 scikit-learn>=1.4
-numpy>=1.23
 meilisearch>=0.29
 python-dateutil>=2.8
