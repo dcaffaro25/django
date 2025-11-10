@@ -20,6 +20,7 @@ from . import utils
 
 
 class DocumentUploadView(generics.CreateAPIView):
+    permission_classes = []
     """Endpoint to upload a PDF and trigger OCR + classification."""
     serializer_class = serializers.DocumentUploadSerializer
 
@@ -35,6 +36,7 @@ class DocumentUploadView(generics.CreateAPIView):
 
 
 class WeakLabelView(APIView):
+    permission_classes = []
     """Endpoint to perform weak labelling (span extraction and E‑code suggestions)."""
     def post(self, request, pk: int):
         document = get_object_or_404(models.Document, pk=pk)
@@ -43,6 +45,7 @@ class WeakLabelView(APIView):
 
 
 class ApplyEventsView(APIView):
+    permission_classes = []
     """Apply suggested events (E‑codes) to a document."""
     def post(self, request, pk: int):
         document = get_object_or_404(models.Document, pk=pk)
@@ -51,6 +54,7 @@ class ApplyEventsView(APIView):
 
 
 class SpanListView(generics.ListAPIView):
+    permission_classes = []
     """List spans for a document."""
     serializer_class = serializers.SpanSerializer
 
@@ -60,6 +64,7 @@ class SpanListView(generics.ListAPIView):
 
 
 class SearchView(APIView):
+    permission_classes = []
     """Hybrid search endpoint combining BM25 and dense embeddings."""
     def post(self, request):
         query = request.data.get('query', '')
@@ -70,6 +75,7 @@ class SearchView(APIView):
 
 
 class PricingRunView(APIView):
+    permission_classes = []
     """Run pricing for a process based on events and structured data."""
     def post(self, request):
         process_id = request.data.get('process_id')
