@@ -12,7 +12,7 @@ from rest_framework.views import APIView
 
 from django.shortcuts import get_object_or_404
 
-from apps.npl import models as npl_models
+from npl import models as npl_models
 from . import models
 from . import serializers
 
