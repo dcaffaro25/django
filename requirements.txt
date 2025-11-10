@@ -49,3 +49,4 @@ sentence-transformers>=2.2
 scikit-learn>=1.4
 meilisearch>=0.29
 python-dateutil>=2.8
+docling=2.61.2
