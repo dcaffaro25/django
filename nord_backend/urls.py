@@ -37,6 +37,8 @@ urlpatterns = [
     path(r'^api/token/refresh/?$', TokenRefreshView.as_view(), name='token_refresh'),
     path("celery/start/", start_task, name="celery_start"),
     path("celery/status/<str:task_id>/", task_status, name="celery_status"),
+    re_path('', include('npl.urls')),
+    re_path('', include('feedback.urls')),
 ]
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
