@@ -133,8 +133,24 @@ def ocr_pipeline_task(document_id: int) -> None:
     doc_type, confidence = utils.classify_document_type(full_text)
     document.doc_type = doc_type
     document.doctype_confidence = confidence
+    # Tenta extrair o número do processo
+    try:
+        process_number = utils.extract_process_number(full_text)
+    except Exception as e:
+        logger.warning("process number extraction failed for doc %s: %s", document.id, e)
+        process_number = None
+    
+    if process_number:
+        # Cria ou recupera o processo e associa ao documento
+        process, _ = models.Process.objects.get_or_create(case_number=process_number)
+        document.process = process
+        document.process_number_raw = process_number
+        document.no_process_found = False
+    else:
+        document.no_process_found = True
+    
     document.save()
-    # Trigger weak labelling automatically
+    # Aciona rotinas subsequentes (extração de spans, etc.)
     weak_labelling_task.delay(document.id)
 
 
@@ -257,6 +273,13 @@ def index_span_task(span_id: int) -> None:
 def apply_events_task(document_id: int) -> None:
     """Map spans to E‑code events and create structured models."""
     document = models.Document.objects.get(pk=document_id)
+    # Se não houver processo, não é possível mapear eventos
+    if not document.process:
+        logger.warning(
+            "apply_events_task chamado para documento %s sem processo; ignorando",
+            document_id
+        )
+        return
     spans = document.spans.all()
     for span in spans:
         codes = utils.map_span_to_event_codes(span)

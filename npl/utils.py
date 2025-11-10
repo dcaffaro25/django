@@ -11,35 +11,62 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple, Optional  
 
 from django.conf import settings
 
 from . import models
 
 
-def classify_document_type(text: str) -> Tuple[str, float]:
-    """Classify the document type based on heuristic rules.
 
-    Returns a tuple of (doctype, confidence).  The function examines the
-    beginning of the text and searches for known anchors such as "É o
-    relatório. Decido.", "ACÓRDÃO", "EDITAL" and keywords indicating
-    certificates or petitions.  A default of ``DESPACHO_MERO_EXPEDIENTE`` is
-    returned when nothing matches.
+def _split_anchors(text: str) -> List[str]:
+    """Divide o campo de âncoras em uma lista, ignorando vazios e espaços."""
+    return [a.strip().lower() for a in text.split(';') if a.strip()]
+
+def extract_process_number(text: str) -> Optional[str]:
+    """
+    Extrai o número do processo do texto usando padrões CNJ.
+
+    Retorna o primeiro número encontrado no formato CNJ (0000000-00.0000.0.00.0000)
+    ou uma sequência de 20 dígitos, ou None se nada for encontrado.
+    """
+    patterns = [
+        r'\b\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}\b',  # formato CNJ com pontos
+        r'\b\d{20}\b',                                # 20 dígitos contínuos
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            return m.group(0)
+    return None
+
+def classify_document_type(text: str) -> Tuple[str, float]:
+    """
+    Classifica o tipo de documento lendo as regras do banco.
+    - Confiança alta (0.9) se encontrar âncora forte.
+    - Confiança moderada (0.6) se encontrar âncora fraca.
+    - Caso contrário, retorna tipo genérico com confiança baixa (0.3).
     """
     lowered = text.lower()
-    rules = [
-        ('SENTENCA', [r'\bé o relat[óo]rio\. decido']),
-        ('ACORDAO', [r'\bac[óo]rd[ãa]o']),
-        ('EDITAL_LEILAO', [r'\bedital\b', r'\bleil[aã]o']),
-        ('AUTO_PENHORA', [r'auto\s+de\s+penhora']),
-        ('PETICAO_EMBARGOS', [r'embargos\s+à\s+execu[çc][aã]o']),
-    ]
-    for doc_type, patterns in rules:
-        for pat in patterns:
-            if re.search(pat, lowered):
-                return doc_type, 0.9
-    return 'DESPACHO_MERO_EXPEDIENTE', 0.3
+
+    # Verificar âncoras fortes e negativas primeiro
+    for rule in models.DocTypeRule.objects.all():
+        negative_anchors = _split_anchors(rule.anchors_negative)
+        if any(neg in lowered for neg in negative_anchors):
+            continue  # ignora este tipo se houver âncora negativa
+
+        strong_anchors = _split_anchors(rule.anchors_strong)
+        if any(strong in lowered for strong in strong_anchors):
+            return rule.doc_type, 0.9
+
+    # Em seguida, procurar âncoras fracas
+    for rule in models.DocTypeRule.objects.all():
+        weak_anchors = _split_anchors(rule.anchors_weak)
+        if any(weak in lowered for weak in weak_anchors):
+            return rule.doc_type, 0.6
+
+    # Nenhuma regra aplicada: retorna tipo padrão
+    return "DESPACHO_MERO_EXPEDIENTE", 0.3
 
 
 def map_span_to_event_codes(span: models.Span) -> List[str]:

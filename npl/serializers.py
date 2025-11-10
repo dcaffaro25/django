@@ -11,10 +11,13 @@ from . import models
 
 
 class DocumentUploadSerializer(serializers.ModelSerializer):
-    """Serializer for uploading a PDF document."""
+    """
+    Serializer para envio de PDF. Apenas o arquivo é enviado; o processo será
+    determinado posteriormente pelo OCR.
+    """
     class Meta:
         model = models.Document
-        fields = ('id', 'process', 'file')
+        fields = ('id', 'file')       # não expor process no upload
         read_only_fields = ('id',)
 
 

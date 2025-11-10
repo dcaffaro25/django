@@ -23,6 +23,37 @@ try:
 except Exception:
     VectorField = None  # type: ignore
 
+class DocTypeRule(models.Model):
+    """
+    Armazena regras de classificação de tipo documental.
+
+    As âncoras de cada categoria (forte, fraca e negativa) são armazenadas em campos
+    de texto, separadas por ';'. Por exemplo: "decido; defiro; julgo procedente".
+    """
+    doc_type = models.CharField(max_length=64, unique=True)
+    description = models.CharField(max_length=255, blank=True)
+
+    # Âncoras fortes: se qualquer âncora forte ocorrer no texto, classifica como este tipo.
+    anchors_strong = models.TextField(
+        blank=True,
+        help_text="Âncoras fortes separadas por ';' (e.g. 'decido; defiro')",
+    )
+
+    # Âncoras fracas: indícios de que o documento pode ser deste tipo.
+    anchors_weak = models.TextField(
+        blank=True,
+        help_text="Âncoras fracas separadas por ';'",
+    )
+
+    # Âncoras negativas: se alguma aparecer, este tipo é ignorado.
+    anchors_negative = models.TextField(
+        blank=True,
+        help_text="Âncoras negativas separadas por ';'",
+    )
+
+    def __str__(self):
+        return f"{self.doc_type} – {self.description}"
+
 
 class Process(models.Model):
     """Represents a judicial process or case.
@@ -52,22 +83,51 @@ class EventType(models.Model):
 
 
 class Document(models.Model):
-    """Represents an uploaded document associated with a process."""
+    """
+    Representa um documento enviado associado a um processo.
 
+    O campo `process` é opcional no momento do upload; a tarefa de OCR tentará
+    extrair o número do processo e criar/associar um processo posteriormente.
+    """
     id = models.BigAutoField(primary_key=True)
-    process = models.ForeignKey(Process, related_name='documents', on_delete=models.CASCADE)
+
+    # Processo associado, se houver; pode ser nulo até que o OCR encontre o número.
+    process = models.ForeignKey(
+        Process,
+        related_name='documents',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        help_text="O processo associado, se conhecido."
+    )
+
+    # Número de processo cru extraído pelo OCR, antes de criar/vincular Process.
+    process_number_raw = models.CharField(
+        max_length=64,
+        blank=True,
+        default='',
+        help_text="Número de processo extraído do texto (formato bruto)."
+    )
+
+    # Marca quando não foi possível detectar um número de processo.
+    no_process_found = models.BooleanField(
+        default=False,
+        help_text="Verdadeiro se nenhum número de processo foi detectado."
+    )
+
+    # Demais campos do documento
     file = models.FileField(upload_to='documents/')
     mime_type = models.CharField(max_length=64, blank=True, default='')
     num_pages = models.IntegerField(default=0)
     text_hash = models.CharField(max_length=64, blank=True, default='')
     ocr_text = models.TextField(blank=True, default='')
-    ocr_data = models.JSONField(default=dict, help_text="Stores per‑page OCR results with engine and profile metadata.")
+    ocr_data = models.JSONField(default=dict, help_text="Resultados de OCR por página com metadados.")
     doc_type = models.CharField(max_length=64, blank=True, default='')
     doctype_confidence = models.FloatField(default=0.0)
     rules_version = models.CharField(max_length=32, blank=True, default='v0')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-
+    
     def __str__(self) -> str:
         return f"Document {self.id} (process {self.process_id})"
 
