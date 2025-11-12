@@ -730,9 +730,9 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 ofx_norm = _digits_no_lz(account_id)
                 bank_acct_obj = (
                     qs.annotate(
-                        branch_s=Cast('branch_id', CharField()),
-                        acct_s=Cast('account_number', CharField()),
-                        ba_concat=Concat('branch_s', 'acct_s', output_field=CharField()),
+                        branch_s=Cast('branch_id', models.CharField()),
+                        acct_s=Cast('account_number', models.CharField()),
+                        ba_concat=Concat('branch_s', 'acct_s', output_field=models.CharField()),
                     )
                     .filter(ba_concat=ofx_norm)
                     .first()
