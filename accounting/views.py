@@ -642,337 +642,270 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         ids = request.data  # Assuming request.data is a list of IDs
         return generic_bulk_delete(self, ids)
     
+    def _scan_ofx_files(self, files_data):
+        """
+        Scan OFX files and classify each transaction as duplicate or pending.
+        This helper does not insert anything into the database; it only inspects
+        the files to inform the user which transactions are duplicates.
+    
+        Returns a list of dictionaries like:
+        {
+          "filename": <optional filename>,
+          "bank": {... bank lookup info ...},
+          "account": {... account lookup info ...},
+          "inserted": 0,     # always zero in scan
+          "duplicates": <num dupes>,
+          "duplicate_ratio": <float 0–1>,
+          "warning": <str or None>,
+          "transactions": [
+            {
+              "date": "YYYY-MM-DD",
+              "amount": 123.45,
+              "transaction_type": "...",
+              "description": "...",
+              "tx_hash": "...",
+              "status": "duplicate" | "pending"
+            },
+            ...
+          ],
+        }
+        """
+        results = []
+        # local helper to strip non-digits / leading zeros
+        def _digits_no_lz(v):
+            import re as _re
+            s = _re.sub(r"\D", "", (v or ""))
+            return s.lstrip("0")
+    
+        for idx, file_item in enumerate(files_data):
+            summary = {
+                "index": idx,
+                "filename": file_item.get("name"),
+                "inserted": 0,
+                "duplicates": 0,
+                "duplicate_ratio": 0.0,
+                "warning": None,
+                "transactions": [],
+            }
+            # decode OFX payload
+            ofx_content = decode_ofx_content(file_item)
+            if not ofx_content:
+                summary["warning"] = "No valid ofx_text or base64Data found."
+                results.append(summary)
+                continue
+            # parse OFX
+            try:
+                parsed = parse_ofx_text(ofx_content)
+            except Exception as exc:
+                summary["warning"] = f"Failed to parse OFX: {exc}"
+                results.append(summary)
+                continue
+    
+            bank_code = parsed.get("bank_code")
+            account_id = parsed.get("account_id")
+            txns = parsed.get("transactions", [])
+            # find bank/account for context (like in original import_ofx)
+            bank_obj = Bank.objects.filter(bank_code=bank_code).first() if bank_code else None
+            # default fields
+            summary["bank"] = {
+                "result": "Success" if bank_obj else "Error",
+                "message": ("Bank found." if bank_obj else f"Bank code '{bank_code}' not found."),
+                "value": BankSerializer(bank_obj).data if bank_obj else bank_code,
+            }
+            account_obj = None
+            if bank_obj:
+                # match by exact account number or by branch+account combination
+                qs = BankAccount.objects.filter(bank__bank_code=bank_code)
+                account_obj = qs.filter(account_number=account_id).first()
+                if not account_obj and account_id:
+                    norm = _digits_no_lz(account_id)
+                    account_obj = (
+                        qs.annotate(
+                            branch_s=Cast("branch_id", CharField()),
+                            acct_s=Cast("account_number", CharField()),
+                            ba_concat=Concat("branch_s", "acct_s", output_field=CharField()),
+                        )
+                        .filter(ba_concat=norm)
+                        .first()
+                    )
+            summary["account"] = {
+                "result": "Success" if account_obj else "Error",
+                "message": ("BankAccount found." if account_obj else f"BankAccount '{account_id}' not found."),
+                "value": BankAccountSerializer(account_obj).data if account_obj else account_id,
+            }
+    
+            dup_count = 0
+            for tx in txns:
+                tx_date_str = tx.get("date")
+                try:
+                    tx_date = datetime.strptime(tx_date_str, "%Y-%m-%d").date()
+                except Exception:
+                    tx_date = None
+                tx_amount = tx.get("amount", 0.0)
+                tx_type = tx.get("transaction_type", "")
+                tx_desc = tx.get("memo", "")
+                # build tx_hash using same fields as in create
+                tx_hash = generate_ofx_transaction_hash(
+                    date_str=tx_date_str or "",
+                    amount=tx_amount,
+                    transaction_type=tx_type,
+                    memo=tx_desc,
+                    bank_number=bank_code,
+                    account_number=account_id,
+                )
+                exists = BankTransaction.objects.filter(tx_hash=tx_hash).exists()
+                if exists:
+                    dup_count += 1
+                summary["transactions"].append({
+                    "date": tx_date_str,
+                    "amount": tx_amount,
+                    "transaction_type": tx_type,
+                    "description": tx_desc,
+                    "tx_hash": tx_hash,
+                    "status": "duplicate" if exists else "pending",
+                })
+    
+            total = len(txns)
+            summary["duplicates"] = dup_count
+            summary["duplicate_ratio"] = (dup_count / total) if total else 0.0
+            if summary["duplicate_ratio"] > 0.8:
+                summary["warning"] = "More than 80% of transactions are duplicates; this file was likely imported before."
+            results.append(summary)
+    
+        return results
+    
     @action(detail=False, methods=['post'])
     def import_ofx(self, request, *args, **kwargs):
         """
-        Accepts a JSON body like:
-        {
-          "files": [
-            { "name": "foo.OFX", "base64Data": "..." },
-            { "ofx_text": "OFXHEADER:100\nDATA:OFXSGML\n..." }
-          ]
-        }
-
-        For each file:
-         - Decode
-         - Parse
-         - Check references
-        Returns a combined structure describing each file's parse and missing references
+        Analyze OFX files and return per-file summaries.
+        No database writes happen here.  Each transaction is labeled as
+        "duplicate" if its tx_hash is already present in the database, otherwise
+        "pending".  A file-level warning is included if most transactions
+        appear to be duplicates.  The result is purely informational.
         """
         files_data = request.data.get("files")
         if not files_data or not isinstance(files_data, list):
             return Response({"error": "Please provide 'files' as a list."},
                             status=status.HTTP_400_BAD_REQUEST)
-
-        import_results = []
-
-        # We'll keep track of overall missing references
-        # But different files can have different bank_code or account_id
-        for idx, file_item in enumerate(files_data):
-            # 1) decode
-            ofx_content = decode_ofx_content(file_item)
-            if not ofx_content:
-                import_results.append({
-                    "index": idx,
-                    "error": "No valid ofx_text or base64Data found.",
-                })
-                continue
-
-            # 2) parse
-            try:
-                parsed = parse_ofx_text(ofx_content)
-            except Exception as e:
-                import_results.append({
-                    "index": idx,
-                    "error": f"Failed to parse OFX: {str(e)}",
-                })
-                continue
-
-            bank_code = int(parsed.get("bank_code"))
-            account_id = parsed.get("account_id")
-            transactions = parsed.get("transactions", [])
-            
-            
-            
-            # 3) check references
-            missing_bank = None
-            missing_bank_account = None
-
-            bank_obj = Bank.objects.filter(bank_code=bank_code).first()
-            if bank_obj:
-                bank_data = {
-                    "result": "Success",
-                    "message": "Bank found.",
-                    "value": BankSerializer(bank_obj).data
-                }
-                bank_num = bank_obj.bank_code
-            else:
-                bank_data = {
-                    "result": "Error",
-                    "message": f"Bank code '{bank_code}' not found.",
-                    "value": bank_code
-                }
-                bank_num = bank_code
-            
-            def _digits_no_lz(v: str) -> str:
-                """Keep only digits and strip leading zeros."""
-                s = re.sub(r'\D', '', (v or ''))
-                return s.lstrip('0')
-            
-
-            
-            qs = BankAccount.objects.filter(bank__bank_code=bank_code)
-            
-            bank_acct_obj = qs.filter(account_number=account_id).first()
-            acct_num = account_id
-            
-            # 2) Fallback: treat OFX number as concat(branch_id + account_number) (DB already trimmed/no LZ)
-            if not bank_acct_obj:
-                ofx_norm = _digits_no_lz(account_id)
-                bank_acct_obj = (
-                    qs.annotate(
-                        branch_s=Cast('branch_id', CharField()),
-                        acct_s=Cast('account_number', CharField()),
-                        ba_concat=Concat('branch_s', 'acct_s', output_field=CharField()),
-                    )
-                    .filter(ba_concat=ofx_norm)
-                    .first()
-                )
-            
-            # 3) Build response
-            if bank_acct_obj:
-                account_data = {
-                    "result": "Success",
-                    "message": "BankAccount found.",
-                    "value": BankAccountSerializer(bank_acct_obj).data,
-                }
-                acct_num = bank_acct_obj.account_number
-            else:
-                account_data = {
-                    "result": "Error",
-                    "message": f"BankAccount '{account_id}' not found.",
-                    "value": account_id,
-                }
-            
-            for tx in transactions:
-                raw_date = tx.get("date")
-                parsed_date = None
-                if raw_date:
-                    try:
-                        parsed_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
-                    except:
-                        pass
-                # build the fields
-                date_str = parsed_date.isoformat() if parsed_date else ""
-                amount_val = tx.get("amount", 0.0)
-                transaction_type = tx.get("transaction_type", "")
-                memo = tx.get("description", "")
-                  # from the DB or your code
-                
-                # 1) Generate the hash
-                tx_hash = generate_ofx_transaction_hash(
-                    date_str=date_str,
-                    amount=amount_val,
-                    transaction_type=transaction_type,
-                    memo=memo,
-                    bank_number=bank_num,
-                    account_number=acct_num
-                )
-                tx['tx_hash'] = tx_hash
-                
-                existing = BankTransaction.objects.filter(tx_hash=tx_hash).first()
-                if existing:
-                    tx['status'] = 'duplicate'
-                else:
-                    tx['status'] = 'pending'
-                    
-            # Summarize result for this file
-            import_results.append({
-                "index": idx,
-                "filename": file_item.get("name"),
-                "bank": bank_data,
-                "account": account_data,
-                "transactions": transactions
-            })
-
+    
+        import_results = self._scan_ofx_files(files_data)
         return Response({"import_results": import_results}, status=status.HTTP_200_OK)
     
     @action(detail=False, methods=['post'])
     def import_ofx_transactions(self, request, *args, **kwargs):
         """
-        Persist a list of OFX files into BankTransaction records.
-
-        Each file in the "files" list should be an object with either
-        ``ofx_text`` containing the raw OFX content or ``base64Data``
-        containing a base64-encoded file, optionally accompanied by a
-        filename.  For every file, we parse the transactions and insert
-        new BankTransaction rows for any transaction that does not already
-        exist in the database (identified by ``tx_hash``).  Existing
-        duplicates are skipped.  If the vast majority of transactions in
-        a file already exist (e.g. >80%), we still import the non-
-        duplicates but include a warning in the response to alert the
-        user that this file appears to have been imported previously.
-
-        Returns a summary for each file with counts of inserted and
-        duplicate transactions and any warnings.  All inserts for a
-        single file are performed atomically.
+        Persist OFX transactions according to an import policy:
+          - 'records' (default): Import all files but only create DB rows for
+            transactions marked 'pending' (non-duplicates).  Files with high
+            duplicate ratios are still processed, but duplicates are skipped.
+          - 'files': Skip any file whose duplicate ratio exceeds 80% and only
+            insert non-duplicate records from the remaining files.
+    
+        The endpoint accepts the same 'files' list as import_ofx.  It returns
+        the scan summary (with duplicates marked) plus insertion counts and a
+        warning if entire files were skipped due to the 'files' policy.
         """
         files_data = request.data.get("files")
         if not files_data or not isinstance(files_data, list):
             return Response({"error": "Please provide 'files' as a list."},
                             status=status.HTTP_400_BAD_REQUEST)
-
+    
+        import_policy = request.data.get("import_policy", "files").strip().lower()
+        if import_policy not in ("records", "files"):
+            return Response({"error": "import_policy must be 'records' or 'files'"},
+                            status=status.HTTP_400_BAD_REQUEST)
+    
+        # First scan files to classify duplicates
+        scanned = self._scan_ofx_files(files_data)
+        duplicate_threshold = 0.80
         results = []
-        # Helper to strip non-digits and leading zeros from account numbers
-        def _digits_no_lz(v: str) -> str:
-            import re as _re
-            s = _re.sub(r'\D', '', (v or ''))
-            return s.lstrip('0')
-
-        for idx, file_item in enumerate(files_data):
-            file_summary = {
-                "index": idx,
-                "filename": file_item.get("name"),
-                "inserted": 0,
-                "duplicates": 0,
-                "transactions": [],
-                "warning": None,
-            }
-            # Decode the file content
-            ofx_content = decode_ofx_content(file_item)
-            if not ofx_content:
-                file_summary["warning"] = "No valid ofx_text or base64Data found."
-                results.append(file_summary)
+    
+        for file_summary in scanned:
+            # Make a copy so we can append insertion results
+            out = dict(file_summary)
+            out["inserted"] = 0  # track new inserts
+            # If policy='files' and duplicate_ratio > threshold, skip the file
+            if (import_policy == "files" and
+                file_summary.get("duplicate_ratio", 0) > duplicate_threshold):
+                out["warning"] = (
+                    out.get("warning") or
+                    "File skipped because more than 80% of transactions were duplicates."
+                )
+                results.append(out)
                 continue
-            # Parse the content
-            try:
-                parsed = parse_ofx_text(ofx_content)
-            except Exception as e:
-                file_summary["warning"] = f"Failed to parse OFX: {str(e)}"
-                results.append(file_summary)
-                continue
-
-            bank_code = parsed.get("bank_code")
-            try:
-                bank_code_int = int(bank_code) if bank_code is not None else None
-            except Exception:
-                bank_code_int = None
-            account_id = parsed.get("account_id")
-            transactions = parsed.get("transactions", [])
-
-            # Lookup Bank and BankAccount
+    
+            # Otherwise, insert non-duplicate transactions
+            tx_infos = file_summary.get("transactions", [])
+            bank_code = file_summary.get("bank", {}).get("value", {}).get("bank_code") \
+                if isinstance(file_summary.get("bank", {}).get("value"), dict) else None
+            account_num = file_summary.get("account", {}).get("value", {}).get("account_number") \
+                if isinstance(file_summary.get("account", {}).get("value"), dict) else None
+    
+            # Re-derive bank/account models
             bank_obj = None
-            bank_num = bank_code_int
-            if bank_code_int is not None:
-                bank_obj = Bank.objects.filter(bank_code=bank_code_int).first()
-                if bank_obj:
-                    bank_num = bank_obj.bank_code
-            # Find bank account by exact account_number or by branch+account
+            if bank_code is not None:
+                bank_obj = Bank.objects.filter(bank_code=bank_code).first()
             bank_acct_obj = None
-            if bank_num is not None:
-                qs = BankAccount.objects.filter(bank__bank_code=bank_num)
-                if account_id:
-                    bank_acct_obj = qs.filter(account_number=account_id).first()
-                if not bank_acct_obj and account_id:
-                    ofx_norm = _digits_no_lz(account_id)
+            if bank_obj and account_num:
+                qs = BankAccount.objects.filter(bank__bank_code=bank_code)
+                bank_acct_obj = qs.filter(account_number=account_num).first()
+                if not bank_acct_obj:
+                    norm = re.sub(r'\D', '', account_num).lstrip('0')
                     bank_acct_obj = (
                         qs.annotate(
-                            branch_s=Cast('branch_id', CharField()),
-                            acct_s=Cast('account_number', CharField()),
-                            ba_concat=Concat('branch_s', 'acct_s', output_field=CharField()),
+                            branch_s=Cast("branch_id", CharField()),
+                            acct_s=Cast("account_number", CharField()),
+                            ba_concat=Concat("branch_s", "acct_s", output_field=CharField()),
                         )
-                        .filter(ba_concat=ofx_norm)
+                        .filter(ba_concat=norm)
                         .first()
                     )
-                if bank_acct_obj:
-                    account_num = bank_acct_obj.account_number
-                else:
-                    account_num = account_id
-            else:
-                account_num = account_id
-
-            # Now process the transactions atomically per file
+    
+            # derive currency and company_id
+            currency_obj = None
+            company_id = None
+            if bank_acct_obj:
+                currency_obj = getattr(bank_acct_obj, "currency", None)
+                company_id = getattr(bank_acct_obj, "company_id", None)
+                if company_id is None and getattr(bank_acct_obj, "entity", None):
+                    company_id = getattr(bank_acct_obj.entity, "company_id", None)
+            elif bank_obj:
+                currency_obj = getattr(bank_obj, "default_currency", None)
+    
             with db_tx.atomic():
-                duplicate_count = 0
-                created_count = 0
-                for tx in transactions:
-                    raw_date = tx.get("date")
+                for tx_info in tx_infos:
+                    if tx_info["status"] != "pending":
+                        continue
+                    # parse date
+                    raw_date = tx_info.get("date")
                     parsed_date = None
                     if raw_date:
                         try:
                             parsed_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
                         except Exception:
                             parsed_date = None
-                    date_str = parsed_date.isoformat() if parsed_date else ""
-                    amount_val = tx.get("amount", 0.0)
-                    transaction_type = tx.get("transaction_type", "")
-                    memo = tx.get("description", "")
-                    # Compute the transaction hash
-                    tx_hash = generate_ofx_transaction_hash(
-                        date_str=date_str,
-                        amount=amount_val,
-                        transaction_type=transaction_type,
-                        memo=memo,
-                        bank_number=bank_num,
-                        account_number=account_num,
-                    )
-                    tx_record = {
-                        "date": raw_date,
-                        "amount": amount_val,
-                        "transaction_type": transaction_type,
-                        "description": memo,
-                        "tx_hash": tx_hash,
-                        "status": "pending",
-                    }
-                    # Check for existing transaction with same hash (avoid duplicates)
-                    exists = BankTransaction.objects.filter(tx_hash=tx_hash).exists()
-                    if exists:
-                        duplicate_count += 1
-                        tx_record["status"] = "duplicate"
-                        file_summary["transactions"].append(tx_record)
-                        continue
-                    # Create new BankTransaction
+                    tx_amount = tx_info.get("amount")
+                    tx_desc = tx_info.get("description")
+                    tx_hash = tx_info.get("tx_hash")
                     try:
-                        # Determine the currency: use bank account's currency if available
-                        currency_obj = None
-                        if bank_acct_obj and getattr(bank_acct_obj, "currency", None):
-                            currency_obj = bank_acct_obj.currency
-                        # Fallback: if Bank has a default currency, use it
-                        elif bank_obj and getattr(bank_obj, "default_currency", None):
-                            currency_obj = bank_obj.default_currency
-                        # Otherwise leave currency as None (model may allow null)
-
-                        new_tx = BankTransaction.objects.create(
-                            company=bank_acct_obj.company,
+                        BankTransaction.objects.create(
+                            company_id=company_id,
                             bank_account=bank_acct_obj,
                             date=parsed_date,
-                            amount=Decimal(str(amount_val)) if amount_val is not None else None,
-                            description=memo,
+                            amount=Decimal(str(tx_amount)) if tx_amount is not None else None,
+                            description=tx_desc,
                             currency=currency_obj,
                             status="pending",
                             tx_hash=tx_hash,
                         )
-                        created_count += 1
-                        tx_record["status"] = "inserted"
-                        tx_record["bank_transaction_id"] = new_tx.id
-                    except Exception as e:
-                        # If creation fails, mark as error and continue
-                        tx_record["status"] = f"error: {str(e)}"
-                    file_summary["transactions"].append(tx_record)
-
-                file_summary["inserted"] = created_count
-                file_summary["duplicates"] = duplicate_count
-                total_tx = len(transactions)
-                if total_tx:
-                    dup_ratio = duplicate_count / float(total_tx)
-                    if dup_ratio > 0.8:
-                        file_summary["warning"] = (
-                            "Most transactions in this file already exist. "
-                            "It may have been imported previously."
-                        )
-
-            results.append(file_summary)
-
+                        out["inserted"] += 1
+                        tx_info["status"] = "inserted"
+                    except Exception as ex:
+                        tx_info["status"] = f"error: {ex}"
+    
+            # Add results for this file
+            results.append(out)
+    
         return Response({"results": results}, status=status.HTTP_200_OK)
     
     @action(detail=False, methods=['get'])
