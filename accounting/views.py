@@ -943,6 +943,7 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                         # Otherwise leave currency as None (model may allow null)
 
                         new_tx = BankTransaction.objects.create(
+                            company=bank_acct_obj.company,
                             bank_account=bank_acct_obj,
                             date=parsed_date,
                             amount=Decimal(str(amount_val)) if amount_val is not None else None,
