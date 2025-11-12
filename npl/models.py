@@ -14,7 +14,7 @@ from django.conf import settings
 from django.contrib.postgres.fields import ArrayField
 from django.db import models
 
-
+from typing import Any, Dict, Iterable, List, Tuple, Optional
 # Attempt to import the VectorField from pgvector.  If pgvector is not
 # installed, fall back to a JSON field for storage.  Users can install
 # ``pgvector`` to enable efficient similarity search.
@@ -89,6 +89,12 @@ class Document(models.Model):
     O campo `process` é opcional no momento do upload; a tarefa de OCR tentará
     extrair o número do processo e criar/associar um processo posteriormente.
     """
+    EMBEDDING_MODE_CHOICES = [
+        ("all_paragraphs", "Todos os parágrafos"),
+        ("spans_only", "Apenas spans"),
+        ("none", "Sem embeddings"),
+    ]
+    
     id = models.BigAutoField(primary_key=True)
 
     # Processo associado, se houver; pode ser nulo até que o OCR encontre o número.
@@ -124,6 +130,16 @@ class Document(models.Model):
     ocr_data = models.JSONField(default=dict, help_text="Resultados de OCR por página com metadados.")
     doc_type = models.CharField(max_length=64, blank=True, default='')
     doctype_confidence = models.FloatField(default=0.0)
+    embedding_mode = models.CharField(
+        max_length=20,
+        choices=EMBEDDING_MODE_CHOICES,
+        default="all_paragraphs",
+        help_text="Define como os embeddings serão gerados para este documento."
+    )
+    processing_stats = models.JSONField(
+        null=True, blank=True,
+        help_text="Métricas de desempenho (tempo, contagem de parágrafos, spans etc.)"
+    )
     rules_version = models.CharField(max_length=32, blank=True, default='v0')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -131,6 +147,52 @@ class Document(models.Model):
     def __str__(self) -> str:
         return f"Document {self.id} (process {self.process_id})"
 
+class SpanRule(models.Model):
+    """
+    Regras de extração de spans.
+
+    - label: rótulo principal (ex.: 'PENHORA', 'FUNDAMENTACAO').
+    - description: descrição amigável.
+    - anchors_strong, anchors_weak, anchors_negative: listas de âncoras separadas por ';'.
+    - embedding_model: nome do modelo usado nas similaridades (por enquanto, 'nomic').
+    - anchor_embeddings: lista de vetores (um por âncora forte), armazenados como JSON.
+    """
+
+    label = models.CharField(max_length=64, unique=True)
+    description = models.CharField(max_length=255, blank=True)
+
+    anchors_strong = models.TextField(
+        blank=True,
+        help_text="Âncoras fortes separadas por ';' (e.g. 'converto a penhora; defiro a penhora')",
+    )
+    anchors_weak = models.TextField(
+        blank=True,
+        help_text="Âncoras fracas separadas por ';'",
+    )
+    anchors_negative = models.TextField(
+        blank=True,
+        help_text="Âncoras negativas separadas por ';'",
+    )
+
+    embedding_model = models.CharField(
+        max_length=128,
+        default="nomic-embed-text",
+        help_text="Modelo de embedding usado nas similaridades (usar 'nomic' por padrão)",
+    )
+    # Salva o embedding de cada âncora forte; armazenado como lista de listas em JSON
+    anchor_embeddings = models.JSONField(null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.label} – {self.description}"
+
+    def strong_anchor_list(self) -> List[str]:
+        return [a.strip() for a in self.anchors_strong.split(';') if a.strip()]
+
+    def weak_anchor_list(self) -> List[str]:
+        return [a.strip() for a in self.anchors_weak.split(';') if a.strip()]
+
+    def negative_anchor_list(self) -> List[str]:
+        return [a.strip() for a in self.anchors_negative.split(';') if a.strip()]
 
 class Span(models.Model):
     """Represents a labelled span of text extracted from a document.
@@ -149,6 +211,9 @@ class Span(models.Model):
     char_start = models.IntegerField(default=0)
     char_end = models.IntegerField(default=0)
     bbox = models.JSONField(null=True, blank=True)
+    strong_anchor_count = models.IntegerField(default=0)
+    weak_anchor_count = models.IntegerField(default=0)
+    negative_anchor_count = models.IntegerField(default=0)
     anchors_pos = models.JSONField(null=True, blank=True)
     anchors_neg = models.JSONField(null=True, blank=True)
     confidence = models.FloatField(default=0.0)

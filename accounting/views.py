@@ -100,6 +100,16 @@ from pgvector.django import CosineDistance
 
 from core.chat.retrieval import _vec_stats, _snippet, _strip_accents, json_safe
 
+from rest_framework import viewsets
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from django.db.models import Q
+from .models import ReconciliationPipeline
+from .serializers import (
+    ReconciliationPipelineSerializer,
+    ResolvedReconciliationPipelineSerializer,
+)
+
 def _mean_date(dates):
     """Return the average (mean) of a list of date objects, or None."""
     ds = [d for d in dates if d]
@@ -345,6 +355,7 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     
 # Transaction ViewSet
 class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
+    permission_classes = []
     #queryset = Transaction.objects.select_related('company').prefetch_related('journal_entries')
     queryset = (
         Transaction.objects
@@ -700,22 +711,46 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     "value": bank_code
                 }
                 bank_num = bank_code
+            
+            def _digits_no_lz(v: str) -> str:
+                """Keep only digits and strip leading zeros."""
+                s = re.sub(r'\D', '', (v or ''))
+                return s.lstrip('0')
+            
 
-            bank_acct_obj = BankAccount.objects.filter(bank__bank_code=bank_code, account_number=account_id).first()
+            
+            qs = BankAccount.objects.filter(bank__bank_code=bank_code)
+            
+            bank_acct_obj = qs.filter(account_number=account_id).first()
+            acct_num = account_id
+            
+            # 2) Fallback: treat OFX number as concat(branch_id + account_number) (DB already trimmed/no LZ)
+            if not bank_acct_obj:
+                ofx_norm = _digits_no_lz(account_id)
+                bank_acct_obj = (
+                    qs.annotate(
+                        branch_s=Cast('branch_id', CharField()),
+                        acct_s=Cast('account_number', CharField()),
+                        ba_concat=Concat('branch_s', 'acct_s', output_field=CharField()),
+                    )
+                    .filter(ba_concat=ofx_norm)
+                    .first()
+                )
+            
+            # 3) Build response
             if bank_acct_obj:
                 account_data = {
                     "result": "Success",
                     "message": "BankAccount found.",
-                    "value": BankAccountSerializer(bank_acct_obj).data
+                    "value": BankAccountSerializer(bank_acct_obj).data,
                 }
                 acct_num = bank_acct_obj.account_number
             else:
                 account_data = {
                     "result": "Error",
                     "message": f"BankAccount '{account_id}' not found.",
-                    "value": account_id
+                    "value": account_id,
                 }
-                acct_num = account_id
             
             for tx in transactions:
                 raw_date = tx.get("date")
@@ -1033,459 +1068,7 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     
         # CHANGED: richer return
         return Response({"created": created_records, "problems": problems})
-    '''
-    @action(detail=False, methods=['post'])
-    def finalize_reconciliation_matches(self, request, *args, **kwargs):
-        """
-        Finalize a batch of reconciliation matches (optionally creating an adjustment on one side).
-        """
-        request_id = str(uuid.uuid4())
-
-        data = request.data
-        matches = data.get("matches", [])
-        adjustment_side = data.get("adjustment_side", "none")  # "bank" | "journal" | "none"
-        reference = data.get("reference", "")
-        notes = data.get("notes", "")
-
-        _info("finalize_begin",
-              request_id=request_id,
-              n_matches=len(matches),
-              adjustment_side=adjustment_side,
-              reference=reference or "",
-              notes_len=len(notes or ""))
-
-        created_ids = []
-        problems = []
-
-        with db_tx.atomic():
-            for idx, match in enumerate(matches, start=1):
-                try:
-                    raw_bank = match.get("bank_transaction_ids", [])
-                    raw_journal = match.get("journal_entry_ids", [])
-                    bank_ids = list({int(x) for x in raw_bank if x is not None})
-                    journal_ids = list({int(x) for x in raw_journal if x is not None})
-
-                    _dbg("match_recv",
-                         request_id=request_id, i=idx,
-                         bank_ids=bank_ids, journal_ids=journal_ids)
-
-                    if not bank_ids or not journal_ids:
-                        problems.append({"reason": "empty_ids", "match": match})
-                        _warn("match_skip_empty_ids", request_id=request_id, i=idx)
-                        continue
-
-                    # Guard: already reconciled as matched/approved
-                    already = BankTransaction.objects.filter(
-                        id__in=bank_ids, reconciliations__status__in=["matched", "approved"]
-                    ).exists() or JournalEntry.objects.filter(
-                        id__in=journal_ids, reconciliations__status__in=["matched", "approved"]
-                    ).exists()
-                    _dbg("match_precheck_already",
-                         request_id=request_id, i=idx, already_reconciled=already)
-
-                    if already:
-                        problems.append({"reason": "already_reconciled",
-                                         "bank_ids": bank_ids, "journal_ids": journal_ids})
-                        _warn("match_skip_already_reconciled", request_id=request_id, i=idx)
-                        continue
-
-                    sp = db_tx.savepoint()
-                    try:
-                        bank_qs = (BankTransaction.objects
-                                   .select_for_update()
-                                   #.select_related("bank_account", "currency")
-                                   .filter(id__in=bank_ids).select_for_update(of=('self',)))
-                        je_qs = (JournalEntry.objects
-                                 .select_for_update()
-                                 #.select_related("account", "account__bank_account",
-                                 #                "transaction", "transaction__currency")
-                                 .filter(id__in=journal_ids).select_for_update(of=('self',)))
-
-                        bank_txs = list(bank_qs)
-                        journal_entries = list(je_qs)
-
-                        _dbg("match_locked_counts",
-                             request_id=request_id, i=idx,
-                             bank_locked=len(bank_txs), journal_locked=len(journal_entries))
-
-                        if not bank_txs or not journal_entries:
-                            problems.append({"reason": "not_found",
-                                             "bank_ids": bank_ids, "journal_ids": journal_ids})
-                            _warn("match_skip_not_found", request_id=request_id, i=idx)
-                            db_tx.savepoint_commit(sp)
-                            continue
-
-                        company_set = {bt.company_id for bt in bank_txs} | {je.company_id for je in journal_entries}
-                        currency_set = {bt.currency_id for bt in bank_txs} | {
-                            je.transaction.currency_id for je in journal_entries if je.transaction_id
-                        }
-
-                        _dbg("match_sets",
-                             request_id=request_id, i=idx,
-                             companies=list(company_set), currencies=list(currency_set))
-
-                        if len(company_set) != 1:
-                            problems.append({"reason": "mixed_company",
-                                             "bank_ids": bank_ids, "journal_ids": journal_ids})
-                            _warn("match_skip_mixed_company", request_id=request_id, i=idx, companies=list(company_set))
-                            db_tx.savepoint_commit(sp)
-                            continue
-                        company_id = next(iter(company_set))
-
-                        if len(currency_set) != 1:
-                            problems.append({"reason": "mixed_currency",
-                                             "bank_ids": bank_ids, "journal_ids": journal_ids})
-                            _warn("match_skip_mixed_currency", request_id=request_id, i=idx, currencies=list(currency_set))
-                            db_tx.savepoint_commit(sp)
-                            continue
-                        currency_id = next(iter(currency_set))
-
-                        # Ensure pending structures
-                        pending_ba, pending_gl = ensure_pending_bank_structs(company_id, currency_id=currency_id)
-                        _dbg("pending_structs",
-                             request_id=request_id, i=idx,
-                             pending_ba_id=pending_ba.id, pending_gl_id=pending_gl.id)
-
-                        # Totals
-                        sum_bank = sum((bt.amount for bt in bank_txs), Decimal("0"))
-                        sum_journal = sum(((je.get_effective_amount() or Decimal("0")) for je in journal_entries),
-                                          Decimal("0"))
-                        diff = sum_bank - sum_journal
-
-                        _dbg("totals_initial",
-                             request_id=request_id, i=idx,
-                             sum_bank=str(sum_bank), sum_journal=str(sum_journal), diff=str(diff))
-
-                        # Adjustment
-                        bank_account_set = {bt.bank_account_id for bt in bank_txs if bt.bank_account_id}
-                        if adjustment_side != "none" and diff != Decimal("0"):
-                            if adjustment_side == "bank":
-                                if len(bank_account_set) != 1:
-                                    problems.append({
-                                        "reason": "cannot_adjust_bank_with_multiple_accounts",
-                                        "bank_account_ids": list(bank_account_set),
-                                        "bank_ids": bank_ids, "journal_ids": journal_ids,
-                                    })
-                                    _warn("adjust_skip_multi_ba",
-                                          request_id=request_id, i=idx, bank_accounts=list(bank_account_set))
-                                else:
-                                    adjustment_amount = sum_journal - sum_bank
-                                    bt0 = bank_txs[0]
-                                    _dbg("adjust_bank_create",
-                                         request_id=request_id, i=idx, amount=str(adjustment_amount))
-                                    adj_bt = BankTransaction.objects.create(
-                                        company_id=company_id,
-                                        bank_account=bt0.bank_account,
-                                        date=bt0.date,
-                                        currency=bt0.currency,
-                                        amount=adjustment_amount,
-                                        description="Adjustment record for reconciliation",
-                                        status="pending",
-                                        tx_hash="adjustment_for_rec",
-                                    )
-                                    bank_txs.append(adj_bt)
-                                    sum_bank += adjustment_amount
-
-                            elif adjustment_side == "journal":
-                                adjustment_amount = sum_bank - sum_journal
-                                je0 = journal_entries[0]
-                                debit_amount = adjustment_amount if adjustment_amount > 0 else None
-                                credit_amount = (-adjustment_amount) if adjustment_amount < 0 else None
-                                _dbg("adjust_journal_create",
-                                     request_id=request_id, i=idx,
-                                     amount=str(adjustment_amount),
-                                     debit=str(debit_amount or 0), credit=str(credit_amount or 0))
-                                adj_je = JournalEntry.objects.create(
-                                    company_id=company_id,
-                                    transaction=je0.transaction,
-                                    account=(pending_gl if (je0.account is None or
-                                                            getattr(je0.account, "bank_account_id", None) is None)
-                                             else je0.account),
-                                    cost_center=je0.cost_center,
-                                    debit_amount=debit_amount,
-                                    credit_amount=credit_amount,
-                                    state="pending",
-                                    date=je0.date or je0.transaction.date,
-                                    bank_designation_pending=True,
-                                )
-                                journal_entries.append(adj_je)
-                                sum_journal += adjustment_amount
-
-                        final_diff = sum_bank - sum_journal
-                        rec_status = "matched" if final_diff == Decimal("0") else "pending"
-
-                        _dbg("totals_final",
-                             request_id=request_id, i=idx,
-                             sum_bank=str(sum_bank), sum_journal=str(sum_journal),
-                             final_diff=str(final_diff), rec_status=rec_status)
-
-                        # Create reconciliation
-                        bank_ids_str = ", ".join(str(x.id) for x in bank_txs)
-                        journal_ids_str = ", ".join(str(x.id) for x in journal_entries)
-                        combined_notes = (
-                            f"{notes}\n"
-                            f"Bank IDs: {bank_ids_str}\n"
-                            f"Journal IDs: {journal_ids_str}\n"
-                            f"Difference: {final_diff}"
-                        )
-
-                        rec = Reconciliation.objects.create(
-                            company_id=company_id,
-                            status=rec_status,
-                            reference=reference,
-                            notes=combined_notes,
-                        )
-                        rec.bank_transactions.set(bank_txs)
-                        rec.journal_entries.set(journal_entries)
-                        created_ids.append(rec.id)
-
-                        _info("reconciliation_created",
-                              request_id=request_id, i=idx,
-                              reconciliation_id=rec.id, status=rec_status,
-                              n_bank=len(bank_txs), n_journal=len(journal_entries))
-
-                        # Promotion to specific bank GL (if single bank account)
-                        if len(bank_account_set) == 1:
-                            target_ba_id = next(iter(bank_account_set))
-                            target_ba = next(bt.bank_account for bt in bank_txs if bt.bank_account_id == target_ba_id)
-                            target_gl = ensure_gl_account_for_bank(company_id, target_ba)
-
-                            changed = 0
-                            for je in journal_entries:
-                                acct_ba_id = getattr(je.account, "bank_account_id", None) if je.account_id else None
-                                if (acct_ba_id == pending_ba.id or je.account_id is None or
-                                        getattr(je, "bank_designation_pending", False)):
-                                    fields = []
-                                    if je.account_id != target_gl.id:
-                                        je.account_id = target_gl.id
-                                        fields.append("account")
-                                    if hasattr(je, "bank_designation_pending") and je.bank_designation_pending:
-                                        je.bank_designation_pending = False
-                                        fields.append("bank_designation_pending")
-                                    if fields:
-                                        je.save(update_fields=fields)
-                                        changed += 1
-                            _dbg("promotion_done",
-                                 request_id=request_id, i=idx, reassigned_lines=changed, target_gl_id=target_gl.id)
-                        else:
-                            problems.append({
-                                "reason": "multiple_bank_accounts_in_match",
-                                "bank_account_ids": list(bank_account_set),
-                                "bank_ids": bank_ids, "journal_ids": journal_ids,
-                            })
-                            _warn("promotion_skipped_multi_ba",
-                                  request_id=request_id, i=idx, bank_accounts=list(bank_account_set))
-
-                        db_tx.savepoint_commit(sp)
-
-                    except Exception as e:
-                        db_tx.savepoint_rollback(sp)
-                        problems.append({"reason": "exception", "error": str(e),
-                                         "bank_ids": bank_ids, "journal_ids": journal_ids})
-                        _warn("match_exception", request_id=request_id, i=idx, error=str(e))
-                        # continue to next item
-
-                except Exception as outer_e:
-                    problems.append({"reason": "outer_exception", "error": str(outer_e),
-                                     "match": match})
-                    _warn("match_outer_exception", request_id=request_id, i=idx, error=str(outer_e))
-                    # keep looping other matches
-
-        _info("finalize_end",
-              request_id=request_id,
-              created=len(created_ids),
-              problems=len(problems),
-              created_ids=created_ids)
-
-        return Response({"reconciliation_ids": created_ids, "problems": problems})
     
-    
-    @action(detail=False, methods=['post'])
-    def finalize_reconciliation_matches(self, request, *args, **kwargs):
-        """
-        Finalize a batch of reconciliation matches (optionally creating an adjustment on one side).
-        """
-        request_id = str(uuid.uuid4())
-        
-        data = request.data
-        matches = data.get("matches", [])
-        adjustment_side = data.get("adjustment_side", "none")  # "bank" | "journal" | "none"
-        reference = data.get("reference", "")
-        notes = data.get("notes", "")
-        
-        _info("finalize_begin",
-              request_id=request_id,
-              n_matches=len(matches),
-              adjustment_side=adjustment_side,
-              reference=reference or "",
-              notes_len=len(notes or ""))
-        
-        created_ids = []
-        problems = []
-    
-        with db_tx.atomic():
-            for match in matches:
-                bank_ids = list({int(x) for x in match.get("bank_transaction_ids", []) if x is not None})
-                journal_ids = list({int(x) for x in match.get("journal_entry_ids", []) if x is not None})
-                if not bank_ids or not journal_ids:
-                    problems.append({"reason": "empty_ids", "match": match})
-                    continue
-    
-                # OPTIONAL: guard against re-using rows already matched/approved
-                if BankTransaction.objects.filter(
-                    id__in=bank_ids, reconciliations__status__in=["matched", "approved"]
-                ).exists() or JournalEntry.objects.filter(
-                    id__in=journal_ids, reconciliations__status__in=["matched", "approved"]
-                ).exists():
-                    problems.append({"reason": "already_reconciled", "bank_ids": bank_ids, "journal_ids": journal_ids})
-                    continue
-    
-                sp = db_tx.savepoint()
-                try:
-                    # Lock rows
-                    bank_qs = (BankTransaction.objects
-                               .select_for_update()
-                               .select_related("bank_account", "currency")
-                               .filter(id__in=bank_ids))
-                    je_qs = (JournalEntry.objects
-                             .select_for_update()
-                             .select_related("account", "account__bank_account", "transaction", "transaction__currency")
-                             .filter(id__in=journal_ids))
-    
-                    bank_txs = list(bank_qs)
-                    journal_entries = list(je_qs)
-                    if not bank_txs or not journal_entries:
-                        problems.append({"reason": "not_found", "bank_ids": bank_ids, "journal_ids": journal_ids})
-                        db_tx.savepoint_commit(sp)
-                        continue
-    
-                    # Company & currency consistency
-                    company_set = {bt.company_id for bt in bank_txs} | {je.company_id for je in journal_entries}
-                    if len(company_set) != 1:
-                        problems.append({"reason": "mixed_company", "bank_ids": bank_ids, "journal_ids": journal_ids})
-                        db_tx.savepoint_commit(sp)
-                        continue
-                    company_id = next(iter(company_set))
-    
-                    currency_set = {bt.currency_id for bt in bank_txs} | {
-                        je.transaction.currency_id for je in journal_entries if je.transaction_id
-                    }
-                    if len(currency_set) != 1:
-                        problems.append({"reason": "mixed_currency", "bank_ids": bank_ids, "journal_ids": journal_ids})
-                        db_tx.savepoint_commit(sp)
-                        continue
-                    currency_id = next(iter(currency_set))
-    
-                    # Ensure pending scaffolding exists
-                    pending_ba, pending_gl = ensure_pending_bank_structs(company_id, currency_id=currency_id)
-    
-                    # Totals
-                    sum_bank = sum((bt.amount for bt in bank_txs), Decimal("0"))
-                    sum_journal = sum(((je.get_effective_amount() or Decimal("0")) for je in journal_entries), Decimal("0"))
-                    diff = sum_bank - sum_journal
-    
-                    # If match spans multiple bank accounts, we will NOT create bank-side adjustments.
-                    bank_account_set = {bt.bank_account_id for bt in bank_txs if bt.bank_account_id}
-    
-                    # Adjustment (optional)
-                    if adjustment_side != "none" and diff != Decimal("0"):
-                        if adjustment_side == "bank":
-                            if len(bank_account_set) != 1:
-                                problems.append({
-                                    "reason": "cannot_adjust_bank_with_multiple_accounts",
-                                    "bank_account_ids": list(bank_account_set),
-                                    "bank_ids": bank_ids, "journal_ids": journal_ids,
-                                })
-                            else:
-                                # Make bank total equal journal total
-                                adjustment_amount = sum_journal - sum_bank
-                                bt0 = bank_txs[0]
-                                adj_bt = BankTransaction.objects.create(
-                                    company_id=company_id,
-                                    bank_account=bt0.bank_account,
-                                    date=bt0.date,
-                                    currency=bt0.currency,
-                                    amount=adjustment_amount,
-                                    description="Adjustment record for reconciliation",
-                                    status="pending",
-                                    tx_hash="adjustment_for_rec",
-                                )
-                                bank_txs.append(adj_bt)
-                                sum_bank += adjustment_amount
-    
-                        elif adjustment_side == "journal":
-                            # Make journal total equal bank total
-                            adjustment_amount = sum_bank - sum_journal
-                            je0 = journal_entries[0]
-                            debit_amount = adjustment_amount if adjustment_amount > 0 else None
-                            credit_amount = (-adjustment_amount) if adjustment_amount < 0 else None
-                            adj_je = JournalEntry.objects.create(
-                                company_id=company_id,
-                                transaction=je0.transaction,
-                                account=pending_gl if (je0.account is None or getattr(je0.account, "bank_account_id", None) is None) else je0.account,
-                                cost_center=je0.cost_center,
-                                debit_amount=debit_amount,
-                                credit_amount=credit_amount,
-                                state="pending",
-                                date=je0.date or je0.transaction.date,
-                                bank_designation_pending=True,  # ensure later promotion
-                            )
-                            journal_entries.append(adj_je)
-                            sum_journal += adjustment_amount
-    
-                    # Final status
-                    final_diff = sum_bank - sum_journal
-                    rec_status = "matched" if final_diff == Decimal("0") else "pending"
-    
-                    # Create Reconciliation
-                    bank_ids_str = ", ".join(str(x.id) for x in bank_txs)
-                    journal_ids_str = ", ".join(str(x.id) for x in journal_entries)
-                    combined_notes = f"{notes}\nBank IDs: {bank_ids_str}\nJournal IDs: {journal_ids_str}\nDifference: {final_diff}"
-    
-                    rec = Reconciliation.objects.create(
-                        company_id=company_id,
-                        status=rec_status,
-                        reference=reference,
-                        notes=combined_notes,
-                    )
-                    rec.bank_transactions.set(bank_txs)
-                    rec.journal_entries.set(journal_entries)
-                    created_ids.append(rec.id)
-    
-                    # Promote pending JEs to the specific bank GL (only if a single bank_account is involved)
-                    if len(bank_account_set) == 1:
-                        target_ba_id = next(iter(bank_account_set))
-                        target_ba = next(bt.bank_account for bt in bank_txs if bt.bank_account_id == target_ba_id)
-                        target_gl = ensure_gl_account_for_bank(company_id, target_ba)
-    
-                        for je in journal_entries:
-                            acct_ba_id = getattr(je.account, "bank_account_id", None) if je.account_id else None
-                            if acct_ba_id == pending_ba.id or je.account_id is None or getattr(je, "bank_designation_pending", False):
-                                updates = {}
-                                if je.account_id != target_gl.id:
-                                    je.account_id = target_gl.id
-                                    updates["account"] = target_gl.id
-                                if hasattr(je, "bank_designation_pending") and je.bank_designation_pending:
-                                    je.bank_designation_pending = False
-                                    updates["bank_designation_pending"] = False
-                                if updates:
-                                    je.save(update_fields=list(updates.keys()))
-                    else:
-                        problems.append({
-                            "reason": "multiple_bank_accounts_in_match",
-                            "bank_account_ids": list(bank_account_set),
-                            "bank_ids": bank_ids,
-                            "journal_ids": journal_ids,
-                        })
-    
-                    db_tx.savepoint_commit(sp)
-    
-                except Exception as e:
-                    db_tx.savepoint_rollback(sp)
-                    problems.append({"reason": "exception", "error": str(e), "bank_ids": bank_ids, "journal_ids": journal_ids})
-    
-        return Response({"reconciliation_ids": created_ids, "problems": problems})
-    '''
     @action(detail=False, methods=['get'])
     def reconciliation_status(self, request, tenant_id=None):
         """
@@ -1578,30 +1161,37 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     @action(detail=False, methods=["post"])
     def start(self, request, tenant_id=None):
         """
-        Start reconciliation as a background task
+        Start reconciliation as a background task.
+
+        Accepts payload keys:
+          - bank_ids: optional list of BankTransaction IDs
+          - book_ids: optional list of journal Transaction IDs
+          - config_id: ID of a ReconciliationConfig (run single stage)
+          - pipeline_id: ID of a ReconciliationPipeline (run multi-stage)
+          - auto_match_100: if true, auto-persist matches with confidence==1.0
         """
         data = request.data
         auto_match_100 = _to_bool(data.get("auto_match_100", False))
-        
-        # 1. Pre-create DB record with placeholder task_id
+
+        # Pre-create a DB record, including config_id or pipeline_id in parameters
         task_obj = ReconciliationTask.objects.create(
-            task_id="queued",   # will be updated after Celery fires
+            task_id="queued",
             tenant_id=tenant_id,
-            parameters=data,
-            status="queued"
+            parameters=data,       # store full payload, incl. config_id/pipeline_id
+            status="queued",
         )
-    
-        # 2. Trigger Celery, pass the db_id
+
+        # Launch Celery; the payload passes through to the service untouched
         async_result = match_many_to_many_task.delay(task_obj.id, data, tenant_id, auto_match_100)
-    
-        # 3. Update the DB record with Celery task_id
+
+        # Update our record with the Celery task ID
         task_obj.task_id = async_result.id
         task_obj.save(update_fields=["task_id"])
-    
+
         return Response({
             "message": "Task enqueued",
-            "task_id": async_result.id,   # Celery UUID
-            "db_id": task_obj.id,         # persistent DB PK
+            "task_id": async_result.id,
+            "db_id": task_obj.id,
         })
 
     @action(detail=True, methods=["get"])
@@ -1770,6 +1360,34 @@ class ReconciliationConfigViewSet(viewsets.ModelViewSet):
         serializer = ResolvedReconciliationConfigSerializer(qs, many=True)
         return Response(serializer.data)
 
+class ReconciliationPipelineViewSet(viewsets.ModelViewSet):
+    """
+    API endpoint for managing reconciliation pipelines.  Pipelines bundle
+    together multiple ReconciliationConfig 'recipes' in a specific order,
+    with optional per‑stage overrides.
+    """
+    queryset = ReconciliationPipeline.objects.all().order_by("-updated_at")
+    serializer_class = ReconciliationPipelineSerializer
+
+    @action(detail=False, methods=["get"])
+    def resolved(self, request, *args, **kwargs):
+        """
+        Return all pipeline definitions available to the current user:
+        - Global
+        - Company
+        - User
+        - Company+User
+        """
+        user = request.user
+        company_id = request.query_params.get("company_id")
+        qs = ReconciliationPipeline.objects.filter(
+            Q(scope="global")
+            | Q(scope="company", company_id=company_id)
+            | Q(scope="user", user=user)
+            | Q(scope="company_user", company_id=company_id, user=user)
+        )
+        serializer = ResolvedReconciliationPipelineSerializer(qs, many=True)
+        return Response(serializer.data)
 
 class EmbeddingHealthView(APIView):
     permission_classes = []  # open for quick checks

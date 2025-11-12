@@ -13,6 +13,7 @@ urlpatterns = [
     path('docs/<int:pk>/label/weak', views.WeakLabelView.as_view(), name='weak-label'),
     path('docs/<int:pk>/events/suggest/apply', views.ApplyEventsView.as_view(), name='apply-events'),
     path('docs/<int:pk>/spans', views.SpanListView.as_view(), name='list-spans'),
+    path('docs/<int:pk>/embedding-mode/', views.EmbeddingModeUpdateView.as_view(), name='docs-embedding-mode'),
     path('search', views.SearchView.as_view(), name='search'),
     path('pricing/run', views.PricingRunView.as_view(), name='pricing-run'),
 ]

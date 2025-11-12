@@ -19,16 +19,25 @@ class ProcessAdmin(admin.ModelAdmin):
 
 @admin.register(models.Document)
 class DocumentAdmin(admin.ModelAdmin):
-    list_display = ('id', 'process', 'doc_type', 'num_pages', 'created_at')
+    list_display = ('id', 'process', 'doc_type', 'embedding_mode', 'num_pages', 'created_at')
     search_fields = ('id', 'process__case_number')
-    list_filter = ('doc_type', 'process__tenant_id')
+    list_filter = ('doc_type', 'process__tenant_id', 'embedding_mode')
+    fieldsets = (
+        (None, {
+            'fields': ('file', 'process', 'embedding_mode')
+        }),
+        ('OCR & Metadados', {
+            'fields': ('ocr_text', 'doc_type', 'doctype_confidence', 'processing_stats')
+        }),
+    )
 
 
 @admin.register(models.Span)
 class SpanAdmin(admin.ModelAdmin):
-    list_display = ('id', 'document', 'label', 'page', 'confidence')
+    list_display = ('id', 'document', 'label', 'page', 'confidence', 'strong_anchor_count', 'weak_anchor_count', 'negative_anchor_count', 'anchors_pos')
     search_fields = ('label', 'text')
     list_filter = ('label', 'document__process__tenant_id')
+
 
 
 @admin.register(models.EventType)
@@ -99,3 +108,37 @@ class PricingRunAdmin(admin.ModelAdmin):
 @admin.register(models.ProcessPricing)
 class ProcessPricingAdmin(admin.ModelAdmin):
     list_display = ('id', 'process', 'price', 'created_at')
+    
+@admin.register(models.SpanRule)
+class SpanRuleAdmin(admin.ModelAdmin):
+    list_display = ('id', 'label', 'description', 'embedding_model')
+    search_fields = ('label', 'anchors_strong', 'anchors_weak', 'anchors_negative')
+    list_filter = ('embedding_model',)
+    readonly_fields = ('anchor_embeddings',)
+    fieldsets = (
+        (None, {
+            'fields': ('label', 'description')
+        }),
+        ('Âncoras', {
+            'fields': ('anchors_strong', 'anchors_weak', 'anchors_negative'),
+            'description': "Separe múltiplas âncoras por ';'."
+        }),
+        ('Embeddings', {
+            'fields': ('embedding_model', 'anchor_embeddings'),
+            'description': "As embeddings são geradas automaticamente ao salvar."
+        }),
+    )
+
+@admin.register(models.DocTypeRule)
+class DocTypeRuleAdmin(admin.ModelAdmin):
+    list_display = ('doc_type', 'description')
+    search_fields = ('doc_type', 'description')
+    fieldsets = (
+        (None, {
+            'fields': ('doc_type', 'description')
+        }),
+        ('Âncoras', {
+            'fields': ('anchors_strong', 'anchors_weak', 'anchors_negative'),
+            'description': "Separe múltiplas âncoras por ';'."
+        }),
+    )

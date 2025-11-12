@@ -302,11 +302,13 @@ EMBED_PATH          = os.getenv("EMBED_PATH", "/api/embeddings")
 EMBED_MODEL         = os.getenv("EMBED_MODEL", "nomic-embed-text")
 EMBED_DIM           = int(os.getenv("EMBED_DIM", "768"))
 EMBED_TIMEOUT_S     = float(os.getenv("EMBED_TIMEOUT_S", "300"))
-EMBED_NUM_THREAD    = int(os.getenv("EMBED_NUM_THREAD", "8"))
+EMBED_NUM_THREAD    = int(os.getenv("EMBED_NUM_THREAD", "20"))
 EMBED_KEEP_ALIVE    = os.getenv("EMBED_KEEP_ALIVE", "45m")
 EMBED_BATCH_SIZE    = max(1, int(os.getenv("EMBED_BATCH_SIZE", "128")))
 EMBED_LIMIT_PER_MODEL = max(1, int(os.getenv("EMBED_LIMIT_PER_MODEL", "2000")))
 EMBED_API_KEY       = os.getenv("EMBED_API_KEY")  # optional; not needed for internal by default
+EMBED_PARALLEL_REQUESTS = int(os.getenv("OLLAMA_NUM_PARALLEL", "5"))
+EMBED_TOKEN_LIMIT = int(os.getenv("EMBED_TOKEN_LIMIT", "2048"))
 
 
 # --- External dependencies the Chat service calls ---

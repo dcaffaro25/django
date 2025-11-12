@@ -138,7 +138,7 @@ class EmbeddingClient:
             return []
         
         clean = [(t or "").strip() or " " for t in texts]
-        log.debug("emb.embed batch n=%d model=%s url=%s", len(clean), self.model, self.url)
+        #log.debug("emb.embed batch n=%d model=%s url=%s", len(clean), self.model, self.url)
         
         # ---- Per-item fallback ----
         out: List[List[float]] = []

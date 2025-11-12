@@ -1,138 +1,507 @@
 """
-Reconciliation service for bank and journal entries.
+embedding_service.py
 
-This module provides a robust implementation of the reconciliation logic,
-addressing issues observed in earlier versions.  Notable improvements include:
-
-- Quantized comparisons: amounts are rounded to two decimal places using
-  Decimal quantization to avoid floating-point artefacts.
-- Date tolerance: exact matches consider dates equal within a configurable
-  number of days rather than only the same calendar day.
-- Effective amounts: journal entries are matched using get_effective_amount()
-  to account for debit/credit direction rather than raw debit minus credit.
-- Strategy configuration: matching behaviour is driven by parameters
-  (strategy, amount tolerance, date tolerance, max group size, etc.)
-  obtained from ReconciliationConfig or the supplied data dictionary.
-- Fuzzy and group matching: fuzzy matching considers small differences in
-  amounts/dates with confidence scoring, while group matching handles
-  many‑to‑many relationships within tolerance windows.
-- Auto‑matching: suggestions with confidence_score == 1.0 can be persisted
-  automatically using the Reconciliation model.
-- Celery‑safe: all database writes are wrapped in transactions and locked
-  appropriately to avoid race conditions.
-
-To use this service in your Celery task, import ReconciliationService below and
-call match_many_to_many() with the request data and tenant_id.
+This module provides the core logic for running reconciliation with
+user‑calibratable weights on embedding similarity, amount, currency and
+date.  It does not define any Django models; instead, it uses simple
+data classes (DTOs) to carry data into a configurable matching engine.
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import timedelta
+from dataclasses import dataclass, field
+from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
-from bisect import bisect_left, bisect_right
 from itertools import combinations
-from collections import defaultdict, Counter
-from typing import List, Dict, Iterable, Tuple, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
-from django.apps import apps
+#from .embedding_service import BankTransactionDTO, JournalEntryDTO, run_single_config, run_pipeline
+
+
+# accounting/services/reconciliation_service.py
+
+
+from typing import Dict, List, Optional
+
 from django.db import transaction
-from django.db.models import Sum, Q
-import logging
-import os
+from django.db.models import Q
 
-from accounting.models import (
+from ..models import (
     BankTransaction,
     JournalEntry,
-    Account,
     Reconciliation,
+    ReconciliationConfig,
+    ReconciliationPipeline,
 )
 
-log = logging.getLogger("recon")
 
+import logging
 
-def _q2(x: Decimal | None) -> Decimal:
-    """
-    Quantize a Decimal to two decimal places with normal rounding.
-    Returns Decimal("0.00") if x is None.
-    """
-    if x is None:
-        return Decimal("0.00")
-    return Decimal(x).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+log = logging.getLogger(__name__)
 
+# ----------------------------------------------------------------------
+#  DTOs for matching
+# ----------------------------------------------------------------------
+@dataclass
+class BankTransactionDTO:
+    id: int
+    company_id: int
+    date: date
+    amount: Decimal
+    currency_id: int
+    description: str
+    embedding: Optional[List[float]] = None
 
-def _is_exact_match(
-    bank_amount: Decimal, txn_amount: Decimal, book_date, bank_date, date_tol_days: int
-) -> bool:
-    """
-    Return True if the absolute values match exactly (to cents) and the dates
-    differ by no more than date_tol_days.  The sign is ignored because bank
-    outflows often have opposite sign to book entries.
-    """
-    return (
-        _q2(bank_amount) == _q2(txn_amount)
-        and book_date
-        and bank_date
-        and abs((bank_date - book_date).days) <= date_tol_days
-    )
+    @property
+    def amount_base(self) -> Decimal:
+        """Return the amount converted to base currency (stub)."""
+        return self.amount
 
 
 @dataclass
-class MatchConfig:
-    """
-    Configuration parameters for reconciliation matching.  Values may come from
-    ReconciliationConfig or a raw payload.
-    """
-    strategy: str
-    amount_tolerance: Decimal
-    date_tolerance_days: int
-    max_group_size: int
-    min_confidence: float
-    max_suggestions: int
-    log_all: bool
+class JournalEntryDTO:
+    id: int
+    company_id: int
+    transaction_id: int
+    date: date
+    effective_amount: Decimal
+    currency_id: int
+    description: str
+    embedding: Optional[List[float]] = None
 
-    @classmethod
-    def from_data(cls, data: Dict[str, object]) -> "MatchConfig":
-        strategy = (data.get("strategy") or "exact 1-to-1").lower()
-        amount_tolerance = Decimal(str(data.get("amount_tolerance", "0")))
-        date_tol = int(data.get("date_tolerance_days", 2))
-        max_gsize = int(data.get("max_group_size", 1))
-        min_conf = float(data.get("min_confidence", 0))
-        max_sug = int(data.get("max_suggestions", 10000))
-        log_all = bool(data.get("log_all") or os.getenv("RECON_LOG_ALL") == "1")
-        return cls(
-            strategy=strategy,
-            amount_tolerance=amount_tolerance,
-            date_tolerance_days=date_tol,
-            max_group_size=max_gsize,
-            min_confidence=min_conf,
-            max_suggestions=max_sug,
-            log_all=log_all,
+    @property
+    def amount_base(self) -> Decimal:
+        return self.effective_amount
+
+
+# ----------------------------------------------------------------------
+#  Stage and pipeline configuration
+# ----------------------------------------------------------------------
+@dataclass
+class StageConfig:
+    type: str
+    enabled: bool = True
+    max_group_size_bank: int = 1
+    max_group_size_book: int = 1
+    amount_tol: Decimal = Decimal("0")
+    date_tol: int = 0
+    # optional weight overrides (None → inherit from config or default)
+    embedding_weight: float | None = None
+    amount_weight: float | None = None
+    currency_weight: float | None = None
+    date_weight: float | None = None
+
+
+@dataclass
+class PipelineConfig:
+    stages: List[StageConfig] = field(default_factory=list)
+    auto_apply_score: float = 1.0
+    max_suggestions: int = 1000
+
+
+# ----------------------------------------------------------------------
+#  Utility functions
+# ----------------------------------------------------------------------
+CENT = Decimal("0.01")
+
+def q2(x: Decimal | None) -> Decimal:
+    """Quantise a Decimal to two decimal places using standard rounding."""
+    if x is None:
+        return Decimal("0.00")
+    return Decimal(x).quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+def build_date_bins(items: Iterable[object], get_date: Callable[[object], Optional[date]],
+                    bin_size_days: int) -> Dict[int, List[object]]:
+    """Bucket items into coarse bins keyed by date.toordinal() / bin_size_days."""
+    from collections import defaultdict
+    bins: Dict[int, List[object]] = defaultdict(list)
+    for it in items:
+        d = get_date(it)
+        if not d:
+            continue
+        bins[d.toordinal() // bin_size_days].append(it)
+    return bins
+
+
+def iter_date_bin_candidates(target_date: date, bins: Dict[int, List[object]],
+                              bin_size_days: int, tol_days: int) -> Iterable[object]:
+    """Yield all items in bins whose date range intersects target_date ± tol_days."""
+    if not target_date:
+        return []
+    start_bin = (target_date - timedelta(days=tol_days)).toordinal() // bin_size_days
+    end_bin = (target_date + timedelta(days=tol_days)).toordinal() // bin_size_days
+    for b in range(start_bin, end_bin + 1):
+        for it in bins.get(b, []):
+            yield it
+
+
+def build_amount_buckets(items: Iterable[object], get_amount: Callable[[object], Decimal]) -> Dict[Decimal, List[object]]:
+    """Bucket items by their quantised amount for fast approximate lookup."""
+    from collections import defaultdict
+    buckets: Dict[Decimal, List[object]] = defaultdict(list)
+    for it in items:
+        buckets[q2(get_amount(it))].append(it)
+    return buckets
+
+
+def probe_amount_buckets(buckets: Dict[Decimal, List[object]], base_amt: Decimal,
+                         amount_tol: Decimal) -> Iterable[object]:
+    """Yield items from buckets whose keys fall within ±amount_tol of base_amt."""
+    step = CENT
+    tol_steps = int((amount_tol / step).to_integral_value())
+    base = q2(base_amt)
+    for k in range(-tol_steps, tol_steps + 1):
+        yield from buckets.get(q2(base + step * k), [])
+
+
+def compute_weighted_confidence(
+    embed_sim: float,
+    amount_diff: Decimal,
+    amount_tol: Decimal,
+    date_diff: int,
+    date_tol: int,
+    currency_match: float,
+    weights: Dict[str, float],
+) -> float:
+    """
+    Calculate a composite confidence score using user-defined weights.
+    Weights should sum to 1.0.  The components are:
+    - embed_sim: similarity of text embeddings (0–1)
+    - amount_diff: absolute difference between amounts (Decimal)
+    - date_diff: absolute difference between dates (int days)
+    - currency_match: 1.0 if currencies match else 0.0
+    The amount and date differences are normalised by their tolerances.
+    """
+    amt_score = max(0.0, 1 - float(amount_diff / (amount_tol or CENT)))
+    date_score = max(0.0, 1 - float(date_diff) / float(date_tol or 1))
+    return round(
+        weights.get("embedding", 0.0) * embed_sim +
+        weights.get("amount", 0.0)    * amt_score +
+        weights.get("currency", 0.0)  * currency_match +
+        weights.get("date", 0.0)      * date_score,
+        4,
+    )
+
+# ----------------------------------------------------------------------
+# Reconciliation pipeline engine
+# ----------------------------------------------------------------------
+class ReconciliationPipelineEngine:
+    """
+    Executes a sequence of matching stages on in-memory DTOs.  Supports exact,
+    fuzzy, one-to-many, many-to-one and many-to-many matching with asymmetric
+    group sizes and weighted confidence scoring.
+    """
+    def __init__(self, company_id: int, config: PipelineConfig):
+        self.company_id = company_id
+        self.config = config
+        self.suggestions: List[dict] = []
+        self.used_banks: set[int] = set()
+        self.used_books: set[int] = set()
+        # Per-stage or global weights; set externally before calling run()
+        self.current_weights: Dict[str, float] | List[Dict[str, float]] = {
+            "embedding": 0.50,
+            "amount":    0.35,
+            "currency":  0.10,
+            "date":      0.05,
+        }
+
+    def run(self, banks: List[BankTransactionDTO], books: List[JournalEntryDTO]) -> List[dict]:
+        """Execute each enabled stage and return suggestions up to the configured limit."""
+        for idx, stage in enumerate(self.config.stages):
+            if not stage.enabled:
+                continue
+            if isinstance(self.current_weights, list):
+                self.stage_weights = self.current_weights[idx]
+            else:
+                self.stage_weights = self.current_weights
+            handler = getattr(self, f"_run_{stage.type}", None)
+            if handler:
+                handler(banks, books, stage)
+                if len(self.suggestions) >= self.config.max_suggestions:
+                    break
+        return self.suggestions[: self.config.max_suggestions]
+
+    # Stage handlers
+    def _run_exact_1to1(self, banks, books, stage: StageConfig):
+        for bank in banks:
+            if bank.id in self.used_banks:
+                continue
+            for book in books:
+                if book.id in self.used_books:
+                    continue
+                if bank.company_id != book.company_id:
+                    continue
+                if q2(bank.amount_base) != q2(book.amount_base):
+                    continue
+                if bank.currency_id != book.currency_id:
+                    continue
+                if bank.date and book.date and abs((bank.date - book.date).days) > stage.date_tol:
+                    continue
+                suggestion = self._make_suggestion("exact_1to1", [bank.id], [book.id], 1.0)
+                self._record(suggestion)
+                break
+
+    def _run_one_to_many(self, banks, books, stage: StageConfig):
+        available_books = [b for b in books if b.id not in self.used_books and b.company_id == self.company_id]
+        for bank in banks:
+            if bank.id in self.used_banks:
+                continue
+            for size in range(1, stage.max_group_size_book + 1):
+                for combo in combinations(available_books, size):
+                    total = sum((b.amount_base for b in combo), Decimal("0"))
+                    if q2(total) != q2(bank.amount_base):
+                        continue
+                    if any(b.currency_id != bank.currency_id for b in combo):
+                        continue
+                    if any(abs((bank.date - b.date).days) > stage.date_tol for b in combo):
+                        continue
+                    suggestion = self._make_suggestion("one_to_many", [bank.id], [b.id for b in combo], 1.0)
+                    self._record(suggestion)
+                    return
+
+    def _run_many_to_one(self, banks, books, stage: StageConfig):
+        available_banks = [b for b in banks if b.id not in self.used_banks and b.company_id == self.company_id]
+        for book in books:
+            if book.id in self.used_books:
+                continue
+            for size in range(1, stage.max_group_size_bank + 1):
+                for combo in combinations(available_banks, size):
+                    total = sum((b.amount_base for b in combo), Decimal("0"))
+                    if q2(total) != q2(book.amount_base):
+                        continue
+                    if any(b.currency_id != book.currency_id for b in combo):
+                        continue
+                    if any(abs((b.date - book.date).days) > stage.date_tol for b in combo):
+                        continue
+                    suggestion = self._make_suggestion("many_to_one", [b.id for b in combo], [book.id], 1.0)
+                    self._record(suggestion)
+                    return
+
+    def _run_fuzzy_1to1(self, banks, books, stage: StageConfig):
+        bin_size = max(1, min(stage.date_tol, 7))
+        book_bins = build_date_bins(
+            [b for b in books if b.id not in self.used_books],
+            get_date=lambda e: e.date,
+            bin_size_days=bin_size,
         )
+        for bank in banks:
+            if bank.id in self.used_banks:
+                continue
+            candidates = list(iter_date_bin_candidates(bank.date, book_bins, bin_size, stage.date_tol))
+            buckets = build_amount_buckets(candidates, get_amount=lambda e: e.amount_base)
+            for book in probe_amount_buckets(buckets, bank.amount_base, stage.amount_tol):
+                if book.id in self.used_books:
+                    continue
+                currency_match = 1.0 if bank.currency_id == book.currency_id else 0.0
+                d_diff = abs((bank.date - book.date).days) if bank.date and book.date else stage.date_tol + 1
+                if d_diff > stage.date_tol:
+                    continue
+                a_diff = abs(q2(bank.amount_base) - q2(book.amount_base))
+                if a_diff > stage.amount_tol:
+                    continue
+                embed_sim = self._cosine_similarity(bank.embedding or [], book.embedding or [])
+                weights = {
+                    "embedding": stage.embedding_weight if stage.embedding_weight is not None else self.stage_weights["embedding"],
+                    "amount":    stage.amount_weight    if stage.amount_weight    is not None else self.stage_weights["amount"],
+                    "currency":  stage.currency_weight  if stage.currency_weight  is not None else self.stage_weights["currency"],
+                    "date":      stage.date_weight      if stage.date_weight      is not None else self.stage_weights["date"],
+                }
+                conf = compute_weighted_confidence(
+                    embed_sim, a_diff, stage.amount_tol, d_diff, stage.date_tol, currency_match, weights
+                )
+                suggestion = self._make_suggestion("fuzzy_1to1", [bank.id], [book.id], conf)
+                self._record(suggestion)
+
+    def _run_many_to_many(self, banks, books, stage: StageConfig):
+        sorted_banks = [b for b in banks if b.id not in self.used_banks and b.company_id == self.company_id]
+        sorted_banks.sort(key=lambda b: b.date)
+        sorted_books = [e for e in books if e.id not in self.used_books and e.company_id == self.company_id]
+        sorted_books.sort(key=lambda e: e.date)
+        for bank in sorted_banks:
+            start = bank.date - timedelta(days=stage.date_tol)
+            end = bank.date + timedelta(days=stage.date_tol)
+            bank_window = [b for b in sorted_banks if start <= b.date <= end]
+            book_window = [e for e in sorted_books if start <= e.date <= end]
+            for i in range(1, min(stage.max_group_size_bank, len(bank_window)) + 1):
+                for bank_combo in combinations(bank_window, i):
+                    sum_bank = sum((b.amount_base for b in bank_combo), Decimal("0"))
+                    for j in range(1, min(stage.max_group_size_book, len(book_window)) + 1):
+                        for book_combo in combinations(book_window, j):
+                            sum_book = sum((e.amount_base for e in book_combo), Decimal("0"))
+                            if q2(sum_bank) != q2(sum_book):
+                                continue
+                            if any(b.currency_id != e.currency_id for b in bank_combo for e in book_combo):
+                                continue
+                            all_dates = [b.date for b in bank_combo] + [e.date for e in book_combo]
+                            if (max(all_dates) - min(all_dates)).days > stage.date_tol:
+                                continue
+                            suggestion = self._make_suggestion(
+                                "many_to_many",
+                                [b.id for b in bank_combo],
+                                [e.id for e in book_combo],
+                                1.0,
+                            )
+                            self._record(suggestion)
+
+    # Internal helpers
+    def _cosine_similarity(self, v1: List[float], v2: List[float]) -> float:
+        if not v1 or not v2:
+            return 0.0
+        from math import sqrt
+        dot = sum(a * b for a, b in zip(v1, v2))
+        norm1 = sqrt(sum(a * a for a in v1))
+        norm2 = sqrt(sum(b * b for b in v2))
+        return dot / (norm1 * norm2) if norm1 and norm2 else 0.0
+
+    def _make_suggestion(self, match_type: str, bank_ids: List[int],
+                         book_ids: List[int], conf: float) -> dict:
+        return {
+            "match_type": match_type,
+            "bank_ids": bank_ids,
+            "journal_entries_ids": book_ids,
+            "confidence_score": float(conf),
+        }
+
+    def _record(self, suggestion: dict) -> None:
+        """Record a suggestion and mark the participating IDs as used."""
+        self.suggestions.append(suggestion)
+        self.used_banks.update(suggestion["bank_ids"])
+        self.used_books.update(suggestion["journal_entries_ids"])
+
+
+# ----------------------------------------------------------------------
+# Helper functions to run a single config or a pipeline
+# ----------------------------------------------------------------------
+def run_single_config(cfg: object,
+                      banks: List[BankTransactionDTO],
+                      books: List[JournalEntryDTO],
+                      company_id: int) -> List[dict]:
+    """
+    Execute a single ReconciliationConfig using the pipeline engine.
+
+    The ``cfg`` object should define:
+      - strategy
+      - amount_tolerance
+      - date_tolerance_days
+      - max_group_size_bank
+      - max_group_size_book
+      - embedding_weight, amount_weight, currency_weight, date_weight
+      - min_confidence (used as auto_apply_score)
+      - max_suggestions
+
+    It must not refer to any legacy strategy or group size field.
+    """
+    strategy_map = {
+        "exact 1-to-1": "exact_1to1",
+        "fuzzy": "fuzzy_1to1",
+        "many-to-many": "many_to_many",
+        "optimized": "fuzzy_1to1",
+    }
+    stage_type = strategy_map.get(getattr(cfg, "strategy", "exact 1-to-1"), "exact_1to1")
+    stage = StageConfig(
+        type=stage_type,
+        enabled=True,
+        max_group_size_bank=getattr(cfg, "max_group_size_bank", 1),
+        max_group_size_book=getattr(cfg, "max_group_size_book", 1),
+        amount_tol=getattr(cfg, "amount_tolerance", Decimal("0")),
+        date_tol=getattr(cfg, "date_tolerance_days", 0),
+    )
+    pipe_cfg = PipelineConfig(
+        stages=[stage],
+        auto_apply_score=float(getattr(cfg, "min_confidence", 1.0)),
+        max_suggestions=getattr(cfg, "max_suggestions", 1000),
+    )
+    engine = ReconciliationPipelineEngine(company_id=company_id, config=pipe_cfg)
+    engine.current_weights = {
+        "embedding": float(getattr(cfg, "embedding_weight", 0.50)),
+        "amount":    float(getattr(cfg, "amount_weight",    0.35)),
+        "currency":  float(getattr(cfg, "currency_weight",  0.10)),
+        "date":      float(getattr(cfg, "date_weight",      0.05)),
+    }
+    return engine.run(banks, books)
+
+def run_pipeline(pipeline: object,
+                 banks: List[BankTransactionDTO],
+                 books: List[JournalEntryDTO]) -> List[dict]:
+    """
+    Execute a multi-stage pipeline.  The ``pipeline`` object must have:
+      - company_id
+      - auto_apply_score
+      - max_suggestions
+      - a ``stages`` iterable that yields stage objects with attributes:
+          enabled, order, config (with relevant fields), and optional overrides.
+    """
+    strategy_map = {
+        "exact 1-to-1": "exact_1to1",
+        "fuzzy": "fuzzy_1to1",
+        "many-to-many": "many_to_many",
+        "optimized": "fuzzy_1to1",
+    }
+    stage_configs: List[StageConfig] = []
+    weight_list: List[Dict[str, float]] = []
+    for stage_obj in pipeline.stages.select_related("config").order_by("order"):
+        cfg = stage_obj.config
+        if not stage_obj.enabled:
+            continue
+        stype = strategy_map.get(cfg.strategy, "exact_1to1")
+        stage_configs.append(StageConfig(
+            type=stype,
+            enabled=True,
+            max_group_size_bank=stage_obj.max_group_size_bank or cfg.max_group_size_bank,
+            max_group_size_book=stage_obj.max_group_size_book or cfg.max_group_size_book,
+            amount_tol=stage_obj.amount_tolerance if stage_obj.amount_tolerance is not None else cfg.amount_tolerance,
+            date_tol=stage_obj.date_tolerance_days if stage_obj.date_tolerance_days is not None else cfg.date_tolerance_days,
+            embedding_weight=stage_obj.embedding_weight if stage_obj.embedding_weight is not None else float(cfg.embedding_weight),
+            amount_weight=stage_obj.amount_weight if stage_obj.amount_weight is not None else float(cfg.amount_weight),
+            currency_weight=stage_obj.currency_weight if stage_obj.currency_weight is not None else float(cfg.currency_weight),
+            date_weight=stage_obj.date_weight if stage_obj.date_weight is not None else float(cfg.date_weight),
+        ))
+        weight_list.append({
+            "embedding": float(stage_obj.embedding_weight) if stage_obj.embedding_weight is not None else float(cfg.embedding_weight),
+            "amount":    float(stage_obj.amount_weight)    if stage_obj.amount_weight    is not None else float(cfg.amount_weight),
+            "currency":  float(stage_obj.currency_weight)  if stage_obj.currency_weight  is not None else float(cfg.currency_weight),
+            "date":      float(stage_obj.date_weight)      if stage_obj.date_weight      is not None else float(cfg.date_weight),
+        })
+    pipe_cfg = PipelineConfig(
+        stages=stage_configs,
+        auto_apply_score=float(pipeline.auto_apply_score),
+        max_suggestions=pipeline.max_suggestions,
+    )
+    engine = ReconciliationPipelineEngine(company_id=pipeline.company_id, config=pipe_cfg)
+    engine.current_weights = weight_list
+    return engine.run(banks, books)
+
+
 
 
 class ReconciliationService:
     """
-    Service layer for reconciliation logic.  Provides methods to match
-    bank transactions and journal entries using exact, fuzzy, or group
-    matching strategies, with configuration-driven behaviour.
+    High-level service to run reconciliation using either a single configuration
+    or a multi-stage pipeline.  No legacy matching functions are used.
     """
 
-    # ------------------------------------------------------------------
-    # Orchestrator
-    # ------------------------------------------------------------------
     @staticmethod
-    def match_many_to_many(data: Dict[str, object], tenant_id: Optional[str] = None,
-                           *, auto_match_100: bool = False) -> Dict[str, object]:
+    def match_many_to_many(
+        data: Dict[str, object],
+        tenant_id: Optional[str] = None,
+        *,
+        auto_match_100: bool = False,
+    ) -> Dict[str, object]:
         """
-        Orchestrates reconciliation matching strategies.  Returns a dict with
-        suggestions and auto_match results.
+        Execute reconciliation based on a config_id or pipeline_id in `data`.
+        It refuses to run if neither is provided.
         """
-        cfg = MatchConfig.from_data(data)
+        config_id = data.get("config_id")
+        pipeline_id = data.get("pipeline_id")
+        if not (config_id or pipeline_id):
+            raise ValueError("Either config_id or pipeline_id must be provided")
 
+        company_id = data.get("company_id")
+
+        # Build candidate QuerySets
         bank_ids = data.get("bank_ids", [])
         book_ids = data.get("book_ids", [])
-
-        # Build candidate bank and journal entry lists
         bank_qs = BankTransaction.objects.exclude(
             reconciliations__status__in=["matched", "approved"]
         )
@@ -145,471 +514,122 @@ class ReconciliationService:
         if book_ids:
             book_qs = book_qs.filter(transaction_id__in=book_ids)
 
-        # Only consider journal entries that belong to a bank account account
+        # Only consider journal entries that belong to a bank account
         book_qs = book_qs.filter(account__bank_account__isnull=False)
 
-        candidate_bank = list(bank_qs)
-        candidate_book = list(book_qs)
-
-        # Stats about candidate ranges
-        def _qs_stats(bank_qs, book_qs):
-            try:
-                bank_min = bank_qs.order_by("date").values_list("date", flat=True).first()
-                bank_max = bank_qs.order_by("-date").values_list("date", flat=True).first()
-            except Exception:
-                bank_min = bank_max = None
-            try:
-                book_min = book_qs.order_by("date").values_list("date", flat=True).first()
-                book_max = book_qs.order_by("-date").values_list("date", flat=True).first()
-            except Exception:
-                book_min = book_max = None
-            return bank_min, bank_max, book_min, book_max
-
-        bank_min, bank_max, book_min, book_max = _qs_stats(bank_qs, book_qs)
-        log.info(
-            "[recon] candidates_qs bank_qs_count=%d book_qs_count=%d "
-            "bank_date_min=%s bank_date_max=%s book_date_min=%s book_date_max=%s",
-            len(candidate_bank), len(candidate_book),
-            bank_min, bank_max, book_min, book_max
-        )
-
-        # Matching strategies
-        exact_matches = []
-        fuzzy_matches = []
-        group_matches = []
-
-        # Exact
-        if cfg.strategy in ("exact 1-to-1", "exact", "optimized"):
-            exact_matches, candidate_bank, candidate_book = ReconciliationService.get_exact_matches(
-                candidate_bank, candidate_book, cfg.date_tolerance_days, log_all=cfg.log_all
+        # Convert querysets to DTOs
+        candidate_bank = [
+            BankTransactionDTO(
+                id=tx.id,
+                company_id=tx.company_id,
+                date=tx.date,
+                amount=tx.amount,
+                currency_id=tx.currency_id,
+                description=tx.description,
+                embedding=list(tx.description_embedding)
+                if getattr(tx, "description_embedding", None)
+                else None,
             )
-            log.info("[recon] exact_done exact=%d bank_left=%d book_left=%d",
-                     len(exact_matches), len(candidate_bank), len(candidate_book))
-
-        # Fuzzy
-        if cfg.strategy in ("fuzzy", "optimized"):
-            fuzzy_matches = ReconciliationService.get_fuzzy_matches(
-                candidate_bank, candidate_book,
-                cfg.amount_tolerance, cfg.date_tolerance_days, log_all=cfg.log_all
+            for tx in bank_qs
+        ]
+        candidate_book = [
+            JournalEntryDTO(
+                id=je.id,
+                company_id=je.company_id,
+                transaction_id=je.transaction_id,
+                date=je.date or (je.transaction.date if je.transaction else None),
+                effective_amount=je.get_effective_amount(),
+                currency_id=je.transaction.currency_id if je.transaction else None,
+                description=je.transaction.description if je.transaction else "",
+                embedding=list(je.transaction.description_embedding)
+                if getattr(je.transaction, "description_embedding", None)
+                else None,
             )
-            log.info("[recon] fuzzy_done fuzzy=%d", len(fuzzy_matches))
-
-        # Group
-        if cfg.strategy in ("many-to-many", "optimized") and cfg.max_group_size > 1:
-            group_matches = ReconciliationService.get_group_matches(
-                candidate_bank, candidate_book,
-                cfg.amount_tolerance, cfg.date_tolerance_days,
-                cfg.max_group_size, log_all=cfg.log_all
-            )
-            log.info("[recon] group_done groups=%d", len(group_matches))
-
-        # Combine and filter by min confidence
-        combined = [s for s in (exact_matches + fuzzy_matches + group_matches)
-                    if float(s.get("confidence_score", 0)) >= cfg.min_confidence]
-
-        # Sort by descending confidence
-        combined.sort(key=lambda x: (-x["confidence_score"], x["difference"]))
-
-        # Cap suggestions
-        combined = combined[:cfg.max_suggestions]
-
-        # Optionally auto-match perfect matches
-        auto_info = {"enabled": bool(auto_match_100), "applied": 0, "skipped": 0, "details": []}
-        if auto_match_100:
-            auto_info = ReconciliationService._apply_auto_matches_100(combined, tenant_id)
-            log.info("[recon] auto100 applied=%d skipped=%d",
-                     auto_info["applied"], auto_info["skipped"])
-
-        return {"suggestions": combined, "auto_match": auto_info}
-
-    # ------------------------------------------------------------------
-    # Matching helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def get_exact_matches(banks: Iterable[BankTransaction], books: Iterable[JournalEntry],
-                          date_tolerance_days: int, *, log_all: bool = False
-                          ) -> Tuple[List[dict], List[BankTransaction], List[JournalEntry]]:
-        """
-        Attempt to match bank transactions and journal entries at a transaction level.
-        A match occurs when the absolute amounts (quantized to two decimals) are exactly equal
-        and the dates differ by no more than date_tolerance_days.
-        Returns a tuple: matched_suggestions, remaining_banks, remaining_books.
-        """
-        exact_matches = []
-        matched_bank_ids = set()
-        matched_book_txn_ids = set()
-
-        # Only consider journal entries whose account is linked to a bank account
-        linked_account_ids = set(
-            Account.objects.filter(bank_account__isnull=False).values_list("id", flat=True)
-        )
-
-        # Group journal entries by transaction_id (one transaction may have multiple lines)
-        book_groups: Dict[int, List[JournalEntry]] = defaultdict(list)
-        for entry in books:
-            if entry.account_id in linked_account_ids:
-                book_groups[entry.transaction_id].append(entry)
-
-        # Evaluate each bank transaction against grouped book entries
-        for bank_tx in banks:
-            for txn_id, entries in book_groups.items():
-                if txn_id in matched_book_txn_ids:
-                    continue
-
-                # Sum effective amounts for the transaction and pick representative date
-                txn_sum = sum(
-                    (e.get_effective_amount() or Decimal("0"))
-                    for e in entries
-                )
-                book_date = entries[0].date or (
-                    entries[0].transaction.date if entries[0].transaction else None
-                )
-
-                if _is_exact_match(bank_tx.amount, txn_sum, book_date, bank_tx.date, date_tolerance_days):
-                    # Found a match
-                    matched_bank_ids.add(bank_tx.id)
-                    matched_book_txn_ids.add(txn_id)
-                    exact_matches.append(
-                        ReconciliationService.format_suggestion_output(
-                            "1-to-1 Exact", [bank_tx], [entries[0]], confidence_score=1.0
-                        )
-                    )
-                    break  # move to next bank_tx
-
-                # Debug logging for mismatches
-                if log_all:
-                    amt_match = abs(_q2(bank_tx.amount)) == abs(_q2(txn_sum))
-                    date_diff = (book_date and bank_tx.date
-                                 and abs((bank_tx.date - book_date).days))
-                    log.debug(
-                        "[exact_try] bank_id=%s txn_id=%s bank_amt=%.2f txn_amt=%.2f "
-                        "amt_match=%s date_diff=%s",
-                        bank_tx.id, txn_id,
-                        float(bank_tx.amount), float(txn_sum),
-                        amt_match, date_diff
-                    )
-
-        # Build lists of remaining candidates
-        remaining_banks = [tx for tx in banks if tx.id not in matched_bank_ids]
-        remaining_books = [
-            entry for entry in books if entry.transaction_id not in matched_book_txn_ids
+            for je in book_qs
         ]
 
-        return exact_matches, remaining_banks, remaining_books
+        # Run the appropriate matching engine
+        if pipeline_id:
+            pipeline = ReconciliationPipeline.objects.get(id=pipeline_id)
+            suggestions = run_pipeline(pipeline, candidate_bank, candidate_book)
+        else:
+            cfg = ReconciliationConfig.objects.get(id=config_id)
+            suggestions = run_single_config(cfg, candidate_bank, candidate_book, company_id)
 
-    @staticmethod
-    def get_fuzzy_matches(banks: Iterable[BankTransaction], books: Iterable[JournalEntry],
-                          amount_tolerance: Decimal, date_tolerance: int, *,
-                          log_all: bool = False) -> List[dict]:
-        """
-        Match individual bank and journal entries when absolute amount differences and
-        date differences are within tolerances.  A confidence score is computed from
-        amount_diff and date_diff.  Returns sorted fuzzy suggestions.
-        """
-        fuzzy_matches: List[dict] = []
+        # Optionally auto-apply matches with confidence 1.0
+        auto_info = {"enabled": bool(auto_match_100), "applied": 0, "skipped": 0, "details": []}
+        if auto_match_100:
+            auto_info = ReconciliationService._apply_auto_matches_100(suggestions)
 
-        for bank_tx in banks:
-            for book_tx in books:
-                bank_amt = _q2(bank_tx.amount)
-                book_amt = _q2(book_tx.get_effective_amount())
-                amount_diff = abs(bank_amt - book_amt)
-                book_date = book_tx.date or (
-                    book_tx.transaction.date if book_tx.transaction else None
-                )
-                if book_date is None or bank_tx.date is None:
-                    continue
-                date_diff = abs((bank_tx.date - book_date).days)
-
-                if amount_diff <= amount_tolerance and date_diff <= date_tolerance:
-                    conf = ReconciliationService.calculate_confidence(
-                        amount_diff, date_diff, amount_tolerance, date_tolerance
-                    )
-                    fuzzy_matches.append(
-                        ReconciliationService.format_suggestion_output(
-                            "1-to-1 fuzzy", [bank_tx], [book_tx], conf
-                        )
-                    )
-
-                if log_all:
-                    log.debug(
-                        "[fuzzy_try] bank_id=%s book_id=%s bank_amt=%.2f book_amt=%.2f "
-                        "amount_diff=%.2f date_diff=%s",
-                        bank_tx.id, book_tx.id,
-                        float(bank_amt), float(book_amt),
-                        float(amount_diff), date_diff
-                    )
-
-        # sort by confidence descending
-        fuzzy_matches.sort(key=lambda x: x["confidence_score"], reverse=True)
-        return fuzzy_matches
-
-    @staticmethod
-    def get_group_matches(
-        banks: Iterable[BankTransaction],
-        books: Iterable[JournalEntry],
-        amount_tolerance: Decimal,
-        date_tolerance: int,
-        max_group_size: int,
-        *,
-        log_all: bool = False
-    ) -> List[dict]:
-        """
-        Many-to-many matching: for each bank transaction, build windows of bank/entry
-        candidates within date tolerance, then evaluate all combinations up to max_group_size.
-        A group match is valid when the absolute differences between summed bank and book
-        amounts are within the tolerance and the date span is within tolerance.
-        """
-        group_matches: List[dict] = []
-        seen_keys = set()
-
-        sorted_banks = sorted(banks, key=lambda x: x.date)
-        sorted_books = sorted(books, key=lambda x: x.date)
-
-        bank_dates = [tx.date for tx in sorted_banks]
-        book_dates = [ent.date for ent in sorted_books]
-
-        for bank_tx in sorted_banks:
-            start = bank_tx.date - timedelta(days=date_tolerance)
-            end = bank_tx.date + timedelta(days=date_tolerance)
-
-            # Build sliding windows
-            b_start = bisect_left(bank_dates, start)
-            b_end = bisect_right(bank_dates, end)
-            bank_window = sorted_banks[b_start:b_end]
-
-            bk_start = bisect_left(book_dates, start)
-            bk_end = bisect_right(book_dates, end)
-            book_window = sorted_books[bk_start:bk_end]
-
-            # iterate combinations
-            for i in range(1, min(len(bank_window), max_group_size) + 1):
-                for bank_combo in combinations(bank_window, i):
-                    sum_bank = sum(_q2(tx.amount) for tx in bank_combo)
-
-                    for j in range(1, min(len(book_window), max_group_size) + 1):
-                        for book_combo in combinations(book_window, j):
-                            book_values = [e.get_effective_amount() for e in book_combo
-                                           if e.get_effective_amount() is not None]
-                            if not book_values:
-                                continue
-                            sum_book = sum(_q2(v) for v in book_values)
-                            amount_diff = abs(sum_bank - sum_book)
-                            if amount_diff > amount_tolerance:
-                                continue
-
-                            all_dates = [tx.date for tx in bank_combo] + [ent.date for ent in book_combo]
-                            span = (max(all_dates) - min(all_dates)).days
-                            if span > date_tolerance:
-                                continue
-
-                            # compute average date difference across cross-products
-                            date_diffs = [
-                                abs((b.date - e.date).days)
-                                for b in bank_combo for e in book_combo
-                            ]
-                            avg_date_diff = sum(date_diffs) / len(date_diffs)
-                            conf = ReconciliationService.calculate_confidence(
-                                amount_diff, avg_date_diff, amount_tolerance, date_tolerance
-                            )
-
-                            key = (tuple(sorted(tx.id for tx in bank_combo)),
-                                   tuple(sorted(ent.id for ent in book_combo)))
-                            if key in seen_keys:
-                                continue
-                            seen_keys.add(key)
-
-                            group_matches.append(
-                                ReconciliationService.format_suggestion_output(
-                                    "many-to-many", list(bank_combo), list(book_combo), conf
-                                )
-                            )
-
-        group_matches.sort(key=lambda x: x["confidence_score"], reverse=True)
-        return group_matches
+        return {"suggestions": suggestions, "auto_match": auto_info}
 
     # ------------------------------------------------------------------
     # Auto-match persistence
     # ------------------------------------------------------------------
     @staticmethod
     @transaction.atomic
-    def _apply_auto_matches_100(suggestions: List[dict], tenant_id: Optional[str] = None,
-                                *, status_value: str = "matched") -> dict:
+    def _apply_auto_matches_100(
+        suggestions: List[dict],
+        status_value: str = "matched"
+    ) -> Dict[str, object]:
         """
         Persist suggestions with confidence_score == 1.0 into Reconciliation records.
-        This method is greedy and ensures no overlap between applied suggestions.
+        Ensures no overlaps.  Returns counts and details.
         """
         applied = 0
         skipped = 0
         details = []
         used_banks: set[int] = set()
         used_books: set[int] = set()
-        reasons = Counter()
 
-        for idx, s in enumerate(suggestions):
+        for s in suggestions:
             if float(s.get("confidence_score", 0)) != 1.0:
-                continue  # only auto-match perfect matches
-
-            bank_ids = [int(b) for b in s.get("bank_ids", [])]
-            book_ids = [int(j) for j in s.get("journal_entries_ids", [])]
+                continue
+            bank_ids = s.get("bank_ids", [])
+            book_ids = s.get("journal_entries_ids", [])
             if not bank_ids or not book_ids:
                 skipped += 1
-                reasons["empty_ids"] += 1
                 details.append({"reason": "empty_ids", "suggestion": s})
                 continue
             if any(b in used_banks for b in bank_ids) or any(j in used_books for j in book_ids):
                 skipped += 1
-                reasons["overlap_in_batch"] += 1
                 details.append({"reason": "overlap_in_batch", "suggestion": s})
                 continue
 
-            sp = transaction.savepoint()
-            try:
-                # check for existing matches in DB
-                if BankTransaction.objects.filter(
-                    id__in=bank_ids, reconciliations__status__in=["matched", "approved"]
-                ).exists():
-                    skipped += 1
-                    reasons["already_matched_bank"] += 1
-                    transaction.savepoint_commit(sp)
-                    continue
-                if JournalEntry.objects.filter(
-                    id__in=book_ids, reconciliations__status__in=["matched", "approved"]
-                ).exists():
-                    skipped += 1
-                    reasons["already_matched_book"] += 1
-                    transaction.savepoint_commit(sp)
-                    continue
-
-                # lock rows
-                bank_objs = list(BankTransaction.objects.select_for_update().filter(id__in=bank_ids))
-                book_objs = list(JournalEntry.objects.select_for_update().filter(id__in=book_ids))
-
-                # infer company; skip if ambiguous
-                company_ids = {b.company_id for b in bank_objs if b.company_id} | \
-                              {j.company_id for j in book_objs if j.company_id}
-                if len(company_ids) != 1:
-                    skipped += 1
-                    reasons["company_unresolved"] += 1
-                    transaction.savepoint_commit(sp)
-                    continue
-                company_id = next(iter(company_ids))
-
-                # create Reconciliation
-                recon = Reconciliation.objects.create(
-                    status=status_value,
-                    company_id=company_id,
-                    notes="auto_match_100",
-                )
-                recon.bank_transactions.add(*bank_objs)
-                recon.journal_entries.add(*book_objs)
-                applied += 1
-                used_banks.update(bank_ids)
-                used_books.update(book_ids)
-                details.append({
-                    "reconciliation_id": recon.id,
-                    "company_id": company_id,
-                    "bank_ids": bank_ids,
-                    "journal_entries_ids": book_ids,
-                })
-                transaction.savepoint_commit(sp)
-
-            except Exception as exc:
-                transaction.savepoint_rollback(sp)
+            # Check for preexisting matches
+            if BankTransaction.objects.filter(
+                id__in=bank_ids, reconciliations__status__in=["matched", "approved"]
+            ).exists() or JournalEntry.objects.filter(
+                id__in=book_ids, reconciliations__status__in=["matched", "approved"]
+            ).exists():
                 skipped += 1
-                reasons["exception"] += 1
-                details.append({"reason": "exception", "error": str(exc), "suggestion": s})
+                details.append({"reason": "already_matched", "suggestion": s})
+                continue
+
+            bank_objs = list(BankTransaction.objects.filter(id__in=bank_ids))
+            book_objs = list(JournalEntry.objects.filter(id__in=book_ids))
+            company_ids = {b.company_id for b in bank_objs} | {j.company_id for j in book_objs}
+            if len(company_ids) != 1:
+                skipped += 1
+                details.append({"reason": "company_unresolved", "suggestion": s})
+                continue
+            company_id = company_ids.pop()
+
+            recon = Reconciliation.objects.create(
+                status=status_value,
+                company_id=company_id,
+                notes="auto_match_100",
+            )
+            recon.bank_transactions.add(*bank_objs)
+            recon.journal_entries.add(*book_objs)
+            applied += 1
+            used_banks.update(bank_ids)
+            used_books.update(book_ids)
+            details.append({"reconciliation_id": recon.id, "bank_ids": bank_ids, "journal_ids": book_ids})
 
         return {
             "enabled": True,
             "applied": applied,
             "skipped": skipped,
-            "reasons": dict(reasons),
             "details": details,
-        }
-
-    # ------------------------------------------------------------------
-    # Utility methods
-    # ------------------------------------------------------------------
-    @staticmethod
-    def calculate_confidence(amount_diff: Decimal | float,
-                             date_diff: float, amount_tol: Decimal,
-                             date_tol: int) -> float:
-        """
-        Compute a confidence score in [0,1] based on normalized differences.
-        Weighted 70% on amount and 30% on date.
-        """
-        amt_tol = float(amount_tol or Decimal("0.01"))
-        dt_tol = float(date_tol or 1)
-        amt_score = max(0.0, 1 - float(amount_diff) / amt_tol)
-        dt_score = max(0.0, 1 - float(date_diff) / dt_tol)
-        return round(0.7 * amt_score + 0.3 * dt_score, 2)
-
-    @staticmethod
-    def format_suggestion_output(match_type: str,
-                                 bank_combo: List[BankTransaction],
-                                 book_combo: List[JournalEntry],
-                                 confidence_score: float) -> dict:
-        """
-        Produce a suggestion dict summarizing a match.
-        """
-        sum_bank = sum(tx.amount for tx in bank_combo)
-        sum_book = sum(entry.get_effective_amount() for entry in book_combo)
-        diff = abs(sum_bank - sum_book)
-        date_diffs = [
-            abs((tx.date - entry.date).days)
-            for tx in bank_combo for entry in book_combo
-        ]
-        avg_date_diff = sum(date_diffs) / len(date_diffs) if date_diffs else 0
-
-        return {
-            "match_type": match_type,
-            "N bank": len(bank_combo),
-            "N book": len(book_combo),
-            "bank_ids": [tx.id for tx in bank_combo],
-            "journal_entries_ids": [entry.id for entry in book_combo],
-            "sum_bank": float(sum_bank),
-            "sum_book": float(sum_book),
-            "difference": float(diff),
-            "avg_date_diff": avg_date_diff,
-            "confidence_score": float(confidence_score),
-            "bank_transaction_details": [
-                {
-                    "id": tx.id,
-                    "date": tx.date.isoformat() if tx.date else None,
-                    "amount": float(tx.amount) if tx.amount is not None else None,
-                    "description": tx.description,
-                    "tx_hash": tx.tx_hash,
-                    "bank_account": {
-                        "id": tx.bank_account.id,
-                        "name": tx.bank_account.name,
-                    } if tx.bank_account else None,
-                    "entity": tx.entity.id if tx.entity else None,
-                    "currency": tx.currency.id,
-                }
-                for tx in bank_combo
-            ],
-            "journal_entry_details": [
-                {
-                    "id": entry.id,
-                    "date": entry.date.isoformat() if entry.date else None,
-                    "amount": float(entry.get_effective_amount()) if entry.get_effective_amount() is not None else None,
-                    "description": entry.transaction.description,
-                    "account": {
-                        "id": entry.account.id,
-                        "account_code": entry.account.account_code,
-                        "name": entry.account.name,
-                    } if entry.account else None,
-                    "transaction": {
-                        "id": entry.transaction.id,
-                        "entity": {
-                            "id": entry.transaction.entity.id,
-                            "name": entry.transaction.entity.name,
-                        } if entry.transaction.entity else None,
-                        "description": entry.transaction.description,
-                        "date": entry.transaction.date.isoformat() if entry.transaction.date else None,
-                    } if entry.transaction else None,
-                }
-                for entry in book_combo
-            ],
         }

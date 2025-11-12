@@ -7,3 +7,7 @@ class NplConfig(AppConfig):
     default_auto_field = 'django.db.models.BigAutoField'
     name = 'npl'
     verbose_name = 'NPL'
+    
+    def ready(self):
+        # importa os signals para registrar os handlers
+        import npl.signals  # noqa

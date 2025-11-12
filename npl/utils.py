@@ -18,17 +18,144 @@ from django.conf import settings
 from . import models
 from docling.document_converter import DocumentConverter
 import json
+from pypdf import PdfReader
+import numpy as np
+from accounting.services.embedding_client import EmbeddingClient
+
+def extract_text_with_pypdf(pdf_path: str) -> str:
+    """Extrai texto de cada página usando pypdf e remove NUL bytes."""
+    reader = PdfReader(pdf_path)
+    text_chunks: List[str] = []
+    for page in reader.pages:
+        page_text = page.extract_text() or ""
+        text_chunks.append(page_text)
+    full = "\n".join(text_chunks)
+    return full.replace("\x00", "")
+
+def extract_pages(pdf_path: str) -> List[Tuple[int, str]]:
+    """Extrai cada página do PDF como (número_da_página, texto)."""
+    reader = PdfReader(pdf_path)
+    pages = []
+    for idx, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+        pages.append((idx, text.replace('\x00', '')))
+    return pages
+
+def segment_paragraphs_with_page(pages: List[Tuple[int, str]]) -> List[Tuple[int, str, int]]:
+    """
+    Divide cada texto de página em parágrafos.
+    Retorna lista de (offset, parágrafo, número_da_página).
+    """
+    paragraphs = []
+    for page_num, text in pages:
+        offset = 0
+        for para in re.split(r"\n\s*\n", text):
+            para = para.strip()
+            if para:
+                pos = text.find(para, offset)
+                paragraphs.append((pos, para, page_num))
+                offset = pos + len(para)
+    return paragraphs
+
+def split_text_by_tokens(text: str, max_tokens: int = 2048) -> List[str]:
+    """Divide um texto em chunks que não excedem o limite aproximado de tokens."""
+    words = text.split()
+    if len(words) <= max_tokens:
+        return [text.strip()]
+    sentences = re.split(r'(?<=[\.\!\?])\s+', text)
+    chunks: List[str] = []
+    current_chunk: List[str] = []
+    current_tokens = 0
+    for sent in sentences:
+        sent_tokens = len(sent.split())
+        if current_tokens + sent_tokens > max_tokens and current_chunk:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = [sent]
+            current_tokens = sent_tokens
+        else:
+            current_chunk.append(sent)
+            current_tokens += sent_tokens
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+    return chunks
+
+def score_paragraph(
+    rule,
+    para_text: str,
+    embed_client: EmbeddingClient,
+    para_vec: Optional[np.ndarray] = None,
+    sim_threshold: float = 0.5,
+    use_synonyms: bool = True,
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Calcula um score para um parágrafo combinando:
+      - Âncoras fortes: +2 por ocorrência literal.
+      - Âncoras fracas: +1 por ocorrência literal.
+      - Sinônimos de âncoras fortes: +1 * similaridade (se use_synonyms=True).
+      - Âncoras negativas: score = -100 (descarta).
+    """
+    lowered = para_text.lower()
+    details: Dict[str, List[Dict[str, Any]]] = {
+        "strong_literal": [],
+        "weak_literal": [],
+        "strong_synonyms": [],
+        "weak_synonyms": [],
+        "negative_matches": [],
+    }
+    score = 0.0
+    for neg in rule.negative_anchor_list():
+        if neg and neg.lower() in lowered:
+            details["negative_matches"].append({"anchor": neg})
+            return -100.0, details
+
+    para_vec_cache: Optional[np.ndarray] = para_vec
+    def ensure_para_vec() -> np.ndarray:
+        nonlocal para_vec_cache
+        if para_vec_cache is None:
+            para_vec_cache = np.array(embed_client.embed_one(para_text), dtype=float)
+        return para_vec_cache
+
+    def cos_sim(a: np.ndarray, b: np.ndarray) -> float:
+        denom = (np.linalg.norm(a) * np.linalg.norm(b))
+        if denom == 0:
+            return 0.0
+        return float(np.dot(a, b) / denom)
+
+    # Âncoras fortes
+    for idx, strong in enumerate(rule.strong_anchor_list()):
+        if not strong:
+            continue
+        count = lowered.count(strong.lower())
+        if count:
+            score += 2.0 * count
+            details["strong_literal"].append({"anchor": strong, "count": count})
+        elif use_synonyms and rule.anchor_embeddings and idx < len(rule.anchor_embeddings):
+            try:
+                pv = ensure_para_vec()
+                anc_vec = np.array(rule.anchor_embeddings[idx], dtype=float)
+                sim = cos_sim(pv, anc_vec)
+                if sim >= sim_threshold:
+                    score += 1.0 * sim
+                    details["strong_synonyms"].append({"anchor": strong, "sim": sim})
+            except Exception:
+                pass
+
+    # Âncoras fracas
+    for weak in rule.weak_anchor_list():
+        if not weak:
+            continue
+        count = lowered.count(weak.lower())
+        if count:
+            score += 1.0 * count
+            details["weak_literal"].append({"anchor": weak, "count": count})
+
+    return score, details
 
 def convert_with_docling(pdf_path: str) -> dict:
-    """
-    Converte um PDF usando Docling e retorna o JSON estruturado.
-    """
+    """Converte um PDF usando Docling e retorna JSON estruturado."""
     converter = DocumentConverter()
-    # Etapa 2: converte o documento
     result = converter.convert(pdf_path)
-    # Etapa 3: obtém o objeto DoclingDocument
     doc = result.document
-    # Etapa 4: exporta para JSON (string)
     json_str = doc.export_to_json()
     return json.loads(json_str)
 

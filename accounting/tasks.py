@@ -37,13 +37,22 @@ STATE_MAP = {
     "FAILURE":  "FAILURE",
     "REVOKED":  "REVOKED",
 }
+
+
 @shared_task(bind=True)
 def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=False):
     task_obj = ReconciliationTask.objects.get(id=db_id)
     try:
         task_obj.status = "running"
         task_obj.save(update_fields=["status", "updated_at"])
-        result = ReconciliationService.match_many_to_many(data, tenant_id, auto_match_100=auto_match_100)
+
+        # Delegates to ReconciliationService, which now looks for config_id and pipeline_id
+        result = ReconciliationService.match_many_to_many(
+            data,
+            tenant_id,
+            auto_match_100=auto_match_100,
+        )
+
         task_obj.status = "completed"
         task_obj.result = result
         task_obj.save(update_fields=["status", "result", "updated_at"])

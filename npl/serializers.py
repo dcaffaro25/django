@@ -12,12 +12,19 @@ from . import models
 
 class DocumentUploadSerializer(serializers.ModelSerializer):
     """
-    Serializer para envio de PDF. Apenas o arquivo é enviado; o processo será
-    determinado posteriormente pelo OCR.
+    Serializer para envio de PDF. Permite especificar opcionalmente o modo de embeddings.
     """
+    embedding_mode = serializers.ChoiceField(
+        choices=models.Document.EMBEDDING_MODE_CHOICES,
+        required=False,
+        default=models.Document.EMBEDDING_MODE_CHOICES[0][0],  # "all_paragraphs"
+        help_text="Define como os embeddings serão gerados: all_paragraphs, spans_only ou none."
+    )
+
     class Meta:
         model = models.Document
-        fields = ('id', 'file')       # não expor process no upload
+        # Inclui embedding_mode no payload
+        fields = ('id', 'file', 'embedding_mode')
         read_only_fields = ('id',)
 
 

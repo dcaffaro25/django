@@ -610,9 +610,19 @@ class Reconciliation(TenantAwareBaseModel):
     
     
 class ReconciliationConfig(models.Model):
-    """
-    Stores reusable reconciliation settings (shortcuts / presets).
-    Can be global (system-wide), per company, or per user.
+    """Stores reusable reconciliation settings.
+
+    Users can control basic matching behaviour via this model:
+
+    * `strategy` – high‑level strategy name (for legacy fallback).
+    * `amount_tolerance` and `date_tolerance_days` – fuzzy match
+      thresholds.
+    * `max_group_size_bank` and `max_group_size_book` – maximum
+      group sizes on each side for many‑to‑many matching.
+    * `fee_accounts`, `duplicate_window_days`, `text_similarity` –
+      tune fee folding, duplicate detection and text similarity.
+
+    The removed fields `fx_policy` and `pipeline` simplify the model.
     """
 
     SCOPE_CHOICES = [
@@ -623,76 +633,185 @@ class ReconciliationConfig(models.Model):
     ]
 
     scope = models.CharField(
-        max_length=20, choices=SCOPE_CHOICES, default="company",
-        help_text="Who this config applies to: global, company, user, or company+user"
+        max_length=20,
+        choices=SCOPE_CHOICES,
+        default="company",
+        help_text="Who this config applies to: global, company, user, or company+user",
     )
-    # Only required if scope == "company"
     company = models.ForeignKey(
         Company,
-        null=True, blank=True,
+        null=True,
+        blank=True,
         on_delete=models.CASCADE,
-        related_name="reconciliation_configs"
+        related_name="reconciliation_configs",
     )
-    
-    # Only required if scope == "user"
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
-        null=True, blank=True,
+        null=True,
+        blank=True,
         on_delete=models.CASCADE,
-        related_name="reconciliation_configs"
+        related_name="reconciliation_configs",
     )
-    
-    name = models.CharField(max_length=255, help_text="Name of this config, e.g. 'High Precision Match' or 'Loose Match'")
+    name = models.CharField(max_length=255)
     description = models.TextField(blank=True, null=True)
-
-    # Bank & Book filters (saved queries)
     bank_filters = models.JSONField(default=dict, blank=True, null=True)
     book_filters = models.JSONField(default=dict, blank=True, null=True)
 
-    # Reconciliation parameters
-    strategy = models.CharField(
-        max_length=50,
-        choices=[
-            ("exact 1-to-1", "Exact 1-to-1"),
-            ("fuzzy", "Fuzzy"),
-            ("many-to-many", "Many-to-Many"),
-            ("optimized", "Optimized"),
-        ],
-        default="optimized"
+    embedding_weight = models.DecimalField(
+        max_digits=4, decimal_places=2, default=0.50,
+        help_text="Weight of embedding similarity in confidence calculation"
     )
-    max_group_size = models.PositiveIntegerField(default=2)
+    amount_weight = models.DecimalField(
+        max_digits=4, decimal_places=2, default=0.35,
+        help_text="Weight of amount match in confidence calculation"
+    )
+    currency_weight = models.DecimalField(
+        max_digits=4, decimal_places=2, default=0.10,
+        help_text="Weight of currency match in confidence calculation"
+    )
+    date_weight = models.DecimalField(
+        max_digits=4, decimal_places=2, default=0.05,
+        help_text="Weight of date proximity in confidence calculation"
+    )
     amount_tolerance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     date_tolerance_days = models.PositiveIntegerField(default=2)
+    max_group_size_bank = models.PositiveIntegerField(default=1)
+    max_group_size_book = models.PositiveIntegerField(default=1)
     min_confidence = models.DecimalField(max_digits=4, decimal_places=2, default=0.9)
-    max_suggestions = models.PositiveIntegerField(default=5)
+    max_suggestions = models.PositiveIntegerField(default=1000)
 
-    # Metadata
+    # Additional tuning fields
+    fee_accounts = models.JSONField(
+        default=list,
+        blank=True,
+        null=True,
+        help_text="List of account codes representing fees to include in group sums.",
+    )
+    duplicate_window_days = models.PositiveIntegerField(
+        default=3,
+        help_text="Number of days within which identical transactions are considered duplicates.",
+    )
+    text_similarity = models.JSONField(
+        default=dict,
+        blank=True,
+        null=True,
+        help_text="Settings for text and embedding similarity (e.g. use_trgm, use_embedding, weights).",
+    )
+
     is_default = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        unique_together = ("company", "user", "name")  # each company can’t have duplicate config names
+        unique_together = ("company", "user", "name")
         ordering = ["-updated_at"]
 
-    def __str__(self):
-        if self.scope == "global":
-            return f"[Global] {self.name}"
-        elif self.scope == "company" and self.company:
-            return f"[Company: {self.company.name}] {self.name}"
-        elif self.scope == "user" and self.user:
-            return f"[User: {self.user.username}] {self.name}"
-        elif self.scope == "company_user" and self.company and self.user:
-            return f"[Company: {self.company.name} | User: {self.user.username}] {self.name}"
-        return f"{self.name} (Unscoped)"
-
     def clean(self):
-        """Ensure required fields are set depending on scope."""
+        super().clean()
+        total = float(self.embedding_weight + self.amount_weight +
+                      self.currency_weight + self.date_weight)
+        if abs(total - 1.0) > 0.001:
+            raise ValidationError("Confidence weights must sum to 1.0")
         from django.core.exceptions import ValidationError
-
         if self.scope == "company" and not self.company:
             raise ValidationError("Company is required for company scope configs.")
         if self.scope == "user" and not self.user:
             raise ValidationError("User is required for user scope configs.")
         if self.scope == "company_user" and (not self.company or not self.user):
             raise ValidationError("Both company and user are required for company_user scope configs.")
+
+    def __str__(self) -> str:
+        return self.name
+    
+
+class ReconciliationPipeline(models.Model):
+    """Defines an ordered sequence of reconciliation stages.
+
+    A pipeline belongs to a scope (global, company, user or company_user)
+    and optionally references a company and/or user.  The pipeline
+    determines high‑level behaviour such as when to auto‑apply
+    matches and how many suggestions to return.  Actual stage logic
+    comes from referenced `ReconciliationConfig` objects via
+    `ReconciliationPipelineStage`.
+    """
+
+    scope = models.CharField(
+        max_length=20,
+        choices=[
+            ("global", "Global"),
+            ("company", "Company"),
+            ("user", "User"),
+            ("company_user", "Company + User"),
+        ],
+        default="company",
+    )
+    company = models.ForeignKey(
+        Company,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="reconciliation_pipelines",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="reconciliation_pipelines",
+    )
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True, null=True)
+    auto_apply_score = models.DecimalField(
+        max_digits=4, decimal_places=2, default=1.0,
+        help_text="Confidence threshold above which matches are auto‑applied."
+    )
+    max_suggestions = models.PositiveIntegerField(
+        default=1000,
+        help_text="Maximum number of suggestions returned in one run."
+    )
+    is_default = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("company", "user", "name")
+        ordering = ["-updated_at"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class ReconciliationPipelineStage(models.Model):
+    """Links a pipeline to a `ReconciliationConfig` and defines order.
+
+    Each stage points to a saved configuration that acts as the recipe
+    for that stage.  The stage may also specify optional overrides
+    (e.g. group sizes, tolerances, text weight) which take precedence
+    over values from the referenced config.
+    """
+
+    pipeline = models.ForeignKey(
+        ReconciliationPipeline,
+        on_delete=models.CASCADE,
+        related_name="stages",
+    )
+    config = models.ForeignKey(
+        ReconciliationConfig,
+        on_delete=models.CASCADE,
+        related_name="pipeline_stages",
+    )
+    order = models.PositiveIntegerField()
+    enabled = models.BooleanField(default=True)
+    # Optional per‑stage overrides
+    max_group_size_bank = models.PositiveIntegerField(null=True, blank=True)
+    max_group_size_book = models.PositiveIntegerField(null=True, blank=True)
+    amount_tolerance = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    date_tolerance_days = models.PositiveIntegerField(null=True, blank=True)
+    text_weight = models.DecimalField(max_digits=4, decimal_places=2, null=True, blank=True)
+
+    class Meta:
+        unique_together = ("pipeline", "order")
+        ordering = ["order"]
+
+    def __str__(self) -> str:
+        return f"{self.pipeline.name} • Stage {self.order} ({self.config.name})"

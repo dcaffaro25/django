@@ -25,15 +25,57 @@ class DocumentUploadView(generics.CreateAPIView):
     serializer_class = serializers.DocumentUploadSerializer
 
     def perform_create(self, serializer):
-        doc = serializer.save()
-        # Kick off asynchronous OCR + classification after committing the record
-        tasks.ocr_pipeline_task.delay(doc.id)
+        embedding_mode = self.request.data.get("embedding_mode") or serializer.validated_data.get("embedding_mode")
+        doc = serializer.save(embedding_mode=embedding_mode)
+        tasks.ocr_pipeline_task.delay(doc.id, embedding_mode=embedding_mode)
 
     def create(self, request, *args, **kwargs):
         response = super().create(request, *args, **kwargs)
         response.data = {'document_id': response.data['id'], 'status': 'accepted'}
         return response
 
+
+class EmbeddingModeUpdateView(APIView):
+    """
+    API para atualizar o embedding_mode de um Document.
+    Não permite retroceder para um modo menos sofisticado.
+    """
+    permission_classes = []  # ajuste conforme sua política de acesso
+
+    MODES = ['none', 'spans_only', 'all_paragraphs']
+
+    def patch(self, request, pk):
+        doc = get_object_or_404(models.Document, pk=pk)
+        new_mode = request.data.get('embedding_mode', '').lower()
+        if new_mode not in self.MODES:
+            return Response({"error": "Invalid embedding_mode"}, status=status.HTTP_400_BAD_REQUEST)
+
+        current_mode = doc.embedding_mode or 'all_paragraphs'
+        # Verifica se a transição é "para frente" na cadeia de modos
+        if self.MODES.index(new_mode) < self.MODES.index(current_mode):
+            return Response(
+                {"error": "Cannot regress to a less sophisticated embedding mode"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if new_mode == current_mode:
+            return Response({"message": "Mode unchanged", "embedding_mode": current_mode})
+
+        # Atualiza o documento
+        doc.embedding_mode = new_mode
+        doc.save(update_fields=['embedding_mode'])
+
+        # Dispara tarefas conforme a transição
+        if current_mode == 'none' and new_mode == 'spans_only':
+            # Gerar embeddings dos spans existentes
+            for span in doc.spans.all():
+                tasks.embed_span_task.delay(span.id)
+        elif new_mode == 'all_paragraphs':
+            # Reexecuta o pipeline em modo all_paragraphs para gerar embeddings de parágrafos
+            # e reclassificar/reestruturar spans.
+            tasks.weak_labelling_task.delay(doc.id, embedding_mode=new_mode)
+
+        return Response({"embedding_mode": new_mode}, status=status.HTTP_200_OK)
 
 class WeakLabelView(APIView):
     permission_classes = []

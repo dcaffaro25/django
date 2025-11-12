@@ -1,7 +1,10 @@
 # NORD/accounting/serializers.py
 
 from rest_framework import serializers
-from .models import (Currency, Account, Transaction, JournalEntry, ReconciliationTask, Rule, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter, ReconciliationConfig)
+from .models import (Currency, Account, Transaction, JournalEntry, 
+                     ReconciliationTask, Rule, Bank, BankAccount, BankTransaction, 
+                     Reconciliation, CostCenter, ReconciliationConfig,
+                     ReconciliationPipeline, ReconciliationPipelineStage)
 from multitenancy.serializers import CompanySerializer, EntitySerializer, FlexibleRelatedField
 from multitenancy.serializers import CompanyMiniSerializer, EntityMiniSerializer
 from django.core.exceptions import ObjectDoesNotExist
@@ -350,12 +353,8 @@ class ReconciliationSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 class ReconciliationConfigSerializer(serializers.ModelSerializer):
-    company_name = serializers.CharField(
-        source="company.name", read_only=True
-    )
-    user_name = serializers.CharField(
-        source="user.username", read_only=True
-    )
+    company_name = serializers.CharField(source="company.name", read_only=True)
+    user_name = serializers.CharField(source="user.username", read_only=True)
 
     class Meta:
         model = ReconciliationConfig
@@ -370,10 +369,24 @@ class ReconciliationConfigSerializer(serializers.ModelSerializer):
             "description",
             "bank_filters",
             "book_filters",
+            # strategy is still useful for legacy fallback
             "strategy",
-            "max_group_size",
+            # new group size fields
+            "max_group_size_bank",
+            "max_group_size_book",
+            # tolerances
             "amount_tolerance",
             "date_tolerance_days",
+            # per‑factor weights
+            "embedding_weight",
+            "amount_weight",
+            "currency_weight",
+            "date_weight",
+            # miscellaneous tuning
+            "fee_accounts",
+            "duplicate_window_days",
+            "text_similarity",
+            # thresholds
             "min_confidence",
             "max_suggestions",
             "is_default",
@@ -384,12 +397,11 @@ class ReconciliationConfigSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         scope = attrs.get("scope") or getattr(self.instance, "scope", None)
-
+        # enforce company/user presence based on scope
         if scope == "company" and not attrs.get("company") and not getattr(self.instance, "company", None):
             raise serializers.ValidationError("Company is required when scope is 'company'.")
         if scope == "user" and not attrs.get("user") and not getattr(self.instance, "user", None):
             raise serializers.ValidationError("User is required when scope is 'user'.")
-
         return attrs
 
 class ResolvedReconciliationConfigSerializer(serializers.ModelSerializer):
@@ -412,9 +424,17 @@ class ResolvedReconciliationConfigSerializer(serializers.ModelSerializer):
             "bank_filters",
             "book_filters",
             "strategy",
-            "max_group_size",
+            "max_group_size_bank",
+            "max_group_size_book",
             "amount_tolerance",
             "date_tolerance_days",
+            "embedding_weight",
+            "amount_weight",
+            "currency_weight",
+            "date_weight",
+            "fee_accounts",
+            "duplicate_window_days",
+            "text_similarity",
             "min_confidence",
             "max_suggestions",
             "is_default",
@@ -432,7 +452,120 @@ class ResolvedReconciliationConfigSerializer(serializers.ModelSerializer):
         if obj.scope == "company_user" and obj.company and obj.user:
             return f"Company+User Shortcut ({obj.company.name} | {obj.user.username})"
         return obj.scope
-    
+
+class ReconciliationPipelineStageSerializer(serializers.ModelSerializer):
+    """
+    Serializer for an individual pipeline stage.  Exposes the stage order,
+    whether it is enabled, and any per‑stage overrides.
+    """
+    config_name = serializers.CharField(source="config.name", read_only=True)
+
+    class Meta:
+        model = ReconciliationPipelineStage
+        fields = [
+            "id",
+            "order",
+            "enabled",
+            "config",        # FK to the ReconciliationConfig this stage uses
+            "config_name",   # Convenience name of that config
+            "max_group_size_bank",
+            "max_group_size_book",
+            "amount_tolerance",
+            "date_tolerance_days",
+            # add weight overrides here if your stage model defines them, e.g.:
+            # "embedding_weight", "amount_weight", "currency_weight", "date_weight",
+        ]
+
+
+class ReconciliationPipelineStageSerializer(serializers.ModelSerializer):
+    """
+    Serializer for an individual stage in a reconciliation pipeline.
+    """
+    config_name = serializers.CharField(source="config.name", read_only=True)
+
+    class Meta:
+        model = ReconciliationPipelineStage
+        fields = [
+            "id",
+            "order",
+            "enabled",
+            "config",
+            "config_name",
+            "max_group_size_bank",
+            "max_group_size_book",
+            "amount_tolerance",
+            "date_tolerance_days",
+            "text_weight",  # include other override fields if you add them
+        ]
+
+
+class ReconciliationPipelineSerializer(serializers.ModelSerializer):
+    """
+    Serializer for a reconciliation pipeline with its nested stages.
+    """
+    company_name = serializers.CharField(source="company.name", read_only=True)
+    user_name = serializers.CharField(source="user.username", read_only=True)
+    stages = ReconciliationPipelineStageSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = ReconciliationPipeline
+        fields = [
+            "id",
+            "scope",
+            "company",
+            "company_name",
+            "user",
+            "user_name",
+            "name",
+            "description",
+            "auto_apply_score",
+            "max_suggestions",
+            "is_default",
+            "stages",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class ResolvedReconciliationPipelineSerializer(serializers.ModelSerializer):
+    """
+    Simple serializer for listing pipelines available to a given user.
+    """
+    company_name = serializers.CharField(source="company.name", read_only=True)
+    user_name = serializers.CharField(source="user.username", read_only=True)
+    scope_label = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ReconciliationPipeline
+        fields = [
+            "id",
+            "scope",
+            "scope_label",
+            "company",
+            "company_name",
+            "user",
+            "user_name",
+            "name",
+            "description",
+            "auto_apply_score",
+            "max_suggestions",
+            "is_default",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_scope_label(self, obj):
+        if obj.scope == "global":
+            return "Global Pipeline"
+        if obj.scope == "company" and obj.company:
+            return f"Company Pipeline ({obj.company.name})"
+        if obj.scope == "user" and obj.user:
+            return f"User Pipeline ({obj.user.username})"
+        if obj.scope == "company_user" and obj.company and obj.user:
+            return f"Company+User Pipeline ({obj.company.name} | {obj.user.username})"
+        return obj.scope
+
 class StartEmbeddingBackfillSerializer(serializers.Serializer):
     per_model_limit = serializers.IntegerField(required=False, min_value=1)
     sync = serializers.BooleanField(required=False, default=False)
