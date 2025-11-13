@@ -673,11 +673,11 @@ class ReconciliationConfig(models.Model):
         max_digits=4, decimal_places=2, default=0.05,
         help_text="Weight of date proximity in confidence calculation"
     )
-    amount_tolerance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    date_tolerance_days = models.PositiveIntegerField(default=2)
-    max_group_size_bank = models.PositiveIntegerField(default=1)
-    max_group_size_book = models.PositiveIntegerField(default=1)
-    min_confidence = models.DecimalField(max_digits=4, decimal_places=2, default=0.9)
+    amount_tolerance = models.DecimalField(max_digits=12, decimal_places=2, default=0) #ok
+    date_tolerance_days = models.PositiveIntegerField(default=2) #ok
+    max_group_size_bank = models.PositiveIntegerField(default=1) #ok
+    max_group_size_book = models.PositiveIntegerField(default=1) #ok
+    min_confidence = models.DecimalField(max_digits=4, decimal_places=2, default=0.9) #ok
     max_suggestions = models.PositiveIntegerField(default=1000)
 
     # Additional tuning fields

@@ -17,7 +17,8 @@ from core.utils.jobs import job_progress
 from core.models import Job
 
 import requests
-
+from celery.utils.log import get_task_logger
+logger = get_task_logger(__name__)
 
 from .services.reconciliation_service import ReconciliationService
 from .models import Account, BankTransaction, Transaction, ReconciliationTask
@@ -75,17 +76,26 @@ def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=Fa
         task_obj.status = "running"
         task_obj.save(update_fields=["status", "updated_at"])
 
-        # Delegates to ReconciliationService, which now looks for config_id and pipeline_id
+        logger.info("Task %s started: bank_ids=%s book_ids=%s config_id=%s pipeline_id=%s",
+                    db_id, data.get("bank_ids"), data.get("book_ids"),
+                    data.get("config_id"), data.get("pipeline_id"))
+
+        # Run the reconciliation once
         result = ReconciliationService.match_many_to_many(
             data,
             tenant_id,
             auto_match_100=auto_match_100,
         )
 
+        logger.info("Task %s completed: %d suggestions, %d auto-applied",
+                    db_id, len(result.get("suggestions", [])),
+                    result.get("auto_match", {}).get("applied", 0))
+
         task_obj.status = "completed"
         task_obj.result = result
         task_obj.save(update_fields=["status", "result", "updated_at"])
         return result
+
     except Exception as e:
         task_obj.status = "failed"
         task_obj.error_message = str(e)

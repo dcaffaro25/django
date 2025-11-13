@@ -398,9 +398,8 @@ def run_single_config(cfg: object,
         "many-to-many": "many_to_many",
         "optimized": "fuzzy_1to1",
     }
-    stage_type = strategy_map.get(getattr(cfg, "strategy", "exact 1-to-1"), "exact_1to1")
     stage = StageConfig(
-        type=stage_type,
+        type="many_to_many",
         enabled=True,
         max_group_size_bank=getattr(cfg, "max_group_size_bank", 1),
         max_group_size_book=getattr(cfg, "max_group_size_book", 1),
@@ -419,7 +418,11 @@ def run_single_config(cfg: object,
         "currency":  float(getattr(cfg, "currency_weight",  0.10)),
         "date":      float(getattr(cfg, "date_weight",      0.05)),
     }
-    return engine.run(banks, books)
+    # Run and filter by min_confidence
+    suggestions = engine.run(banks, books)
+    min_conf = float(getattr(cfg, "min_confidence", 0))
+    suggestions = [s for s in suggestions if s["confidence_score"] >= min_conf]
+    return suggestions
 
 def run_pipeline(pipeline: object,
                  banks: List[BankTransactionDTO],
@@ -560,7 +563,12 @@ class ReconciliationService:
         auto_info = {"enabled": bool(auto_match_100), "applied": 0, "skipped": 0, "details": []}
         if auto_match_100:
             auto_info = ReconciliationService._apply_auto_matches_100(suggestions)
-
+        
+        log.info(
+    "Recon task: company=%s config_id=%s pipeline_id=%s banks=%d books=%d suggestions=%d",
+    company_id, config_id, pipeline_id, len(candidate_bank), len(candidate_book), len(suggestions)
+)
+        
         return {"suggestions": suggestions, "auto_match": auto_info}
 
     # ------------------------------------------------------------------
