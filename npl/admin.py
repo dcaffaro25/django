@@ -7,7 +7,9 @@ multi‑tenant management.
 """
 from django.contrib import admin
 
+
 from . import models
+
 
 
 @admin.register(models.Process)
