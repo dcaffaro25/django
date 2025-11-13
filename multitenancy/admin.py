@@ -14,32 +14,20 @@ User = get_user_model()
 class FastDeleteMixin:
     """
     Mixin to replace Django's default 'delete_selected' action with a fast
-    deletion that avoids building a big confirmation page.  Use with caution:
-    there is no per-object confirmation!
+    deletion that avoids a confirmation page.
     """
     @admin.action(description="Delete selected records")
     def fast_delete_selected(self, request, queryset):
         count = queryset.count()
         if count:
-            # Delete in bulk without confirmation; wraps in a single transaction
             queryset.delete()
             self.message_user(
                 request,
-                f"Successfully deleted {count} {model_ngettext(self.model, count)}.",
+                f"Successfully deleted {count} {model_ngettext(self.model, count)}."
             )
 
-    def get_actions(self, request):
-        actions = super().get_actions(request)
-        # Remove the built-in delete action, if present
-        if "delete_selected" in actions:
-            del actions["delete_selected"]
-        # Add our fast delete action
-        actions["fast_delete_selected"] = (
-            self.fast_delete_selected,
-            "fast_delete_selected",
-            "Delete selected records",
-        )
-        return actions
+    # Register our custom action; removing get_actions avoids bound‑method errors
+    actions = ['fast_delete_selected']
 
 class AuditColsMixin:
     """
@@ -119,11 +107,11 @@ class PerPageFilter(SimpleListFilter):
     parameter_name = "per_page"
 
     def lookups(self, request, model_admin):
-        return [(n, str(n)) for n in (25, 50, 100, 200, 500, 1000)]
+        return [(str(n), str(n)) for n in (25, 50, 100, 200, 500, 1000)]
 
     def queryset(self, request, queryset):
-        # no filtering happens – this simply exposes ?per_page= in the query string
-        return queryset
+        return queryset  # no filtering; just adds the parameter
+
 
 
 class CompanyScopedAdmin(FastDeleteMixin, AuditColsMixin, admin.ModelAdmin):
@@ -131,21 +119,20 @@ class CompanyScopedAdmin(FastDeleteMixin, AuditColsMixin, admin.ModelAdmin):
     list_max_show_all = 5000
 
     def get_list_per_page(self, request):
-        per_page = request.GET.get("per_page")
-        if per_page:
+        # Honour ?per_page=... in the URL
+        value = request.GET.get("per_page")
+        if value:
             try:
-                per_page_int = int(per_page)
-                if 10 <= per_page_int <= 1000:
-                    request.session[
-                        f"admin:{self.opts.app_label}.{self.opts.model_name}:per_page"
-                    ] = per_page_int
-                    return per_page_int
+                per_page = int(value)
+                if 10 <= per_page <= 1000:
+                    key = f"admin:{self.opts.app_label}.{self.opts.model_name}:per_page"
+                    request.session[key] = per_page
+                    return per_page
             except (ValueError, TypeError):
                 pass
-        return request.session.get(
-            f"admin:{self.opts.app_label}.{self.opts.model_name}:per_page",
-            self.list_per_page,
-        )
+        # Otherwise fall back to session or default
+        key = f"admin:{self.opts.app_label}.{self.opts.model_name}:per_page"
+        return request.session.get(key, self.list_per_page)
 
     def get_list_filter(self, request):
         filters = list(super().get_list_filter(request))
@@ -157,21 +144,18 @@ class PlainAdmin(FastDeleteMixin, AuditColsMixin, admin.ModelAdmin):
     list_max_show_all = 5000
 
     def get_list_per_page(self, request):
-        per_page = request.GET.get("per_page")
-        if per_page:
+        value = request.GET.get("per_page")
+        if value:
             try:
-                per_page_int = int(per_page)
-                if 10 <= per_page_int <= 1000:
-                    request.session[
-                        f"admin:{self.opts.app_label}.{self.opts.model_name}:per_page"
-                    ] = per_page_int
-                    return per_page_int
+                per_page = int(value)
+                if 10 <= per_page <= 1000:
+                    key = f"admin:{self.opts.app_label}.{self.opts.model_name}:per_page"
+                    request.session[key] = per_page
+                    return per_page
             except (ValueError, TypeError):
                 pass
-        return request.session.get(
-            f"admin:{self.opts.app_label}.{self.opts.model_name}:per_page",
-            self.list_per_page,
-        )
+        key = f"admin:{self.opts.app_label}.{self.opts.model_name}:per_page"
+        return request.session.get(key, self.list_per_page)
 
     def get_list_filter(self, request):
         filters = list(super().get_list_filter(request))

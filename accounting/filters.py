@@ -87,7 +87,7 @@ class TransactionFilter(filters.FilterSet):
         )
         # A JE has at least one OK reconciliation
         ok_recon = Reconciliation.objects.filter(
-            journal_entry_id=OuterRef('id'),
+            journal_entry__id=OuterRef('id'),
             status__in=['matched', 'approved'],
         )
 
