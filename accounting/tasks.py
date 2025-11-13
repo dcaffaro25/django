@@ -25,6 +25,35 @@ from .services.embedding_client import EmbeddingClient
 
 log = logging.getLogger(__name__)
 
+from accounting.utils import update_journal_entries_and_transaction_flags
+
+@shared_task(bind=True)
+def recalc_unposted_flags_task(self) -> dict:
+    """
+    Iterate over all transactions where state != 'posted' and recompute the
+    is_balanced / is_reconciled flags on each journal entry and its parent
+    transaction.  Returns a count of updated transactions.
+    """
+    updated_count = 0
+    # Use a single transaction for consistency
+    with transaction.atomic():
+        unposted_txs = (
+            Transaction.objects
+            .exclude(state='posted')
+            .select_related('company', 'currency', 'entity')
+            .prefetch_related('journal_entries__account__bank_account',
+                              'journal_entries__reconciliations')
+        )
+        for tx in unposted_txs:
+            # Gather all journal entries for this transaction
+            entries = list(tx.journal_entries.all())
+            if entries:
+                # This helper recomputes is_cash, is_reconciled on each JE,
+                # and is_balanced, is_reconciled on the transaction
+                update_journal_entries_and_transaction_flags(entries)
+                updated_count += 1
+    return {"updated_transactions": updated_count}
+
 CANCEL_KEY_PREFIX = "embed:cancel:"  # cache key for graceful cancel
 STATE_MAP = {
     "PENDING":  "PENDING",

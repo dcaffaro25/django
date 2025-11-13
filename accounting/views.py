@@ -16,7 +16,7 @@ from multitenancy.mixins import ScopedQuerysetMixin
 from .models import (Currency, Account, Transaction, JournalEntry, Rule, CostCenter, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter,ReconciliationTask, ReconciliationConfig)
 from .serializers import (CurrencySerializer, AccountSerializer, TransactionSerializer, CostCenterSerializer, JournalEntrySerializer, RuleSerializer, BankSerializer, BankAccountSerializer, BankTransactionSerializer, ReconciliationSerializer, TransactionListSerializer,ReconciliationTaskSerializer,ReconciliationConfigSerializer)
 from .services.transaction_service import *
-from .utils import parse_ofx_text, decode_ofx_content, generate_ofx_transaction_hash, find_book_combos
+from .utils import update_journal_entries_and_transaction_flags, parse_ofx_text, decode_ofx_content, generate_ofx_transaction_hash, find_book_combos
 from datetime import datetime
 import pandas as pd
 from decimal import Decimal
@@ -85,7 +85,7 @@ from .serializers import (
     TaskStatusSerializer,
 )
 from .services.embedding_client import EmbeddingClient, _embed_url
-from .tasks import generate_missing_embeddings
+from .tasks import generate_missing_embeddings, recalc_unposted_flags_task
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -479,7 +479,8 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             return Response({'status': 'Transaction unposted successfully'})
         except ValueError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
+    
+    
     # Cancel a transaction
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
@@ -489,7 +490,19 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
 
         cancel_transaction(transaction)
         return Response({'status': 'Transaction canceled successfully'})
-
+    
+    @action(detail=False, methods=['post'], url_path='recalc-unposted-flags-task')
+    def recalc_unposted_flags_task(self, request, *args, **kwargs):
+        """
+        Enqueue a Celery task that recomputes is_balanced/is_reconciled flags
+        on all unposted transactions.  Returns the Celery task ID.
+        """
+        async_result = recalc_unposted_flags_task.delay()
+        return Response({
+            "task_id": async_result.id,
+            "status": "queued"
+        })
+    
     # Automatically create a balancing journal entry
     @action(detail=True, methods=['post'])
     def create_balancing_entry(self, request, pk=None):
@@ -557,6 +570,7 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     else:
         permission_classes = [permissions.IsAuthenticated]
     
+       
     # Bulk operations
     @action(methods=['post'], detail=False)
     def bulk_create(self, request, *args, **kwargs):

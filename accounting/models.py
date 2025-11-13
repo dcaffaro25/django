@@ -289,6 +289,9 @@ class Transaction(TenantAwareBaseModel):
         help_text="Vector embeddings (embeddinggemma:300m) of the description content",
         null=True, blank=True)
     
+    is_balanced  = models.BooleanField(default=False)
+    is_reconciled  = models.BooleanField(default=False)
+    is_posted = models.BooleanField(default=False)
     
     class Meta:
         indexes = [
@@ -350,7 +353,10 @@ class JournalEntry(TenantAwareBaseModel):
         db_index=True,
         help_text="If True, this line is the cash/bank leg and still awaits assignment to a specific bank GL."
     )
-
+    
+    is_cash = models.BooleanField(default=False)
+    is_reconciled = models.BooleanField(default=False)
+    
     class Meta:
         indexes = [
             models.Index(fields=['transaction']),
@@ -464,12 +470,6 @@ class Rule(models.Model):
     model = models.CharField(max_length=100)  # e.g., 'Transaction', 'Account'
     action = models.CharField(max_length=100)  # e.g., 'create_journal_entry'
     condition = models.JSONField()  # JSON to define when the rule is applicable
-
-
-
-
-
-
 
 
 class BankTransaction(TenantAwareBaseModel):

@@ -358,41 +358,7 @@ class ReconciliationConfigSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ReconciliationConfig
-        fields = [
-            "id",
-            "scope",
-            "company",
-            "company_name",
-            "user",
-            "user_name",
-            "name",
-            "description",
-            "bank_filters",
-            "book_filters",
-            # strategy is still useful for legacy fallback
-            "strategy",
-            # new group size fields
-            "max_group_size_bank",
-            "max_group_size_book",
-            # tolerances
-            "amount_tolerance",
-            "date_tolerance_days",
-            # per‑factor weights
-            "embedding_weight",
-            "amount_weight",
-            "currency_weight",
-            "date_weight",
-            # miscellaneous tuning
-            "fee_accounts",
-            "duplicate_window_days",
-            "text_similarity",
-            # thresholds
-            "min_confidence",
-            "max_suggestions",
-            "is_default",
-            "created_at",
-            "updated_at",
-        ]
+        fields = "__all__"
         read_only_fields = ["created_at", "updated_at"]
 
     def validate(self, attrs):
@@ -411,36 +377,7 @@ class ResolvedReconciliationConfigSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ReconciliationConfig
-        fields = [
-            "id",
-            "scope",
-            "scope_label",
-            "company",
-            "company_name",
-            "user",
-            "user_name",
-            "name",
-            "description",
-            "bank_filters",
-            "book_filters",
-            "strategy",
-            "max_group_size_bank",
-            "max_group_size_book",
-            "amount_tolerance",
-            "date_tolerance_days",
-            "embedding_weight",
-            "amount_weight",
-            "currency_weight",
-            "date_weight",
-            "fee_accounts",
-            "duplicate_window_days",
-            "text_similarity",
-            "min_confidence",
-            "max_suggestions",
-            "is_default",
-            "created_at",
-            "updated_at",
-        ]
+        fields = "__all__"
 
     def get_scope_label(self, obj):
         if obj.scope == "global":
@@ -462,19 +399,7 @@ class ReconciliationPipelineStageSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ReconciliationPipelineStage
-        fields = [
-            "id",
-            "order",
-            "enabled",
-            "config",        # FK to the ReconciliationConfig this stage uses
-            "config_name",   # Convenience name of that config
-            "max_group_size_bank",
-            "max_group_size_book",
-            "amount_tolerance",
-            "date_tolerance_days",
-            # add weight overrides here if your stage model defines them, e.g.:
-            # "embedding_weight", "amount_weight", "currency_weight", "date_weight",
-        ]
+        fields = "__all__"
 
 
 class ReconciliationPipelineStageSerializer(serializers.ModelSerializer):
@@ -485,18 +410,7 @@ class ReconciliationPipelineStageSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ReconciliationPipelineStage
-        fields = [
-            "id",
-            "order",
-            "enabled",
-            "config",
-            "config_name",
-            "max_group_size_bank",
-            "max_group_size_book",
-            "amount_tolerance",
-            "date_tolerance_days",
-            "text_weight",  # include other override fields if you add them
-        ]
+        fields = "__all__"
 
 
 class ReconciliationPipelineSerializer(serializers.ModelSerializer):
@@ -509,22 +423,7 @@ class ReconciliationPipelineSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ReconciliationPipeline
-        fields = [
-            "id",
-            "scope",
-            "company",
-            "company_name",
-            "user",
-            "user_name",
-            "name",
-            "description",
-            "auto_apply_score",
-            "max_suggestions",
-            "is_default",
-            "stages",
-            "created_at",
-            "updated_at",
-        ]
+        fields = "__all__"
         read_only_fields = ["created_at", "updated_at"]
 
 
@@ -538,22 +437,7 @@ class ResolvedReconciliationPipelineSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ReconciliationPipeline
-        fields = [
-            "id",
-            "scope",
-            "scope_label",
-            "company",
-            "company_name",
-            "user",
-            "user_name",
-            "name",
-            "description",
-            "auto_apply_score",
-            "max_suggestions",
-            "is_default",
-            "created_at",
-            "updated_at",
-        ]
+        fields = "__all__"
 
     def get_scope_label(self, obj):
         if obj.scope == "global":

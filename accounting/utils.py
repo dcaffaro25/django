@@ -4,6 +4,53 @@ from datetime import datetime
 import hashlib
 import json
 from decimal import Decimal
+from django.db import transaction
+from django.db.models import Q, Sum
+from django.db.models.functions import Coalesce
+
+from accounting.models import Transaction, JournalEntry
+
+def update_journal_entries_and_transaction_flags(journal_entries):
+    """
+    Given an iterable of JournalEntry instances, recompute per‑entry flags
+    (is_cash, is_reconciled) and the parent Transaction flags (is_balanced,
+    is_reconciled).  Call this inside an atomic block.
+    """
+    tx_ids = {je.transaction_id for je in journal_entries}
+
+    with transaction.atomic():
+        # Per-entry flags
+        for je in journal_entries:
+            is_cash = bool(
+                je.bank_designation_pending or (
+                    je.account and getattr(je.account, 'bank_account_id', None)
+                )
+            )
+            je.is_cash = is_cash
+            je.is_reconciled = je.reconciliations.filter(
+                status__in=['matched', 'approved']
+            ).exists()
+            je.save(update_fields=['is_cash', 'is_reconciled'])
+
+        # Transaction flags
+        for tx in Transaction.objects.select_for_update().filter(id__in=tx_ids):
+            sums = tx.journal_entries.aggregate(
+                total_debits=Coalesce(Sum('debit_amount'), Decimal('0')),
+                total_credits=Coalesce(Sum('credit_amount'), Decimal('0')),
+            )
+            tx.is_balanced = (sums['total_debits'] == sums['total_credits'])
+
+            bank_entries = tx.journal_entries.filter(
+                Q(account__bank_account__isnull=False) | Q(bank_designation_pending=True)
+            )
+            if not bank_entries.exists():
+                tx.is_reconciled = False
+            else:
+                tx.is_reconciled = not bank_entries.exclude(
+                    is_reconciled=True
+                ).exists()
+
+            tx.save(update_fields=['is_balanced', 'is_reconciled'])
 
 def decode_ofx_content(data_dict):
     """
