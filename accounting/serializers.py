@@ -181,7 +181,7 @@ class JournalEntrySerializer(serializers.ModelSerializer):
     class Meta:
         model = JournalEntry
         fields = [
-            "id", "transaction", "account", "cost_center",
+            "id", "company", "transaction", "account", "cost_center",
             "debit_amount", "credit_amount",
             "state", "date",
             "bank_designation_pending", "has_designated_bank",

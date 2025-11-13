@@ -393,7 +393,7 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         # Apply optional filters
         company_id = request.query_params.get("tenant_id")
         if company_id:
-            qs = qs.filter(company_id=company_id)
+            qs = qs.filter(company__id=company_id)
 
         date_from = request.query_params.get("date_from")
         date_to = request.query_params.get("date_to")
