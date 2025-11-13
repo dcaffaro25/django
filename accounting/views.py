@@ -112,6 +112,9 @@ from .serializers import (
 )
 import re
 
+from rest_framework import permissions
+
+
 def _mean_date(dates):
     """Return the average (mean) of a list of date objects, or None."""
     ds = [d for d in dates if d]
@@ -142,6 +145,11 @@ class CurrencyViewSet(viewsets.ModelViewSet):
     queryset = Currency.objects.all()
     serializer_class = CurrencySerializer
     
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+    
     @action(methods=['post'], detail=False)
     def bulk_create(self, request, *args, **kwargs):
         return generic_bulk_create(self, request.data)
@@ -159,6 +167,11 @@ class CurrencyViewSet(viewsets.ModelViewSet):
 class CostCenterViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = CostCenter.objects.all()
     serializer_class = CostCenterSerializer
+    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
     
     @action(methods=['post'], detail=False)
     def bulk_create(self, request, *args, **kwargs):
@@ -178,6 +191,11 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Account.objects.all()
     serializer_class = AccountSerializer
     
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+    
     @action(methods=['post'], detail=False)
     def bulk_create(self, request, *args, **kwargs):
         return generic_bulk_create(self, request.data)
@@ -192,6 +210,12 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return generic_bulk_delete(self, ids)
 
 class AccountSummaryView(APIView):
+    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+    
     def get(self, request, *args, **kwargs):
         company_id = request.query_params.get('company_id')
         entity_id = request.query_params.get('entity_id')
@@ -213,6 +237,11 @@ class AccountSummaryView(APIView):
 class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Reconciliation.objects.all()
     serializer_class = ReconciliationSerializer
+    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
     
     # Bulk operations
     @action(methods=['post'], detail=False)
@@ -357,7 +386,10 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     
 # Transaction ViewSet
 class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
-    permission_classes = []
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
     #queryset = Transaction.objects.select_related('company').prefetch_related('journal_entries')
     queryset = (
         Transaction.objects
@@ -519,7 +551,12 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         # If you also need cost_center or any other FK, include it too
     )
     serializer_class = JournalEntrySerializer
-
+    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+    
     # Bulk operations
     @action(methods=['post'], detail=False)
     def bulk_create(self, request, *args, **kwargs):
@@ -566,7 +603,11 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
 class RuleViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Rule.objects.all()
     serializer_class = RuleSerializer
-    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+        
     @action(methods=['post'], detail=False)
     def bulk_create(self, request, *args, **kwargs):
         return generic_bulk_create(self, request.data)
@@ -584,7 +625,11 @@ class RuleViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
 class BankViewSet(viewsets.ModelViewSet):
     queryset = Bank.objects.all()
     serializer_class = BankSerializer
-    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+        
     @action(methods=['post'], detail=False)
     def bulk_create(self, request, *args, **kwargs):
         return generic_bulk_create(self, request.data)
@@ -604,7 +649,11 @@ class BankViewSet(viewsets.ModelViewSet):
 class BankAccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = BankAccount.objects.all()
     serializer_class = BankAccountSerializer
-    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+        
     @action(methods=['post'], detail=False)
     def bulk_create(self, request, *args, **kwargs):
         return generic_bulk_create(self, request.data)
@@ -620,6 +669,11 @@ class BankAccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     
 # BankTransaction ViewSet
 class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+        
     queryset = (
         BankTransaction.objects
         .select_related("bank_account", "bank_account__entity", "currency")  # add "bank_account__bank" if you render it
@@ -1242,6 +1296,11 @@ class UnreconciledDashboardView(APIView):
     
     Returns overall and daily aggregates.
     """
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+        
     def get(self, request, tenant_id=None):
         try:
             # --- BANK TRANSACTIONS ---
@@ -1301,6 +1360,11 @@ class UnreconciledDashboardView(APIView):
     
     
 class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+        
     queryset = ReconciliationTask.objects.all().order_by("-created_at")
     serializer_class = ReconciliationTaskSerializer
 
@@ -1465,6 +1529,11 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         })
 
 class ReconciliationConfigViewSet2(viewsets.ModelViewSet):
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+        
     queryset = ReconciliationConfig.objects.all()
     serializer_class = ReconciliationConfigSerializer
 
@@ -1481,6 +1550,11 @@ class ReconciliationConfigViewSet2(viewsets.ModelViewSet):
         )
 
 class ReconciliationConfigViewSet(viewsets.ModelViewSet):
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+        
     queryset = ReconciliationConfig.objects.all()
     serializer_class = ReconciliationConfigSerializer
 
@@ -1512,6 +1586,11 @@ class ReconciliationPipelineViewSet(viewsets.ModelViewSet):
     together multiple ReconciliationConfig 'recipes' in a specific order,
     with optional per‑stage overrides.
     """
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+        
     queryset = ReconciliationPipeline.objects.all().order_by("-updated_at")
     serializer_class = ReconciliationPipelineSerializer
 
@@ -1536,7 +1615,10 @@ class ReconciliationPipelineViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 class EmbeddingHealthView(APIView):
-    permission_classes = []  # open for quick checks
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, tenant_id=None):
         client = EmbeddingClient()
@@ -1572,7 +1654,10 @@ class EmbeddingHealthView(APIView):
             )
 
 class EmbeddingMissingCountsView(APIView):
-    permission_classes = []#IsAdminUser]
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, tenant_id=None):
         tx  = Transaction.objects.filter(description_embedding__isnull=True).count()
@@ -1589,7 +1674,10 @@ class EmbeddingMissingCountsView(APIView):
         )
 
 class EmbeddingBackfillView(APIView):
-    permission_classes = []#permissions.IsAdminUser]
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, tenant_id=None):
         # you can keep your serializer; here we focus on headers + optional pre-totals
@@ -1694,7 +1782,10 @@ class EmbeddingJobsListView(APIView):
     """
     GET /api/embeddings/jobs/?limit=25&status=any&kind=embeddings&include_active=1
     """
-    permission_classes = []#permissions.IsAdminUser]
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, tenant_id=None):
         limit = int(request.query_params.get("limit", 25))
@@ -1720,7 +1811,10 @@ class EmbeddingJobsListView(APIView):
 
 
 class EmbeddingTaskStatusView(APIView):
-    permission_classes = []#permissions.IsAdminUser]
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, task_id, tenant_id=None):
         try:
@@ -1757,7 +1851,10 @@ class EmbeddingTaskStatusView(APIView):
         return Response(payload, status=status.HTTP_200_OK)
 
 class EmbeddingTaskCancelView(APIView):
-    permission_classes = []#permissions.IsAdminUser]
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, task_id, tenant_id=None):
         current_app.control.revoke(task_id, terminate=True)
@@ -1773,7 +1870,10 @@ class EmbeddingsTestView(APIView):
     POST /api/embeddings/test/
     { "texts": ["hello", "banana"] }  # optional overrides also supported
     """
-    permission_classes = []  # lock down if needed
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, tenant_id=None):
         ser = EmbedTestSerializer(data=request.data)
@@ -1811,7 +1911,10 @@ def _search_qs(model, vec, field_name: str, k: int, values: list[str]):
 
 
 class EmbeddingsSearchView(APIView):
-    permission_classes = []#]IsAdminUser]
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request, tenant_id=None):
         body = request.data or {}

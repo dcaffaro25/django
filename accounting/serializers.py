@@ -169,7 +169,7 @@ class JournalEntrySerializer(serializers.ModelSerializer):
     #account = AccountSerializer()
     
     def get_has_designated_bank(self, obj):
-        return obj.has_designated_bank
+        return bool(obj.account and getattr(obj.account, 'bank_account_id', None))
 
     def validate(self, attrs):
         # Enforce: if not pending, account is required

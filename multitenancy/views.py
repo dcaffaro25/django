@@ -78,7 +78,11 @@ class LogoutView(views.APIView):
 class UserCreateView(generics.CreateAPIView):
     queryset = CustomUser.objects.all()
     serializer_class = UserCreateSerializer
-    permission_classes = [permissions.IsAdminUser]
+    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAdminUser]
 
     def perform_create(self, serializer):
         user = serializer.save()
@@ -96,7 +100,11 @@ class UserCreateView(generics.CreateAPIView):
 class ChangePasswordView(generics.UpdateAPIView):
     serializer_class = ChangePasswordSerializer
     model = CustomUser
-    permission_classes = [permissions.IsAuthenticated]
+    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
 
     def get_object(self, queryset=None):
         return self.request.user
@@ -118,7 +126,12 @@ class ChangePasswordView(generics.UpdateAPIView):
 
 class PasswordResetForceView(generics.GenericAPIView):
     serializer_class = PasswordResetForceSerializer
-    permission_classes = [permissions.IsAdminUser]  # or AllowAny if self-service
+    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAdminUser]
+
     
     
     COOLDOWN_MINUTES = settings.PASSWORD_RESET_EMAIL_COOLDOWN  # ✅ minimum time before another email can be sent
@@ -181,7 +194,12 @@ class AdminForcePasswordView(generics.GenericAPIView):
     - Otherwise, use the standard fallback "ChangeMe123".
     - User is forced to change password on next login.
     """
-    permission_classes = [permissions.IsAdminUser]
+
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAdminUser]
+
 
     def post(self, request, *args, **kwargs):
         username_or_email = request.data.get("username") or request.data.get("email")
@@ -234,6 +252,11 @@ class CompanyViewSet(viewsets.ModelViewSet):
     #queryset = Company.objects.none()
     serializer_class = CompanySerializer
 
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+
     def get_queryset(self):
         #if hasattr(self.request, 'tenant'):
         #    if self.request.tenant == 'all':
@@ -249,11 +272,23 @@ class CompanyViewSet(viewsets.ModelViewSet):
 class EntityMiniViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Entity.objects.all()
     serializer_class = EntityMiniSerializer
+    
+
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
 
 class EntityViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Entity.objects.all()
     serializer_class = EntitySerializer
+    
 
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+    
     #def get_queryset(self):
     #    if hasattr(self.request, 'tenant'):
     #        if self.request.tenant == 'all':
@@ -353,6 +388,12 @@ class EntityDynamicTransposedView(APIView):
         - `format`: 'by_entity' or 'by_account'
     """
     
+
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+    
     def get(self, request, tenant_id=None):
         transpose_by = request.query_params.get('transpose_by', 'account')
         format_type = request.query_params.get('format', 'by_entity')
@@ -451,7 +492,12 @@ class EntityDynamicTransposedView(APIView):
 class EntityTreeView(generics.ListAPIView):
     #queryset = Company.objects.none()
     serializer_class = EntitySerializer
-
+    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+    
     def get_queryset(self):
         if hasattr(self.request, 'tenant'):
             if self.request.tenant == 'all':
@@ -468,6 +514,12 @@ class EntityTreeView(generics.ListAPIView):
             return Entity.objects.none()  # Or handle as appropriate
 
 class ValidateRuleView(APIView):
+
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+    
     def post(self, request, tenant_id=None):
         """
         Endpoint to validate a rule and propose mock setup data and payload.
@@ -523,6 +575,11 @@ class ValidateRuleView(APIView):
             )
 
 class ExecuteRuleView(APIView):
+
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
     def post(self, request, tenant_id=None):
         """
         Endpoint to execute a rule in a sandboxed environment.
@@ -560,7 +617,13 @@ class SubstitutionRuleViewSet(viewsets.ModelViewSet):
     """
     queryset = SubstitutionRule.objects.all()
     serializer_class = SubstitutionRuleSerializer
+    
 
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+    
     def get_queryset(self):
         company = getattr(self.request, 'tenant', None)
         return super().get_queryset().filter(company=company)
@@ -569,7 +632,13 @@ class SubstitutionRuleViewSet(viewsets.ModelViewSet):
 class IntegrationRuleViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = IntegrationRule.objects.all()
     serializer_class = IntegrationRuleSerializer
+    
 
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+    
     def get_queryset(self):
         company = getattr(self.request, 'tenant', None)
         return super().get_queryset().filter(company=company)
@@ -602,6 +671,13 @@ def _scrub_json(o):
     return o
 
 class BulkImportAPIView(APIView):
+    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+
+        permission_classes = [permissions.IsAuthenticated]
+    
     def post(self, request, *args, **kwargs):
         up = request.FILES["file"]
         # compute sha256 (preserve file pointer)

@@ -18,6 +18,7 @@ import logging
 
 DEBUG = True
 IMPORT_DEBUG = True
+AUTH_OFF = True
 
 class SlowOnlyFilter(logging.Filter):
     def __init__(self, threshold_ms=200):
