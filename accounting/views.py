@@ -378,7 +378,42 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         if self.action == 'list':
             return TransactionListSerializer
         return TransactionSerializer
+    
+    @action(detail=False, methods=['get'], url_path='unmatched')
+    def unmatched(self, request, tenant_id=None):
+        """
+        Returns transactions that still have unreconciled journal entries.
+        Optional query parameters:
+        - company_id: filter by company
+        - date_from / date_to: filter by transaction date
+        """
+        # Base queryset: only transactions with journal entries tied to a bank account
+        qs = Transaction.objects.filter(journal_entries__account__bank_account__isnull=False)
 
+        # Apply optional filters
+        company_id = request.query_params.get("tenant_id")
+        if company_id:
+            qs = qs.filter(company_id=company_id)
+
+        date_from = request.query_params.get("date_from")
+        date_to = request.query_params.get("date_to")
+        if date_from:
+            qs = qs.filter(date__gte=date_from)
+        if date_to:
+            qs = qs.filter(date__lte=date_to)
+
+        # Exclude any transaction where all bank-side JEs are reconciled (matched or approved)
+        matched_recon_tx_ids = Reconciliation.objects.filter(
+            status__in=['matched', 'approved'],
+            journal_entries__account__bank_account__isnull=False
+        ).values_list('journal_entries__transaction_id', flat=True)
+
+        qs_unmatched = qs.exclude(id__in=matched_recon_tx_ids).distinct()
+
+        serializer_class = self.get_serializer_class()  # use list vs detail serializer
+        serializer = serializer_class(qs_unmatched, many=True)
+        return Response(serializer.data)
+    
     # Bulk operations
     @action(methods=['post'], detail=False)
     def bulk_create(self, request, *args, **kwargs):
