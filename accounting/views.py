@@ -407,7 +407,7 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     ordering = ["-date", "-id"]
     
     def get_serializer_class(self):
-        if self.action == 'list':
+        if self.action == 'list' or 'unmatched':
             return TransactionListSerializer
         return TransactionSerializer
     
