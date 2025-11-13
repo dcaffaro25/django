@@ -1399,7 +1399,7 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
 
         # Pre-create a DB record, including config_id or pipeline_id in parameters
         task_obj = ReconciliationTask.objects.create(
-            task_id="queued",
+            task_id=uuid.uuid4(),
             tenant_id=tenant_id,
             parameters=data,       # store full payload, incl. config_id/pipeline_id
             status="queued",
