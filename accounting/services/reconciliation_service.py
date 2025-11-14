@@ -37,7 +37,7 @@ from ..models import (
 
 import logging
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("recon")
 
 # ----------------------------------------------------------------------
 #  DTOs for matching
