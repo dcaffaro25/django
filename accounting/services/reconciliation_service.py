@@ -392,19 +392,20 @@ def run_single_config(cfg: object,
 
     It must not refer to any legacy strategy or group size field.
     """
-    strategy_map = {
-        "exact 1-to-1": "exact_1to1",
-        "fuzzy": "fuzzy_1to1",
-        "many-to-many": "many_to_many",
-        "optimized": "fuzzy_1to1",
-    }
+    # determine type for a single-stage config:
+    if cfg.max_group_size_bank > 1 or cfg.max_group_size_book > 1:
+        stage_type = "many_to_many"
+    elif cfg.amount_tolerance > 0 or cfg.date_tolerance_days > 0:
+        stage_type = "fuzzy_1to1"
+    else:
+        stage_type = "exact_1to1"
+    
     stage = StageConfig(
-        type="many_to_many",
-        enabled=True,
-        max_group_size_bank=getattr(cfg, "max_group_size_bank", 1),
-        max_group_size_book=getattr(cfg, "max_group_size_book", 1),
-        amount_tol=getattr(cfg, "amount_tolerance", Decimal("0")),
-        date_tol=getattr(cfg, "date_tolerance_days", 0),
+        type=stage_type,
+        max_group_size_bank=cfg.max_group_size_bank,
+        max_group_size_book=cfg.max_group_size_book,
+        amount_tol=cfg.amount_tolerance,
+        date_tol=cfg.date_tolerance_days,
     )
     pipe_cfg = PipelineConfig(
         stages=[stage],
@@ -435,21 +436,26 @@ def run_pipeline(pipeline: object,
       - a ``stages`` iterable that yields stage objects with attributes:
           enabled, order, config (with relevant fields), and optional overrides.
     """
-    strategy_map = {
-        "exact 1-to-1": "exact_1to1",
-        "fuzzy": "fuzzy_1to1",
-        "many-to-many": "many_to_many",
-        "optimized": "fuzzy_1to1",
-    }
+    
+    
+    
     stage_configs: List[StageConfig] = []
     weight_list: List[Dict[str, float]] = []
     for stage_obj in pipeline.stages.select_related("config").order_by("order"):
         cfg = stage_obj.config
         if not stage_obj.enabled:
             continue
-        stype = strategy_map.get(cfg.strategy, "exact_1to1")
+        
+        if cfg.max_group_size_bank > 1 or cfg.max_group_size_book > 1:
+            stage_type = "many_to_many"
+        elif cfg.amount_tolerance > 0 or cfg.date_tolerance_days > 0:
+            stage_type = "fuzzy_1to1"
+        else:
+            stage_type = "exact_1to1"
+            
+        
         stage_configs.append(StageConfig(
-            type=stype,
+            type=stage_type,
             enabled=True,
             max_group_size_bank=stage_obj.max_group_size_bank or cfg.max_group_size_bank,
             max_group_size_book=stage_obj.max_group_size_book or cfg.max_group_size_book,
@@ -515,7 +521,7 @@ class ReconciliationService:
             reconciliations__status__in=["matched", "approved"]
         )
         if book_ids:
-            book_qs = book_qs.filter(transaction_id__in=book_ids)
+            book_qs = book_qs.filter(id__in=book_ids)
 
         # Only consider journal entries that belong to a bank account
         book_qs = book_qs.filter(account__bank_account__isnull=False)
