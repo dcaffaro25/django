@@ -14,7 +14,7 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from itertools import combinations
 from typing import Callable, Dict, Iterable, List, Optional
-
+from multitenancy.utils import resolve_tenant
 #from .embedding_service import BankTransactionDTO, JournalEntryDTO, run_single_config, run_pipeline
 
 
@@ -222,9 +222,10 @@ class ReconciliationPipelineEngine:
                 self.stage_weights = self.current_weights
             handler = getattr(self, f"_run_{stage.type}", None)
             
-            log.debug("Stage %d (%s) started with weights %s and tolerances: amount_tol=%s, date_tol=%d, max_group_size_bank=%d, max_group_size_book=%d",
+            log.debug("Stage %d (%s) started with weights %s and tolerances: amount_tol=%s, date_tol=%d, max_group_size_bank=%d, max_group_size_book=%d, banks=%d, books=%d",
               idx, stage.type, self.stage_weights, stage.amount_tol, stage.date_tol, 
-              stage.max_group_size_bank, stage.max_group_size_book)
+              stage.max_group_size_bank, stage.max_group_size_book,
+              len(banks), len(books))
             
             if handler:
                 handler(banks, books, stage)
@@ -332,60 +333,53 @@ class ReconciliationPipelineEngine:
         sorted_banks.sort(key=lambda b: b.date)
         sorted_books = [e for e in books if e.id not in self.used_books and e.company_id == self.company_id]
         sorted_books.sort(key=lambda e: e.date)
-        log.debug("Starting many-to-many reconciliation stage: %d banks, %d books", len(sorted_banks), len(sorted_books))
         
-        
+        log.debug("Starting many-to-many reconciliation stage na company %d: %d banks, %d sorted banks, %d books, %d sorted books", self.company_id, len(banks), len(sorted_banks), len(books), len(sorted_books))
+    
         for bank in sorted_banks:
-        start = bank.date - timedelta(days=stage.date_tol)
-        end = bank.date + timedelta(days=stage.date_tol)
-        bank_window = [b for b in sorted_banks if start <= b.date <= end]
-        book_window = [e for e in sorted_books if start <= e.date <= end]
-        
-        
-        log.debug("Bank %s: date=%s, amount=%.2f, currency=%s, window banks=%d, window books=%d",
-        bank.id, bank.date, bank.amount, bank.currency_id, len(bank_window), len(book_window))
-        
-        
-        for i in range(1, min(stage.max_group_size_bank, len(bank_window)) + 1):
-        for bank_combo in combinations(bank_window, i):
-        sum_bank = sum((b.amount_base for b in bank_combo), Decimal("0"))
-        
-        
-        for j in range(1, min(stage.max_group_size_book, len(book_window)) + 1):
-        for book_combo in combinations(book_window, j):
-        sum_book = sum((e.amount_base for e in book_combo), Decimal("0"))
-        
-        
-        log.debug("Trying bank combo IDs %s (sum=%.2f) vs book combo IDs %s (sum=%.2f)",
-        [b.id for b in bank_combo], sum_bank, [e.id for e in book_combo], sum_book)
-        
-        
-        if q2(sum_bank) != q2(sum_book):
-        log.debug("Amount mismatch: bank=%.2f, book=%.2f", q2(sum_bank), q2(sum_book))
-        continue
-        
-        
-        if any(b.currency_id != e.currency_id for b in bank_combo for e in book_combo):
-        log.debug("Currency mismatch found in combination; skipping")
-        continue
-        
-        
-        all_dates = [b.date for b in bank_combo] + [e.date for e in book_combo]
-        if (max(all_dates) - min(all_dates)).days > stage.date_tol:
-        log.debug("Date range too wide in combo: min=%s, max=%s, span=%d days",
-        min(all_dates), max(all_dates), (max(all_dates) - min(all_dates)).days)
-        continue
-        
-        
-        suggestion = self._make_suggestion(
-        "many_to_many",
-        [b.id for b in bank_combo],
-        [e.id for e in book_combo],
-        1.0,
-        )
-        log.debug("Recording valid suggestion: bank_ids=%s, journal_ids=%s",
-        suggestion["bank_ids"], suggestion["journal_entries_ids"])
-        self._record(suggestion)
+            start = bank.date - timedelta(days=stage.date_tol)
+            end = bank.date + timedelta(days=stage.date_tol)
+            bank_window = [b for b in sorted_banks if start <= b.date <= end]
+            book_window = [e for e in sorted_books if start <= e.date <= end]
+    
+            log.debug("Bank %s: date=%s, amount=%.2f, currency=%s, window banks=%d, window books=%d", 
+                      bank.id, bank.date, bank.amount, bank.currency_id, len(bank_window), len(book_window))
+    
+            for i in range(1, min(stage.max_group_size_bank, len(bank_window)) + 1):
+                for bank_combo in combinations(bank_window, i):
+                    sum_bank = sum((b.amount_base for b in bank_combo), Decimal("0"))
+    
+                    for j in range(1, min(stage.max_group_size_book, len(book_window)) + 1):
+                        for book_combo in combinations(book_window, j):
+                            sum_book = sum((e.amount_base for e in book_combo), Decimal("0"))
+    
+                            #log.debug("Trying bank combo IDs %s (sum=%.2f) vs book combo IDs %s (sum=%.2f)", 
+                            #          [b.id for b in bank_combo], sum_bank, [e.id for e in book_combo], sum_book)
+    
+                            if q2(sum_bank) != q2(sum_book):
+                                #log.debug("Amount mismatch: bank=%.2f, book=%.2f", q2(sum_bank), q2(sum_book))
+                                continue
+    
+                            if any(b.currency_id != e.currency_id for b in bank_combo for e in book_combo):
+                                #log.debug("Currency mismatch found in combination; skipping")
+                                continue
+    
+                            all_dates = [b.date for b in bank_combo] + [e.date for e in book_combo]
+                            if (max(all_dates) - min(all_dates)).days > stage.date_tol:
+                                #log.debug("Date range too wide in combo: min=%s, max=%s, span=%d days", 
+                                #          min(all_dates), max(all_dates), (max(all_dates) - min(all_dates)).days)
+                                continue
+    
+                            suggestion = self._make_suggestion(
+                                "many_to_many",
+                                [b.id for b in bank_combo],
+                                [e.id for e in book_combo],
+                                1.0,
+                            )
+                            log.debug("Recording valid suggestion: bank_ids=%s, journal_ids=%s", 
+                                      suggestion["bank_ids"], suggestion["journal_entries_ids"])
+                            self._record(suggestion)
+
 
     # Internal helpers
     def _cosine_similarity(self, v1: List[float], v2: List[float]) -> float:
@@ -450,6 +444,15 @@ def run_single_config(cfg: object,
     log.debug("Running single config (ID=%s) for company %s: determined stage_type=%s", 
           getattr(cfg, "id", None), company_id, stage_type)
     
+    log.debug("Created %d BankTransactionDTOs", len(banks))
+    for dto in banks[:10]:  # limit to first 10 for brevity
+        log.debug("BankDTO: id=%s, amount=%s, date=%s, currency_id=%s, company_id=%s",
+                  dto.id, dto.amount, dto.date, dto.currency_id, dto.company_id)
+    
+    log.debug("Created %d JournalEntryDTOs", len(books))
+    for dto in books[:10]:  # again, limit to avoid noise
+        log.debug("BookDTO: id=%s, tx_id=%s, amount=%s, date=%s, currency_id=%s, company_id=%s",
+                  dto.id, dto.transaction_id, dto.effective_amount, dto.date, dto.currency_id, dto.company_id)
     
     stage = StageConfig(
         type=stage_type,
@@ -586,7 +589,7 @@ class ReconciliationService:
         if not (config_id or pipeline_id):
             raise ValueError("Either config_id or pipeline_id must be provided")
 
-        company_id = tenant_id
+        company_id = resolve_tenant(tenant_id).id
 
         # Build candidate QuerySets
         bank_ids = data.get("bank_ids", [])
@@ -642,6 +645,12 @@ class ReconciliationService:
             )
             for tx in bank_qs
         ]
+        
+        log.debug("Created %d BankTransactionDTOs", len(candidate_bank))
+        for dto in candidate_bank[:10]:  # limit to first 10 for brevity
+            log.debug("BankDTO: id=%s, amount=%s, date=%s, currency_id=%s, company_id=%s",
+                      dto.id, dto.amount, dto.date, dto.currency_id, dto.company_id)
+        
         candidate_book = [
             JournalEntryDTO(
                 id=je.id,
@@ -657,6 +666,11 @@ class ReconciliationService:
             )
             for je in book_qs
         ]
+        
+        log.debug("Created %d JournalEntryDTOs", len(candidate_book))
+        for dto in candidate_book[:10]:  # again, limit to avoid noise
+            log.debug("BookDTO: id=%s, tx_id=%s, amount=%s, date=%s, currency_id=%s, company_id=%s",
+                      dto.id, dto.transaction_id, dto.effective_amount, dto.date, dto.currency_id, dto.company_id)
 
         # Run the appropriate matching engine
         if pipeline_id:

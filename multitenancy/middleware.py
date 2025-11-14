@@ -32,7 +32,7 @@ class TenantMiddleware:
         # Extract the tenant identifier
         path_parts = request.path_info.strip('/').split('/')
         subdomain = path_parts[0] if path_parts else None
-        print(subdomain)
+        #print(subdomain)
         # Check if the user is authenticated
         if not request.user.is_authenticated and subdomain != 'testco':
             try:
@@ -57,5 +57,5 @@ class TenantMiddleware:
                 request.tenant = resolve_tenant(subdomain)
             except Company.DoesNotExist:
                 raise Http404("Company not found")
-        print(request.tenant)
+        #print(request.tenant)
         return self.get_response(request)
