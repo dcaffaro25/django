@@ -160,7 +160,9 @@ class SpanRule(models.Model):
 
     label = models.CharField(max_length=64, unique=True)
     description = models.CharField(max_length=255, blank=True)
-
+    
+    doc_type = models.ForeignKey(DocTypeRule, related_name='span_rules', on_delete=models.CASCADE)
+    
     anchors_strong = models.TextField(
         blank=True,
         help_text="Âncoras fortes separadas por ';' (e.g. 'converto a penhora; defiro a penhora')",

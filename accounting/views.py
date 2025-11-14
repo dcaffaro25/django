@@ -492,7 +492,7 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return Response({'status': 'Transaction canceled successfully'})
     
     @action(detail=False, methods=['post'], url_path='recalc-unposted-flags-task')
-    def recalc_unposted_flags_task(self, request, *args, **kwargs):
+    def recalc_unposted_flags_task(self, request, tenant_id=None, *args, **kwargs):
         """
         Enqueue a Celery task that recomputes is_balanced/is_reconciled flags
         on all unposted transactions.  Returns the Celery task ID.

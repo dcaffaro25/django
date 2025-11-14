@@ -60,6 +60,8 @@ ALL_MODELS = [
     ("billing", "Contract"),
     ("billing", "Invoice"),
     ("billing", "InvoiceLine"),
+    ("npl", "DocTypeRule"),
+    ("npl", "SpanRule")
 
 ]
 

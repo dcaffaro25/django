@@ -121,7 +121,9 @@ MODEL_APP_MAP = {
     "InvoiceLine": "billing",
     "FinancialIndex": "core",
     "IndexQuote": "core",
-    "FinancialIndexQuoteForecast": "core"
+    "FinancialIndexQuoteForecast": "core",
+    "DocTypeRule": "npl",
+    "SpanRule": "npl"
     
     # Add other model-app mappings as needed
 }
