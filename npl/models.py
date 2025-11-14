@@ -158,8 +158,8 @@ class SpanRule(models.Model):
     - anchor_embeddings: lista de vetores (um por âncora forte), armazenados como JSON.
     """
 
-    label = models.CharField(max_length=100, unique=True)
-    description = models.CharField(max_length=255, blank=True)
+    label = models.CharField(max_length=100)
+    description = models.CharField(max_length=255, null=True, blank=True)
     
     doc_type = models.ForeignKey(DocTypeRule, related_name='span_rules', on_delete=models.CASCADE)
     
@@ -183,7 +183,10 @@ class SpanRule(models.Model):
     )
     # Salva o embedding de cada âncora forte; armazenado como lista de listas em JSON
     anchor_embeddings = models.JSONField(null=True, blank=True)
-
+    
+    class Meta:
+        unique_together = ('doc_type', 'label')
+    
     def __str__(self):
         return f"{self.label} – {self.description}"
 
