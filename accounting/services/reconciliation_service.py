@@ -506,7 +506,7 @@ class ReconciliationService:
         if not (config_id or pipeline_id):
             raise ValueError("Either config_id or pipeline_id must be provided")
 
-        company_id = data.get("company_id")
+        company_id = data.get("tenant_id")
 
         # Build candidate QuerySets
         bank_ids = data.get("bank_ids", [])
