@@ -332,31 +332,60 @@ class ReconciliationPipelineEngine:
         sorted_banks.sort(key=lambda b: b.date)
         sorted_books = [e for e in books if e.id not in self.used_books and e.company_id == self.company_id]
         sorted_books.sort(key=lambda e: e.date)
+        log.debug("Starting many-to-many reconciliation stage: %d banks, %d books", len(sorted_banks), len(sorted_books))
+        
+        
         for bank in sorted_banks:
-            start = bank.date - timedelta(days=stage.date_tol)
-            end = bank.date + timedelta(days=stage.date_tol)
-            bank_window = [b for b in sorted_banks if start <= b.date <= end]
-            book_window = [e for e in sorted_books if start <= e.date <= end]
-            for i in range(1, min(stage.max_group_size_bank, len(bank_window)) + 1):
-                for bank_combo in combinations(bank_window, i):
-                    sum_bank = sum((b.amount_base for b in bank_combo), Decimal("0"))
-                    for j in range(1, min(stage.max_group_size_book, len(book_window)) + 1):
-                        for book_combo in combinations(book_window, j):
-                            sum_book = sum((e.amount_base for e in book_combo), Decimal("0"))
-                            if q2(sum_bank) != q2(sum_book):
-                                continue
-                            if any(b.currency_id != e.currency_id for b in bank_combo for e in book_combo):
-                                continue
-                            all_dates = [b.date for b in bank_combo] + [e.date for e in book_combo]
-                            if (max(all_dates) - min(all_dates)).days > stage.date_tol:
-                                continue
-                            suggestion = self._make_suggestion(
-                                "many_to_many",
-                                [b.id for b in bank_combo],
-                                [e.id for e in book_combo],
-                                1.0,
-                            )
-                            self._record(suggestion)
+        start = bank.date - timedelta(days=stage.date_tol)
+        end = bank.date + timedelta(days=stage.date_tol)
+        bank_window = [b for b in sorted_banks if start <= b.date <= end]
+        book_window = [e for e in sorted_books if start <= e.date <= end]
+        
+        
+        log.debug("Bank %s: date=%s, amount=%.2f, currency=%s, window banks=%d, window books=%d",
+        bank.id, bank.date, bank.amount, bank.currency_id, len(bank_window), len(book_window))
+        
+        
+        for i in range(1, min(stage.max_group_size_bank, len(bank_window)) + 1):
+        for bank_combo in combinations(bank_window, i):
+        sum_bank = sum((b.amount_base for b in bank_combo), Decimal("0"))
+        
+        
+        for j in range(1, min(stage.max_group_size_book, len(book_window)) + 1):
+        for book_combo in combinations(book_window, j):
+        sum_book = sum((e.amount_base for e in book_combo), Decimal("0"))
+        
+        
+        log.debug("Trying bank combo IDs %s (sum=%.2f) vs book combo IDs %s (sum=%.2f)",
+        [b.id for b in bank_combo], sum_bank, [e.id for e in book_combo], sum_book)
+        
+        
+        if q2(sum_bank) != q2(sum_book):
+        log.debug("Amount mismatch: bank=%.2f, book=%.2f", q2(sum_bank), q2(sum_book))
+        continue
+        
+        
+        if any(b.currency_id != e.currency_id for b in bank_combo for e in book_combo):
+        log.debug("Currency mismatch found in combination; skipping")
+        continue
+        
+        
+        all_dates = [b.date for b in bank_combo] + [e.date for e in book_combo]
+        if (max(all_dates) - min(all_dates)).days > stage.date_tol:
+        log.debug("Date range too wide in combo: min=%s, max=%s, span=%d days",
+        min(all_dates), max(all_dates), (max(all_dates) - min(all_dates)).days)
+        continue
+        
+        
+        suggestion = self._make_suggestion(
+        "many_to_many",
+        [b.id for b in bank_combo],
+        [e.id for e in book_combo],
+        1.0,
+        )
+        log.debug("Recording valid suggestion: bank_ids=%s, journal_ids=%s",
+        suggestion["bank_ids"], suggestion["journal_entries_ids"])
+        self._record(suggestion)
 
     # Internal helpers
     def _cosine_similarity(self, v1: List[float], v2: List[float]) -> float:
