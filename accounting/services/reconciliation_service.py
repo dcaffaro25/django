@@ -208,17 +208,31 @@ class ReconciliationPipelineEngine:
 
     def run(self, banks: List[BankTransactionDTO], books: List[JournalEntryDTO]) -> List[dict]:
         """Execute each enabled stage and return suggestions up to the configured limit."""
+        
+        log.debug("Executing reconciliation pipeline: %d stages to run, up to %d suggestions", 
+          len(self.config.stages), self.config.max_suggestions)
+        
         for idx, stage in enumerate(self.config.stages):
             if not stage.enabled:
+                log.debug("Skipping stage %d (%s): disabled", idx, stage.type)
                 continue
             if isinstance(self.current_weights, list):
                 self.stage_weights = self.current_weights[idx]
             else:
                 self.stage_weights = self.current_weights
             handler = getattr(self, f"_run_{stage.type}", None)
+            
+            log.debug("Stage %d (%s) started with weights %s and tolerances: amount_tol=%s, date_tol=%d, max_group_size_bank=%d, max_group_size_book=%d",
+              idx, stage.type, self.stage_weights, stage.amount_tol, stage.date_tol, 
+              stage.max_group_size_bank, stage.max_group_size_book)
+            
             if handler:
                 handler(banks, books, stage)
+                log.debug("Stage %d (%s) completed: total suggestions so far = %d", 
+                          idx, stage.type, len(self.suggestions))
                 if len(self.suggestions) >= self.config.max_suggestions:
+                    log.debug("Reached max_suggestions (%d); breaking out of pipeline at stage %d", 
+                              self.config.max_suggestions, idx)
                     break
         return self.suggestions[: self.config.max_suggestions]
 
@@ -365,6 +379,8 @@ class ReconciliationPipelineEngine:
 
     def _record(self, suggestion: dict) -> None:
         """Record a suggestion and mark the participating IDs as used."""
+        log.debug("Recording suggestion: type=%s, bank_ids=%s, journal_ids=%s, confidence=%.4f",
+              suggestion["match_type"], suggestion["bank_ids"], suggestion["journal_entries_ids"], suggestion["confidence_score"])
         self.suggestions.append(suggestion)
         self.used_banks.update(suggestion["bank_ids"])
         self.used_books.update(suggestion["journal_entries_ids"])
@@ -392,6 +408,8 @@ def run_single_config(cfg: object,
 
     It must not refer to any legacy strategy or group size field.
     """
+    
+    
     # determine type for a single-stage config:
     if cfg.max_group_size_bank > 1 or cfg.max_group_size_book > 1:
         stage_type = "many_to_many"
@@ -399,6 +417,10 @@ def run_single_config(cfg: object,
         stage_type = "fuzzy_1to1"
     else:
         stage_type = "exact_1to1"
+    
+    log.debug("Running single config (ID=%s) for company %s: determined stage_type=%s", 
+          getattr(cfg, "id", None), company_id, stage_type)
+    
     
     stage = StageConfig(
         type=stage_type,
@@ -419,10 +441,25 @@ def run_single_config(cfg: object,
         "currency":  float(getattr(cfg, "currency_weight",  0.10)),
         "date":      float(getattr(cfg, "date_weight",      0.05)),
     }
+    
+    log.debug(
+        "Single config weights: embedding=%.2f, amount=%.2f, currency=%.2f, date=%.2f; "
+        "tolerances: amount_tol=%s, date_tol=%s; max_group_size_bank=%d, max_group_size_book=%d; "
+        "min_confidence=%.2f, max_suggestions=%d",
+        engine.current_weights["embedding"], engine.current_weights["amount"], 
+        engine.current_weights["currency"], engine.current_weights["date"],
+        cfg.amount_tolerance, cfg.date_tolerance_days, cfg.max_group_size_bank, cfg.max_group_size_book,
+        float(getattr(cfg, "min_confidence", 0)), getattr(cfg, "max_suggestions", 1000)
+    )
+    
     # Run and filter by min_confidence
     suggestions = engine.run(banks, books)
+    total = len(suggestions)
     min_conf = float(getattr(cfg, "min_confidence", 0))
-    suggestions = [s for s in suggestions if s["confidence_score"] >= min_conf]
+    if min_conf:
+        suggestions = [s for s in suggestions if s["confidence_score"] >= min_conf]
+        log.debug("Applied min_confidence=%.2f filter: %d of %d suggestions retained", 
+                  min_conf, len(suggestions), total)
     return suggestions
 
 def run_pipeline(pipeline: object,
@@ -437,7 +474,8 @@ def run_pipeline(pipeline: object,
           enabled, order, config (with relevant fields), and optional overrides.
     """
     
-    
+    log.debug("Running multi-stage pipeline (ID=%s) for company %s: auto_apply_score=%.2f, max_suggestions=%d", 
+          getattr(pipeline, "id", None), pipeline.company_id, float(pipeline.auto_apply_score), pipeline.max_suggestions)
     
     stage_configs: List[StageConfig] = []
     weight_list: List[Dict[str, float]] = []
@@ -453,6 +491,12 @@ def run_pipeline(pipeline: object,
         else:
             stage_type = "exact_1to1"
             
+        log.debug(
+            "Configured pipeline stage %d (order %d): type=%s, max_group_size_bank=%d, max_group_size_book=%d, "
+            "amount_tol=%s, date_tol=%s, weights=%s",
+            len(stage_configs), stage_obj.order, stage_type, stage_configs[-1].max_group_size_bank, 
+            stage_configs[-1].max_group_size_book, stage_configs[-1].amount_tol, stage_configs[-1].date_tol, weight_list[-1]
+        )
         
         stage_configs.append(StageConfig(
             type=stage_type,
@@ -472,11 +516,18 @@ def run_pipeline(pipeline: object,
             "currency":  float(stage_obj.currency_weight)  if stage_obj.currency_weight  is not None else float(cfg.currency_weight),
             "date":      float(stage_obj.date_weight)      if stage_obj.date_weight      is not None else float(cfg.date_weight),
         })
+        
+    
     pipe_cfg = PipelineConfig(
         stages=stage_configs,
         auto_apply_score=float(pipeline.auto_apply_score),
         max_suggestions=pipeline.max_suggestions,
     )
+    
+    log.debug("Pipeline engine initialized with %d enabled stages out of %d configured", 
+      len(stage_configs), pipeline.stages.count() if hasattr(pipeline.stages, 'count') else len(stage_configs))
+        
+    
     engine = ReconciliationPipelineEngine(company_id=pipeline.company_id, config=pipe_cfg)
     engine.current_weights = weight_list
     return engine.run(banks, books)
@@ -514,18 +565,39 @@ class ReconciliationService:
         bank_qs = BankTransaction.objects.exclude(
             reconciliations__status__in=["matched", "approved"]
         )
+        bank_count_initial = bank_qs.count()
+        log.debug("Initial unmatched bank transactions count: %d", bank_count_initial)
+        
         if bank_ids:
             bank_qs = bank_qs.filter(id__in=bank_ids)
-
+            filtered_count = bank_qs.count()
+            log.debug("Filtered bank transactions by provided IDs (%d ids): %d records remain", 
+                      len(bank_ids), filtered_count)
+        else:
+            log.debug("No bank_ids provided; using all unmatched bank transactions (%d records)", 
+                      bank_count_initial)
+        
         book_qs = JournalEntry.objects.exclude(
             reconciliations__status__in=["matched", "approved"]
         )
+        book_count_initial = book_qs.count()
+        log.debug("Initial unmatched journal entries count: %d", book_count_initial)
         if book_ids:
             book_qs = book_qs.filter(id__in=book_ids)
+            filtered_book_count = book_qs.count()
+            log.debug("Filtered journal entries by provided IDs (%d ids): %d records remain", 
+                      len(book_ids), filtered_book_count)
+        else:
+            log.debug("No book_ids provided; using all unmatched journal entries (%d records)", 
+                      book_count_initial)
 
         # Only consider journal entries that belong to a bank account
+        pre_account_count = book_qs.count()
         book_qs = book_qs.filter(account__bank_account__isnull=False)
-
+        post_account_count = book_qs.count()
+        log.debug("Filtered journal entries to those linked to bank accounts: %d records remain (from %d)", 
+                  post_account_count, pre_account_count)
+        
         # Convert querysets to DTOs
         candidate_bank = [
             BankTransactionDTO(
@@ -595,7 +667,9 @@ class ReconciliationService:
         details = []
         used_banks: set[int] = set()
         used_books: set[int] = set()
-
+        
+        log.debug("Auto-match 100%% process starting for %d suggestions", len(suggestions))
+        
         for s in suggestions:
             if float(s.get("confidence_score", 0)) != 1.0:
                 continue
@@ -604,10 +678,12 @@ class ReconciliationService:
             if not bank_ids or not book_ids:
                 skipped += 1
                 details.append({"reason": "empty_ids", "suggestion": s})
+                log.debug("Skipping auto-match suggestion (empty IDs): %s", s)
                 continue
             if any(b in used_banks for b in bank_ids) or any(j in used_books for j in book_ids):
                 skipped += 1
                 details.append({"reason": "overlap_in_batch", "suggestion": s})
+                log.debug("Skipping auto-match suggestion due to overlap in batch: %s", s)
                 continue
 
             # Check for preexisting matches
@@ -618,6 +694,7 @@ class ReconciliationService:
             ).exists():
                 skipped += 1
                 details.append({"reason": "already_matched", "suggestion": s})
+                log.debug("Skipping auto-match suggestion because already matched/approved in DB: %s", s)
                 continue
 
             bank_objs = list(BankTransaction.objects.filter(id__in=bank_ids))
@@ -626,6 +703,7 @@ class ReconciliationService:
             if len(company_ids) != 1:
                 skipped += 1
                 details.append({"reason": "company_unresolved", "suggestion": s})
+                log.debug("Skipping auto-match suggestion due to multiple company IDs: %s", s)
                 continue
             company_id = company_ids.pop()
 
@@ -640,7 +718,17 @@ class ReconciliationService:
             used_banks.update(bank_ids)
             used_books.update(book_ids)
             details.append({"reconciliation_id": recon.id, "bank_ids": bank_ids, "journal_ids": book_ids})
-
+            log.debug("Auto-matched reconciliation created: id=%s (banks=%s, journals=%s)", recon.id, bank_ids, book_ids)
+            
+        log.debug("Auto-match 100%% results: %d applied, %d skipped", applied, skipped)
+        for entry in details:
+            if "reason" in entry:
+                log.debug("Auto-match skipped detail: reason=%s, suggestion=%s", 
+                          entry["reason"], entry.get("suggestion"))
+            else:
+                log.debug("Auto-match applied detail: reconciliation_id=%s, bank_ids=%s, journal_ids=%s", 
+                          entry.get("reconciliation_id"), entry.get("bank_ids"), entry.get("journal_ids"))
+            
         return {
             "enabled": True,
             "applied": applied,
