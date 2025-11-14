@@ -253,7 +253,9 @@ class ReconciliationPipelineEngine:
                     continue
                 if bank.date and book.date and abs((bank.date - book.date).days) > stage.date_tol:
                     continue
-                suggestion = self._make_suggestion("exact_1to1", [bank.id], [book.id], 1.0)
+                suggestion = self._make_suggestion("exact_1to1", [bank], [book], 1.0,
+                    stage=stage,
+                    weights=self.stage_weights)
                 self._record(suggestion)
                 break
 
@@ -271,7 +273,9 @@ class ReconciliationPipelineEngine:
                         continue
                     if any(abs((bank.date - b.date).days) > stage.date_tol for b in combo):
                         continue
-                    suggestion = self._make_suggestion("one_to_many", [bank.id], [b.id for b in combo], 1.0)
+                    suggestion = self._make_suggestion("one_to_many", [bank], combo, 1.0,
+                        stage=stage,
+                        weights=self.stage_weights)
                     self._record(suggestion)
                     return
 
@@ -289,7 +293,9 @@ class ReconciliationPipelineEngine:
                         continue
                     if any(abs((b.date - book.date).days) > stage.date_tol for b in combo):
                         continue
-                    suggestion = self._make_suggestion("many_to_one", [b.id for b in combo], [book.id], 1.0)
+                    suggestion = self._make_suggestion("many_to_one", combo, [book], 1.0,
+                        stage=stage,
+                        weights=self.stage_weights)
                     self._record(suggestion)
                     return
 
@@ -325,7 +331,15 @@ class ReconciliationPipelineEngine:
                 conf = compute_weighted_confidence(
                     embed_sim, a_diff, stage.amount_tol, d_diff, stage.date_tol, currency_match, weights
                 )
-                suggestion = self._make_suggestion("fuzzy_1to1", [bank.id], [book.id], conf)
+                suggestion = self._make_suggestion("fuzzy_1to1", [bank], [book], conf,
+                    stage=stage,
+                    weights=weights,
+                    extra={
+                        "embed_similarity": float(embed_sim),
+                        "amount_diff": float(a_diff),
+                        "date_diff_days": int(d_diff),
+                        "currency_match": currency_match,
+                    })
                 self._record(suggestion)
 
     def _run_many_to_many(self, banks, books, stage: StageConfig):
@@ -372,9 +386,11 @@ class ReconciliationPipelineEngine:
     
                             suggestion = self._make_suggestion(
                                 "many_to_many",
-                                [b.id for b in bank_combo],
-                                [e.id for e in book_combo],
-                                1.0,
+                                bank_combo,
+                                book_combo,
+                                1,
+                                stage=stage,
+                                weights=self.stage_weights
                             )
                             log.debug("Recording valid suggestion: bank_ids=%s, journal_ids=%s", 
                                       suggestion["bank_ids"], suggestion["journal_entries_ids"])
@@ -390,15 +406,135 @@ class ReconciliationPipelineEngine:
         norm1 = sqrt(sum(a * a for a in v1))
         norm2 = sqrt(sum(b * b for b in v2))
         return dot / (norm1 * norm2) if norm1 and norm2 else 0.0
+    
+    def _aggregate_group_stats(self, items, *, is_bank: bool) -> dict:
+        """
+        Compute descriptive statistics and formatted lines for a group of
+        BankTransactionDTOs or JournalEntryDTOs.
+        """
+        from datetime import date as _date
 
-    def _make_suggestion(self, match_type: str, bank_ids: List[int],
-                         book_ids: List[int], conf: float) -> dict:
+        # pick the amount/date fields according to DTO type
+        amounts: List[Decimal] = []
+        dates: List[date] = []
+        for it in items:
+            amt = it.amount_base
+            if amt is not None:
+                amounts.append(amt)
+            if it.date:
+                dates.append(it.date)
+
+        count = len(items)
+        sum_amount = sum(amounts, Decimal("0")) if amounts else Decimal("0")
+
+        min_date = min(dates) if dates else None
+        max_date = max(dates) if dates else None
+
+        # weighted average date using |amount| as weight to avoid sign cancellation
+        weighted_avg_date = None
+        if dates and amounts:
+            pairs = [(it.date, abs(it.amount_base)) for it in items if it.date and it.amount_base is not None]
+            total_abs = sum((w for _, w in pairs), Decimal("0"))
+            if total_abs:
+                num = sum((Decimal(d.toordinal()) * w for d, w in pairs), Decimal("0"))
+                ord_ = int((num / total_abs).to_integral_value(ROUND_HALF_UP))
+                weighted_avg_date = _date.fromordinal(ord_)
+
+        # formatted lines: one per row, with date, value and description
+        lines = []
+        for it in items:
+            d = it.date.isoformat() if it.date else "N/A"
+            v = q2(it.amount_base)
+            desc = (it.description or "").replace("\n", " ").strip()
+            prefix = "BANK" if is_bank else "BOOK"
+            lines.append(f"{prefix}#{it.id} | {d} | {v} | {desc}")
+
         return {
-            "match_type": match_type,
-            "bank_ids": bank_ids,
-            "journal_entries_ids": book_ids,
-            "confidence_score": float(conf),
+            "count": count,
+            "sum_amount": float(q2(sum_amount)),
+            "min_date": min_date.isoformat() if min_date else None,
+            "max_date": max_date.isoformat() if max_date else None,
+            "weighted_avg_date": weighted_avg_date.isoformat() if weighted_avg_date else None,
+            "lines_text": "\n".join(lines),
         }
+    
+    def _make_suggestion(
+        self,
+        match_type: str,
+        bank_items: List[BankTransactionDTO],
+        book_items: List[JournalEntryDTO],
+        conf: float,
+        *,
+        stage: StageConfig | None = None,
+        weights: Optional[Dict[str, float]] = None,
+        extra: Optional[Dict[str, object]] = None,
+    ) -> dict:
+        """
+        Build a rich suggestion payload for front-end / API consumption.
+        - bank_items / book_items: DTOs participating in the match
+        - conf: final confidence score (0–1)
+        - stage: optional StageConfig for match parameters
+        - weights: optional per-component confidence weights
+        - extra: optional dict with additional debug info (embed sim, etc.)
+        """
+
+        weights = weights or getattr(self, "stage_weights", self.current_weights)
+
+        bank_stats = self._aggregate_group_stats(bank_items, is_bank=True)
+        book_stats = self._aggregate_group_stats(book_items, is_bank=False)
+
+        sum_bank = Decimal(str(bank_stats["sum_amount"]))
+        sum_book = Decimal(str(book_stats["sum_amount"]))
+        abs_diff = float(q2(abs(sum_bank - sum_book)))
+
+        match_params = {}
+        if stage is not None:
+            match_params = {
+                "amount_tolerance": float(stage.amount_tol),
+                "date_tolerance_days": int(stage.date_tol),
+                "max_group_size_bank": int(stage.max_group_size_bank),
+                "max_group_size_book": int(stage.max_group_size_book),
+            }
+
+        suggestion = {
+            "match_type": match_type,
+            # raw IDs used for persistence
+            "bank_ids": [b.id for b in bank_items],
+            "journal_entries_ids": [e.id for e in book_items],
+            # stats
+            "bank_stats": {
+                "count": bank_stats["count"],
+                "sum_amount": bank_stats["sum_amount"],
+                "min_date": bank_stats["min_date"],
+                "weighted_avg_date": bank_stats["weighted_avg_date"],
+                "max_date": bank_stats["max_date"],
+            },
+            "book_stats": {
+                "count": book_stats["count"],
+                "sum_amount": book_stats["sum_amount"],
+                "min_date": book_stats["min_date"],
+                "weighted_avg_date": book_stats["weighted_avg_date"],
+                "max_date": book_stats["max_date"],
+            },
+            # human-readable lines
+            "bank_lines": bank_stats["lines_text"],
+            "book_lines": book_stats["lines_text"],
+            # reconciliation quality
+            "abs_amount_diff": abs_diff,
+            "confidence_score": float(conf),
+            "confidence_weights": {
+                "embedding": float(weights.get("embedding", 0.0)),
+                "amount": float(weights.get("amount", 0.0)),
+                "currency": float(weights.get("currency", 0.0)),
+                "date": float(weights.get("date", 0.0)),
+            },
+            "match_parameters": match_params,
+        }
+
+        if extra:
+            suggestion["extra"] = extra
+
+        return suggestion
 
     def _record(self, suggestion: dict) -> None:
         """Record a suggestion and mark the participating IDs as used."""
