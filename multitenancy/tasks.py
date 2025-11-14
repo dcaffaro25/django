@@ -117,6 +117,8 @@ MODEL_APP_MAP: Dict[str, str] = {
     "KPI": "hr",
     "Bonus": "hr",
     "RecurringAdjustment": "hr",
+    "DocTypeRule": "npl",
+    "SpanRule": "npl",
 }
 
 PATH_COLS = ("path", "Caminho")

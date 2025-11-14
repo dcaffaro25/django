@@ -32,13 +32,6 @@ from django.db.models import Model, QuerySet
 import re
 from decimal import Decimal, InvalidOperation
 
-
-
-
-
-
-
-
 import json
 from datetime import datetime, date, time, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -123,7 +116,7 @@ MODEL_APP_MAP = {
     "IndexQuote": "core",
     "FinancialIndexQuoteForecast": "core",
     "DocTypeRule": "npl",
-    "SpanRule": "npl"
+    "SpanRule": "npl",
     
     # Add other model-app mappings as needed
 }
@@ -289,7 +282,7 @@ class BulkImportPreview(APIView):
 
             PREFERRED_ORDER = [
                 "Company", "Entity", "Currency", "Account", "CostCenter",
-                "Transaction", "JournalEntry"
+                "Transaction", "JournalEntry", "DocTypeRule", "SpanRule"
             ]
             sheet_names = [n for n in xls.keys() if n != "References"]
             order_index = {name: i for i, name in enumerate(PREFERRED_ORDER)}
