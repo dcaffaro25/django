@@ -181,11 +181,70 @@ class JournalEntrySerializer(serializers.ModelSerializer):
     class Meta:
         model = JournalEntry
         fields = [
-            "id", "company", "transaction", "account", "cost_center",
+            "id", "company", "transaction", "description","account", "cost_center",
             "debit_amount", "credit_amount",
             "state", "date",
             "bank_designation_pending", "has_designated_bank",
         ]
+
+class JournalEntryListSerializer(serializers.ModelSerializer):
+    company = serializers.PrimaryKeyRelatedField(read_only=True)
+    currency = serializers.PrimaryKeyRelatedField(read_only=True)
+    entity = serializers.PrimaryKeyRelatedField(read_only=True)
+    balance = serializers.SerializerMethodField()
+    transaction_date = serializers.SerializerMethodField()
+    transaction_description = serializers.SerializerMethodField()
+    transaction_value = serializers.SerializerMethodField()
+    bank_account = serializers.SerializerMethodField()
+    reconciliation_status = serializers.SerializerMethodField()
+    bank_date = serializers.SerializerMethodField()
+
+    class Meta:
+        model = JournalEntry
+        fields = [
+            'id', 'company', 'entity', 'currency', 'description', 'bank_date', 'balance',
+            'transaction_date', 'transaction_description', 'transaction_value',
+            'bank_account', 'reconciliation_status',
+        ]
+
+    def get_transaction_date(self, obj):
+        """Returns date from related transaction."""
+        return obj.transaction.date if obj.transaction else None
+
+    def get_transaction_description(self, obj):
+        """Returns description from related transaction."""
+        return obj.transaction.description if obj.transaction else None
+
+    def get_transaction_value(self, obj):
+        """Returns amount from related transaction as float."""
+        if obj.transaction and obj.transaction.amount is not None:
+            return float(obj.transaction.amount)
+        return None
+
+    def get_bank_date(self, obj):
+        """Returns the journal date only if linked to a bank account."""
+        if obj.account and obj.account.bank_account:
+            return obj.date
+        return None
+
+    def get_bank_account(self, obj):
+        """Returns the bank account ID if linked."""
+        if obj.account and obj.account.bank_account:
+            return obj.account.bank_account.id
+        return None
+
+    def get_balance(self, obj):
+        """Returns debit - credit as float."""
+        debit = obj.debit_amount or 0
+        credit = obj.credit_amount or 0
+        return float(debit - credit)
+
+    def get_reconciliation_status(self, obj):
+        """Returns reconciliation status based on linked reconciliations."""
+        if obj.account and obj.account.bank_account:
+            if obj.reconciliations.filter(status__in=["matched", "approved"]).exists():
+                return "matched"
+        return "pending"
 
 class TransactionListSerializer(serializers.ModelSerializer):
     company = serializers.PrimaryKeyRelatedField(read_only=True)

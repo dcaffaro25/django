@@ -337,6 +337,7 @@ class Transaction(TenantAwareBaseModel):
 
 class JournalEntry(TenantAwareBaseModel):
     transaction = models.ForeignKey(Transaction, related_name='journal_entries', on_delete=models.CASCADE)
+    description = models.CharField(max_length=255, null=True, blank=True)
     account = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True)
     cost_center = models.ForeignKey(CostCenter, on_delete=models.CASCADE, null=True, blank=True)
     debit_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)

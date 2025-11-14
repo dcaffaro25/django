@@ -14,7 +14,7 @@ from multitenancy.api_utils import generic_bulk_create, generic_bulk_update, gen
 from multitenancy.models import CustomUser, Company, Entity
 from multitenancy.mixins import ScopedQuerysetMixin
 from .models import (Currency, Account, Transaction, JournalEntry, Rule, CostCenter, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter,ReconciliationTask, ReconciliationConfig)
-from .serializers import (CurrencySerializer, AccountSerializer, TransactionSerializer, CostCenterSerializer, JournalEntrySerializer, RuleSerializer, BankSerializer, BankAccountSerializer, BankTransactionSerializer, ReconciliationSerializer, TransactionListSerializer,ReconciliationTaskSerializer,ReconciliationConfigSerializer)
+from .serializers import (CurrencySerializer, AccountSerializer, TransactionSerializer, CostCenterSerializer, JournalEntrySerializer, JournalEntryListSerializer, RuleSerializer, BankSerializer, BankAccountSerializer, BankTransactionSerializer, ReconciliationSerializer, TransactionListSerializer,ReconciliationTaskSerializer,ReconciliationConfigSerializer)
 from .services.transaction_service import *
 from .utils import update_journal_entries_and_transaction_flags, parse_ofx_text, decode_ofx_content, generate_ofx_transaction_hash, find_book_combos
 from datetime import datetime
@@ -570,7 +570,12 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     else:
         permission_classes = [permissions.IsAuthenticated]
     
-       
+    
+    def get_serializer_class(self):
+        if self.action in ['list', 'unmatched']:
+            return JournalEntryListSerializer
+        return JournalEntrySerializer
+    
     # Bulk operations
     @action(methods=['post'], detail=False)
     def bulk_create(self, request, *args, **kwargs):
@@ -584,7 +589,43 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     def bulk_delete(self, request, *args, **kwargs):
         ids = request.data  # Assuming request.data is a list of IDs
         return generic_bulk_delete(self, ids)
+    
+    @action(detail=False, methods=['get'], url_path='unmatched')
+    def unmatched(self, request, tenant_id=None):
+        """
+        Returns transactions that still have unreconciled journal entries.
+        Optional query parameters:
+        - company_id: filter by company
+        - date_from / date_to: filter by transaction date
+        """
+        # Base queryset: only transactions with journal entries tied to a bank account
+        
+        qs = JournalEntry.objects.filter(account__bank_account__isnull=False)
+        qs = qs.select_related('transaction', 'account', 'company').prefetch_related('reconciliations')
+        # Apply optional filters
+        company_id = request.query_params.get("tenant_id")
+        if company_id:
+            qs = qs.filter(company__id=company_id)
 
+        date_from = request.query_params.get("date_from")
+        date_to = request.query_params.get("date_to")
+        if date_from:
+            qs = qs.filter(date__gte=date_from)
+        if date_to:
+            qs = qs.filter(date__lte=date_to)
+
+        # Exclude any transaction where all bank-side JEs are reconciled (matched or approved)
+        matched_je_ids = (
+            Reconciliation.objects
+            .filter(status__in=['matched', 'approved'])
+            .values_list('journal_entries__id', flat=True)
+        )
+        
+        qs_unmatched = qs.exclude(id__in=matched_je_ids).distinct()
+        serializer_class = self.get_serializer_class()  # use list vs detail serializer
+        serializer = serializer_class(qs_unmatched, many=True)
+        return Response(serializer.data)
+    
     # Get journal entries by transaction
     @action(detail=False, methods=['get'])
     def by_transaction(self, request):
