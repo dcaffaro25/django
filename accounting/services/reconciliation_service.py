@@ -84,7 +84,12 @@ class StageConfig:
     max_group_size_bank: int = 1
     max_group_size_book: int = 1
     amount_tol: Decimal = Decimal("0")
-    date_tol: int = 0
+    date_tol: int = 0  # legacy/default tolerance
+
+    # NEW: independent date constraints (None => fall back to date_tol)
+    group_date_span_days: Optional[int] = None    # max span within each side
+    avg_date_diff_days: Optional[int] = None      # max |weighted_avg(bank) - weighted_avg(book)|
+
     # optional weight overrides (None → inherit from config or default)
     embedding_weight: float | None = None
     amount_weight: float | None = None
@@ -256,8 +261,7 @@ class ReconciliationPipelineEngine:
     def run(self, banks: List[BankTransactionDTO], books: List[JournalEntryDTO]) -> List[dict]:
         """Execute each enabled stage and return suggestions up to the configured limit."""
         
-        log.debug("Executing reconciliation pipeline: %d stages to run, up to %d suggestions", 
-          len(self.config.stages), self.config.max_suggestions)
+
         
         for idx, stage in enumerate(self.config.stages):
             if not stage.enabled:
@@ -286,6 +290,7 @@ class ReconciliationPipelineEngine:
 
     # Stage handlers
     def _run_exact_1to1(self, banks, books, stage: StageConfig):
+        centroid_tol = stage.avg_date_diff_days if stage.avg_date_diff_days is not None else stage.date_tol
         for bank in banks:
             if bank.id in self.used_banks:
                 continue
@@ -298,16 +303,19 @@ class ReconciliationPipelineEngine:
                     continue
                 if bank.currency_id != book.currency_id:
                     continue
-                if bank.date and book.date and abs((bank.date - book.date).days) > stage.date_tol:
+                if bank.date and book.date and abs((bank.date - book.date).days) > centroid_tol:
                     continue
-                suggestion = self._make_suggestion("exact_1to1", [bank], [book], 1.0,
-                    stage=stage,
-                    weights=self.stage_weights)
+                suggestion = self._make_suggestion(
+                    "exact_1to1", [bank], [book], 1.0, stage=stage, weights=self.stage_weights
+                )
                 self._record(suggestion)
                 break
 
     def _run_one_to_many(self, banks, books, stage: StageConfig):
         available_books = [b for b in books if b.id not in self.used_books and b.company_id == self.company_id]
+        span_tol = stage.group_date_span_days if stage.group_date_span_days is not None else stage.date_tol
+        centroid_tol = stage.avg_date_diff_days if stage.avg_date_diff_days is not None else stage.date_tol
+
         for bank in banks:
             if bank.id in self.used_banks:
                 continue
@@ -318,16 +326,27 @@ class ReconciliationPipelineEngine:
                         continue
                     if any(b.currency_id != bank.currency_id for b in combo):
                         continue
-                    if any(abs((bank.date - b.date).days) > stage.date_tol for b in combo):
+
+                    # NEW: span within the book group
+                    if self._date_span_days(combo) > span_tol:
                         continue
-                    suggestion = self._make_suggestion("one_to_many", [bank], combo, 1.0,
-                        stage=stage,
-                        weights=self.stage_weights)
+
+                    # NEW: centroid gap (bank single date vs book group wavg)
+                    book_avg = self._weighted_avg_date(combo)
+                    if bank.date and book_avg and abs((bank.date - book_avg).days) > centroid_tol:
+                        continue
+
+                    suggestion = self._make_suggestion(
+                        "one_to_many", [bank], combo, 1.0, stage=stage, weights=self.stage_weights
+                    )
                     self._record(suggestion)
                     return
 
     def _run_many_to_one(self, banks, books, stage: StageConfig):
         available_banks = [b for b in banks if b.id not in self.used_banks and b.company_id == self.company_id]
+        span_tol = stage.group_date_span_days if stage.group_date_span_days is not None else stage.date_tol
+        centroid_tol = stage.avg_date_diff_days if stage.avg_date_diff_days is not None else stage.date_tol
+
         for book in books:
             if book.id in self.used_books:
                 continue
@@ -338,16 +357,26 @@ class ReconciliationPipelineEngine:
                         continue
                     if any(b.currency_id != book.currency_id for b in combo):
                         continue
-                    if any(abs((b.date - book.date).days) > stage.date_tol for b in combo):
+
+                    # NEW: span within the bank group
+                    if self._date_span_days(combo) > span_tol:
                         continue
-                    suggestion = self._make_suggestion("many_to_one", combo, [book], 1.0,
-                        stage=stage,
-                        weights=self.stage_weights)
+
+                    # NEW: centroid gap (bank group wavg vs book single date)
+                    bank_avg = self._weighted_avg_date(combo)
+                    if bank_avg and book.date and abs((bank_avg - book.date).days) > centroid_tol:
+                        continue
+
+                    suggestion = self._make_suggestion(
+                        "many_to_one", combo, [book], 1.0, stage=stage, weights=self.stage_weights
+                    )
                     self._record(suggestion)
                     return
 
     def _run_fuzzy_1to1(self, banks, books, stage: StageConfig):
-        bin_size = max(1, min(stage.date_tol, 7))
+        centroid_tol = stage.avg_date_diff_days if stage.avg_date_diff_days is not None else stage.date_tol
+        bin_size = max(1, min(centroid_tol, 7))
+
         book_bins = build_date_bins(
             [b for b in books if b.id not in self.used_books],
             get_date=lambda e: e.date,
@@ -356,18 +385,22 @@ class ReconciliationPipelineEngine:
         for bank in banks:
             if bank.id in self.used_banks:
                 continue
-            candidates = list(iter_date_bin_candidates(bank.date, book_bins, bin_size, stage.date_tol))
+            candidates = list(iter_date_bin_candidates(bank.date, book_bins, bin_size, centroid_tol))
             buckets = build_amount_buckets(candidates, get_amount=lambda e: e.amount_base)
+
             for book in probe_amount_buckets(buckets, bank.amount_base, stage.amount_tol):
                 if book.id in self.used_books:
                     continue
+
                 currency_match = 1.0 if bank.currency_id == book.currency_id else 0.0
-                d_diff = abs((bank.date - book.date).days) if bank.date and book.date else stage.date_tol + 1
-                if d_diff > stage.date_tol:
+                d_diff = abs((bank.date - book.date).days) if bank.date and book.date else centroid_tol + 1
+                if d_diff > centroid_tol:
                     continue
+
                 a_diff = abs(q2(bank.amount_base) - q2(book.amount_base))
                 if a_diff > stage.amount_tol:
                     continue
+
                 embed_sim = self._cosine_similarity(bank.embedding or [], book.embedding or [])
                 weights = {
                     "embedding": stage.embedding_weight if stage.embedding_weight is not None else self.stage_weights["embedding"],
@@ -375,20 +408,17 @@ class ReconciliationPipelineEngine:
                     "currency":  stage.currency_weight  if stage.currency_weight  is not None else self.stage_weights["currency"],
                     "date":      stage.date_weight      if stage.date_weight      is not None else self.stage_weights["date"],
                 }
-                
+
                 scores = compute_match_scores(
                     embed_sim=embed_sim,
                     amount_diff=a_diff,
                     amount_tol=stage.amount_tol,
                     date_diff=d_diff,
-                    date_tol=stage.date_tol,
+                    date_tol=centroid_tol,
                     currency_match=currency_match,
                     weights=weights,
                 )
-                
-                conf = compute_weighted_confidence(
-                    embed_sim, a_diff, stage.amount_tol, d_diff, stage.date_tol, currency_match, weights
-                )
+
                 suggestion = self._make_suggestion(
                     "fuzzy_1to1",
                     [bank],
@@ -400,7 +430,9 @@ class ReconciliationPipelineEngine:
                     extra={
                         "embed_similarity": float(embed_sim),
                         "amount_diff": float(a_diff),
-                        "date_diff_days": int(d_diff),
+                        "date_centroid_diff_days": int(d_diff),
+                        "group_span_bank_days": 0,
+                        "group_span_book_days": 0,
                         "currency_match": currency_match,
                     },
                 )
@@ -411,50 +443,60 @@ class ReconciliationPipelineEngine:
         sorted_banks.sort(key=lambda b: b.date)
         sorted_books = [e for e in books if e.id not in self.used_books and e.company_id == self.company_id]
         sorted_books.sort(key=lambda e: e.date)
-        
-        log.debug("Starting many-to-many reconciliation stage na company %d: %d banks, %d sorted banks, %d books, %d sorted books", self.company_id, len(banks), len(sorted_banks), len(books), len(sorted_books))
-    
+
+        log.debug(
+            "Starting many-to-many reconciliation stage na company %d: banks=%d sorted_banks=%d books=%d sorted_books=%d",
+            self.company_id, len(banks), len(sorted_banks), len(books), len(sorted_books)
+        )
+
+        span_tol = stage.group_date_span_days if stage.group_date_span_days is not None else stage.date_tol
+        centroid_tol = stage.avg_date_diff_days if stage.avg_date_diff_days is not None else stage.date_tol
+
         for bank in sorted_banks:
-            start = bank.date - timedelta(days=stage.date_tol)
-            end = bank.date + timedelta(days=stage.date_tol)
+            window_days = max(span_tol, centroid_tol)
+            start = bank.date - timedelta(days=window_days)
+            end = bank.date + timedelta(days=window_days)
             bank_window = [b for b in sorted_banks if start <= b.date <= end]
             book_window = [e for e in sorted_books if start <= e.date <= end]
-    
-            log.debug("Bank %s: date=%s, amount=%.2f, currency=%s, window banks=%d, window books=%d", 
-                      bank.id, bank.date, bank.amount, bank.currency_id, len(bank_window), len(book_window))
-    
+
+            log.debug(
+                "Bank %s: date=%s, amount=%.2f, currency=%s, window banks=%d, window books=%d",
+                bank.id, bank.date, bank.amount, bank.currency_id, len(bank_window), len(book_window)
+            )
+
             for i in range(1, min(stage.max_group_size_bank, len(bank_window)) + 1):
                 for bank_combo in combinations(bank_window, i):
                     sum_bank = sum((b.amount_base for b in bank_combo), Decimal("0"))
-    
+
                     for j in range(1, min(stage.max_group_size_book, len(book_window)) + 1):
                         for book_combo in combinations(book_window, j):
                             sum_book = sum((e.amount_base for e in book_combo), Decimal("0"))
-    
-                            #log.debug("Trying bank combo IDs %s (sum=%.2f) vs book combo IDs %s (sum=%.2f)", 
-                            #          [b.id for b in bank_combo], sum_bank, [e.id for e in book_combo], sum_book)
-    
+
                             if q2(sum_bank) != q2(sum_book):
-                                #log.debug("Amount mismatch: bank=%.2f, book=%.2f", q2(sum_bank), q2(sum_book))
                                 continue
-    
+
                             if any(b.currency_id != e.currency_id for b in bank_combo for e in book_combo):
-                                #log.debug("Currency mismatch found in combination; skipping")
                                 continue
-    
-                            all_dates = [b.date for b in bank_combo] + [e.date for e in book_combo]
-                            if (max(all_dates) - min(all_dates)).days > stage.date_tol:
-                                #log.debug("Date range too wide in combo: min=%s, max=%s, span=%d days", 
-                                #          min(all_dates), max(all_dates), (max(all_dates) - min(all_dates)).days)
+
+                            # NEW: per-side span constraints
+                            if self._date_span_days(bank_combo) > span_tol:
                                 continue
-                            
+                            if self._date_span_days(book_combo) > span_tol:
+                                continue
+
+                            # NEW: centroid gap constraint
+                            b_avg = self._weighted_avg_date(bank_combo)
+                            e_avg = self._weighted_avg_date(book_combo)
+                            if b_avg and e_avg and abs((b_avg - e_avg).days) > centroid_tol:
+                                continue
+
                             # after checks
                             emb_bank = _avg_embedding(bank_combo)
                             emb_book = _avg_embedding(book_combo)
                             embed_sim = self._cosine_similarity(emb_bank, emb_book)
-                            
+
                             a_diff = Decimal("0")  # sums already equal
-                            d_diff = (max(all_dates) - min(all_dates)).days
+                            d_diff = abs((b_avg - e_avg).days) if (b_avg and e_avg) else 0
                             currency_match = 1.0
 
                             scores = compute_match_scores(
@@ -462,7 +504,7 @@ class ReconciliationPipelineEngine:
                                 amount_diff=a_diff,
                                 amount_tol=stage.amount_tol or CENT,
                                 date_diff=d_diff,
-                                date_tol=stage.date_tol or 1,
+                                date_tol=centroid_tol or 1,
                                 currency_match=currency_match,
                                 weights=self.stage_weights,
                             )
@@ -475,12 +517,41 @@ class ReconciliationPipelineEngine:
                                 stage=stage,
                                 weights=self.stage_weights,
                                 component_scores=scores,
+                                extra={
+                                    "embed_similarity": float(embed_sim),
+                                    "date_centroid_diff_days": int(d_diff),
+                                    "group_span_bank_days": self._date_span_days(bank_combo),
+                                    "group_span_book_days": self._date_span_days(book_combo),
+                                },
                             )
-                            
-                            log.debug("Recording valid suggestion: bank_ids=%s, journal_ids=%s", 
-                                      suggestion["bank_ids"], suggestion["journal_entries_ids"])
+
+                            log.debug(
+                                "Recording valid suggestion: bank_ids=%s, journal_ids=%s",
+                                suggestion["bank_ids"], suggestion["journal_entries_ids"]
+                            )
                             self._record(suggestion)
 
+    
+    def _date_span_days(self, items) -> int:
+        dates = [it.date for it in items if it.date]
+        return (max(dates) - min(dates)).days if len(dates) >= 2 else 0
+
+    def _weighted_avg_date(self, items):
+        """
+        Amount‑weighted average date using |amount_base| as weight
+        (same logic used for display in _aggregate_group_stats).
+        """
+        from datetime import date as _date
+        pairs = [(it.date, abs(it.amount_base))
+                 for it in items if it.date and it.amount_base is not None]
+        if not pairs:
+            return None
+        total = sum((w for _, w in pairs), Decimal("0"))
+        if not total:
+            return None
+        num = sum((Decimal(d.toordinal()) * w for d, w in pairs), Decimal("0"))
+        ord_ = int((num / total).to_integral_value(ROUND_HALF_UP))
+        return _date.fromordinal(ord_)
 
     # Internal helpers
     def _cosine_similarity(self, v1: List[float], v2: List[float]) -> float:
@@ -580,6 +651,8 @@ class ReconciliationPipelineEngine:
             match_params = {
                 "amount_tolerance": float(stage.amount_tol),
                 "date_tolerance_days": int(stage.date_tol),
+                "date_group_span_days": int(stage.group_date_span_days if stage.group_date_span_days is not None else stage.date_tol),
+                "avg_date_diff_days": int(stage.avg_date_diff_days if stage.avg_date_diff_days is not None else stage.date_tol),
                 "max_group_size_bank": int(stage.max_group_size_bank),
                 "max_group_size_book": int(stage.max_group_size_book),
             }
@@ -617,11 +690,11 @@ class ReconciliationPipelineEngine:
             },
             "match_parameters": match_params,
         }
-        
+
         # Attach per-dimension scores if provided
         if component_scores:
             suggestion["component_scores"] = component_scores
-        
+
         if extra:
             suggestion["extra"] = extra
 
@@ -645,21 +718,8 @@ def run_single_config(cfg: object,
                       company_id: int) -> List[dict]:
     """
     Execute a single ReconciliationConfig using the pipeline engine.
-
-    The ``cfg`` object should define:
-      - strategy
-      - amount_tolerance
-      - date_tolerance_days
-      - max_group_size_bank
-      - max_group_size_book
-      - embedding_weight, amount_weight, currency_weight, date_weight
-      - min_confidence (used as auto_apply_score)
-      - max_suggestions
-
-    It must not refer to any legacy strategy or group size field.
     """
-    
-    
+
     # determine type for a single-stage config:
     if cfg.max_group_size_bank > 1 or cfg.max_group_size_book > 1:
         stage_type = "many_to_many"
@@ -667,27 +727,23 @@ def run_single_config(cfg: object,
         stage_type = "fuzzy_1to1"
     else:
         stage_type = "exact_1to1"
-    
-    log.debug("Running single config (ID=%s) for company %s: determined stage_type=%s", 
-          getattr(cfg, "id", None), company_id, stage_type)
-    
-    log.debug("Created %d BankTransactionDTOs", len(banks))
-    for dto in banks[:10]:  # limit to first 10 for brevity
-        log.debug("BankDTO: id=%s, amount=%s, date=%s, currency_id=%s, company_id=%s",
-                  dto.id, dto.amount, dto.date, dto.currency_id, dto.company_id)
-    
-    log.debug("Created %d JournalEntryDTOs", len(books))
-    for dto in books[:10]:  # again, limit to avoid noise
-        log.debug("BookDTO: id=%s, tx_id=%s, amount=%s, date=%s, currency_id=%s, company_id=%s",
-                  dto.id, dto.transaction_id, dto.effective_amount, dto.date, dto.currency_id, dto.company_id)
-    
+
+    log.debug(
+        "Running single config (ID=%s) for company %s: determined stage_type=%s",
+        getattr(cfg, "id", None), company_id, stage_type
+    )
+
     stage = StageConfig(
         type=stage_type,
         max_group_size_bank=cfg.max_group_size_bank,
         max_group_size_book=cfg.max_group_size_book,
         amount_tol=cfg.amount_tolerance,
         date_tol=cfg.date_tolerance_days,
+        # NEW: optional fields; if missing, remain None and fall back to date_tol
+        group_date_span_days=getattr(cfg, "group_date_span_days", None),
+        avg_date_diff_days=getattr(cfg, "avg_date_diff_days", None),
     )
+
     pipe_cfg = PipelineConfig(
         stages=[stage],
         auto_apply_score=float(getattr(cfg, "min_confidence", 1.0)),
@@ -700,25 +756,11 @@ def run_single_config(cfg: object,
         "currency":  float(getattr(cfg, "currency_weight",  0.10)),
         "date":      float(getattr(cfg, "date_weight",      0.05)),
     }
-    
-    log.debug(
-        "Single config weights: embedding=%.2f, amount=%.2f, currency=%.2f, date=%.2f; "
-        "tolerances: amount_tol=%s, date_tol=%s; max_group_size_bank=%d, max_group_size_book=%d; "
-        "min_confidence=%.2f, max_suggestions=%d",
-        engine.current_weights["embedding"], engine.current_weights["amount"], 
-        engine.current_weights["currency"], engine.current_weights["date"],
-        cfg.amount_tolerance, cfg.date_tolerance_days, cfg.max_group_size_bank, cfg.max_group_size_book,
-        float(getattr(cfg, "min_confidence", 0)), getattr(cfg, "max_suggestions", 1000)
-    )
-    
-    # Run and filter by min_confidence
+
     suggestions = engine.run(banks, books)
-    total = len(suggestions)
     min_conf = float(getattr(cfg, "min_confidence", 0))
     if min_conf:
         suggestions = [s for s in suggestions if s["confidence_score"] >= min_conf]
-        log.debug("Applied min_confidence=%.2f filter: %d of %d suggestions retained", 
-                  min_conf, len(suggestions), total)
     return suggestions
 
 def run_pipeline(pipeline: object,
@@ -732,31 +774,38 @@ def run_pipeline(pipeline: object,
       - a ``stages`` iterable that yields stage objects with attributes:
           enabled, order, config (with relevant fields), and optional overrides.
     """
-    
-    log.debug("Running multi-stage pipeline (ID=%s) for company %s: auto_apply_score=%.2f, max_suggestions=%d", 
-          getattr(pipeline, "id", None), pipeline.company_id, float(pipeline.auto_apply_score), pipeline.max_suggestions)
-    
+    log.debug(
+        "Running multi-stage pipeline (ID=%s) for company %s: auto_apply_score=%.2f, max_suggestions=%d",
+        getattr(pipeline, "id", None),
+        pipeline.company_id,
+        float(pipeline.auto_apply_score),
+        pipeline.max_suggestions
+    )
+
     stage_configs: List[StageConfig] = []
     weight_list: List[Dict[str, float]] = []
+
     for stage_obj in pipeline.stages.select_related("config").order_by("order"):
         cfg = stage_obj.config
         if not stage_obj.enabled:
             continue
-        
+
         if cfg.max_group_size_bank > 1 or cfg.max_group_size_book > 1:
             stage_type = "many_to_many"
         elif cfg.amount_tolerance > 0 or cfg.date_tolerance_days > 0:
             stage_type = "fuzzy_1to1"
         else:
             stage_type = "exact_1to1"
-            
-        log.debug(
-            "Configured pipeline stage %d (order %d): type=%s, max_group_size_bank=%d, max_group_size_book=%d, "
-            "amount_tol=%s, date_tol=%s, weights=%s",
-            len(stage_configs), stage_obj.order, stage_type, stage_configs[-1].max_group_size_bank, 
-            stage_configs[-1].max_group_size_book, stage_configs[-1].amount_tol, stage_configs[-1].date_tol, weight_list[-1]
-        )
-        
+
+        # Pull per-stage overrides if present; otherwise use cfg; else leave None (fallback happens at runtime)
+        group_span = getattr(stage_obj, "group_date_span_days", None)
+        if group_span is None:
+            group_span = getattr(cfg, "group_date_span_days", None)
+
+        centroid_gap = getattr(stage_obj, "avg_date_diff_days", None)
+        if centroid_gap is None:
+            centroid_gap = getattr(cfg, "avg_date_diff_days", None)
+
         stage_configs.append(StageConfig(
             type=stage_type,
             enabled=True,
@@ -764,29 +813,33 @@ def run_pipeline(pipeline: object,
             max_group_size_book=stage_obj.max_group_size_book or cfg.max_group_size_book,
             amount_tol=stage_obj.amount_tolerance if stage_obj.amount_tolerance is not None else cfg.amount_tolerance,
             date_tol=stage_obj.date_tolerance_days if stage_obj.date_tolerance_days is not None else cfg.date_tolerance_days,
-            embedding_weight=stage_obj.embedding_weight if stage_obj.embedding_weight is not None else float(cfg.embedding_weight),
-            amount_weight=stage_obj.amount_weight if stage_obj.amount_weight is not None else float(cfg.amount_weight),
-            currency_weight=stage_obj.currency_weight if stage_obj.currency_weight is not None else float(cfg.currency_weight),
-            date_weight=stage_obj.date_weight if stage_obj.date_weight is not None else float(cfg.date_weight),
+            group_date_span_days=group_span,
+            avg_date_diff_days=centroid_gap,
+            embedding_weight=stage_obj.embedding_weight if getattr(stage_obj, "embedding_weight", None) is not None else float(cfg.embedding_weight),
+            amount_weight=stage_obj.amount_weight if getattr(stage_obj, "amount_weight", None) is not None else float(cfg.amount_weight),
+            currency_weight=stage_obj.currency_weight if getattr(stage_obj, "currency_weight", None) is not None else float(cfg.currency_weight),
+            date_weight=stage_obj.date_weight if getattr(stage_obj, "date_weight", None) is not None else float(cfg.date_weight),
         ))
+
         weight_list.append({
-            "embedding": float(stage_obj.embedding_weight) if stage_obj.embedding_weight is not None else float(cfg.embedding_weight),
-            "amount":    float(stage_obj.amount_weight)    if stage_obj.amount_weight    is not None else float(cfg.amount_weight),
-            "currency":  float(stage_obj.currency_weight)  if stage_obj.currency_weight  is not None else float(cfg.currency_weight),
-            "date":      float(stage_obj.date_weight)      if stage_obj.date_weight      is not None else float(cfg.date_weight),
+            "embedding": float(getattr(stage_obj, "embedding_weight", cfg.embedding_weight)),
+            "amount":    float(getattr(stage_obj, "amount_weight",    cfg.amount_weight)),
+            "currency":  float(getattr(stage_obj, "currency_weight",  cfg.currency_weight)),
+            "date":      float(getattr(stage_obj, "date_weight",      cfg.date_weight)),
         })
-        
-    
+
     pipe_cfg = PipelineConfig(
         stages=stage_configs,
         auto_apply_score=float(pipeline.auto_apply_score),
         max_suggestions=pipeline.max_suggestions,
     )
-    
-    log.debug("Pipeline engine initialized with %d enabled stages out of %d configured", 
-      len(stage_configs), pipeline.stages.count() if hasattr(pipeline.stages, 'count') else len(stage_configs))
-        
-    
+
+    log.debug(
+        "Pipeline engine initialized with %d enabled stages out of %d configured",
+        len(stage_configs),
+        pipeline.stages.count() if hasattr(pipeline.stages, 'count') else len(stage_configs)
+    )
+
     engine = ReconciliationPipelineEngine(company_id=pipeline.company_id, config=pipe_cfg)
     engine.current_weights = weight_list
     return engine.run(banks, books)

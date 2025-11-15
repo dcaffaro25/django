@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Tuple, Optional  
 
@@ -21,6 +22,213 @@ import json
 from pypdf import PdfReader
 import numpy as np
 from accounting.services.embedding_client import EmbeddingClient
+import json
+import os
+from dataclasses import dataclass
+from typing import Dict, List, TypedDict
+
+from io import BytesIO
+from typing import BinaryIO, Optional
+
+def extract_text_from_pdf_fileobj(fileobj: BinaryIO) -> str:
+    """
+    Extract text from a PDF-like file object (BytesIO / InMemoryUploadedFile).
+    Uses PyPDF/fitz/whatever you already use; example below with PyPDF2.
+    """
+    try:
+        from PyPDF2 import PdfReader
+        buf = BytesIO(fileobj.read())
+        reader = PdfReader(buf)
+        texts = []
+        for page in reader.pages:
+            try:
+                texts.append(page.extract_text() or "")
+            except Exception:
+                texts.append("")
+        return "\n".join(texts).strip()
+    finally:
+        try:
+            fileobj.seek(0)
+        except Exception:
+            pass
+
+def normalize_ocr_text(text: str) -> str:
+    """
+    Normalize OCR text to improve literal matching:
+    - remove NUL
+    - join hyphen + newline splits: 'palavra-\\nseguinte' -> 'palavraseguinte'
+    - replace newlines with single space
+    - collapse whitespace
+    - lowercase
+    - remove accents
+    """
+    if not text:
+        return ""
+    text = text.replace("\x00", "")
+    text = re.sub(r"(\w)\s*-\s*\n\s*(\w)", r"\1\2", text)
+    text = text.replace("\n", " ")
+    text = re.sub(r"\s+", " ", text)
+    text = text.lower()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    return text.strip()
+
+
+class AnchorHit(TypedDict, total=False):
+    anchor: str
+    count: int          # for literal/regex matches
+    present: bool       # for AI yes/no signals
+    source: str         # "text" | "embedding" | "ai"
+
+
+AnchorsByStrength = Dict[str, List[AnchorHit]]  # keys: "strong", "weak", "negative"
+
+
+@dataclass
+class AnchorWeights:
+    strong: float = 2.0
+    weak: float = 1.0
+    negative: float = -100.0
+
+
+def score_from_anchor_hits(hits: AnchorsByStrength, weights: AnchorWeights) -> float:
+    """Compute a score given anchor hits and weights."""
+    # any negative hit => auto-kill (negative weight)
+    if hits.get("negative"):
+        return weights.negative
+
+    score = 0.0
+    for h in hits.get("strong", []):
+        score += weights.strong * int(h.get("count", 1))
+    for h in hits.get("weak", []):
+        score += weights.weak * int(h.get("count", 1))
+    return score
+
+
+def confidence_from_score(score: float) -> float:
+    """Simple mapping. Keep your heuristic if you prefer."""
+    if score <= 0:
+        return 0.3
+    if score >= 3:
+        return 0.9
+    return 0.6
+
+
+# ---------- Strategy 1: rule_literal (normalized literal matching) ----------
+
+def _count_occurrences(norm_hay: str, compact_hay: str, anchor: str) -> int:
+    a_norm = normalize_ocr_text(anchor)
+    if not a_norm:
+        return 0
+    c = norm_hay.count(a_norm)
+    if c == 0:
+        c = compact_hay.count(compact_text(a_norm))
+    return c
+
+
+def find_anchors_rule_literal(
+    text: str,
+    strong_anchors: List[str],
+    weak_anchors: List[str],
+    negative_anchors: List[str],
+) -> AnchorsByStrength:
+    norm_text = normalize_ocr_text(text)
+    compact = compact_text(text)
+
+    hits: AnchorsByStrength = {"strong": [], "weak": [], "negative": []}
+
+    for a in strong_anchors:
+        cnt = _count_occurrences(norm_text, compact, a)
+        if cnt:
+            hits["strong"].append({"anchor": a, "count": cnt, "source": "text"})
+
+    for a in weak_anchors:
+        cnt = _count_occurrences(norm_text, compact, a)
+        if cnt:
+            hits["weak"].append({"anchor": a, "count": cnt, "source": "text"})
+
+    for a in negative_anchors:
+        cnt = _count_occurrences(norm_text, compact, a)
+        if cnt:
+            hits["negative"].append({"anchor": a, "count": cnt, "source": "text"})
+
+    return hits
+
+
+# ---------- Strategy 2: ai_anchor (LLM-assisted presence detection) ----------
+
+_USE_AI = os.getenv("NPL_USE_AI_ANCHOR", "false").lower() in ("1", "true", "yes")
+
+def _call_openai_for_anchors(text: str, strong: List[str], weak: List[str], neg: List[str]) -> Dict:
+    """
+    Call OpenAI to judge presence/absence of anchors, tolerant to OCR distortion.
+    If OPENAI_API_KEY or NPL_USE_AI_ANCHOR is not set, returns empty detections.
+    """
+    if not _USE_AI or not os.getenv("OPENAI_API_KEY"):
+        return {"strong": {}, "weak": {}, "negative": {}}
+
+    try:
+        # Lazy import to avoid hard dependency when disabled
+        from openai import OpenAI
+        client = OpenAI()
+
+        anchor_list = {
+            "strong": strong,
+            "weak": weak,
+            "negative": neg,
+        }
+
+        prompt = (
+            "You are given OCR text from Brazilian legal documents. "
+            "For each anchor, answer if it appears in the text, even if distorted by OCR.\n\n"
+            "Return STRICT JSON with keys 'strong', 'weak', 'negative', each mapping to an object "
+            "where keys are anchors and values are true/false.\n\n"
+            f"Anchors: {json.dumps(anchor_list, ensure_ascii=False)}\n\n"
+            f"Text:\n{text}"
+        )
+
+        completion = client.chat.completions.create(
+            model=os.getenv("NPL_AI_MODEL", "gpt-4o-mini"),
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        content = completion.choices[0].message["content"]
+        return json.loads(content)
+    except Exception:
+        return {"strong": {}, "weak": {}, "negative": {}}
+
+
+def find_anchors_ai(
+    text: str,
+    strong_anchors: List[str],
+    weak_anchors: List[str],
+    negative_anchors: List[str],
+) -> AnchorsByStrength:
+    result = _call_openai_for_anchors(text, strong_anchors, weak_anchors, negative_anchors)
+
+    hits: AnchorsByStrength = {"strong": [], "weak": [], "negative": []}
+    for strength in ("strong", "weak", "negative"):
+        detected = result.get(strength, {}) or {}
+        for anchor, present in detected.items():
+            if present:
+                hits[strength].append({"anchor": anchor, "present": True, "source": "ai"})
+    return hits
+
+
+
+
+
+
+
+
+def compact_text(text: str) -> str:
+    """
+    More aggressive: remove ALL whitespace after normalize_ocr_text.
+    Useful for OCR where letters are spaced apart: 'p e n h o r a'.
+    """
+    t = normalize_ocr_text(text)
+    return re.sub(r"\s+", "", t)
 
 def extract_text_with_pypdf(pdf_path: str) -> str:
     """Extrai texto de cada página usando pypdf e remove NUL bytes."""

@@ -14,11 +14,13 @@ class DocumentUploadSerializer(serializers.ModelSerializer):
     """
     Serializer para envio de PDF. Permite especificar opcionalmente o modo de embeddings.
     """
+    
+    file = serializers.FileField(write_only=True, required=True)
+    
     embedding_mode = serializers.ChoiceField(
-        choices=models.Document.EMBEDDING_MODE_CHOICES,
+        choices=getattr(models.Document, "EMBEDDING_MODE_CHOICES", (("all_paragraphs", "all_paragraphs"),)),
         required=False,
-        default=models.Document.EMBEDDING_MODE_CHOICES[0][0],
-        help_text="Define como os embeddings serão gerados: all_paragraphs, spans_only ou none."
+        default=lambda: getattr(models.Document, "EMBEDDING_MODE_CHOICES", (("all_paragraphs", "all_paragraphs"),))[0][0],
     )
     
     # NEW
@@ -28,29 +30,26 @@ class DocumentUploadSerializer(serializers.ModelSerializer):
         help_text="Se verdadeiro, popula os campos de debug (doc_type e spans).",
     )
     
+    file_name = serializers.CharField(required=False, allow_blank=True)
+    
+    store_file = serializers.BooleanField(required=False, default=False)  # NEW (default: do not store)
+    
     class Meta:
         model = models.Document
-        fields = ('id', 'file', 'embedding_mode', 'file_name', 'debug_mode')
-        read_only_fields = ('id',)
+        fields = ("id", "file", "file_name", "store_file", "embedding_mode", "debug_mode")
+        read_only_fields = ("id",)
 
 
 class DocumentSerializer(serializers.ModelSerializer):
-    """Detailed document representation used for listing and retrieving docs."""
     class Meta:
         model = models.Document
         fields = (
-            'id',
-            'process',
-            'file_name',          # NEW
-            'mime_type',
-            'num_pages',
-            'doc_type',
-            'doctype_confidence',
-            'doctype_debug',   # NEW
-            'embedding_mode',     # (optional but usually useful)
-            'debug_mode',      # NEW
-            'created_at',
-            'updated_at',
+            "id", "file_name", "store_file",
+            "mime_type", "num_pages",
+            "doc_type", "doc_type_strategy", "doctype_confidence",
+            "doc_type_anchors", "doctype_debug",
+            "embedding_mode", "debug_mode",
+            "created_at", "updated_at",
         )
 
 
@@ -58,23 +57,33 @@ class SpanSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Span
         fields = (
-            'id',
-            'document',
-            'label',
-            'label_subtype',
-            'text',
-            'page',
-            'char_start',
-            'char_end',
-            'confidence',
-            'strong_anchor_count',   # NEW
-            'weak_anchor_count',     # NEW
-            'negative_anchor_count', # NEW
-            'anchors_pos',           # NEW
-            'anchors_neg',           # NEW
-            'extra',                 # NEW: holds debug payload when enabled
+            "id", "document", "label", "text", "page",
+            "char_start", "char_end", "confidence",
+            "span_strategy",
+            "strong_anchor_count", "weak_anchor_count", "negative_anchor_count",
+            "anchors_pos", "anchors_neg",
+            "extra",
         )
 
+
+class DocTypeRuleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.DocTypeRule
+        fields = "__all__"
+
+
+class SpanRuleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.SpanRule
+        fields = "__all__"
+
+class SpanEmbeddingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = getattr(models, "SpanEmbedding", None)
+        if model is None:
+            fields = ()
+        else:
+            fields = "__all__"
 
 class CourtEventSerializer(serializers.ModelSerializer):
     class Meta:

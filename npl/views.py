@@ -13,45 +13,232 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+
 from . import models
 from . import serializers
 from . import tasks
 from . import utils
 
+from django.conf import settings
+from rest_framework import permissions
+from django.shortcuts import get_object_or_404
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.permissions import AllowAny  # adjust to your needs
+from rest_framework.response import Response
+from rest_framework import generics
+
+from . import models, serializers, tasks
 
 class DocumentUploadView(generics.CreateAPIView):
-    permission_classes = []
-    """Endpoint to upload a PDF and trigger OCR + classification."""
+    """
+    POST /documents/upload/
+    Body: file (required), store_file?(default False), file_name?, embedding_mode?, debug_mode?
+    Behavior:
+      - OCR is extracted immediately from the uploaded stream.
+      - By default the file is NOT stored; if store_file=true, keep it.
+      - Then we queue classification + spans from OCR text.
+    """
+    permission_classes = [permissions.AllowAny]
     serializer_class = serializers.DocumentUploadSerializer
 
     def perform_create(self, serializer):
-        embedding_mode = (
-            self.request.data.get("embedding_mode")
-            or serializer.validated_data.get("embedding_mode")
-        )
-        debug_mode = serializer.validated_data.get("debug_mode", False)
-        
-        uploaded_file = self.request.FILES.get('file')
-        original_name = getattr(uploaded_file, 'name', '') if uploaded_file else ''
+        uploaded_file = self.request.FILES["file"]
+        debug_mode = bool(self.request.data.get("debug_mode", False))
+        store_file = bool(self.request.data.get("store_file", False))
+        embedding_mode = self.request.data.get("embedding_mode") or getattr(models.Document, "EMBEDDING_MODE_CHOICES", (("all_paragraphs","all_paragraphs"),))[0][0]
+        file_name = self.request.data.get("file_name") or getattr(uploaded_file, "name", "")
 
-        doc = serializer.save(
+        # 1) OCR directly from the uploaded stream (no need to persist)
+        ocr_text = utils.extract_text_from_pdf_fileobj(uploaded_file)
+
+        # 2) Build save kwargs
+        save_kwargs = dict(
+            file_name=file_name,
+            debug_mode=debug_mode,
+            store_file=store_file,
             embedding_mode=embedding_mode,
-            file_name=original_name,  # NEW
-            debug_mode=debug_mode
+            ocr_text=ocr_text,
+            ocr_data={"engine": "pypdf"},
+            mime_type=getattr(uploaded_file, "content_type", "") or "",
         )
-        tasks.ocr_pipeline_task.delay(doc.id, embedding_mode=embedding_mode)
+        # 3) Optionally persist the file if store_file=True
+        if store_file:
+            save_kwargs["file"] = uploaded_file
+
+        # 4) Create the document
+        doc = serializer.save(**save_kwargs)
+
+        # 5) Queue classification + spans (no OCR step needed)
+        tasks.rerun_doctype_and_spans_task.delay(doc.id, embedding_mode=embedding_mode)
+
+
 
     def create(self, request, *args, **kwargs):
         response = super().create(request, *args, **kwargs)
         response.data = {'document_id': response.data['id'], 'status': 'accepted'}
         return response
 
+class DocumentViewSet(viewsets.ModelViewSet):
+    queryset = models.Document.objects.all().order_by("-id")
+    serializer_class = serializers.DocumentSerializer
+    permission_classes = [permissions.AllowAny]
+
+    @action(detail=True, methods=["post"])
+    def re_ocr(self, request, pk=None):
+        """
+        Re-OCR this document by uploading a file again (does NOT require stored file).
+        Body: file (required), store_file?(default False)
+        """
+        doc = self.get_object()
+        if "file" not in request.FILES:
+            return Response({"detail": "Missing file."}, status=status.HTTP_400_BAD_REQUEST)
+
+        uploaded_file = request.FILES["file"]
+        store_file = bool(request.data.get("store_file", False))
+
+        # OCR from stream
+        ocr_text = utils.extract_text_from_pdf_fileobj(uploaded_file)
+
+        # Update doc OCR
+        doc.ocr_text = ocr_text
+        doc.ocr_data = {"engine": "pypdf", "re_ocr": True}
+        doc.store_file = store_file
+
+        # Optionally persist file
+        if store_file:
+            doc.file = uploaded_file
+            doc.file_name = getattr(uploaded_file, "name", doc.file_name or "")
+            doc.mime_type = getattr(uploaded_file, "content_type", "") or doc.mime_type
+        else:
+            # Ensure file field is cleared if previously stored and user opts out now
+            doc.file = None
+
+        doc.save(update_fields=["ocr_text", "ocr_data", "store_file", "file", "file_name", "mime_type"])
+
+        # Re-run doc_type + spans from OCR text
+        embedding_mode = request.data.get("embedding_mode") or getattr(doc, "embedding_mode", "all_paragraphs")
+        tasks.rerun_doctype_and_spans_task.delay(doc.id, embedding_mode=embedding_mode)
+        return Response({"status": "queued", "action": "re_ocr"}, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=True, methods=["post"])
+    def rerun_full_pipeline(self, request, pk=None):
+        """
+        Only works if the file is stored (store_file=True). Otherwise, ask client to use re_ocr.
+        """
+        doc = self.get_object()
+        if not doc.store_file or not doc.file:
+            return Response(
+                {"detail": "This document has no stored file. Use /re_ocr to upload a file and re-run OCR."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        embedding_mode = request.data.get("embedding_mode") or getattr(doc, "embedding_mode", "all_paragraphs")
+        tasks.rerun_full_pipeline_task.delay(doc.id, embedding_mode=embedding_mode)
+        return Response({"status": "queued", "action": "rerun_full_pipeline"}, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=True, methods=["post"])
+    def rerun_doctype_spans(self, request, pk=None):
+        doc = self.get_object()
+        embedding_mode = request.data.get("embedding_mode") or getattr(doc, "embedding_mode", "all_paragraphs")
+        tasks.rerun_doctype_and_spans_task.delay(doc.id, embedding_mode=embedding_mode)
+        return Response({"status": "queued", "action": "rerun_doctype_spans"}, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=True, methods=["post"])
+    def recalc_span_scores(self, request, pk=None):
+        """
+        Body (optional): {"weights": {"strong": 2.5, "weak": 1.0, "negative": -100.0}}
+        """
+        doc = self.get_object()
+        weights = (request.data or {}).get("weights") or {}
+        tasks.recalc_span_scores_task.delay(doc.id, weights_dict=weights)
+        return Response({"status": "queued", "action": "recalc_span_scores", "weights": weights}, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=True, methods=["post"])
+    def recalc_doc_type_scores(self, request, pk=None):
+        """
+        Body (optional): {"weights": {...}, "prefer_strategy": "rule_literal"|"ai_anchor"}
+        """
+        doc = self.get_object()
+        body = request.data or {}
+        weights = body.get("weights") or {}
+        prefer_strategy = body.get("prefer_strategy")
+        tasks.recalc_doc_type_scores_task.delay(doc.id, weights_dict=weights, prefer_strategy=prefer_strategy)
+        return Response({"status": "queued", "action": "recalc_doc_type_scores", "weights": weights, "prefer_strategy": prefer_strategy}, status=status.HTTP_202_ACCEPTED)
+
+    @action(detail=True, methods=["post"])
+    def toggle_debug(self, request, pk=None):
+        doc = self.get_object()
+        doc.debug_mode = bool(request.data.get("debug_mode", not doc.debug_mode))
+        doc.save(update_fields=["debug_mode"])
+        return Response({"id": doc.id, "debug_mode": doc.debug_mode})
+
+    @action(detail=True, methods=["get"])
+    def anchors(self, request, pk=None):
+        """
+        Inspect document's doc_type anchors (both strategies) and spans grouped by strategy.
+        """
+        doc = self.get_object()
+        spans = models.Span.objects.filter(document=doc).order_by("page", "id")
+
+        payload = {
+            "document_id": doc.id,
+            "doc_type": {
+                "type": doc.doc_type,
+                "strategy": doc.doc_type_strategy,
+                "confidence": doc.doctype_confidence,
+                "anchors": doc.doc_type_anchors or {},
+            },
+            "spans": [],
+        }
+        for s in spans:
+            payload["spans"].append({
+                "id": s.id,
+                "label": s.label,
+                "page": s.page,
+                "strategy": s.span_strategy,
+                "confidence": s.confidence,
+                "anchors_pos": s.anchors_pos,
+                "anchors_neg": s.anchors_neg,
+                "extra": s.extra,  # contains per-strategy anchors/scores
+            })
+        return Response(payload)
+
+class SpanViewSet(viewsets.ModelViewSet):
+    queryset = models.Span.objects.all().order_by("document_id", "page", "id")
+    serializer_class = serializers.SpanSerializer
+    permission_classes = [permissions.AllowAny]
+
+
+class DocTypeRuleViewSet(viewsets.ModelViewSet):
+    queryset = models.DocTypeRule.objects.all().order_by("id")
+    serializer_class = serializers.DocTypeRuleSerializer
+    permission_classes = [permissions.AllowAny]
+
+
+class SpanRuleViewSet(viewsets.ModelViewSet):
+    queryset = models.SpanRule.objects.all().order_by("id")
+    serializer_class = serializers.SpanRuleSerializer
+    permission_classes = [permissions.AllowAny]
+
+
+# Optional: read-only embeddings
+try:
+    class SpanEmbeddingViewSet(viewsets.ReadOnlyModelViewSet):
+        queryset = models.SpanEmbedding.objects.all().order_by("id")
+        serializer_class = serializers.SpanEmbeddingSerializer
+        permission_classes = [permissions.AllowAny]
+except Exception:
+    SpanEmbeddingViewSet = None
+
 class DocumentRerunFullPipelineView(APIView):
     """
     Reexecuta OCR + classificação + spans a partir do PDF original.
     POST /documents/<id>/rerun_full_pipeline/
     """
-    permission_classes = []  # ajuste conforme sua auth
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]  # ajuste conforme sua auth
 
     def post(self, request, pk):
         doc = get_object_or_404(models.Document, pk=pk)
@@ -68,7 +255,10 @@ class DocumentRerunDoctypeSpansView(APIView):
     Recalcula apenas doc_type + spans usando o OCR já salvo.
     POST /documents/<id>/rerun_doctype_spans/
     """
-    permission_classes = []  # ajuste conforme sua auth
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]  # ajuste conforme sua auth
 
     def post(self, request, pk):
         doc = get_object_or_404(models.Document, pk=pk)
@@ -85,7 +275,10 @@ class EmbeddingModeUpdateView(APIView):
     API para atualizar o embedding_mode de um Document.
     Não permite retroceder para um modo menos sofisticado.
     """
-    permission_classes = []  # ajuste conforme sua política de acesso
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]  # ajuste conforme sua política de acesso
 
     MODES = ['none', 'spans_only', 'all_paragraphs']
 

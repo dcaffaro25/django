@@ -20,250 +20,369 @@ from accounting.services.embedding_client import EmbeddingClient
 from . import models, utils
 import os
 
+from .utils import (
+    AnchorWeights,
+    find_anchors_rule_literal, find_anchors_ai,
+    score_from_anchor_hits, confidence_from_score,
+)
+
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
 # OCR and initial processing
 # --------------------------------------------------------------------------- #
 
+_USE_AI = os.getenv("NPL_USE_AI_ANCHOR", "false").lower() in ("1", "true", "yes")
+
 @shared_task
 def ocr_pipeline_task(document_id: int, embedding_mode: str | None = None) -> None:
-    """Extrai o texto e dispara a task de weak labelling. Registra tempo de OCR."""
     document = models.Document.objects.get(pk=document_id)
-    metrics = document.processing_stats or {}
-    start_ocr = time.perf_counter()
 
+    # --- OCR extraction as you already do ---
     pdf_path = document.file.path
-    text = utils.extract_text_with_pypdf(pdf_path)
+    text = utils.extract_text_with_pypdf(pdf_path)  # keep your existing function
     document.ocr_text = text
     document.ocr_data = {"engine": "pypdf"}
 
-    # NEW: when debug_mode, keep per-rule details
+    # --- DocType classification using BOTH strategies (anchor finding -> scoring) ---
+    rules = list(models.DocTypeRule.objects.all())
+    weights = AnchorWeights()
+    doc_type_anchors: Dict[str, List[Dict[str, Any]]] = {"rule_literal": [], "ai_anchor": []}
+
+    best_rule = None
+    best_score = float("-inf")
+    best_conf = 0.0
+    best_strategy = models.Document.DOC_STRATEGY_RULE_LITERAL
+
+    for rule in rules:
+        strong = [a.strip() for a in rule.anchors_strong.split(";") if a.strip()]
+        weak = [a.strip() for a in rule.anchors_weak.split(";") if a.strip()]
+        neg = [a.strip() for a in rule.anchors_negative.split(";") if a.strip()]
+
+        # Strategy 1: rule_literal
+        hits_rule = find_anchors_rule_literal(text, strong, weak, neg)
+        score_rule = score_from_anchor_hits(hits_rule, weights)
+        conf_rule = confidence_from_score(score_rule)
+        doc_type_anchors["rule_literal"].append({
+            "doc_type": rule.doc_type, "rule_id": rule.id,
+            "anchors": hits_rule, "score": score_rule, "confidence": conf_rule,
+        })
+
+        # Strategy 2: ai_anchor (optional)
+        if _USE_AI or document.debug_mode:
+            hits_ai = find_anchors_ai(text, strong, weak, neg)
+            score_ai = score_from_anchor_hits(hits_ai, weights)
+            conf_ai = confidence_from_score(score_ai)
+            doc_type_anchors["ai_anchor"].append({
+                "doc_type": rule.doc_type, "rule_id": rule.id,
+                "anchors": hits_ai, "score": score_ai, "confidence": conf_ai,
+            })
+
+        # choose the “displayed” doc_type using rule_literal (you can change this later)
+        if score_rule > best_score:
+            best_score = score_rule
+            best_conf = conf_rule
+            best_rule = rule
+            best_strategy = models.Document.DOC_STRATEGY_RULE_LITERAL
+
+    if best_rule:
+        document.doc_type = best_rule.doc_type
+    document.doc_type_strategy = best_strategy
+    document.doctype_confidence = best_conf
+    document.doc_type_anchors = doc_type_anchors
+
+    # Keep your existing doctype_debug when debug_mode:
     if getattr(document, "debug_mode", False):
-        doc_type, doc_confidence, debug_rows = utils.classify_document_type_with_debug(text)
-        document.doc_type = doc_type
-        document.doctype_confidence = doc_confidence
         document.doctype_debug = {
-            "weights": {"strong": 2.0, "weak": 1.0, "negative": -100.0},
-            "rules": debug_rows,
+            "weights": {"strong": weights.strong, "weak": weights.weak, "negative": weights.negative},
+            "rules": doc_type_anchors["rule_literal"],  # or include both if you prefer
         }
     else:
-        doc_type, doc_confidence = utils.classify_document_type(text)
-        document.doc_type = doc_type
-        document.doctype_confidence = doc_confidence
         document.doctype_debug = None
 
-    process_number = utils.extract_process_number(text)
-    if process_number:
-        process, _ = models.Process.objects.get_or_create(case_number=process_number)
-        document.process = process
-        document.process_number_raw = process_number
-        document.no_process_found = False
-    else:
-        document.no_process_found = True
+    document.save()
 
-    with transaction.atomic():
-        document.save()
-
-    end_ocr = time.perf_counter()
-    # Se nenhum modo for passado, deixa para a próxima task decidir
-    metrics["ocr"] = {
-        "time_sec": end_ocr - start_ocr,
-        "num_characters": len(text)
-    }
-    document.processing_stats = metrics
-    document.save(update_fields=["processing_stats"])
+    # --- Kick off spans pipeline as before ---
     weak_labelling_task.delay(document.id, embedding_mode=embedding_mode)
 
 @shared_task
 def weak_labelling_task(document_id: int, embedding_mode: str | None = None) -> None:
-    """Segmenta, embed, pontua e cria spans conforme o modo de embeddings."""
+    """
+    Create spans using:
+      - Strategy 1: rule_literal (your current implementation)
+      - Strategy 2: ai_anchor (additional spans for comparison)
+    """
     document = models.Document.objects.get(pk=document_id)
+    text = document.ocr_text or ""
     metrics = document.processing_stats or {}
     total_start = time.perf_counter()
-    
-    # NEW: limpa spans e embeddings anteriores para permitir reprocessamento idempotente
+
+    # Idempotency: clear old spans & embeddings
     models.SpanEmbedding.objects.filter(span__document=document).delete()
     models.Span.objects.filter(document=document).delete()
-    
-    # Decide o modo de embeddings: argumento > campo do documento > variável de ambiente
-    mode = (embedding_mode
-            or getattr(document, "embedding_mode", None)
-            or os.getenv("EMBEDDING_MODE", "all_paragraphs")).lower()
+
+    # Determine mode as you currently do
+    mode = (embedding_mode or getattr(document, "embedding_mode", None) or os.getenv("EMBEDDING_MODE", "all_paragraphs")).lower()
     metrics["embedding_mode"] = mode
 
-    rules = models.SpanRule.objects.all()
-    if not rules:
-        logger.info("No SpanRules configured; skipping span extraction")
-        return
+    rules = list(models.SpanRule.objects.all())
 
-    # 1. Segmentação em parágrafos com número de página
-    seg_start = time.perf_counter()
-    pages = utils.extract_pages(document.file.path)
-    paragraphs = utils.segment_paragraphs_with_page(pages)
-    seg_end = time.perf_counter()
-    metrics["segmentation"] = {
-        "num_paragraphs": len(paragraphs),
-        "time_sec": seg_end - seg_start
-    }
+    # Use your existing text segmentation / paragraph grouping
+    paragraphs = utils.segment_into_paragraphs(text)  # keep your own function
+    grouped = utils.group_paragraphs(paragraphs, mode=mode)  # keep your own function
 
-    # Configurações de embeddings
-    embed_parallel = int(os.getenv("EMBED_PARALLEL_REQUESTS", 1))
-    num_thread = int(os.getenv("EMBED_NUM_THREAD", 0))
-    max_tokens = int(os.getenv("EMBED_TOKEN_LIMIT", 2048))
-    metrics["embedding_config"] = {
-        "embedding_num_thread": num_thread,
-        "embedding_parallel_requests": embed_parallel,
-        "embedding_token_limit": max_tokens,
-        "batch_size": len(paragraphs)
-    }
+    weights = AnchorWeights()
 
-    # 2. Embeddings de parágrafos (apenas no modo all_paragraphs)
-    para_vecs: List[np.ndarray | None] = [None] * len(paragraphs)
-    embed_client = EmbeddingClient(model=settings.EMBED_MODEL, dim=settings.EMBED_DIM, num_thread=num_thread)
-    if mode == "all_paragraphs":
-        emb_start = time.perf_counter()
+    # --- Strategy 1: rule_literal spans ---
+    for group in grouped:
+        snippet = " ".join(p["text"] for p in group)
+        first_page = group[0]["page"]
+        for rule in rules:
+            strong = rule.strong_anchor_list()
+            weak = rule.weak_anchor_list()
+            neg = rule.negative_anchor_list()
 
-        def embed_single_paragraph(paragraph: str) -> np.ndarray:
-            chunks = utils.split_text_by_tokens(paragraph, max_tokens=max_tokens)
-            vecs = embed_client.embed_texts(chunks)
-            arrs = [np.array(v, dtype=float) for v in vecs]
-            return np.mean(arrs, axis=0)
+            hits = find_anchors_rule_literal(snippet, strong, weak, neg)
+            if not (hits["strong"] or hits["weak"] or hits["negative"]):
+                continue
 
-        para_texts = [p[1] for p in paragraphs]
-        with ThreadPoolExecutor(max_workers=embed_parallel) as executor:
-            futures = [executor.submit(embed_single_paragraph, p) for p in para_texts]
-            for idx, f in enumerate(futures):
-                try:
-                    para_vecs[idx] = f.result()
-                except Exception as e:
-                    logger.exception("Failed to embed paragraph: %s", e)
-                    para_vecs[idx] = None
+            score = score_from_anchor_hits(hits, weights)
+            conf = confidence_from_score(score)
 
-        emb_end = time.perf_counter()
-        metrics["embedding"] = {"time_sec": emb_end - emb_start}
-    else:
-        metrics["embedding"] = {"time_sec": 0.0}
+            # Flatten anchors for quick UI
+            anchors_pos = [h["anchor"] for h in hits["strong"]] + [h["anchor"] for h in hits["weak"]]
+            anchors_neg = [h["anchor"] for h in hits["negative"]]
 
-    # 3. Scoring e criação de spans
-    total_scoring_time = 0.0
-    total_span_creation_time = 0.0
-    total_spans = 0
-
-    # Usar sinônimos somente se embeddar parágrafos
-    use_synonyms = (mode == "all_paragraphs")
-
-    for rule in rules:
-        scoring_start = time.perf_counter()
-        scores: List[float] = []
-        details_list: List[Dict[str, Any]] = []
-        for idx, (offset, para, page) in enumerate(paragraphs):
-            sc, det = utils.score_paragraph(
-                rule, para, embed_client,
-                para_vec=para_vecs[idx],
-                use_synonyms=use_synonyms
+            span = models.Span.objects.create(
+                document=document,
+                label=rule.label,
+                text=snippet,
+                page=first_page,
+                char_start=0, char_end=0,
+                confidence=conf,
+                span_strategy=models.Span.STRATEGY_RULE_LITERAL,
+                strong_anchor_count=len(hits["strong"]),
+                weak_anchor_count=len(hits["weak"]),
+                negative_anchor_count=len(hits["negative"]),
+                anchors_pos=anchors_pos, anchors_neg=anchors_neg,
+                extra={
+                    "anchors": {"rule_literal": hits},
+                    "scores": {"rule_literal": {"weights": {"strong": weights.strong, "weak": weights.weak, "negative": weights.negative},
+                                                "score": score, "confidence": conf}},
+                    "embedding_mode": mode,
+                },
             )
-            scores.append(sc)
-            details_list.append(det)
-        scoring_end = time.perf_counter()
-        total_scoring_time += scoring_end - scoring_start
+            if mode != "none" and hasattr(utils, "embed_span_task"):
+                utils.embed_span_task.delay(span.id)
 
-        if not scores:
-            continue
+    # --- Strategy 2: ai_anchor spans (optional) ---
+    if _USE_AI or document.debug_mode:
+        for group in grouped:
+            snippet = " ".join(p["text"] for p in group)
+            first_page = group[0]["page"]
+            for rule in rules:
+                strong = rule.strong_anchor_list()
+                weak = rule.weak_anchor_list()
+                neg = rule.negative_anchor_list()
 
-        max_score = max(scores)
-        threshold = max_score * 0.5
+                hits_ai = find_anchors_ai(snippet, strong, weak, neg)
+                if not (hits_ai["strong"] or hits_ai["weak"] or hits_ai["negative"]):
+                    continue
 
-        current_group: List[Tuple[int, str, int]] = []
-        current_details: List[Dict[str, Any]] = []
-        current_scores: List[float] = []
-        
-        for (offset, para, page), sc, det in zip(paragraphs, scores, details_list):
-            if sc >= threshold:
-                current_group.append((offset, para, page))
-                current_details.append(det)
-                current_scores.append(sc)
-            else:
-                if current_group:
-                    span_time_start = time.perf_counter()
-                    create_span_only(document, rule, current_group, current_details, mode, current_scores)
-                    span_time_end = time.perf_counter()
-                    total_span_creation_time += span_time_end - span_time_start
-                    total_spans += 1
-                    current_group = []
-                    current_details = []
-                    current_scores = []
-        if current_group:
-            span_time_start = time.perf_counter()
-            create_span_only(document, rule, current_group, current_details, mode, current_scores)
-            span_time_end = time.perf_counter()
-            total_span_creation_time += span_time_end - span_time_start
-            total_spans += 1
+                score_ai = score_from_anchor_hits(hits_ai, weights)
+                conf_ai = confidence_from_score(score_ai)
 
-    metrics["scoring"] = {"time_sec": total_scoring_time}
-    metrics["span_creation"] = {"num_spans": total_spans, "time_sec": total_span_creation_time}
-    metrics["total_time_sec"] = time.perf_counter() - total_start
+                anchors_pos = [h["anchor"] for h in hits_ai["strong"]] + [h["anchor"] for h in hits_ai["weak"]]
+                anchors_neg = [h["anchor"] for h in hits_ai["negative"]]
 
+                span = models.Span.objects.create(
+                    document=document,
+                    label=rule.label,
+                    text=snippet,
+                    page=first_page,
+                    char_start=0, char_end=0,
+                    confidence=conf_ai,
+                    span_strategy=models.Span.STRATEGY_AI_ANCHOR,
+                    strong_anchor_count=len(hits_ai["strong"]),
+                    weak_anchor_count=len(hits_ai["weak"]),
+                    negative_anchor_count=len(hits_ai["negative"]),
+                    anchors_pos=anchors_pos, anchors_neg=anchors_neg,
+                    extra={
+                        "anchors": {"ai_anchor": hits_ai},
+                        "scores": {"ai_anchor": {"weights": {"strong": weights.strong, "weak": weights.weak, "negative": weights.negative},
+                                                 "score": score_ai, "confidence": conf_ai}},
+                        "embedding_mode": mode,
+                    },
+                )
+                if mode != "none" and hasattr(utils, "embed_span_task"):
+                    utils.embed_span_task.delay(span.id)
+
+    metrics["total_seconds"] = round(time.perf_counter() - total_start, 3)
     document.processing_stats = metrics
     document.save(update_fields=["processing_stats"])
 
 @shared_task
 def rerun_doctype_and_spans_task(document_id: int, embedding_mode: str | None = None) -> None:
+    """
+    Recompute doc_type + spans using only the OCR text previously saved.
+    This is the default flow because we don't persist the file unless store_file=True.
+    """
     document = models.Document.objects.get(pk=document_id)
-    text = document.ocr_text or ''
+    text = document.ocr_text or ""
+    rules = list(models.DocTypeRule.objects.all())
+    weights = AnchorWeights()
+    doc_type_anchors: Dict[str, List[Dict[str, Any]]] = {"rule_literal": [], "ai_anchor": []}
 
-    if text:
-        if getattr(document, "debug_mode", False):
-            doc_type, doc_confidence, debug_rows = utils.classify_document_type_with_debug(text)
-            document.doc_type = doc_type
-            document.doctype_confidence = doc_confidence
-            document.doctype_debug = {
-                "weights": {"strong": 2.0, "weak": 1.0, "negative": -100.0},
-                "rules": debug_rows,
-            }
-        else:
-            doc_type, doc_confidence = utils.classify_document_type(text)
-            document.doc_type = doc_type
-            document.doctype_confidence = doc_confidence
-            document.doctype_debug = None
+    best_rule = None
+    best_score = float("-inf")
+    best_conf = 0.0
+    best_strategy = models.Document.DOC_STRATEGY_RULE_LITERAL
 
-        document.save(update_fields=["doc_type", "doctype_confidence", "doctype_debug"])
+    for rule in rules:
+        strong = [a.strip() for a in rule.anchors_strong.split(";") if a.strip()]
+        weak = [a.strip() for a in rule.anchors_weak.split(";") if a.strip()]
+        neg = [a.strip() for a in rule.anchors_negative.split(";") if a.strip()]
 
+        hits_rule = find_anchors_rule_literal(text, strong, weak, neg)
+        score_rule = score_from_anchor_hits(hits_rule, weights)
+        conf_rule = confidence_from_score(score_rule)
+        doc_type_anchors["rule_literal"].append({
+            "doc_type": rule.doc_type, "rule_id": rule.id,
+            "anchors": hits_rule, "score": score_rule, "confidence": conf_rule,
+        })
+        if score_rule > best_score:
+            best_score = score_rule
+            best_conf = conf_rule
+            best_rule = rule
+            best_strategy = models.Document.DOC_STRATEGY_RULE_LITERAL
+
+        if _USE_AI or document.debug_mode:
+            hits_ai = find_anchors_ai(text, strong, weak, neg)
+            score_ai = score_from_anchor_hits(hits_ai, weights)
+            conf_ai = confidence_from_score(score_ai)
+            doc_type_anchors["ai_anchor"].append({
+                "doc_type": rule.doc_type, "rule_id": rule.id,
+                "anchors": hits_ai, "score": score_ai, "confidence": conf_ai,
+            })
+
+    if best_rule:
+        document.doc_type = best_rule.doc_type
+    document.doc_type_strategy = best_strategy
+    document.doctype_confidence = best_conf
+    document.doc_type_anchors = doc_type_anchors
+
+    if getattr(document, "debug_mode", False):
+        document.doctype_debug = {
+            "weights": {"strong": weights.strong, "weak": weights.weak, "negative": weights.negative},
+            "rules": doc_type_anchors["rule_literal"],
+        }
+    else:
+        document.doctype_debug = None
+
+    document.save(update_fields=["doc_type", "doc_type_strategy", "doctype_confidence", "doc_type_anchors", "doctype_debug"])
+
+    # Clear old spans and re-run weak labelling
     models.SpanEmbedding.objects.filter(span__document=document).delete()
     models.Span.objects.filter(document=document).delete()
-
     weak_labelling_task.delay(document.id, embedding_mode=embedding_mode)
 
 @shared_task
 def rerun_full_pipeline_task(document_id: int, embedding_mode: str | None = None) -> None:
-    """
-    Reexecuta o pipeline completo a partir do PDF:
-    - zera campos de OCR, doc_type e spans
-    - chama ocr_pipeline_task, que por sua vez chamará weak_labelling_task.
-    """
+    """Re-run from scratch (OCR + doc_type + spans)."""
     document = models.Document.objects.get(pk=document_id)
-
-    # Limpa spans e embeddings
+    if not document.store_file or not document.file:
+        # No stored file; can't re-OCR without reupload
+        return
+    
     models.SpanEmbedding.objects.filter(span__document=document).delete()
     models.Span.objects.filter(document=document).delete()
-
-    # Reseta campos de OCR / classificação / métricas
     document.ocr_text = ''
     document.ocr_data = {}
     document.doc_type = ''
+    document.doc_type_strategy = models.Document.DOC_STRATEGY_RULE_LITERAL
     document.doctype_confidence = 0.0
+    document.doc_type_anchors = None
     document.processing_stats = {}
-    document.save(update_fields=[
-        "ocr_text",
-        "ocr_data",
-        "doc_type",
-        "doctype_confidence",
-        "processing_stats",
-    ])
-
-    # Usa embedding_mode passado ou o já salvo no documento
+    document.save(update_fields=["ocr_text", "ocr_data", "doc_type", "doc_type_strategy", "doctype_confidence", "doc_type_anchors", "processing_stats"])
     mode = (embedding_mode or getattr(document, "embedding_mode", None) or "all_paragraphs")
     ocr_pipeline_task.delay(document.id, embedding_mode=mode)
+
+@shared_task
+def recalc_span_scores_task(document_id: int, weights_dict: dict | None = None) -> None:
+    """
+    Recalculate span scores/confidence from stored anchors (no OCR/AI calls).
+    """
+    document = models.Document.objects.get(pk=document_id)
+    weights = AnchorWeights(**(weights_dict or {}))
+    spans = models.Span.objects.filter(document=document)
+
+    for span in spans:
+        extra = span.extra or {}
+        anchors_section = extra.get("anchors", {})
+        if span.span_strategy == models.Span.STRATEGY_RULE_LITERAL:
+            hits = anchors_section.get("rule_literal") or {"strong": [], "weak": [], "negative": []}
+            strategy_key = "rule_literal"
+        elif span.span_strategy == models.Span.STRATEGY_AI_ANCHOR:
+            hits = anchors_section.get("ai_anchor") or {"strong": [], "weak": [], "negative": []}
+            strategy_key = "ai_anchor"
+        else:
+            continue
+
+        score = score_from_anchor_hits(hits, weights)
+        conf = confidence_from_score(score)
+
+        scores_section = extra.get("scores", {})
+        scores_section[strategy_key] = {
+            "weights": {"strong": weights.strong, "weak": weights.weak, "negative": weights.negative},
+            "score": score,
+            "confidence": conf,
+        }
+        extra["scores"] = scores_section
+
+        span.confidence = conf
+        span.extra = extra
+        span.save(update_fields=["confidence", "extra"])
+
+@shared_task
+def recalc_doc_type_scores_task(document_id: int, weights_dict: dict | None = None, prefer_strategy: str | None = None) -> None:
+    """
+    Recalculate doc_type scores/confidence from stored doc_type_anchors.
+    Optionally change the preferred display strategy ('rule_literal' or 'ai_anchor').
+    """
+    document = models.Document.objects.get(pk=document_id)
+    weights = AnchorWeights(**(weights_dict or {}))
+    anchors = document.doc_type_anchors or {}
+
+    # Re-score
+    best_rule = None
+    best_score = float("-inf")
+    best_conf = 0.0
+    display_strategy = prefer_strategy or document.doc_type_strategy or models.Document.DOC_STRATEGY_RULE_LITERAL
+
+    # Always re-evaluate rule_literal; ai_anchor if present
+    rescored = {"rule_literal": [], "ai_anchor": []}
+
+    for strategy in ("rule_literal", "ai_anchor"):
+        for row in anchors.get(strategy, []):
+            hits = row.get("anchors", {"strong": [], "weak": [], "negative": []})
+            score = score_from_anchor_hits(hits, weights)
+            conf = confidence_from_score(score)
+            row["score"] = score
+            row["confidence"] = conf
+            rescored[strategy].append(row)
+
+            # choose displayed doc_type according to 'display_strategy'
+            if strategy == display_strategy and score > best_score:
+                best_score = score
+                best_conf = conf
+                best_rule = row
+
+    document.doc_type_anchors = rescored
+    if best_rule:
+        document.doc_type = best_rule["doc_type"]
+    document.doc_type_strategy = display_strategy
+    document.doctype_confidence = best_conf
+    document.save(update_fields=["doc_type", "doc_type_strategy", "doctype_confidence", "doc_type_anchors"])
 
 def create_span_only(document, rule, group, details_list, embedding_mode, scores):
     """

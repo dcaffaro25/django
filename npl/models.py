@@ -95,7 +95,54 @@ class Document(models.Model):
         ("none", "Sem embeddings"),
     ]
     
-    id = models.BigAutoField(primary_key=True)
+    
+    # File becomes optional (null/blank allowed)
+    file = models.FileField(upload_to='documents/', null=True, blank=True)
+
+    # Store original (user) filename for display/debug
+    file_name = models.CharField(max_length=255, blank=True, default='',
+        help_text="Nome original do arquivo enviado (para debug e display).",
+    )
+    
+    # Opt-in flag: by default we do NOT store the file
+    store_file = models.BooleanField(
+        default=False,
+        help_text="If true, persist the uploaded file; otherwise discard after OCR.",
+    )
+    
+    ocr_text = models.TextField(blank=True, default='')
+    ocr_data = models.JSONField(default=dict, blank=True, help_text="Resultados de OCR por página com metadados.")
+    
+    mime_type = models.CharField(max_length=64, blank=True, default='')
+    num_pages = models.IntegerField(default=0)
+    doc_type = models.CharField(max_length=64, blank=True, default='')
+    doctype_confidence = models.FloatField(default=0.0)
+    
+    
+    debug_mode = models.BooleanField(
+        default=False,
+        help_text="Se verdadeiro, armazena informações detalhadas de debug (âncoras, pesos, scores).",
+    )
+    doctype_debug = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Para cada DocTypeRule: âncoras encontradas, pesos e score final.",
+    )
+    
+    DOC_STRATEGY_RULE_LITERAL = "rule_literal"
+    DOC_STRATEGY_AI_ANCHOR = "ai_anchor"
+    DOC_STRATEGY_CHOICES = [
+        (DOC_STRATEGY_RULE_LITERAL, "Rule literal / embeddings"),
+        (DOC_STRATEGY_AI_ANCHOR, "AI-assisted anchors"),
+    ]
+
+    doc_type_strategy = models.CharField(
+        max_length=32,
+        choices=DOC_STRATEGY_CHOICES,
+        default=DOC_STRATEGY_RULE_LITERAL,
+        help_text="Strategy that determined doc_type.",
+    )
+    
     
     # Processo associado, se houver; pode ser nulo até que o OCR encontre o número.
     process = models.ForeignKey(
@@ -122,20 +169,23 @@ class Document(models.Model):
     )
 
     # Demais campos do documento
-    file_name = models.CharField(
-        max_length=255,
-        blank=True,
-        default='',
-        help_text="Nome original do arquivo enviado (para debug e display).",
-    )
-    file = models.FileField(upload_to='documents/')
-    mime_type = models.CharField(max_length=64, blank=True, default='')
-    num_pages = models.IntegerField(default=0)
+    
+    
+    
     text_hash = models.CharField(max_length=64, blank=True, default='')
-    ocr_text = models.TextField(blank=True, default='')
-    ocr_data = models.JSONField(default=dict, help_text="Resultados de OCR por página com metadados.")
-    doc_type = models.CharField(max_length=64, blank=True, default='')
-    doctype_confidence = models.FloatField(default=0.0)
+    
+    
+    
+    # ---- DocType strategy/anchors ----
+    
+
+    # stores per-rule anchors found per strategy for doc_type
+    doc_type_anchors = models.JSONField(
+        null=True, blank=True,
+        help_text="Per-rule anchors per strategy: {'rule_literal': [...], 'ai_anchor': [...]}",
+    )
+    
+    
     embedding_mode = models.CharField(
         max_length=20,
         choices=EMBEDDING_MODE_CHOICES,
@@ -149,15 +199,7 @@ class Document(models.Model):
     rules_version = models.CharField(max_length=32, blank=True, default='v0')
     
     # NEW: debug flag + per-doc_type debug payload
-    debug_mode = models.BooleanField(
-        default=False,
-        help_text="Se verdadeiro, armazena informações detalhadas de debug (âncoras, pesos, scores).",
-    )
-    doctype_debug = models.JSONField(
-        null=True,
-        blank=True,
-        help_text="Para cada DocTypeRule: âncoras encontradas, pesos e score final.",
-    )
+    
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -234,6 +276,21 @@ class Span(models.Model):
     char_start = models.IntegerField(default=0)
     char_end = models.IntegerField(default=0)
     bbox = models.JSONField(null=True, blank=True)
+    
+    # NEW: how this span was created
+    STRATEGY_RULE_LITERAL = "rule_literal"
+    STRATEGY_AI_ANCHOR = "ai_anchor"
+    SPAN_STRATEGY_CHOICES = [
+        (STRATEGY_RULE_LITERAL, "Rule literal / embeddings"),
+        (STRATEGY_AI_ANCHOR, "AI-assisted anchors"),
+    ]
+    span_strategy = models.CharField(
+        max_length=32,
+        choices=SPAN_STRATEGY_CHOICES,
+        default=STRATEGY_RULE_LITERAL,
+        help_text="Strategy used to create this span.",
+    )
+    
     strong_anchor_count = models.IntegerField(default=0)
     weak_anchor_count = models.IntegerField(default=0)
     negative_anchor_count = models.IntegerField(default=0)
