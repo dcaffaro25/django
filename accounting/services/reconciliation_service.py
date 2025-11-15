@@ -155,6 +155,50 @@ def probe_amount_buckets(buckets: Dict[Decimal, List[object]], base_amt: Decimal
         yield from buckets.get(q2(base + step * k), [])
 
 
+def compute_match_scores(
+    *,
+    embed_sim: float,           # 0–1
+    amount_diff: Decimal,       # absolute difference
+    amount_tol: Decimal,        # tolerance (>= 0)
+    date_diff: int,             # abs difference in days
+    date_tol: int,              # tolerance (>= 0)
+    currency_match: float,      # 0 or 1
+    weights: Dict[str, float],  # embedding/amount/date/currency weights
+) -> Dict[str, float]:
+    """
+    Return per-dimension scores (0–1) and a weighted global score.
+    """
+    # defensive guards for zero tolerances
+    amt_norm = float(amount_diff / (amount_tol or CENT))
+    amt_score = max(0.0, 1.0 - amt_norm)
+
+    date_norm = float(date_diff) / float(date_tol or 1)
+    date_score = max(0.0, 1.0 - date_norm)
+
+    desc_score = max(0.0, min(1.0, float(embed_sim)))  # ensure 0–1
+    curr_score = max(0.0, min(1.0, float(currency_match)))
+
+    w_emb = float(weights.get("embedding", 0.0))
+    w_amt = float(weights.get("amount", 0.0))
+    w_date = float(weights.get("date", 0.0))
+    w_curr = float(weights.get("currency", 0.0))
+
+    global_score = round(
+        w_emb * desc_score +
+        w_amt * amt_score +
+        w_date * date_score +
+        w_curr * curr_score,
+        4,
+    )
+
+    return {
+        "description_score": desc_score,
+        "amount_score": amt_score,
+        "date_score": date_score,
+        "currency_score": curr_score,
+        "global_score": global_score,
+    }
+
 def compute_weighted_confidence(
     embed_sim: float,
     amount_diff: Decimal,
@@ -164,24 +208,27 @@ def compute_weighted_confidence(
     currency_match: float,
     weights: Dict[str, float],
 ) -> float:
-    """
-    Calculate a composite confidence score using user-defined weights.
-    Weights should sum to 1.0.  The components are:
-    - embed_sim: similarity of text embeddings (0–1)
-    - amount_diff: absolute difference between amounts (Decimal)
-    - date_diff: absolute difference between dates (int days)
-    - currency_match: 1.0 if currencies match else 0.0
-    The amount and date differences are normalised by their tolerances.
-    """
-    amt_score = max(0.0, 1 - float(amount_diff / (amount_tol or CENT)))
-    date_score = max(0.0, 1 - float(date_diff) / float(date_tol or 1))
-    return round(
-        weights.get("embedding", 0.0) * embed_sim +
-        weights.get("amount", 0.0)    * amt_score +
-        weights.get("currency", 0.0)  * currency_match +
-        weights.get("date", 0.0)      * date_score,
-        4,
+    scores = compute_match_scores(
+        embed_sim=embed_sim,
+        amount_diff=amount_diff,
+        amount_tol=amount_tol,
+        date_diff=date_diff,
+        date_tol=date_tol,
+        currency_match=currency_match,
+        weights=weights,
     )
+    return scores["global_score"]
+
+def _avg_embedding(items):
+    vecs = [it.embedding for it in items if it.embedding]
+    if not vecs:
+        return []
+    dim = len(vecs[0])
+    sums = [0.0] * dim
+    for v in vecs:
+        for i, x in enumerate(v):
+            sums[i] += x
+    return [s / len(vecs) for s in sums]
 
 # ----------------------------------------------------------------------
 # Reconciliation pipeline engine
@@ -328,18 +375,35 @@ class ReconciliationPipelineEngine:
                     "currency":  stage.currency_weight  if stage.currency_weight  is not None else self.stage_weights["currency"],
                     "date":      stage.date_weight      if stage.date_weight      is not None else self.stage_weights["date"],
                 }
+                
+                scores = compute_match_scores(
+                    embed_sim=embed_sim,
+                    amount_diff=a_diff,
+                    amount_tol=stage.amount_tol,
+                    date_diff=d_diff,
+                    date_tol=stage.date_tol,
+                    currency_match=currency_match,
+                    weights=weights,
+                )
+                
                 conf = compute_weighted_confidence(
                     embed_sim, a_diff, stage.amount_tol, d_diff, stage.date_tol, currency_match, weights
                 )
-                suggestion = self._make_suggestion("fuzzy_1to1", [bank], [book], conf,
+                suggestion = self._make_suggestion(
+                    "fuzzy_1to1",
+                    [bank],
+                    [book],
+                    scores["global_score"],
                     stage=stage,
                     weights=weights,
+                    component_scores=scores,
                     extra={
                         "embed_similarity": float(embed_sim),
                         "amount_diff": float(a_diff),
                         "date_diff_days": int(d_diff),
                         "currency_match": currency_match,
-                    })
+                    },
+                )
                 self._record(suggestion)
 
     def _run_many_to_many(self, banks, books, stage: StageConfig):
@@ -383,15 +447,36 @@ class ReconciliationPipelineEngine:
                                 #log.debug("Date range too wide in combo: min=%s, max=%s, span=%d days", 
                                 #          min(all_dates), max(all_dates), (max(all_dates) - min(all_dates)).days)
                                 continue
-    
+                            
+                            # after checks
+                            emb_bank = _avg_embedding(bank_combo)
+                            emb_book = _avg_embedding(book_combo)
+                            embed_sim = self._cosine_similarity(emb_bank, emb_book)
+                            
+                            a_diff = Decimal("0")  # sums already equal
+                            d_diff = (max(all_dates) - min(all_dates)).days
+                            currency_match = 1.0
+
+                            scores = compute_match_scores(
+                                embed_sim=embed_sim,
+                                amount_diff=a_diff,
+                                amount_tol=stage.amount_tol or CENT,
+                                date_diff=d_diff,
+                                date_tol=stage.date_tol or 1,
+                                currency_match=currency_match,
+                                weights=self.stage_weights,
+                            )
+
                             suggestion = self._make_suggestion(
                                 "many_to_many",
-                                bank_combo,
-                                book_combo,
-                                1,
+                                list(bank_combo),
+                                list(book_combo),
+                                scores["global_score"],
                                 stage=stage,
-                                weights=self.stage_weights
+                                weights=self.stage_weights,
+                                component_scores=scores,
                             )
+                            
                             log.debug("Recording valid suggestion: bank_ids=%s, journal_ids=%s", 
                                       suggestion["bank_ids"], suggestion["journal_entries_ids"])
                             self._record(suggestion)
@@ -406,6 +491,8 @@ class ReconciliationPipelineEngine:
         norm1 = sqrt(sum(a * a for a in v1))
         norm2 = sqrt(sum(b * b for b in v2))
         return dot / (norm1 * norm2) if norm1 and norm2 else 0.0
+    
+    
     
     def _aggregate_group_stats(self, items, *, is_bank: bool) -> dict:
         """
@@ -468,6 +555,7 @@ class ReconciliationPipelineEngine:
         stage: StageConfig | None = None,
         weights: Optional[Dict[str, float]] = None,
         extra: Optional[Dict[str, object]] = None,
+        component_scores: Optional[Dict[str, float]] = None,
     ) -> dict:
         """
         Build a rich suggestion payload for front-end / API consumption.
@@ -498,7 +586,6 @@ class ReconciliationPipelineEngine:
 
         suggestion = {
             "match_type": match_type,
-            # raw IDs used for persistence
             "bank_ids": [b.id for b in bank_items],
             "journal_entries_ids": [e.id for e in book_items],
             # stats
@@ -530,7 +617,11 @@ class ReconciliationPipelineEngine:
             },
             "match_parameters": match_params,
         }
-
+        
+        # Attach per-dimension scores if provided
+        if component_scores:
+            suggestion["component_scores"] = component_scores
+        
         if extra:
             suggestion["extra"] = extra
 

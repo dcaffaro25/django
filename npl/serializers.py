@@ -17,14 +17,20 @@ class DocumentUploadSerializer(serializers.ModelSerializer):
     embedding_mode = serializers.ChoiceField(
         choices=models.Document.EMBEDDING_MODE_CHOICES,
         required=False,
-        default=models.Document.EMBEDDING_MODE_CHOICES[0][0],  # "all_paragraphs"
+        default=models.Document.EMBEDDING_MODE_CHOICES[0][0],
         help_text="Define como os embeddings serão gerados: all_paragraphs, spans_only ou none."
     )
-
+    
+    # NEW
+    debug_mode = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Se verdadeiro, popula os campos de debug (doc_type e spans).",
+    )
+    
     class Meta:
         model = models.Document
-        # Inclui embedding_mode no payload
-        fields = ('id', 'file', 'embedding_mode')
+        fields = ('id', 'file', 'embedding_mode', 'file_name', 'debug_mode')
         read_only_fields = ('id',)
 
 
@@ -35,10 +41,14 @@ class DocumentSerializer(serializers.ModelSerializer):
         fields = (
             'id',
             'process',
+            'file_name',          # NEW
             'mime_type',
             'num_pages',
             'doc_type',
             'doctype_confidence',
+            'doctype_debug',   # NEW
+            'embedding_mode',     # (optional but usually useful)
+            'debug_mode',      # NEW
             'created_at',
             'updated_at',
         )
@@ -57,6 +67,12 @@ class SpanSerializer(serializers.ModelSerializer):
             'char_start',
             'char_end',
             'confidence',
+            'strong_anchor_count',   # NEW
+            'weak_anchor_count',     # NEW
+            'negative_anchor_count', # NEW
+            'anchors_pos',           # NEW
+            'anchors_neg',           # NEW
+            'extra',                 # NEW: holds debug payload when enabled
         )
 
 

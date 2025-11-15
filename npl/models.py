@@ -96,7 +96,7 @@ class Document(models.Model):
     ]
     
     id = models.BigAutoField(primary_key=True)
-
+    
     # Processo associado, se houver; pode ser nulo até que o OCR encontre o número.
     process = models.ForeignKey(
         Process,
@@ -122,6 +122,12 @@ class Document(models.Model):
     )
 
     # Demais campos do documento
+    file_name = models.CharField(
+        max_length=255,
+        blank=True,
+        default='',
+        help_text="Nome original do arquivo enviado (para debug e display).",
+    )
     file = models.FileField(upload_to='documents/')
     mime_type = models.CharField(max_length=64, blank=True, default='')
     num_pages = models.IntegerField(default=0)
@@ -141,6 +147,18 @@ class Document(models.Model):
         help_text="Métricas de desempenho (tempo, contagem de parágrafos, spans etc.)"
     )
     rules_version = models.CharField(max_length=32, blank=True, default='v0')
+    
+    # NEW: debug flag + per-doc_type debug payload
+    debug_mode = models.BooleanField(
+        default=False,
+        help_text="Se verdadeiro, armazena informações detalhadas de debug (âncoras, pesos, scores).",
+    )
+    doctype_debug = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Para cada DocTypeRule: âncoras encontradas, pesos e score final.",
+    )
+    
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     

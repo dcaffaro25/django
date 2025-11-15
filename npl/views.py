@@ -25,14 +25,59 @@ class DocumentUploadView(generics.CreateAPIView):
     serializer_class = serializers.DocumentUploadSerializer
 
     def perform_create(self, serializer):
-        embedding_mode = self.request.data.get("embedding_mode") or serializer.validated_data.get("embedding_mode")
-        doc = serializer.save(embedding_mode=embedding_mode)
+        embedding_mode = (
+            self.request.data.get("embedding_mode")
+            or serializer.validated_data.get("embedding_mode")
+        )
+        debug_mode = serializer.validated_data.get("debug_mode", False)
+        
+        uploaded_file = self.request.FILES.get('file')
+        original_name = getattr(uploaded_file, 'name', '') if uploaded_file else ''
+
+        doc = serializer.save(
+            embedding_mode=embedding_mode,
+            file_name=original_name,  # NEW
+            debug_mode=debug_mode
+        )
         tasks.ocr_pipeline_task.delay(doc.id, embedding_mode=embedding_mode)
 
     def create(self, request, *args, **kwargs):
         response = super().create(request, *args, **kwargs)
         response.data = {'document_id': response.data['id'], 'status': 'accepted'}
         return response
+
+class DocumentRerunFullPipelineView(APIView):
+    """
+    Reexecuta OCR + classificação + spans a partir do PDF original.
+    POST /documents/<id>/rerun_full_pipeline/
+    """
+    permission_classes = []  # ajuste conforme sua auth
+
+    def post(self, request, pk):
+        doc = get_object_or_404(models.Document, pk=pk)
+        embedding_mode = request.data.get('embedding_mode') or doc.embedding_mode
+        tasks.rerun_full_pipeline_task.delay(doc.id, embedding_mode=embedding_mode)
+        return Response(
+            {"document_id": doc.id, "status": "queued", "action": "rerun_full_pipeline"},
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+class DocumentRerunDoctypeSpansView(APIView):
+    """
+    Recalcula apenas doc_type + spans usando o OCR já salvo.
+    POST /documents/<id>/rerun_doctype_spans/
+    """
+    permission_classes = []  # ajuste conforme sua auth
+
+    def post(self, request, pk):
+        doc = get_object_or_404(models.Document, pk=pk)
+        embedding_mode = request.data.get('embedding_mode') or doc.embedding_mode
+        tasks.rerun_doctype_and_spans_task.delay(doc.id, embedding_mode=embedding_mode)
+        return Response(
+            {"document_id": doc.id, "status": "queued", "action": "rerun_doctype_spans"},
+            status=status.HTTP_202_ACCEPTED,
+        )
 
 
 class EmbeddingModeUpdateView(APIView):

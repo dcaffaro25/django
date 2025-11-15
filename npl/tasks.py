@@ -38,9 +38,20 @@ def ocr_pipeline_task(document_id: int, embedding_mode: str | None = None) -> No
     document.ocr_text = text
     document.ocr_data = {"engine": "pypdf"}
 
-    doc_type, doc_confidence = utils.classify_document_type(text)
-    document.doc_type = doc_type
-    document.doctype_confidence = doc_confidence
+    # NEW: when debug_mode, keep per-rule details
+    if getattr(document, "debug_mode", False):
+        doc_type, doc_confidence, debug_rows = utils.classify_document_type_with_debug(text)
+        document.doc_type = doc_type
+        document.doctype_confidence = doc_confidence
+        document.doctype_debug = {
+            "weights": {"strong": 2.0, "weak": 1.0, "negative": -100.0},
+            "rules": debug_rows,
+        }
+    else:
+        doc_type, doc_confidence = utils.classify_document_type(text)
+        document.doc_type = doc_type
+        document.doctype_confidence = doc_confidence
+        document.doctype_debug = None
 
     process_number = utils.extract_process_number(text)
     if process_number:
@@ -70,7 +81,11 @@ def weak_labelling_task(document_id: int, embedding_mode: str | None = None) -> 
     document = models.Document.objects.get(pk=document_id)
     metrics = document.processing_stats or {}
     total_start = time.perf_counter()
-
+    
+    # NEW: limpa spans e embeddings anteriores para permitir reprocessamento idempotente
+    models.SpanEmbedding.objects.filter(span__document=document).delete()
+    models.Span.objects.filter(document=document).delete()
+    
     # Decide o modo de embeddings: argumento > campo do documento > variável de ambiente
     mode = (embedding_mode
             or getattr(document, "embedding_mode", None)
@@ -192,6 +207,64 @@ def weak_labelling_task(document_id: int, embedding_mode: str | None = None) -> 
     document.processing_stats = metrics
     document.save(update_fields=["processing_stats"])
 
+@shared_task
+def rerun_doctype_and_spans_task(document_id: int, embedding_mode: str | None = None) -> None:
+    document = models.Document.objects.get(pk=document_id)
+    text = document.ocr_text or ''
+
+    if text:
+        if getattr(document, "debug_mode", False):
+            doc_type, doc_confidence, debug_rows = utils.classify_document_type_with_debug(text)
+            document.doc_type = doc_type
+            document.doctype_confidence = doc_confidence
+            document.doctype_debug = {
+                "weights": {"strong": 2.0, "weak": 1.0, "negative": -100.0},
+                "rules": debug_rows,
+            }
+        else:
+            doc_type, doc_confidence = utils.classify_document_type(text)
+            document.doc_type = doc_type
+            document.doctype_confidence = doc_confidence
+            document.doctype_debug = None
+
+        document.save(update_fields=["doc_type", "doctype_confidence", "doctype_debug"])
+
+    models.SpanEmbedding.objects.filter(span__document=document).delete()
+    models.Span.objects.filter(document=document).delete()
+
+    weak_labelling_task.delay(document.id, embedding_mode=embedding_mode)
+
+@shared_task
+def rerun_full_pipeline_task(document_id: int, embedding_mode: str | None = None) -> None:
+    """
+    Reexecuta o pipeline completo a partir do PDF:
+    - zera campos de OCR, doc_type e spans
+    - chama ocr_pipeline_task, que por sua vez chamará weak_labelling_task.
+    """
+    document = models.Document.objects.get(pk=document_id)
+
+    # Limpa spans e embeddings
+    models.SpanEmbedding.objects.filter(span__document=document).delete()
+    models.Span.objects.filter(document=document).delete()
+
+    # Reseta campos de OCR / classificação / métricas
+    document.ocr_text = ''
+    document.ocr_data = {}
+    document.doc_type = ''
+    document.doctype_confidence = 0.0
+    document.processing_stats = {}
+    document.save(update_fields=[
+        "ocr_text",
+        "ocr_data",
+        "doc_type",
+        "doctype_confidence",
+        "processing_stats",
+    ])
+
+    # Usa embedding_mode passado ou o já salvo no documento
+    mode = (embedding_mode or getattr(document, "embedding_mode", None) or "all_paragraphs")
+    ocr_pipeline_task.delay(document.id, embedding_mode=mode)
+
 def create_span_only(document, rule, group, details_list, embedding_mode, scores):
     """
     Cria um Span a partir de um grupo de parágrafos, associando a primeira página e
@@ -229,16 +302,54 @@ def create_span_only(document, rule, group, details_list, embedding_mode, scores
     weak_count = len(combined_details["weak_literal"]) + len(combined_details["weak_synonyms"])
     negative_count = len(combined_details["negative_matches"])
 
-    
     # Score agregado (exemplo: soma das pontuações dos parágrafos)
     span_score = sum(scores) if scores else 0.0
 
-    # Cálculo de confiança usando score e contagens, caso deseje
-    # Por exemplo, normalizar pelo número de parágrafos:
     if scores:
         confidence = min(1.0, max(0.0, span_score / (len(scores) * max(1.0, max(scores)))))
     else:
         confidence = min(1.0, 0.5 + 0.1 * len(group))
+
+    # NEW: construir payload de debug somente se o documento estiver em modo debug
+    debug_payload = None
+    if getattr(document, "debug_mode", False):
+        debug_payload = {
+            "rule": {
+                "id": rule.id,
+                "label": rule.label,
+                "doc_type": rule.doc_type.doc_type,
+                "description": rule.description,
+            },
+            "anchors": {
+                # você pode normalizar ou apenas repassar as estruturas já usadas
+                "strong": {
+                    "literal": combined_details["strong_literal"],
+                    "synonyms": combined_details["strong_synonyms"],
+                },
+                "weak": {
+                    "literal": combined_details["weak_literal"],
+                    "synonyms": combined_details["weak_synonyms"],
+                },
+                "negative": combined_details["negative_matches"],
+            },
+            "weights": {
+                "strong_literal": 2.0,
+                "weak_literal": 1.0,
+                "strong_synonym": 1.0,
+                "negative": -100.0,
+            },
+            "scores": {
+                "paragraph_scores": scores,
+                "span_score": span_score,
+            },
+        }
+
+    extra = {
+        "score_details": combined_details,
+        "embedding_mode": embedding_mode,
+    }
+    if debug_payload is not None:
+        extra["debug"] = debug_payload
 
     span = models.Span.objects.create(
         document=document,
@@ -250,13 +361,10 @@ def create_span_only(document, rule, group, details_list, embedding_mode, scores
         confidence=confidence,
         anchors_pos=anchors_pos,
         anchors_neg=anchors_neg,
-        strong_anchor_count = strong_count,
-        weak_anchor_count = weak_count,
-        negative_anchor_count = negative_count,
-        extra={
-            "score_details": combined_details,
-            "embedding_mode": embedding_mode,
-        },
+        strong_anchor_count=strong_count,
+        weak_anchor_count=weak_count,
+        negative_anchor_count=negative_count,
+        extra=extra,
     )
 
     if embedding_mode != "none":

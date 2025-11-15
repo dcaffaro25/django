@@ -180,33 +180,84 @@ def extract_process_number(text: str) -> Optional[str]:
             return m.group(0)
     return None
 
-def classify_document_type(text: str) -> Tuple[str, float]:
+def classify_document_type_with_debug(text: str):
     """
-    Classifica o tipo de documento lendo as regras do banco.
-    - Confiança alta (0.9) se encontrar âncora forte.
-    - Confiança moderada (0.6) se encontrar âncora fraca.
-    - Caso contrário, retorna tipo genérico com confiança baixa (0.3).
+    Versão com debug: para cada DocTypeRule, informa âncoras encontradas,
+    pesos usados, score e confiança.
     """
     lowered = text.lower()
 
-    # Verificar âncoras fortes e negativas primeiro
-    for rule in models.DocTypeRule.objects.all():
-        negative_anchors = _split_anchors(rule.anchors_negative)
-        if any(neg in lowered for neg in negative_anchors):
-            continue  # ignora este tipo se houver âncora negativa
+    STRONG_W = 2.0
+    WEAK_W = 1.0
+    NEG_W = -100.0
 
+    debug_rows: List[Dict[str, Any]] = []
+
+    best_type = "DESPACHO_MERO_EXPEDIENTE"
+    best_conf = 0.3
+    best_score = float("-inf")
+
+    rules = list(models.DocTypeRule.objects.all())
+    if not rules:
+        # sem regras configuradas – comportamento antigo
+        return best_type, best_conf, []
+
+    for rule in rules:
         strong_anchors = _split_anchors(rule.anchors_strong)
-        if any(strong in lowered for strong in strong_anchors):
-            return rule.doc_type, 0.9
-
-    # Em seguida, procurar âncoras fracas
-    for rule in models.DocTypeRule.objects.all():
         weak_anchors = _split_anchors(rule.anchors_weak)
-        if any(weak in lowered for weak in weak_anchors):
-            return rule.doc_type, 0.6
+        negative_anchors = _split_anchors(rule.anchors_negative)
 
-    # Nenhuma regra aplicada: retorna tipo padrão
-    return "DESPACHO_MERO_EXPEDIENTE", 0.3
+        strong_matches = [a for a in strong_anchors if a and a in lowered]
+        weak_matches = [a for a in weak_anchors if a and a in lowered]
+        negative_matches = [a for a in negative_anchors if a and a in lowered]
+
+        if negative_matches:
+            score = NEG_W
+        else:
+            score = STRONG_W * len(strong_matches) + WEAK_W * len(weak_matches)
+
+        if strong_matches and not negative_matches:
+            conf = 0.9
+        elif weak_matches and not negative_matches:
+            conf = 0.6
+        else:
+            conf = 0.3
+
+        debug_rows.append({
+            "doc_type": rule.doc_type,
+            "description": rule.description,
+            "anchors": {
+                "strong": strong_matches,
+                "weak": weak_matches,
+                "negative": negative_matches,
+            },
+            "weights": {
+                "strong": STRONG_W,
+                "weak": WEAK_W,
+                "negative": NEG_W,
+            },
+            "score": score,
+            "confidence": conf,
+        })
+
+        # escolhe o melhor tipo ignorando regras com âncoras negativas
+        if not negative_matches and score > best_score:
+            best_score = score
+            best_type = rule.doc_type
+            best_conf = conf
+
+    # fallback se todas as regras forem descartadas por negativo
+    if best_score == float("-inf"):
+        best_type, best_conf = "DESPACHO_MERO_EXPEDIENTE", 0.3
+
+    return best_type, best_conf, debug_rows
+
+def classify_document_type(text: str):
+    """
+    Wrapper compatível com a versão antiga: retorna apenas (doc_type, confiança).
+    """
+    doc_type, conf, _ = classify_document_type_with_debug(text)
+    return doc_type, conf
 
 
 def map_span_to_event_codes(span: models.Span) -> List[str]:
