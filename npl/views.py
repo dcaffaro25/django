@@ -13,7 +13,8 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-
+from django.utils.dateparse import parse_date
+from django.db.models import Count, Q
 from . import models
 from . import serializers
 from . import tasks
@@ -83,7 +84,12 @@ class DocumentViewSet(viewsets.ModelViewSet):
     queryset = models.Document.objects.all().order_by("-id")
     serializer_class = serializers.DocumentSerializer
     permission_classes = [permissions.AllowAny]
-
+    
+    def get_serializer_class(self):
+        if self.action == "list":
+            return serializers.DocumentListItemSerializer
+        return serializers.DocumentSerializer
+    
     @action(detail=True, methods=["post"])
     def re_ocr(self, request, pk=None):
         """
@@ -202,6 +208,100 @@ class DocumentViewSet(viewsets.ModelViewSet):
                 "extra": s.extra,  # contains per-strategy anchors/scores
             })
         return Response(payload)
+
+class DocumentListView(generics.ListAPIView):
+    """
+    GET /documents/list/
+    Returns a paginated, filterable list of documents.
+    Query params:
+      - q: search in file_name and doc_type. (use &search_ocr=1 to include OCR text)
+      - search_ocr: 0/1 (default 0). If 1, includes ocr_text in search (slower).
+      - process_id: int
+      - doc_type: single or comma-separated list (e.g. DECISAO,DESPACHO)
+      - strategy: doc_type_strategy filter (rule_literal|ai_anchor)
+      - debug_mode: 0/1
+      - store_file: 0/1
+      - has_spans: 0/1
+      - created_from, created_to: YYYY-MM-DD
+      - ordering: one of (-created_at, created_at, -doctype_confidence, doctype_confidence, -id, id)
+    Pagination uses your DRF default settings.
+    """
+    permission_classes = [permissions.AllowAny]
+    serializer_class = serializers.DocumentListItemSerializer
+
+    def _to_bool(self, v):
+        if v is None:
+            return None
+        return str(v).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+    def get_queryset(self):
+        qs = (
+            models.Document.objects
+            .select_related("process")
+            .annotate(span_count=Count("spans"))
+            .order_by("-id")
+        )
+
+        p = self.request.query_params
+
+        # Basic filters
+        process_id = p.get("process_id")
+        if process_id:
+            qs = qs.filter(process_id=process_id)
+
+        doc_type = p.get("doc_type")
+        if doc_type:
+            items = [x.strip() for x in doc_type.split(",") if x.strip()]
+            qs = qs.filter(doc_type__in=items)
+
+        strategy = p.get("strategy")
+        if strategy in {models.Document.DOC_STRATEGY_RULE_LITERAL, models.Document.DOC_STRATEGY_AI_ANCHOR}:
+            qs = qs.filter(doc_type_strategy=strategy)
+
+        debug_mode = self._to_bool(p.get("debug_mode"))
+        if debug_mode is not None:
+            qs = qs.filter(debug_mode=debug_mode)
+
+        store_file = self._to_bool(p.get("store_file"))
+        if store_file is not None:
+            qs = qs.filter(store_file=store_file)
+
+        has_spans = self._to_bool(p.get("has_spans"))
+        if has_spans is True:
+            qs = qs.filter(spans__isnull=False).distinct()
+        elif has_spans is False:
+            qs = qs.filter(spans__isnull=True)
+
+        # Date range
+        created_from = p.get("created_from")
+        if created_from:
+            d = parse_date(created_from)
+            if d:
+                qs = qs.filter(created_at__date__gte=d)
+
+        created_to = p.get("created_to")
+        if created_to:
+            d = parse_date(created_to)
+            if d:
+                qs = qs.filter(created_at__date__lte=d)
+
+        # Free text search
+        q = p.get("q", "").strip()
+        if q:
+            search_ocr = self._to_bool(p.get("search_ocr"))  # default False
+            q_filter = Q(file_name__icontains=q) | Q(doc_type__icontains=q)
+            if search_ocr:
+                # Warning: includes OCR text; can be slower on large tables
+                q_filter = q_filter | Q(ocr_text__icontains=q)
+            qs = qs.filter(q_filter)
+
+        # Ordering
+        ordering = p.get("ordering", "-id")
+        allowed = {"-created_at", "created_at", "-doctype_confidence", "doctype_confidence", "-id", "id"}
+        if ordering in allowed:
+            qs = qs.order_by(ordering, "-id" if ordering != "-id" else "-created_at")
+
+        return qs
 
 class SpanViewSet(viewsets.ModelViewSet):
     queryset = models.Span.objects.all().order_by("document_id", "page", "id")

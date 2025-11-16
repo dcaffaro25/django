@@ -20,6 +20,7 @@ from datetime import date as _date
 
 # accounting/services/reconciliation_service.py
 
+from collections.abc import Sequence
 
 from typing import Dict, List, Optional
 
@@ -116,6 +117,30 @@ class PipelineConfig:
 #  Utility functions
 # ----------------------------------------------------------------------
 CENT = Decimal("0.01")
+
+def _as_vec_list(vec) -> Optional[List[float]]:
+    """
+    Return a plain list[float] for any pgvector/ndarray/list-like input,
+    or None if the field is missing. Never uses truthiness of arrays.
+    """
+    if vec is None:
+        return None
+    # memoryview -> bytes (pgvector sometimes)
+    if isinstance(vec, memoryview):
+        try:
+            vec = list(vec.tobytes())  # fall back to raw bytes if needed
+        except Exception:
+            vec = list(vec)
+    try:
+        return [float(x) for x in list(vec)]
+    except Exception:
+        try:
+            # Some vector types are already iterable but not list()-able
+            if isinstance(vec, Sequence):
+                return [float(x) for x in vec]
+        except Exception:
+            pass
+    return None
 
 def q2(x: Decimal | None) -> Decimal:
     """Quantise a Decimal to two decimal places using standard rounding."""
@@ -883,8 +908,10 @@ class ReconciliationService:
         # Build candidate QuerySets
         bank_ids = data.get("bank_ids", [])
         book_ids = data.get("book_ids", [])
-        bank_qs = BankTransaction.objects.exclude(
-            reconciliations__status__in=["matched", "approved"]
+        bank_qs = (
+            BankTransaction.objects
+            .exclude(reconciliations__status__in=["matched", "approved"])
+            .only("id", "company_id", "date", "amount", "currency_id", "description", "description_embedding")
         )
         bank_count_initial = bank_qs.count()
         log.debug("Initial unmatched bank transactions count: %d", bank_count_initial)
@@ -898,8 +925,19 @@ class ReconciliationService:
             log.debug("No bank_ids provided; using all unmatched bank transactions (%d records)", 
                       bank_count_initial)
         
-        book_qs = JournalEntry.objects.exclude(
-            reconciliations__status__in=["matched", "approved"]
+        book_qs = (
+            JournalEntry.objects
+            .exclude(reconciliations__status__in=["matched", "approved"])
+            .filter(account__bank_account__isnull=False)
+            # We use je.get_effective_amount() → needs debit/credit/account.
+            # We also read transaction.date / transaction.currency_id / transaction.description / transaction.description_embedding.
+            .select_related("transaction")
+            .only(
+                "id", "company_id", "transaction_id", "date",
+                "debit_amount", "credit_amount", "account_id",
+                "transaction__date", "transaction__currency_id",
+                "transaction__description", "transaction__description_embedding",
+            )
         )
         book_count_initial = book_qs.count()
         log.debug("Initial unmatched journal entries count: %d", book_count_initial)
@@ -928,9 +966,7 @@ class ReconciliationService:
                 amount=tx.amount,
                 currency_id=tx.currency_id,
                 description=tx.description,
-                embedding=list(tx.description_embedding)
-                if getattr(tx, "description_embedding", None)
-                else None,
+                embedding=_as_vec_list(getattr(tx, "description_embedding", None)),
             )
             for tx in bank_qs
         ]
@@ -940,21 +976,26 @@ class ReconciliationService:
             log.debug("BankDTO: id=%s, amount=%s, date=%s, currency_id=%s, company_id=%s",
                       dto.id, dto.amount, dto.date, dto.currency_id, dto.company_id)
         
-        candidate_book = [
-            JournalEntryDTO(
-                id=je.id,
-                company_id=je.company_id,
-                transaction_id=je.transaction_id,
-                date=je.date or (je.transaction.date if je.transaction else None),
-                effective_amount=je.get_effective_amount(),
-                currency_id=je.transaction.currency_id if je.transaction else None,
-                description=je.transaction.description if je.transaction else "",
-                embedding=list(je.transaction.description_embedding)
-                if getattr(je.transaction, "description_embedding", None)
-                else None,
+        candidate_book = []
+        for je in book_qs:
+            tr = getattr(je, "transaction", None)
+            tr_date = je.date or (tr.date if tr else None)
+            tr_curr_id = tr.currency_id if tr else None
+            tr_desc = tr.description if tr else ""
+            tr_vec = _as_vec_list(getattr(tr, "description_embedding", None)) if tr else None
+        
+            candidate_book.append(
+                JournalEntryDTO(
+                    id=je.id,
+                    company_id=je.company_id,
+                    transaction_id=je.transaction_id,
+                    date=tr_date,
+                    effective_amount=je.get_effective_amount(),  # uses debit/credit
+                    currency_id=tr_curr_id,
+                    description=tr_desc,
+                    embedding=tr_vec,
+                )
             )
-            for je in book_qs
-        ]
         
         log.debug("Created %d JournalEntryDTOs", len(candidate_book))
         for dto in candidate_book[:10]:  # again, limit to avoid noise

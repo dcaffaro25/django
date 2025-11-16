@@ -157,14 +157,14 @@ def find_anchors_rule_literal(
 
 # ---------- Strategy 2: ai_anchor (LLM-assisted presence detection) ----------
 
-_USE_AI = os.getenv("NPL_USE_AI_ANCHOR", "false").lower() in ("1", "true", "yes")
+_USE_AI = os.getenv("NPL_USE_AI_ANCHOR", "true").lower() in ("1", "true", "yes")
 
 def _call_openai_for_anchors(text: str, strong: List[str], weak: List[str], neg: List[str]) -> Dict:
     """
     Call OpenAI to judge presence/absence of anchors, tolerant to OCR distortion.
     If OPENAI_API_KEY or NPL_USE_AI_ANCHOR is not set, returns empty detections.
     """
-    if not _USE_AI or not os.getenv("OPENAI_API_KEY"):
+    if not _USE_AI or not os.getenv("OPEN_AI_API_KEY"):
         return {"strong": {}, "weak": {}, "negative": {}}
 
     try:

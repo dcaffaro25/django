@@ -1458,7 +1458,60 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             "task_id": async_result.id,
             "db_id": task_obj.id,
         })
+    
+    @action(detail=True, methods=["get"], url_path="fresh-suggestions")
+    def fresh_suggestions(self, request, pk=None, tenant_id=None):
+        """
+        Return the task's suggestions after filtering out any that involve
+        bank or journal records that are already reconciled (matched/approved).
+        """
+        task = self.get_object()
+        result = task.result or {}
+        suggestions = result.get("suggestions", [])
 
+        if not suggestions:
+            return Response({"suggestions": [], "removed": 0, "total": 0})
+
+        # Collect all ids we need to check in one shot
+        all_bank_ids = set()
+        all_book_ids = set()
+        for s in suggestions:
+            all_bank_ids.update(s.get("bank_ids", []))
+            all_book_ids.update(s.get("journal_entries_ids", []))
+
+        # Which of those are already reconciled?
+        reconciled_banks = set(
+            BankTransaction.objects
+            .filter(id__in=all_bank_ids, reconciliations__status__in=["matched", "approved"])
+            .values_list("id", flat=True)
+        )
+        reconciled_books = set(
+            JournalEntry.objects
+            .filter(id__in=all_book_ids, reconciliations__status__in=["matched", "approved"])
+            .values_list("id", flat=True)
+        )
+
+        filtered = []
+        removed = []
+        for s in suggestions:
+            b_ids = s.get("bank_ids", [])
+            j_ids = s.get("journal_entries_ids", [])
+            if any(b in reconciled_banks for b in b_ids) or any(j in reconciled_books for j in j_ids):
+                removed.append({
+                    "bank_ids": b_ids,
+                    "journal_entry_ids": j_ids,
+                    "reason": "already_reconciled"
+                })
+                continue
+            filtered.append(s)
+
+        return Response({
+            "total": len(suggestions),
+            "removed": len(removed),
+            "suggestions": filtered,
+            "removed_details": removed[:50],  # trim if you want
+        })
+    
     @action(detail=True, methods=["get"])
     def status(self, request, pk=None, tenant_id=None):
         """

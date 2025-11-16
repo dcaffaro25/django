@@ -53,6 +53,26 @@ class DocumentSerializer(serializers.ModelSerializer):
         )
 
 
+class DocumentListItemSerializer(serializers.ModelSerializer):
+    """Lean serializer for list views (fast table rendering)."""
+    span_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = models.Document
+        fields = (
+            "id",
+            "file_name",
+            "doc_type",
+            "doc_type_strategy",
+            "doctype_confidence",
+            "debug_mode",
+            "store_file",
+            "process",          # process id; change to nested if you want case_number
+            "created_at",
+            "updated_at",
+            "span_count",
+        )
+
 class SpanSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.Span

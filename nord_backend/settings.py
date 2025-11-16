@@ -295,6 +295,7 @@ if not os.getenv("REDIS_URL"):
 IMPORT_MAX_BATCH_SIZE = 1000
 INTEGRATION_MAX_BATCH_SIZE = 500
 
+OPEN_AI_API_KEY = os.getenv("OPEN_AI_API_KEY")
 
 # ---- Embeddings config (single-source) ----
 EMBED_INTERNAL_HOST = os.getenv("EMBED_INTERNAL_HOST")  # e.g. "embedding-service.railway.internal"

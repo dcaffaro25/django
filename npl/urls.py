@@ -14,6 +14,7 @@ from .views import (
     DocTypeRuleViewSet,
     SpanRuleViewSet,
     SpanEmbeddingViewSet,
+    DocumentListView,
 )
 
 router = DefaultRouter()
@@ -32,6 +33,7 @@ urlpatterns = [
     path('docs/<int:pk>/embedding-mode/', views.EmbeddingModeUpdateView.as_view(), name='docs-embedding-mode'),
     path('documents/<int:pk>/rerun_full_pipeline/', views.DocumentRerunFullPipelineView.as_view(), name='document-rerun-full'),
     path('documents/<int:pk>/rerun_doctype_spans/', views.DocumentRerunDoctypeSpansView.as_view(), name='document-rerun-labels'),
+    path("documents/list/", DocumentListView.as_view(), name="document-list"),
     path('search', views.SearchView.as_view(), name='search'),
     path('pricing/run', views.PricingRunView.as_view(), name='pricing-run'),
     path("", include(router.urls)),
