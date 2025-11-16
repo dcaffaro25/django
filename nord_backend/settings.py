@@ -282,9 +282,14 @@ CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = "UTC"
 
 # Optional task time limits (protects against runaway jobs)
-CELERY_TASK_T_LIMIT = int(os.getenv("CELERY_TASK_TIME_LIMIT", 123))  # minutes
+CELERY_TASK_T_LIMIT = int(os.getenv("CELERY_TASK_TIME_LIMIT", 10))  # minutes
 CELERY_TASK_SOFT_TIME_LIMIT = (CELERY_TASK_T_LIMIT-3)*60  # 12 minutes
 CELERY_TASK_TIME_LIMIT = CELERY_TASK_T_LIMIT*60       # 15 minutes
+
+CELERY_TASK_ROUTES = {
+    'accounting.tasks.match_many_to_many_task': {'queue': 'recon'},
+    'accounting.tasks.generate_missing_embeddings': {'queue': 'embeddings'},
+}
 
 if not os.getenv("REDIS_URL"):
     CELERY_TASK_ALWAYS_EAGER = True
