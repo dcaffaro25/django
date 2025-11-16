@@ -645,10 +645,10 @@ class ReconciliationConfig(models.Model):
     book_filters = models.JSONField(default=dict, blank=True, null=True)
 
     # Scoring weights (must sum to 1.0)
-    embedding_weight = models.DecimalField(max_digits=4, decimal_places=2, default=0.50)
-    amount_weight    = models.DecimalField(max_digits=4, decimal_places=2, default=0.35)
-    currency_weight  = models.DecimalField(max_digits=4, decimal_places=2, default=0.10)
-    date_weight      = models.DecimalField(max_digits=4, decimal_places=2, default=0.05)
+    embedding_weight = models.DecimalField(max_digits=4, decimal_places=2, default=0.50) #####
+    amount_weight    = models.DecimalField(max_digits=4, decimal_places=2, default=0.35) #####
+    currency_weight  = models.DecimalField(max_digits=4, decimal_places=2, default=0.10) #####
+    date_weight      = models.DecimalField(max_digits=4, decimal_places=2, default=0.05) #####
 
     # Tolerances / sizes
     amount_tolerance     = models.DecimalField(max_digits=12, decimal_places=2, default=0)
@@ -750,7 +750,13 @@ class ReconciliationPipeline(models.Model):
 
 
 class ReconciliationPipelineStage(models.Model):
-    """Links a pipeline to a config and defines order + optional overrides."""
+    """
+    Links a pipeline to a config and defines order + optional overrides.
+
+    All override fields are optional; when null they inherit from the linked
+    ReconciliationConfig. This replaces the legacy `date_tolerance_days` field
+    with the new `group_span_days` and `avg_date_delta_days` knobs.
+    """
     pipeline = models.ForeignKey(
         ReconciliationPipeline, on_delete=models.CASCADE, related_name="stages"
     )
