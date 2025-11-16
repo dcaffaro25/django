@@ -452,41 +452,83 @@ class ReconciliationPipelineEngine:
                     return
 
     def _run_fuzzy_1to1(self, banks, books, stage: StageConfig):
+        """
+        Fuzzy 1-to-1 matching with global non-overlapping selection.
+
+        We:
+          1) Generate all valid (bank, book) fuzzy candidates with scores
+          2) Sort them by global_score (and tie-breakers)
+          3) Greedily pick a non-overlapping set of pairs
+        """
+
         # Use a small bin to keep buckets tight, but respect the candidate window
-        bin_size = max(1, min(stage.candidate_window_days or 1, 7))
-        book_bins = build_date_bins([b for b in books if b.id not in self.used_books],
-                                    get_date=lambda e: e.date,
-                                    bin_size_days=bin_size)
-    
+        win = stage.candidate_window_days
+        bin_size = max(1, min(win or 1, 7))
+
+        # Index books by date bins for faster lookup
+        book_bins = build_date_bins(
+            [b for b in books if b.id not in self.used_books],
+            get_date=lambda e: e.date,
+            bin_size_days=bin_size,
+        )
+
+        candidates: list[dict] = []
+
         for bank in banks:
             if bank.id in self.used_banks:
                 continue
-    
-            candidates = list(iter_date_bin_candidates(bank.date, book_bins, bin_size, stage.candidate_window_days))
-            buckets = build_amount_buckets(candidates, get_amount=lambda e: e.amount_base)
-    
+
+            # Find nearby books in date space
+            candidates_in_window = list(
+                iter_date_bin_candidates(bank.date, book_bins, bin_size, win)
+            )
+            # Bucket by amount around this bank
+            buckets = build_amount_buckets(
+                candidates_in_window, get_amount=lambda e: e.amount_base
+            )
+
             for book in probe_amount_buckets(buckets, bank.amount_base, stage.amount_tol):
+                # Respect global used flags from previous stages
                 if book.id in self.used_books:
                     continue
-                # currency + amount guards
+
+                # Basic guards: currency and amount tolerance
                 if bank.currency_id != book.currency_id:
                     continue
+
                 a_diff = abs(q2(bank.amount_base) - q2(book.amount_base))
                 if a_diff > stage.amount_tol:
                     continue
-    
-                # CROSS‑side only for 1:1
-                avg_delta = abs((bank.date - book.date).days) if (bank.date and book.date) else stage.candidate_window_days + 1
+
+                # CROSS-side date delta
+                if bank.date and book.date:
+                    avg_delta = abs((bank.date - book.date).days)
+                else:
+                    # If we don't have dates, treat as outside tolerance
+                    avg_delta = (stage.avg_date_delta_days or win or 0) + 1
+
                 if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                     continue
-    
-                embed_sim = self._cosine_similarity(bank.embedding or [], book.embedding or [])
+
+                embed_sim = self._cosine_similarity(
+                    bank.embedding or [], book.embedding or []
+                )
+
                 weights = {
-                    "embedding": stage.embedding_weight if stage.embedding_weight is not None else self.stage_weights["embedding"],
-                    "amount":    stage.amount_weight    if stage.amount_weight    is not None else self.stage_weights["amount"],
-                    "currency":  stage.currency_weight  if stage.currency_weight  is not None else self.stage_weights["currency"],
-                    "date":      stage.date_weight      if stage.date_weight      is not None else self.stage_weights["date"],
+                    "embedding": stage.embedding_weight
+                    if stage.embedding_weight is not None
+                    else self.stage_weights["embedding"],
+                    "amount": stage.amount_weight
+                    if stage.amount_weight is not None
+                    else self.stage_weights["amount"],
+                    "currency": stage.currency_weight
+                    if stage.currency_weight is not None
+                    else self.stage_weights["currency"],
+                    "date": stage.date_weight
+                    if stage.date_weight is not None
+                    else self.stage_weights["date"],
                 }
+
                 scores = compute_match_scores(
                     embed_sim=embed_sim,
                     amount_diff=a_diff,
@@ -496,16 +538,80 @@ class ReconciliationPipelineEngine:
                     currency_match=1.0,
                     weights=weights,
                 )
-                self._record(self._make_suggestion(
-                    "fuzzy_1to1", [bank], [book], scores["global_score"],
-                    stage=stage, weights=weights, component_scores=scores,
-                    extra={
-                        "embed_similarity": float(embed_sim),
+
+                candidates.append(
+                    {
+                        "bank": bank,
+                        "book": book,
+                        "scores": scores,
+                        "weights": weights,
+                        "embed_sim": float(embed_sim),
                         "amount_diff": float(a_diff),
-                        "avg_date_delta_days_measured": int(avg_delta),
-                        "currency_match": 1.0,
-                    },
-                ))
+                        "avg_delta": int(avg_delta),
+                    }
+                )
+
+        if not candidates:
+            return
+
+        # ------------------------------------------------------------------
+        # GLOBAL SELECTION: pick best non-overlapping pairs
+        # ------------------------------------------------------------------
+        # Sort by:
+        #  1) global_score (desc)
+        #  2) smaller |avg_delta| (tie-breaker)
+        #  3) smaller |amount_diff| (tie-breaker)
+        candidates.sort(
+            key=lambda c: (
+                c["scores"]["global_score"],
+                -abs(c["avg_delta"]),
+                -abs(c["amount_diff"]),
+            ),
+            reverse=True,
+        )
+
+        local_used_banks: set[int] = set()
+        local_used_books: set[int] = set()
+
+        for c in candidates:
+            bank = c["bank"]
+            book = c["book"]
+
+            # Respect global + local non-overlap
+            if (
+                bank.id in self.used_banks
+                or book.id in self.used_books
+                or bank.id in local_used_banks
+                or book.id in local_used_books
+            ):
+                continue
+
+            scores = c["scores"]
+            weights = c["weights"]
+
+            suggestion = self._make_suggestion(
+                "fuzzy_1to1",
+                [bank],
+                [book],
+                scores["global_score"],
+                stage=stage,
+                weights=weights,
+                component_scores=scores,
+                extra={
+                    "embed_similarity": c["embed_sim"],
+                    "amount_diff": c["amount_diff"],
+                    "avg_date_delta_days_measured": c["avg_delta"],
+                    "currency_match": 1.0,
+                },
+            )
+
+            self._record(suggestion)
+
+            local_used_banks.add(bank.id)
+            local_used_books.add(book.id)
+
+            if len(self.suggestions) >= self.config.max_suggestions:
+                break
 
     def _run_many_to_many(self, banks, books, stage: StageConfig):
         # Copy & sort (company‑filtered)

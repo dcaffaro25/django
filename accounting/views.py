@@ -1539,6 +1539,45 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         serializer = self.get_serializer(task)
         return Response(serializer.data)
     
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None, tenant_id=None):
+        """
+        Cancel a reconciliation task.
+
+        - Marks the DB task as 'cancelled' (with optional reason).
+        - Sends a Celery revoke() for the underlying task_id (best-effort).
+        """
+        task = self.get_object()
+
+        # If it's already in a terminal state, don't "cancel" again
+        if task.status in ["completed", "failed", "cancelled"]:
+            return Response(
+                {
+                    "detail": "Task is already finished and cannot be cancelled.",
+                    "status": task.status,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        reason = (request.data.get("reason") or "Cancelled by user").strip()
+
+        # Best-effort Celery revoke (may or may not actually kill a running task)
+        if task.task_id:
+            try:
+                current_app.control.revoke(task.task_id, terminate=True)
+            except Exception as e:
+                log.warning(
+                    "Failed to revoke Celery task %s for ReconciliationTask %s: %s",
+                    task.task_id, task.id, e
+                )
+
+        task.status = "cancelled"
+        task.error_message = reason
+        task.save(update_fields=["status", "error_message", "updated_at"])
+
+        serializer = self.get_serializer(task)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+    
     @action(detail=False, methods=["get"])
     def queued(self, request, tenant_id=None):
         """
