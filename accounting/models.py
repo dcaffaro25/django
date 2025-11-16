@@ -613,17 +613,15 @@ class Reconciliation(TenantAwareBaseModel):
 class ReconciliationConfig(models.Model):
     """Stores reusable reconciliation settings.
 
-    Users can control basic matching behaviour via this model:
+    Users can control matching behaviour via this model:
 
-    * `strategy` – high‑level strategy name (for legacy fallback).
-    * `amount_tolerance` and `date_tolerance_days` – fuzzy match
-      thresholds.
-    * `max_group_size_bank` and `max_group_size_book` – maximum
-      group sizes on each side for many‑to‑many matching.
-    * `fee_accounts`, `duplicate_window_days`, `text_similarity` –
-      tune fee folding, duplicate detection and text similarity.
-
-    The removed fields `fx_policy` and `pipeline` simplify the model.
+    * `amount_tolerance` – fuzzy match threshold for amounts.
+    * `group_span_days` – max allowed date span within a candidate group (banks+books).
+    * `avg_date_delta_days` – max allowed abs(delta) between weighted-average dates
+      of the bank group and the book group.
+    * `max_group_size_bank` / `max_group_size_book` – group sizes for many-to-many.
+    * `embedding_weight`, `amount_weight`, `currency_weight`, `date_weight` – scoring weights.
+    * `min_confidence`, `max_suggestions` – result thresholds/limits.
     """
 
     SCOPE_CHOICES = [
@@ -633,71 +631,40 @@ class ReconciliationConfig(models.Model):
         ("company_user", "Company + User"),
     ]
 
-    scope = models.CharField(
-        max_length=20,
-        choices=SCOPE_CHOICES,
-        default="company",
-        help_text="Who this config applies to: global, company, user, or company+user",
-    )
+    scope = models.CharField(max_length=20, choices=SCOPE_CHOICES, default="company")
     company = models.ForeignKey(
-        Company,
-        null=True,
-        blank=True,
-        on_delete=models.CASCADE,
-        related_name="reconciliation_configs",
+        Company, null=True, blank=True, on_delete=models.CASCADE, related_name="reconciliation_configs"
     )
     user = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        null=True,
-        blank=True,
-        on_delete=models.CASCADE,
-        related_name="reconciliation_configs",
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.CASCADE, related_name="reconciliation_configs"
     )
+
     name = models.CharField(max_length=255)
     description = models.TextField(blank=True, null=True)
     bank_filters = models.JSONField(default=dict, blank=True, null=True)
     book_filters = models.JSONField(default=dict, blank=True, null=True)
 
-    embedding_weight = models.DecimalField(
-        max_digits=4, decimal_places=2, default=0.50,
-        help_text="Weight of embedding similarity in confidence calculation"
-    )
-    amount_weight = models.DecimalField(
-        max_digits=4, decimal_places=2, default=0.35,
-        help_text="Weight of amount match in confidence calculation"
-    )
-    currency_weight = models.DecimalField(
-        max_digits=4, decimal_places=2, default=0.10,
-        help_text="Weight of currency match in confidence calculation"
-    )
-    date_weight = models.DecimalField(
-        max_digits=4, decimal_places=2, default=0.05,
-        help_text="Weight of date proximity in confidence calculation"
-    )
-    amount_tolerance = models.DecimalField(max_digits=12, decimal_places=2, default=0) #ok
-    date_tolerance_days = models.PositiveIntegerField(default=2) #ok
-    max_group_size_bank = models.PositiveIntegerField(default=1) #ok
-    max_group_size_book = models.PositiveIntegerField(default=1) #ok
-    min_confidence = models.DecimalField(max_digits=4, decimal_places=2, default=0.9) #ok
+    # Scoring weights (must sum to 1.0)
+    embedding_weight = models.DecimalField(max_digits=4, decimal_places=2, default=0.50)
+    amount_weight    = models.DecimalField(max_digits=4, decimal_places=2, default=0.35)
+    currency_weight  = models.DecimalField(max_digits=4, decimal_places=2, default=0.10)
+    date_weight      = models.DecimalField(max_digits=4, decimal_places=2, default=0.05)
+
+    # Tolerances / sizes
+    amount_tolerance     = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    group_span_days      = models.PositiveIntegerField(default=2, help_text="Max span inside a candidate group.")
+    avg_date_delta_days  = models.PositiveIntegerField(default=2, help_text="Max |Δ| between group weighted-average dates.")
+    max_group_size_bank  = models.PositiveIntegerField(default=1)
+    max_group_size_book  = models.PositiveIntegerField(default=1)
+
+    # Thresholds / limits
+    min_confidence  = models.DecimalField(max_digits=4, decimal_places=2, default=0.90)
     max_suggestions = models.PositiveIntegerField(default=1000)
 
-    # Additional tuning fields
-    fee_accounts = models.JSONField(
-        default=list,
-        blank=True,
-        null=True,
-        help_text="List of account codes representing fees to include in group sums.",
-    )
-    duplicate_window_days = models.PositiveIntegerField(
-        default=3,
-        help_text="Number of days within which identical transactions are considered duplicates.",
-    )
-    text_similarity = models.JSONField(
-        default=dict,
-        blank=True,
-        null=True,
-        help_text="Settings for text and embedding similarity (e.g. use_trgm, use_embedding, weights).",
-    )
+    # Additional tuning (unchanged)
+    fee_accounts = models.JSONField(default=list, blank=True, null=True)
+    duplicate_window_days = models.PositiveIntegerField(default=3)
+    text_similarity = models.JSONField(default=dict, blank=True, null=True)
 
     is_default = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -709,9 +676,9 @@ class ReconciliationConfig(models.Model):
 
     def clean(self):
         super().clean()
-        total = float(self.embedding_weight + self.amount_weight +
-                      self.currency_weight + self.date_weight)
+        total = float(self.embedding_weight + self.amount_weight + self.currency_weight + self.date_weight)
         if abs(total - 1.0) > 0.001:
+            from django.core.exceptions import ValidationError
             raise ValidationError("Confidence weights must sum to 1.0")
         from django.core.exceptions import ValidationError
         if self.scope == "company" and not self.company:
@@ -783,32 +750,30 @@ class ReconciliationPipeline(models.Model):
 
 
 class ReconciliationPipelineStage(models.Model):
-    """Links a pipeline to a `ReconciliationConfig` and defines order.
-
-    Each stage points to a saved configuration that acts as the recipe
-    for that stage.  The stage may also specify optional overrides
-    (e.g. group sizes, tolerances, text weight) which take precedence
-    over values from the referenced config.
-    """
-
+    """Links a pipeline to a config and defines order + optional overrides."""
     pipeline = models.ForeignKey(
-        ReconciliationPipeline,
-        on_delete=models.CASCADE,
-        related_name="stages",
+        ReconciliationPipeline, on_delete=models.CASCADE, related_name="stages"
     )
     config = models.ForeignKey(
-        ReconciliationConfig,
-        on_delete=models.CASCADE,
-        related_name="pipeline_stages",
+        ReconciliationConfig, on_delete=models.CASCADE, related_name="pipeline_stages"
     )
     order = models.PositiveIntegerField()
     enabled = models.BooleanField(default=True)
-    # Optional per‑stage overrides
+
+    # Optional per-stage overrides (all fields are optional)
     max_group_size_bank = models.PositiveIntegerField(null=True, blank=True)
     max_group_size_book = models.PositiveIntegerField(null=True, blank=True)
-    amount_tolerance = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
-    date_tolerance_days = models.PositiveIntegerField(null=True, blank=True)
-    text_weight = models.DecimalField(max_digits=4, decimal_places=2, null=True, blank=True)
+    amount_tolerance    = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    # NEW date knobs (replace old date_tolerance_days)
+    group_span_days     = models.PositiveIntegerField(null=True, blank=True)
+    avg_date_delta_days = models.PositiveIntegerField(null=True, blank=True)
+
+    # Proper weight overrides (replace old text_weight)
+    embedding_weight = models.DecimalField(max_digits=4, decimal_places=2, null=True, blank=True)
+    amount_weight    = models.DecimalField(max_digits=4, decimal_places=2, null=True, blank=True)
+    currency_weight  = models.DecimalField(max_digits=4, decimal_places=2, null=True, blank=True)
+    date_weight      = models.DecimalField(max_digits=4, decimal_places=2, null=True, blank=True)
 
     class Meta:
         unique_together = ("pipeline", "order")

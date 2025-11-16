@@ -84,17 +84,21 @@ class StageConfig:
     max_group_size_bank: int = 1
     max_group_size_book: int = 1
     amount_tol: Decimal = Decimal("0")
-    date_tol: int = 0  # legacy/default tolerance
 
-    # NEW: independent date constraints (None => fall back to date_tol)
-    group_date_span_days: Optional[int] = None    # max span within each side
-    avg_date_diff_days: Optional[int] = None      # max |weighted_avg(bank) - weighted_avg(book)|
+    # NEW: split the date tolerance into two independent knobs
+    group_span_days: int = 0            # max span allowed inside a group
+    avg_date_delta_days: int = 0        # max |Δ| between bank and book group weighted-average dates
 
     # optional weight overrides (None → inherit from config or default)
     embedding_weight: float | None = None
     amount_weight: float | None = None
     currency_weight: float | None = None
     date_weight: float | None = None
+
+    @property
+    def candidate_window_days(self) -> int:
+        """Use the looser of the two values to find candidates efficiently."""
+        return max(int(self.group_span_days or 0), int(self.avg_date_delta_days or 0), 0)
 
 
 @dataclass
@@ -313,94 +317,130 @@ class ReconciliationPipelineEngine:
 
     def _run_one_to_many(self, banks, books, stage: StageConfig):
         available_books = [b for b in books if b.id not in self.used_books and b.company_id == self.company_id]
-        span_tol = stage.group_date_span_days if stage.group_date_span_days is not None else stage.date_tol
-        centroid_tol = stage.avg_date_diff_days if stage.avg_date_diff_days is not None else stage.date_tol
-
+        win = stage.candidate_window_days
+    
         for bank in banks:
             if bank.id in self.used_banks:
                 continue
+    
+            # reduce search to books within ±win of the bank date
+            local_books = [b for b in available_books if abs((bank.date - b.date).days) <= win]
+    
             for size in range(1, stage.max_group_size_book + 1):
-                for combo in combinations(available_books, size):
+                for combo in combinations(local_books, size):
                     total = sum((b.amount_base for b in combo), Decimal("0"))
                     if q2(total) != q2(bank.amount_base):
                         continue
                     if any(b.currency_id != bank.currency_id for b in combo):
                         continue
-
-                    # NEW: span within the book group
-                    if self._date_span_days(combo) > span_tol:
+    
+                    # NEW: date span + average date delta checks
+                    all_dates = [bank.date] + [b.date for b in combo]
+                    span_days = (max(all_dates) - min(all_dates)).days
+                    if stage.group_span_days and span_days > stage.group_span_days:
                         continue
-
-                    # NEW: centroid gap (bank single date vs book group wavg)
+    
+                    bank_avg = bank.date
                     book_avg = self._weighted_avg_date(combo)
-                    if bank.date and book_avg and abs((bank.date - book_avg).days) > centroid_tol:
+                    avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
+                    if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                         continue
-
-                    suggestion = self._make_suggestion(
-                        "one_to_many", [bank], combo, 1.0, stage=stage, weights=self.stage_weights
+    
+                    scores = compute_match_scores(
+                        embed_sim=self._cosine_similarity(bank.embedding or [], _avg_embedding(combo)),
+                        amount_diff=Decimal("0"),               # sums equal
+                        amount_tol=stage.amount_tol or CENT,
+                        date_diff=avg_delta,
+                        date_tol=stage.avg_date_delta_days or 1,
+                        currency_match=1.0,
+                        weights=self.stage_weights,
                     )
-                    self._record(suggestion)
+                    self._record(self._make_suggestion(
+                        "one_to_many", [bank], list(combo), scores["global_score"],
+                        stage=stage, weights=self.stage_weights, component_scores=scores,
+                        extra={"group_span_days_measured": span_days, "avg_date_delta_days_measured": avg_delta}
+                    ))
                     return
-
+    
+    
     def _run_many_to_one(self, banks, books, stage: StageConfig):
         available_banks = [b for b in banks if b.id not in self.used_banks and b.company_id == self.company_id]
-        span_tol = stage.group_date_span_days if stage.group_date_span_days is not None else stage.date_tol
-        centroid_tol = stage.avg_date_diff_days if stage.avg_date_diff_days is not None else stage.date_tol
-
+        win = stage.candidate_window_days
+    
         for book in books:
             if book.id in self.used_books:
                 continue
+    
+            local_banks = [b for b in available_banks if abs((b.date - book.date).days) <= win]
+    
             for size in range(1, stage.max_group_size_bank + 1):
-                for combo in combinations(available_banks, size):
+                for combo in combinations(local_banks, size):
                     total = sum((b.amount_base for b in combo), Decimal("0"))
                     if q2(total) != q2(book.amount_base):
                         continue
                     if any(b.currency_id != book.currency_id for b in combo):
                         continue
-
-                    # NEW: span within the bank group
-                    if self._date_span_days(combo) > span_tol:
+    
+                    all_dates = [book.date] + [b.date for b in combo]
+                    span_days = (max(all_dates) - min(all_dates)).days
+                    if stage.group_span_days and span_days > stage.group_span_days:
                         continue
-
-                    # NEW: centroid gap (bank group wavg vs book single date)
+    
                     bank_avg = self._weighted_avg_date(combo)
-                    if bank_avg and book.date and abs((bank_avg - book.date).days) > centroid_tol:
+                    book_avg = book.date
+                    avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
+                    if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                         continue
-
-                    suggestion = self._make_suggestion(
-                        "many_to_one", combo, [book], 1.0, stage=stage, weights=self.stage_weights
+    
+                    scores = compute_match_scores(
+                        embed_sim=self._cosine_similarity(_avg_embedding(combo), book.embedding or []),
+                        amount_diff=Decimal("0"),
+                        amount_tol=stage.amount_tol or CENT,
+                        date_diff=avg_delta,
+                        date_tol=stage.avg_date_delta_days or 1,
+                        currency_match=1.0,
+                        weights=self.stage_weights,
                     )
-                    self._record(suggestion)
+                    self._record(self._make_suggestion(
+                        "many_to_one", list(combo), [book], scores["global_score"],
+                        stage=stage, weights=self.stage_weights, component_scores=scores,
+                        extra={"group_span_days_measured": span_days, "avg_date_delta_days_measured": avg_delta}
+                    ))
                     return
 
     def _run_fuzzy_1to1(self, banks, books, stage: StageConfig):
-        centroid_tol = stage.avg_date_diff_days if stage.avg_date_diff_days is not None else stage.date_tol
-        bin_size = max(1, min(centroid_tol, 7))
-
-        book_bins = build_date_bins(
-            [b for b in books if b.id not in self.used_books],
-            get_date=lambda e: e.date,
-            bin_size_days=bin_size,
-        )
+        win = max(1, min(stage.candidate_window_days, 7))
+        book_bins = build_date_bins([b for b in books if b.id not in self.used_books],
+                                    get_date=lambda e: e.date,
+                                    bin_size_days=win)
+    
         for bank in banks:
             if bank.id in self.used_banks:
                 continue
-            candidates = list(iter_date_bin_candidates(bank.date, book_bins, bin_size, centroid_tol))
+    
+            candidates = list(iter_date_bin_candidates(bank.date, book_bins, win, stage.candidate_window_days))
             buckets = build_amount_buckets(candidates, get_amount=lambda e: e.amount_base)
-
+    
             for book in probe_amount_buckets(buckets, bank.amount_base, stage.amount_tol):
                 if book.id in self.used_books:
                     continue
-
+    
+                # Currency + amount guards
                 currency_match = 1.0 if bank.currency_id == book.currency_id else 0.0
-                d_diff = abs((bank.date - book.date).days) if bank.date and book.date else centroid_tol + 1
-                if d_diff > centroid_tol:
-                    continue
-
                 a_diff = abs(q2(bank.amount_base) - q2(book.amount_base))
                 if a_diff > stage.amount_tol:
                     continue
-
+    
+                # NEW: date guards
+                d_span = abs((bank.date - book.date).days) if bank.date and book.date else stage.candidate_window_days + 1
+                if stage.group_span_days and d_span > stage.group_span_days:
+                    continue
+    
+                avg_delta = d_span  # for 1:1, group avg == own date
+                if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
+                    continue
+    
+                # Scoring (use avg_delta for the date score)
                 embed_sim = self._cosine_similarity(bank.embedding or [], book.embedding or [])
                 weights = {
                     "embedding": stage.embedding_weight if stage.embedding_weight is not None else self.stage_weights["embedding"],
@@ -408,21 +448,19 @@ class ReconciliationPipelineEngine:
                     "currency":  stage.currency_weight  if stage.currency_weight  is not None else self.stage_weights["currency"],
                     "date":      stage.date_weight      if stage.date_weight      is not None else self.stage_weights["date"],
                 }
-
                 scores = compute_match_scores(
                     embed_sim=embed_sim,
                     amount_diff=a_diff,
                     amount_tol=stage.amount_tol,
-                    date_diff=d_diff,
-                    date_tol=centroid_tol,
+                    date_diff=avg_delta,
+                    date_tol=stage.avg_date_delta_days or 1,
                     currency_match=currency_match,
                     weights=weights,
                 )
-
+    
                 suggestion = self._make_suggestion(
                     "fuzzy_1to1",
-                    [bank],
-                    [book],
+                    [bank], [book],
                     scores["global_score"],
                     stage=stage,
                     weights=weights,
@@ -430,9 +468,8 @@ class ReconciliationPipelineEngine:
                     extra={
                         "embed_similarity": float(embed_sim),
                         "amount_diff": float(a_diff),
-                        "date_centroid_diff_days": int(d_diff),
-                        "group_span_bank_days": 0,
-                        "group_span_book_days": 0,
+                        "group_span_days_measured": int(d_span),
+                        "avg_date_delta_days_measured": int(avg_delta),
                         "currency_match": currency_match,
                     },
                 )
@@ -443,114 +480,77 @@ class ReconciliationPipelineEngine:
         sorted_banks.sort(key=lambda b: b.date)
         sorted_books = [e for e in books if e.id not in self.used_books and e.company_id == self.company_id]
         sorted_books.sort(key=lambda e: e.date)
-
-        log.debug(
-            "Starting many-to-many reconciliation stage na company %d: banks=%d sorted_banks=%d books=%d sorted_books=%d",
-            self.company_id, len(banks), len(sorted_banks), len(books), len(sorted_books)
-        )
-
-        span_tol = stage.group_date_span_days if stage.group_date_span_days is not None else stage.date_tol
-        centroid_tol = stage.avg_date_diff_days if stage.avg_date_diff_days is not None else stage.date_tol
-
+    
+        win = stage.candidate_window_days
+        log.debug("Starting many-to-many company=%d banks=%d books=%d win=%d",
+                  self.company_id, len(sorted_banks), len(sorted_books), win)
+    
         for bank in sorted_banks:
-            window_days = max(span_tol, centroid_tol)
-            start = bank.date - timedelta(days=window_days)
-            end = bank.date + timedelta(days=window_days)
+            start = bank.date - timedelta(days=win)
+            end   = bank.date + timedelta(days=win)
             bank_window = [b for b in sorted_banks if start <= b.date <= end]
             book_window = [e for e in sorted_books if start <= e.date <= end]
-
-            log.debug(
-                "Bank %s: date=%s, amount=%.2f, currency=%s, window banks=%d, window books=%d",
-                bank.id, bank.date, bank.amount, bank.currency_id, len(bank_window), len(book_window)
-            )
-
+    
             for i in range(1, min(stage.max_group_size_bank, len(bank_window)) + 1):
                 for bank_combo in combinations(bank_window, i):
                     sum_bank = sum((b.amount_base for b in bank_combo), Decimal("0"))
-
+    
                     for j in range(1, min(stage.max_group_size_book, len(book_window)) + 1):
                         for book_combo in combinations(book_window, j):
                             sum_book = sum((e.amount_base for e in book_combo), Decimal("0"))
-
                             if q2(sum_bank) != q2(sum_book):
                                 continue
-
                             if any(b.currency_id != e.currency_id for b in bank_combo for e in book_combo):
                                 continue
-
-                            # NEW: per-side span constraints
-                            if self._date_span_days(bank_combo) > span_tol:
+    
+                            # NEW: group span check
+                            all_dates = [b.date for b in bank_combo] + [e.date for e in book_combo]
+                            span_days = (max(all_dates) - min(all_dates)).days
+                            if stage.group_span_days and span_days > stage.group_span_days:
                                 continue
-                            if self._date_span_days(book_combo) > span_tol:
+    
+                            # NEW: weighted-average delta check
+                            bank_avg = self._weighted_avg_date(bank_combo)
+                            book_avg = self._weighted_avg_date(book_combo)
+                            avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
+                            if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                                 continue
-
-                            # NEW: centroid gap constraint
-                            b_avg = self._weighted_avg_date(bank_combo)
-                            e_avg = self._weighted_avg_date(book_combo)
-                            if b_avg and e_avg and abs((b_avg - e_avg).days) > centroid_tol:
-                                continue
-
-                            # after checks
-                            emb_bank = _avg_embedding(bank_combo)
-                            emb_book = _avg_embedding(book_combo)
-                            embed_sim = self._cosine_similarity(emb_bank, emb_book)
-
-                            a_diff = Decimal("0")  # sums already equal
-                            d_diff = abs((b_avg - e_avg).days) if (b_avg and e_avg) else 0
-                            currency_match = 1.0
-
+    
+                            # Scoring — use avg_delta for date component
+                            embed_sim = self._cosine_similarity(_avg_embedding(bank_combo), _avg_embedding(book_combo))
                             scores = compute_match_scores(
                                 embed_sim=embed_sim,
-                                amount_diff=a_diff,
+                                amount_diff=Decimal("0"),
                                 amount_tol=stage.amount_tol or CENT,
-                                date_diff=d_diff,
-                                date_tol=centroid_tol or 1,
-                                currency_match=currency_match,
+                                date_diff=avg_delta,
+                                date_tol=stage.avg_date_delta_days or 1,
+                                currency_match=1.0,
                                 weights=self.stage_weights,
                             )
-
-                            suggestion = self._make_suggestion(
+    
+                            self._record(self._make_suggestion(
                                 "many_to_many",
-                                list(bank_combo),
-                                list(book_combo),
+                                list(bank_combo), list(book_combo),
                                 scores["global_score"],
-                                stage=stage,
-                                weights=self.stage_weights,
-                                component_scores=scores,
-                                extra={
-                                    "embed_similarity": float(embed_sim),
-                                    "date_centroid_diff_days": int(d_diff),
-                                    "group_span_bank_days": self._date_span_days(bank_combo),
-                                    "group_span_book_days": self._date_span_days(book_combo),
-                                },
-                            )
-
-                            log.debug(
-                                "Recording valid suggestion: bank_ids=%s, journal_ids=%s",
-                                suggestion["bank_ids"], suggestion["journal_entries_ids"]
-                            )
-                            self._record(suggestion)
+                                stage=stage, weights=self.stage_weights, component_scores=scores,
+                                extra={"group_span_days_measured": span_days, "avg_date_delta_days_measured": avg_delta}
+                            ))
 
     
     def _date_span_days(self, items) -> int:
         dates = [it.date for it in items if it.date]
         return (max(dates) - min(dates)).days if len(dates) >= 2 else 0
 
-    def _weighted_avg_date(self, items):
-        """
-        Amount‑weighted average date using |amount_base| as weight
-        (same logic used for display in _aggregate_group_stats).
-        """
-        from datetime import date as _date
-        pairs = [(it.date, abs(it.amount_base))
-                 for it in items if it.date and it.amount_base is not None]
+    def _weighted_avg_date(self, items) -> Optional[date]:
+        pairs = [(it.date, abs(it.amount_base)) for it in items if it.date and it.amount_base is not None]
         if not pairs:
             return None
-        total = sum((w for _, w in pairs), Decimal("0"))
-        if not total:
+        total_abs = sum((w for _, w in pairs), Decimal("0"))
+        if not total_abs:
             return None
         num = sum((Decimal(d.toordinal()) * w for d, w in pairs), Decimal("0"))
-        ord_ = int((num / total).to_integral_value(ROUND_HALF_UP))
+        ord_ = int((num / total_abs).to_integral_value(ROUND_HALF_UP))
+        from datetime import date as _date
         return _date.fromordinal(ord_)
 
     # Internal helpers
@@ -650,9 +650,8 @@ class ReconciliationPipelineEngine:
         if stage is not None:
             match_params = {
                 "amount_tolerance": float(stage.amount_tol),
-                "date_tolerance_days": int(stage.date_tol),
-                "date_group_span_days": int(stage.group_date_span_days if stage.group_date_span_days is not None else stage.date_tol),
-                "avg_date_diff_days": int(stage.avg_date_diff_days if stage.avg_date_diff_days is not None else stage.date_tol),
+                "date_group_span_days": int(stage.group_span_days),
+                "date_avg_delta_days": int(stage.avg_date_delta_days),
                 "max_group_size_bank": int(stage.max_group_size_bank),
                 "max_group_size_book": int(stage.max_group_size_book),
             }
@@ -738,10 +737,8 @@ def run_single_config(cfg: object,
         max_group_size_bank=cfg.max_group_size_bank,
         max_group_size_book=cfg.max_group_size_book,
         amount_tol=cfg.amount_tolerance,
-        date_tol=cfg.date_tolerance_days,
-        # NEW: optional fields; if missing, remain None and fall back to date_tol
-        group_date_span_days=getattr(cfg, "group_date_span_days", None),
-        avg_date_diff_days=getattr(cfg, "avg_date_diff_days", None),
+        group_span_days=cfg.group_span_days,
+        avg_date_delta_days=cfg.avg_date_delta_days,
     )
 
     pipe_cfg = PipelineConfig(
@@ -789,43 +786,32 @@ def run_pipeline(pipeline: object,
         cfg = stage_obj.config
         if not stage_obj.enabled:
             continue
-
+    
         if cfg.max_group_size_bank > 1 or cfg.max_group_size_book > 1:
             stage_type = "many_to_many"
-        elif cfg.amount_tolerance > 0 or cfg.date_tolerance_days > 0:
+        elif cfg.amount_tolerance > 0 or (cfg.group_span_days > 0 or cfg.avg_date_delta_days > 0):
             stage_type = "fuzzy_1to1"
         else:
             stage_type = "exact_1to1"
-
-        # Pull per-stage overrides if present; otherwise use cfg; else leave None (fallback happens at runtime)
-        group_span = getattr(stage_obj, "group_date_span_days", None)
-        if group_span is None:
-            group_span = getattr(cfg, "group_date_span_days", None)
-
-        centroid_gap = getattr(stage_obj, "avg_date_diff_days", None)
-        if centroid_gap is None:
-            centroid_gap = getattr(cfg, "avg_date_diff_days", None)
-
+    
         stage_configs.append(StageConfig(
             type=stage_type,
             enabled=True,
             max_group_size_bank=stage_obj.max_group_size_bank or cfg.max_group_size_bank,
             max_group_size_book=stage_obj.max_group_size_book or cfg.max_group_size_book,
             amount_tol=stage_obj.amount_tolerance if stage_obj.amount_tolerance is not None else cfg.amount_tolerance,
-            date_tol=stage_obj.date_tolerance_days if stage_obj.date_tolerance_days is not None else cfg.date_tolerance_days,
-            group_date_span_days=group_span,
-            avg_date_diff_days=centroid_gap,
-            embedding_weight=stage_obj.embedding_weight if getattr(stage_obj, "embedding_weight", None) is not None else float(cfg.embedding_weight),
-            amount_weight=stage_obj.amount_weight if getattr(stage_obj, "amount_weight", None) is not None else float(cfg.amount_weight),
-            currency_weight=stage_obj.currency_weight if getattr(stage_obj, "currency_weight", None) is not None else float(cfg.currency_weight),
-            date_weight=stage_obj.date_weight if getattr(stage_obj, "date_weight", None) is not None else float(cfg.date_weight),
+            group_span_days=stage_obj.group_span_days if stage_obj.group_span_days is not None else cfg.group_span_days,
+            avg_date_delta_days=stage_obj.avg_date_delta_days if stage_obj.avg_date_delta_days is not None else cfg.avg_date_delta_days,
+            embedding_weight=float(stage_obj.embedding_weight) if stage_obj.embedding_weight is not None else float(cfg.embedding_weight),
+            amount_weight=float(stage_obj.amount_weight) if stage_obj.amount_weight is not None else float(cfg.amount_weight),
+            currency_weight=float(stage_obj.currency_weight) if stage_obj.currency_weight is not None else float(cfg.currency_weight),
+            date_weight=float(stage_obj.date_weight) if stage_obj.date_weight is not None else float(cfg.date_weight),
         ))
-
         weight_list.append({
-            "embedding": float(getattr(stage_obj, "embedding_weight", cfg.embedding_weight)),
-            "amount":    float(getattr(stage_obj, "amount_weight",    cfg.amount_weight)),
-            "currency":  float(getattr(stage_obj, "currency_weight",  cfg.currency_weight)),
-            "date":      float(getattr(stage_obj, "date_weight",      cfg.date_weight)),
+            "embedding": float(stage_obj.embedding_weight) if stage_obj.embedding_weight is not None else float(cfg.embedding_weight),
+            "amount":    float(stage_obj.amount_weight)    if stage_obj.amount_weight    is not None else float(cfg.amount_weight),
+            "currency":  float(stage_obj.currency_weight)  if stage_obj.currency_weight  is not None else float(cfg.currency_weight),
+            "date":      float(stage_obj.date_weight)      if stage_obj.date_weight      is not None else float(cfg.date_weight),
         })
 
     pipe_cfg = PipelineConfig(
