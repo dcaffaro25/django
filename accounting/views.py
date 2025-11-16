@@ -11,6 +11,7 @@ from django.utils import timezone
 from datetime import timedelta
 from itertools import product, combinations
 from multitenancy.api_utils import generic_bulk_create, generic_bulk_update, generic_bulk_delete
+from multitenancy.utils import resolve_tenant
 from multitenancy.models import CustomUser, Company, Entity
 from multitenancy.mixins import ScopedQuerysetMixin
 from .models import (Currency, Account, Transaction, JournalEntry, Rule, CostCenter, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter,ReconciliationTask, ReconciliationConfig)
@@ -1422,7 +1423,15 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         
     queryset = ReconciliationTask.objects.all().order_by("-created_at")
     serializer_class = ReconciliationTaskSerializer
-
+    
+    def get_queryset(self):
+        qs = ReconciliationTask.objects.all().order_by("-created_at")
+        # Accept tenant from router path or ?tenant_id=...
+        tenant_id = self.kwargs.get("tenant_id") or self.request.query_params.get("tenant_id")
+        if tenant_id:
+            qs = qs.filter(tenant_id=tenant_id)
+        return qs
+    
     @action(detail=False, methods=["post"])
     def start(self, request, tenant_id=None):
         """
@@ -1462,55 +1471,64 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=["get"], url_path="fresh-suggestions")
     def fresh_suggestions(self, request, pk=None, tenant_id=None):
         """
-        Return the task's suggestions after filtering out any that involve
-        bank or journal records that are already reconciled (matched/approved).
+        Return only the suggestions from this task that are still 'fresh':
+        i.e., none of their bank_ids or journal_entries_ids are already used
+        in a matched/approved reconciliation for this tenant.
         """
         task = self.get_object()
+
         result = task.result or {}
-        suggestions = result.get("suggestions", [])
-
+        suggestions = result.get("suggestions") or []
         if not suggestions:
-            return Response({"suggestions": [], "removed": 0, "total": 0})
+            return Response({"count": 0, "suggestions": []})
 
-        # Collect all ids we need to check in one shot
-        all_bank_ids = set()
-        all_book_ids = set()
-        for s in suggestions:
-            all_bank_ids.update(s.get("bank_ids", []))
-            all_book_ids.update(s.get("journal_entries_ids", []))
+        # Company scope from tenant
+        company = resolve_tenant(tenant_id)
+        company_id = company.id
 
-        # Which of those are already reconciled?
-        reconciled_banks = set(
-            BankTransaction.objects
-            .filter(id__in=all_bank_ids, reconciliations__status__in=["matched", "approved"])
-            .values_list("id", flat=True)
+        # Sets of already reconciled IDs for this company
+        used_bank_ids = set(
+            BankTransaction.objects.filter(
+                company_id=company_id,
+                reconciliations__status__in=["matched", "approved"],
+            ).values_list("id", flat=True)
         )
-        reconciled_books = set(
-            JournalEntry.objects
-            .filter(id__in=all_book_ids, reconciliations__status__in=["matched", "approved"])
-            .values_list("id", flat=True)
+        used_book_ids = set(
+            JournalEntry.objects.filter(
+                company_id=company_id,
+                reconciliations__status__in=["matched", "approved"],
+            ).values_list("id", flat=True)
         )
 
-        filtered = []
-        removed = []
+        # Optional filters
+        try:
+            min_conf = float(request.query_params.get("min_confidence", "0"))
+        except ValueError:
+            min_conf = 0.0
+        try:
+            limit = int(request.query_params.get("limit", "1000"))
+        except ValueError:
+            limit = 1000
+
+        fresh = []
         for s in suggestions:
-            b_ids = s.get("bank_ids", [])
-            j_ids = s.get("journal_entries_ids", [])
-            if any(b in reconciled_banks for b in b_ids) or any(j in reconciled_books for j in j_ids):
-                removed.append({
-                    "bank_ids": b_ids,
-                    "journal_entry_ids": j_ids,
-                    "reason": "already_reconciled"
-                })
+            if s.get("confidence_score", 0) < min_conf:
                 continue
-            filtered.append(s)
+            b_ids = set(s.get("bank_ids", []))
+            j_ids = set(s.get("journal_entries_ids", []))
+            # Skip if any id already reconciled
+            if b_ids & used_bank_ids:
+                continue
+            if j_ids & used_book_ids:
+                continue
+            fresh.append(s)
+            if len(fresh) >= limit:
+                break
 
-        return Response({
-            "total": len(suggestions),
-            "removed": len(removed),
-            "suggestions": filtered,
-            "removed_details": removed[:50],  # trim if you want
-        })
+        return Response(
+            {"count": len(fresh), "suggestions": fresh},
+            status=status.HTTP_200_OK,
+        )
     
     @action(detail=True, methods=["get"])
     def status(self, request, pk=None, tenant_id=None):
