@@ -110,7 +110,7 @@ class StageConfig:
 class PipelineConfig:
     stages: list[StageConfig] = field(default_factory=list)
     auto_apply_score: float = 1.0
-    max_suggestions: int = 1000
+    max_suggestions: int = 10000
 
 
 # ----------------------------------------------------------------------
@@ -912,7 +912,7 @@ def run_single_config(cfg: object,
     pipe_cfg = PipelineConfig(
         stages=[stage],
         auto_apply_score=float(getattr(cfg, "min_confidence", 1.0)),
-        max_suggestions=getattr(cfg, "max_suggestions", 1000),
+        max_suggestions=getattr(cfg, "max_suggestions", 10000),
     )
     engine = ReconciliationPipelineEngine(company_id=company_id, config=pipe_cfg)
     engine.current_weights = {
