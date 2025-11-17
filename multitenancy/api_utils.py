@@ -115,11 +115,17 @@ MODEL_APP_MAP = {
     "FinancialIndex": "core",
     "IndexQuote": "core",
     "FinancialIndexQuoteForecast": "core",
+    "Position":"hr",
+    "Employee":"hr",
+    "TimeTracking":"hr",
+    "RecurringAdjustment":"hr",
     "DocTypeRule": "npl",
     "SpanRule": "npl",
     
     # Add other model-app mappings as needed
 }
+
+
 
 def _json_safe(obj):
     """Convert arbitrary Python/Django objects into JSON-serializable structures."""
@@ -827,7 +833,55 @@ class BulkImportTemplateDownloadView(APIView):
             "BankTransaction": ["__row_id", "company_fk", "entity_fk", "bank_account_fk", "date", "amount", "description", "currency_fk", "transaction_type", "check_number", "reference_number", "payee", "memo", "account_number", "routing_number", "transaction_id"],
             "IntegrationRule": ["__row_id", "company_fk","name","description","trigger_event","execution_order","filter_conditions","rule","use_celery","is_active","last_run_at","times_executed"],
             "SubstitutionRule": ["__row_id", "company_fk","title","model_name","field_name","column_name","column_index","match_type","match_value","substitution_value","filter_conditions"],
+            "Position": ["__row_id", "company_fk","title","description","department","hierarchy_level","min_salary","max_salary"],
+            "Employee": ["__row_id", "company_fk","CPF","name",
+                         "position_fk",
+                         "hire_date",
+                         "salary",
+                         "vacation_days"],
+            "TimeTracking": ["__row_id", "company_fk","employee_fk",
+                             "month_date",
+                             "total_hours_worked",
+                             "total_overtime_hours",
+                             "overtime_hours_paid",
+                             "days_present",
+                             "days_absent",
+                             "leave_days",
+                             "effective_hours",
+                             "bank_hours_balance",
+                             "vacation_start_date",
+                             "vacation_end_date",
+                             "vacation_days_used",
+                             "absence_reason",
+                             "status"],
+            "RecurringAdjustment": ["__row_id", "company_fk","name",
+                                    "type",
+                                    "employee_fk",
+                                    "start_date",
+                                    "end_date",
+                                    "base_for_inss",
+                                    "base_for_fgts",
+                                    "base_for_irpf",
+                                    "calculation_formula",
+                                    "employer_cost_formula",
+                                    "priority",
+                                    "default_account_fk"]
+        
+        
         }
+
+
+
+
+
+    
+
+    
+    
+
+
+
+
 
         ws = wb.active
         ws.title = 'Company'

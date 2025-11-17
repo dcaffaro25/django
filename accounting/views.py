@@ -1063,6 +1063,440 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     def finalize_reconciliation_matches(self, request, *args, **kwargs):
         """
         Finalize a batch of reconciliation matches (optionally creating an adjustment on one side).
+    
+        Optimised version:
+          - no giant transaction; each DB write uses autocommit
+          - batch pre-load of BankTransaction / JournalEntry
+          - no global select_for_update() locks
+          - single bulk_update() for promotion
+        """
+        request_id = str(uuid.uuid4())
+    
+        data = request.data
+        matches = data.get("matches", [])
+        adjustment_side = data.get("adjustment_side", "none")  # "bank" | "journal" | "none"
+        reference = data.get("reference", "")
+        notes = data.get("notes", "")
+    
+        _info(
+            "finalize_begin",
+            request_id=request_id,
+            n_matches=len(matches),
+            adjustment_side=adjustment_side,
+            reference=reference or "",
+            notes_len=len(notes or ""),
+        )
+    
+        created_records: list[dict] = []
+        problems: list[dict] = []
+    
+        # ------------------------------------------------------------------
+        # 1) Pre-collect all IDs for batching
+        # ------------------------------------------------------------------
+        all_bank_ids: set[int] = set()
+        all_journal_ids: set[int] = set()
+        for m in matches:
+            raw_bank = m.get("bank_transaction_ids", []) or []
+            raw_journal = m.get("journal_entry_ids", []) or []
+            all_bank_ids.update(int(x) for x in raw_bank if x is not None)
+            all_journal_ids.update(int(x) for x in raw_journal if x is not None)
+    
+        if not all_bank_ids and not all_journal_ids:
+            return Response({"created": [], "problems": [{"reason": "no_ids"}]})
+    
+        # ------------------------------------------------------------------
+        # 2) Pre-load already reconciled IDs in TWO queries
+        # ------------------------------------------------------------------
+        already_bank_ids = set(
+            BankTransaction.objects.filter(
+                id__in=all_bank_ids,
+                reconciliations__status__in=["matched", "approved"],
+            ).values_list("id", flat=True)
+        )
+        already_journal_ids = set(
+            JournalEntry.objects.filter(
+                id__in=all_journal_ids,
+                reconciliations__status__in=["matched", "approved"],
+            ).values_list("id", flat=True)
+        )
+    
+        _dbg(
+            "preload_already",
+            request_id=request_id,
+            n_bank_ids=len(all_bank_ids),
+            n_journal_ids=len(all_journal_ids),
+            already_banks=len(already_bank_ids),
+            already_journals=len(already_journal_ids),
+        )
+    
+        # ------------------------------------------------------------------
+        # 3) Pre-load all referenced Bank / Journal rows (NO locking)
+        # ------------------------------------------------------------------
+        bank_map: dict[int, BankTransaction] = BankTransaction.objects.in_bulk(all_bank_ids)
+    
+        journal_map: dict[int, JournalEntry] = {
+            je.id: je
+            for je in JournalEntry.objects.filter(id__in=all_journal_ids)
+            .select_related("transaction", "account", "account__bank_account", "cost_center")
+        }
+    
+        _dbg(
+            "preload_maps",
+            request_id=request_id,
+            banks_loaded=len(bank_map),
+            journals_loaded=len(journal_map),
+        )
+    
+        # ------------------------------------------------------------------
+        # 4) Caches for expensive helpers and per-batch usage tracking
+        # ------------------------------------------------------------------
+        pending_structs_cache: dict[tuple[int, int], tuple] = {}   # (company, currency) -> (pending_ba, pending_gl)
+        gl_cache: dict[tuple[int, int], object] = {}               # (company, bank_account_id) -> gl_account
+    
+        # journal entries to bulk-update at the end
+        jes_to_update: list[JournalEntry] = []
+    
+        # avoid reusing same IDs in the same batch
+        used_bank_ids_batch: set[int] = set()
+        used_journal_ids_batch: set[int] = set()
+    
+        # ------------------------------------------------------------------
+        # 5) Process each match
+        # ------------------------------------------------------------------
+        for idx, match in enumerate(matches, start=1):
+            try:
+                raw_bank = match.get("bank_transaction_ids", []) or []
+                raw_journal = match.get("journal_entry_ids", []) or []
+                bank_ids = list({int(x) for x in raw_bank if x is not None})
+                journal_ids = list({int(x) for x in raw_journal if x is not None})
+    
+                if not bank_ids or not journal_ids:
+                    problems.append({"reason": "empty_ids", "match": match})
+                    _warn("match_skip_empty_ids", request_id=request_id, i=idx)
+                    continue
+    
+                # Skip if used already in this batch
+                if any(bid in used_bank_ids_batch for bid in bank_ids) or any(
+                    jid in used_journal_ids_batch for jid in journal_ids
+                ):
+                    problems.append(
+                        {
+                            "reason": "overlap_in_batch",
+                            "bank_ids": bank_ids,
+                            "journal_ids": journal_ids,
+                        }
+                    )
+                    _warn("match_skip_overlap_batch", request_id=request_id, i=idx)
+                    continue
+    
+                # Fast in-memory "already reconciled" check
+                if any(bid in already_bank_ids for bid in bank_ids) or any(
+                    jid in already_journal_ids for jid in journal_ids
+                ):
+                    problems.append(
+                        {
+                            "reason": "already_reconciled",
+                            "bank_ids": bank_ids,
+                            "journal_ids": journal_ids,
+                        }
+                    )
+                    _warn("match_skip_already_reconciled", request_id=request_id, i=idx)
+                    continue
+    
+                # Get objects from pre-loaded maps
+                bank_txs = [bank_map.get(bid) for bid in bank_ids if bid in bank_map]
+                journal_entries = [
+                    journal_map.get(jid) for jid in journal_ids if jid in journal_map
+                ]
+    
+                bank_txs = [bt for bt in bank_txs if bt is not None]
+                journal_entries = [je for je in journal_entries if je is not None]
+    
+                if not bank_txs or not journal_entries:
+                    problems.append(
+                        {
+                            "reason": "not_found",
+                            "bank_ids": bank_ids,
+                            "journal_ids": journal_ids,
+                        }
+                    )
+                    _warn("match_skip_not_found", request_id=request_id, i=idx)
+                    continue
+    
+                company_set = {bt.company_id for bt in bank_txs} | {
+                    je.company_id for je in journal_entries
+                }
+                currency_set = {bt.currency_id for bt in bank_txs} | {
+                    je.transaction.currency_id
+                    for je in journal_entries
+                    if je.transaction_id
+                }
+    
+                if len(company_set) != 1:
+                    problems.append(
+                        {
+                            "reason": "mixed_company",
+                            "bank_ids": bank_ids,
+                            "journal_ids": journal_ids,
+                        }
+                    )
+                    _warn(
+                        "match_skip_mixed_company",
+                        request_id=request_id,
+                        i=idx,
+                        companies=list(company_set),
+                    )
+                    continue
+                company_id = next(iter(company_set))
+    
+                if len(currency_set) != 1:
+                    problems.append(
+                        {
+                            "reason": "mixed_currency",
+                            "bank_ids": bank_ids,
+                            "journal_ids": journal_ids,
+                        }
+                    )
+                    _warn(
+                        "match_skip_mixed_currency",
+                        request_id=request_id,
+                        i=idx,
+                        currencies=list(currency_set),
+                    )
+                    continue
+                currency_id = next(iter(currency_set))
+    
+                # Cached pending structs per (company, currency)
+                pend_key = (company_id, currency_id)
+                if pend_key in pending_structs_cache:
+                    pending_ba, pending_gl = pending_structs_cache[pend_key]
+                else:
+                    pending_ba, pending_gl = ensure_pending_bank_structs(
+                        company_id, currency_id=currency_id
+                    )
+                    pending_structs_cache[pend_key] = (pending_ba, pending_gl)
+    
+                sum_bank = sum((bt.amount for bt in bank_txs), Decimal("0"))
+                sum_journal = sum(
+                    ((je.get_effective_amount() or Decimal("0")) for je in journal_entries),
+                    Decimal("0"),
+                )
+                diff = sum_bank - sum_journal
+    
+                bank_account_set = {bt.bank_account_id for bt in bank_txs if bt.bank_account_id}
+    
+                # Adjustment logic (same as before, just no savepoints)
+                if adjustment_side != "none" and diff != Decimal("0"):
+                    if adjustment_side == "bank":
+                        if len(bank_account_set) != 1:
+                            problems.append(
+                                {
+                                    "reason": "cannot_adjust_bank_with_multiple_accounts",
+                                    "bank_account_ids": list(bank_account_set),
+                                    "bank_ids": bank_ids,
+                                    "journal_ids": journal_ids,
+                                }
+                            )
+                            _warn(
+                                "adjust_skip_multi_ba",
+                                request_id=request_id,
+                                i=idx,
+                                bank_accounts=list(bank_account_set),
+                            )
+                        else:
+                            adjustment_amount = sum_journal - sum_bank
+                            bt0 = bank_txs[0]
+                            _dbg(
+                                "adjust_bank_create",
+                                request_id=request_id,
+                                i=idx,
+                                amount=str(adjustment_amount),
+                            )
+                            adj_bt = BankTransaction.objects.create(
+                                company_id=company_id,
+                                bank_account=bt0.bank_account,
+                                date=bt0.date,
+                                currency=bt0.currency,
+                                amount=adjustment_amount,
+                                description="Adjustment record for reconciliation",
+                                status="pending",
+                                tx_hash="adjustment_for_rec",
+                            )
+                            bank_txs.append(adj_bt)
+                            sum_bank += adjustment_amount
+    
+                    elif adjustment_side == "journal":
+                        adjustment_amount = sum_bank - sum_journal
+                        je0 = journal_entries[0]
+                        debit_amount = adjustment_amount if adjustment_amount > 0 else None
+                        credit_amount = -adjustment_amount if adjustment_amount < 0 else None
+                        _dbg(
+                            "adjust_journal_create",
+                            request_id=request_id,
+                            i=idx,
+                            amount=str(adjustment_amount),
+                            debit=str(debit_amount or 0),
+                            credit=str(credit_amount or 0),
+                        )
+                        adj_je = JournalEntry.objects.create(
+                            company_id=company_id,
+                            transaction=je0.transaction,
+                            account=(
+                                pending_gl
+                                if (
+                                    je0.account is None
+                                    or getattr(je0.account, "bank_account_id", None) is None
+                                )
+                                else je0.account
+                            ),
+                            cost_center=je0.cost_center,
+                            debit_amount=debit_amount,
+                            credit_amount=credit_amount,
+                            state="pending",
+                            date=je0.date or je0.transaction.date,
+                            bank_designation_pending=True,
+                        )
+                        journal_entries.append(adj_je)
+                        sum_journal += adjustment_amount
+    
+                final_diff = sum_bank - sum_journal
+                rec_status = "matched" if final_diff == Decimal("0") else "pending"
+    
+                bank_ids_used = [x.id for x in bank_txs]
+                journal_ids_used = [x.id for x in journal_entries]
+    
+                bank_ids_str = ", ".join(str(x) for x in bank_ids_used)
+                journal_ids_str = ", ".join(str(x) for x in journal_ids_used)
+                combined_notes = (
+                    f"{notes}\n"
+                    f"Bank IDs: {bank_ids_str}\n"
+                    f"Journal IDs: {journal_ids_str}\n"
+                    f"Difference: {final_diff}"
+                )
+    
+                rec = Reconciliation.objects.create(
+                    company_id=company_id,
+                    status=rec_status,
+                    reference=reference,
+                    notes=combined_notes,
+                )
+                rec.bank_transactions.set(bank_txs)
+                rec.journal_entries.set(journal_entries)
+    
+                created_records.append(
+                    {
+                        "reconciliation_id": rec.id,
+                        "status": rec_status,
+                        "bank_ids_used": bank_ids_used,
+                        "journal_ids_used": journal_ids_used,
+                    }
+                )
+    
+                _info(
+                    "reconciliation_created",
+                    request_id=request_id,
+                    i=idx,
+                    reconciliation_id=rec.id,
+                    status=rec_status,
+                    n_bank=len(bank_txs),
+                    n_journal=len(journal_entries),
+                )
+    
+                # Mark used in this batch (so they won't be reused)
+                used_bank_ids_batch.update(bank_ids_used)
+                used_journal_ids_batch.update(journal_ids_used)
+    
+                # Promotion: collect changes for bulk_update
+                if len(bank_account_set) == 1:
+                    target_ba_id = next(iter(bank_account_set))
+    
+                    gl_key = (company_id, target_ba_id)
+                    if gl_key in gl_cache:
+                        target_gl = gl_cache[gl_key]
+                    else:
+                        target_ba = next(
+                            bt.bank_account
+                            for bt in bank_txs
+                            if bt.bank_account_id == target_ba_id
+                        )
+                        target_gl = ensure_gl_account_for_bank(company_id, target_ba)
+                        gl_cache[gl_key] = target_gl
+    
+                    changed = 0
+                    for je in journal_entries:
+                        acct_ba_id = (
+                            getattr(je.account, "bank_account_id", None)
+                            if je.account_id
+                            else None
+                        )
+                        if (
+                            acct_ba_id == pending_ba.id
+                            or je.account_id is None
+                            or getattr(je, "bank_designation_pending", False)
+                        ):
+                            if je.account_id != target_gl.id:
+                                je.account_id = target_gl.id
+                            if hasattr(je, "bank_designation_pending") and je.bank_designation_pending:
+                                je.bank_designation_pending = False
+                            jes_to_update.append(je)
+                            changed += 1
+                    _dbg(
+                        "promotion_done",
+                        request_id=request_id,
+                        i=idx,
+                        reassigned_lines=changed,
+                        target_gl_id=target_gl.id,
+                    )
+                else:
+                    problems.append(
+                        {
+                            "reason": "multiple_bank_accounts_in_match",
+                            "bank_account_ids": list(bank_account_set),
+                            "bank_ids": bank_ids,
+                            "journal_ids": journal_ids,
+                        }
+                    )
+                    _warn(
+                        "promotion_skipped_multi_ba",
+                        request_id=request_id,
+                        i=idx,
+                        bank_accounts=list(bank_account_set),
+                    )
+    
+            except Exception as outer_e:
+                problems.append(
+                    {"reason": "outer_exception", "error": str(outer_e), "match": match}
+                )
+                _warn(
+                    "match_outer_exception",
+                    request_id=request_id,
+                    i=idx,
+                    error=str(outer_e),
+                )
+    
+        # ------------------------------------------------------------------
+        # 6) Bulk-update all changed journal entries (promotion)
+        # ------------------------------------------------------------------
+        if jes_to_update:
+            unique_jes = {je.id: je for je in jes_to_update}.values()
+            JournalEntry.objects.bulk_update(
+                list(unique_jes), ["account", "bank_designation_pending"]
+            )
+    
+        _info(
+            "finalize_end",
+            request_id=request_id,
+            created=len(created_records),
+            problems=len(problems),
+        )
+    
+        return Response({"created": created_records, "problems": problems})
+
+    
+    @action(detail=False, methods=['post'])
+    def finalize_reconciliation_matches_legacy(self, request, *args, **kwargs):
+        """
+        Finalize a batch of reconciliation matches (optionally creating an adjustment on one side).
         """
         request_id = str(uuid.uuid4())
     
@@ -1392,15 +1826,7 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                         }
                     )
     
-                    _info(
-                        "reconciliation_created",
-                        request_id=request_id,
-                        i=idx,
-                        reconciliation_id=rec.id,
-                        status=rec_status,
-                        n_bank=len(bank_txs),
-                        n_journal=len(journal_entries),
-                    )
+                    #_info("reconciliation_created",request_id=request_id,i=idx,reconciliation_id=rec.id,status=rec_status,n_bank=len(bank_txs),n_journal=len(journal_entries))
     
                     # Promotion (collect changes for bulk_update)
                     if len(bank_account_set) == 1:
