@@ -4,7 +4,7 @@ import time
 from typing import List, Callable, Optional, Sequence
 from django.core.cache import cache
 from celery import shared_task, states
-from celery.exceptions import Ignore
+from celery.exceptions import Ignore, SoftTimeLimitExceeded
 from .services.reconciliation_service import ReconciliationService
 from .models import ReconciliationTask
 from django.db import transaction
@@ -87,16 +87,72 @@ def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=Fa
             auto_match_100=auto_match_100,
         )
 
-        logger.info("Task %s completed: %d suggestions, %d auto-applied",
-                    db_id, len(result.get("suggestions", [])),
-                    result.get("auto_match", {}).get("applied", 0))
+        suggestions = result.get("suggestions", []) or []
+        auto_info = result.get("auto_match", {}) or {}
+        stats = result.get("stats", {}) or {}
+
+        logger.info(
+            "Task %s completed: %d suggestions, %d auto-applied",
+            db_id,
+            len(suggestions),
+            auto_info.get("applied", 0),
+        )
+
+        # ---- persist stats into ReconciliationTask ----
+        task_obj.suggestion_count = int(stats.get("suggestion_count", len(suggestions)))
+        task_obj.bank_candidates = int(stats.get("bank_candidates", 0))
+        task_obj.journal_candidates = int(stats.get("journal_candidates", 0))
+
+        task_obj.matched_bank_transactions = int(
+            stats.get("matched_bank_transactions", 0)
+        )
+        task_obj.matched_journal_entries = int(
+            stats.get("matched_journal_entries", 0)
+        )
+
+        task_obj.duration_seconds = stats.get("duration_seconds")
+        task_obj.soft_time_limit_seconds = stats.get("time_limit_seconds")
+
+        task_obj.auto_match_enabled = bool(auto_info.get("enabled", False))
+        task_obj.auto_match_applied = int(auto_info.get("applied", 0))
+        task_obj.auto_match_skipped = int(auto_info.get("skipped", 0))
+
+        # keep full stats + result JSON
+        task_obj.stats = stats
+        task_obj.result = result
 
         task_obj.status = "completed"
-        task_obj.result = result
-        task_obj.save(update_fields=["status", "result", "updated_at"])
+        task_obj.save(update_fields=[
+            "status",
+            "result",
+            "stats",
+            "suggestion_count",
+            "bank_candidates",
+            "journal_candidates",
+            "matched_bank_transactions",
+            "matched_journal_entries",
+            "duration_seconds",
+            "soft_time_limit_seconds",
+            "auto_match_enabled",
+            "auto_match_applied",
+            "auto_match_skipped",
+            "updated_at",
+        ])
+
         return result
 
+    except SoftTimeLimitExceeded as e:
+        # Celery soft time limit hit: mark task as failed instead of leaving it "running"
+        msg = f"Soft time limit exceeded in Celery worker: {e}"
+        logger.warning("Recon task %s soft-timeout: %s", db_id, e)
+
+        task_obj.status = "failed"
+        task_obj.error_message = msg
+        task_obj.save(update_fields=["status", "error_message", "updated_at"])
+        raise
+
     except Exception as e:
+        logger.exception("Recon task %s raised exception: %s", db_id, e)
         task_obj.status = "failed"
         task_obj.error_message = str(e)
         task_obj.save(update_fields=["status", "error_message", "updated_at"])
