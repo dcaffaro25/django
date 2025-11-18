@@ -983,9 +983,14 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             tx_infos = file_summary.get("transactions", [])
             bank_code = file_summary.get("bank", {}).get("value", {}).get("bank_code") \
                 if isinstance(file_summary.get("bank", {}).get("value"), dict) else None
+            
+            bank_code = re.sub(r'\D', '',bank_code).lstrip('0')
+            
             account_num = file_summary.get("account", {}).get("value", {}).get("account_number") \
                 if isinstance(file_summary.get("account", {}).get("value"), dict) else None
-    
+            
+            account_num = re.sub(r'\D', '', account_num).lstrip('0')
+            
             # Re-derive bank/account models
             bank_obj = None
             if bank_code is not None:
@@ -2032,20 +2037,44 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         data = request.data
         auto_match_100 = _to_bool(data.get("auto_match_100", False))
 
-        # Pre-create a DB record, including config_id or pipeline_id in parameters
+        config_id = data.get("config_id")
+        pipeline_id = data.get("pipeline_id")
+
+        cfg = None
+        pipe = None
+        soft_limit = None
+
+        if config_id:
+            try:
+                cfg = ReconciliationConfig.objects.get(id=config_id)
+                soft_limit = getattr(cfg, "soft_time_limit_seconds", None)
+            except ReconciliationConfig.DoesNotExist:
+                cfg = None
+
+        if pipeline_id:
+            try:
+                pipe = ReconciliationPipeline.objects.get(id=pipeline_id)
+                # Pipeline-level soft limit overrides config-level if both are set
+                soft_limit = getattr(pipe, "soft_time_limit_seconds", None)
+            except ReconciliationPipeline.DoesNotExist:
+                pipe = None
+
         task_obj = ReconciliationTask.objects.create(
             task_id=uuid.uuid4(),
             tenant_id=tenant_id,
-            parameters=data,       # store full payload, incl. config_id/pipeline_id
+            parameters=data,
             status="queued",
+            config=cfg,
+            pipeline=pipe,
+            config_name=cfg.name if cfg else "",
+            pipeline_name=pipe.name if pipe else "",
+            soft_time_limit_seconds=soft_limit,
         )
 
-        # Launch Celery; the payload passes through to the service untouched
         async_result = match_many_to_many_task.delay(task_obj.id, data, tenant_id, auto_match_100)
 
-        # Update our record with the Celery task ID
         task_obj.task_id = async_result.id
-        task_obj.save(update_fields=["task_id"])
+        task_obj.save(update_fields=["task_id", "updated_at"])
 
         return Response({
             "message": "Task enqueued",

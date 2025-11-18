@@ -404,7 +404,52 @@ class BankTransactionSerializer(serializers.ModelSerializer):
 class ReconciliationTaskSerializer(serializers.ModelSerializer):
     class Meta:
         model = ReconciliationTask
-        fields = "__all__"
+        fields = [
+            "id",
+            "task_id",
+            "status",
+            "tenant_id",
+
+            "config",
+            "config_name",
+            "pipeline",
+            "pipeline_name",
+
+            "parameters",
+            "result",
+            "error_message",
+
+            "bank_candidates",
+            "journal_candidates",
+            "suggestion_count",
+            "matched_bank_transactions",
+            "matched_journal_entries",
+            "auto_match_enabled",
+            "auto_match_applied",
+            "auto_match_skipped",
+            "duration_seconds",
+            "stats",
+
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "status",
+            "result",
+            "error_message",
+            "bank_candidates",
+            "journal_candidates",
+            "suggestion_count",
+            "matched_bank_transactions",
+            "matched_journal_entries",
+            "auto_match_enabled",
+            "auto_match_applied",
+            "auto_match_skipped",
+            "duration_seconds",
+            "stats",
+            "created_at",
+            "updated_at",
+        ]
 
 class ReconciliationSerializer(serializers.ModelSerializer):
     class Meta:

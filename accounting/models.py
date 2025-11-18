@@ -1,5 +1,7 @@
 # NORD/accounting/models.py
 
+from django.utils import timezone
+
 from re import U
 from django.db import models
 #from multitenancy.models import BaseModel, TenantAwareBaseModel#Company, CustomUser, Entity
@@ -540,76 +542,6 @@ class BankTransaction(TenantAwareBaseModel):
         return f'{self.date} - {self.amount} - {self.description} - {self.bank_account}'
     
     
-
-class ReconciliationTask(models.Model):
-    STATUS_CHOICES = [
-        ("queued", "queued"),
-        ("running", "running"),
-        ("completed", "completed"),
-        ("failed", "failed"),
-    ]
-
-    task_id = models.CharField(max_length=255, unique=True, db_index=True)
-    tenant_id = models.CharField(max_length=255, null=True, blank=True)
-
-    parameters = models.JSONField(default=dict)  # request payload
-    result = models.JSONField(null=True, blank=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="queued")
-    error_message = models.TextField(null=True, blank=True)
-
-    created_at = models.DateTimeField(default=now)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    def __str__(self):
-        return f"ReconciliationTask {self.task_id} ({self.status})"
-
-
-
-class Reconciliation(TenantAwareBaseModel):
-    """
-    Represents a reconciliation process linking journal entries and bank transactions.
-    """
-    journal_entries = models.ManyToManyField('JournalEntry', related_name='reconciliations')
-    bank_transactions = models.ManyToManyField('BankTransaction', related_name='reconciliations')
-    status = models.CharField(
-        max_length=50,
-        choices=[
-            ('pending', 'Pending'),
-            ('matched', 'Matched'),
-            ('unmatched', 'Unmatched'),
-            ('review', 'Pending Review'),
-            ('approved', 'Approved')
-        ],
-        default='pending'
-    )
-    # Use a DateTimeField to capture exact time.
-    #reconciled_at = models.DateTimeField(auto_now_add=True)
-    #reconciled_by = models.ForeignKey('multitenancy.CustomUser', on_delete=models.SET_NULL, null=True)
-    # Optional fields for added context:
-    reference = models.CharField(max_length=50, blank=True, null=True)
-    notes = models.TextField(blank=True, null=True)
-
-    def __str__(self):
-        journal_ids = ', '.join(str(j.id) for j in self.journal_entries.all())
-        bank_ids = ', '.join(str(b.id) for b in self.bank_transactions.all())
-        return f"Reconciliation {self.reference or ''}: Journals({journal_ids}) ↔ Banks({bank_ids})"
-
-    @property
-    def total_journal_amount(self):
-        # Sum the amounts from the related journal entries (using a defined method or field)
-        return sum(entry.get_amount() for entry in self.journal_entries.all() if entry.get_amount() is not None)
-
-    @property
-    def total_bank_amount(self):
-        # Sum the amounts from the related bank transactions
-        return sum(tx.amount for tx in self.bank_transactions.all() if tx.amount is not None)
-
-    @property
-    def discrepancy(self):
-        # The difference between bank and journal totals.
-        return self.total_bank_amount - self.total_journal_amount
-    
-    
 class ReconciliationConfig(models.Model):
     """Stores reusable reconciliation settings.
 
@@ -622,6 +554,7 @@ class ReconciliationConfig(models.Model):
     * `max_group_size_bank` / `max_group_size_book` – group sizes for many-to-many.
     * `embedding_weight`, `amount_weight`, `currency_weight`, `date_weight` – scoring weights.
     * `min_confidence`, `max_suggestions` – result thresholds/limits.
+    * `soft_time_limit_seconds` – soft runtime limit for this config run.
     """
 
     SCOPE_CHOICES = [
@@ -645,10 +578,10 @@ class ReconciliationConfig(models.Model):
     book_filters = models.JSONField(default=dict, blank=True, null=True)
 
     # Scoring weights (must sum to 1.0)
-    embedding_weight = models.DecimalField(max_digits=4, decimal_places=2, default=0.50) #####
-    amount_weight    = models.DecimalField(max_digits=4, decimal_places=2, default=0.35) #####
-    currency_weight  = models.DecimalField(max_digits=4, decimal_places=2, default=0.10) #####
-    date_weight      = models.DecimalField(max_digits=4, decimal_places=2, default=0.05) #####
+    embedding_weight = models.DecimalField(max_digits=4, decimal_places=2, default=0.50)
+    amount_weight    = models.DecimalField(max_digits=4, decimal_places=2, default=0.35)
+    currency_weight  = models.DecimalField(max_digits=4, decimal_places=2, default=0.10)
+    date_weight      = models.DecimalField(max_digits=4, decimal_places=2, default=0.05)
 
     # Tolerances / sizes
     amount_tolerance     = models.DecimalField(max_digits=12, decimal_places=2, default=0)
@@ -661,7 +594,14 @@ class ReconciliationConfig(models.Model):
     min_confidence  = models.DecimalField(max_digits=4, decimal_places=2, default=0.90)
     max_suggestions = models.PositiveIntegerField(default=1000)
 
-    # Additional tuning (unchanged)
+    # Soft runtime limit (used by engine and stats)
+    soft_time_limit_seconds = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Soft runtime limit in seconds for this config's reconciliation run.",
+    )
+
+    # Additional tuning
     fee_accounts = models.JSONField(default=list, blank=True, null=True)
     duplicate_window_days = models.PositiveIntegerField(default=3)
     text_similarity = models.JSONField(default=dict, blank=True, null=True)
@@ -697,7 +637,7 @@ class ReconciliationPipeline(models.Model):
 
     A pipeline belongs to a scope (global, company, user or company_user)
     and optionally references a company and/or user.  The pipeline
-    determines high‑level behaviour such as when to auto‑apply
+    determines high-level behaviour such as when to auto-apply
     matches and how many suggestions to return.  Actual stage logic
     comes from referenced `ReconciliationConfig` objects via
     `ReconciliationPipelineStage`.
@@ -729,14 +669,25 @@ class ReconciliationPipeline(models.Model):
     )
     name = models.CharField(max_length=255)
     description = models.TextField(blank=True, null=True)
+
     auto_apply_score = models.DecimalField(
-        max_digits=4, decimal_places=2, default=1.0,
-        help_text="Confidence threshold above which matches are auto‑applied."
+        max_digits=4,
+        decimal_places=2,
+        default=1.0,
+        help_text="Confidence threshold above which matches are auto-applied.",
     )
     max_suggestions = models.PositiveIntegerField(
         default=1000,
-        help_text="Maximum number of suggestions returned in one run."
+        help_text="Maximum number of suggestions returned in one run.",
     )
+
+    # Soft runtime limit in seconds for this pipeline
+    soft_time_limit_seconds = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Soft runtime limit in seconds for runs using this pipeline.",
+    )
+
     is_default = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -787,3 +738,119 @@ class ReconciliationPipelineStage(models.Model):
 
     def __str__(self) -> str:
         return f"{self.pipeline.name} • Stage {self.order} ({self.config.name})"
+
+
+class ReconciliationTask(models.Model):
+    STATUS_CHOICES = [
+        ("queued", "Queued"),
+        ("running", "Running"),
+        ("completed", "Completed"),
+        ("failed", "Failed"),
+        ("cancelled", "Cancelled"),
+    ]
+
+    task_id = models.CharField(max_length=255, blank=True, null=True, db_index=True)
+    status = models.CharField(max_length=32, choices=STATUS_CHOICES, default="queued")
+    tenant_id = models.CharField(max_length=64, db_index=True, blank=True, null=True,)
+
+    # Which config / pipeline was used
+    config = models.ForeignKey(
+        ReconciliationConfig,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="tasks",
+    )
+    pipeline = models.ForeignKey(
+        ReconciliationPipeline,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="tasks",
+    )
+
+    # Effective soft runtime limit in seconds used for this task (from config or pipeline)
+    soft_time_limit_seconds = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Soft runtime limit in seconds used for this reconciliation run (from config or pipeline).",
+    )
+
+    # Snapshots so you still see meaningful info if config/pipeline are renamed/deleted
+    config_name = models.CharField(max_length=255, blank=True, default="")
+    pipeline_name = models.CharField(max_length=255, blank=True, default="")
+
+    # Original fields
+    parameters = models.JSONField(default=dict, blank=True)
+    result = models.JSONField(null=True, blank=True)
+    error_message = models.TextField(null=True, blank=True)
+
+    # High-level recon stats
+    bank_candidates = models.PositiveIntegerField(default=0)
+    journal_candidates = models.PositiveIntegerField(default=0)
+    suggestion_count = models.PositiveIntegerField(default=0)
+    matched_bank_transactions = models.PositiveIntegerField(default=0)
+    matched_journal_entries = models.PositiveIntegerField(default=0)
+
+    auto_match_enabled = models.BooleanField(default=False)
+    auto_match_applied = models.PositiveIntegerField(default=0)
+    auto_match_skipped = models.PositiveIntegerField(default=0)
+
+    duration_seconds = models.FloatField(null=True, blank=True)
+
+    # Full stats blob from ReconciliationService.match_many_to_many
+    stats = models.JSONField(default=dict, blank=True)
+
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self) -> str:
+        return f"ReconTask(id={self.id}, status={self.status}, tenant={self.tenant_id})"
+
+
+
+class Reconciliation(TenantAwareBaseModel):
+    """
+    Represents a reconciliation process linking journal entries and bank transactions.
+    """
+    journal_entries = models.ManyToManyField('JournalEntry', related_name='reconciliations')
+    bank_transactions = models.ManyToManyField('BankTransaction', related_name='reconciliations')
+    status = models.CharField(
+        max_length=50,
+        choices=[
+            ('pending', 'Pending'),
+            ('matched', 'Matched'),
+            ('unmatched', 'Unmatched'),
+            ('review', 'Pending Review'),
+            ('approved', 'Approved')
+        ],
+        default='pending'
+    )
+    # Use a DateTimeField to capture exact time.
+    #reconciled_at = models.DateTimeField(auto_now_add=True)
+    #reconciled_by = models.ForeignKey('multitenancy.CustomUser', on_delete=models.SET_NULL, null=True)
+    # Optional fields for added context:
+    reference = models.CharField(max_length=50, blank=True, null=True)
+    notes = models.TextField(blank=True, null=True)
+
+    def __str__(self):
+        journal_ids = ', '.join(str(j.id) for j in self.journal_entries.all())
+        bank_ids = ', '.join(str(b.id) for b in self.bank_transactions.all())
+        return f"Reconciliation {self.reference or ''}: Journals({journal_ids}) ↔ Banks({bank_ids})"
+
+    @property
+    def total_journal_amount(self):
+        # Sum the amounts from the related journal entries (using a defined method or field)
+        return sum(entry.get_amount() for entry in self.journal_entries.all() if entry.get_amount() is not None)
+
+    @property
+    def total_bank_amount(self):
+        # Sum the amounts from the related bank transactions
+        return sum(tx.amount for tx in self.bank_transactions.all() if tx.amount is not None)
+
+    @property
+    def discrepancy(self):
+        # The difference between bank and journal totals.
+        return self.total_bank_amount - self.total_journal_amount
+    
+    

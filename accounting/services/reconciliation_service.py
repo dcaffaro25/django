@@ -8,7 +8,7 @@ data classes (DTOs) to carry data into a configurable matching engine.
 """
 
 from __future__ import annotations
-
+from time import monotonic
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
@@ -111,7 +111,7 @@ class PipelineConfig:
     stages: list[StageConfig] = field(default_factory=list)
     auto_apply_score: float = 1.0
     max_suggestions: int = 10000
-
+    max_runtime_seconds: float | None = None   # NEW
 
 # ----------------------------------------------------------------------
 #  Utility functions
@@ -293,16 +293,39 @@ class ReconciliationPipelineEngine:
             "currency":  0.10,
             "date":      0.05,
         }
-
+        
+        # Soft runtime limit support
+        self.max_runtime_seconds: float | None = config.max_runtime_seconds
+        self._start_ts: float = monotonic()
+    
+    def _time_exceeded(self) -> bool:
+        """
+        Return True if the configured soft time limit (if any) has been exceeded.
+        """
+        if not self.max_runtime_seconds:
+            return False
+        return (monotonic() - self._start_ts) >= self.max_runtime_seconds
+    
     def run(self, banks: list[BankTransactionDTO], books: list[JournalEntryDTO]) -> list[dict]:
         for idx, stage in enumerate(self.config.stages):
             if not stage.enabled:
                 continue
-            self.stage_weights = self.current_weights[idx] if isinstance(self.current_weights, list) else self.current_weights
-    
+            
+            if self._time_exceeded():
+                log.debug(
+                    "Time limit reached before stage %d (%s); stopping pipeline.",
+                    idx, stage.type,
+                )
+                break
+            
+            self.stage_weights = (
+                self.current_weights[idx]
+                if isinstance(self.current_weights, list)
+                else self.current_weights
+            )
+            
             handler = getattr(self, f"_run_{stage.type}", None)
     
-            # UPDATED LOG LINE (no date_tol; show both new knobs)
             log.debug(
                 "Stage %d (%s): weights=%s amount_tol=%s group_span_days=%d avg_date_delta_days=%d "
                 "max_grp_bank=%d max_grp_book=%d banks=%d books=%d",
@@ -314,14 +337,27 @@ class ReconciliationPipelineEngine:
     
             if handler:
                 handler(banks, books, stage)
+                
+                if self._time_exceeded():
+                    log.debug(
+                        "Time limit reached after stage %d (%s); stopping pipeline.",
+                        idx, stage.type,
+                    )
+                    break
+                
                 if len(self.suggestions) >= self.config.max_suggestions:
                     break
+                
         return self.suggestions[: self.config.max_suggestions]
 
-    # Stage handlers
+    # ------------------------ Stage handlers ------------------------
+
     def _run_exact_1to1(self, banks, books, stage: StageConfig):
         tol = int(stage.avg_date_delta_days or 0)
         for bank in banks:
+            if self._time_exceeded():
+                return
+            
             if bank.id in self.used_banks:
                 continue
             for book in books:
@@ -333,10 +369,19 @@ class ReconciliationPipelineEngine:
                     continue
                 if bank.currency_id != book.currency_id:
                     continue
-                # Cross‑side constraint: |bank.date - book.date| <= avg_date_delta_days
+                # Cross-side constraint: |bank.date - book.date| <= avg_date_delta_days
                 if bank.date and book.date and abs((bank.date - book.date).days) > tol:
                     continue
-                self._record(self._make_suggestion("exact_1to1", [bank], [book], 1.0, stage=stage, weights=self.stage_weights))
+                self._record(
+                    self._make_suggestion(
+                        "exact_1to1",
+                        [bank],
+                        [book],
+                        1.0,
+                        stage=stage,
+                        weights=self.stage_weights,
+                    )
+                )
                 break
 
     def _run_one_to_many(self, banks, books, stage: StageConfig):
@@ -344,6 +389,9 @@ class ReconciliationPipelineEngine:
         win = stage.candidate_window_days
     
         for bank in banks:
+            if self._time_exceeded():
+                return
+            
             if bank.id in self.used_banks:
                 continue
     
@@ -362,13 +410,13 @@ class ReconciliationPipelineEngine:
                     if any(b.currency_id != bank.currency_id for b in combo):
                         continue
     
-                    # INTRA‑side: span constraint ONLY for the grouped side (books)
+                    # INTRA-side: span constraint ONLY for the grouped side (books)
                     book_dates = [b.date for b in combo if b.date]
                     book_span = (max(book_dates) - min(book_dates)).days if len(book_dates) >= 2 else 0
                     if stage.group_span_days and book_span > stage.group_span_days:
                         continue
     
-                    # CROSS‑side: weighted‑avg date delta
+                    # CROSS-side: weighted-avg date delta
                     bank_avg = bank.date
                     book_avg = self._weighted_avg_date(combo)
                     avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
@@ -385,22 +433,31 @@ class ReconciliationPipelineEngine:
                         currency_match=1.0,
                         weights=self.stage_weights,
                     )
-                    self._record(self._make_suggestion(
-                        "one_to_many", [bank], list(combo), scores["global_score"],
-                        stage=stage, weights=self.stage_weights, component_scores=scores,
-                        extra={
-                            "book_span_days_measured": book_span,
-                            "avg_date_delta_days_measured": avg_delta
-                        }
-                    ))
+                    self._record(
+                        self._make_suggestion(
+                            "one_to_many",
+                            [bank],
+                            list(combo),
+                            scores["global_score"],
+                            stage=stage,
+                            weights=self.stage_weights,
+                            component_scores=scores,
+                            extra={
+                                "book_span_days_measured": book_span,
+                                "avg_date_delta_days_measured": avg_delta,
+                            },
+                        )
+                    )
                     return
-    
     
     def _run_many_to_one(self, banks, books, stage: StageConfig):
         available_banks = [b for b in banks if b.id not in self.used_banks and b.company_id == self.company_id]
         win = stage.candidate_window_days
     
         for book in books:
+            if self._time_exceeded():
+                return
+            
             if book.id in self.used_books:
                 continue
     
@@ -418,13 +475,13 @@ class ReconciliationPipelineEngine:
                     if any(b.currency_id != book.currency_id for b in combo):
                         continue
     
-                    # INTRA‑side: span constraint ONLY for the grouped side (banks)
+                    # INTRA-side: span constraint ONLY for the grouped side (banks)
                     bank_dates = [b.date for b in combo if b.date]
                     bank_span = (max(bank_dates) - min(bank_dates)).days if len(bank_dates) >= 2 else 0
                     if stage.group_span_days and bank_span > stage.group_span_days:
                         continue
     
-                    # CROSS‑side: weighted‑avg date delta
+                    # CROSS-side: weighted-avg date delta
                     bank_avg = self._weighted_avg_date(combo)
                     book_avg = book.date
                     avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
@@ -441,14 +498,21 @@ class ReconciliationPipelineEngine:
                         currency_match=1.0,
                         weights=self.stage_weights,
                     )
-                    self._record(self._make_suggestion(
-                        "many_to_one", list(combo), [book], scores["global_score"],
-                        stage=stage, weights=self.stage_weights, component_scores=scores,
-                        extra={
-                            "bank_span_days_measured": bank_span,
-                            "avg_date_delta_days_measured": avg_delta
-                        }
-                    ))
+                    self._record(
+                        self._make_suggestion(
+                            "many_to_one",
+                            list(combo),
+                            [book],
+                            scores["global_score"],
+                            stage=stage,
+                            weights=self.stage_weights,
+                            component_scores=scores,
+                            extra={
+                                "bank_span_days_measured": bank_span,
+                                "avg_date_delta_days_measured": avg_delta,
+                            },
+                        )
+                    )
                     return
 
     def _run_fuzzy_1to1(self, banks, books, stage: StageConfig):
@@ -461,7 +525,6 @@ class ReconciliationPipelineEngine:
           3) Greedily pick a non-overlapping set of pairs
         """
 
-        # Use a small bin to keep buckets tight, but respect the candidate window
         win = stage.candidate_window_days
         bin_size = max(1, min(win or 1, 7))
 
@@ -475,6 +538,9 @@ class ReconciliationPipelineEngine:
         candidates: list[dict] = []
 
         for bank in banks:
+            if self._time_exceeded():
+                return
+            
             if bank.id in self.used_banks:
                 continue
 
@@ -504,7 +570,6 @@ class ReconciliationPipelineEngine:
                 if bank.date and book.date:
                     avg_delta = abs((bank.date - book.date).days)
                 else:
-                    # If we don't have dates, treat as outside tolerance
                     avg_delta = (stage.avg_date_delta_days or win or 0) + 1
 
                 if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
@@ -554,13 +619,7 @@ class ReconciliationPipelineEngine:
         if not candidates:
             return
 
-        # ------------------------------------------------------------------
         # GLOBAL SELECTION: pick best non-overlapping pairs
-        # ------------------------------------------------------------------
-        # Sort by:
-        #  1) global_score (desc)
-        #  2) smaller |avg_delta| (tie-breaker)
-        #  3) smaller |amount_diff| (tie-breaker)
         candidates.sort(
             key=lambda c: (
                 c["scores"]["global_score"],
@@ -577,7 +636,6 @@ class ReconciliationPipelineEngine:
             bank = c["bank"]
             book = c["book"]
 
-            # Respect global + local non-overlap
             if (
                 bank.id in self.used_banks
                 or book.id in self.used_books
@@ -614,7 +672,7 @@ class ReconciliationPipelineEngine:
                 break
 
     def _run_many_to_many(self, banks, books, stage: StageConfig):
-        # Copy & sort (company‑filtered)
+        # Copy & sort (company-filtered)
         sorted_banks = [b for b in banks if b.company_id == self.company_id]
         sorted_banks.sort(key=lambda b: b.date)
         sorted_books = [e for e in books if e.company_id == self.company_id]
@@ -625,6 +683,9 @@ class ReconciliationPipelineEngine:
                   self.company_id, len(sorted_banks), len(sorted_books), win)
     
         for bank in sorted_banks:
+            if self._time_exceeded():
+                return
+            
             if bank.id in self.used_banks:
                 continue
     
@@ -654,7 +715,7 @@ class ReconciliationPipelineEngine:
                             if any(b.currency_id != e.currency_id for b in bank_combo for e in book_combo):
                                 continue
     
-                            # INTRA‑side spans (separate checks)
+                            # INTRA-side spans (separate checks)
                             bank_span = self._date_span_days(bank_combo)
                             book_span = self._date_span_days(book_combo)
                             if stage.group_span_days:
@@ -663,7 +724,7 @@ class ReconciliationPipelineEngine:
                                 if book_span > stage.group_span_days:
                                     continue
     
-                            # CROSS‑side weighted‑avg delta
+                            # CROSS-side weighted-avg delta
                             bank_avg = self._weighted_avg_date(bank_combo)
                             book_avg = self._weighted_avg_date(book_combo)
                             avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
@@ -684,19 +745,25 @@ class ReconciliationPipelineEngine:
                                 weights=self.stage_weights,
                             )
     
-                            self._record(self._make_suggestion(
-                                "many_to_many",
-                                list(bank_combo), list(book_combo),
-                                scores["global_score"],
-                                stage=stage, weights=self.stage_weights, component_scores=scores,
-                                extra={
-                                    "bank_span_days_measured": bank_span,
-                                    "book_span_days_measured": book_span,
-                                    "avg_date_delta_days_measured": avg_delta
-                                },
-                            ))
+                            self._record(
+                                self._make_suggestion(
+                                    "many_to_many",
+                                    list(bank_combo),
+                                    list(book_combo),
+                                    scores["global_score"],
+                                    stage=stage,
+                                    weights=self.stage_weights,
+                                    component_scores=scores,
+                                    extra={
+                                        "bank_span_days_measured": bank_span,
+                                        "book_span_days_measured": book_span,
+                                        "avg_date_delta_days_measured": avg_delta,
+                                    },
+                                )
+                            )
 
-    
+    # ------------------------ Internal helpers ------------------------
+
     def _date_span_days(self, items) -> int:
         dates = [it.date for it in items if it.date]
         return (max(dates) - min(dates)).days if len(dates) >= 2 else 0
@@ -711,8 +778,7 @@ class ReconciliationPipelineEngine:
         num = sum((Decimal(d.toordinal()) * w for d, w in pairs), Decimal("0"))
         ord_ = int((num / total_abs).to_integral_value(ROUND_HALF_UP))
         return _date.fromordinal(ord_)
-
-    # Internal helpers
+    
     def _cosine_similarity(self, v1: List[float], v2: List[float]) -> float:
         if not v1 or not v2:
             return 0.0
@@ -722,8 +788,6 @@ class ReconciliationPipelineEngine:
         norm2 = sqrt(sum(b * b for b in v2))
         return dot / (norm1 * norm2) if norm1 and norm2 else 0.0
     
-    
-    
     def _aggregate_group_stats(self, items, *, is_bank: bool) -> dict:
         """
         Compute descriptive statistics and formatted lines for a group of
@@ -731,7 +795,6 @@ class ReconciliationPipelineEngine:
         """
         from datetime import date as _date
 
-        # pick the amount/date fields according to DTO type
         amounts: List[Decimal] = []
         dates: List[date] = []
         for it in items:
@@ -747,7 +810,6 @@ class ReconciliationPipelineEngine:
         min_date = min(dates) if dates else None
         max_date = max(dates) if dates else None
 
-        # weighted average date using |amount| as weight to avoid sign cancellation
         weighted_avg_date = None
         if dates and amounts:
             pairs = [(it.date, abs(it.amount_base)) for it in items if it.date and it.amount_base is not None]
@@ -757,7 +819,6 @@ class ReconciliationPipelineEngine:
                 ord_ = int((num / total_abs).to_integral_value(ROUND_HALF_UP))
                 weighted_avg_date = _date.fromordinal(ord_)
 
-        # formatted lines: one per row, with date, value and description
         lines = []
         for it in items:
             d = it.date.isoformat() if it.date else "N/A"
@@ -789,13 +850,7 @@ class ReconciliationPipelineEngine:
     ) -> dict:
         """
         Build a rich suggestion payload for front-end / API consumption.
-        - bank_items / book_items: DTOs participating in the match
-        - conf: final confidence score (0–1)
-        - stage: optional StageConfig for match parameters
-        - weights: optional per-component confidence weights
-        - extra: optional dict with additional debug info (embed sim, etc.)
         """
-
         weights = weights or getattr(self, "stage_weights", self.current_weights)
 
         bank_stats = self._aggregate_group_stats(bank_items, is_bank=True)
@@ -819,7 +874,6 @@ class ReconciliationPipelineEngine:
             "match_type": match_type,
             "bank_ids": [b.id for b in bank_items],
             "journal_entries_ids": [e.id for e in book_items],
-            # stats
             "bank_stats": {
                 "count": bank_stats["count"],
                 "sum_amount": bank_stats["sum_amount"],
@@ -834,10 +888,8 @@ class ReconciliationPipelineEngine:
                 "weighted_avg_date": book_stats["weighted_avg_date"],
                 "max_date": book_stats["max_date"],
             },
-            # human-readable lines
             "bank_lines": bank_stats["lines_text"],
             "book_lines": book_stats["lines_text"],
-            # reconciliation quality
             "abs_amount_diff": abs_diff,
             "confidence_score": float(conf),
             "confidence_weights": {
@@ -849,7 +901,6 @@ class ReconciliationPipelineEngine:
             "match_parameters": match_params,
         }
 
-        # Attach per-dimension scores if provided
         if component_scores:
             suggestion["component_scores"] = component_scores
 
@@ -874,12 +925,17 @@ class ReconciliationPipelineEngine:
     
         self._seen_groups.add(key)
     
-        log.debug("Recording suggestion: type=%s, bank_ids=%s, journal_ids=%s, confidence=%.4f",
-                  suggestion["match_type"], suggestion["bank_ids"],
-                  suggestion["journal_entries_ids"], suggestion["confidence_score"])
+        log.debug(
+            "Recording suggestion: type=%s, bank_ids=%s, journal_ids=%s, confidence=%.4f",
+            suggestion["match_type"],
+            suggestion["bank_ids"],
+            suggestion["journal_entries_ids"],
+            suggestion["confidence_score"],
+        )
         self.suggestions.append(suggestion)
         self.used_banks.update(suggestion["bank_ids"])
         self.used_books.update(suggestion["journal_entries_ids"])
+
 
 
 # ----------------------------------------------------------------------
@@ -896,11 +952,16 @@ def run_single_config(cfg: object,
     # determine type for a single-stage config:
     if cfg.max_group_size_bank > 1 or cfg.max_group_size_book > 1:
         stage_type = "many_to_many"
-    elif cfg.amount_tolerance > 0 or (getattr(cfg, "group_span_days", 0) > 0 or getattr(cfg, "avg_date_delta_days", 0) > 0):
+    elif cfg.amount_tolerance > 0 or (
+        getattr(cfg, "group_span_days", 0) > 0
+        or getattr(cfg, "avg_date_delta_days", 0) > 0
+    ):
         stage_type = "fuzzy_1to1"
     else:
         stage_type = "exact_1to1"
-
+    
+    soft_limit = getattr(cfg, "soft_time_limit_seconds", None)
+    
     stage = StageConfig(
         type=stage_type,
         max_group_size_bank=cfg.max_group_size_bank,
@@ -909,10 +970,12 @@ def run_single_config(cfg: object,
         group_span_days=getattr(cfg, "group_span_days", 0),
         avg_date_delta_days=getattr(cfg, "avg_date_delta_days", 0),
     )
+    
     pipe_cfg = PipelineConfig(
         stages=[stage],
         auto_apply_score=float(getattr(cfg, "min_confidence", 1.0)),
         max_suggestions=getattr(cfg, "max_suggestions", 10000),
+        max_runtime_seconds=float(soft_limit) if soft_limit is not None else None,
     )
     engine = ReconciliationPipelineEngine(company_id=company_id, config=pipe_cfg)
     engine.current_weights = {
@@ -945,40 +1008,77 @@ def run_pipeline(pipeline: object,
         if not stage_obj.enabled:
             continue
 
-        span = stage_obj.group_span_days if stage_obj.group_span_days is not None else getattr(cfg, "group_span_days", 0)
-        delta = stage_obj.avg_date_delta_days if stage_obj.avg_date_delta_days is not None else getattr(cfg, "avg_date_delta_days", 0)
+        span = (
+            stage_obj.group_span_days
+            if stage_obj.group_span_days is not None
+            else getattr(cfg, "group_span_days", 0)
+        )
+        delta = (
+            stage_obj.avg_date_delta_days
+            if stage_obj.avg_date_delta_days is not None
+            else getattr(cfg, "avg_date_delta_days", 0)
+        )
 
-        if (stage_obj.max_group_size_bank or cfg.max_group_size_bank) > 1 or (stage_obj.max_group_size_book or cfg.max_group_size_book) > 1:
+        if (stage_obj.max_group_size_bank or cfg.max_group_size_bank) > 1 or (
+            stage_obj.max_group_size_book or cfg.max_group_size_book
+        ) > 1:
             stage_type = "many_to_many"
         elif (stage_obj.amount_tolerance or cfg.amount_tolerance) > 0 or (span > 0 or delta > 0):
             stage_type = "fuzzy_1to1"
         else:
             stage_type = "exact_1to1"
 
-        stage_configs.append(StageConfig(
-            type=stage_type,
-            enabled=True,
-            max_group_size_bank=stage_obj.max_group_size_bank or cfg.max_group_size_bank,
-            max_group_size_book=stage_obj.max_group_size_book or cfg.max_group_size_book,
-            amount_tol=stage_obj.amount_tolerance if stage_obj.amount_tolerance is not None else cfg.amount_tolerance,
-            group_span_days=span,
-            avg_date_delta_days=delta,
-            embedding_weight=float(getattr(stage_obj, "embedding_weight", None)) if getattr(stage_obj, "embedding_weight", None) is not None else float(cfg.embedding_weight),
-            amount_weight=float(getattr(stage_obj, "amount_weight", None)) if getattr(stage_obj, "amount_weight", None) is not None else float(cfg.amount_weight),
-            currency_weight=float(getattr(stage_obj, "currency_weight", None)) if getattr(stage_obj, "currency_weight", None) is not None else float(cfg.currency_weight),
-            date_weight=float(getattr(stage_obj, "date_weight", None)) if getattr(stage_obj, "date_weight", None) is not None else float(cfg.date_weight),
-        ))
-        weight_list.append({
-            "embedding": float(getattr(stage_obj, "embedding_weight", None)) if getattr(stage_obj, "embedding_weight", None) is not None else float(cfg.embedding_weight),
-            "amount":    float(getattr(stage_obj, "amount_weight", None))    if getattr(stage_obj, "amount_weight", None)    is not None else float(cfg.amount_weight),
-            "currency":  float(getattr(stage_obj, "currency_weight", None))  if getattr(stage_obj, "currency_weight", None)  is not None else float(cfg.currency_weight),
-            "date":      float(getattr(stage_obj, "date_weight", None))      if getattr(stage_obj, "date_weight", None)      is not None else float(cfg.date_weight),
-        })
-
+        stage_configs.append(
+            StageConfig(
+                type=stage_type,
+                enabled=True,
+                max_group_size_bank=stage_obj.max_group_size_bank or cfg.max_group_size_bank,
+                max_group_size_book=stage_obj.max_group_size_book or cfg.max_group_size_book,
+                amount_tol=(
+                    stage_obj.amount_tolerance
+                    if stage_obj.amount_tolerance is not None
+                    else cfg.amount_tolerance
+                ),
+                group_span_days=span,
+                avg_date_delta_days=delta,
+                embedding_weight=float(getattr(stage_obj, "embedding_weight", None))
+                if getattr(stage_obj, "embedding_weight", None) is not None
+                else float(cfg.embedding_weight),
+                amount_weight=float(getattr(stage_obj, "amount_weight", None))
+                if getattr(stage_obj, "amount_weight", None) is not None
+                else float(cfg.amount_weight),
+                currency_weight=float(getattr(stage_obj, "currency_weight", None))
+                if getattr(stage_obj, "currency_weight", None) is not None
+                else float(cfg.currency_weight),
+                date_weight=float(getattr(stage_obj, "date_weight", None))
+                if getattr(stage_obj, "date_weight", None) is not None
+                else float(cfg.date_weight),
+            )
+        )
+        weight_list.append(
+            {
+                "embedding": float(getattr(stage_obj, "embedding_weight", None))
+                if getattr(stage_obj, "embedding_weight", None) is not None
+                else float(cfg.embedding_weight),
+                "amount": float(getattr(stage_obj, "amount_weight", None))
+                if getattr(stage_obj, "amount_weight", None) is not None
+                else float(cfg.amount_weight),
+                "currency": float(getattr(stage_obj, "currency_weight", None))
+                if getattr(stage_obj, "currency_weight", None) is not None
+                else float(cfg.currency_weight),
+                "date": float(getattr(stage_obj, "date_weight", None))
+                if getattr(stage_obj, "date_weight", None) is not None
+                else float(cfg.date_weight),
+            }
+        )
+    
+    soft_limit = getattr(pipeline, "soft_time_limit_seconds", None)
+    
     pipe_cfg = PipelineConfig(
         stages=stage_configs,
         auto_apply_score=float(pipeline.auto_apply_score),
         max_suggestions=pipeline.max_suggestions,
+        max_runtime_seconds=float(soft_limit) if soft_limit is not None else None,
     )
     engine = ReconciliationPipelineEngine(company_id=pipeline.company_id, config=pipe_cfg)
     engine.current_weights = weight_list
@@ -1003,12 +1103,21 @@ class ReconciliationService:
         """
         Execute reconciliation based on a config_id or pipeline_id in `data`.
         It refuses to run if neither is provided.
+
+        Returns:
+          {
+            "suggestions": [...],
+            "auto_match": {...},
+            "stats": {...}
+          }
         """
+        start_ts = monotonic()
+
         config_id = data.get("config_id")
         pipeline_id = data.get("pipeline_id")
         if not (config_id or pipeline_id):
             raise ValueError("Either config_id or pipeline_id must be provided")
-
+        
         company_id = resolve_tenant(tenant_id).id
 
         # Build candidate QuerySets
@@ -1025,18 +1134,21 @@ class ReconciliationService:
         if bank_ids:
             bank_qs = bank_qs.filter(id__in=bank_ids)
             filtered_count = bank_qs.count()
-            log.debug("Filtered bank transactions by provided IDs (%d ids): %d records remain", 
-                      len(bank_ids), filtered_count)
+            log.debug(
+                "Filtered bank transactions by provided IDs (%d ids): %d records remain",
+                len(bank_ids),
+                filtered_count,
+            )
         else:
-            log.debug("No bank_ids provided; using all unmatched bank transactions (%d records)", 
-                      bank_count_initial)
+            log.debug(
+                "No bank_ids provided; using all unmatched bank transactions (%d records)",
+                bank_count_initial,
+            )
         
         book_qs = (
             JournalEntry.objects
             .exclude(reconciliations__status__in=["matched", "approved"])
             .filter(account__bank_account__isnull=False)
-            # We use je.get_effective_amount() → needs debit/credit/account.
-            # We also read transaction.date / transaction.currency_id / transaction.description / transaction.description_embedding.
             .select_related("transaction")
             .only(
                 "id", "company_id", "transaction_id", "date",
@@ -1050,21 +1162,29 @@ class ReconciliationService:
         if book_ids:
             book_qs = book_qs.filter(id__in=book_ids)
             filtered_book_count = book_qs.count()
-            log.debug("Filtered journal entries by provided IDs (%d ids): %d records remain", 
-                      len(book_ids), filtered_book_count)
+            log.debug(
+                "Filtered journal entries by provided IDs (%d ids): %d records remain",
+                len(book_ids),
+                filtered_book_count,
+            )
         else:
-            log.debug("No book_ids provided; using all unmatched journal entries (%d records)", 
-                      book_count_initial)
+            log.debug(
+                "No book_ids provided; using all unmatched journal entries (%d records)",
+                book_count_initial,
+            )
 
         # Only consider journal entries that belong to a bank account
         pre_account_count = book_qs.count()
         book_qs = book_qs.filter(account__bank_account__isnull=False)
         post_account_count = book_qs.count()
-        log.debug("Filtered journal entries to those linked to bank accounts: %d records remain (from %d)", 
-                  post_account_count, pre_account_count)
+        log.debug(
+            "Filtered journal entries to those linked to bank accounts: %d records remain (from %d)",
+            post_account_count,
+            pre_account_count,
+        )
         
         # Convert querysets to DTOs
-        candidate_bank = [
+        candidate_bank: List[BankTransactionDTO] = [
             BankTransactionDTO(
                 id=tx.id,
                 company_id=tx.company_id,
@@ -1078,11 +1198,13 @@ class ReconciliationService:
         ]
         
         log.debug("Created %d BankTransactionDTOs", len(candidate_bank))
-        for dto in candidate_bank[:10]:  # limit to first 10 for brevity
-            log.debug("BankDTO: id=%s, amount=%s, date=%s, currency_id=%s, company_id=%s",
-                      dto.id, dto.amount, dto.date, dto.currency_id, dto.company_id)
+        for dto in candidate_bank[:10]:
+            log.debug(
+                "BankDTO: id=%s, amount=%s, date=%s, currency_id=%s, company_id=%s",
+                dto.id, dto.amount, dto.date, dto.currency_id, dto.company_id,
+            )
         
-        candidate_book = []
+        candidate_book: List[JournalEntryDTO] = []
         for je in book_qs:
             tr = getattr(je, "transaction", None)
             tr_date = je.date or (tr.date if tr else None)
@@ -1096,7 +1218,7 @@ class ReconciliationService:
                     company_id=je.company_id,
                     transaction_id=je.transaction_id,
                     date=tr_date,
-                    effective_amount=je.get_effective_amount(),  # uses debit/credit
+                    effective_amount=je.get_effective_amount(),
                     currency_id=tr_curr_id,
                     description=tr_desc,
                     embedding=tr_vec,
@@ -1104,29 +1226,143 @@ class ReconciliationService:
             )
         
         log.debug("Created %d JournalEntryDTOs", len(candidate_book))
-        for dto in candidate_book[:10]:  # again, limit to avoid noise
-            log.debug("BookDTO: id=%s, tx_id=%s, amount=%s, date=%s, currency_id=%s, company_id=%s",
-                      dto.id, dto.transaction_id, dto.effective_amount, dto.date, dto.currency_id, dto.company_id)
+        for dto in candidate_book[:10]:
+            log.debug(
+                "BookDTO: id=%s, tx_id=%s, amount=%s, date=%s, currency_id=%s, company_id=%s",
+                dto.id, dto.transaction_id, dto.effective_amount,
+                dto.date, dto.currency_id, dto.company_id,
+            )
 
-        # Run the appropriate matching engine
+        # Run the appropriate matching engine and capture soft limit
+        soft_time_limit = None
         if pipeline_id:
-            pipeline = ReconciliationPipeline.objects.get(id=pipeline_id)
-            suggestions = run_pipeline(pipeline, candidate_bank, candidate_book)
+            pipe_obj = ReconciliationPipeline.objects.get(id=pipeline_id)
+            suggestions = run_pipeline(pipe_obj, candidate_bank, candidate_book)
+            soft_time_limit = getattr(pipe_obj, "soft_time_limit_seconds", None)
         else:
-            cfg = ReconciliationConfig.objects.get(id=config_id)
-            suggestions = run_single_config(cfg, candidate_bank, candidate_book, company_id)
+            cfg_obj = ReconciliationConfig.objects.get(id=config_id)
+            suggestions = run_single_config(cfg_obj, candidate_bank, candidate_book, company_id)
+            soft_time_limit = getattr(cfg_obj, "soft_time_limit_seconds", None)
 
-        # Optionally auto-apply matches with confidence 1.0
+        # Auto-apply matches with confidence 1.0
         auto_info = {"enabled": bool(auto_match_100), "applied": 0, "skipped": 0, "details": []}
         if auto_match_100:
             auto_info = ReconciliationService._apply_auto_matches_100(suggestions)
-        
+
+        duration = monotonic() - start_ts
+
+        # ---------------------- stats aggregation ----------------------
+        suggestion_count = len(suggestions)
+        bank_candidate_count = len(candidate_bank)
+        book_candidate_count = len(candidate_book)
+
+        matched_bank_ids: set[int] = set()
+        matched_book_ids: set[int] = set()
+        match_type_counts: Dict[str, int] = {}
+        confidences: List[float] = []
+        abs_diffs: List[float] = []
+
+        for s in suggestions:
+            mt = s.get("match_type", "unknown")
+            match_type_counts[mt] = match_type_counts.get(mt, 0) + 1
+
+            for bid in s.get("bank_ids", []):
+                matched_bank_ids.add(bid)
+            for jid in s.get("journal_entries_ids", []):
+                matched_book_ids.add(jid)
+
+            try:
+                confidences.append(float(s.get("confidence_score", 0.0)))
+            except Exception:
+                pass
+            try:
+                abs_diffs.append(float(s.get("abs_amount_diff", 0.0)))
+            except Exception:
+                pass
+
+        def _percentile(sorted_vals: List[float], p: float) -> Optional[float]:
+            if not sorted_vals:
+                return None
+            k = (len(sorted_vals) - 1) * p
+            f = int(k)
+            c = min(f + 1, len(sorted_vals) - 1)
+            if f == c:
+                return sorted_vals[f]
+            d0 = sorted_vals[f] * (c - k)
+            d1 = sorted_vals[c] * (k - f)
+            return d0 + d1
+
+        conf_min = conf_max = conf_avg = conf_p50 = conf_p90 = None
+        perfect_conf = 0
+        if confidences:
+            confidences_sorted = sorted(confidences)
+            conf_min = confidences_sorted[0]
+            conf_max = confidences_sorted[-1]
+            conf_avg = sum(confidences_sorted) / len(confidences_sorted)
+            conf_p50 = _percentile(confidences_sorted, 0.5)
+            conf_p90 = _percentile(confidences_sorted, 0.9)
+            perfect_conf = sum(1 for c in confidences_sorted if abs(c - 1.0) < 1e-9)
+
+        diff_min = diff_max = diff_avg = None
+        if abs_diffs:
+            diffs_sorted = sorted(abs_diffs)
+            diff_min = diffs_sorted[0]
+            diff_max = diffs_sorted[-1]
+            diff_avg = sum(diffs_sorted) / len(diffs_sorted)
+
+        stats: Dict[str, object] = {
+            "company_id": company_id,
+            "config_id": config_id,
+            "pipeline_id": pipeline_id,
+            "duration_seconds": round(duration, 3),
+            "time_limit_seconds": soft_time_limit,
+            "time_limit_reached": bool(soft_time_limit and duration >= soft_time_limit),
+
+            "bank_candidates": bank_candidate_count,
+            "journal_candidates": book_candidate_count,
+
+            "suggestion_count": suggestion_count,
+            "match_types": match_type_counts,
+
+            "matched_bank_transactions": len(matched_bank_ids),
+            "matched_journal_entries": len(matched_book_ids),
+            "bank_coverage_ratio": float(len(matched_bank_ids) / bank_candidate_count) if bank_candidate_count else 0.0,
+            "journal_coverage_ratio": float(len(matched_book_ids) / book_candidate_count) if book_candidate_count else 0.0,
+
+            "confidence_stats": {
+                "min": conf_min,
+                "max": conf_max,
+                "avg": conf_avg,
+                "p50": conf_p50,
+                "p90": conf_p90,
+                "perfect_1_0_count": perfect_conf,
+            },
+
+            "amount_diff_stats": {
+                "min": diff_min,
+                "max": diff_max,
+                "avg": diff_avg,
+            },
+
+            "auto_match": {
+                "enabled": auto_info["enabled"],
+                "applied": auto_info["applied"],
+                "skipped": auto_info["skipped"],
+            },
+        }
+
         log.info(
-    "Recon task: company=%s config_id=%s pipeline_id=%s banks=%d books=%d suggestions=%d",
-    company_id, config_id, pipeline_id, len(candidate_bank), len(candidate_book), len(suggestions)
-)
+            "Recon task: company=%s config_id=%s pipeline_id=%s banks=%d books=%d suggestions=%d duration=%.3fs",
+            company_id, config_id, pipeline_id,
+            bank_candidate_count, book_candidate_count,
+            suggestion_count, duration,
+        )
         
-        return {"suggestions": suggestions, "auto_match": auto_info}
+        return {
+            "suggestions": suggestions,
+            "auto_match": auto_info,
+            "stats": stats,
+        }
 
     # ------------------------------------------------------------------
     # Auto-match persistence
