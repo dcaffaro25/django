@@ -112,46 +112,11 @@ from .serializers import (
     ResolvedReconciliationPipelineSerializer,
 )
 import re
-
+from accounting.utils import _normalize_digits, _normalize_raw_digits
 from rest_framework import permissions
 
 
-def _normalize_digits(value) -> Optional[str]:
-    """
-    Normalize a bank or account code:
-    - accepts None / int / str
-    - strips all non-digits
-    - returns canonical string without leading zeros (via int),
-      e.g. '0237' -> '237'.
-    """
-    if value is None:
-        return None
-    s = str(value).strip()
-    if not s:
-        return None
-    digits = re.sub(r"\D", "", s)
-    if not digits:
-        return None
-    # canonical form: int -> str, removes leading zeros safely
-    try:
-        return str(int(digits))
-    except ValueError:
-        return None
 
-
-def _normalize_raw_digits(value) -> Optional[str]:
-    """
-    Return only the digits from value as a string (no int() cast),
-    e.g. '0237' -> '0237'. Useful for exact matching when DB stores
-    codes with leading zeros.
-    """
-    if value is None:
-        return None
-    s = str(value).strip()
-    if not s:
-        return None
-    digits = re.sub(r"\D", "", s)
-    return digits or None
 
 def _mean_date(dates):
     """Return the average (mean) of a list of date objects, or None."""

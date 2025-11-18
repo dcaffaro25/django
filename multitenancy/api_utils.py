@@ -871,18 +871,6 @@ class BulkImportTemplateDownloadView(APIView):
         }
 
 
-
-
-
-    
-
-    
-    
-
-
-
-
-
         ws = wb.active
         ws.title = 'Company'
         ws.append(sheet_defs['Company'])

@@ -7,8 +7,47 @@ from decimal import Decimal
 from django.db import transaction
 from django.db.models import Q, Sum
 from django.db.models.functions import Coalesce
+from typing import List, Dict, Any, Optional
 
 from accounting.models import Transaction, JournalEntry
+
+
+def _normalize_digits(value) -> Optional[str]:
+    """
+    Normalize a bank or account code:
+    - accepts None / int / str
+    - strips all non-digits
+    - returns canonical string without leading zeros (via int),
+      e.g. '0237' -> '237'.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    digits = re.sub(r"\D", "", s)
+    if not digits:
+        return None
+    # canonical form: int -> str, removes leading zeros safely
+    try:
+        return str(int(digits))
+    except ValueError:
+        return None
+
+
+def _normalize_raw_digits(value) -> Optional[str]:
+    """
+    Return only the digits from value as a string (no int() cast),
+    e.g. '0237' -> '0237'. Useful for exact matching when DB stores
+    codes with leading zeros.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    digits = re.sub(r"\D", "", s)
+    return digits or None
 
 def update_journal_entries_and_transaction_flags(journal_entries):
     """
@@ -99,11 +138,13 @@ def parse_ofx_text(ofx_text):
     if not bank_match:
         raise ValueError("No <BANKID> found in OFX.")
     bank_code = bank_match.group(1).strip()
-
+    bank_code = _normalize_digits(bank_code)        # '0237' -> '237'
+    bank_code = _normalize_raw_digits(bank_code)     # '0237' -> '0237'
+    
     # 2) Extract account_id
     acct_match = re.search(r"<ACCTID>([\w/\-]+)", ofx_text)
     account_id = acct_match.group(1).strip() if acct_match else None
-
+    account_id = _normalize_raw_digits(account_id)
     # 3) Find <STMTTRN> blocks
     stmttrn_pattern = re.compile(r"<STMTTRN>(.*?)</STMTTRN>", re.DOTALL)
     blocks = stmttrn_pattern.findall(ofx_text)
