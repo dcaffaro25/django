@@ -969,38 +969,59 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             # Make a copy so we can append insertion results
             out = dict(file_summary)
             out["inserted"] = 0  # track new inserts
+            
             # If policy='files' and duplicate_ratio > threshold, skip the file
-            if (import_policy == "files" and
-                file_summary.get("duplicate_ratio", 0) > duplicate_threshold):
+            if (
+                import_policy == "files"
+                and file_summary.get("duplicate_ratio", 0) > duplicate_threshold
+            ):
                 out["warning"] = (
-                    out.get("warning") or
-                    "File skipped because more than 80% of transactions were duplicates."
+                    out.get("warning")
+                    or "File skipped because more than 80% of transactions were duplicates."
                 )
                 results.append(out)
                 continue
-    
+
             # Otherwise, insert non-duplicate transactions
-            tx_infos = file_summary.get("transactions", [])
-            bank_code = file_summary.get("bank", {}).get("value", {}).get("bank_code") \
-                if isinstance(file_summary.get("bank", {}).get("value"), dict) else None
-            
-            bank_code = re.sub(r'\D', '',bank_code).lstrip('0')
-            
-            account_num = file_summary.get("account", {}).get("value", {}).get("account_number") \
-                if isinstance(file_summary.get("account", {}).get("value"), dict) else None
-            
-            account_num = re.sub(r'\D', '', account_num).lstrip('0')
-            
-            # Re-derive bank/account models
+            tx_infos = file_summary.get("transactions", []) or []
+
+            # Extract raw bank/account info from scan summary
+            bank_value = file_summary.get("bank", {}).get("value")
+            account_value = file_summary.get("account", {}).get("value")
+
+            raw_bank_code = (
+                bank_value.get("bank_code")
+                if isinstance(bank_value, dict)
+                else None
+            )
+            raw_account_num = (
+                account_value.get("account_number")
+                if isinstance(account_value, dict)
+                else None
+            )
+
+            # Normalize codes
+            bank_code_norm = _normalize_digits(raw_bank_code)        # '0237' -> '237'
+            bank_code_raw = _normalize_raw_digits(raw_bank_code)     # '0237' -> '0237'
+            account_num_norm = _normalize_raw_digits(raw_account_num)  # keep all significant digits
+
+            # Find Bank
             bank_obj = None
-            if bank_code is not None:
-                bank_obj = Bank.objects.filter(bank_code=bank_code).first()
+            if bank_code_norm or bank_code_raw:
+                bank_code_candidates = {c for c in (bank_code_norm, bank_code_raw) if c}
+                bank_obj = Bank.objects.filter(bank_code__in=bank_code_candidates).first()
+
+            # Find BankAccount
             bank_acct_obj = None
-            if bank_obj and account_num:
-                qs = BankAccount.objects.filter(bank__bank_code=bank_code)
-                bank_acct_obj = qs.filter(account_number=account_num).first()
+            if bank_obj and account_num_norm:
+                qs = BankAccount.objects.filter(bank=bank_obj)
+
+                # First try direct account_number match
+                bank_acct_obj = qs.filter(account_number=account_num_norm).first()
+
                 if not bank_acct_obj:
-                    norm = re.sub(r'\D', '', account_num).lstrip('0')
+                    # Fallback: branch + account concatenation (normalized)
+                    norm = re.sub(r"\D", "", account_num_norm)
                     bank_acct_obj = (
                         qs.annotate(
                             branch_s=Cast("branch_id", CharField()),
@@ -1010,7 +1031,7 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                         .filter(ba_concat=norm)
                         .first()
                     )
-    
+
             # derive currency and company_id
             currency_obj = None
             company_id = None
@@ -1021,12 +1042,13 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     company_id = getattr(bank_acct_obj.entity, "company_id", None)
             elif bank_obj:
                 currency_obj = getattr(bank_obj, "default_currency", None)
-    
+
+            # Insert transactions
             with db_tx.atomic():
                 for tx_info in tx_infos:
-                    if tx_info["status"] != "pending":
+                    if tx_info.get("status") != "pending":
                         continue
-                    # parse date
+
                     raw_date = tx_info.get("date")
                     parsed_date = None
                     if raw_date:
@@ -1034,9 +1056,11 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                             parsed_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
                         except Exception:
                             parsed_date = None
+
                     tx_amount = tx_info.get("amount")
                     tx_desc = tx_info.get("description")
                     tx_hash = tx_info.get("tx_hash")
+
                     try:
                         BankTransaction.objects.create(
                             company_id=company_id,
@@ -1052,10 +1076,9 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                         tx_info["status"] = "inserted"
                     except Exception as ex:
                         tx_info["status"] = f"error: {ex}"
-    
-            # Add results for this file
+
             results.append(out)
-    
+
         return Response({"results": results}, status=status.HTTP_200_OK)
     
     @action(detail=False, methods=['get'])
