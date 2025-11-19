@@ -5,8 +5,57 @@ import math
 import logging
 import requests
 from django.conf import settings
+import re
 
 log = logging.getLogger("recon")  # or "embeddings"
+
+DATE_PATTERNS = [
+    r"\b\d{4}-\d{2}-\d{2}\b",      # 2025-02-01
+    r"\b\d{2}/\d{2}/\d{4}\b",      # 01/02/2025
+    r"\b\d{2}\.\d{2}\.\d{4}\b",    # 01.02.2025
+]
+
+AMOUNT_PATTERN = r"\b\d{1,3}(?:\.\d{3})*(?:,\d{2})?\b"  # 1.234,56 style
+
+
+def clean_description_for_embedding(raw: str) -> str:
+    """
+    Strip dates, obvious numeric tokens, and trailing 'metadata' segments
+    from a description to keep only the semantic core.
+
+    Example:
+      "DEPARTAMENTO PESSOAL;Salários E Remunerações;Salario 022025;Rosevania De Almeida Da Silva Barros;2025-02-01;2025-03-01;2025-02-01;Bradesco"
+      → "DEPARTAMENTO PESSOAL; Salários E Remunerações; Rosevania De Almeida Da Silva Barros"
+    """
+    if not raw:
+        return ""
+
+    text = str(raw)
+
+    # Remove date patterns
+    for pat in DATE_PATTERNS:
+        text = re.sub(pat, " ", text)
+
+    # Remove amount-like tokens (e.g. "1.234,56" or "123")
+    text = re.sub(AMOUNT_PATTERN, " ", text)
+
+    # Replace multiple separators with single space
+    text = re.sub(r"[;,\|]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Optionally drop very numeric / short tokens
+    parts = [p.strip() for p in text.split(" ") if p.strip()]
+    kept = []
+    for p in parts:
+        # skip tokens that are mostly digits or very short
+        if len(p) <= 2:
+            continue
+        if re.fullmatch(r"\d[\d\.\-_/]*", p):
+            continue
+        kept.append(p)
+
+    cleaned = " ".join(kept)
+    return cleaned or text.strip()
 
 def _embed_base_url() -> str:
     """

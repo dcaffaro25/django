@@ -274,17 +274,17 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     def summaries(self, request, *args, **kwargs):
         """
         Return reconciliations in a compact, 'matches-like' format.
-
+    
         Query params:
           - status: comma-separated list of statuses (default: matched,approved)
         """
         status_param = request.query_params.get("status", "matched,approved")
         wanted_status = [s.strip() for s in status_param.split(",") if s.strip()]
-
+    
         qs = self.filter_queryset(
             self.get_queryset().filter(status__in=wanted_status)
         )
-
+    
         # Prefetch to avoid N+1 queries
         bank_qs = BankTransaction.objects.select_related(
             "bank_account", "bank_account__entity", "currency"
@@ -293,81 +293,89 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             "account", "account__bank_account",
             "transaction", "transaction__entity", "transaction__currency"
         )
-
+    
         qs = qs.prefetch_related(
             Prefetch("bank_transactions", queryset=bank_qs),
             Prefetch("journal_entries", queryset=book_qs),
         )
-
+    
         # Pagination support
         page = self.paginate_queryset(qs)
         recs = page if page is not None else qs
-
+    
         results = []
+    
+        def get_bank_transaction_summary(bank_items):
+            lines = []
+            for tx in bank_items:
+                lines.append(
+                    f"ID: {tx.id}, Date: {tx.date}, Amount: {tx.amount}, Desc: {tx.description}"
+                )
+            return "\n".join(lines)
+    
+        def get_journal_entries_summary(book_items):
+            lines = []
+            for entry in book_items:
+                account_code = entry.account.account_code if entry.account_id else "N/A"
+                account_name = entry.account.name if entry.account_id else "N/A"
+                direction = "DEBIT" if entry.debit_amount else "CREDIT"
+                eff = entry.get_effective_amount()
+                desc = entry.transaction.description if entry.transaction_id else ""
+                lines.append(
+                    f"ID: {entry.transaction.id if entry.transaction_id else entry.id}, "
+                    f"Date: {entry.date}, JE: {direction} {eff} - "
+                    f"({account_code}) {account_name}, Desc: {desc}"
+                )
+            return "\n".join(lines)
+    
         for rec in recs:
             banks = list(rec.bank_transactions.all())
             books = list(rec.journal_entries.all())
-
+    
             bank_ids = [b.id for b in banks]
             book_ids = [j.id for j in books]
-
-            # sums
-            bank_sum = sum((b.amount or 0) for b in banks)
-            book_sum = 0
+    
+            # --- amounts and sums ---
+            bank_sum = Decimal("0")
+            bank_amounts: list[float] = []
+            bank_dates: list[date] = []
+    
+            for b in banks:
+                if b.amount is not None:
+                    bank_sum += b.amount
+                    bank_amounts.append(float(b.amount))
+                if b.date:
+                    bank_dates.append(b.date)
+    
+            book_sum = Decimal("0")
+            book_amounts: list[float] = []
+            book_dates: list[date] = []
+    
             for je in books:
                 eff = je.get_effective_amount()
                 if eff is not None:
                     book_sum += eff
-
+                    book_amounts.append(float(eff))
+                d = je.date or (je.transaction.date if je.transaction_id and je.transaction else None)
+                if d:
+                    book_dates.append(d)
+    
             # signed difference (bank - book)
             difference = bank_sum - book_sum
-
-            # average dates
-            bank_avg = _mean_date([b.date for b in banks])
-            # prefer entry.date, fall back to transaction.date
-            book_dates = [je.date or (je.transaction.date if je.transaction_id else None) for je in books]
+    
+            # average dates (per side)
+            bank_avg = _mean_date(bank_dates)
             book_avg = _mean_date(book_dates)
-
-            # descriptions (collapse duplicates; short, readable)
-            def _collapse_desc(items, getter, max_unique=5):
-                seen = []
-                for it in items:
-                    txt = getter(it)
-                    if txt and txt not in seen:
-                        seen.append(txt)
-                    if len(seen) >= max_unique:
-                        break
-                return " | ".join(seen)
-            
-            def get_bank_transaction_summary(bank_items):
-                lines = []
-                for tx in bank_items:
-                    lines.append(f"ID: {tx.id}, Date: {tx.date}, Amount: {tx.amount}, Desc: {tx.description}")
-                return "\n".join(lines)
-        
-            def get_journal_entries_summary(book_items):
-                lines = []
-                for entry in book_items:
-                    account_code = entry.account.account_code if entry.account_id else "N/A"
-                    account_name = entry.account.name if entry.account_id else "N/A"
-                    direction = "DEBIT" if entry.debit_amount else "CREDIT"
-                    eff = entry.get_effective_amount()
-                    desc = entry.transaction.description if entry.transaction_id else ""
-                    lines.append(
-                        f"ID: {entry.transaction.id if entry.transaction_id else entry.id}, "
-                        f"Date: {entry.date}, JE: {direction} {eff} - "
-                        f"({account_code}) {account_name}, Desc: {desc}"
-                    )
-                return "\n".join(lines)
-            
-            bank_description = get_bank_transaction_summary(#_collapse_desc(
-                banks)#, lambda b: b.description)
-            book_description = get_journal_entries_summary(#_collapse_desc(
-                books#, lambda je: (je.transaction.description if je.transaction_id else None)
-            )
-            
-            
-            
+    
+            # overall min/max date considering both bank and books
+            all_dates = bank_dates + book_dates
+            min_date = min(all_dates) if all_dates else None
+            max_date = max(all_dates) if all_dates else None
+    
+            # descriptions (here we use the detailed multiline summaries)
+            bank_description = get_bank_transaction_summary(banks)
+            book_description = get_journal_entries_summary(books)
+    
             results.append({
                 "reconciliation_id": rec.id,
                 "bank_ids": bank_ids,
@@ -377,15 +385,347 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 "bank_sum_value": float(bank_sum),
                 "book_sum_value": float(book_sum),
                 "difference": float(difference),
+                "bank_amounts": bank_amounts,
+                "book_amounts": book_amounts,
                 "bank_avg_date": bank_avg.isoformat() if bank_avg else None,
                 "book_avg_date": book_avg.isoformat() if book_avg else None,
+                "min_date": min_date.isoformat() if min_date else None,
+                "max_date": max_date.isoformat() if max_date else None,
                 "reference": rec.reference,
                 "notes": rec.notes,
             })
-
+    
         if page is not None:
             return self.get_paginated_response(results)
         return Response(results, status=status.HTTP_200_OK)
+    
+    @action(detail=False, methods=["get"], url_path="export-unreconciled-report")
+    def export_unreconciled_report(self, request, *args, **kwargs):
+        """
+        Export an Excel file with:
+          - Report: summary KPIs (counts, totals, date stats, description patterns)
+          - Banks_to_reconcile: all unreconciled bank transactions
+          - Books_unmatched: all unreconciled journal entries
+
+        Optional query params:
+          - company_id (if you are not using tenant_id for scoping)
+          - date_from (YYYY-MM-DD)
+          - date_to   (YYYY-MM-DD)
+          - bank_account_ids=1,2,3 (optional filter)
+        """
+        # --- 1. Resolve scope (company/tenant) ---
+        company_id = request.query_params.get("company_id")
+        if not company_id:
+            tenant_id = request.query_params.get("tenant_id")
+            if not tenant_id:
+                return Response(
+                    {"detail": "Provide company_id or tenant_id"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            from multitenancy.utils import resolve_tenant
+            company_id = resolve_tenant(tenant_id).id
+
+        # Date filters
+        date_from_str = request.query_params.get("date_from")
+        date_to_str = request.query_params.get("date_to")
+        date_from = date_to = None
+        try:
+            if date_from_str:
+                date_from = datetime.strptime(date_from_str, "%Y-%m-%d").date()
+            if date_to_str:
+                date_to = datetime.strptime(date_to_str, "%Y-%m-%d").date()
+        except ValueError:
+            return Response(
+                {"detail": "Invalid date_from/date_to, use YYYY-MM-DD"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        bank_account_ids_raw = request.query_params.get("bank_account_ids")
+        bank_account_ids = []
+        if bank_account_ids_raw:
+            bank_account_ids = [
+                int(x) for x in bank_account_ids_raw.split(",") if x.strip().isdigit()
+            ]
+
+        # --- 2. Query unreconciled banks & books ---
+        bank_qs = BankTransaction.objects.filter(company_id=company_id).exclude(
+            reconciliations__status__in=["matched", "approved"]
+        )
+        if date_from:
+            bank_qs = bank_qs.filter(date__gte=date_from)
+        if date_to:
+            bank_qs = bank_qs.filter(date__lte=date_to)
+        if bank_account_ids:
+            bank_qs = bank_qs.filter(bank_account_id__in=bank_account_ids)
+
+        # Unmatched journal entries linked to bank accounts
+        book_qs = (
+            JournalEntry.objects.filter(company_id=company_id)
+            .exclude(reconciliations__status__in=["matched", "approved"])
+            .filter(account__bank_account__isnull=False)
+            .select_related("transaction", "account", "account__bank_account")
+        )
+        if date_from:
+            book_qs = book_qs.filter(
+                Q(date__gte=date_from) | Q(transaction__date__gte=date_from)
+            )
+        if date_to:
+            book_qs = book_qs.filter(
+                Q(date__lte=date_to) | Q(transaction__date__lte=date_to)
+            )
+
+        bank_rows = list(
+            bank_qs.select_related("bank_account", "currency").order_by("date", "id")
+        )
+        book_rows = list(book_qs.order_by("date", "id"))
+
+        # --- 3. Compute high-level stats ---
+        total_banks = len(bank_rows)
+        total_books = len(book_rows)
+
+        total_bank_amount = (
+            sum((bt.amount or Decimal("0")) for bt in bank_rows)
+            if bank_rows
+            else Decimal("0")
+        )
+        total_book_amount = (
+            sum((je.get_effective_amount() or Decimal("0")) for je in book_rows)
+            if book_rows
+            else Decimal("0")
+        )
+
+        bank_dates = [bt.date for bt in bank_rows if bt.date]
+        book_dates = [
+            (je.date or (je.transaction.date if je.transaction else None))
+            for je in book_rows
+        ]
+        bank_dates = [d for d in bank_dates if d]
+        book_dates = [d for d in book_dates if d]
+
+        bank_min_date = min(bank_dates) if bank_dates else None
+        bank_max_date = max(bank_dates) if bank_dates else None
+        book_min_date = min(book_dates) if book_dates else None
+        book_max_date = max(book_dates) if book_dates else None
+
+        # Totals by currency
+        bank_by_curr: dict[str, Decimal] = {}
+        for bt in bank_rows:
+            code = getattr(bt.currency, "code", None) or "N/A"
+            bank_by_curr.setdefault(code, Decimal("0"))
+            bank_by_curr[code] += bt.amount or Decimal("0")
+
+        book_by_curr: dict[str, Decimal] = {}
+        for je in book_rows:
+            code_obj = getattr(je.transaction, "currency", None)
+            ccode = getattr(code_obj, "code", None) if code_obj else "N/A"
+            book_amt = je.get_effective_amount() or Decimal("0")
+            book_by_curr.setdefault(ccode, Decimal("0"))
+            book_by_curr[ccode] += book_amt
+
+        # Simple description patterns: top 10 cleaned descriptions on each side
+        bank_desc_counter = Counter()
+        for bt in bank_rows:
+            bank_desc_counter[clean_description_for_embedding(bt.description)] += 1
+
+        book_desc_counter = Counter()
+        for je in book_rows:
+            book_desc_counter[clean_description_for_embedding(
+                getattr(je.transaction, "description", "") or ""
+            )] += 1
+
+        top_bank_desc = bank_desc_counter.most_common(10)
+        top_book_desc = book_desc_counter.most_common(10)
+
+        # --- 4. Build Excel workbook ---
+        wb = Workbook()
+        ws_report = wb.active
+        ws_report.title = "Report"
+
+        ws_report["A1"] = "Reconciliation Unreconciled Report"
+        ws_report["A2"] = f"Company ID: {company_id}"
+        ws_report["A3"] = f"Generated at: {datetime.utcnow().isoformat()}"
+
+        row = 5
+        ws_report.cell(row=row, column=1, value="Banks - total records")
+        ws_report.cell(row=row, column=2, value=total_banks)
+        row += 1
+        ws_report.cell(row=row, column=1, value="Banks - total amount")
+        ws_report.cell(row=row, column=2, value=float(total_bank_amount))
+        row += 1
+
+        ws_report.cell(row=row, column=1, value="Books - total records")
+        ws_report.cell(row=row, column=2, value=total_books)
+        row += 1
+        ws_report.cell(row=row, column=1, value="Books - total amount")
+        ws_report.cell(row=row, column=2, value=float(total_book_amount))
+        row += 2
+
+        ws_report.cell(row=row, column=1, value="Bank dates (min)")
+        ws_report.cell(row=row, column=2, value=str(bank_min_date) if bank_min_date else "")
+        row += 1
+        ws_report.cell(row=row, column=1, value="Bank dates (max)")
+        ws_report.cell(row=row, column=2, value=str(bank_max_date) if bank_max_date else "")
+        row += 1
+        ws_report.cell(row=row, column=1, value="Book dates (min)")
+        ws_report.cell(row=row, column=2, value=str(book_min_date) if book_min_date else "")
+        row += 1
+        ws_report.cell(row=row, column=1, value="Book dates (max)")
+        ws_report.cell(row=row, column=2, value=str(book_max_date) if book_max_date else "")
+        row += 2
+
+        ws_report.cell(row=row, column=1, value="Bank totals by currency")
+        row += 1
+        for code, amt in bank_by_curr.items():
+            ws_report.cell(row=row, column=1, value=code)
+            ws_report.cell(row=row, column=2, value=float(amt))
+            row += 1
+
+        row += 2
+        ws_report.cell(row=row, column=1, value="Book totals by currency")
+        row += 1
+        for code, amt in book_by_curr.items():
+            ws_report.cell(row=row, column=1, value=code)
+            ws_report.cell(row=row, column=2, value=float(amt))
+            row += 1
+
+        row += 2
+        ws_report.cell(row=row, column=1, value="Top bank description patterns (cleaned)")
+        row += 1
+        ws_report.cell(row=row, column=1, value="Description")
+        ws_report.cell(row=row, column=2, value="Count")
+        row += 1
+        for desc, cnt in top_bank_desc:
+            ws_report.cell(row=row, column=1, value=desc)
+            ws_report.cell(row=row, column=2, value=cnt)
+            row += 1
+
+        row += 2
+        ws_report.cell(row=row, column=1, value="Top book description patterns (cleaned)")
+        row += 1
+        ws_report.cell(row=row, column=1, value="Description")
+        ws_report.cell(row=row, column=2, value="Count")
+        row += 1
+        for desc, cnt in top_book_desc:
+            ws_report.cell(row=row, column=1, value=desc)
+            ws_report.cell(row=row, column=2, value=cnt)
+            row += 1
+
+        # --- 5. Banks_to_reconcile sheet ---
+        ws_banks = wb.create_sheet(title="Banks_to_reconcile")
+        bank_headers = [
+            "BankTransactionID",
+            "BankAccountID",
+            "BankAccountName",
+            "Date",
+            "Currency",
+            "Amount",
+            "OriginalDescription",
+            "CleanDescriptionForEmbedding",
+            "SuggestedNewJournalAccount",
+            "SuggestedCostCenter",
+            "SuggestedCounterparty",
+            "UserNotes",
+        ]
+        ws_banks.append(bank_headers)
+
+        for bt in bank_rows:
+            cur_code = getattr(bt.currency, "code", None)
+            acct = getattr(bt, "bank_account", None)
+            acct_name = getattr(acct, "name", "") if acct else ""
+            cleaned = clean_description_for_embedding(bt.description or "")
+            ws_banks.append(
+                [
+                    bt.id,
+                    bt.bank_account_id,
+                    acct_name,
+                    bt.date.isoformat() if bt.date else "",
+                    cur_code,
+                    float(bt.amount or 0),
+                    bt.description or "",
+                    cleaned,
+                    "",
+                    "",
+                    "",
+                    "",
+                ]
+            )
+
+        for col_idx, col in enumerate(ws_banks.columns, start=1):
+            max_len = 0
+            col_letter = get_column_letter(col_idx)
+            for cell in col:
+                try:
+                    max_len = max(max_len, len(str(cell.value)))
+                except Exception:
+                    pass
+            ws_banks.column_dimensions[col_letter].width = min(max_len + 2, 60)
+
+        # --- 6. Books_unmatched sheet ---
+        ws_books = wb.create_sheet(title="Books_unmatched")
+        book_headers = [
+            "JournalEntryID",
+            "TransactionID",
+            "AccountID",
+            "AccountName",
+            "BankAccountID",
+            "Date",
+            "Currency",
+            "EffectiveAmount",
+            "OriginalDescription",
+            "CleanDescriptionForEmbedding",
+            "UserNotes",
+        ]
+        ws_books.append(book_headers)
+
+        for je in book_rows:
+            tx = getattr(je, "transaction", None)
+            acct = getattr(je, "account", None)
+            bank_acct = getattr(acct, "bank_account", None) if acct else None
+            cur_code_obj = getattr(tx, "currency", None)
+            cur_code_val = getattr(cur_code_obj, "code", None) if cur_code_obj else None
+            eff_amt = je.get_effective_amount() or Decimal("0")
+            desc = getattr(tx, "description", "") or ""
+            cleaned = clean_description_for_embedding(desc)
+            d = je.date or (tx.date if tx else None)
+            ws_books.append(
+                [
+                    je.id,
+                    je.transaction_id,
+                    je.account_id,
+                    getattr(acct, "name", "") if acct else "",
+                    getattr(bank_acct, "id", None) if bank_acct else None,
+                    d.isoformat() if d else "",
+                    cur_code_val,
+                    float(eff_amt),
+                    desc,
+                    cleaned,
+                    "",
+                ]
+            )
+
+        for col_idx, col in enumerate(ws_books.columns, start=1):
+            max_len = 0
+            col_letter = get_column_letter(col_idx)
+            for cell in col:
+                try:
+                    max_len = max(max_len, len(str(cell.value)))
+                except Exception:
+                    pass
+            ws_books.column_dimensions[col_letter].width = min(max_len + 2, 60)
+
+        # --- 7. Return as HTTP response ---
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        filename = f"reconciliation_unreconciled_{company_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        response = HttpResponse(
+            output.getvalue(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+    
     
 # Transaction ViewSet
 class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
@@ -448,6 +788,8 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         serializer_class = self.get_serializer_class()  # use list vs detail serializer
         serializer = serializer_class(qs_unmatched, many=True)
         return Response(serializer.data)
+    
+    
     
     # Bulk operations
     @action(methods=['post'], detail=False)
