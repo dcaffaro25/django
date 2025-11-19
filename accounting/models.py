@@ -589,7 +589,13 @@ class ReconciliationConfig(models.Model):
     avg_date_delta_days  = models.PositiveIntegerField(default=2, help_text="Max |Δ| between group weighted-average dates.")
     max_group_size_bank  = models.PositiveIntegerField(default=1)
     max_group_size_book  = models.PositiveIntegerField(default=1)
-
+    
+    allow_mixed_signs = models.BooleanField(
+        default=False,
+        help_text="If false, only match groups where all amounts have the same sign as the bank. "
+                  "If true, allow groups that mix positive and negative amounts.",
+    )
+    
     # Thresholds / limits
     min_confidence  = models.DecimalField(max_digits=4, decimal_places=2, default=0.90)
     max_suggestions = models.PositiveIntegerField(default=1000)

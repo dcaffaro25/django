@@ -95,7 +95,10 @@ class StageConfig:
     amount_weight: float | None = None
     currency_weight: float | None = None
     date_weight: float | None = None
-
+    
+    # NEW: whether we allow mixed-sign amounts inside a group
+    allow_mixed_signs: bool = False
+    
     @property
     def candidate_window_days(self) -> int:
         """
@@ -384,7 +387,7 @@ class ReconciliationPipelineEngine:
                 )
                 break
 
-    def _run_one_to_many(self, banks, books, stage: StageConfig):
+    def _run_one_to_many_legacy(self, banks, books, stage: StageConfig):
         available_books = [b for b in books if b.id not in self.used_books and b.company_id == self.company_id]
         win = stage.candidate_window_days
     
@@ -450,7 +453,482 @@ class ReconciliationPipelineEngine:
                     )
                     return
     
+    
+    
+    def _find_mixed_one_to_many_group(
+        self,
+        bank: BankTransactionDTO,
+        local_books: List[JournalEntryDTO],
+        stage: StageConfig,
+    ) -> Optional[List[JournalEntryDTO]]:
+        """
+        Branch-and-bound search for a subset of `local_books` (mixed-sign amounts)
+        whose sum matches bank.amount_base within the given tolerance.
+
+        Uses rem_min/rem_max bounds to prune branches. Applies:
+          - amount tolerance
+          - currency check
+          - group_span_days
+          - avg_date_delta_days
+        Returns the FIRST valid combination found, or None.
+        """
+        n = len(local_books)
+        if n == 0:
+            return None
+
+        amounts: List[Decimal] = [
+            (b.amount_base or Decimal("0")) for b in local_books
+        ]
+        target = q2(bank.amount_base)
+        tol = stage.amount_tol or Decimal("0")
+
+        # Precompute remaining min/max sums from each index
+        rem_min = [Decimal("0")] * (n + 1)
+        rem_max = [Decimal("0")] * (n + 1)
+        for i in range(n - 1, -1, -1):
+            a = amounts[i]
+            if a >= 0:
+                rem_max[i] = rem_max[i + 1] + a
+                rem_min[i] = rem_min[i + 1]
+            else:
+                rem_min[i] = rem_min[i + 1] + a
+                rem_max[i] = rem_max[i + 1]
+
+        lower = target - tol
+        upper = target + tol
+        result_indices: Optional[List[int]] = None
+
+        def dfs(idx: int, chosen: List[int], current_sum: Decimal):
+            nonlocal result_indices
+
+            if result_indices is not None:
+                return
+
+            if len(chosen) > stage.max_group_size_book:
+                return
+
+            if idx == n:
+                if not chosen:
+                    return
+                if not (lower <= q2(current_sum) <= upper):
+                    return
+
+                combo = [local_books[i] for i in chosen]
+
+                # Currency check
+                if any(b.currency_id != bank.currency_id for b in combo):
+                    return
+
+                # INTRA-side span constraint ONLY for the books
+                dates = [b.date for b in combo if b.date]
+                book_span = (max(dates) - min(dates)).days if len(dates) >= 2 else 0
+                if stage.group_span_days and book_span > stage.group_span_days:
+                    return
+
+                # CROSS-side avg date delta
+                bank_avg = bank.date
+                book_avg = self._weighted_avg_date(combo)
+                win = stage.candidate_window_days
+                avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
+                if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
+                    return
+
+                result_indices = chosen.copy()
+                return
+
+            # Branch-and-bound: check reachable range
+            possible_min = current_sum + rem_min[idx]
+            possible_max = current_sum + rem_max[idx]
+            if possible_max < lower or possible_min > upper:
+                return
+
+            # Option 1: skip this item
+            dfs(idx + 1, chosen, current_sum)
+            if result_indices is not None:
+                return
+
+            # Option 2: take this item
+            dfs(idx + 1, chosen + [idx], current_sum + amounts[idx])
+
+        dfs(0, [], Decimal("0"))
+
+        if result_indices is None:
+            return None
+
+        return [local_books[i] for i in result_indices]
+
+    def _run_one_to_many(self, banks, books, stage: StageConfig):
+        """
+        One bank to many books.
+
+        Behaviour:
+          - If stage.allow_mixed_signs is False:
+              * filter candidate books to same sign as bank.amount_base
+              * use fast prefix-sum pruning (all amounts same sign)
+          - If stage.allow_mixed_signs is True:
+              * if candidate books all same sign -> prefix-sum pruning
+              * if truly mixed -> use branch-and-bound DFS (_find_mixed_one_to_many_group)
+        """
+        available_books = [
+            b for b in books
+            if b.id not in self.used_books and b.company_id == self.company_id
+        ]
+        win = stage.candidate_window_days
+
+        for bank in banks:
+            if self._time_exceeded():
+                return
+
+            if bank.id in self.used_banks:
+                continue
+
+            bank_amt = bank.amount_base or Decimal("0")
+            bank_sign = 1 if bank_amt > 0 else -1 if bank_amt < 0 else 0
+
+            # cheap prefilter around the bank date
+            local_books = [
+                b for b in available_books
+                if b.date and bank.date and abs((bank.date - b.date).days) <= win
+            ]
+            if not local_books:
+                continue
+
+            # Sign filtering when mixed signs are NOT allowed
+            if not stage.allow_mixed_signs and bank_sign != 0:
+                if bank_sign > 0:
+                    local_books = [
+                        b for b in local_books
+                        if (b.amount_base or Decimal("0")) >= 0
+                    ]
+                else:  # bank_sign < 0
+                    local_books = [
+                        b for b in local_books
+                        if (b.amount_base or Decimal("0")) <= 0
+                    ]
+                if not local_books:
+                    continue
+
+            # Collect amounts (can be mixed-sign if allow_mixed_signs=True)
+            book_amounts = [
+                (b.amount_base or Decimal("0")) for b in local_books
+            ]
+            if not book_amounts:
+                continue
+
+            has_pos = any(a > 0 for a in book_amounts)
+            has_neg = any(a < 0 for a in book_amounts)
+            mixed_signs = has_pos and has_neg
+
+            # ---------------------------
+            # PATH 1: mixed-sign search (only if allowed)
+            # ---------------------------
+            if mixed_signs and stage.allow_mixed_signs:
+                combo = self._find_mixed_one_to_many_group(bank, local_books, stage)
+                if not combo:
+                    continue  # no valid combination found for this bank
+
+                book_dates = [b.date for b in combo if b.date]
+                book_span = (max(book_dates) - min(book_dates)).days if len(book_dates) >= 2 else 0
+                bank_avg = bank.date
+                book_avg = self._weighted_avg_date(combo)
+                avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
+
+                sim = self._cosine_similarity(bank.embedding or [], _avg_embedding(combo))
+                scores = compute_match_scores(
+                    embed_sim=sim,
+                    amount_diff=Decimal("0"),
+                    amount_tol=stage.amount_tol or CENT,
+                    date_diff=avg_delta,
+                    date_tol=stage.avg_date_delta_days or 1,
+                    currency_match=1.0,
+                    weights=self.stage_weights,
+                )
+                self._record(
+                    self._make_suggestion(
+                        "one_to_many",
+                        [bank],
+                        list(combo),
+                        scores["global_score"],
+                        stage=stage,
+                        weights=self.stage_weights,
+                        component_scores=scores,
+                        extra={
+                            "book_span_days_measured": book_span,
+                            "avg_date_delta_days_measured": avg_delta,
+                            "mixed_signs": True,
+                        },
+                    )
+                )
+                return  # first valid combo per bank, as in original logic
+
+            # ---------------------------
+            # PATH 2: same-sign cases (fast prefix pruning)
+            # ---------------------------
+            # From here, either:
+            #  - allow_mixed_signs=False and we filtered by sign, OR
+            #  - allow_mixed_signs=True but book_amounts are effectively same sign.
+
+            # sort descending to get the largest amounts first
+            amounts_desc = sorted(book_amounts, reverse=True)
+            prefix_max: list[Decimal] = []
+            acc = Decimal("0")
+            for amt in amounts_desc:
+                acc += amt
+                prefix_max.append(acc)
+
+            target = q2(bank_amt)
+            tol = stage.amount_tol or Decimal("0")
+
+            # quick global bail: if even using all local books we can't reach the target
+            if q2(prefix_max[-1]) + tol < target:
+                continue
+
+            max_size = min(stage.max_group_size_book, len(local_books))
+
+            for size in range(1, max_size + 1):
+                if self._time_exceeded():
+                    return
+
+                # upper bound of any subset of size `size`: prefix_max[size-1]
+                if q2(prefix_max[size - 1]) + tol < target:
+                    continue
+
+                for combo in combinations(local_books, size):
+                    if any(x.id in self.used_books for x in combo):
+                        continue
+
+                    total = sum((b.amount_base for b in combo), Decimal("0"))
+                    if q2(total) != target:
+                        continue
+                    if any(b.currency_id != bank.currency_id for b in combo):
+                        continue
+
+                    # INTRA-side: span constraint ONLY for the grouped side (books)
+                    book_dates = [b.date for b in combo if b.date]
+                    book_span = (max(book_dates) - min(book_dates)).days if len(book_dates) >= 2 else 0
+                    if stage.group_span_days and book_span > stage.group_span_days:
+                        continue
+
+                    # CROSS-side: weighted-avg date delta
+                    bank_avg = bank.date
+                    book_avg = self._weighted_avg_date(combo)
+                    avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
+                    if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
+                        continue
+
+                    sim = self._cosine_similarity(bank.embedding or [], _avg_embedding(combo))
+                    scores = compute_match_scores(
+                        embed_sim=sim,
+                        amount_diff=Decimal("0"),
+                        amount_tol=stage.amount_tol or CENT,
+                        date_diff=avg_delta,
+                        date_tol=stage.avg_date_delta_days or 1,
+                        currency_match=1.0,
+                        weights=self.stage_weights,
+                    )
+                    self._record(
+                        self._make_suggestion(
+                            "one_to_many",
+                            [bank],
+                            list(combo),
+                            scores["global_score"],
+                            stage=stage,
+                            weights=self.stage_weights,
+                            component_scores=scores,
+                            extra={
+                                "book_span_days_measured": book_span,
+                                "avg_date_delta_days_measured": avg_delta,
+                                "mixed_signs": False,
+                            },
+                        )
+                    )
+                    return
+    
     def _run_many_to_one(self, banks, books, stage: StageConfig):
+        """
+        Many banks to one book.
+
+        Optimizations:
+          - If stage.allow_mixed_signs is False:
+              * filter candidate banks to same sign as book.amount_base
+              * use fast prefix-sum pruning (all amounts same sign).
+          - If stage.allow_mixed_signs is True:
+              * if candidate banks all same sign -> prefix-sum pruning,
+              * if mixed-sign -> branch-and-bound DFS via _find_mixed_many_to_one_group.
+        """
+        available_banks = [
+            b for b in banks
+            if b.id not in self.used_banks and b.company_id == self.company_id
+        ]
+        win = stage.candidate_window_days
+    
+        for book in books:
+            if self._time_exceeded():
+                return
+            
+            if book.id in self.used_books:
+                continue
+
+            book_amt = book.amount_base or Decimal("0")
+            book_sign = 1 if book_amt > 0 else -1 if book_amt < 0 else 0
+
+            # local window by date
+            local_banks = [
+                b for b in available_banks
+                if b.date and book.date and abs((b.date - book.date).days) <= win
+            ]
+            if not local_banks:
+                continue
+
+            bank_amounts = [
+                (b.amount_base or Decimal("0")) for b in local_banks
+            ]
+            if not bank_amounts:
+                continue
+
+            has_pos = any(a > 0 for a in bank_amounts)
+            has_neg = any(a < 0 for a in bank_amounts)
+            mixed_signs = has_pos and has_neg
+
+            # If we don't allow mixed signs, filter to same sign as the book
+            if not stage.allow_mixed_signs and book_sign != 0:
+                if book_sign > 0:
+                    local_banks = [
+                        b for b in local_banks
+                        if (b.amount_base or Decimal("0")) >= 0
+                    ]
+                else:
+                    local_banks = [
+                        b for b in local_banks
+                        if (b.amount_base or Decimal("0")) <= 0
+                    ]
+                if not local_banks:
+                    continue
+                bank_amounts = [(b.amount_base or Decimal("0")) for b in local_banks]
+                has_pos = any(a > 0 for a in bank_amounts)
+                has_neg = any(a < 0 for a in bank_amounts)
+                mixed_signs = has_pos and has_neg
+
+            # ---------------------------
+            # PATH 1: mixed-sign search if allowed
+            # ---------------------------
+            if mixed_signs and stage.allow_mixed_signs:
+                combo = self._find_mixed_many_to_one_group(book, local_banks, stage)
+                if not combo:
+                    continue
+
+                bank_dates = [b.date for b in combo if b.date]
+                bank_span = (max(bank_dates) - min(bank_dates)).days if len(bank_dates) >= 2 else 0
+                bank_avg = self._weighted_avg_date(combo)
+                book_avg = book.date
+                avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
+
+                sim = self._cosine_similarity(_avg_embedding(combo), book.embedding or [])
+                scores = compute_match_scores(
+                    embed_sim=sim,
+                    amount_diff=Decimal("0"),
+                    amount_tol=stage.amount_tol or CENT,
+                    date_diff=avg_delta,
+                    date_tol=stage.avg_date_delta_days or 1,
+                    currency_match=1.0,
+                    weights=self.stage_weights,
+                )
+                self._record(
+                    self._make_suggestion(
+                        "many_to_one",
+                        list(combo),
+                        [book],
+                        scores["global_score"],
+                        stage=stage,
+                        weights=self.stage_weights,
+                        component_scores=scores,
+                        extra={
+                            "bank_span_days_measured": bank_span,
+                            "avg_date_delta_days_measured": avg_delta,
+                            "mixed_signs": True,
+                        },
+                    )
+                )
+                return
+
+            # ---------------------------
+            # PATH 2: same-sign fast path
+            # ---------------------------
+            # From here, either mixed_signs == False (all same sign), or allow_mixed_signs is False
+            # and we have filtered to same sign as book_amt.
+
+            amounts_desc = sorted(bank_amounts, reverse=True)
+            prefix_max: List[Decimal] = []
+            acc = Decimal("0")
+            for amt in amounts_desc:
+                acc += amt
+                prefix_max.append(acc)
+
+            target = q2(book_amt)
+            tol = stage.amount_tol or Decimal("0")
+
+            if q2(prefix_max[-1]) + tol < target:
+                continue
+
+            max_size = min(stage.max_group_size_bank, len(local_banks))
+
+            for size in range(1, max_size + 1):
+                if self._time_exceeded():
+                    return
+
+                if q2(prefix_max[size - 1]) + tol < target:
+                    continue
+
+                for combo in combinations(local_banks, size):
+                    if any(x.id in self.used_banks for x in combo):
+                        continue
+
+                    total = sum((b.amount_base for b in combo), Decimal("0"))
+                    if q2(total) != target:
+                        continue
+                    if any(b.currency_id != book.currency_id for b in combo):
+                        continue
+
+                    bank_dates = [b.date for b in combo if b.date]
+                    bank_span = (max(bank_dates) - min(bank_dates)).days if len(bank_dates) >= 2 else 0
+                    if stage.group_span_days and bank_span > stage.group_span_days:
+                        continue
+
+                    bank_avg = self._weighted_avg_date(combo)
+                    book_avg = book.date
+                    avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
+                    if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
+                        continue
+
+                    sim = self._cosine_similarity(_avg_embedding(combo), book.embedding or [])
+                    scores = compute_match_scores(
+                        embed_sim=sim,
+                        amount_diff=Decimal("0"),
+                        amount_tol=stage.amount_tol or CENT,
+                        date_diff=avg_delta,
+                        date_tol=stage.avg_date_delta_days or 1,
+                        currency_match=1.0,
+                        weights=self.stage_weights,
+                    )
+                    self._record(
+                        self._make_suggestion(
+                            "many_to_one",
+                            list(combo),
+                            [book],
+                            scores["global_score"],
+                            stage=stage,
+                            weights=self.stage_weights,
+                            component_scores=scores,
+                            extra={
+                                "bank_span_days_measured": bank_span,
+                                "avg_date_delta_days_measured": avg_delta,
+                                "mixed_signs": False,
+                            },
+                        )
+                    )
+                    return
+    
+    def _run_many_to_one_legacy(self, banks, books, stage: StageConfig):
         available_banks = [b for b in banks if b.id not in self.used_banks and b.company_id == self.company_id]
         win = stage.candidate_window_days
     
@@ -670,8 +1148,163 @@ class ReconciliationPipelineEngine:
 
             if len(self.suggestions) >= self.config.max_suggestions:
                 break
-
+    
     def _run_many_to_many(self, banks, books, stage: StageConfig):
+        """
+        Many-to-many matching with amount-based pruning.
+
+        If stage.allow_mixed_signs is False:
+          - we restrict candidate books to have the same sign as the anchor bank.amount_base.
+        """
+        sorted_banks = [b for b in banks if b.company_id == self.company_id]
+        sorted_banks.sort(key=lambda b: b.date)
+        sorted_books = [e for e in books if e.company_id == self.company_id]
+        sorted_books.sort(key=lambda e: e.date)
+    
+        win = stage.candidate_window_days
+        log.debug(
+            "Starting many-to-many company=%d banks=%d books=%d win=%d",
+            self.company_id, len(sorted_banks), len(sorted_books), win,
+        )
+    
+        for bank in sorted_banks:
+            if self._time_exceeded():
+                return
+
+            if bank.id in self.used_banks:
+                continue
+
+            bank_amt = bank.amount_base or Decimal("0")
+            bank_sign = 1 if bank_amt > 0 else -1 if bank_amt < 0 else 0
+    
+            start = bank.date - timedelta(days=win)
+            end = bank.date + timedelta(days=win)
+            bank_window = [b for b in sorted_banks if start <= b.date <= end]
+            book_window = [e for e in sorted_books if start <= e.date <= end]
+            if not bank_window or not book_window:
+                continue
+
+            # If mixed signs not allowed, filter books by sign relative to bank
+            if not stage.allow_mixed_signs and bank_sign != 0:
+                if bank_sign > 0:
+                    book_window = [
+                        e for e in book_window
+                        if (e.amount_base or Decimal("0")) >= 0
+                    ]
+                else:
+                    book_window = [
+                        e for e in book_window
+                        if (e.amount_base or Decimal("0")) <= 0
+                    ]
+                if not book_window:
+                    continue
+
+            # Precompute book amount prefix maxima (assumes mostly same-sign here)
+            book_amounts = [e.amount_base for e in book_window if e.amount_base is not None]
+            if not book_amounts:
+                continue
+            book_amounts_desc = sorted(book_amounts, reverse=True)
+            book_prefix_max: list[Decimal] = []
+            acc = Decimal("0")
+            for amt in book_amounts_desc:
+                acc += amt
+                book_prefix_max.append(acc)
+
+            tol = stage.amount_tol or Decimal("0")
+    
+            for i in range(1, min(stage.max_group_size_bank, len(bank_window)) + 1):
+                if self._time_exceeded():
+                    return
+
+                for bank_combo in combinations(bank_window, i):
+                    if self._time_exceeded():
+                        return
+
+                    # anchor to avoid duplicates
+                    if bank.id != min(b.id for b in bank_combo):
+                        continue
+                    if any(bc.id in self.used_banks for bc in bank_combo):
+                        continue
+    
+                    sum_bank = sum((b.amount_base for b in bank_combo), Decimal("0"))
+                    target = q2(sum_bank)
+
+                    # quick global bound: if even using all books we can't reach this sum, skip
+                    if q2(book_prefix_max[-1]) + tol < target:
+                        continue
+    
+                    max_book_group_size = min(stage.max_group_size_book, len(book_window))
+
+                    for j in range(1, max_book_group_size + 1):
+                        if self._time_exceeded():
+                            return
+
+                        # upper bound for any subset of size j on book side
+                        if q2(book_prefix_max[j - 1]) + tol < target:
+                            continue
+
+                        for book_combo in combinations(book_window, j):
+                            if self._time_exceeded():
+                                return
+
+                            if any(bk.id in self.used_books for bk in book_combo):
+                                continue
+    
+                            sum_book = sum((e.amount_base for e in book_combo), Decimal("0"))
+                            if q2(sum_book) != target:
+                                continue
+                            if any(b.currency_id != e.currency_id for b in bank_combo for e in book_combo):
+                                continue
+    
+                            # INTRA-side spans (separate checks)
+                            bank_span = self._date_span_days(bank_combo)
+                            book_span = self._date_span_days(book_combo)
+                            if stage.group_span_days:
+                                if bank_span > stage.group_span_days:
+                                    continue
+                                if book_span > stage.group_span_days:
+                                    continue
+    
+                            # CROSS-side weighted-avg delta
+                            bank_avg = self._weighted_avg_date(bank_combo)
+                            book_avg = self._weighted_avg_date(book_combo)
+                            avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
+                            if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
+                                continue
+    
+                            emb_bank = _avg_embedding(bank_combo)
+                            emb_book = _avg_embedding(book_combo)
+                            embed_sim = self._cosine_similarity(emb_bank, emb_book)
+    
+                            scores = compute_match_scores(
+                                embed_sim=embed_sim,
+                                amount_diff=Decimal("0"),
+                                amount_tol=stage.amount_tol or CENT,
+                                date_diff=avg_delta,
+                                date_tol=stage.avg_date_delta_days or 1,
+                                currency_match=1.0,
+                                weights=self.stage_weights,
+                            )
+    
+                            self._record(
+                                self._make_suggestion(
+                                    "many_to_many",
+                                    list(bank_combo),
+                                    list(book_combo),
+                                    scores["global_score"],
+                                    stage=stage,
+                                    weights=self.stage_weights,
+                                    component_scores=scores,
+                                    extra={
+                                        "bank_span_days_measured": bank_span,
+                                        "book_span_days_measured": book_span,
+                                        "avg_date_delta_days_measured": avg_delta,
+                                        "mixed_signs_allowed": stage.allow_mixed_signs,
+                                    },
+                                )
+                            )
+    
+    def _run_many_to_many_legacy(self, banks, books, stage: StageConfig):
         # Copy & sort (company-filtered)
         sorted_banks = [b for b in banks if b.company_id == self.company_id]
         sorted_banks.sort(key=lambda b: b.date)
@@ -961,6 +1594,7 @@ def run_single_config(cfg: object,
         stage_type = "exact_1to1"
     
     soft_limit = getattr(cfg, "soft_time_limit_seconds", None)
+    allow_mixed = bool(getattr(cfg, "allow_mixed_signs", False))
     
     stage = StageConfig(
         type=stage_type,
@@ -969,6 +1603,7 @@ def run_single_config(cfg: object,
         amount_tol=cfg.amount_tolerance,
         group_span_days=getattr(cfg, "group_span_days", 0),
         avg_date_delta_days=getattr(cfg, "avg_date_delta_days", 0),
+        allow_mixed_signs=allow_mixed,
     )
     
     pipe_cfg = PipelineConfig(
@@ -1027,7 +1662,12 @@ def run_pipeline(pipeline: object,
             stage_type = "fuzzy_1to1"
         else:
             stage_type = "exact_1to1"
-
+        
+        # Allow per-stage override later; for now, use config flag
+        allow_mixed = getattr(stage_obj, "allow_mixed_signs", None)
+        if allow_mixed is None:
+            allow_mixed = getattr(cfg, "allow_mixed_signs", False)
+        
         stage_configs.append(
             StageConfig(
                 type=stage_type,
@@ -1053,6 +1693,7 @@ def run_pipeline(pipeline: object,
                 date_weight=float(getattr(stage_obj, "date_weight", None))
                 if getattr(stage_obj, "date_weight", None) is not None
                 else float(cfg.date_weight),
+                allow_mixed_signs=bool(allow_mixed),
             )
         )
         weight_list.append(

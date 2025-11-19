@@ -506,15 +506,6 @@ class ReconciliationPipelineStageSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
 
-class ReconciliationPipelineStageSerializer(serializers.ModelSerializer):
-    """
-    Serializer for an individual stage in a reconciliation pipeline.
-    """
-    config_name = serializers.CharField(source="config.name", read_only=True)
-
-    class Meta:
-        model = ReconciliationPipelineStage
-        fields = "__all__"
 
 
 class ReconciliationPipelineSerializer(serializers.ModelSerializer):
