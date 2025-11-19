@@ -121,6 +121,15 @@ class PipelineConfig:
 # ----------------------------------------------------------------------
 CENT = Decimal("0.01")
 
+def _sign(x: Decimal | None) -> int:
+    if x is None:
+        return 0
+    if x > 0:
+        return 1
+    if x < 0:
+        return -1
+    return 0
+
 def _as_vec_list(vec) -> Optional[List[float]]:
     """
     Return a plain list[float] for any pgvector/ndarray/list-like input,
@@ -455,31 +464,32 @@ class ReconciliationPipelineEngine:
     
     
     
-    def _find_mixed_one_to_many_group(
+    def _find_mixed_many_to_one_group(
         self,
-        bank: BankTransactionDTO,
-        local_books: List[JournalEntryDTO],
+        book: JournalEntryDTO,
+        local_banks: List[BankTransactionDTO],
         stage: StageConfig,
-    ) -> Optional[List[JournalEntryDTO]]:
+    ) -> Optional[List[BankTransactionDTO]]:
         """
-        Branch-and-bound search for a subset of `local_books` (mixed-sign amounts)
-        whose sum matches bank.amount_base within the given tolerance.
+        Branch-and-bound search for a subset of `local_banks` (mixed-sign amounts)
+        whose sum matches book.amount_base within the given tolerance.
 
         Uses rem_min/rem_max bounds to prune branches. Applies:
           - amount tolerance
           - currency check
-          - group_span_days
-          - avg_date_delta_days
-        Returns the FIRST valid combination found, or None.
+          - group_span_days (banks)
+          - avg_date_delta_days between bank-group weighted avg date and book.date
+
+        Returns the FIRST valid combination of banks, or None.
         """
-        n = len(local_books)
+        n = len(local_banks)
         if n == 0:
             return None
 
         amounts: List[Decimal] = [
-            (b.amount_base or Decimal("0")) for b in local_books
+            (b.amount_base or Decimal("0")) for b in local_banks
         ]
-        target = q2(bank.amount_base)
+        target = q2(book.amount_base)
         tol = stage.amount_tol or Decimal("0")
 
         # Precompute remaining min/max sums from each index
@@ -504,7 +514,7 @@ class ReconciliationPipelineEngine:
             if result_indices is not None:
                 return
 
-            if len(chosen) > stage.max_group_size_book:
+            if len(chosen) > stage.max_group_size_bank:
                 return
 
             if idx == n:
@@ -513,21 +523,21 @@ class ReconciliationPipelineEngine:
                 if not (lower <= q2(current_sum) <= upper):
                     return
 
-                combo = [local_books[i] for i in chosen]
+                combo = [local_banks[i] for i in chosen]
 
                 # Currency check
-                if any(b.currency_id != bank.currency_id for b in combo):
+                if any(b.currency_id != book.currency_id for b in combo):
                     return
 
-                # INTRA-side span constraint ONLY for the books
+                # INTRA-side span constraint for banks
                 dates = [b.date for b in combo if b.date]
-                book_span = (max(dates) - min(dates)).days if len(dates) >= 2 else 0
-                if stage.group_span_days and book_span > stage.group_span_days:
+                bank_span = (max(dates) - min(dates)).days if len(dates) >= 2 else 0
+                if stage.group_span_days and bank_span > stage.group_span_days:
                     return
 
                 # CROSS-side avg date delta
-                bank_avg = bank.date
-                book_avg = self._weighted_avg_date(combo)
+                bank_avg = self._weighted_avg_date(combo)
+                book_avg = book.date
                 win = stage.candidate_window_days
                 avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
                 if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
@@ -555,7 +565,7 @@ class ReconciliationPipelineEngine:
         if result_indices is None:
             return None
 
-        return [local_books[i] for i in result_indices]
+        return [local_banks[i] for i in result_indices]
 
     def _run_one_to_many(self, banks, books, stage: StageConfig):
         """
@@ -564,10 +574,11 @@ class ReconciliationPipelineEngine:
         Behaviour:
           - If stage.allow_mixed_signs is False:
               * filter candidate books to same sign as bank.amount_base
-              * use fast prefix-sum pruning (all amounts same sign)
+              * use fast prefix-sum pruning ONLY when all candidate book amounts
+                and the bank amount are non-negative.
           - If stage.allow_mixed_signs is True:
-              * if candidate books all same sign -> prefix-sum pruning
-              * if truly mixed -> use branch-and-bound DFS (_find_mixed_one_to_many_group)
+              * if candidate books all same sign -> same as above,
+              * if mixed-sign -> branch-and-bound DFS via _find_mixed_one_to_many_group.
         """
         available_books = [
             b for b in books
@@ -583,7 +594,7 @@ class ReconciliationPipelineEngine:
                 continue
 
             bank_amt = bank.amount_base or Decimal("0")
-            bank_sign = 1 if bank_amt > 0 else -1 if bank_amt < 0 else 0
+            bank_sign = _sign(bank_amt)
 
             # cheap prefilter around the bank date
             local_books = [
@@ -662,54 +673,62 @@ class ReconciliationPipelineEngine:
                 return  # first valid combo per bank, as in original logic
 
             # ---------------------------
-            # PATH 2: same-sign cases (fast prefix pruning)
+            # PATH 2: same-sign cases
             # ---------------------------
-            # From here, either:
-            #  - allow_mixed_signs=False and we filtered by sign, OR
-            #  - allow_mixed_signs=True but book_amounts are effectively same sign.
-
-            # sort descending to get the largest amounts first
-            amounts_desc = sorted(book_amounts, reverse=True)
-            prefix_max: list[Decimal] = []
-            acc = Decimal("0")
-            for amt in amounts_desc:
-                acc += amt
-                prefix_max.append(acc)
-
             target = q2(bank_amt)
             tol = stage.amount_tol or Decimal("0")
 
-            # quick global bail: if even using all local books we can't reach the target
-            if q2(prefix_max[-1]) + tol < target:
+            # Global loose bounds (sign-agnostic, using tolerance)
+            min_possible = sum(a for a in book_amounts if a < 0)
+            max_possible = sum(a for a in book_amounts if a > 0)
+            L = target - tol
+            U = target + tol
+            # If target interval [L,U] is completely outside [min_possible,max_possible], prune
+            if U < min_possible or L > max_possible:
                 continue
 
+            all_non_negative = all(a >= 0 for a in book_amounts)
+            use_prefix_bounds = all_non_negative and target >= 0
+
             max_size = min(stage.max_group_size_book, len(local_books))
+
+            # Optionally build prefix bounds if safe (non-negative amounts & target)
+            if use_prefix_bounds:
+                amounts_desc = sorted(book_amounts, reverse=True)
+                prefix_max: List[Decimal] = []
+                acc = Decimal("0")
+                for amt in amounts_desc:
+                    acc += amt
+                    prefix_max.append(acc)
+                # quick global bail: if even using all local books we can't reach the target band, skip
+                if q2(prefix_max[-1]) + tol < target:
+                    continue
 
             for size in range(1, max_size + 1):
                 if self._time_exceeded():
                     return
 
-                # upper bound of any subset of size `size`: prefix_max[size-1]
-                if q2(prefix_max[size - 1]) + tol < target:
-                    continue
+                if use_prefix_bounds:
+                    # upper bound of any subset of size `size`: prefix_max[size-1]
+                    if q2(prefix_max[size - 1]) + tol < target:
+                        continue
 
                 for combo in combinations(local_books, size):
                     if any(x.id in self.used_books for x in combo):
                         continue
 
                     total = sum((b.amount_base for b in combo), Decimal("0"))
-                    if q2(total) != target:
+                    diff = abs(q2(total) - target)
+                    if diff > stage.amount_tol:
                         continue
                     if any(b.currency_id != bank.currency_id for b in combo):
                         continue
 
-                    # INTRA-side: span constraint ONLY for the grouped side (books)
                     book_dates = [b.date for b in combo if b.date]
                     book_span = (max(book_dates) - min(book_dates)).days if len(book_dates) >= 2 else 0
                     if stage.group_span_days and book_span > stage.group_span_days:
                         continue
 
-                    # CROSS-side: weighted-avg date delta
                     bank_avg = bank.date
                     book_avg = self._weighted_avg_date(combo)
                     avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
@@ -751,9 +770,10 @@ class ReconciliationPipelineEngine:
         Optimizations:
           - If stage.allow_mixed_signs is False:
               * filter candidate banks to same sign as book.amount_base
-              * use fast prefix-sum pruning (all amounts same sign).
+              * use fast prefix-sum pruning ONLY when all candidate bank amounts
+                and the book amount are non-negative.
           - If stage.allow_mixed_signs is True:
-              * if candidate banks all same sign -> prefix-sum pruning,
+              * if candidate banks all same sign -> same as above,
               * if mixed-sign -> branch-and-bound DFS via _find_mixed_many_to_one_group.
         """
         available_banks = [
@@ -770,7 +790,7 @@ class ReconciliationPipelineEngine:
                 continue
 
             book_amt = book.amount_base or Decimal("0")
-            book_sign = 1 if book_amt > 0 else -1 if book_amt < 0 else 0
+            book_sign = _sign(book_amt)
 
             # local window by date
             local_banks = [
@@ -854,37 +874,48 @@ class ReconciliationPipelineEngine:
             # ---------------------------
             # PATH 2: same-sign fast path
             # ---------------------------
-            # From here, either mixed_signs == False (all same sign), or allow_mixed_signs is False
-            # and we have filtered to same sign as book_amt.
-
-            amounts_desc = sorted(bank_amounts, reverse=True)
-            prefix_max: List[Decimal] = []
-            acc = Decimal("0")
-            for amt in amounts_desc:
-                acc += amt
-                prefix_max.append(acc)
-
             target = q2(book_amt)
             tol = stage.amount_tol or Decimal("0")
 
-            if q2(prefix_max[-1]) + tol < target:
+            # Global loose bounds with tolerance
+            min_possible = sum(a for a in bank_amounts if a < 0)
+            max_possible = sum(a for a in bank_amounts if a > 0)
+            L = target - tol
+            U = target + tol
+            if U < min_possible or L > max_possible:
                 continue
 
+            all_non_negative = all(a >= 0 for a in bank_amounts)
+            use_prefix_bounds = all_non_negative and target >= 0
+
             max_size = min(stage.max_group_size_bank, len(local_banks))
+
+            if use_prefix_bounds:
+                amounts_desc = sorted(bank_amounts, reverse=True)
+                prefix_max: List[Decimal] = []
+                acc = Decimal("0")
+                for amt in amounts_desc:
+                    acc += amt
+                    prefix_max.append(acc)
+
+                if q2(prefix_max[-1]) + tol < target:
+                    continue
 
             for size in range(1, max_size + 1):
                 if self._time_exceeded():
                     return
 
-                if q2(prefix_max[size - 1]) + tol < target:
-                    continue
+                if use_prefix_bounds:
+                    if q2(prefix_max[size - 1]) + tol < target:
+                        continue
 
                 for combo in combinations(local_banks, size):
                     if any(x.id in self.used_banks for x in combo):
                         continue
 
                     total = sum((b.amount_base for b in combo), Decimal("0"))
-                    if q2(total) != target:
+                    diff = abs(q2(total) - target)
+                    if diff > stage.amount_tol:
                         continue
                     if any(b.currency_id != book.currency_id for b in combo):
                         continue
@@ -1154,7 +1185,8 @@ class ReconciliationPipelineEngine:
         Many-to-many matching with amount-based pruning.
 
         If stage.allow_mixed_signs is False:
-          - we restrict candidate books to have the same sign as the anchor bank.amount_base.
+          - restrict BOTH candidate banks and books to have the same sign as the anchor bank.amount_base.
+          - effectively, positive and negative groups are reconciled separately.
         """
         sorted_banks = [b for b in banks if b.company_id == self.company_id]
         sorted_banks.sort(key=lambda b: b.date)
@@ -1175,7 +1207,7 @@ class ReconciliationPipelineEngine:
                 continue
 
             bank_amt = bank.amount_base or Decimal("0")
-            bank_sign = 1 if bank_amt > 0 else -1 if bank_amt < 0 else 0
+            bank_sign = _sign(bank_amt)
     
             start = bank.date - timedelta(days=win)
             end = bank.date + timedelta(days=win)
@@ -1184,31 +1216,28 @@ class ReconciliationPipelineEngine:
             if not bank_window or not book_window:
                 continue
 
-            # If mixed signs not allowed, filter books by sign relative to bank
+            # If mixed signs not allowed, filter BOTH banks and books by sign relative to anchor
             if not stage.allow_mixed_signs and bank_sign != 0:
                 if bank_sign > 0:
+                    bank_window = [
+                        b for b in bank_window
+                        if (b.amount_base or Decimal("0")) >= 0
+                    ]
                     book_window = [
                         e for e in book_window
                         if (e.amount_base or Decimal("0")) >= 0
                     ]
                 else:
+                    bank_window = [
+                        b for b in bank_window
+                        if (b.amount_base or Decimal("0")) <= 0
+                    ]
                     book_window = [
                         e for e in book_window
                         if (e.amount_base or Decimal("0")) <= 0
                     ]
-                if not book_window:
+                if not bank_window or not book_window:
                     continue
-
-            # Precompute book amount prefix maxima (assumes mostly same-sign here)
-            book_amounts = [e.amount_base for e in book_window if e.amount_base is not None]
-            if not book_amounts:
-                continue
-            book_amounts_desc = sorted(book_amounts, reverse=True)
-            book_prefix_max: list[Decimal] = []
-            acc = Decimal("0")
-            for amt in book_amounts_desc:
-                acc += amt
-                book_prefix_max.append(acc)
 
             tol = stage.amount_tol or Decimal("0")
     
@@ -1229,9 +1258,33 @@ class ReconciliationPipelineEngine:
                     sum_bank = sum((b.amount_base for b in bank_combo), Decimal("0"))
                     target = q2(sum_bank)
 
-                    # quick global bound: if even using all books we can't reach this sum, skip
-                    if q2(book_prefix_max[-1]) + tol < target:
+                    # Build book amounts for this window
+                    book_amounts = [e.amount_base for e in book_window if e.amount_base is not None]
+                    if not book_amounts:
                         continue
+
+                    # Global bounds using tolerance
+                    min_possible = sum(a for a in book_amounts if a < 0)
+                    max_possible = sum(a for a in book_amounts if a > 0)
+                    L = target - tol
+                    U = target + tol
+                    if U < min_possible or L > max_possible:
+                        continue
+
+                    # Prefix bounds only if non-negative target & amounts
+                    all_non_negative = all(a >= 0 for a in book_amounts)
+                    use_prefix_bounds = all_non_negative and target >= 0
+
+                    if use_prefix_bounds:
+                        book_amounts_desc = sorted(book_amounts, reverse=True)
+                        book_prefix_max: List[Decimal] = []
+                        acc = Decimal("0")
+                        for amt in book_amounts_desc:
+                            acc += amt
+                            book_prefix_max.append(acc)
+
+                        if q2(book_prefix_max[-1]) + tol < target:
+                            continue
     
                     max_book_group_size = min(stage.max_group_size_book, len(book_window))
 
@@ -1239,9 +1292,9 @@ class ReconciliationPipelineEngine:
                         if self._time_exceeded():
                             return
 
-                        # upper bound for any subset of size j on book side
-                        if q2(book_prefix_max[j - 1]) + tol < target:
-                            continue
+                        if use_prefix_bounds:
+                            if q2(book_prefix_max[j - 1]) + tol < target:
+                                continue
 
                         for book_combo in combinations(book_window, j):
                             if self._time_exceeded():
@@ -1251,7 +1304,8 @@ class ReconciliationPipelineEngine:
                                 continue
     
                             sum_book = sum((e.amount_base for e in book_combo), Decimal("0"))
-                            if q2(sum_book) != target:
+                            diff = abs(q2(sum_book) - target)
+                            if diff > stage.amount_tol:
                                 continue
                             if any(b.currency_id != e.currency_id for b in bank_combo for e in book_combo):
                                 continue
