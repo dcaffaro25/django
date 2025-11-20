@@ -606,7 +606,11 @@ class ReconciliationConfig(models.Model):
         blank=True,
         help_text="Soft runtime limit in seconds for this config's reconciliation run.",
     )
-
+    
+    # NEW: how many alternative matches to return per anchor (bank/book)
+    # 1 = only the best (current behaviour); 3 = best + 2 alternatives, etc.
+    max_alternatives_per_match = models.PositiveIntegerField(default=2)
+    
     # Additional tuning
     fee_accounts = models.JSONField(default=list, blank=True, null=True)
     duplicate_window_days = models.PositiveIntegerField(default=3)
