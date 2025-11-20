@@ -319,8 +319,19 @@ class ReconciliationPipelineEngine:
         return (monotonic() - self._start_ts) >= self.max_runtime_seconds
     
     def run(self, banks: list[BankTransactionDTO], books: list[JournalEntryDTO]) -> list[dict]:
+        log.debug(
+            "PipelineEngine.run: company_id=%s stages=%d banks=%d books=%d max_suggestions=%d max_runtime=%s",
+            self.company_id,
+            len(self.config.stages),
+            len(banks),
+            len(books),
+            self.config.max_suggestions,
+            self.max_runtime_seconds,
+        )
+
         for idx, stage in enumerate(self.config.stages):
             if not stage.enabled:
+                log.debug("Stage %d (%s) skipped: enabled=False", idx, stage.type)
                 continue
             
             if self._time_exceeded():
@@ -337,14 +348,16 @@ class ReconciliationPipelineEngine:
             )
             
             handler = getattr(self, f"_run_{stage.type}", None)
-    
+            win = stage.candidate_window_days
+
             log.debug(
-                "Stage %d (%s): weights=%s amount_tol=%s group_span_days=%d avg_date_delta_days=%d "
-                "max_grp_bank=%d max_grp_book=%d banks=%d books=%d",
+                "Stage %d (%s): weights=%s amount_tol=%s group_span_days=%d "
+                "avg_date_delta_days=%d candidate_window_days=%d "
+                "max_grp_bank=%d max_grp_book=%d banks=%d books=%d allow_mixed_signs=%s",
                 idx, stage.type, self.stage_weights, stage.amount_tol,
-                stage.group_span_days, stage.avg_date_delta_days,
+                stage.group_span_days, stage.avg_date_delta_days, win,
                 stage.max_group_size_bank, stage.max_group_size_book,
-                len(banks), len(books)
+                len(banks), len(books), stage.allow_mixed_signs,
             )
     
             if handler:
@@ -358,8 +371,16 @@ class ReconciliationPipelineEngine:
                     break
                 
                 if len(self.suggestions) >= self.config.max_suggestions:
+                    log.debug(
+                        "Reached max_suggestions=%d at stage %d (%s); stopping.",
+                        self.config.max_suggestions, idx, stage.type,
+                    )
                     break
                 
+        log.debug(
+            "PipelineEngine.run finished: suggestions=%d used_banks=%d used_books=%d",
+            len(self.suggestions), len(self.used_banks), len(self.used_books),
+        )
         return self.suggestions[: self.config.max_suggestions]
 
     # ------------------------ Stage handlers ------------------------
@@ -585,7 +606,11 @@ class ReconciliationPipelineEngine:
             if b.id not in self.used_books and b.company_id == self.company_id
         ]
         win = stage.candidate_window_days
-
+        log.debug(
+            "_run_one_to_many: banks=%d books=%d win=%d amount_tol=%s allow_mixed=%s",
+            len(banks), len(books), win, stage.amount_tol, stage.allow_mixed_signs,
+        )
+        
         for bank in banks:
             if self._time_exceeded():
                 return
@@ -781,7 +806,11 @@ class ReconciliationPipelineEngine:
             if b.id not in self.used_banks and b.company_id == self.company_id
         ]
         win = stage.candidate_window_days
-    
+        log.debug(
+            "_run_many_to_one: banks=%d books=%d win=%d amount_tol=%s allow_mixed=%s",
+            len(banks), len(books), win, stage.amount_tol, stage.allow_mixed_signs,
+        )
+        
         for book in books:
             if self._time_exceeded():
                 return
@@ -1650,6 +1679,18 @@ def run_single_config(cfg: object,
     soft_limit = getattr(cfg, "soft_time_limit_seconds", None)
     allow_mixed = bool(getattr(cfg, "allow_mixed_signs", False))
     
+    log.debug(
+        "run_single_config: cfg_id=%s company_id=%s stage_type=%s "
+        "max_group_size_bank=%d max_group_size_book=%d "
+        "amount_tolerance=%s group_span_days=%s avg_date_delta_days=%s "
+        "allow_mixed_signs=%s soft_time_limit=%s",
+        getattr(cfg, "id", None), company_id, stage_type,
+        cfg.max_group_size_bank, cfg.max_group_size_book,
+        cfg.amount_tolerance, getattr(cfg, "group_span_days", None),
+        getattr(cfg, "avg_date_delta_days", None),
+        allow_mixed, soft_limit,
+    )
+
     stage = StageConfig(
         type=stage_type,
         max_group_size_bank=cfg.max_group_size_bank,
@@ -1658,6 +1699,10 @@ def run_single_config(cfg: object,
         group_span_days=getattr(cfg, "group_span_days", 0),
         avg_date_delta_days=getattr(cfg, "avg_date_delta_days", 0),
         allow_mixed_signs=allow_mixed,
+    )
+    
+    log.debug(
+        "run_single_config: StageConfig=%s", stage,
     )
     
     pipe_cfg = PipelineConfig(
@@ -1675,26 +1720,38 @@ def run_single_config(cfg: object,
     }
     suggestions = engine.run(banks, books)
     min_conf = float(getattr(cfg, "min_confidence", 0))
-    return [s for s in suggestions if s["confidence_score"] >= min_conf] if min_conf else suggestions
+    if min_conf:
+        suggestions = [s for s in suggestions if s["confidence_score"] >= min_conf]
+    log.debug(
+        "run_single_config: cfg_id=%s produced %d suggestions (min_conf=%.3f)",
+        getattr(cfg, "id", None), len(suggestions), min_conf,
+    )
+    return suggestions
+
 
 def run_pipeline(pipeline: object,
                  banks: List[BankTransactionDTO],
                  books: List[JournalEntryDTO]) -> List[dict]:
     """
-    Execute a multi-stage pipeline.  The ``pipeline`` object must have:
-      - company_id
-      - auto_apply_score
-      - max_suggestions
-      - a ``stages`` iterable that yields stage objects with attributes:
-          enabled, order, config (with relevant fields), and optional overrides.
+    Execute a multi-stage pipeline.
     """
     
     stage_configs: list[StageConfig] = []
     weight_list: list[dict[str, float]] = []
     
-    for stage_obj in pipeline.stages.select_related("config").order_by("order"):
+    log.debug(
+        "run_pipeline: pipeline_id=%s company_id=%s stages_db=%d auto_apply_score=%s max_suggestions=%s",
+        getattr(pipeline, "id", None),
+        pipeline.company_id,
+        pipeline.stages.count() if hasattr(pipeline.stages, "count") else None,
+        getattr(pipeline, "auto_apply_score", None),
+        getattr(pipeline, "max_suggestions", None),
+    )
+    
+    for idx, stage_obj in enumerate(pipeline.stages.select_related("config").order_by("order")):
         cfg = stage_obj.config
         if not stage_obj.enabled:
+            log.debug("run_pipeline: stage[%d] disabled; skipping", idx)
             continue
 
         span = (
@@ -1717,39 +1774,61 @@ def run_pipeline(pipeline: object,
         else:
             stage_type = "exact_1to1"
         
-        # Allow per-stage override later; for now, use config flag
         allow_mixed = getattr(stage_obj, "allow_mixed_signs", None)
         if allow_mixed is None:
             allow_mixed = getattr(cfg, "allow_mixed_signs", False)
-        
-        stage_configs.append(
-            StageConfig(
-                type=stage_type,
-                enabled=True,
-                max_group_size_bank=stage_obj.max_group_size_bank or cfg.max_group_size_bank,
-                max_group_size_book=stage_obj.max_group_size_book or cfg.max_group_size_book,
-                amount_tol=(
-                    stage_obj.amount_tolerance
-                    if stage_obj.amount_tolerance is not None
-                    else cfg.amount_tolerance
-                ),
-                group_span_days=span,
-                avg_date_delta_days=delta,
-                embedding_weight=float(getattr(stage_obj, "embedding_weight", None))
-                if getattr(stage_obj, "embedding_weight", None) is not None
-                else float(cfg.embedding_weight),
-                amount_weight=float(getattr(stage_obj, "amount_weight", None))
-                if getattr(stage_obj, "amount_weight", None) is not None
-                else float(cfg.amount_weight),
-                currency_weight=float(getattr(stage_obj, "currency_weight", None))
-                if getattr(stage_obj, "currency_weight", None) is not None
-                else float(cfg.currency_weight),
-                date_weight=float(getattr(stage_obj, "date_weight", None))
-                if getattr(stage_obj, "date_weight", None) is not None
-                else float(cfg.date_weight),
-                allow_mixed_signs=bool(allow_mixed),
-            )
+
+        log.debug(
+            "run_pipeline: stage[%d] db_stage_id=%s order=%s cfg_id=%s type=%s "
+            "cfg_group_span=%s stage_group_span=%s -> span=%s "
+            "cfg_avg_delta=%s stage_avg_delta=%s -> delta=%s "
+            "max_group_size_bank=%s max_group_size_book=%s allow_mixed_signs=%s",
+            idx,
+            getattr(stage_obj, "id", None),
+            getattr(stage_obj, "order", None),
+            getattr(cfg, "id", None),
+            stage_type,
+            getattr(cfg, "group_span_days", None),
+            getattr(stage_obj, "group_span_days", None),
+            span,
+            getattr(cfg, "avg_date_delta_days", None),
+            getattr(stage_obj, "avg_date_delta_days", None),
+            delta,
+            stage_obj.max_group_size_bank or cfg.max_group_size_bank,
+            stage_obj.max_group_size_book or cfg.max_group_size_book,
+            allow_mixed,
         )
+        
+        stage_conf = StageConfig(
+            type=stage_type,
+            enabled=True,
+            max_group_size_bank=stage_obj.max_group_size_bank or cfg.max_group_size_bank,
+            max_group_size_book=stage_obj.max_group_size_book or cfg.max_group_size_book,
+            amount_tol=(
+                stage_obj.amount_tolerance
+                if stage_obj.amount_tolerance is not None
+                else cfg.amount_tolerance
+            ),
+            group_span_days=span,
+            avg_date_delta_days=delta,
+            embedding_weight=float(getattr(stage_obj, "embedding_weight", None))
+            if getattr(stage_obj, "embedding_weight", None) is not None
+            else float(cfg.embedding_weight),
+            amount_weight=float(getattr(stage_obj, "amount_weight", None))
+            if getattr(stage_obj, "amount_weight", None) is not None
+            else float(cfg.amount_weight),
+            currency_weight=float(getattr(stage_obj, "currency_weight", None))
+            if getattr(stage_obj, "currency_weight", None) is not None
+            else float(cfg.currency_weight),
+            date_weight=float(getattr(stage_obj, "date_weight", None))
+            if getattr(stage_obj, "date_weight", None) is not None
+            else float(cfg.date_weight),
+            allow_mixed_signs=bool(allow_mixed),
+        )
+
+        log.debug("run_pipeline: stage[%d] StageConfig=%s", idx, stage_conf)
+
+        stage_configs.append(stage_conf)
         weight_list.append(
             {
                 "embedding": float(getattr(stage_obj, "embedding_weight", None))
@@ -1775,6 +1854,12 @@ def run_pipeline(pipeline: object,
         max_suggestions=pipeline.max_suggestions,
         max_runtime_seconds=float(soft_limit) if soft_limit is not None else None,
     )
+
+    log.debug(
+        "run_pipeline: built %d StageConfig(s); soft_time_limit=%s",
+        len(stage_configs), soft_limit,
+    )
+    
     engine = ReconciliationPipelineEngine(company_id=pipeline.company_id, config=pipe_cfg)
     engine.current_weights = weight_list
     return engine.run(banks, books)
@@ -1931,10 +2016,12 @@ class ReconciliationService:
         # Run the appropriate matching engine and capture soft limit
         soft_time_limit = None
         if pipeline_id:
+            log.debug("match_many_to_many: using pipeline_id=%s", pipeline_id)
             pipe_obj = ReconciliationPipeline.objects.get(id=pipeline_id)
             suggestions = run_pipeline(pipe_obj, candidate_bank, candidate_book)
             soft_time_limit = getattr(pipe_obj, "soft_time_limit_seconds", None)
         else:
+            log.debug("match_many_to_many: using config_id=%s", config_id)
             cfg_obj = ReconciliationConfig.objects.get(id=config_id)
             suggestions = run_single_config(cfg_obj, candidate_bank, candidate_book, company_id)
             soft_time_limit = getattr(cfg_obj, "soft_time_limit_seconds", None)
