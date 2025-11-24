@@ -86,111 +86,151 @@ DEFAULT_SUGGESTION_FLUSH_INTERVAL = int(getattr(settings, "RECON_SUGGESTION_FLUS
 @shared_task(bind=True)
 def compare_two_engines_task(self, db_id: int, data: Dict[str, Any], tenant_id: str = None, auto_match_100: bool = False):
     """
-    Orquestra duas execuções:
-      - legacy: a task histórica match_many_to_many_task (já existente)
-      - fast: a nova task match_many_to_many_fast_task (implementada abaixo)
-
-    Cria duas ReconciliationTask "filhas" para isolar resultados e, quando ambas terminam,
-    persiste um resumo comparativo no ReconciliationTask original (db_id).
+    Executa duas engines em paralelo (legacy + fast) e salva um resumo comparativo no parent.
     """
     parent_task = ReconciliationTask.objects.get(id=db_id)
-
-    # create a unique run id
     run_uuid = str(uuid.uuid4())
+    now = timezone.now()
 
-    # create two ReconciliationTask rows to host the runs (child tasks)
-    legacy_row = ReconciliationTask.objects.create(
-        parent=parent_task if hasattr(parent_task, "id") else None,
-        name=f"legacy-run-{run_uuid}",
-        status="queued",
-        created_at=timezone.now(),
-        meta={"strategy": "legacy", "run_uuid": run_uuid},
-    )
-    fast_row = ReconciliationTask.objects.create(
-        parent=parent_task if hasattr(parent_task, "id") else None,
-        name=f"fast-run-{run_uuid}",
-        status="queued",
-        created_at=timezone.now(),
-        meta={"strategy": "fast_v1", "run_uuid": run_uuid},
-    )
-
-    # dispatch the legacy job (existing implementation) to a dedicated queue if desired
-    legacy_async = match_many_to_many_task.apply_async(
-        args=(legacy_row.id, data, tenant_id, auto_match_100),
-        queue="recon_legacy"
-    )
-
-    # dispatch the fast job (we will implement match_many_to_many_fast_task below)
-    fast_async = match_many_to_many_fast_task.apply_async(
-        args=(fast_row.id, data, tenant_id, auto_match_100),
-        queue="recon_fast"
-    )
-
-    # Optionally wait / poll for completion here with timeout, or return immediately and let a separate monitor aggregate results.
-    # We'll poll with backoff for a short while to produce a quick comparison if both finish soon.
-    max_wait_s = 600  # don't block forever; caller can re-query DB
-    poll_interval = 2.0
-    waited = 0.0
-
-    legacy_res = None
-    fast_res = None
-
-    while waited < max_wait_s:
-        if legacy_res is None:
-            l_state = AsyncResult(legacy_async.id).state
-            if l_state in ("SUCCESS", "FAILURE", "REVOKED", "RETRY"):
-                legacy_res = AsyncResult(legacy_async.id)
-        if fast_res is None:
-            f_state = AsyncResult(fast_async.id).state
-            if f_state in ("SUCCESS", "FAILURE", "REVOKED", "RETRY"):
-                fast_res = AsyncResult(fast_async.id)
-
-        if legacy_res and fast_res:
-            break
-        time.sleep(poll_interval)
-        waited += poll_interval
-
-    # Build a lightweight comparison summary (best effort)
-    def load_task_row(rt_id):
-        try:
-            return ReconciliationTask.objects.get(id=rt_id)
-        except Exception:
-            return None
-
-    legacy_row = load_task_row(legacy_row.id)
-    fast_row = load_task_row(fast_row.id)
-
-    summary = {
+    # ---------------------------------------------------------------------
+    # 1. Criar Child Task - LEGACY
+    # ---------------------------------------------------------------------
+    legacy_params = {
+        "origin_request_parameters": data,
+        "strategy": "legacy",
         "parent_task_id": db_id,
         "run_uuid": run_uuid,
-        "legacy": {
-            "task_id": legacy_row.id if legacy_row else None,
-            "status": legacy_row.status if legacy_row else None,
-            "suggestion_count": getattr(legacy_row, "suggestion_count", None),
-            "duration_seconds": getattr(legacy_row, "duration_seconds", None),
-            "time_limit_reached": getattr(legacy_row, "soft_time_limit_seconds", None) is not None and getattr(legacy_row, "duration_seconds", 0) >= getattr(legacy_row, "soft_time_limit_seconds", 0),
-        },
-        "fast": {
-            "task_id": fast_row.id if fast_row else None,
-            "status": fast_row.status if fast_row else None,
-            "suggestion_count": getattr(fast_row, "suggestion_count", None),
-            "duration_seconds": getattr(fast_row, "duration_seconds", None),
-            "time_limit_reached": getattr(fast_row, "soft_time_limit_seconds", None) is not None and getattr(fast_row, "duration_seconds", 0) >= getattr(fast_row, "soft_time_limit_seconds", 0),
-        },
-        "generated_at": timezone.now(),
     }
 
-    # Persist comparison inside parent task meta (or in a dedicated model)
+    legacy_row = ReconciliationTask.objects.create(
+        task_id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        parameters=legacy_params,
+        status="queued",
+        config=parent_task.config,
+        pipeline=parent_task.pipeline,
+        config_name=parent_task.config_name,
+        pipeline_name=parent_task.pipeline_name,
+        soft_time_limit_seconds=parent_task.soft_time_limit_seconds,
+        created_at=now,
+    )
+
+    # ---------------------------------------------------------------------
+    # 2. Criar Child Task - FAST
+    # ---------------------------------------------------------------------
+    fast_params = {
+        "origin_request_parameters": data,
+        "strategy": "fast_v1",
+        "parent_task_id": db_id,
+        "run_uuid": run_uuid,
+    }
+
+    fast_row = ReconciliationTask.objects.create(
+        task_id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        parameters=fast_params,
+        status="queued",
+        config=parent_task.config,
+        pipeline=parent_task.pipeline,
+        config_name=parent_task.config_name,
+        pipeline_name=parent_task.pipeline_name,
+        soft_time_limit_seconds=parent_task.soft_time_limit_seconds,
+        created_at=now,
+    )
+
+    # ---------------------------------------------------------------------
+    # 3. Dispatch das duas engines
+    # ---------------------------------------------------------------------
+    legacy_async = match_many_to_many_task.apply_async(
+        args=(legacy_row.id, data, tenant_id, auto_match_100),
+        queue="recon_legacy",
+    )
+
+    fast_async = match_many_to_many_fast_task.apply_async(
+        args=(fast_row.id, data, tenant_id, auto_match_100),
+        queue="recon_fast",
+    )
+
+    # ---------------------------------------------------------------------
+    # 4. Poll até terminarem (máximo 10 min)
+    # ---------------------------------------------------------------------
+    max_wait_s = 600
+    poll = 2
+    waited = 0
+
+    legacy_finished = fast_finished = False
+
+    while waited < max_wait_s:
+        if not legacy_finished:
+            state = AsyncResult(legacy_async.id).state
+            if state in ("SUCCESS", "FAILURE", "REVOKED", "RETRY"):
+                legacy_finished = True
+
+        if not fast_finished:
+            state = AsyncResult(fast_async.id).state
+            if state in ("SUCCESS", "FAILURE", "REVOKED", "RETRY"):
+                fast_finished = True
+
+        if legacy_finished and fast_finished:
+            break
+
+        time.sleep(poll)
+        waited += poll
+
+    # Reload child tasks to get updated stats (duration, suggestion_count, etc)
+    legacy_row.refresh_from_db()
+    fast_row.refresh_from_db()
+
+    # ---------------------------------------------------------------------
+    # 5. Build comparison summary
+    # ---------------------------------------------------------------------
+    summary = {
+        "run_uuid": run_uuid,
+        "parent_task_id": db_id,
+        "generated_at": timezone.now(),
+
+        "legacy": {
+            "task_id": legacy_row.id,
+            "status": legacy_row.status,
+            "duration_seconds": getattr(legacy_row, "duration_seconds", None),
+            "suggestion_count": getattr(legacy_row, "suggestion_count", None),
+            "time_limit_reached": (
+                parent_task.soft_time_limit_seconds is not None
+                and legacy_row.duration_seconds
+                and legacy_row.duration_seconds >= parent_task.soft_time_limit_seconds
+            ),
+        },
+
+        "fast": {
+            "task_id": fast_row.id,
+            "status": fast_row.status,
+            "duration_seconds": getattr(fast_row, "duration_seconds", None),
+            "suggestion_count": getattr(fast_row, "suggestion_count", None),
+            "time_limit_reached": (
+                parent_task.soft_time_limit_seconds is not None
+                and fast_row.duration_seconds
+                and fast_row.duration_seconds >= parent_task.soft_time_limit_seconds
+            ),
+        },
+    }
+
+    # ---------------------------------------------------------------------
+    # 6. Persistir comparação no parent meta[]
+    # ---------------------------------------------------------------------
     try:
-        parent_task.meta = parent_task.meta or {}
-        parent_task.meta.setdefault("comparisons", [])
-        parent_task.meta["comparisons"].append(summary)
+        meta = parent_task.meta or {}
+        meta.setdefault("comparisons", [])
+        meta["comparisons"].append(summary)
+
+        parent_task.meta = meta
         parent_task.updated_at = timezone.now()
         parent_task.save(update_fields=["meta", "updated_at"])
+
     except Exception:
-        log.exception("Failed saving comparison summary for parent task %s", db_id)
+        log.exception("Failed saving comparison summary for task %s", db_id)
 
     return summary
+
 
 @shared_task(bind=True)
 def match_many_to_many_fast_task(self, db_id: int, data: Dict[str, Any], tenant_id: str = None, auto_match_100: bool = False):
