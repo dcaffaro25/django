@@ -1919,7 +1919,8 @@ class ReconciliationPipelineEngine:
 def run_single_config(cfg: object,
                       banks: List[BankTransactionDTO],
                       books: List[JournalEntryDTO],
-                      company_id: int) -> List[dict]:
+                      company_id: int,
+                      on_suggestion: Optional[Callable[[dict], None]] = None) -> List[dict]:
     """
     Execute a single ReconciliationConfig using the pipeline engine.
     """
@@ -1974,7 +1975,11 @@ def run_single_config(cfg: object,
         max_suggestions=getattr(cfg, "max_suggestions", 10000),
         max_runtime_seconds=float(soft_limit) if soft_limit is not None else None,
     )
-    engine = ReconciliationPipelineEngine(company_id=company_id, config=pipe_cfg)
+    engine = ReconciliationPipelineEngine(
+        company_id=company_id,
+        config=pipe_cfg,
+        on_suggestion=on_suggestion,  # <-- NOVO
+    )
     engine.current_weights = {
         "embedding": float(getattr(cfg, "embedding_weight", 0.50)),
         "amount":    float(getattr(cfg, "amount_weight",    0.35)),
@@ -1994,7 +1999,8 @@ def run_single_config(cfg: object,
 
 def run_pipeline(pipeline: object,
                  banks: List[BankTransactionDTO],
-                 books: List[JournalEntryDTO]) -> List[dict]:
+                 books: List[JournalEntryDTO],
+                 on_suggestion: Optional[Callable[[dict], None]] = None) -> List[dict]:
     """
     Execute a multi-stage pipeline.
     """
@@ -2128,7 +2134,11 @@ def run_pipeline(pipeline: object,
         len(stage_configs), soft_limit,
     )
 
-    engine = ReconciliationPipelineEngine(company_id=pipeline.company_id, config=pipe_cfg)
+    engine = ReconciliationPipelineEngine(
+        company_id=pipeline.company_id,
+        config=pipe_cfg,
+        on_suggestion=on_suggestion,  # <-- NOVO
+    )
     engine.current_weights = weight_list
     return engine.run(banks, books)
 
@@ -2147,6 +2157,7 @@ class ReconciliationService:
         tenant_id: Optional[str] = None,
         *,
         auto_match_100: bool = False,
+        on_suggestion: Optional[Callable[[dict], None]] = None,
     ) -> Dict[str, object]:
         """
         Execute reconciliation based on a config_id or pipeline_id in `data`.
@@ -2300,12 +2311,23 @@ class ReconciliationService:
         if pipeline_id:
             log.debug("match_many_to_many: using pipeline_id=%s", pipeline_id)
             pipe_obj = ReconciliationPipeline.objects.get(id=pipeline_id)
-            suggestions = run_pipeline(pipe_obj, candidate_bank, candidate_book)
+            suggestions = run_pipeline(
+                pipe_obj,
+                candidate_bank,
+                candidate_book,
+                on_suggestion=on_suggestion,  # <-- NOVO
+            )
             soft_time_limit = getattr(pipe_obj, "soft_time_limit_seconds", None)
         else:
             log.debug("match_many_to_many: using config_id=%s", config_id)
             cfg_obj = ReconciliationConfig.objects.get(id=config_id)
-            suggestions = run_single_config(cfg_obj, candidate_bank, candidate_book, company_id)
+            suggestions = run_single_config(
+                cfg_obj,
+                candidate_bank,
+                candidate_book,
+                company_id,
+                on_suggestion=on_suggestion,  # <-- NOVO
+            )
             soft_time_limit = getattr(cfg_obj, "soft_time_limit_seconds", None)
 
         # Auto-apply matches with confidence 1.0

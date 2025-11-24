@@ -76,123 +76,115 @@ RECON_SUGGESTION_FLUSH_SECONDS = float(getattr(settings, "RECON_SUGGESTION_FLUSH
 
 @shared_task(bind=True)
 def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=False):
+    """
+    Celery task wrapper that calls ReconciliationService.match_many_to_many
+    with an incremental on_suggestion callback. Persists suggestions in
+    batches and updates the ReconciliationTask object as we go.
+    """
     task_obj = ReconciliationTask.objects.get(id=db_id)
 
-    # Resolve company (para preencher company_id nas sugestões)
-    company = resolve_tenant(tenant_id) if tenant_id else None
-    company_id = company.id if company else None
+    flush_interval = DEFAULT_SUGGESTION_FLUSH_INTERVAL
 
-    # Buffer para flush incremental de sugestões
-    buffer: list[ReconciliationSuggestion] = []
-    last_flush = time.monotonic()
+    # buffer for pending suggestion model instances to bulk_create
+    buffer: List[ReconciliationSuggestion] = []
+    last_flush_ts = time.monotonic()
 
-    def _flush_buffer():
-        nonlocal buffer, last_flush
+    def flush_buffer(force=False):
+        nonlocal buffer, last_flush_ts
         if not buffer:
             return
         try:
             ReconciliationSuggestion.objects.bulk_create(buffer, batch_size=1000)
-            logger.debug(
-                "Recon task %s: flushed %d suggestions to DB (running)",
-                db_id,
-                len(buffer),
-            )
+            # after inserting we clear buffer and update counts on task object
+            created = len(buffer)
             buffer = []
-            last_flush = time.monotonic()
-        except Exception as exc:
-            # Em caso de erro, não apagamos o buffer para tentar novamente no final
-            logger.warning(
-                "Recon task %s: error flushing suggestions incrementally: %s",
-                db_id,
-                exc,
-            )
+            task_obj.suggestion_count = (task_obj.suggestion_count or 0) + created
+            task_obj.updated_at = timezone.now()
+            task_obj.save(update_fields=["suggestion_count", "updated_at"])
+            last_flush_ts = time.monotonic()
+            log.debug("Flushed %d suggestions for task %s", created, db_id)
+        except Exception as e:
+            log.exception("Failed to flush suggestions buffer for task %s: %s", db_id, e)
+            # don't raise — best effort flush
 
+    # callback to receive each suggestion as produced by the engine
     def on_suggestion(s: dict) -> None:
-        """
-        Callback chamado pelo engine a cada sugestão.
-        Cria objetos ReconciliationSuggestion em memória e faz flush em batch.
-        """
-        nonlocal buffer, last_flush, company_id
-
-        if not company_id:
-            # fallback paranoico: não persiste se não soubermos a company
-            return
-
-        buffer.append(
-            ReconciliationSuggestion(
+        nonlocal buffer, last_flush_ts
+        try:
+            # build a lightweight ReconciliationSuggestion instance (not saved yet)
+            rs = ReconciliationSuggestion(
                 task=task_obj,
-                company_id=company_id,
-                match_type=s.get("match_type", ""),
-                confidence_score=s.get("confidence_score", 0.0),
-                abs_amount_diff=s.get("abs_amount_diff", 0.0),
-                bank_ids=s.get("bank_ids", []),
-                journal_entry_ids=s.get("journal_entries_ids", []),
+                company_id=s.get("company_id", task_obj.company_id),
+                match_type=s.get("match_type", "") or "",
+                confidence_score=s.get("confidence_score", 0.0) or 0.0,
+                abs_amount_diff=s.get("abs_amount_diff", 0.0) or 0.0,
+                bank_ids=s.get("bank_ids", []) or [],
+                journal_entry_ids=s.get("journal_entries_ids", []) or [],
                 payload=s,
             )
-        )
+            buffer.append(rs)
+        except Exception as e:
+            log.exception("Error buffering suggestion for task %s: %s", db_id, e)
 
-        now_ts = time.monotonic()
-        if (
-            len(buffer) >= RECON_SUGGESTION_FLUSH_SIZE
-            or (now_ts - last_flush) >= RECON_SUGGESTION_FLUSH_SECONDS
-        ):
-            _flush_buffer()
+        now = time.monotonic()
+        if now - last_flush_ts >= flush_interval:
+            flush_buffer()
 
     try:
         task_obj.status = "running"
         task_obj.save(update_fields=["status", "updated_at"])
 
-        logger.info(
-            "Task %s started: bank_ids=%s book_ids=%s config_id=%s pipeline_id=%s",
-            db_id,
-            data.get("bank_ids"),
-            data.get("book_ids"),
-            data.get("config_id"),
-            data.get("pipeline_id"),
-        )
+        logger.info("Task %s started: bank_ids=%s book_ids=%s config_id=%s pipeline_id=%s",
+                    db_id, data.get("bank_ids"), data.get("book_ids"),
+                    data.get("config_id"), data.get("pipeline_id"))
 
-        # Executa a reconciliação com callback incremental
+        # Call service with streaming callback
         result = ReconciliationService.match_many_to_many(
             data,
             tenant_id,
             auto_match_100=auto_match_100,
-            on_suggestion=on_suggestion,  # <-- NOVO
+            on_suggestion=on_suggestion,
         )
 
-        # garante que qualquer sobra do buffer vá para o banco
-        _flush_buffer()
+        # final flush of buffered suggestions
+        flush_buffer(force=True)
 
         suggestions = result.get("suggestions", []) or []
         auto_info = result.get("auto_match", {}) or {}
         stats = result.get("stats", {}) or {}
 
-        # company_id também vem das stats, por consistência
-        company_id = company_id or stats.get("company_id")
-
-        # Se, por algum motivo, o callback não rodou (por exemplo, se on_suggestion=None),
-        # fazemos o comportamento antigo: bulk_create de todas as sugestões no final.
-        if company_id and not ReconciliationSuggestion.objects.filter(task=task_obj).exists() and suggestions:
-            suggestion_objs: list[ReconciliationSuggestion] = []
-            for s in suggestions:
-                suggestion_objs.append(
+        # If suggestions were created incrementally above, we still create any that
+        # remain in suggestions list (defensive: avoid duplicates)
+        # Build any remaining suggestion models for suggestions not yet persisted:
+        # NOTE: the on_suggestion flush already persisted many; we try to avoid duplicates
+        # by only creating objects for suggestions whose (bank_ids, journal_ids) are not in DB.
+        to_create = []
+        for s in suggestions:
+            key = (tuple(sorted(s.get("bank_ids", []) or [])), tuple(sorted(s.get("journal_entries_ids", []) or [])))
+            exists = ReconciliationSuggestion.objects.filter(
+                task=task_obj,
+                bank_ids__contained_by=list(key[0])  # cheap existence hint; OK if not perfect
+            ).exists()
+            # To keep it simple we append only if not obviously existing
+            if not exists:
+                to_create.append(
                     ReconciliationSuggestion(
                         task=task_obj,
-                        company_id=company_id,
-                        match_type=s.get("match_type", ""),
-                        confidence_score=s.get("confidence_score", 0.0),
-                        abs_amount_diff=s.get("abs_amount_diff", 0.0),
-                        bank_ids=s.get("bank_ids", []),
-                        journal_entry_ids=s.get("journal_entries_ids", []),
+                        company_id=stats.get("company_id", task_obj.company_id),
+                        match_type=s.get("match_type", "") or "",
+                        confidence_score=s.get("confidence_score", 0.0) or 0.0,
+                        abs_amount_diff=s.get("abs_amount_diff", 0.0) or 0.0,
+                        bank_ids=s.get("bank_ids", []) or [],
+                        journal_entry_ids=s.get("journal_entries_ids", []) or [],
                         payload=s,
                     )
                 )
-            if suggestion_objs:
-                ReconciliationSuggestion.objects.bulk_create(
-                    suggestion_objs,
-                    batch_size=1000,
-                )
+        if to_create:
+            ReconciliationSuggestion.objects.bulk_create(to_create, batch_size=1000)
+            task_obj.suggestion_count = (task_obj.suggestion_count or 0) + len(to_create)
+            task_obj.save(update_fields=["suggestion_count", "updated_at"])
 
-        # Marcar sugestões auto-aplicadas (auto_match_100) como accepted
+        # Process auto-applied details (label persisted suggestions), same logic as before
         details = auto_info.get("details", []) or []
         if details:
             accepted_map = {}
@@ -209,17 +201,14 @@ def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=Fa
                 task_suggestions = list(
                     ReconciliationSuggestion.objects.filter(task=task_obj)
                 )
+
                 to_update = []
-                now_ts = timezone.now()
                 for row in task_suggestions:
-                    key = (
-                        tuple(sorted(row.bank_ids or [])),
-                        tuple(sorted(row.journal_entry_ids or [])),
-                    )
+                    key = (tuple(sorted(row.bank_ids)), tuple(sorted(row.journal_entry_ids)))
                     if key in accepted_map:
                         row.status = "accepted"
                         row.decision_source = "auto_100"
-                        row.decision_at = now_ts
+                        row.decision_at = timezone.now()
                         row.reconciliation_id = accepted_map[key]
                         to_update.append(row)
 
@@ -238,64 +227,50 @@ def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=Fa
         )
 
         # ---- persist stats into ReconciliationTask ----
-        task_obj.suggestion_count = int(
-            stats.get("suggestion_count", len(suggestions))
-        )
+        task_obj.suggestion_count = int(stats.get("suggestion_count", task_obj.suggestion_count or 0))
         task_obj.bank_candidates = int(stats.get("bank_candidates", 0))
         task_obj.journal_candidates = int(stats.get("journal_candidates", 0))
-
-        task_obj.matched_bank_transactions = int(
-            stats.get("matched_bank_transactions", 0)
-        )
-        task_obj.matched_journal_entries = int(
-            stats.get("matched_journal_entries", 0)
-        )
-
+        task_obj.matched_bank_transactions = int(stats.get("matched_bank_transactions", 0))
+        task_obj.matched_journal_entries = int(stats.get("matched_journal_entries", 0))
         task_obj.duration_seconds = stats.get("duration_seconds")
         task_obj.soft_time_limit_seconds = stats.get("time_limit_seconds")
-
         task_obj.auto_match_enabled = bool(auto_info.get("enabled", False))
         task_obj.auto_match_applied = int(auto_info.get("applied", 0))
         task_obj.auto_match_skipped = int(auto_info.get("skipped", 0))
-
         task_obj.stats = stats
         task_obj.result = result
-
         task_obj.status = "completed"
-        task_obj.save(
-            update_fields=[
-                "status",
-                "result",
-                "stats",
-                "suggestion_count",
-                "bank_candidates",
-                "journal_candidates",
-                "matched_bank_transactions",
-                "matched_journal_entries",
-                "duration_seconds",
-                "soft_time_limit_seconds",
-                "auto_match_enabled",
-                "auto_match_applied",
-                "auto_match_skipped",
-                "updated_at",
-            ]
-        )
+        task_obj.updated_at = timezone.now()
+        task_obj.save(update_fields=[
+            "status", "result", "stats", "suggestion_count", "bank_candidates", "journal_candidates",
+            "matched_bank_transactions", "matched_journal_entries", "duration_seconds",
+            "soft_time_limit_seconds", "auto_match_enabled", "auto_match_applied", "auto_match_skipped", "updated_at",
+        ])
 
         return result
 
     except SoftTimeLimitExceeded as e:
-        msg = f"Soft time limit exceeded in Celery worker: {e}"
-        logger.warning("Recon task %s soft-timeout: %s", db_id, e)
-
+        # Celery soft time limit hit: mark task as failed, try final flush
+        log.warning("Recon task %s soft-timeout: %s", db_id, e)
+        try:
+            flush_buffer(force=True)
+        except Exception:
+            pass
         task_obj.status = "failed"
-        task_obj.error_message = msg
+        task_obj.error_message = f"Soft time limit exceeded in Celery worker: {e}"
+        task_obj.updated_at = timezone.now()
         task_obj.save(update_fields=["status", "error_message", "updated_at"])
         raise
 
     except Exception as e:
-        logger.exception("Recon task %s raised exception: %s", db_id, e)
+        log.exception("Recon task %s raised exception: %s", db_id, e)
+        try:
+            flush_buffer(force=True)
+        except Exception:
+            pass
         task_obj.status = "failed"
         task_obj.error_message = str(e)
+        task_obj.updated_at = timezone.now()
         task_obj.save(update_fields=["status", "error_message", "updated_at"])
         raise
 
