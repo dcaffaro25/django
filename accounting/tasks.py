@@ -15,12 +15,19 @@ from django.utils import timezone
 
 from core.utils.jobs import job_progress
 from core.models import Job
-
+from celery import shared_task
+from celery.result import AsyncResult
+from django.utils import timezone
+from .models import ReconciliationTask
+from .tasks import match_many_to_many_task  # task existente
+from .tasks import RECON_SUGGESTION_FLUSH_SECONDS, DEFAULT_SUGGESTION_FLUSH_INTERVAL
+from typing import Dict, Any, Decimal
+import uuid
 import requests
 from celery.utils.log import get_task_logger
 logger = get_task_logger(__name__)
 
-from .services.reconciliation_service import ReconciliationService
+from .services.reconciliation_service import ReconciliationService, _as_vec_list, q2, CENT, compute_match_scores, _avg_embedding
 from .models import Account, BankTransaction, Transaction, ReconciliationTask
 from .services.embedding_client import EmbeddingClient
 from multitenancy.utils import resolve_tenant  # <-- NOVO IMPORT
@@ -74,6 +81,334 @@ RECON_SUGGESTION_FLUSH_SIZE = int(getattr(settings, "RECON_SUGGESTION_FLUSH_SIZE
 RECON_SUGGESTION_FLUSH_SECONDS = float(getattr(settings, "RECON_SUGGESTION_FLUSH_SECONDS", 30.0))
 
 DEFAULT_SUGGESTION_FLUSH_INTERVAL = int(getattr(settings, "RECON_SUGGESTION_FLUSH_INTERVAL", 30))
+
+@shared_task(bind=True)
+def compare_two_engines_task(self, db_id: int, data: Dict[str, Any], tenant_id: str = None, auto_match_100: bool = False):
+    """
+    Orquestra duas execuções:
+      - legacy: a task histórica match_many_to_many_task (já existente)
+      - fast: a nova task match_many_to_many_fast_task (implementada abaixo)
+
+    Cria duas ReconciliationTask "filhas" para isolar resultados e, quando ambas terminam,
+    persiste um resumo comparativo no ReconciliationTask original (db_id).
+    """
+    parent_task = ReconciliationTask.objects.get(id=db_id)
+
+    # create a unique run id
+    run_uuid = str(uuid.uuid4())
+
+    # create two ReconciliationTask rows to host the runs (child tasks)
+    legacy_row = ReconciliationTask.objects.create(
+        parent=parent_task if hasattr(parent_task, "id") else None,
+        name=f"legacy-run-{run_uuid}",
+        status="queued",
+        created_at=timezone.now(),
+        meta={"strategy": "legacy", "run_uuid": run_uuid},
+    )
+    fast_row = ReconciliationTask.objects.create(
+        parent=parent_task if hasattr(parent_task, "id") else None,
+        name=f"fast-run-{run_uuid}",
+        status="queued",
+        created_at=timezone.now(),
+        meta={"strategy": "fast_v1", "run_uuid": run_uuid},
+    )
+
+    # dispatch the legacy job (existing implementation) to a dedicated queue if desired
+    legacy_async = match_many_to_many_task.apply_async(
+        args=(legacy_row.id, data, tenant_id, auto_match_100),
+        queue="recon_legacy"
+    )
+
+    # dispatch the fast job (we will implement match_many_to_many_fast_task below)
+    fast_async = match_many_to_many_fast_task.apply_async(
+        args=(fast_row.id, data, tenant_id, auto_match_100),
+        queue="recon_fast"
+    )
+
+    # Optionally wait / poll for completion here with timeout, or return immediately and let a separate monitor aggregate results.
+    # We'll poll with backoff for a short while to produce a quick comparison if both finish soon.
+    max_wait_s = 600  # don't block forever; caller can re-query DB
+    poll_interval = 2.0
+    waited = 0.0
+
+    legacy_res = None
+    fast_res = None
+
+    while waited < max_wait_s:
+        if legacy_res is None:
+            l_state = AsyncResult(legacy_async.id).state
+            if l_state in ("SUCCESS", "FAILURE", "REVOKED", "RETRY"):
+                legacy_res = AsyncResult(legacy_async.id)
+        if fast_res is None:
+            f_state = AsyncResult(fast_async.id).state
+            if f_state in ("SUCCESS", "FAILURE", "REVOKED", "RETRY"):
+                fast_res = AsyncResult(fast_async.id)
+
+        if legacy_res and fast_res:
+            break
+        time.sleep(poll_interval)
+        waited += poll_interval
+
+    # Build a lightweight comparison summary (best effort)
+    def load_task_row(rt_id):
+        try:
+            return ReconciliationTask.objects.get(id=rt_id)
+        except Exception:
+            return None
+
+    legacy_row = load_task_row(legacy_row.id)
+    fast_row = load_task_row(fast_row.id)
+
+    summary = {
+        "parent_task_id": db_id,
+        "run_uuid": run_uuid,
+        "legacy": {
+            "task_id": legacy_row.id if legacy_row else None,
+            "status": legacy_row.status if legacy_row else None,
+            "suggestion_count": getattr(legacy_row, "suggestion_count", None),
+            "duration_seconds": getattr(legacy_row, "duration_seconds", None),
+            "time_limit_reached": getattr(legacy_row, "soft_time_limit_seconds", None) is not None and getattr(legacy_row, "duration_seconds", 0) >= getattr(legacy_row, "soft_time_limit_seconds", 0),
+        },
+        "fast": {
+            "task_id": fast_row.id if fast_row else None,
+            "status": fast_row.status if fast_row else None,
+            "suggestion_count": getattr(fast_row, "suggestion_count", None),
+            "duration_seconds": getattr(fast_row, "duration_seconds", None),
+            "time_limit_reached": getattr(fast_row, "soft_time_limit_seconds", None) is not None and getattr(fast_row, "duration_seconds", 0) >= getattr(fast_row, "soft_time_limit_seconds", 0),
+        },
+        "generated_at": timezone.now(),
+    }
+
+    # Persist comparison inside parent task meta (or in a dedicated model)
+    try:
+        parent_task.meta = parent_task.meta or {}
+        parent_task.meta.setdefault("comparisons", [])
+        parent_task.meta["comparisons"].append(summary)
+        parent_task.updated_at = timezone.now()
+        parent_task.save(update_fields=["meta", "updated_at"])
+    except Exception:
+        log.exception("Failed saving comparison summary for parent task %s", db_id)
+
+    return summary
+
+@shared_task(bind=True)
+def match_many_to_many_fast_task(self, db_id: int, data: Dict[str, Any], tenant_id: str = None, auto_match_100: bool = False):
+    """
+    Fast alternative runner:
+      - does not change the legacy code paths
+      - applies prefilter (embed top-K + amount closeness + date window)
+      - uses subset-sum bitset for same-sign when possible
+      - uses beam search fallback for mixed-sign or when DP not feasible
+      - persists suggestions similarly to legacy task to ReconciliationSuggestion
+    """
+    # Local imports to avoid top-level heavy deps
+    from .services.reconciliation_service import BankTransactionDTO, JournalEntryDTO
+    from .models import BankTransaction, JournalEntry, ReconciliationSuggestion, ReconciliationTask
+    from django.utils import timezone
+
+    # Configuration tunables
+    K_EMBED = int(getattr(settings, "FAST_PREFILTER_TOPK_EMBED", 120))
+    MAX_CANDIDATES = int(getattr(settings, "FAST_MAX_CANDIDATES", 60))
+    MAX_DP = int(getattr(settings, "FAST_MAX_DP", 60))
+    BEAM_SIZE = int(getattr(settings, "FAST_BEAM_SIZE", 200))
+
+    task_row = ReconciliationTask.objects.get(id=db_id)
+    task_row.status = "running"
+    task_row.save(update_fields=["status", "updated_at"])
+
+    start_ts = time.time()
+    # --- build candidate DTOs (reuse same Qs as legacy to be fair) ---
+    # (copy the same queryset logic as in ReconciliationService.match_many_to_many but simplified)
+    company_id = data.get("company_id")
+    if company_id is None and tenant_id:
+        try:
+            company_obj = resolve_tenant(tenant_id)
+            company_id = getattr(company_obj, "id", None)
+        except Exception:
+            company_id = None
+
+    bank_ids = data.get("bank_ids", [])
+    book_ids = data.get("book_ids", [])
+
+    bank_qs = BankTransaction.objects.exclude(reconciliations__status__in=["matched","approved"]).filter(company_id=company_id)
+    if bank_ids:
+        bank_qs = bank_qs.filter(id__in=bank_ids)
+    book_qs = JournalEntry.objects.exclude(reconciliations__status__in=["matched","approved"]).filter(company_id=company_id, account__bank_account__isnull=False)
+    if book_ids:
+        book_qs = book_qs.filter(id__in=book_ids)
+
+    banks = [
+        BankTransactionDTO(
+            id=b.id, company_id=b.company_id, date=b.date, amount=b.amount,
+            currency_id=b.currency_id, description=b.description,
+            embedding=_as_vec_list(getattr(b, "description_embedding", None))
+        )
+        for b in bank_qs
+    ]
+    books = [
+        JournalEntryDTO(
+            id=j.id, company_id=j.company_id, transaction_id=j.transaction_id,
+            date=j.date or (getattr(j, "transaction").date if getattr(j, "transaction", None) else None),
+            effective_amount=j.get_effective_amount(),
+            currency_id=(getattr(j, "transaction").currency_id if getattr(j, "transaction", None) else None),
+            description=(getattr(j, "transaction").description if getattr(j, "transaction", None) else ""),
+            embedding=_as_vec_list(getattr(getattr(j, "transaction", None), "description_embedding", None))
+        )
+        for j in book_qs
+    ]
+
+    # Helper: top-K by embedding similarity (fallback to simple cosine loop if no FAISS)
+    def topk_by_embedding(anchor_vec, candidates, k):
+        if not anchor_vec or not candidates:
+            return list(range(min(k, len(candidates))))
+        sims = [(i, self._cosine_similarity(anchor_vec, (c.embedding or []))) for i, c in enumerate(candidates)]
+        sims.sort(key=lambda x: x[1], reverse=True)
+        return [i for i, _ in sims[:k]]
+
+    # subset-sum bitset (simpler, adapted version - ensure q2/CENT in scope)
+    def subset_sum_bitset_indices(items, target_dec: Decimal, tol_dec: Decimal, max_card: int):
+        # items: list of DTOs with .amount_base; returns list of index-lists
+        cents = [int(q2(it.amount_base) / CENT) for it in items]
+        target = int(q2(target_dec) / CENT)
+        tol = int(q2(tol_dec) / CENT)
+        total = sum(cents)
+        if target - tol > total or target + tol < 0:
+            return []
+        dp = 1
+        parents = {}
+        sizes = {0: 0}
+        for idx, val in enumerate(cents):
+            shifted = dp << val
+            new = shifted & ~dp
+            if new:
+                s = new
+                while s:
+                    lowbit = s & -s
+                    sum_pos = lowbit.bit_length() - 1
+                    prev = sum_pos - val
+                    prev_size = sizes.get(prev)
+                    if prev_size is not None and prev_size + 1 <= max_card:
+                        if sum_pos not in parents:
+                            parents[sum_pos] = (idx, prev)
+                            sizes[sum_pos] = prev_size + 1
+                    s &= s - 1
+            dp |= shifted
+        results = []
+        low = max(0, target - tol)
+        high = min(total, target + tol)
+        for s in range(low, high + 1):
+            if (dp >> s) & 1:
+                # reconstruct
+                cur = s
+                combo = []
+                while cur != 0:
+                    if cur not in parents:
+                        combo = []
+                        break
+                    idx, prev = parents[cur]
+                    combo.append(idx)
+                    cur = prev
+                if combo:
+                    results.append(list(reversed(combo)))
+        return results
+
+    # Beam search fallback (simple greedy beam)
+    def beam_search_indices(items, target_dec: Decimal, tol_dec: Decimal, max_card: int, beam_size=BEAM_SIZE):
+        # order candidates by amount closeness + embedding heuristic
+        target = q2(target_dec)
+        ranked = sorted(enumerate(items), key=lambda x: abs(q2(x[1].amount_base) - target))
+        beam = [(Decimal("0.00"), [])]  # (sum, indices)
+        for idx, item in ranked:
+            new_beam = list(beam)
+            for s, idxs in beam:
+                if len(idxs) + 1 > max_card:
+                    continue
+                s2 = s + q2(item.amount_base)
+                idxs2 = idxs + [idx]
+                new_beam.append((s2, idxs2))
+            # keep beam_size best by closeness to target
+            new_beam.sort(key=lambda t: abs(t[0] - target))
+            beam = new_beam[:beam_size]
+        # collect those within tol
+        tol = q2(tol_dec)
+        solutions = [idxs for s, idxs in beam if abs(s - target) <= tol]
+        return solutions
+
+    suggestions_out = []
+    # Now iterate anchors (banks) and produce suggestions using new strategy (no mutation of existing functions)
+    for bank in banks:
+        # prefilter: date window & currency
+        win_days = int(data.get("date_window_days", 365))
+        local_books = [b for b in books if b.currency_id == bank.currency_id and b.date and bank.date and abs((bank.date - b.date).days) <= win_days]
+        if not local_books:
+            continue
+        # prefilter by embedding top-K
+        top_idx = topk_by_embedding(bank.embedding or [], local_books, K_EMBED)
+        local_books = [local_books[i] for i in top_idx]
+        # reduce by amount closeness if too many
+        if len(local_books) > MAX_CANDIDATES:
+            local_books.sort(key=lambda b: abs(q2(b.amount_base) - q2(bank.amount_base)))
+            local_books = local_books[:MAX_CANDIDATES]
+
+        # Decide strategy
+        book_amounts = [q2(b.amount_base) for b in local_books]
+        all_non_negative = all(a >= 0 for a in book_amounts)
+
+        if all_non_negative and len(local_books) <= MAX_DP:
+            combos_idx = subset_sum_bitset_indices(local_books, bank.amount_base, Decimal(getattr(data, "amount_tolerance", "0.00") or Decimal("0.00")), getattr(data, "max_group_size_book", 5) )
+        else:
+            combos_idx = beam_search_indices(local_books, bank.amount_base, Decimal(getattr(data, "amount_tolerance", "0.00") or Decimal("0.00")), getattr(data, "max_group_size_book", 5), beam_size=BEAM_SIZE)
+
+        # convert combos -> suggestions and persist incrementally
+        for idxs in combos_idx:
+            combo_books = [local_books[i] for i in idxs]
+            # compute confidence using existing helpers (reuse compute_match_scores)
+            sim = self._cosine_similarity(bank.embedding or [], _avg_embedding(combo_books))
+            scores = compute_match_scores(
+                embed_sim=sim,
+                amount_diff=abs(q2(sum(b.amount_base for b in combo_books)) - q2(bank.amount_base)),
+                amount_tol=Decimal(getattr(data, "amount_tolerance", "0.00") or Decimal("0.00")),
+                date_diff=abs((bank.date - self._weighted_avg_date(combo_books)).days) if (bank.date and self._weighted_avg_date(combo_books)) else 0,
+                date_tol=int(getattr(data, "avg_date_delta_days", 1) or 1),
+                currency_match=1.0,
+                weights={"embedding": 0.5, "amount": 0.35, "date": 0.1, "currency": 0.05}
+            )
+            sug = {
+                "match_type": "one_to_many_fast",
+                "bank_ids": [bank.id],
+                "journal_entries_ids": [b.id for b in combo_books],
+                "confidence_score": float(scores["global_score"]),
+                "abs_amount_diff": float(abs(q2(sum(b.amount_base for b in combo_books)) - q2(bank.amount_base))),
+                "component_scores": scores,
+            }
+            # persist suggestion row similar to legacy on_suggestion logic
+            rs = ReconciliationSuggestion(
+                task=task_row,
+                company_id=bank.company_id,
+                match_type=sug["match_type"],
+                confidence_score=sug["confidence_score"],
+                abs_amount_diff=sug["abs_amount_diff"],
+                bank_ids=sug["bank_ids"],
+                journal_entry_ids=sug["journal_entries_ids"],
+                payload=sug,
+            )
+            rs.save()
+            suggestions_out.append(sug)
+
+    # finalize task_row stats
+    task_row.suggestion_count = ReconciliationSuggestion.objects.filter(task=task_row).count()
+    task_row.duration_seconds = time.time() - start_ts
+    task_row.status = "completed"
+    task_row.updated_at = timezone.now()
+    task_row.save(update_fields=["suggestion_count", "duration_seconds", "status", "updated_at"])
+
+    # optionally auto-apply if requested — reusing the same auto-match flow is possible, but keep minimal for now
+    if auto_match_100:
+        # call util to apply auto matches similar to ReconciliationService._apply_auto_matches_100
+        ReconciliationService._apply_auto_matches_100(suggestions_out)
+
+    return {"suggestions": suggestions_out, "stats": {"suggestion_count": len(suggestions_out), "duration_seconds": task_row.duration_seconds}}
+
 
 @shared_task(bind=True)
 def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=False):
