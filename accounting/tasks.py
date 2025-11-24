@@ -21,7 +21,8 @@ from django.utils import timezone
 from .models import ReconciliationTask
 #from .tasks import match_many_to_many_task  # task existente
 #from .tasks import RECON_SUGGESTION_FLUSH_SECONDS, DEFAULT_SUGGESTION_FLUSH_INTERVAL
-from typing import Dict, Any, Decimal
+from typing import Dict, Any
+from decimal import Decimal
 import uuid
 import requests
 from celery.utils.log import get_task_logger
