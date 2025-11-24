@@ -23,6 +23,7 @@ from pgvector.django import VectorField, HnswIndex
 
 from django.utils.dateparse import parse_date  # only needed if you keep saves without full_clean()
 
+from django.contrib.postgres.fields import ArrayField  # Postgres
 
 
 class Currency(BaseModel):
@@ -864,3 +865,97 @@ class Reconciliation(TenantAwareBaseModel):
         return self.total_bank_amount - self.total_journal_amount
     
     
+
+
+class ReconciliationSuggestion(models.Model):
+    """
+    A single reconciliation match suggestion produced by a ReconciliationTask.
+    Also records whether this suggestion was ultimately accepted or not.
+    """
+
+    STATUS_CHOICES = [
+        ("pending", "Pending"),          # generated, no decision yet
+        ("accepted", "Accepted"),        # used to create/attach to a Reconciliation
+        ("rejected", "Rejected"),        # explicitly rejected by user
+        ("superseded", "Superseded"),    # another suggestion with same anchors accepted
+    ]
+
+    DECISION_SOURCE_CHOICES = [
+        ("auto_100", "Auto match 100%"),   # from auto_match_100
+        ("user", "User action"),           # user clicked "match"
+        ("system", "System"),              # e.g. background logic
+    ]
+
+    task = models.ForeignKey(
+        "ReconciliationTask",
+        related_name="suggestions",
+        on_delete=models.CASCADE,
+    )
+
+    company_id = models.IntegerField(db_index=True)
+
+    # Core suggestion metadata
+    match_type = models.CharField(max_length=32, db_index=True)
+    confidence_score = models.DecimalField(
+        max_digits=5, decimal_places=4, db_index=True
+    )
+    abs_amount_diff = models.DecimalField(
+        max_digits=18, decimal_places=2, default=Decimal("0.00")
+    )
+
+    bank_ids = ArrayField(
+        base_field=models.IntegerField(),
+        default=list,
+        blank=True,
+    )
+    journal_entry_ids = ArrayField(
+        base_field=models.IntegerField(),
+        default=list,
+        blank=True,
+    )
+
+    # Full original API payload (what FE expects today)
+    payload = models.JSONField()
+
+    # --- NEW: label / decision info for ML / analytics ---
+    status = models.CharField(
+        max_length=16,
+        choices=STATUS_CHOICES,
+        default="pending",
+        db_index=True,
+    )
+    decision_source = models.CharField(
+        max_length=16,
+        choices=DECISION_SOURCE_CHOICES,
+        null=True,
+        blank=True,
+        db_index=True,
+    )
+    decision_at = models.DateTimeField(null=True, blank=True)
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reconciliation_suggestion_decisions",
+    )
+    reconciliation = models.ForeignKey(
+        "Reconciliation",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="suggestions",
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["task", "-confidence_score"]),
+            models.Index(fields=["task", "match_type"]),
+            models.Index(fields=["company_id", "match_type"]),
+            models.Index(fields=["task", "status"]),
+        ]
+
+    def __str__(self):
+        return f"Suggestion(task={self.task_id}, type={self.match_type}, conf={self.confidence_score}, status={self.status})"

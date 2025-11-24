@@ -14,7 +14,7 @@ from multitenancy.api_utils import generic_bulk_create, generic_bulk_update, gen
 from multitenancy.utils import resolve_tenant
 from multitenancy.models import CustomUser, Company, Entity
 from multitenancy.mixins import ScopedQuerysetMixin
-from .models import (Currency, Account, Transaction, JournalEntry, Rule, CostCenter, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter,ReconciliationTask, ReconciliationConfig)
+from .models import (Currency, Account, Transaction, JournalEntry, Rule, CostCenter, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter,ReconciliationTask, ReconciliationConfig, ReconciliationSuggestion)
 from .serializers import (CurrencySerializer, AccountSerializer, TransactionSerializer, CostCenterSerializer, JournalEntrySerializer, JournalEntryListSerializer, RuleSerializer, BankSerializer, BankAccountSerializer, BankTransactionSerializer, ReconciliationSerializer, TransactionListSerializer,ReconciliationTaskSerializer,ReconciliationConfigSerializer)
 from .services.transaction_service import *
 from .utils import update_journal_entries_and_transaction_flags, parse_ofx_text, decode_ofx_content, generate_ofx_transaction_hash, find_book_combos
@@ -55,6 +55,12 @@ from rest_framework.response import Response
 from rest_framework import status
 
 from accounting.models import Reconciliation, BankTransaction, JournalEntry
+
+from .serializers import (
+    ReconciliationPipelineSerializer,
+    ResolvedReconciliationPipelineSerializer,
+)
+from .serializers import ResolvedReconciliationConfigSerializer
 
 # accounting/views_embeddings.py
 
@@ -142,6 +148,76 @@ def _info(tag, **k):
 def _warn(tag, **k):
     parts = " ".join(f"{kk}={vv}" for kk, vv in k.items())
     log.warning("[%s] %s", tag, parts)
+
+def _label_suggestions_for_match(
+    company_id,
+    bank_ids_used,
+    journal_ids_used,
+    reconciliation,
+    decision_source="user",
+    user=None,
+):
+    """
+    Marca ReconciliationSuggestion de acordo com o match efetivamente criado.
+
+    - Sugestões com o MESMO conjunto de (bank_ids, journal_entry_ids) =>
+      status='accepted', linkadas ao `reconciliation`.
+    - Outras sugestões pendentes que compartilham pelo menos um anchor =>
+      status='superseded' (não podem mais ser usadas).
+
+    Não altera o formato das respostas das views; só grava rótulos para treino.
+    """
+    if not (bank_ids_used or journal_ids_used):
+        return
+
+    bank_set = set(bank_ids_used or [])
+    journal_set = set(journal_ids_used or [])
+    if not (bank_set or journal_set):
+        return
+
+    # Candidatas: sugestões pendentes que têm overlap com algum dos anchors
+    candidates = ReconciliationSuggestion.objects.filter(
+        company_id=company_id,
+        status="pending",
+    ).filter(
+        Q(bank_ids__overlap=list(bank_set)) |
+        Q(journal_entry_ids__overlap=list(journal_set))
+    )
+
+    if not candidates.exists():
+        return
+
+    now_ts = timezone.now()
+    to_update = []
+
+    for sg in candidates:
+        sg_bank = set(sg.bank_ids or [])
+        sg_journal = set(sg.journal_entry_ids or [])
+
+        if sg_bank == bank_set and sg_journal == journal_set:
+            # Esta é exatamente a combinação que o usuário aceitou
+            sg.status = "accepted"
+            sg.decision_source = decision_source
+            sg.decision_at = now_ts
+            sg.reconciliation = reconciliation
+            if user and not sg.decided_by_id:
+                sg.decided_by = user
+        else:
+            # Compartilha algum anchor, mas não é a combinação escolhida:
+            # não faz mais sentido mantê-la como pendente.
+            sg.status = "superseded"
+            if not sg.decision_source:
+                sg.decision_source = "system"
+            if not sg.decision_at:
+                sg.decision_at = now_ts
+
+        to_update.append(sg)
+
+    if to_update:
+        ReconciliationSuggestion.objects.bulk_update(
+            to_update,
+            ["status", "decision_source", "decision_at", "reconciliation", "decided_by"],
+        )
 
 # Currency ViewSet
 class CurrencyViewSet(viewsets.ModelViewSet):
@@ -1773,7 +1849,25 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     n_bank=len(bank_txs),
                     n_journal=len(journal_entries),
                 )
-    
+                
+                # NOVO: marcar sugestões relacionadas como accepted/superseded
+                try:
+                    _label_suggestions_for_match(
+                        company_id=company_id,
+                        bank_ids_used=bank_ids_used,
+                        journal_ids_used=journal_ids_used,
+                        reconciliation=rec,
+                        decision_source="user",
+                        user=request.user if getattr(request, "user", None) and request.user.is_authenticated else None,
+                    )
+                except Exception as lbl_exc:
+                    _warn(
+                        "label_suggestions_error",
+                        request_id=request_id,
+                        i=idx,
+                        error=str(lbl_exc),
+                    )
+                
                 # Mark used in this batch (so they won't be reused)
                 used_bank_ids_batch.update(bank_ids_used)
                 used_journal_ids_batch.update(journal_ids_used)
@@ -2197,7 +2291,25 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                             "journal_ids_used": journal_ids_used,
                         }
                     )
-    
+                    
+                    # NOVO: marcar sugestões como accepted/superseded também na versão legacy
+                    try:
+                        _label_suggestions_for_match(
+                            company_id=company_id,
+                            bank_ids_used=bank_ids_used,
+                            journal_ids_used=journal_ids_used,
+                            reconciliation=rec,
+                            decision_source="user",
+                            user=request.user if getattr(request, "user", None) and request.user.is_authenticated else None,
+                        )
+                    except Exception as lbl_exc:
+                        _warn(
+                            "label_suggestions_error_legacy",
+                            request_id=request_id,
+                            i=idx,
+                            error=str(lbl_exc),
+                        )
+                    
                     #_info("reconciliation_created",request_id=request_id,i=idx,reconciliation_id=rec.id,status=rec_status,n_bank=len(bank_txs),n_journal=len(journal_entries))
     
                     # Promotion (collect changes for bulk_update)
@@ -2452,22 +2564,21 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     @action(detail=True, methods=["get"], url_path="fresh-suggestions")
     def fresh_suggestions(self, request, pk=None, tenant_id=None):
         """
-        Return only the suggestions from this task that are still 'fresh':
-        i.e., none of their bank_ids or journal_entries_ids are already used
-        in a matched/approved reconciliation for this tenant.
+        Retorna apenas as sugestões 'frescas' deste task:
+        - Nenhum dos seus bank_ids / journal_entries_ids foi usado
+          em uma reconciliation matched/approved.
+        
+        Compatível com:
+        - Novo modelo ReconciliationSuggestion (preferido)
+        - Formato legado em task.result["suggestions"] (fallback)
         """
         task = self.get_object()
 
-        result = task.result or {}
-        suggestions = result.get("suggestions") or []
-        if not suggestions:
-            return Response({"count": 0, "suggestions": []})
-
-        # Company scope from tenant
+        # Escopo da company via tenant
         company = resolve_tenant(tenant_id)
         company_id = company.id
 
-        # Sets of already reconciled IDs for this company
+        # IDs já reconciliados (matched/approved) para esta company
         used_bank_ids = set(
             BankTransaction.objects.filter(
                 company_id=company_id,
@@ -2481,7 +2592,7 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             ).values_list("id", flat=True)
         )
 
-        # Optional filters
+        # Filtros opcionais
         try:
             min_conf = float(request.query_params.get("min_confidence", "0"))
         except ValueError:
@@ -2491,13 +2602,61 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         except ValueError:
             limit = 1000
 
+        # --- NOVO: preferir as sugestões persistidas em tabela ---
+        db_qs = ReconciliationSuggestion.objects.filter(
+            task=task,
+            company_id=company_id,
+            status="pending",
+        )
+
+        if db_qs.exists():
+            fresh_payloads = []
+            for sg in db_qs.order_by("-confidence_score"):
+                conf = float(sg.confidence_score or 0)
+                if conf < min_conf:
+                    continue
+
+                b_ids = set(sg.bank_ids or [])
+                j_ids = set(sg.journal_entry_ids or [])
+
+                # Pula se algum anchor já foi reconciliado
+                if b_ids & used_bank_ids:
+                    continue
+                if j_ids & used_book_ids:
+                    continue
+
+                payload = (sg.payload or {}).copy()
+
+                # Garante compatibilidade com o formato legado:
+                payload.setdefault("bank_ids", list(b_ids))
+                if "journal_entries_ids" not in payload:
+                    payload["journal_entries_ids"] = list(j_ids)
+
+                # Campo extra não-breaking, útil para UX futura
+                payload.setdefault("suggestion_id", sg.id)
+
+                fresh_payloads.append(payload)
+                if len(fresh_payloads) >= limit:
+                    break
+
+            return Response(
+                {"count": len(fresh_payloads), "suggestions": fresh_payloads},
+                status=status.HTTP_200_OK,
+            )
+
+        # --- FALLBACK: comportamento antigo usando task.result["suggestions"] ---
+        result = task.result or {}
+        suggestions = result.get("suggestions") or []
+        if not suggestions:
+            return Response({"count": 0, "suggestions": []})
+
         fresh = []
         for s in suggestions:
             if s.get("confidence_score", 0) < min_conf:
                 continue
             b_ids = set(s.get("bank_ids", []))
             j_ids = set(s.get("journal_entries_ids", []))
-            # Skip if any id already reconciled
+            # Pula se algum anchor já foi reconciliado
             if b_ids & used_bank_ids:
                 continue
             if j_ids & used_book_ids:
@@ -2633,7 +2792,7 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
           - ?last_n=100   (last 100 tasks)
           - ?hours_ago=6  (tasks from the last 6 hours)
         """
-        tenant_filter = tenant_id
+        tenant_filter = tenant_id or request.query_params.get("tenant_id")
         last_n = request.query_params.get("last_n")
         hours_ago = request.query_params.get("hours_ago")
     
@@ -2700,7 +2859,7 @@ class ReconciliationConfigViewSet(viewsets.ModelViewSet):
         permission_classes = []
     else:
         permission_classes = [permissions.IsAuthenticated]
-        
+
     queryset = ReconciliationConfig.objects.all()
     serializer_class = ReconciliationConfigSerializer
 
@@ -2911,7 +3070,11 @@ def _job_to_dict(j: Job) -> Dict[str, Any]:
         "enqueued_at": j.enqueued_at,
         "started_at": j.started_at,
         "finished_at": j.finished_at,
-        "runtime_s": _runtime_seconds(j.started_at or j.enqueued_at or j.created_at, j.finished_at or now()),
+        # ANTES: ... or now()
+        "runtime_s": _runtime_seconds(
+            j.started_at or j.enqueued_at or j.created_at,
+            j.finished_at or timezone.now(),
+        ),
         "retries": j.retries,
         "max_retries": j.max_retries,
         "total": j.total,
@@ -3006,7 +3169,7 @@ class EmbeddingTaskCancelView(APIView):
         current_app.control.revoke(task_id, terminate=True)
         Job.objects.filter(task_id=task_id).update(
             state=STATE_MAP["REVOKED"],
-            finished_at=now(),
+            finished_at=timezone.now(),  # ANTES: now()
             error="revoked",
         )
         return Response({"task_id": task_id, "revoked": True}, status=status.HTTP_200_OK)

@@ -22,7 +22,9 @@ from datetime import date as _date
 
 from collections.abc import Sequence
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Callable  # <-- adicionar Callable
+
+
 
 from django.db import transaction
 from django.db.models import Q
@@ -293,15 +295,23 @@ class ReconciliationPipelineEngine:
     fuzzy, one-to-many, many-to-one and many-to-many matching with asymmetric
     group sizes and weighted confidence scoring.
     """
-    def __init__(self, company_id: int, config: PipelineConfig):
+    def __init__(
+        self,
+        company_id: int,
+        config: PipelineConfig,
+        on_suggestion: Optional[Callable[[dict], None]] = None,  # <-- NOVO
+    ):
         self.company_id = company_id
         self.config = config
         self.suggestions: List[dict] = []
         self.used_banks: set[int] = set()
         self.used_books: set[int] = set()
-        
+
         self._seen_groups: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
-        
+
+        # callback opcional para stream de sugestões
+        self._on_suggestion = on_suggestion
+
         # Per-stage or global weights; set externally before calling run()
         self.current_weights: Dict[str, float] | List[Dict[str, float]] = {
             "embedding": 0.50,
@@ -309,7 +319,7 @@ class ReconciliationPipelineEngine:
             "currency":  0.10,
             "date":      0.05,
         }
-        
+
         # Soft runtime limit support
         self.max_runtime_seconds: float | None = config.max_runtime_seconds
         self._start_ts: float = monotonic()
@@ -417,95 +427,7 @@ class ReconciliationPipelineEngine:
             return None
         return [local_books[i] for i in result_indices]
     
-    def _find_mixed_many_to_one_group(
-        self,
-        book: JournalEntryDTO,
-        local_banks: List[BankTransactionDTO],
-        stage: StageConfig,
-    ) -> Optional[List[BankTransactionDTO]]:
-        """
-        Branch-and-bound search for a subset of `local_banks` (mixed-sign amounts)
-        whose sum matches book.amount_base within the given tolerance.
-    
-        Applies:
-          - amount tolerance band
-          - currency check
-          - group_span_days (banks)
-          - avg_date_delta_days between bank-group weighted avg date and book.date
-        """
-        n = len(local_banks)
-        if n == 0:
-            return None
-    
-        amounts: List[Decimal] = [(b.amount_base or Decimal("0")) for b in local_banks]
-        target = q2(book.amount_base)
-        tol = stage.amount_tol or Decimal("0")
-    
-        rem_min = [Decimal("0")] * (n + 1)
-        rem_max = [Decimal("0")] * (n + 1)
-        for i in range(n - 1, -1, -1):
-            a = amounts[i]
-            if a >= 0:
-                rem_max[i] = rem_max[i + 1] + a
-                rem_min[i] = rem_min[i + 1]
-            else:
-                rem_min[i] = rem_min[i + 1] + a
-                rem_max[i] = rem_max[i + 1]
-    
-        lower = target - tol
-        upper = target + tol
-        result_indices: Optional[List[int]] = None
-    
-        def dfs(idx: int, chosen: List[int], current_sum: Decimal):
-            nonlocal result_indices
-            if result_indices is not None:
-                return
-            if len(chosen) > stage.max_group_size_bank:
-                return
-    
-            if idx == n:
-                if not chosen:
-                    return
-                if not (lower <= q2(current_sum) <= upper):
-                    return
-    
-                combo = [local_banks[i] for i in chosen]
-    
-                if any(b.currency_id != book.currency_id for b in combo):
-                    return
-    
-                dates = [b.date for b in combo if b.date]
-                bank_span = (max(dates) - min(dates)).days if len(dates) >= 2 else 0
-                if stage.group_span_days and bank_span > stage.group_span_days:
-                    return
-    
-                bank_avg = self._weighted_avg_date(combo)
-                book_avg = book.date
-                win = stage.candidate_window_days
-                avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
-                if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
-                    return
-    
-                result_indices = chosen.copy()
-                return
-    
-            possible_min = current_sum + rem_min[idx]
-            possible_max = current_sum + rem_max[idx]
-            if possible_max < lower or possible_min > upper:
-                return
-    
-            dfs(idx + 1, chosen, current_sum)
-            if result_indices is not None:
-                return
-            dfs(idx + 1, chosen + [idx], current_sum + amounts[idx])
-    
-        dfs(0, [], Decimal("0"))
-    
-        if result_indices is None:
-            return None
-        return [local_banks[i] for i in result_indices]
-
-    
+        
     def run(self, banks: list[BankTransactionDTO], books: list[JournalEntryDTO]) -> list[dict]:
         log.debug(
             "PipelineEngine.run: company_id=%s stages=%d banks=%d books=%d max_suggestions=%d max_runtime=%s",
@@ -896,6 +818,14 @@ class ReconciliationPipelineEngine:
                     self._record(best)
                     for alt in candidates[1:]:
                         self.suggestions.append(alt)
+                        if self._on_suggestion:
+                            try:
+                                self._on_suggestion(alt)
+                            except Exception as cb_exc:
+                                log.warning(
+                                    "on_suggestion callback failed (alt one_to_many): %s",
+                                    cb_exc,
+                                )
                 continue
 
             all_non_negative = all(a >= 0 for a in book_amounts)
@@ -917,6 +847,14 @@ class ReconciliationPipelineEngine:
                         self._record(best)
                         for alt in candidates[1:]:
                             self.suggestions.append(alt)
+                            if self._on_suggestion:
+                                try:
+                                    self._on_suggestion(alt)
+                                except Exception as cb_exc:
+                                    log.warning(
+                                        "on_suggestion callback failed (alt many_to_many): %s",
+                                        cb_exc,
+                                    )
                     continue
 
             for size in range(1, max_size + 1):
@@ -980,6 +918,14 @@ class ReconciliationPipelineEngine:
                 self._record(best)
                 for alt in candidates[1:]:
                     self.suggestions.append(alt)
+                    if self._on_suggestion:
+                        try:
+                            self._on_suggestion(alt)
+                        except Exception as cb_exc:
+                            log.warning(
+                                "on_suggestion callback failed (alt many_to_many): %s",
+                                cb_exc,
+                            )
 
 
     
@@ -1101,6 +1047,14 @@ class ReconciliationPipelineEngine:
                     self._record(best)
                     for alt in candidates[1:]:
                         self.suggestions.append(alt)
+                        if self._on_suggestion:
+                            try:
+                                self._on_suggestion(alt)
+                            except Exception as cb_exc:
+                                log.warning(
+                                    "on_suggestion callback failed (alt many_to_one): %s",
+                                    cb_exc,
+                                )
                 continue
 
             all_non_negative = all(a >= 0 for a in bank_amounts)
@@ -1122,6 +1076,14 @@ class ReconciliationPipelineEngine:
                         self._record(best)
                         for alt in candidates[1:]:
                             self.suggestions.append(alt)
+                            if self._on_suggestion:
+                                try:
+                                    self._on_suggestion(alt)
+                                except Exception as cb_exc:
+                                    log.warning(
+                                        "on_suggestion callback failed (alt many_to_many): %s",
+                                        cb_exc,
+                                    )
                     continue
 
             for size in range(1, max_size + 1):
@@ -1185,6 +1147,14 @@ class ReconciliationPipelineEngine:
                 self._record(best)
                 for alt in candidates[1:]:
                     self.suggestions.append(alt)
+                    if self._on_suggestion:
+                        try:
+                            self._on_suggestion(alt)
+                        except Exception as cb_exc:
+                            log.warning(
+                                "on_suggestion callback failed (alt many_to_many): %s",
+                                cb_exc,
+                            )
 
 
     
@@ -1257,16 +1227,19 @@ class ReconciliationPipelineEngine:
         """
         Fuzzy 1-to-1 matching with global non-overlapping selection.
 
-        We:
-          1) Generate all valid (bank, book) fuzzy candidates with scores
-          2) Sort them by global_score (and tie-breakers)
-          3) Greedily pick a non-overlapping set of pairs
+        Passos:
+          1) Gerar todos os candidatos (bank, book) válidos com score
+          2) Ordenar por global_score (e tie-breakers)
+          3) Escolher um conjunto global de pares não sobrepostos (primários)
+          4) Opcionalmente adicionar alternativas por bank, até
+             stage.max_alternatives_per_anchor (sem marcar used_*).
         """
-
         win = stage.candidate_window_days
         bin_size = max(1, min(win or 1, 7))
 
-        # Index books by date bins for faster lookup
+        max_k = max(int(stage.max_alternatives_per_anchor or 1), 1)
+
+        # Indexar books por bins de data para lookup mais rápido
         book_bins = build_date_bins(
             [b for b in books if b.id not in self.used_books],
             get_date=lambda e: e.date,
@@ -1278,25 +1251,28 @@ class ReconciliationPipelineEngine:
         for bank in banks:
             if self._time_exceeded():
                 return
-            
             if bank.id in self.used_banks:
                 continue
 
-            # Find nearby books in date space
+            # Books "perto" em data
             candidates_in_window = list(
                 iter_date_bin_candidates(bank.date, book_bins, bin_size, win)
             )
-            # Bucket by amount around this bank
+            if not candidates_in_window:
+                continue
+
+            # Bucket por amount em torno deste bank
             buckets = build_amount_buckets(
                 candidates_in_window, get_amount=lambda e: e.amount_base
             )
 
-            for book in probe_amount_buckets(buckets, bank.amount_base, stage.amount_tol):
-                # Respect global used flags from previous stages
+            for book in probe_amount_buckets(
+                buckets, bank.amount_base, stage.amount_tol
+            ):
                 if book.id in self.used_books:
                     continue
 
-                # Basic guards: currency and amount tolerance
+                # Guards básicos
                 if bank.currency_id != book.currency_id:
                     continue
 
@@ -1304,7 +1280,7 @@ class ReconciliationPipelineEngine:
                 if a_diff > stage.amount_tol:
                     continue
 
-                # CROSS-side date delta
+                # Δ de datas
                 if bank.date and book.date:
                     avg_delta = abs((bank.date - book.date).days)
                 else:
@@ -1357,7 +1333,7 @@ class ReconciliationPipelineEngine:
         if not candidates:
             return
 
-        # GLOBAL SELECTION: pick best non-overlapping pairs
+        # GLOBAL SELECTION: melhores pares não sobrepostos
         candidates.sort(
             key=lambda c: (
                 c["scores"]["global_score"],
@@ -1369,6 +1345,7 @@ class ReconciliationPipelineEngine:
 
         local_used_banks: set[int] = set()
         local_used_books: set[int] = set()
+        primary_pairs: set[tuple[int, int]] = set()  # (bank_id, book_id) primário
 
         for c in candidates:
             bank = c["bank"]
@@ -1405,9 +1382,73 @@ class ReconciliationPipelineEngine:
 
             local_used_banks.add(bank.id)
             local_used_books.add(book.id)
+            primary_pairs.add((bank.id, book.id))
 
             if len(self.suggestions) >= self.config.max_suggestions:
                 break
+
+        # Se max_k == 1, comportamento antigo: só um par por bank
+        if max_k <= 1:
+            return
+
+        # Alternativas por bank (sem mexer em used_* global)
+        per_bank_count: dict[int, int] = {
+            bank_id: 1 for (bank_id, _) in primary_pairs
+        }
+
+        for c in candidates:
+            if self._time_exceeded():
+                return
+
+            bank = c["bank"]
+            book = c["book"]
+            b_id = bank.id
+            j_id = book.id
+
+            # limite por bank
+            current = per_bank_count.get(b_id, 0)
+            if current >= max_k:
+                continue
+
+            # não repetir o par primário
+            if (b_id, j_id) in primary_pairs:
+                continue
+
+            scores = c["scores"]
+            weights = c["weights"]
+
+            alt_suggestion = self._make_suggestion(
+                "fuzzy_1to1",
+                [bank],
+                [book],
+                scores["global_score"],
+                stage=stage,
+                weights=weights,
+                component_scores=scores,
+                extra={
+                    "embed_similarity": c["embed_sim"],
+                    "amount_diff": c["amount_diff"],
+                    "avg_date_delta_days_measured": c["avg_delta"],
+                    "currency_match": 1.0,
+                    "alternative_for_bank": b_id,
+                },
+            )
+
+            self.suggestions.append(alt_suggestion)
+            per_bank_count[b_id] = current + 1
+
+            if self._on_suggestion:
+                try:
+                    self._on_suggestion(alt_suggestion)
+                except Exception as cb_exc:
+                    log.warning(
+                        "on_suggestion callback failed (alt fuzzy_1to1): %s", cb_exc
+                    )
+
+            if len(self.suggestions) >= self.config.max_suggestions:
+                return
+
+
     
     def _run_many_to_many(self, banks, books, stage: StageConfig):
         """
@@ -1582,6 +1623,14 @@ class ReconciliationPipelineEngine:
                 self._record(best)
                 for alt in candidates[1:]:
                     self.suggestions.append(alt)
+                    if self._on_suggestion:
+                        try:
+                            self._on_suggestion(alt)
+                        except Exception as cb_exc:
+                            log.warning(
+                                "on_suggestion callback failed (alt many_to_many): %s",
+                                cb_exc,
+                            )
 
 
     
@@ -1831,14 +1880,17 @@ class ReconciliationPipelineEngine:
         bank_key = tuple(sorted(suggestion["bank_ids"]))
         book_key = tuple(sorted(suggestion["journal_entries_ids"]))
         key = (bank_key, book_key)
-    
+
         if key in self._seen_groups:
-            log.debug("Skipping duplicate suggestion: banks=%s books=%s",
-                      bank_key, book_key)
+            log.debug(
+                "Skipping duplicate suggestion: banks=%s books=%s",
+                bank_key,
+                book_key,
+            )
             return
-    
+
         self._seen_groups.add(key)
-    
+
         log.debug(
             "Recording suggestion: type=%s, bank_ids=%s, journal_ids=%s, confidence=%.4f",
             suggestion["match_type"],
@@ -1846,9 +1898,18 @@ class ReconciliationPipelineEngine:
             suggestion["journal_entries_ids"],
             suggestion["confidence_score"],
         )
+
         self.suggestions.append(suggestion)
         self.used_banks.update(suggestion["bank_ids"])
         self.used_books.update(suggestion["journal_entries_ids"])
+
+        # Dispara callback (para persistência incremental, etc.)
+        if self._on_suggestion:
+            try:
+                self._on_suggestion(suggestion)
+            except Exception as cb_exc:
+                log.warning("on_suggestion callback failed: %s", cb_exc)
+
 
 
 
@@ -2113,28 +2174,35 @@ class ReconciliationService:
         bank_qs = (
             BankTransaction.objects
             .exclude(reconciliations__status__in=["matched", "approved"])
+            .filter(company_id=company_id)
             .only("id", "company_id", "date", "amount", "currency_id", "description", "description_embedding")
         )
         bank_count_initial = bank_qs.count()
-        log.debug("Initial unmatched bank transactions count: %d", bank_count_initial)
+        log.debug(
+            "Initial unmatched bank transactions count (company_id=%s): %d",
+            company_id, bank_count_initial,
+        )
         
         if bank_ids:
             bank_qs = bank_qs.filter(id__in=bank_ids)
             filtered_count = bank_qs.count()
             log.debug(
-                "Filtered bank transactions by provided IDs (%d ids): %d records remain",
+                "Filtered bank transactions by provided IDs (%d ids) for company_id=%s: %d records remain",
                 len(bank_ids),
+                company_id,
                 filtered_count,
             )
         else:
             log.debug(
-                "No bank_ids provided; using all unmatched bank transactions (%d records)",
+                "No bank_ids provided; using all unmatched bank transactions for company_id=%s (%d records)",
+                company_id,
                 bank_count_initial,
             )
         
         book_qs = (
             JournalEntry.objects
             .exclude(reconciliations__status__in=["matched", "approved"])
+            .filter(company_id=company_id)              # <- NOVO: escopo por company
             .filter(account__bank_account__isnull=False)
             .select_related("transaction")
             .only(
@@ -2145,18 +2213,25 @@ class ReconciliationService:
             )
         )
         book_count_initial = book_qs.count()
-        log.debug("Initial unmatched journal entries count: %d", book_count_initial)
+        log.debug(
+            "Initial unmatched journal entries count (company_id=%s): %d",
+            company_id,
+            book_count_initial,
+        )
+
         if book_ids:
             book_qs = book_qs.filter(id__in=book_ids)
             filtered_book_count = book_qs.count()
             log.debug(
-                "Filtered journal entries by provided IDs (%d ids): %d records remain",
+                "Filtered journal entries by provided IDs (%d ids) for company_id=%s: %d records remain",
                 len(book_ids),
+                company_id,
                 filtered_book_count,
             )
         else:
             log.debug(
-                "No book_ids provided; using all unmatched journal entries (%d records)",
+                "No book_ids provided; using all unmatched journal entries for company_id=%s (%d records)",
+                company_id,
                 book_count_initial,
             )
 
