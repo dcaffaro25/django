@@ -1969,11 +1969,18 @@ def run_single_config(cfg: object,
     
     log.debug("run_single_config: StageConfig=%s", stage)
     
+    max_runtime = None
+    try:
+        if soft_limit is not None and float(soft_limit) > 0:
+            max_runtime = float(soft_limit)
+    except Exception:
+        max_runtime = None
+
     pipe_cfg = PipelineConfig(
         stages=[stage],
         auto_apply_score=float(getattr(cfg, "min_confidence", 1.0)),
         max_suggestions=getattr(cfg, "max_suggestions", 10000),
-        max_runtime_seconds=float(soft_limit) if soft_limit is not None else None,
+        max_runtime_seconds=max_runtime,   # <-- use None when soft_limit is 0 or invalid
     )
     engine = ReconciliationPipelineEngine(
         company_id=company_id,
@@ -2122,11 +2129,18 @@ def run_pipeline(pipeline: object,
 
     soft_limit = getattr(pipeline, "soft_time_limit_seconds", None)
 
+    max_runtime = None
+    try:
+        if soft_limit is not None and float(soft_limit) > 0:
+            max_runtime = float(soft_limit)
+    except Exception:
+        max_runtime = None
+
     pipe_cfg = PipelineConfig(
         stages=stage_configs,
         auto_apply_score=float(pipeline.auto_apply_score),
         max_suggestions=pipeline.max_suggestions,
-        max_runtime_seconds=float(soft_limit) if soft_limit is not None else None,
+        max_runtime_seconds=max_runtime,
     )
 
     log.debug(

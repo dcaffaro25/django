@@ -84,6 +84,23 @@ def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=Fa
     """
     task_obj = ReconciliationTask.objects.get(id=db_id)
 
+    # ---- NOVO: resolver company_id independentemente do ReconciliationTask model ----
+    # Prefer explicit company in payload -> resolve tenant -> fallback None
+    company_id = None
+    try:
+        company_id = data.get("company_id", None)
+    except Exception:
+        company_id = None
+
+    if company_id is None:
+        try:
+            # tenant_id é o que vem do request/context; resolve_tenant retorna company/tenant object
+            if tenant_id:
+                company_obj = resolve_tenant(tenant_id)
+                company_id = getattr(company_obj, "id", None)
+        except Exception:
+            company_id = None
+
     flush_interval = DEFAULT_SUGGESTION_FLUSH_INTERVAL
 
     # buffer for pending suggestion model instances to bulk_create
@@ -110,12 +127,15 @@ def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=Fa
 
     # callback to receive each suggestion as produced by the engine
     def on_suggestion(s: dict) -> None:
-        nonlocal buffer, last_flush_ts
+        nonlocal buffer, last_flush_ts, company_id
         try:
+            # Prefer company_id provided inside suggestion payload, else fallback to outer-resolved company_id
+            sugg_company_id = s.get("company_id") or company_id
+
             # build a lightweight ReconciliationSuggestion instance (not saved yet)
             rs = ReconciliationSuggestion(
                 task=task_obj,
-                company_id=s.get("company_id", task_obj.company_id),
+                company_id=sugg_company_id,
                 match_type=s.get("match_type", "") or "",
                 confidence_score=s.get("confidence_score", 0.0) or 0.0,
                 abs_amount_diff=s.get("abs_amount_diff", 0.0) or 0.0,
@@ -125,6 +145,7 @@ def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=Fa
             )
             buffer.append(rs)
         except Exception as e:
+            # Defensive: never let a single suggestion crash the whole task
             log.exception("Error buffering suggestion for task %s: %s", db_id, e)
 
         now = time.monotonic()
@@ -156,27 +177,26 @@ def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=Fa
 
         # If suggestions were created incrementally above, we still create any that
         # remain in suggestions list (defensive: avoid duplicates)
-        # Build any remaining suggestion models for suggestions not yet persisted:
-        # NOTE: the on_suggestion flush already persisted many; we try to avoid duplicates
-        # by only creating objects for suggestions whose (bank_ids, journal_ids) are not in DB.
         to_create = []
         for s in suggestions:
-            key = (tuple(sorted(s.get("bank_ids", []) or [])), tuple(sorted(s.get("journal_entries_ids", []) or [])))
+            bank_ids = s.get("bank_ids", []) or []
+            journal_ids = s.get("journal_entries_ids", []) or []
+            # Use an equality check on both arrays to avoid duplicates (works with ArrayField)
             exists = ReconciliationSuggestion.objects.filter(
                 task=task_obj,
-                bank_ids__contained_by=list(key[0])  # cheap existence hint; OK if not perfect
+                bank_ids=bank_ids,
+                journal_entry_ids=journal_ids
             ).exists()
-            # To keep it simple we append only if not obviously existing
             if not exists:
                 to_create.append(
                     ReconciliationSuggestion(
                         task=task_obj,
-                        company_id=stats.get("company_id", task_obj.company_id),
+                        company_id=stats.get("company_id") or company_id,
                         match_type=s.get("match_type", "") or "",
                         confidence_score=s.get("confidence_score", 0.0) or 0.0,
                         abs_amount_diff=s.get("abs_amount_diff", 0.0) or 0.0,
-                        bank_ids=s.get("bank_ids", []) or [],
-                        journal_entry_ids=s.get("journal_entries_ids", []) or [],
+                        bank_ids=bank_ids,
+                        journal_entry_ids=journal_ids,
                         payload=s,
                     )
                 )
