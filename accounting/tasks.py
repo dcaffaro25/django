@@ -284,7 +284,7 @@ def match_many_to_many_fast_task(self, db_id: int, data: Dict[str, Any], tenant_
 
     start_ts = time.time()
 
-    # build DTOs (reuse similar queryset logic as legacy)
+    # build DTOs (reuse similar queryset logic as legacy
     company_id = data.get("company_id")
     if company_id is None and tenant_id:
         try:
