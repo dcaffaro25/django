@@ -335,7 +335,7 @@ def match_many_to_many_fast_task(self, db_id: int, data: Dict[str, Any], tenant_
             transaction_id=getattr(j, "transaction_id", None),
             date=getattr(j, "date", None) or (getattr(getattr(j, "transaction", None), "date", None)),
             effective_amount=getattr(j, "get_effective_amount", lambda: None)() if hasattr(j, "get_effective_amount") else getattr(j, "amount", 0),
-            amount_base=getattr(j, "get_effective_amount", lambda: 0)(),  # expected by DP helpers
+            #amount_base=getattr(j, "get_effective_amount", lambda: 0)(),  # expected by DP helpers
             currency_id=(getattr(getattr(j, "transaction", None), "currency_id", None) if getattr(j, "transaction", None) else None),
             description=(getattr(getattr(j, "transaction", None), "description", "") if getattr(j, "transaction", None) else ""),
             embedding=_as_vec_list(getattr(getattr(j, "transaction", None), "description_embedding", None)),
@@ -362,9 +362,9 @@ def match_many_to_many_fast_task(self, db_id: int, data: Dict[str, Any], tenant_
     def subset_sum_bitset_indices(items, target_dec: Decimal, tol_dec: Decimal, max_card: int):
         # items: list of DTOs with .amount_base
         try:
-            cents = [int(q2(getattr(it, "amount_base", 0)) / CENT) for it in items]
+            cents = [int(q2(getattr(it, "effective_amount", 0)) / CENT) for it in items]
         except Exception:
-            cents = [int(q2(getattr(it, "amount_base", 0)) / CENT) if getattr(it, "amount_base", None) is not None else 0 for it in items]
+            cents = [int(q2(getattr(it, "effective_amount", 0)) / CENT) if getattr(it, "effective_amount", None) is not None else 0 for it in items]
         target = int(q2(target_dec) / CENT)
         tol = int(q2(tol_dec) / CENT)
         total = sum(cents)
@@ -418,14 +418,14 @@ def match_many_to_many_fast_task(self, db_id: int, data: Dict[str, Any], tenant_
     # beam search fallback (simple)
     def beam_search_indices(items, target_dec: Decimal, tol_dec: Decimal, max_card: int, beam_size=BEAM_SIZE):
         target = q2(target_dec)
-        ranked = sorted(enumerate(items), key=lambda x: abs(q2(getattr(x[1], "amount_base", 0)) - target))
+        ranked = sorted(enumerate(items), key=lambda x: abs(q2(getattr(x[1], "effective_amount", 0)) - target))
         beam = [(Decimal("0.00"), [])]
         for idx, item in ranked:
             new_beam = list(beam)
             for s, idxs in beam:
                 if len(idxs) + 1 > max_card:
                     continue
-                s2 = s + q2(getattr(item, "amount_base", Decimal("0.00")))
+                s2 = s + q2(getattr(item, "effective_amount", Decimal("0.00")))
                 idxs2 = idxs + [idx]
                 new_beam.append((s2, idxs2))
             new_beam.sort(key=lambda t: abs(t[0] - target))
@@ -460,11 +460,11 @@ def match_many_to_many_fast_task(self, db_id: int, data: Dict[str, Any], tenant_
 
         # reduce by amount closeness if still too many
         if len(local_books) > MAX_CANDIDATES:
-            local_books.sort(key=lambda b: abs(q2(getattr(b, "amount_base", 0)) - q2(getattr(bank, "amount", 0))))
+            local_books.sort(key=lambda b: abs(q2(getattr(b, "effective_amount", 0)) - q2(getattr(bank, "amount", 0))))
             local_books = local_books[:MAX_CANDIDATES]
 
         # decide DP vs beam
-        book_amounts = [q2(getattr(b, "amount_base", 0)) for b in local_books]
+        book_amounts = [q2(getattr(b, "effective_amount", 0)) for b in local_books]
         all_non_negative = all(a >= 0 for a in book_amounts)
         amt_tol = Decimal(str(data.get("amount_tolerance", "0.00") or "0.00"))
         max_group = int(data.get("max_group_size_book", 5) or 5)
@@ -501,7 +501,7 @@ def match_many_to_many_fast_task(self, db_id: int, data: Dict[str, Any], tenant_
                 total = Decimal("0.00")
                 for it in items:
                     try:
-                        total += q2(getattr(it, "amount_base", Decimal("0.00")))
+                        total += q2(getattr(it, "effective_amount", Decimal("0.00")))
                     except Exception:
                         pass
                 if total == Decimal("0.00"):
@@ -511,7 +511,7 @@ def match_many_to_many_fast_task(self, db_id: int, data: Dict[str, Any], tenant_
                     if not getattr(it, "date", None):
                         continue
                     try:
-                        w = float(q2(getattr(it, "amount_base", Decimal("0.00"))) / total)
+                        w = float(q2(getattr(it, "effective_amount", Decimal("0.00"))) / total)
                     except Exception:
                         w = 0.0
                     weighted += it.date.toordinal() * w
@@ -523,7 +523,7 @@ def match_many_to_many_fast_task(self, db_id: int, data: Dict[str, Any], tenant_
             date_avg = _weighted_avg_date(combo_books)
             date_diff = abs((bank.date - date_avg).days) if (bank.date and date_avg) else 0
 
-            amount_sum = q2(sum(getattr(b, "amount_base", 0) for b in combo_books))
+            amount_sum = q2(sum(getattr(b, "effective_amount", 0) for b in combo_books))
             amount_diff = abs(amount_sum - q2(getattr(bank, "amount", Decimal("0.00"))))
 
             scores = compute_match_scores(
