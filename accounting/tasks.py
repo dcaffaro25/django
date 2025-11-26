@@ -307,8 +307,11 @@ def match_many_to_many_fast_task(
         return {"error": "Task not found"}
 
     task_row.status = "running"
-    task_row.started_at = timezone.now()
-    task_row.save(update_fields=["status", "started_at"])
+    # só seta se o campo existir no modelo
+    if hasattr(task_row, "started_at"):
+        task_row.started_at = timezone.now()
+    # não usar update_fields com started_at, porque pode não existir
+    task_row.save()
 
     start_ts = time.time()
 
@@ -632,7 +635,8 @@ def match_many_to_many_fast_task(
                 task_row.result = result
 
             task_row.status = "completed"
-            task_row.finished_at = timezone.now()
+            if hasattr(task_row, "finished_at"):
+                task_row.finished_at = timezone.now()
             task_row.save()  # sem update_fields para não errar nome de campo
 
         return result
@@ -640,8 +644,9 @@ def match_many_to_many_fast_task(
     except Exception as exc:
         logger.exception("match_many_to_many_fast_task failed: %s", exc)
         task_row.status = "failed"
-        task_row.finished_at = timezone.now()
-        task_row.save(update_fields=["status", "finished_at"])
+        if hasattr(task_row, "finished_at"):
+            task_row.finished_at = timezone.now()
+        task_row.save()
         return {"error": str(exc)}
 
 
