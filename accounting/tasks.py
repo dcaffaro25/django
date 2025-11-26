@@ -276,13 +276,21 @@ def match_many_to_many_fast_task(
     - Retorna o mesmo formato de resultado:
       {"suggestions": [...], "auto_match": {...}, "stats": {...}}
     """
+    import logging
+    import time
     from django.utils import timezone
     from django.db import transaction
     from itertools import combinations
+    from decimal import Decimal
 
-    from .models import BankTransaction, Transaction, ReconciliationTask, ReconciliationSuggestion
+    from .models import (
+        BankTransaction,
+        Transaction,
+        ReconciliationTask,
+        ReconciliationSuggestion,
+    )
     try:
-        from .models import JournalEntry  # seu modelo novo de lançamentos
+        from .models import JournalEntry  # modelo de lançamentos
     except Exception:
         JournalEntry = None  # type: ignore
 
@@ -300,6 +308,9 @@ def match_many_to_many_fast_task(
 
     logger = logging.getLogger("recon")
 
+    # ------------------------------------------------------------------ #
+    # Recupera task_row
+    # ------------------------------------------------------------------ #
     try:
         task_row = ReconciliationTask.objects.get(id=db_id)
     except ReconciliationTask.DoesNotExist:
@@ -307,15 +318,16 @@ def match_many_to_many_fast_task(
         return {"error": "Task not found"}
 
     task_row.status = "running"
-    # só seta se o campo existir no modelo
     if hasattr(task_row, "started_at"):
         task_row.started_at = timezone.now()
-    # não usar update_fields com started_at, porque pode não existir
+    # não usar update_fields com started_at, pois pode não existir no modelo
     task_row.save()
 
     start_ts = time.time()
 
-    # ---- helper local para stats (NÃO mexe no service) ----------------------
+    # ------------------------------------------------------------------ #
+    # Helper local de stats (versão "fast" do _build_stats)
+    # ------------------------------------------------------------------ #
     def _build_stats_for_fast(
         suggestions: List[dict],
         auto_info: Dict[str, Any],
@@ -419,7 +431,9 @@ def match_many_to_many_fast_task(
         }
 
     try:
-        # --------- resolve company_id ----------------------------------------
+        # ------------------------------------------------------------------ #
+        # resolve company_id
+        # ------------------------------------------------------------------ #
         company_id = data.get("company_id")
         if not company_id and tenant_id:
             try:
@@ -430,13 +444,26 @@ def match_many_to_many_fast_task(
         if not company_id:
             company_id = task_row.company_id
 
-        # --------- base querysets -------------------------------------------
-        bank_qs = BankTransaction.objects.exclude(is_deleted=True).filter(company_id=company_id)
+        # ------------------------------------------------------------------ #
+        # Querysets base – alinhados com o engine principal
+        # (unmatched + não deletados + journal com conta bancária)
+        # ------------------------------------------------------------------ #
+        bank_qs = (
+            BankTransaction.objects
+            .exclude(is_deleted=True)
+            .exclude(reconciliations__status__in=["matched", "approved"])
+            .filter(company_id=company_id)
+        )
 
         if JournalEntry:
-            book_qs = JournalEntry.objects.exclude(is_deleted=True).filter(company_id=company_id)
+            book_qs = (
+                JournalEntry.objects
+                .exclude(is_deleted=True)
+                .exclude(reconciliations__status__in=["matched", "approved"])
+                .filter(company_id=company_id, account__bank_account__isnull=False)
+                .select_related("transaction")
+            )
         else:
-            # fallback se ainda não tiver JournalEntry
             book_qs = Transaction.objects.none()
 
         bank_ids = data.get("bank_ids") or []
@@ -447,7 +474,9 @@ def match_many_to_many_fast_task(
         if book_ids and JournalEntry:
             book_qs = book_qs.filter(id__in=book_ids)
 
-        # --------- monta DTOs -----------------------------------------------
+        # ------------------------------------------------------------------ #
+        # Monta DTOs – mesma estrutura do ReconciliationService
+        # ------------------------------------------------------------------ #
         banks: List[BankTransactionDTO] = []
         for b in bank_qs:
             banks.append(
@@ -458,28 +487,32 @@ def match_many_to_many_fast_task(
                     amount=q2(b.amount),
                     currency_id=b.currency_id,
                     description=b.description or "",
-                    embedding=_as_vec_list(b.embedding),
+                    embedding=_as_vec_list(getattr(b, "description_embedding", None)),
                 )
             )
 
         books: List[JournalEntryDTO] = []
         if JournalEntry:
-            for j in book_qs.select_related("transaction"):
+            for j in book_qs:
                 tx = j.transaction
+                # mesmo cálculo de amount do engine: get_effective_amount()
+                effective_amount = j.get_effective_amount() if hasattr(j, "get_effective_amount") else j.amount
                 books.append(
                     JournalEntryDTO(
                         id=j.id,
                         company_id=j.company_id,
                         transaction_id=j.transaction_id,
                         date=tx.date,
-                        effective_amount=q2(j.amount),
-                        currency_id=j.currency_id,
+                        effective_amount=q2(effective_amount),
+                        currency_id=tx.currency_id,
                         description=tx.description or j.description or "",
-                        embedding=_as_vec_list(tx.embedding or j.embedding),
+                        embedding=_as_vec_list(getattr(tx, "description_embedding", None)),
                     )
                 )
 
-        # --------- parâmetros do algoritmo fast -----------------------------
+        # ------------------------------------------------------------------ #
+        # Parâmetros (tentar refletir o config do engine)
+        # ------------------------------------------------------------------ #
         amt_tol = Decimal(str(data.get("amount_tolerance", "0.00") or "0.00"))
         if amt_tol <= 0:
             amt_tol = CENT
@@ -488,9 +521,11 @@ def match_many_to_many_fast_task(
         if date_tol <= 0:
             date_tol = 365
 
-        win_days = int(data.get("date_window_days", 365) or 365)
+        win_days = int(data.get("candidate_window_days", data.get("date_window_days", 365)) or 365)
         max_group = int(data.get("max_group_size_book", 10) or 10)
         max_group = max(1, max_group)
+
+        allow_mixed_signs = bool(data.get("allow_mixed_signs", False))
 
         weights = {
             "embedding": float(data.get("embedding_weight", 0.5)),
@@ -512,17 +547,29 @@ def match_many_to_many_fast_task(
 
         hard_timeout = float(getattr(task_row, "soft_time_limit_seconds", 0) or 0)
 
-        # --------- núcleo do algoritmo fast ---------------------------------
+        # ------------------------------------------------------------------ #
+        # Núcleo do algoritmo fast
+        # ------------------------------------------------------------------ #
         for bank in banks:
             if hard_timeout and time.time() - start_ts > hard_timeout:
                 logger.warning("match_many_to_many_fast_task: soft time limit reached, stopping early")
                 break
 
-            local_books = [
-                b for b in books
-                if abs((b.date - bank.date).days) <= win_days
-                and (b.currency_id == bank.currency_id)
-            ]
+            # filtra por janela de data, moeda e (opcionalmente) sinal
+            local_books = []
+            for b in books:
+                if abs((b.date - bank.date).days) > win_days:
+                    continue
+                if b.currency_id != bank.currency_id:
+                    continue
+                if not allow_mixed_signs:
+                    # exige mesmo sinal (ignorando zeros)
+                    if bank.amount > 0 and b.effective_amount < 0:
+                        continue
+                    if bank.amount < 0 and b.effective_amount > 0:
+                        continue
+                local_books.append(b)
+
             if not local_books:
                 continue
 
@@ -558,7 +605,9 @@ def match_many_to_many_fast_task(
                         continue
 
                     suggestion = {
-                        "match_type": "one_to_many_fast",  # pode manter diferente do engine normal
+                        # mantém um tipo diferente para identificar engine fast,
+                        # mas estrutura compatível com o resto do sistema
+                        "match_type": "one_to_many_fast",
                         "bank_ids": [bank.id],
                         "journal_entries_ids": [b.id for b in combo_books],
                         "confidence_score": global_score,
@@ -573,7 +622,9 @@ def match_many_to_many_fast_task(
                     }
                     suggestions_out.append(suggestion)
 
-        # --------- auto-match 100% e stats -----------------------------------
+        # ------------------------------------------------------------------ #
+        # Auto-match 100% e stats
+        # ------------------------------------------------------------------ #
         auto_info: Dict[str, Any] = {
             "enabled": bool(auto_match_100),
             "applied": 0,
@@ -587,7 +638,9 @@ def match_many_to_many_fast_task(
 
         stats = _build_stats_for_fast(suggestions_out, auto_info, banks, books)
 
-        # --------- persiste sugestões + atualiza task ------------------------
+        # ------------------------------------------------------------------ #
+        # Persistência das sugestões + atualização da task
+        # ------------------------------------------------------------------ #
         with transaction.atomic():
             ReconciliationSuggestion.objects.filter(task=task_row).delete()
 
@@ -609,7 +662,6 @@ def match_many_to_many_fast_task(
                 "stats": stats,
             }
 
-            # Atualiza alguns campos básicos (sem supor todos os atributos do model)
             task_row.suggestion_count = stats.get("suggestion_count", len(suggestions_out))
             if hasattr(task_row, "bank_candidates"):
                 task_row.bank_candidates = stats.get("bank_candidates")
@@ -637,7 +689,7 @@ def match_many_to_many_fast_task(
             task_row.status = "completed"
             if hasattr(task_row, "finished_at"):
                 task_row.finished_at = timezone.now()
-            task_row.save()  # sem update_fields para não errar nome de campo
+            task_row.save()
 
         return result
 
