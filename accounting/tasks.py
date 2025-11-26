@@ -48,6 +48,7 @@ from accounting.utils import update_journal_entries_and_transaction_flags
 logger = get_task_logger(__name__)
 log = logging.getLogger(__name__)
 
+import json
 
 # -----------------------
 # Helpers
@@ -261,7 +262,11 @@ def compare_two_engines_task(self, db_id: int, data: Dict[str, Any], tenant_id: 
     try:
         result = parent_task.result or {}
         result.setdefault("comparisons", [])
-        result["comparisons"].append(summary)
+
+        # Make summary JSON-serializable (datetimes, Decimals, etc.)
+        safe_summary = json.loads(json.dumps(summary, default=str))
+
+        result["comparisons"].append(safe_summary)
         parent_task.result = result
         parent_task.updated_at = timezone.now()
         parent_task.save(update_fields=["result", "updated_at"])
