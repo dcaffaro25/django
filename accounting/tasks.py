@@ -127,7 +127,7 @@ def compare_two_engines_task(self, db_id: int, data: Dict[str, Any], tenant_id: 
     """
     Orquestra duas execuções:
       - legacy: match_many_to_many_task (código existente)
-      - fast: match_many_to_many_fast_task (nova implementação aqui)
+      - fast: match_many_to_many_task com fast=True (nova implementação no ReconciliationService)
 
     Cria duas ReconciliationTask filhas, dispara as tasks em filas separadas e aguarda (poll)
     um curto período para coletar resultados; grava um resumo comparativo em parent_task.result["comparisons"].
@@ -135,6 +135,14 @@ def compare_two_engines_task(self, db_id: int, data: Dict[str, Any], tenant_id: 
     parent_task = ReconciliationTask.objects.get(id=db_id)
     run_uuid = str(uuid.uuid4())
     now = timezone.now()
+
+    # Base request payloads (não mutar 'data' original)
+    legacy_data: Dict[str, Any] = dict(data or {})
+    fast_data: Dict[str, Any] = dict(data or {})
+
+    # Força o modo legacy/fast no payload enviado ao engine
+    legacy_data.pop("fast", None)
+    fast_data["fast"] = True
 
     # create two child rows mirroring fields used by start()
     legacy_params = {
@@ -148,6 +156,7 @@ def compare_two_engines_task(self, db_id: int, data: Dict[str, Any], tenant_id: 
         "strategy": "fast_v1",
         "parent_task_id": db_id,
         "run_uuid": run_uuid,
+        "fast": True,
     }
 
     legacy_row = ReconciliationTask.objects.create(
@@ -178,15 +187,15 @@ def compare_two_engines_task(self, db_id: int, data: Dict[str, Any], tenant_id: 
 
     # dispatch both (optionally dedicated queues configured in Celery)
     legacy_async = match_many_to_many_task.apply_async(
-        args=(legacy_row.id, data, tenant_id, auto_match_100),
+        args=(legacy_row.id, legacy_data, tenant_id, auto_match_100, False),
         queue="recon_legacy",
     )
-    fast_async = match_many_to_many_fast_task.apply_async(
-        args=(fast_row.id, data, tenant_id, auto_match_100),
+    fast_async = match_many_to_many_task.apply_async(
+        args=(fast_row.id, fast_data, tenant_id, auto_match_100, True),
         queue="recon_fast",
     )
 
-    # Poll for a short time (non-blocking caller can re-query parent task)
+    # Poll for a short time (caller can re-query parent task later)
     max_wait_s = int(getattr(settings, "COMPARE_MAX_WAIT_S", 600))
     poll = float(getattr(settings, "COMPARE_POLL_INTERVAL_S", 2.0))
     waited = 0.0
@@ -229,14 +238,22 @@ def compare_two_engines_task(self, db_id: int, data: Dict[str, Any], tenant_id: 
             "status": safe_attr(legacy_row, "status"),
             "duration_seconds": safe_attr(legacy_row, "duration_seconds"),
             "suggestion_count": safe_attr(legacy_row, "suggestion_count"),
-            "time_limit_reached": bool(parent_task.soft_time_limit_seconds and safe_attr(legacy_row, "duration_seconds") and safe_attr(legacy_row, "duration_seconds") >= parent_task.soft_time_limit_seconds),
+            "time_limit_reached": bool(
+                parent_task.soft_time_limit_seconds
+                and safe_attr(legacy_row, "duration_seconds")
+                and safe_attr(legacy_row, "duration_seconds") >= parent_task.soft_time_limit_seconds
+            ),
         },
         "fast": {
             "task_id": safe_attr(fast_row, "id"),
             "status": safe_attr(fast_row, "status"),
             "duration_seconds": safe_attr(fast_row, "duration_seconds"),
             "suggestion_count": safe_attr(fast_row, "suggestion_count"),
-            "time_limit_reached": bool(parent_task.soft_time_limit_seconds and safe_attr(fast_row, "duration_seconds") and safe_attr(fast_row, "duration_seconds") >= parent_task.soft_time_limit_seconds),
+            "time_limit_reached": bool(
+                parent_task.soft_time_limit_seconds
+                and safe_attr(fast_row, "duration_seconds")
+                and safe_attr(fast_row, "duration_seconds") >= parent_task.soft_time_limit_seconds
+            ),
         },
     }
 
@@ -254,466 +271,21 @@ def compare_two_engines_task(self, db_id: int, data: Dict[str, Any], tenant_id: 
     return summary
 
 
-# -----------------------
-# Fast match implementation
-# -----------------------
-# -----------------------
-# Fast match implementation
-# -----------------------
-@shared_task(bind=True)
-def match_many_to_many_fast_task(
-    self,
-    db_id: int,
-    data: Dict[str, Any],
-    tenant_id: str = None,
-    auto_match_100: bool = False,
-):
-    """
-    Versão fast do reconciliador many-to-many.
-
-    IMPORTANTE:
-    - NÃO mexe no ReconciliationService.match_many_to_many.
-    - Retorna o mesmo formato de resultado:
-      {"suggestions": [...], "auto_match": {...}, "stats": {...}}
-    """
-    import logging
-    import time
-    from django.utils import timezone
-    from django.db import transaction
-    from itertools import combinations
-    from decimal import Decimal
-
-    from .models import (
-        BankTransaction,
-        Transaction,
-        ReconciliationTask,
-        ReconciliationSuggestion,
-    )
-    try:
-        from .models import JournalEntry  # modelo de lançamentos
-    except Exception:
-        JournalEntry = None  # type: ignore
-
-    from .services.reconciliation_service import (
-        BankTransactionDTO,
-        JournalEntryDTO,
-        _as_vec_list,
-        q2,
-        CENT,
-        compute_match_scores,
-        _avg_embedding,
-        ReconciliationService,  # para _apply_auto_matches_100
-    )
-    from multitenancy.utils import resolve_tenant
-
-    logger = logging.getLogger("recon")
-
-    # ------------------------------------------------------------------ #
-    # Recupera task_row
-    # ------------------------------------------------------------------ #
-    try:
-        task_row = ReconciliationTask.objects.get(id=db_id)
-    except ReconciliationTask.DoesNotExist:
-        logger.error("match_many_to_many_fast_task: ReconciliationTask %s not found", db_id)
-        return {"error": "Task not found"}
-
-    task_row.status = "running"
-    if hasattr(task_row, "started_at"):
-        task_row.started_at = timezone.now()
-    # não usar update_fields com started_at, pois pode não existir no modelo
-    task_row.save()
-
-    start_ts = time.time()
-
-    # ------------------------------------------------------------------ #
-    # Helper local de stats (versão "fast" do _build_stats)
-    # ------------------------------------------------------------------ #
-    def _build_stats_for_fast(
-        suggestions: List[dict],
-        auto_info: Dict[str, Any],
-        candidate_bank: List[BankTransactionDTO],
-        candidate_book: List[JournalEntryDTO],
-    ) -> Dict[str, Any]:
-        suggestion_count = len(suggestions)
-        bank_candidate_count = len(candidate_bank)
-        book_candidate_count = len(candidate_book)
-
-        matched_bank_ids = set()
-        matched_book_ids = set()
-        match_type_counts: Dict[str, int] = {}
-        confidences: List[float] = []
-        abs_diffs: List[float] = []
-
-        for s in suggestions:
-            mt = s.get("match_type", "unknown")
-            match_type_counts[mt] = match_type_counts.get(mt, 0) + 1
-
-            for bid in s.get("bank_ids", []) or []:
-                matched_bank_ids.add(bid)
-            for jid in s.get("journal_entries_ids", []) or []:
-                matched_book_ids.add(jid)
-
-            try:
-                confidences.append(float(s.get("confidence_score", 0.0)))
-            except Exception:
-                pass
-            try:
-                abs_diffs.append(float(s.get("abs_amount_diff", 0.0)))
-            except Exception:
-                pass
-
-        def _percentile(sorted_vals: List[float], p: float):
-            if not sorted_vals:
-                return None
-            k = (len(sorted_vals) - 1) * p
-            f = int(k)
-            c = min(f + 1, len(sorted_vals) - 1)
-            if f == c:
-                return sorted_vals[f]
-            d0 = sorted_vals[f] * (c - k)
-            d1 = sorted_vals[c] * (k - f)
-            return d0 + d1
-
-        conf_min = conf_max = conf_avg = conf_p50 = conf_p90 = None
-        perfect_conf = 0
-        if confidences:
-            confidences_sorted = sorted(confidences)
-            conf_min = confidences_sorted[0]
-            conf_max = confidences_sorted[-1]
-            conf_avg = sum(confidences_sorted) / len(confidences_sorted)
-            conf_p50 = _percentile(confidences_sorted, 0.5)
-            conf_p90 = _percentile(confidences_sorted, 0.9)
-            perfect_conf = sum(1 for c in confidences_sorted if abs(c - 1.0) < 1e-9)
-
-        diff_min = diff_max = diff_avg = None
-        if abs_diffs:
-            diffs_sorted = sorted(abs_diffs)
-            diff_min = diffs_sorted[0]
-            diff_max = diffs_sorted[-1]
-            diff_avg = sum(diffs_sorted) / len(diffs_sorted)
-
-        duration = time.time() - start_ts
-        soft_time_limit = getattr(task_row, "soft_time_limit_seconds", None)
-
-        return {
-            "company_id": task_row.company_id,
-            "config_id": data.get("config_id"),
-            "pipeline_id": data.get("pipeline_id"),
-            "duration_seconds": round(duration, 3),
-            "time_limit_seconds": soft_time_limit,
-            "time_limit_reached": bool(soft_time_limit and duration >= float(soft_time_limit or 0.0)),
-            "bank_candidates": bank_candidate_count,
-            "journal_candidates": book_candidate_count,
-            "suggestion_count": suggestion_count,
-            "match_types": match_type_counts,
-            "matched_bank_transactions": len(matched_bank_ids),
-            "matched_journal_entries": len(matched_book_ids),
-            "bank_coverage_ratio": float(len(matched_bank_ids) / bank_candidate_count) if bank_candidate_count else 0.0,
-            "journal_coverage_ratio": float(len(matched_book_ids) / book_candidate_count) if book_candidate_count else 0.0,
-            "confidence_stats": {
-                "min": conf_min,
-                "max": conf_max,
-                "avg": conf_avg,
-                "p50": conf_p50,
-                "p90": conf_p90,
-                "perfect_1_0_count": perfect_conf,
-            },
-            "amount_diff_stats": {
-                "min": diff_min,
-                "max": diff_max,
-                "avg": diff_avg,
-            },
-            "auto_match": {
-                "enabled": bool(auto_info.get("enabled")),
-                "applied": int(auto_info.get("applied", 0)),
-                "skipped": int(auto_info.get("skipped", 0)),
-            },
-        }
-
-    try:
-        # ------------------------------------------------------------------ #
-        # resolve company_id
-        # ------------------------------------------------------------------ #
-        company_id = data.get("company_id")
-        if not company_id and tenant_id:
-            try:
-                company_id = resolve_tenant(tenant_id).id
-            except Exception:
-                company_id = task_row.company_id
-
-        if not company_id:
-            company_id = task_row.company_id
-
-        # ------------------------------------------------------------------ #
-        # Querysets base – alinhados com o engine principal
-        # (unmatched + não deletados + journal com conta bancária)
-        # ------------------------------------------------------------------ #
-        bank_qs = (
-            BankTransaction.objects
-            .exclude(is_deleted=True)
-            .exclude(reconciliations__status__in=["matched", "approved"])
-            .filter(company_id=company_id)
-        )
-
-        if JournalEntry:
-            book_qs = (
-                JournalEntry.objects
-                .exclude(is_deleted=True)
-                .exclude(reconciliations__status__in=["matched", "approved"])
-                .filter(company_id=company_id, account__bank_account__isnull=False)
-                .select_related("transaction")
-            )
-        else:
-            book_qs = Transaction.objects.none()
-
-        bank_ids = data.get("bank_ids") or []
-        book_ids = data.get("book_ids") or []
-
-        if bank_ids:
-            bank_qs = bank_qs.filter(id__in=bank_ids)
-        if book_ids and JournalEntry:
-            book_qs = book_qs.filter(id__in=book_ids)
-
-        # ------------------------------------------------------------------ #
-        # Monta DTOs – mesma estrutura do ReconciliationService
-        # ------------------------------------------------------------------ #
-        banks: List[BankTransactionDTO] = []
-        for b in bank_qs:
-            banks.append(
-                BankTransactionDTO(
-                    id=b.id,
-                    company_id=b.company_id,
-                    date=b.date,
-                    amount=q2(b.amount),
-                    currency_id=b.currency_id,
-                    description=b.description or "",
-                    embedding=_as_vec_list(getattr(b, "description_embedding", None)),
-                )
-            )
-
-        books: List[JournalEntryDTO] = []
-        if JournalEntry:
-            for j in book_qs:
-                tx = j.transaction
-                # mesmo cálculo de amount do engine: get_effective_amount()
-                effective_amount = j.get_effective_amount() if hasattr(j, "get_effective_amount") else j.amount
-                books.append(
-                    JournalEntryDTO(
-                        id=j.id,
-                        company_id=j.company_id,
-                        transaction_id=j.transaction_id,
-                        date=tx.date,
-                        effective_amount=q2(effective_amount),
-                        currency_id=tx.currency_id,
-                        description=tx.description or j.description or "",
-                        embedding=_as_vec_list(getattr(tx, "description_embedding", None)),
-                    )
-                )
-
-        # ------------------------------------------------------------------ #
-        # Parâmetros (tentar refletir o config do engine)
-        # ------------------------------------------------------------------ #
-        amt_tol = Decimal(str(data.get("amount_tolerance", "0.00") or "0.00"))
-        if amt_tol <= 0:
-            amt_tol = CENT
-
-        date_tol = int(data.get("avg_date_delta_days", 365) or 365)
-        if date_tol <= 0:
-            date_tol = 365
-
-        win_days = int(data.get("candidate_window_days", data.get("date_window_days", 365)) or 365)
-        max_group = int(data.get("max_group_size_book", 10) or 10)
-        max_group = max(1, max_group)
-
-        allow_mixed_signs = bool(data.get("allow_mixed_signs", False))
-
-        weights = {
-            "embedding": float(data.get("embedding_weight", 0.5)),
-            "amount": float(data.get("amount_weight", 0.35)),
-            "currency": float(data.get("currency_weight", 0.1)),
-            "date": float(data.get("date_weight", 0.05)),
-        }
-
-        suggestions_out: List[dict] = []
-
-        def cosine_similarity(v1, v2) -> float:
-            if not v1 or not v2:
-                return 0.0
-            from math import sqrt
-            dot = sum(float(a) * float(b) for a, b in zip(v1, v2))
-            norm1 = sqrt(sum(float(a) * float(a) for a in v1))
-            norm2 = sqrt(sum(float(b) * float(b) for b in v2))
-            return dot / (norm1 * norm2) if norm1 and norm2 else 0.0
-
-        hard_timeout = float(getattr(task_row, "soft_time_limit_seconds", 0) or 0)
-
-        # ------------------------------------------------------------------ #
-        # Núcleo do algoritmo fast
-        # ------------------------------------------------------------------ #
-        for bank in banks:
-            if hard_timeout and time.time() - start_ts > hard_timeout:
-                logger.warning("match_many_to_many_fast_task: soft time limit reached, stopping early")
-                break
-
-            # filtra por janela de data, moeda e (opcionalmente) sinal
-            local_books = []
-            for b in books:
-                if abs((b.date - bank.date).days) > win_days:
-                    continue
-                if b.currency_id != bank.currency_id:
-                    continue
-                if not allow_mixed_signs:
-                    # exige mesmo sinal (ignorando zeros)
-                    if bank.amount > 0 and b.effective_amount < 0:
-                        continue
-                    if bank.amount < 0 and b.effective_amount > 0:
-                        continue
-                local_books.append(b)
-
-            if not local_books:
-                continue
-
-            local_books = sorted(local_books, key=lambda b: b.date)
-            max_k = min(max_group, len(local_books))
-
-            bank_vec = bank.embedding
-
-            for grp_size in range(1, max_k + 1):
-                for idxs in combinations(range(len(local_books)), grp_size):
-                    combo_books = [local_books[i] for i in idxs]
-
-                    books_vec = _avg_embedding(combo_books)
-                    sim = cosine_similarity(bank_vec, books_vec) if bank_vec and books_vec else 0.0
-
-                    amount_sum = q2(sum((b.effective_amount for b in combo_books), Decimal("0.00")))
-                    amount_diff = q2(abs(amount_sum - q2(bank.amount)))
-                    date_diff = max(abs((b.date - bank.date).days) for b in combo_books)
-                    currency_match = 1.0  # já filtramos por currency
-
-                    scores = compute_match_scores(
-                        embed_sim=sim,
-                        amount_diff=amount_diff,
-                        amount_tol=amt_tol,
-                        date_diff=date_diff,
-                        date_tol=date_tol,
-                        currency_match=currency_match,
-                        weights=weights,
-                    )
-
-                    global_score = float(scores.get("global_score", 0.0))
-                    if global_score <= 0:
-                        continue
-
-                    suggestion = {
-                        # mantém um tipo diferente para identificar engine fast,
-                        # mas estrutura compatível com o resto do sistema
-                        "match_type": "one_to_many_fast",
-                        "bank_ids": [bank.id],
-                        "journal_entries_ids": [b.id for b in combo_books],
-                        "confidence_score": global_score,
-                        "abs_amount_diff": float(amount_diff),
-                        "component_scores": scores,
-                        "extra": {
-                            "engine": "fast_v1",
-                            "avg_date_delta_days_measured": date_diff,
-                            "amount_diff_measured": float(amount_diff),
-                            "embed_similarity": float(sim),
-                        },
-                    }
-                    suggestions_out.append(suggestion)
-
-        # ------------------------------------------------------------------ #
-        # Auto-match 100% e stats
-        # ------------------------------------------------------------------ #
-        auto_info: Dict[str, Any] = {
-            "enabled": bool(auto_match_100),
-            "applied": 0,
-            "skipped": 0,
-        }
-        if auto_match_100 and suggestions_out:
-            try:
-                auto_info = ReconciliationService._apply_auto_matches_100(suggestions_out)
-            except Exception:
-                logger.exception("match_many_to_many_fast_task: error applying 100%% auto-match")
-
-        stats = _build_stats_for_fast(suggestions_out, auto_info, banks, books)
-
-        # ------------------------------------------------------------------ #
-        # Persistência das sugestões + atualização da task
-        # ------------------------------------------------------------------ #
-        with transaction.atomic():
-            ReconciliationSuggestion.objects.filter(task=task_row).delete()
-
-            for s in suggestions_out:
-                ReconciliationSuggestion.objects.create(
-                    task=task_row,
-                    company_id=task_row.company_id,
-                    match_type=s.get("match_type", "unknown"),
-                    bank_ids=s.get("bank_ids", []),
-                    journal_entries_ids=s.get("journal_entries_ids", []),
-                    confidence_score=s.get("confidence_score", 0.0),
-                    abs_amount_diff=s.get("abs_amount_diff", 0.0),
-                    payload=s,
-                )
-
-            result = {
-                "suggestions": suggestions_out,
-                "auto_match": auto_info,
-                "stats": stats,
-            }
-
-            task_row.suggestion_count = stats.get("suggestion_count", len(suggestions_out))
-            if hasattr(task_row, "bank_candidates"):
-                task_row.bank_candidates = stats.get("bank_candidates")
-            if hasattr(task_row, "journal_candidates"):
-                task_row.journal_candidates = stats.get("journal_candidates")
-            if hasattr(task_row, "matched_bank_transactions"):
-                task_row.matched_bank_transactions = stats.get("matched_bank_transactions")
-            if hasattr(task_row, "matched_journal_entries"):
-                task_row.matched_journal_entries = stats.get("matched_journal_entries")
-            if hasattr(task_row, "duration_seconds"):
-                task_row.duration_seconds = stats.get("duration_seconds")
-            if hasattr(task_row, "soft_time_limit_seconds"):
-                task_row.soft_time_limit_seconds = stats.get("time_limit_seconds")
-            if hasattr(task_row, "auto_match_enabled"):
-                task_row.auto_match_enabled = bool(auto_info.get("enabled", False))
-            if hasattr(task_row, "auto_match_applied"):
-                task_row.auto_match_applied = int(auto_info.get("applied", 0))
-            if hasattr(task_row, "auto_match_skipped"):
-                task_row.auto_match_skipped = int(auto_info.get("skipped", 0))
-            if hasattr(task_row, "stats"):
-                task_row.stats = stats
-            if hasattr(task_row, "result"):
-                task_row.result = result
-
-            task_row.status = "completed"
-            if hasattr(task_row, "finished_at"):
-                task_row.finished_at = timezone.now()
-            task_row.save()
-
-        return result
-
-    except Exception as exc:
-        logger.exception("match_many_to_many_fast_task failed: %s", exc)
-        task_row.status = "failed"
-        if hasattr(task_row, "finished_at"):
-            task_row.finished_at = timezone.now()
-        task_row.save()
-        return {"error": str(exc)}
-
-
 
 # -----------------------
 # Legacy wrapper (unchanged behaviour, but hardened)
 # -----------------------
 @shared_task(bind=True)
-def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=False):
+def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=False, fast=False):
     """
     Wrapper that calls ReconciliationService.match_many_to_many with streaming on_suggestion callback.
     Persists suggestions in batches and updates the ReconciliationTask object incrementally.
     """
     task_obj = ReconciliationTask.objects.get(id=db_id)
-
+    
+    # local copy so we don't mutate the caller's dict
+    request_data: Dict[str, Any] = dict(data or {})
+    
     # resolve company id defensively
     company_id = None
     try:
@@ -727,7 +299,18 @@ def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=Fa
             company_id = getattr(company_obj, "id", None)
         except Exception:
             company_id = None
-
+    
+    # derive 'fast' from task.strategy when not explicitly set
+    strategy = getattr(task_obj, "strategy", None)
+    if strategy in ("fast", "fast_v1") and not request_data.get("fast"):
+        request_data["fast"] = True
+    elif "fast" not in request_data:
+        # make it explicit for the engine (defaults to legacy path)
+        request_data["fast"] = False
+    
+    request_data["fast"] = fast
+    
+    
     flush_interval = DEFAULT_SUGGESTION_FLUSH_INTERVAL
     buffer: List[ReconciliationSuggestion] = []
     last_flush_ts = time.monotonic()
@@ -780,7 +363,7 @@ def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=Fa
                     data.get("config_id"), data.get("pipeline_id"))
 
         result = ReconciliationService.match_many_to_many(
-            data,
+            request_data,
             tenant_id,
             auto_match_100=auto_match_100,
             on_suggestion=on_suggestion,

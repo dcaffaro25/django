@@ -121,8 +121,7 @@ class PipelineConfig:
     auto_apply_score: float = 1.0
     max_suggestions: int = 10000
     max_runtime_seconds: float | None = None   # NEW
-    fast: bool = False
-    
+
 # ----------------------------------------------------------------------
 #  Utility functions
 # ----------------------------------------------------------------------
@@ -324,10 +323,7 @@ class ReconciliationPipelineEngine:
         # Soft runtime limit support
         self.max_runtime_seconds: float | None = config.max_runtime_seconds
         self._start_ts: float = monotonic()
-        
-        # NEW: whether to use _fast stage handlers when available
-        self.fast: bool = bool(getattr(config, "fast", False))
-        
+    
     def _time_exceeded(self) -> bool:
         """
         Return True if the configured soft time limit (if any) has been exceeded.
@@ -434,15 +430,13 @@ class ReconciliationPipelineEngine:
         
     def run(self, banks: list[BankTransactionDTO], books: list[JournalEntryDTO]) -> list[dict]:
         log.debug(
-            "PipelineEngine.run: company_id=%s stages=%d banks=%d books=%d "
-            "max_suggestions=%d max_runtime=%s fast=%s",
+            "PipelineEngine.run: company_id=%s stages=%d banks=%d books=%d max_suggestions=%d max_runtime=%s",
             self.company_id,
             len(self.config.stages),
             len(banks),
             len(books),
             self.config.max_suggestions,
             self.max_runtime_seconds,
-            self.fast,
         )
 
         for idx, stage in enumerate(self.config.stages):
@@ -463,21 +457,7 @@ class ReconciliationPipelineEngine:
                 else self.current_weights
             )
             
-            base_name = f"_run_{stage.type}"
-            handler = None
-            
-            if self.fast:
-                fast_name = f"{base_name}_fast"
-                handler = getattr(self, fast_name, None)
-                if handler:
-                    log.debug(
-                        "Using FAST handler %s for stage %d (%s)",
-                        fast_name, idx, stage.type,
-                    )
-            if handler is None:
-                handler = getattr(self, base_name, None)
-            
-
+            handler = getattr(self, f"_run_{stage.type}", None)
             win = stage.candidate_window_days
 
             log.debug(
@@ -547,6 +527,73 @@ class ReconciliationPipelineEngine:
                 )
                 break
 
+    def _run_one_to_many_legacy(self, banks, books, stage: StageConfig):
+        available_books = [b for b in books if b.id not in self.used_books and b.company_id == self.company_id]
+        win = stage.candidate_window_days
+    
+        for bank in banks:
+            if self._time_exceeded():
+                return
+            
+            if bank.id in self.used_banks:
+                continue
+    
+            # cheap prefilter around the bank date
+            local_books = [b for b in available_books if abs((bank.date - b.date).days) <= win]
+    
+            for size in range(1, stage.max_group_size_book + 1):
+                for combo in combinations(local_books, size):
+                    # live 'used' pruning (book side)
+                    if any(x.id in self.used_books for x in combo):
+                        continue
+    
+                    total = sum((b.amount_base for b in combo), Decimal("0"))
+                    if q2(total) != q2(bank.amount_base):
+                        continue
+                    if any(b.currency_id != bank.currency_id for b in combo):
+                        continue
+    
+                    # INTRA-side: span constraint ONLY for the grouped side (books)
+                    book_dates = [b.date for b in combo if b.date]
+                    book_span = (max(book_dates) - min(book_dates)).days if len(book_dates) >= 2 else 0
+                    if stage.group_span_days and book_span > stage.group_span_days:
+                        continue
+    
+                    # CROSS-side: weighted-avg date delta
+                    bank_avg = bank.date
+                    book_avg = self._weighted_avg_date(combo)
+                    avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
+                    if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
+                        continue
+    
+                    sim = self._cosine_similarity(bank.embedding or [], _avg_embedding(combo))
+                    scores = compute_match_scores(
+                        embed_sim=sim,
+                        amount_diff=Decimal("0"),
+                        amount_tol=stage.amount_tol or CENT,
+                        date_diff=avg_delta,
+                        date_tol=stage.avg_date_delta_days or 1,
+                        currency_match=1.0,
+                        weights=self.stage_weights,
+                    )
+                    self._record(
+                        self._make_suggestion(
+                            "one_to_many",
+                            [bank],
+                            list(combo),
+                            scores["global_score"],
+                            stage=stage,
+                            weights=self.stage_weights,
+                            component_scores=scores,
+                            extra={
+                                "book_span_days_measured": book_span,
+                                "avg_date_delta_days_measured": avg_delta,
+                            },
+                        )
+                    )
+                    return
+    
+    
     
     def _find_mixed_many_to_one_group(
         self,
@@ -880,294 +927,6 @@ class ReconciliationPipelineEngine:
                                 cb_exc,
                             )
 
-    def _run_one_to_many_fast(self, banks, books, stage: StageConfig):
-        """
-        FAST variant of one-to-many:
-
-        Same semantics as _run_one_to_many, but we cap the number of candidate
-        books per bank based on amount/date proximity to reduce combinatorial
-        explosion on large datasets.
-        """
-        available_books = [
-            b for b in books
-            if b.id not in self.used_books and b.company_id == self.company_id
-        ]
-        win = stage.candidate_window_days
-        max_k = max(int(stage.max_alternatives_per_anchor or 1), 1)
-
-        # hard cap of local candidates per bank
-        MAX_LOCAL_BOOKS = 128
-
-        log.debug(
-            "_run_one_to_many_fast: banks=%d books=%d win=%d amount_tol=%s "
-            "allow_mixed=%s max_k=%d max_local_books=%d",
-            len(banks), len(books), win, stage.amount_tol,
-            stage.allow_mixed_signs, max_k, MAX_LOCAL_BOOKS,
-        )
-
-        def add_candidate(sug: dict, buf: list[dict]) -> None:
-            score = float(sug.get("confidence_score", 0.0))
-            if len(buf) < max_k:
-                buf.append(sug)
-                return
-            worst_idx = min(
-                range(len(buf)),
-                key=lambda i: float(buf[i].get("confidence_score", 0.0)),
-            )
-            if score > float(buf[worst_idx].get("confidence_score", 0.0)):
-                buf[worst_idx] = sug
-
-        for bank in banks:
-            if self._time_exceeded():
-                return
-            if bank.id in self.used_banks:
-                continue
-
-            bank_amt = bank.amount_base or Decimal("0")
-            bank_sign = _sign(bank_amt)
-
-            # date window
-            local_books = [
-                b for b in available_books
-                if b.date and bank.date and abs((bank.date - b.date).days) <= win
-            ]
-            if not local_books:
-                continue
-
-            # sign filtering if mixed_signs is False
-            if not stage.allow_mixed_signs and bank_sign != 0:
-                if bank_sign > 0:
-                    local_books = [
-                        b for b in local_books
-                        if (b.amount_base or Decimal("0")) >= 0
-                    ]
-                else:
-                    local_books = [
-                        b for b in local_books
-                        if (b.amount_base or Decimal("0")) <= 0
-                    ]
-                if not local_books:
-                    continue
-
-            # CAP: keep only the closest candidates by amount + date
-            if len(local_books) > MAX_LOCAL_BOOKS:
-                target = q2(bank_amt)
-
-                def sort_key(b):
-                    amt = b.amount_base or Decimal("0")
-                    amt_diff = abs(q2(amt) - target)
-                    date_diff = (
-                        abs((b.date - bank.date).days)
-                        if b.date and bank.date
-                        else 9999
-                    )
-                    return (amt_diff, date_diff)
-
-                before = len(local_books)
-                local_books = sorted(local_books, key=sort_key)[:MAX_LOCAL_BOOKS]
-                log.debug(
-                    "_run_one_to_many_fast: bank_id=%s capped local_books from %d to %d",
-                    bank.id, before, len(local_books),
-                )
-
-            book_amounts = [(b.amount_base or Decimal("0")) for b in local_books]
-            if not book_amounts:
-                continue
-
-            has_pos = any(a > 0 for a in book_amounts)
-            has_neg = any(a < 0 for a in book_amounts)
-            mixed_signs = has_pos and has_neg
-
-            candidates: list[dict] = []
-
-            # ---- PATH 1: mixed-sign search (only if allowed) ----
-            if mixed_signs and stage.allow_mixed_signs:
-                combo = self._find_mixed_one_to_many_group(bank, local_books, stage)
-                if combo:
-                    book_dates = [b.date for b in combo if b.date]
-                    book_span = (
-                        (max(book_dates) - min(book_dates)).days
-                        if len(book_dates) >= 2
-                        else 0
-                    )
-                    bank_avg = bank.date
-                    book_avg = self._weighted_avg_date(combo)
-                    avg_delta = (
-                        abs((bank_avg - book_avg).days)
-                        if (bank_avg and book_avg)
-                        else win + 1
-                    )
-
-                    sim = self._cosine_similarity(
-                        bank.embedding or [], _avg_embedding(combo)
-                    )
-                    scores = compute_match_scores(
-                        embed_sim=sim,
-                        amount_diff=Decimal("0"),
-                        amount_tol=stage.amount_tol or CENT,
-                        date_diff=avg_delta,
-                        date_tol=stage.avg_date_delta_days or 1,
-                        currency_match=1.0,
-                        weights=self.stage_weights,
-                    )
-                    sug = self._make_suggestion(
-                        "one_to_many",
-                        [bank],
-                        list(combo),
-                        scores["global_score"],
-                        stage=stage,
-                        weights=self.stage_weights,
-                        component_scores=scores,
-                        extra={
-                            "book_span_days_measured": book_span,
-                            "avg_date_delta_days_measured": avg_delta,
-                            "mixed_signs": True,
-                        },
-                    )
-                    add_candidate(sug, candidates)
-
-            # ---- PATH 2: same-sign / bounded search ----
-            target = q2(bank_amt)
-            tol = stage.amount_tol or Decimal("0")
-
-            min_possible = sum(a for a in book_amounts if a < 0)
-            max_possible = sum(a for a in book_amounts if a > 0)
-            L = target - tol
-            U = target + tol
-            if U < min_possible or L > max_possible:
-                if candidates:
-                    candidates.sort(
-                        key=lambda s: float(s["confidence_score"]), reverse=True
-                    )
-                    best = candidates[0]
-                    self._record(best)
-                    for alt in candidates[1:]:
-                        self.suggestions.append(alt)
-                        if self._on_suggestion:
-                            try:
-                                self._on_suggestion(alt)
-                            except Exception as cb_exc:
-                                log.warning(
-                                    "on_suggestion callback failed (alt one_to_many_fast): %s",
-                                    cb_exc,
-                                )
-                continue
-
-            all_non_negative = all(a >= 0 for a in book_amounts)
-            use_prefix_bounds = all_non_negative and target >= 0
-
-            max_size = min(stage.max_group_size_book, len(local_books))
-
-            prefix_max: List[Decimal] = []
-            if use_prefix_bounds:
-                amounts_desc = sorted(book_amounts, reverse=True)
-                acc = Decimal("0")
-                for amt in amounts_desc:
-                    acc += amt
-                    prefix_max.append(acc)
-                if q2(prefix_max[-1]) + tol < target:
-                    if candidates:
-                        candidates.sort(
-                            key=lambda s: float(s["confidence_score"]), reverse=True
-                        )
-                        best = candidates[0]
-                        self._record(best)
-                        for alt in candidates[1:]:
-                            self.suggestions.append(alt)
-                            if self._on_suggestion:
-                                try:
-                                    self._on_suggestion(alt)
-                                except Exception as cb_exc:
-                                    log.warning(
-                                        "on_suggestion callback failed (alt many_to_many_fast): %s",
-                                        cb_exc,
-                                    )
-                    continue
-
-            for size in range(1, max_size + 1):
-                if self._time_exceeded():
-                    return
-
-                if use_prefix_bounds and q2(prefix_max[size - 1]) + tol < target:
-                    continue
-
-                for combo in combinations(local_books, size):
-                    if self._time_exceeded():
-                        return
-
-                    if any(x.id in self.used_books for x in combo):
-                        continue
-
-                    total = sum((b.amount_base for b in combo), Decimal("0"))
-                    diff = abs(q2(total) - target)
-                    if diff > stage.amount_tol:
-                        continue
-                    if any(b.currency_id != bank.currency_id for b in combo):
-                        continue
-
-                    book_dates = [b.date for b in combo if b.date]
-                    book_span = (
-                        (max(book_dates) - min(book_dates)).days
-                        if len(book_dates) >= 2
-                        else 0
-                    )
-                    if stage.group_span_days and book_span > stage.group_span_days:
-                        continue
-
-                    bank_avg = bank.date
-                    book_avg = self._weighted_avg_date(combo)
-                    avg_delta = (
-                        abs((bank_avg - book_avg).days)
-                        if (bank_avg and book_avg)
-                        else win + 1
-                    )
-                    if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
-                        continue
-
-                    sim = self._cosine_similarity(
-                        bank.embedding or [], _avg_embedding(combo)
-                    )
-                    scores = compute_match_scores(
-                        embed_sim=sim,
-                        amount_diff=Decimal("0"),
-                        amount_tol=stage.amount_tol or CENT,
-                        date_diff=avg_delta,
-                        date_tol=stage.avg_date_delta_days or 1,
-                        currency_match=1.0,
-                        weights=self.stage_weights,
-                    )
-                    sug = self._make_suggestion(
-                        "one_to_many",
-                        [bank],
-                        list(combo),
-                        scores["global_score"],
-                        stage=stage,
-                        weights=self.stage_weights,
-                        component_scores=scores,
-                        extra={
-                            "book_span_days_measured": book_span,
-                            "avg_date_delta_days_measured": avg_delta,
-                            "mixed_signs": False,
-                        },
-                    )
-                    add_candidate(sug, candidates)
-
-            if candidates:
-                candidates.sort(
-                    key=lambda s: float(s["confidence_score"]), reverse=True
-                )
-                best = candidates[0]
-                self._record(best)
-                for alt in candidates[1:]:
-                    self.suggestions.append(alt)
-                    if self._on_suggestion:
-                        try:
-                            self._on_suggestion(alt)
-                        except Exception as cb_exc:
-                            log.warning(
-                                "on_suggestion callback failed (alt many_to_many_fast): %s",
-                                cb_exc,
-                            )
 
     
     def _run_many_to_one(self, banks, books, stage: StageConfig):
@@ -1397,256 +1156,47 @@ class ReconciliationPipelineEngine:
                                 cb_exc,
                             )
 
-    def _run_many_to_one_fast(self, banks, books, stage: StageConfig):
-        """
-        FAST variant of many-to-one:
 
-        Same semantics as _run_many_to_one but with a hard cap on the number
-        of candidate banks per book based on amount/date proximity.
-        """
-        available_banks = [
-            b for b in banks
-            if b.id not in self.used_banks and b.company_id == self.company_id
-        ]
+    
+    def _run_many_to_one_legacy(self, banks, books, stage: StageConfig):
+        available_banks = [b for b in banks if b.id not in self.used_banks and b.company_id == self.company_id]
         win = stage.candidate_window_days
-        max_k = max(int(stage.max_alternatives_per_anchor or 1), 1)
-
-        MAX_LOCAL_BANKS = 128
-
-        log.debug(
-            "_run_many_to_one_fast: banks=%d books=%d win=%d amount_tol=%s "
-            "allow_mixed=%s max_k=%d max_local_banks=%d",
-            len(banks), len(books), win, stage.amount_tol,
-            stage.allow_mixed_signs, max_k, MAX_LOCAL_BANKS,
-        )
-
-        def add_candidate(sug: dict, buf: list[dict]) -> None:
-            score = float(sug.get("confidence_score", 0.0))
-            if len(buf) < max_k:
-                buf.append(sug)
-                return
-            worst_idx = min(
-                range(len(buf)),
-                key=lambda i: float(buf[i].get("confidence_score", 0.0)),
-            )
-            if score > float(buf[worst_idx].get("confidence_score", 0.0)):
-                buf[worst_idx] = sug
-
+    
         for book in books:
             if self._time_exceeded():
                 return
+            
             if book.id in self.used_books:
                 continue
-
-            book_amt = book.amount_base or Decimal("0")
-            book_sign = _sign(book_amt)
-
-            local_banks = [
-                b for b in available_banks
-                if b.date and book.date and abs((b.date - book.date).days) <= win
-            ]
-            if not local_banks:
-                continue
-
-            bank_amounts = [(b.amount_base or Decimal("0")) for b in local_banks]
-            if not bank_amounts:
-                continue
-
-            has_pos = any(a > 0 for a in bank_amounts)
-            has_neg = any(a < 0 for a in bank_amounts)
-            mixed_signs = has_pos and has_neg
-
-            if not stage.allow_mixed_signs and book_sign != 0:
-                if book_sign > 0:
-                    local_banks = [
-                        b for b in local_banks
-                        if (b.amount_base or Decimal("0")) >= 0
-                    ]
-                else:
-                    local_banks = [
-                        b for b in local_banks
-                        if (b.amount_base or Decimal("0")) <= 0
-                    ]
-                if not local_banks:
-                    continue
-                bank_amounts = [(b.amount_base or Decimal("0")) for b in local_banks]
-                has_pos = any(a > 0 for a in bank_amounts)
-                has_neg = any(a < 0 for a in bank_amounts)
-                mixed_signs = has_pos and has_neg
-
-            # CAP: limit local_banks per book
-            if len(local_banks) > MAX_LOCAL_BANKS:
-                target = q2(book_amt)
-
-                def sort_key(b):
-                    amt = b.amount_base or Decimal("0")
-                    amt_diff = abs(q2(amt) - target)
-                    date_diff = (
-                        abs((b.date - book.date).days)
-                        if b.date and book.date
-                        else 9999
-                    )
-                    return (amt_diff, date_diff)
-
-                before = len(local_banks)
-                local_banks = sorted(local_banks, key=sort_key)[:MAX_LOCAL_BANKS]
-                bank_amounts = [(b.amount_base or Decimal("0")) for b in local_banks]
-                log.debug(
-                    "_run_many_to_one_fast: book_id=%s capped local_banks from %d to %d",
-                    book.id, before, len(local_banks),
-                )
-
-            candidates: list[dict] = []
-
-            # ---- PATH 1: mixed-sign via DFS ----
-            if mixed_signs and stage.allow_mixed_signs:
-                combo = self._find_mixed_many_to_one_group(book, local_banks, stage)
-                if combo:
-                    bank_dates = [b.date for b in combo if b.date]
-                    bank_span = (
-                        (max(bank_dates) - min(bank_dates)).days
-                        if len(bank_dates) >= 2
-                        else 0
-                    )
-                    bank_avg = self._weighted_avg_date(combo)
-                    book_avg = book.date
-                    avg_delta = (
-                        abs((bank_avg - book_avg).days)
-                        if (bank_avg and book_avg)
-                        else win + 1
-                    )
-
-                    sim = self._cosine_similarity(
-                        _avg_embedding(combo), book.embedding or []
-                    )
-                    scores = compute_match_scores(
-                        embed_sim=sim,
-                        amount_diff=Decimal("0"),
-                        amount_tol=stage.amount_tol or CENT,
-                        date_diff=avg_delta,
-                        date_tol=stage.avg_date_delta_days or 1,
-                        currency_match=1.0,
-                        weights=self.stage_weights,
-                    )
-                    sug = self._make_suggestion(
-                        "many_to_one",
-                        list(combo),
-                        [book],
-                        scores["global_score"],
-                        stage=stage,
-                        weights=self.stage_weights,
-                        component_scores=scores,
-                        extra={
-                            "bank_span_days_measured": bank_span,
-                            "avg_date_delta_days_measured": avg_delta,
-                            "mixed_signs": True,
-                        },
-                    )
-                    add_candidate(sug, candidates)
-
-            # ---- PATH 2: same-sign bounded search ----
-            target = q2(book_amt)
-            tol = stage.amount_tol or Decimal("0")
-
-            min_possible = sum(a for a in bank_amounts if a < 0)
-            max_possible = sum(a for a in bank_amounts if a > 0)
-            L = target - tol
-            U = target + tol
-            if U < min_possible or L > max_possible:
-                if candidates:
-                    candidates.sort(
-                        key=lambda s: float(s["confidence_score"]), reverse=True
-                    )
-                    best = candidates[0]
-                    self._record(best)
-                    for alt in candidates[1:]:
-
-                        self.suggestions.append(alt)
-                        if self._on_suggestion:
-                            try:
-                                self._on_suggestion(alt)
-                            except Exception as cb_exc:
-                                log.warning(
-                                    "on_suggestion callback failed (alt many_to_one_fast): %s",
-                                    cb_exc,
-                                )
-                continue
-
-            all_non_negative = all(a >= 0 for a in bank_amounts)
-            use_prefix_bounds = all_non_negative and target >= 0
-
-            max_size = min(stage.max_group_size_bank, len(local_banks))
-
-            prefix_max: List[Decimal] = []
-            if use_prefix_bounds:
-                amounts_desc = sorted(bank_amounts, reverse=True)
-                acc = Decimal("0")
-                for amt in amounts_desc:
-                    acc += amt
-                    prefix_max.append(acc)
-                if q2(prefix_max[-1]) + tol < target:
-                    if candidates:
-                        candidates.sort(
-                            key=lambda s: float(s["confidence_score"]), reverse=True
-                        )
-                        best = candidates[0]
-                        self._record(best)
-                        for alt in candidates[1:]:
-
-                            self.suggestions.append(alt)
-                            if self._on_suggestion:
-                                try:
-                                    self._on_suggestion(alt)
-                                except Exception as cb_exc:
-                                    log.warning(
-                                        "on_suggestion callback failed (alt many_to_many_fast): %s",
-                                        cb_exc,
-                                    )
-                    continue
-
-            for size in range(1, max_size + 1):
-                if self._time_exceeded():
-                    return
-
-                if use_prefix_bounds and q2(prefix_max[size - 1]) + tol < target:
-                    continue
-
+    
+            local_banks = [b for b in available_banks if abs((b.date - book.date).days) <= win]
+    
+            for size in range(1, stage.max_group_size_bank + 1):
                 for combo in combinations(local_banks, size):
-                    if self._time_exceeded():
-                        return
-
+                    # FIX: check against used_banks (not used_books)
                     if any(x.id in self.used_banks for x in combo):
                         continue
-
+    
                     total = sum((b.amount_base for b in combo), Decimal("0"))
-                    diff = abs(q2(total) - target)
-                    if diff > stage.amount_tol:
+                    if q2(total) != q2(book.amount_base):
                         continue
                     if any(b.currency_id != book.currency_id for b in combo):
                         continue
-
+    
+                    # INTRA-side: span constraint ONLY for the grouped side (banks)
                     bank_dates = [b.date for b in combo if b.date]
-                    bank_span = (
-                        (max(bank_dates) - min(bank_dates)).days
-                        if len(bank_dates) >= 2
-                        else 0
-                    )
+                    bank_span = (max(bank_dates) - min(bank_dates)).days if len(bank_dates) >= 2 else 0
                     if stage.group_span_days and bank_span > stage.group_span_days:
                         continue
-
+    
+                    # CROSS-side: weighted-avg date delta
                     bank_avg = self._weighted_avg_date(combo)
                     book_avg = book.date
-                    avg_delta = (
-                        abs((bank_avg - book_avg).days)
-                        if (bank_avg and book_avg)
-                        else win + 1
-                    )
+                    avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
                     if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                         continue
-
-                    sim = self._cosine_similarity(
-                        _avg_embedding(combo), book.embedding or []
-                    )
+    
+                    sim = self._cosine_similarity(_avg_embedding(combo), book.embedding or [])
                     scores = compute_match_scores(
                         embed_sim=sim,
                         amount_diff=Decimal("0"),
@@ -1656,41 +1206,22 @@ class ReconciliationPipelineEngine:
                         currency_match=1.0,
                         weights=self.stage_weights,
                     )
-                    sug = self._make_suggestion(
-                        "many_to_one",
-                        list(combo),
-                        [book],
-                        scores["global_score"],
-                        stage=stage,
-                        weights=self.stage_weights,
-                        component_scores=scores,
-                        extra={
-                            "bank_span_days_measured": bank_span,
-                            "avg_date_delta_days_measured": avg_delta,
-                            "mixed_signs": False,
-                        },
+                    self._record(
+                        self._make_suggestion(
+                            "many_to_one",
+                            list(combo),
+                            [book],
+                            scores["global_score"],
+                            stage=stage,
+                            weights=self.stage_weights,
+                            component_scores=scores,
+                            extra={
+                                "bank_span_days_measured": bank_span,
+                                "avg_date_delta_days_measured": avg_delta,
+                            },
+                        )
                     )
-                    add_candidate(sug, candidates)
-
-            if candidates:
-                candidates.sort(
-                    key=lambda s: float(s["confidence_score"]), reverse=True
-                )
-                best = candidates[0]
-                self._record(best)
-                for alt in candidates[1:]:
-                    self.suggestions.append(alt)
-                    if self._on_suggestion:
-                        try:
-                            self._on_suggestion(alt)
-                        except Exception as cb_exc:
-                            log.warning(
-                                "on_suggestion callback failed (alt many_to_many_fast): %s",
-                                cb_exc,
-                            )
-
-    
-
+                    return
 
     def _run_fuzzy_1to1(self, banks, books, stage: StageConfig):
         """
@@ -2101,201 +1632,53 @@ class ReconciliationPipelineEngine:
                                 cb_exc,
                             )
 
-    def _run_many_to_many_fast(self, banks, books, stage: StageConfig):
-        """
-        FAST variant of many-to-many matching.
 
-        Similar to _run_many_to_many but we cap the date-window size for both
-        bank and book sides around the anchor bank to keep the search tractable.
-        """
+    
+    def _run_many_to_many_legacy(self, banks, books, stage: StageConfig):
+        # Copy & sort (company-filtered)
         sorted_banks = [b for b in banks if b.company_id == self.company_id]
         sorted_banks.sort(key=lambda b: b.date)
         sorted_books = [e for e in books if e.company_id == self.company_id]
         sorted_books.sort(key=lambda e: e.date)
     
         win = stage.candidate_window_days
-        max_k = max(int(stage.max_alternatives_per_anchor or 1), 1)
-
-        MAX_BANK_WINDOW = 64
-        MAX_BOOK_WINDOW = 64
-
-        log.debug(
-            "_run_many_to_many_fast: banks=%d books=%d win=%d amount_tol=%s "
-            "allow_mixed=%s max_k=%d max_bank_window=%d max_book_window=%d",
-            len(sorted_banks), len(sorted_books), win, stage.amount_tol,
-            stage.allow_mixed_signs, max_k, MAX_BANK_WINDOW, MAX_BOOK_WINDOW,
-        )
-
-        def add_candidate(sug: dict, buf: list[dict]) -> None:
-            score = float(sug.get("confidence_score", 0.0))
-            if len(buf) < max_k:
-                buf.append(sug)
-                return
-            worst_idx = min(
-                range(len(buf)),
-                key=lambda i: float(buf[i].get("confidence_score", 0.0)),
-            )
-            if score > float(buf[worst_idx].get("confidence_score", 0.0)):
-                buf[worst_idx] = sug
+        log.debug("Starting many-to-many company=%d banks=%d books=%d win=%d",
+                  self.company_id, len(sorted_banks), len(sorted_books), win)
     
         for bank in sorted_banks:
             if self._time_exceeded():
                 return
+            
             if bank.id in self.used_banks:
                 continue
-
-            bank_amt = bank.amount_base or Decimal("0")
-            bank_sign = _sign(bank_amt)
     
             start = bank.date - timedelta(days=win)
-            end = bank.date + timedelta(days=win)
+            end   = bank.date + timedelta(days=win)
             bank_window = [b for b in sorted_banks if start <= b.date <= end]
             book_window = [e for e in sorted_books if start <= e.date <= end]
-            if not bank_window or not book_window:
-                continue
-
-            if not stage.allow_mixed_signs and bank_sign != 0:
-                if bank_sign > 0:
-                    bank_window = [
-                        b for b in bank_window
-                        if (b.amount_base or Decimal("0")) >= 0
-                    ]
-                    book_window = [
-                        e for e in book_window
-                        if (e.amount_base or Decimal("0")) >= 0
-                    ]
-                else:
-                    bank_window = [
-                        b for b in bank_window
-                        if (b.amount_base or Decimal("0")) <= 0
-                    ]
-                    book_window = [
-                        e for e in book_window
-                        if (e.amount_base or Decimal("0")) <= 0
-                    ]
-                if not bank_window or not book_window:
-                    continue
-
-            # CAP: limit bank_window and book_window sizes
-            if len(bank_window) > MAX_BANK_WINDOW:
-                others = [b for b in bank_window if b.id != bank.id]
-
-                def sort_key_bank(bk):
-                    amt = bk.amount_base or Decimal("0")
-                    amt_diff = abs(q2(amt) - q2(bank_amt))
-                    date_diff = (
-                        abs((bk.date - bank.date).days)
-                        if bk.date and bank.date
-                        else 9999
-                    )
-                    return (amt_diff, date_diff)
-
-                others_sorted = sorted(others, key=sort_key_bank)
-                before = len(bank_window)
-                bank_window = [bank] + others_sorted[: MAX_BANK_WINDOW - 1]
-                log.debug(
-                    "_run_many_to_many_fast: anchor bank_id=%s capped bank_window from %d to %d",
-                    bank.id, before, len(bank_window),
-                )
-
-            if len(book_window) > MAX_BOOK_WINDOW:
-                # approximate target as |bank_amt| to bias by scale
-                approximate_target = q2(bank_amt)
-
-                def sort_key_book(e):
-                    amt = e.amount_base or Decimal("0")
-                    amt_diff = abs(q2(amt) - approximate_target)
-                    date_diff = (
-                        abs((e.date - bank.date).days)
-                        if e.date and bank.date
-                        else 9999
-                    )
-                    return (amt_diff, date_diff)
-
-                before = len(book_window)
-                book_window = sorted(book_window, key=sort_key_book)[:MAX_BOOK_WINDOW]
-                log.debug(
-                    "_run_many_to_many_fast: anchor bank_id=%s capped book_window from %d to %d",
-                    bank.id, before, len(book_window),
-                )
-
-            if not bank_window or not book_window:
-                continue
-
-            candidates: list[dict] = []
-            tol = stage.amount_tol or Decimal("0")
     
             for i in range(1, min(stage.max_group_size_bank, len(bank_window)) + 1):
-                if self._time_exceeded():
-                    return
-
                 for bank_combo in combinations(bank_window, i):
-                    if self._time_exceeded():
-                        return
+                    # anchor to avoid duplicates
                     if bank.id != min(b.id for b in bank_combo):
                         continue
                     if any(bc.id in self.used_banks for bc in bank_combo):
                         continue
     
                     sum_bank = sum((b.amount_base for b in bank_combo), Decimal("0"))
-                    target = q2(sum_bank)
-
-                    book_amounts = [
-                        e.amount_base for e in book_window if e.amount_base is not None
-                    ]
-                    if not book_amounts:
-                        continue
-
-                    min_possible = sum(a for a in book_amounts if a < 0)
-                    max_possible = sum(a for a in book_amounts if a > 0)
-                    L = target - tol
-                    U = target + tol
-                    if U < min_possible or L > max_possible:
-                        continue
-
-                    all_non_negative = all(a >= 0 for a in book_amounts)
-                    use_prefix_bounds = all_non_negative and target >= 0
-
-                    book_prefix_max: List[Decimal] = []
-                    if use_prefix_bounds:
-                        book_amounts_desc = sorted(book_amounts, reverse=True)
-                        acc = Decimal("0")
-                        for amt in book_amounts_desc:
-                            acc += amt
-                            book_prefix_max.append(acc)
-                        if q2(book_prefix_max[-1]) + tol < target:
-                            continue
     
-                    max_book_group_size = min(
-                        stage.max_group_size_book, len(book_window)
-                    )
-
-                    for j in range(1, max_book_group_size + 1):
-                        if self._time_exceeded():
-                            return
-
-                        if use_prefix_bounds and q2(book_prefix_max[j - 1]) + tol < target:
-                            continue
-
+                    for j in range(1, min(stage.max_group_size_book, len(book_window)) + 1):
                         for book_combo in combinations(book_window, j):
-                            if self._time_exceeded():
-                                return
                             if any(bk.id in self.used_books for bk in book_combo):
                                 continue
     
-                            sum_book = sum(
-                                (e.amount_base for e in book_combo), Decimal("0")
-                            )
-                            diff = abs(q2(sum_book) - target)
-                            if diff > stage.amount_tol:
+                            sum_book = sum((e.amount_base for e in book_combo), Decimal("0"))
+                            if q2(sum_bank) != q2(sum_book):
                                 continue
-                            if any(
-                                b.currency_id != e.currency_id
-                                for b in bank_combo
-                                for e in book_combo
-                            ):
+                            if any(b.currency_id != e.currency_id for b in bank_combo for e in book_combo):
                                 continue
     
+                            # INTRA-side spans (separate checks)
                             bank_span = self._date_span_days(bank_combo)
                             book_span = self._date_span_days(book_combo)
                             if stage.group_span_days:
@@ -2304,13 +1687,10 @@ class ReconciliationPipelineEngine:
                                 if book_span > stage.group_span_days:
                                     continue
     
+                            # CROSS-side weighted-avg delta
                             bank_avg = self._weighted_avg_date(bank_combo)
                             book_avg = self._weighted_avg_date(book_combo)
-                            avg_delta = (
-                                abs((bank_avg - book_avg).days)
-                                if (bank_avg and book_avg)
-                                else win + 1
-                            )
+                            avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
                             if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                                 continue
     
@@ -2328,40 +1708,22 @@ class ReconciliationPipelineEngine:
                                 weights=self.stage_weights,
                             )
     
-                            sug = self._make_suggestion(
-                                "many_to_many",
-                                list(bank_combo),
-                                list(book_combo),
-                                scores["global_score"],
-                                stage=stage,
-                                weights=self.stage_weights,
-                                component_scores=scores,
-                                extra={
-                                    "bank_span_days_measured": bank_span,
-                                    "book_span_days_measured": book_span,
-                                    "avg_date_delta_days_measured": avg_delta,
-                                    "mixed_signs_allowed": stage.allow_mixed_signs,
-                                },
+                            self._record(
+                                self._make_suggestion(
+                                    "many_to_many",
+                                    list(bank_combo),
+                                    list(book_combo),
+                                    scores["global_score"],
+                                    stage=stage,
+                                    weights=self.stage_weights,
+                                    component_scores=scores,
+                                    extra={
+                                        "bank_span_days_measured": bank_span,
+                                        "book_span_days_measured": book_span,
+                                        "avg_date_delta_days_measured": avg_delta,
+                                    },
+                                )
                             )
-                            add_candidate(sug, candidates)
-
-            if candidates:
-                candidates.sort(
-                    key=lambda s: float(s["confidence_score"]), reverse=True
-                )
-                best = candidates[0]
-                self._record(best)
-                for alt in candidates[1:]:
-                    self.suggestions.append(alt)
-                    if self._on_suggestion:
-                        try:
-                            self._on_suggestion(alt)
-                        except Exception as cb_exc:
-                            log.warning(
-                                "on_suggestion callback failed (alt many_to_many_fast): %s",
-                                cb_exc,
-                            )
-
 
     # ------------------------ Internal helpers ------------------------
 
@@ -2558,9 +1920,7 @@ def run_single_config(cfg: object,
                       banks: List[BankTransactionDTO],
                       books: List[JournalEntryDTO],
                       company_id: int,
-                      on_suggestion: Optional[Callable[[dict], None]] = None,
-                      fast: bool = False,
-                      ) -> List[dict]:
+                      on_suggestion: Optional[Callable[[dict], None]] = None) -> List[dict]:
     """
     Execute a single ReconciliationConfig using the pipeline engine.
     """
@@ -2621,7 +1981,6 @@ def run_single_config(cfg: object,
         auto_apply_score=float(getattr(cfg, "min_confidence", 1.0)),
         max_suggestions=getattr(cfg, "max_suggestions", 10000),
         max_runtime_seconds=max_runtime,   # <-- use None when soft_limit is 0 or invalid
-        fast=fast,
     )
     engine = ReconciliationPipelineEngine(
         company_id=company_id,
@@ -2645,13 +2004,10 @@ def run_single_config(cfg: object,
     return suggestions
 
 
-def run_pipeline(
-    pipeline: object,
-    banks: List[BankTransactionDTO],
-    books: List[JournalEntryDTO],
-    on_suggestion: Optional[Callable[[dict], None]] = None,
-    fast: bool = False,
-) -> List[dict]:
+def run_pipeline(pipeline: object,
+                 banks: List[BankTransactionDTO],
+                 books: List[JournalEntryDTO],
+                 on_suggestion: Optional[Callable[[dict], None]] = None) -> List[dict]:
     """
     Execute a multi-stage pipeline.
     """
@@ -2659,14 +2015,12 @@ def run_pipeline(
     weight_list: list[dict[str, float]] = []
 
     log.debug(
-        "run_pipeline: pipeline_id=%s company_id=%s stages_db=%d "
-        "auto_apply_score=%s max_suggestions=%s fast=%s",
+        "run_pipeline: pipeline_id=%s company_id=%s stages_db=%d auto_apply_score=%s max_suggestions=%s",
         getattr(pipeline, "id", None),
         pipeline.company_id,
         pipeline.stages.count() if hasattr(pipeline.stages, "count") else None,
         getattr(pipeline, "auto_apply_score", None),
         getattr(pipeline, "max_suggestions", None),
-        fast,
     )
 
     for idx, stage_obj in enumerate(pipeline.stages.select_related("config").order_by("order")):
@@ -2787,12 +2141,11 @@ def run_pipeline(
         auto_apply_score=float(pipeline.auto_apply_score),
         max_suggestions=pipeline.max_suggestions,
         max_runtime_seconds=max_runtime,
-        fast=fast,
     )
 
     log.debug(
-        "run_pipeline: built %d StageConfig(s); soft_time_limit=%s fast=%s",
-        len(stage_configs), soft_limit, fast,
+        "run_pipeline: built %d StageConfig(s); soft_time_limit=%s",
+        len(stage_configs), soft_limit,
     )
 
     engine = ReconciliationPipelineEngine(
@@ -2802,7 +2155,6 @@ def run_pipeline(
     )
     engine.current_weights = weight_list
     return engine.run(banks, books)
-
 
 
 
@@ -2972,35 +2324,50 @@ class ReconciliationService:
         
         # Run the appropriate matching engine and capture soft limit
         soft_time_limit = None
-        if pipeline_id:
-            log.debug(
-                "match_many_to_many: using pipeline_id=%s fast=%s",
-                pipeline_id, use_fast,
-            )
-            pipe_obj = ReconciliationPipeline.objects.get(id=pipeline_id)
-            suggestions = run_pipeline(
-                pipe_obj,
+        
+        if use_fast:
+            log.debug("match_many_to_many: fast mode enabled, using simplified matcher")
+            suggestions = ReconciliationService._fast_match(
                 candidate_bank,
                 candidate_book,
-                on_suggestion=on_suggestion,
-                fast=use_fast,
+                data,
             )
-            soft_time_limit = getattr(pipe_obj, "soft_time_limit_seconds", None)
+            # optional: propagate pipeline/config soft_time_limit if defined
+            if pipeline_id:
+                try:
+                    pipe_obj = ReconciliationPipeline.objects.get(id=pipeline_id)
+                    soft_time_limit = getattr(pipe_obj, "soft_time_limit_seconds", None)
+                except Exception:
+                    soft_time_limit = None
+            elif config_id:
+                try:
+                    cfg_obj = ReconciliationConfig.objects.get(id=config_id)
+                    soft_time_limit = getattr(cfg_obj, "soft_time_limit_seconds", None)
+                except Exception:
+                    soft_time_limit = None
         else:
-            log.debug(
-                "match_many_to_many: using config_id=%s fast=%s",
-                config_id, use_fast,
-            )
-            cfg_obj = ReconciliationConfig.objects.get(id=config_id)
-            suggestions = run_single_config(
-                cfg_obj,
-                candidate_bank,
-                candidate_book,
-                company_id,
-                on_suggestion=on_suggestion,
-                fast=use_fast,
-            )
-            soft_time_limit = getattr(cfg_obj, "soft_time_limit_seconds", None)
+            # original pipeline/config execution
+            if pipeline_id:
+                log.debug("match_many_to_many: using pipeline_id=%s", pipeline_id)
+                pipe_obj = ReconciliationPipeline.objects.get(id=pipeline_id)
+                suggestions = run_pipeline(
+                    pipe_obj,
+                    candidate_bank,
+                    candidate_book,
+                    on_suggestion=on_suggestion,
+                )
+                soft_time_limit = getattr(pipe_obj, "soft_time_limit_seconds", None)
+            else:
+                log.debug("match_many_to_many: using config_id=%s", config_id)
+                cfg_obj = ReconciliationConfig.objects.get(id=config_id)
+                suggestions = run_single_config(
+                    cfg_obj,
+                    candidate_bank,
+                    candidate_book,
+                    company_id,
+                    on_suggestion=on_suggestion,
+                )
+                soft_time_limit = getattr(cfg_obj, "soft_time_limit_seconds", None)
 
         # Auto-apply matches with confidence 1.0
         auto_info = {"enabled": bool(auto_match_100), "applied": 0, "skipped": 0, "details": []}
