@@ -261,483 +261,388 @@ def compare_two_engines_task(self, db_id: int, data: Dict[str, Any], tenant_id: 
 # Fast match implementation
 # -----------------------
 @shared_task(bind=True)
-def match_many_to_many_fast_task(self, db_id: int, data: Dict[str, Any], tenant_id: str = None, auto_match_100: bool = False):
+def match_many_to_many_fast_task(
+    self,
+    db_id: int,
+    data: Dict[str, Any],
+    tenant_id: str = None,
+    auto_match_100: bool = False,
+):
     """
-    Fast alternative runner for heavy 1-to-M / M-to-1 / M-to-M cases.
+    Versão fast do reconciliador many-to-many.
 
-    IMPORTANT:
-    - Uses the same DTOs (BankTransactionDTO / JournalEntryDTO),
-    - Uses ReconciliationPipelineEngine._make_suggestion to build suggestion payloads,
-    - Uses ReconciliationService._build_stats to build the stats dict.
-
-    So the RETURN SHAPE is identical to ReconciliationService.match_many_to_many:
-      {
-        "suggestions": [...],
-        "auto_match": {...},
-        "stats": {...}
-      }
-    Only the internal search algorithm is different ("fast_v1").
+    IMPORTANTE:
+    - NÃO mexe no ReconciliationService.match_many_to_many.
+    - Retorna o mesmo formato de resultado:
+      {"suggestions": [...], "auto_match": {...}, "stats": {...}}
     """
-    # Tunables (override in settings if needed)
-    K_EMBED = int(getattr(settings, "FAST_PREFILTER_TOPK_EMBED", 120))
-    MAX_CANDIDATES = int(getattr(settings, "FAST_MAX_CANDIDATES", 60))
-    MAX_DP = int(getattr(settings, "FAST_MAX_DP", 60))
-    BEAM_SIZE = int(getattr(settings, "FAST_BEAM_SIZE", 200))
-    MAX_TIME_PER_BANK = float(getattr(settings, "FAST_MAX_TIME_PER_BANK", 5.0))
-    GLOBAL_HARD_TIMEOUT = float(getattr(settings, "FAST_GLOBAL_HARD_TIMEOUT", 15 * 60))
+    from django.utils import timezone
+    from django.db import transaction
+    from itertools import combinations
 
-    task_row = ReconciliationTask.objects.get(id=db_id)
+    from .models import BankTransaction, Transaction, ReconciliationTask, ReconciliationSuggestion
+    try:
+        from .models import JournalEntry  # seu modelo novo de lançamentos
+    except Exception:
+        JournalEntry = None  # type: ignore
+
+    from .services.reconciliation_service import (
+        BankTransactionDTO,
+        JournalEntryDTO,
+        _as_vec_list,
+        q2,
+        CENT,
+        compute_match_scores,
+        _avg_embedding,
+        ReconciliationService,  # para _apply_auto_matches_100
+    )
+    from multitenancy.utils import resolve_tenant
+
+    logger = logging.getLogger("recon")
+
+    try:
+        task_row = ReconciliationTask.objects.get(id=db_id)
+    except ReconciliationTask.DoesNotExist:
+        logger.error("match_many_to_many_fast_task: ReconciliationTask %s not found", db_id)
+        return {"error": "Task not found"}
+
     task_row.status = "running"
-    task_row.updated_at = timezone.now()
-    task_row.save(update_fields=["status", "updated_at"])
+    task_row.started_at = timezone.now()
+    task_row.save(update_fields=["status", "started_at"])
 
     start_ts = time.time()
 
-    # ----------------
-    # Resolve company_id
-    # ----------------
-    company_id = data.get("company_id")
-    if company_id is None and tenant_id:
-        try:
-            company_obj = resolve_tenant(tenant_id)
-            company_id = getattr(company_obj, "id", None)
-        except Exception:
-            company_id = None
+    # ---- helper local para stats (NÃO mexe no service) ----------------------
+    def _build_stats_for_fast(
+        suggestions: List[dict],
+        auto_info: Dict[str, Any],
+        candidate_bank: List[BankTransactionDTO],
+        candidate_book: List[JournalEntryDTO],
+    ) -> Dict[str, Any]:
+        suggestion_count = len(suggestions)
+        bank_candidate_count = len(candidate_bank)
+        book_candidate_count = len(candidate_book)
 
-    if company_id is None:
-        raise ValueError("company_id is required for fast reconciliation")
+        matched_bank_ids = set()
+        matched_book_ids = set()
+        match_type_counts: Dict[str, int] = {}
+        confidences: List[float] = []
+        abs_diffs: List[float] = []
 
-    bank_ids = data.get("bank_ids") or []
-    book_ids = data.get("book_ids") or []
+        for s in suggestions:
+            mt = s.get("match_type", "unknown")
+            match_type_counts[mt] = match_type_counts.get(mt, 0) + 1
 
-    # ----------------
-    # Build QuerySets / DTOs (similar to ReconciliationService)
-    # ----------------
-    bank_qs = (
-        BankTransaction.objects
-        .exclude(reconciliations__status__in=["matched", "approved"])
-        .filter(company_id=company_id)
-        .only("id", "company_id", "date", "amount", "currency_id", "description", "description_embedding")
-    )
-    if bank_ids:
-        bank_qs = bank_qs.filter(id__in=bank_ids)
+            for bid in s.get("bank_ids", []) or []:
+                matched_bank_ids.add(bid)
+            for jid in s.get("journal_entries_ids", []) or []:
+                matched_book_ids.add(jid)
 
-    try:
-        from .models import JournalEntry  # if it’s in same app; adjust path if needed
-    except Exception:
-        JournalEntry = None
-
-    if JournalEntry is not None:
-        book_qs = (
-            JournalEntry.objects
-            .exclude(reconciliations__status__in=["matched", "approved"])
-            .filter(company_id=company_id, account__bank_account__isnull=False)
-            .select_related("transaction")
-            .only(
-                "id", "company_id", "transaction_id", "date",
-                "debit_amount", "credit_amount", "account_id",
-                "transaction__date", "transaction__currency_id",
-                "transaction__description", "transaction__description_embedding",
-            )
-        )
-        if book_ids:
-            book_qs = book_qs.filter(id__in=book_ids)
-    else:
-        book_qs = JournalEntry.objects.none()  # or Transaction.objects.none()
-
-    banks: List[BankTransactionDTO] = [
-        BankTransactionDTO(
-            id=b.id,
-            company_id=b.company_id,
-            date=b.date,
-            amount=b.amount,
-            currency_id=b.currency_id,
-            description=b.description,
-            embedding=_as_vec_list(getattr(b, "description_embedding", None)),
-        )
-        for b in bank_qs
-    ]
-
-    books: List[JournalEntryDTO] = []
-    for je in book_qs:
-        tr = getattr(je, "transaction", None)
-        tr_date = je.date or (tr.date if tr else None)
-        tr_curr_id = tr.currency_id if tr else None
-        tr_desc = tr.description if tr else ""
-        tr_vec = _as_vec_list(getattr(tr, "description_embedding", None)) if tr else None
-
-        books.append(
-            JournalEntryDTO(
-                id=je.id,
-                company_id=je.company_id,
-                transaction_id=je.transaction_id,
-                date=tr_date,
-                effective_amount=je.get_effective_amount(),
-                currency_id=tr_curr_id,
-                description=tr_desc,
-                embedding=tr_vec,
-            )
-        )
-
-    # ----------------
-    # Helper: top-k by embedding
-    # ----------------
-    def topk_by_embedding(anchor_vec, candidates, k: int) -> List[int]:
-        if not anchor_vec:
-            return list(range(min(k, len(candidates))))
-        sims = []
-        for i, c in enumerate(candidates):
             try:
-                s = cosine_similarity(anchor_vec, (c.embedding or []))
+                confidences.append(float(s.get("confidence_score", 0.0)))
             except Exception:
-                s = 0.0
-            sims.append((i, s))
-        sims.sort(key=lambda t: (t[1], -t[0]), reverse=True)
-        return [i for i, _ in sims[:k]]
-
-    # subset-sum bitset DP (for non-negative amounts)
-    def subset_sum_bitset_indices(items, target_dec: Decimal, tol_dec: Decimal, max_card: int) -> List[List[int]]:
-        try:
-            cents = [int(q2(getattr(it, "effective_amount", 0)) / CENT) for it in items]
-        except Exception:
-            cents = [
-                int(q2(getattr(it, "effective_amount", 0)) / CENT)
-                if getattr(it, "effective_amount", None) is not None else 0
-                for it in items
-            ]
-        target = int(q2(target_dec) / CENT)
-        tol = int(q2(tol_dec) / CENT)
-        total = sum(cents)
-        if target - tol > total or target + tol < 0:
-            return []
-        if total > 5_000_000:
-            return []
-        dp = 1
-        parents: Dict[int, tuple[int, int]] = {}
-        sizes: Dict[int, int] = {0: 0}
-        for idx, val in enumerate(cents):
-            if val < 0:
-                continue
-            shifted = dp << val
-            new = shifted & ~dp
-            if new:
-                s = new
-                while s:
-                    lowbit = s & -s
-                    sum_pos = lowbit.bit_length() - 1
-                    prev = sum_pos - val
-                    prev_size = sizes.get(prev)
-                    if prev_size is not None and prev_size + 1 <= max_card:
-                        if sum_pos not in parents:
-                            parents[sum_pos] = (idx, prev)
-                            sizes[sum_pos] = prev_size + 1
-                    s &= s - 1
-            dp |= shifted
-        results: List[List[int]] = []
-        low = max(0, target - tol)
-        high = min(total, target + tol)
-        for s in range(low, high + 1):
-            if (dp >> s) & 1:
-                cur = s
-                combo: List[int] = []
-                while cur != 0:
-                    if cur not in parents:
-                        combo = []
-                        break
-                    idx, prev = parents[cur]
-                    combo.append(idx)
-                    cur = prev
-                if combo:
-                    results.append(list(reversed(combo)))
-        return results
-
-    # beam search fallback
-    def beam_search_indices(items, target_dec: Decimal, tol_dec: Decimal, max_card: int, beam_size=BEAM_SIZE) -> List[List[int]]:
-        target = q2(target_dec)
-        ranked = sorted(
-            enumerate(items),
-            key=lambda x: abs(q2(getattr(x[1], "effective_amount", 0)) - target),
-        )
-        beam: List[tuple[Decimal, List[int]]] = [(Decimal("0.00"), [])]
-        for idx, item in ranked:
-            new_beam = list(beam)
-            for s, idxs in beam:
-                if len(idxs) + 1 > max_card:
-                    continue
-                s2 = s + q2(getattr(item, "effective_amount", Decimal("0.00")))
-                idxs2 = idxs + [idx]
-                new_beam.append((s2, idxs2))
-            new_beam.sort(key=lambda t: abs(t[0] - target))
-            beam = new_beam[:beam_size]
-        tol = q2(tol_dec)
-        solutions = [idxs for s, idxs in beam if abs(s - target) <= tol]
-        return solutions
-
-    # ----------------
-    # Engine instance ONLY for payload shaping (_make_suggestion)
-    # ----------------
-    amt_tol = Decimal(str(data.get("amount_tolerance", "0.00") or "0.00"))
-    max_group_size_book = int(data.get("max_group_size_book", 5) or 5)
-    group_span_days = int(data.get("group_span_days", 0) or 0)
-    avg_date_delta_days = int(data.get("avg_date_delta_days", 0) or 0)
-    win_days = int(data.get("date_window_days", 365) or 365)
-
-    stage = StageConfig(
-        type="one_to_many",              # for now this fast engine covers 1->N
-        max_group_size_bank=1,
-        max_group_size_book=max_group_size_book,
-        amount_tol=amt_tol,
-        group_span_days=group_span_days,
-        avg_date_delta_days=avg_date_delta_days or win_days,
-        allow_mixed_signs=False,
-        max_alternatives_per_anchor=1,
-    )
-
-    pipe_cfg = PipelineConfig(
-        stages=[stage],
-        auto_apply_score=1.0,
-        max_suggestions=1000000,
-        max_runtime_seconds=None,
-    )
-
-    engine = ReconciliationPipelineEngine(
-        company_id=company_id,
-        config=pipe_cfg,
-        on_suggestion=None,
-    )
-    engine.current_weights = {
-        "embedding": 0.50,
-        "amount":    0.35,
-        "currency":  0.10,
-        "date":      0.05,
-    }
-    engine.stage_weights = engine.current_weights
-
-    # ----------------
-    # Main loop
-    # ----------------
-    suggestions_out: List[dict] = []
-    task_start = time.time()
-
-    for bank in banks:
-        if time.time() - task_start > GLOBAL_HARD_TIMEOUT:
-            log.warning("match_many_to_many_fast_task %s: global hard timeout reached", db_id)
-            break
-
-        bank_start = time.time()
-
-        # prefilter by date + currency
-        local_books = [
-            b for b in books
-            if b.currency_id == bank.currency_id
-            and getattr(b, "date", None)
-            and getattr(bank, "date", None)
-            and abs((bank.date - b.date).days) <= win_days
-        ]
-        if not local_books:
-            continue
-
-        # embedding top-K
-        top_idx = topk_by_embedding(bank.embedding or [], local_books, K_EMBED)
-        local_books = [local_books[i] for i in top_idx]
-
-        # amount closeness pruning
-        if len(local_books) > MAX_CANDIDATES:
-            local_books.sort(
-                key=lambda b: abs(q2(getattr(b, "effective_amount", 0)) - q2(getattr(bank, "amount", 0)))
-            )
-            local_books = local_books[:MAX_CANDIDATES]
-
-        book_amounts = [q2(getattr(b, "effective_amount", 0)) for b in local_books]
-        if not book_amounts:
-            continue
-
-        all_non_negative = all(a >= 0 for a in book_amounts)
-        combos_idx: List[List[int]] = []
-
-        try:
-            if all_non_negative and len(local_books) <= MAX_DP:
-                combos_idx = subset_sum_bitset_indices(
-                    local_books,
-                    getattr(bank, "amount", Decimal("0.00")),
-                    amt_tol,
-                    max_group_size_book,
-                )
-                if not combos_idx:
-                    combos_idx = beam_search_indices(
-                        local_books,
-                        getattr(bank, "amount", Decimal("0.00")),
-                        amt_tol,
-                        max_group_size_book,
-                        beam_size=BEAM_SIZE,
-                    )
-            else:
-                combos_idx = beam_search_indices(
-                    local_books,
-                    getattr(bank, "amount", Decimal("0.00")),
-                    amt_tol,
-                    max_group_size_book,
-                    beam_size=BEAM_SIZE,
-                )
-        except Exception:
-            log.exception("Error deriving combos for bank %s; falling back to greedy", bank.id)
-            if local_books:
-                combos_idx = [[0]]
-
-        if time.time() - bank_start > MAX_TIME_PER_BANK:
-            log.debug(
-                "match_many_to_many_fast_task %s: skipping heavy processing for bank %s due to time-per-bank guard",
-                db_id, bank.id,
-            )
-            continue
-
-        # build suggestions using the SAME payload generator as the pipeline engine
-        for idxs in combos_idx:
-            combo_books = [local_books[i] for i in idxs]
-
-            # weighted avg date and spans using same semantics
-            def _weighted_avg_date(items):
-                total = Decimal("0.00")
-                for it in items:
-                    try:
-                        total += q2(getattr(it, "effective_amount", Decimal("0.00")))
-                    except Exception:
-                        pass
-                if total == Decimal("0.00"):
-                    return None
-                weighted = 0.0
-                for it in items:
-                    if not getattr(it, "date", None):
-                        continue
-                    try:
-                        w = float(q2(getattr(it, "effective_amount", Decimal("0.00"))) / total)
-                    except Exception:
-                        w = 0.0
-                    weighted += it.date.toordinal() * w
-                try:
-                    return timezone.datetime.fromordinal(int(round(weighted))).date()
-                except Exception:
-                    return None
-
-            date_avg = _weighted_avg_date(combo_books)
-            date_diff = abs((bank.date - date_avg).days) if (bank.date and date_avg) else 0
-
-            amount_sum = q2(sum(getattr(b, "effective_amount", 0) for b in combo_books))
-            amount_diff = abs(amount_sum - q2(getattr(bank, "amount", Decimal("0.00"))))
-
-            sim = cosine_similarity(bank.embedding or [], _avg_embedding(combo_books))
-
-            scores = compute_match_scores(
-                embed_sim=sim,
-                amount_diff=amount_diff,
-                amount_tol=amt_tol,
-                date_diff=date_diff,
-                date_tol=avg_date_delta_days or 1,
-                currency_match=1.0,
-                weights=engine.stage_weights,
-            )
-
-            sug = engine._make_suggestion(
-                "one_to_many",
-                [bank],
-                combo_books,
-                scores["global_score"],
-                stage=stage,
-                weights=engine.stage_weights,
-                component_scores=scores,
-                extra={
-                    "engine": "fast_v1",
-                    "amount_diff_raw": float(amount_diff),
-                    "avg_date_delta_days_measured": date_diff,
-                },
-            )
-
-            # persist row
+                pass
             try:
-                rs = ReconciliationSuggestion(
-                    task=task_row,
-                    company_id=bank.company_id,
-                    match_type=sug["match_type"],
-                    confidence_score=sug["confidence_score"],
-                    abs_amount_diff=sug["abs_amount_diff"],
-                    bank_ids=sug["bank_ids"],
-                    journal_entry_ids=sug["journal_entries_ids"],
-                    payload=sug,
-                )
-                rs.save()
+                abs_diffs.append(float(s.get("abs_amount_diff", 0.0)))
             except Exception:
-                log.exception("Failed saving fast suggestion for bank %s", bank.id)
+                pass
 
-            suggestions_out.append(sug)
+        def _percentile(sorted_vals: List[float], p: float):
+            if not sorted_vals:
+                return None
+            k = (len(sorted_vals) - 1) * p
+            f = int(k)
+            c = min(f + 1, len(sorted_vals) - 1)
+            if f == c:
+                return sorted_vals[f]
+            d0 = sorted_vals[f] * (c - k)
+            d1 = sorted_vals[c] * (k - f)
+            return d0 + d1
 
-    # ----------------
-    # Auto-match 100% (same as main engine)
-    # ----------------
-    auto_info: Dict[str, Any] = {
-        "enabled": bool(auto_match_100),
-        "applied": 0,
-        "skipped": 0,
-        "details": [],
-    }
-    if auto_match_100 and suggestions_out:
-        try:
-            res = ReconciliationService._apply_auto_matches_100(suggestions_out)
-            if isinstance(res, dict):
-                auto_info = res
-        except Exception:
-            log.exception("Failed applying auto_match_100 for fast run %s", db_id)
+        conf_min = conf_max = conf_avg = conf_p50 = conf_p90 = None
+        perfect_conf = 0
+        if confidences:
+            confidences_sorted = sorted(confidences)
+            conf_min = confidences_sorted[0]
+            conf_max = confidences_sorted[-1]
+            conf_avg = sum(confidences_sorted) / len(confidences_sorted)
+            conf_p50 = _percentile(confidences_sorted, 0.5)
+            conf_p90 = _percentile(confidences_sorted, 0.9)
+            perfect_conf = sum(1 for c in confidences_sorted if abs(c - 1.0) < 1e-9)
 
-    duration = time.time() - start_ts
+        diff_min = diff_max = diff_avg = None
+        if abs_diffs:
+            diffs_sorted = sorted(abs_diffs)
+            diff_min = diffs_sorted[0]
+            diff_max = diffs_sorted[-1]
+            diff_avg = sum(diffs_sorted) / len(diffs_sorted)
 
-    # ----------------
-    # Stats (reuse SAME builder as match_many_to_many)
-    # ----------------
-    stats = ReconciliationService._build_stats(
-        company_id=company_id,
-        config_id=data.get("config_id"),
-        pipeline_id=data.get("pipeline_id"),
-        suggestions=suggestions_out,
-        auto_info=auto_info,
-        candidate_bank=banks,
-        candidate_book=books,
-        duration=duration,
-        soft_time_limit=getattr(task_row, "soft_time_limit_seconds", None),
-    )
+        duration = time.time() - start_ts
+        soft_time_limit = getattr(task_row, "soft_time_limit_seconds", None)
 
-    # finalize task_row
-    try:
-        task_row.suggestion_count = stats["suggestion_count"]
-        task_row.bank_candidates = stats["bank_candidates"]
-        task_row.journal_candidates = stats["journal_candidates"]
-        task_row.matched_bank_transactions = stats["matched_bank_transactions"]
-        task_row.matched_journal_entries = stats["matched_journal_entries"]
-        task_row.duration_seconds = stats["duration_seconds"]
-        task_row.soft_time_limit_seconds = stats["time_limit_seconds"]
-        task_row.auto_match_enabled = auto_info.get("enabled", False)
-        task_row.auto_match_applied = auto_info.get("applied", 0)
-        task_row.auto_match_skipped = auto_info.get("skipped", 0)
-        task_row.stats = stats
-        task_row.result = {
-            "suggestions": suggestions_out,
-            "auto_match": auto_info,
-            "stats": stats,
+        return {
+            "company_id": task_row.company_id,
+            "config_id": data.get("config_id"),
+            "pipeline_id": data.get("pipeline_id"),
+            "duration_seconds": round(duration, 3),
+            "time_limit_seconds": soft_time_limit,
+            "time_limit_reached": bool(soft_time_limit and duration >= float(soft_time_limit or 0.0)),
+            "bank_candidates": bank_candidate_count,
+            "journal_candidates": book_candidate_count,
+            "suggestion_count": suggestion_count,
+            "match_types": match_type_counts,
+            "matched_bank_transactions": len(matched_bank_ids),
+            "matched_journal_entries": len(matched_book_ids),
+            "bank_coverage_ratio": float(len(matched_bank_ids) / bank_candidate_count) if bank_candidate_count else 0.0,
+            "journal_coverage_ratio": float(len(matched_book_ids) / book_candidate_count) if book_candidate_count else 0.0,
+            "confidence_stats": {
+                "min": conf_min,
+                "max": conf_max,
+                "avg": conf_avg,
+                "p50": conf_p50,
+                "p90": conf_p90,
+                "perfect_1_0_count": perfect_conf,
+            },
+            "amount_diff_stats": {
+                "min": diff_min,
+                "max": diff_max,
+                "avg": diff_avg,
+            },
+            "auto_match": {
+                "enabled": bool(auto_info.get("enabled")),
+                "applied": int(auto_info.get("applied", 0)),
+                "skipped": int(auto_info.get("skipped", 0)),
+            },
         }
-        task_row.status = "completed"
-        task_row.updated_at = timezone.now()
-        task_row.save(update_fields=[
-            "status", "result", "stats", "suggestion_count", "bank_candidates",
-            "journal_candidates", "matched_bank_transactions", "matched_journal_entries",
-            "duration_seconds", "soft_time_limit_seconds", "auto_match_enabled",
-            "auto_match_applied", "auto_match_skipped", "updated_at",
-        ])
-    except Exception:
-        log.exception("Failed updating ReconciliationTask %s with fast stats/result", db_id)
 
-    return {
-        "suggestions": suggestions_out,
-        "auto_match": auto_info,
-        "stats": stats,
-    }
+    try:
+        # --------- resolve company_id ----------------------------------------
+        company_id = data.get("company_id")
+        if not company_id and tenant_id:
+            try:
+                company_id = resolve_tenant(tenant_id).id
+            except Exception:
+                company_id = task_row.company_id
+
+        if not company_id:
+            company_id = task_row.company_id
+
+        # --------- base querysets -------------------------------------------
+        bank_qs = BankTransaction.objects.exclude(is_deleted=True).filter(company_id=company_id)
+
+        if JournalEntry:
+            book_qs = JournalEntry.objects.exclude(is_deleted=True).filter(company_id=company_id)
+        else:
+            # fallback se ainda não tiver JournalEntry
+            book_qs = Transaction.objects.none()
+
+        bank_ids = data.get("bank_ids") or []
+        book_ids = data.get("book_ids") or []
+
+        if bank_ids:
+            bank_qs = bank_qs.filter(id__in=bank_ids)
+        if book_ids and JournalEntry:
+            book_qs = book_qs.filter(id__in=book_ids)
+
+        # --------- monta DTOs -----------------------------------------------
+        banks: List[BankTransactionDTO] = []
+        for b in bank_qs:
+            banks.append(
+                BankTransactionDTO(
+                    id=b.id,
+                    company_id=b.company_id,
+                    date=b.date,
+                    amount=q2(b.amount),
+                    currency_id=b.currency_id,
+                    description=b.description or "",
+                    embedding=_as_vec_list(b.embedding),
+                )
+            )
+
+        books: List[JournalEntryDTO] = []
+        if JournalEntry:
+            for j in book_qs.select_related("transaction"):
+                tx = j.transaction
+                books.append(
+                    JournalEntryDTO(
+                        id=j.id,
+                        company_id=j.company_id,
+                        transaction_id=j.transaction_id,
+                        date=tx.date,
+                        effective_amount=q2(j.amount),
+                        currency_id=j.currency_id,
+                        description=tx.description or j.description or "",
+                        embedding=_as_vec_list(tx.embedding or j.embedding),
+                    )
+                )
+
+        # --------- parâmetros do algoritmo fast -----------------------------
+        amt_tol = Decimal(str(data.get("amount_tolerance", "0.00") or "0.00"))
+        if amt_tol <= 0:
+            amt_tol = CENT
+
+        date_tol = int(data.get("avg_date_delta_days", 365) or 365)
+        if date_tol <= 0:
+            date_tol = 365
+
+        win_days = int(data.get("date_window_days", 365) or 365)
+        max_group = int(data.get("max_group_size_book", 10) or 10)
+        max_group = max(1, max_group)
+
+        weights = {
+            "embedding": float(data.get("embedding_weight", 0.5)),
+            "amount": float(data.get("amount_weight", 0.35)),
+            "currency": float(data.get("currency_weight", 0.1)),
+            "date": float(data.get("date_weight", 0.05)),
+        }
+
+        suggestions_out: List[dict] = []
+
+        def cosine_similarity(v1, v2) -> float:
+            if not v1 or not v2:
+                return 0.0
+            from math import sqrt
+            dot = sum(float(a) * float(b) for a, b in zip(v1, v2))
+            norm1 = sqrt(sum(float(a) * float(a) for a in v1))
+            norm2 = sqrt(sum(float(b) * float(b) for b in v2))
+            return dot / (norm1 * norm2) if norm1 and norm2 else 0.0
+
+        hard_timeout = float(getattr(task_row, "soft_time_limit_seconds", 0) or 0)
+
+        # --------- núcleo do algoritmo fast ---------------------------------
+        for bank in banks:
+            if hard_timeout and time.time() - start_ts > hard_timeout:
+                logger.warning("match_many_to_many_fast_task: soft time limit reached, stopping early")
+                break
+
+            local_books = [
+                b for b in books
+                if abs((b.date - bank.date).days) <= win_days
+                and (b.currency_id == bank.currency_id)
+            ]
+            if not local_books:
+                continue
+
+            local_books = sorted(local_books, key=lambda b: b.date)
+            max_k = min(max_group, len(local_books))
+
+            bank_vec = bank.embedding
+
+            for grp_size in range(1, max_k + 1):
+                for idxs in combinations(range(len(local_books)), grp_size):
+                    combo_books = [local_books[i] for i in idxs]
+
+                    books_vec = _avg_embedding(combo_books)
+                    sim = cosine_similarity(bank_vec, books_vec) if bank_vec and books_vec else 0.0
+
+                    amount_sum = q2(sum((b.effective_amount for b in combo_books), Decimal("0.00")))
+                    amount_diff = q2(abs(amount_sum - q2(bank.amount)))
+                    date_diff = max(abs((b.date - bank.date).days) for b in combo_books)
+                    currency_match = 1.0  # já filtramos por currency
+
+                    scores = compute_match_scores(
+                        embed_sim=sim,
+                        amount_diff=amount_diff,
+                        amount_tol=amt_tol,
+                        date_diff=date_diff,
+                        date_tol=date_tol,
+                        currency_match=currency_match,
+                        weights=weights,
+                    )
+
+                    global_score = float(scores.get("global_score", 0.0))
+                    if global_score <= 0:
+                        continue
+
+                    suggestion = {
+                        "match_type": "one_to_many_fast",  # pode manter diferente do engine normal
+                        "bank_ids": [bank.id],
+                        "journal_entries_ids": [b.id for b in combo_books],
+                        "confidence_score": global_score,
+                        "abs_amount_diff": float(amount_diff),
+                        "component_scores": scores,
+                        "extra": {
+                            "engine": "fast_v1",
+                            "avg_date_delta_days_measured": date_diff,
+                            "amount_diff_measured": float(amount_diff),
+                            "embed_similarity": float(sim),
+                        },
+                    }
+                    suggestions_out.append(suggestion)
+
+        # --------- auto-match 100% e stats -----------------------------------
+        auto_info: Dict[str, Any] = {
+            "enabled": bool(auto_match_100),
+            "applied": 0,
+            "skipped": 0,
+        }
+        if auto_match_100 and suggestions_out:
+            try:
+                auto_info = ReconciliationService._apply_auto_matches_100(suggestions_out)
+            except Exception:
+                logger.exception("match_many_to_many_fast_task: error applying 100%% auto-match")
+
+        stats = _build_stats_for_fast(suggestions_out, auto_info, banks, books)
+
+        # --------- persiste sugestões + atualiza task ------------------------
+        with transaction.atomic():
+            ReconciliationSuggestion.objects.filter(task=task_row).delete()
+
+            for s in suggestions_out:
+                ReconciliationSuggestion.objects.create(
+                    task=task_row,
+                    company_id=task_row.company_id,
+                    match_type=s.get("match_type", "unknown"),
+                    bank_ids=s.get("bank_ids", []),
+                    journal_entries_ids=s.get("journal_entries_ids", []),
+                    confidence_score=s.get("confidence_score", 0.0),
+                    abs_amount_diff=s.get("abs_amount_diff", 0.0),
+                    payload=s,
+                )
+
+            result = {
+                "suggestions": suggestions_out,
+                "auto_match": auto_info,
+                "stats": stats,
+            }
+
+            # Atualiza alguns campos básicos (sem supor todos os atributos do model)
+            task_row.suggestion_count = stats.get("suggestion_count", len(suggestions_out))
+            if hasattr(task_row, "bank_candidates"):
+                task_row.bank_candidates = stats.get("bank_candidates")
+            if hasattr(task_row, "journal_candidates"):
+                task_row.journal_candidates = stats.get("journal_candidates")
+            if hasattr(task_row, "matched_bank_transactions"):
+                task_row.matched_bank_transactions = stats.get("matched_bank_transactions")
+            if hasattr(task_row, "matched_journal_entries"):
+                task_row.matched_journal_entries = stats.get("matched_journal_entries")
+            if hasattr(task_row, "duration_seconds"):
+                task_row.duration_seconds = stats.get("duration_seconds")
+            if hasattr(task_row, "soft_time_limit_seconds"):
+                task_row.soft_time_limit_seconds = stats.get("time_limit_seconds")
+            if hasattr(task_row, "auto_match_enabled"):
+                task_row.auto_match_enabled = bool(auto_info.get("enabled", False))
+            if hasattr(task_row, "auto_match_applied"):
+                task_row.auto_match_applied = int(auto_info.get("applied", 0))
+            if hasattr(task_row, "auto_match_skipped"):
+                task_row.auto_match_skipped = int(auto_info.get("skipped", 0))
+            if hasattr(task_row, "stats"):
+                task_row.stats = stats
+            if hasattr(task_row, "result"):
+                task_row.result = result
+
+            task_row.status = "completed"
+            task_row.finished_at = timezone.now()
+            task_row.save()  # sem update_fields para não errar nome de campo
+
+        return result
+
+    except Exception as exc:
+        logger.exception("match_many_to_many_fast_task failed: %s", exc)
+        task_row.status = "failed"
+        task_row.finished_at = timezone.now()
+        task_row.save(update_fields=["status", "finished_at"])
+        return {"error": str(exc)}
 
 
 
