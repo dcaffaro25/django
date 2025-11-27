@@ -2875,7 +2875,7 @@ class ReconciliationService:
         book_qs = (
             JournalEntry.objects
             .exclude(reconciliations__status__in=["matched", "approved"])
-            .filter(company_id=company_id)              # <- NOVO: escopo por company
+            .filter(company_id=company_id)
             .filter(account__bank_account__isnull=False)
             .select_related("transaction")
             .only(
@@ -2918,21 +2918,36 @@ class ReconciliationService:
             pre_account_count,
         )
         
-        # Convert querysets to DTOs
-        candidate_bank: List[BankTransactionDTO] = [
-            BankTransactionDTO(
-                id=tx.id,
-                company_id=tx.company_id,
-                date=tx.date,
-                amount=tx.amount,
-                currency_id=tx.currency_id,
-                description=tx.description,
-                embedding=_as_vec_list(getattr(tx, "description_embedding", None)),
+        # ------------------------------------------------------------------
+        # Convert querysets to DTOs, EXCLUINDO amount == 0
+        # ------------------------------------------------------------------
+        candidate_bank: List[BankTransactionDTO] = []
+        skipped_zero_bank = 0
+
+        for tx in bank_qs:
+            amt = tx.amount or Decimal("0")
+            # usamos q2 para garantir consistência com o resto do engine
+            if q2(amt) == Decimal("0.00"):
+                skipped_zero_bank += 1
+                continue
+
+            candidate_bank.append(
+                BankTransactionDTO(
+                    id=tx.id,
+                    company_id=tx.company_id,
+                    date=tx.date,
+                    amount=amt,
+                    currency_id=tx.currency_id,
+                    description=tx.description,
+                    embedding=_as_vec_list(getattr(tx, "description_embedding", None)),
+                )
             )
-            for tx in bank_qs
-        ]
-        
-        log.debug("Created %d BankTransactionDTOs", len(candidate_bank))
+
+        log.debug(
+            "Created %d BankTransactionDTOs (skipped %d with zero amount)",
+            len(candidate_bank),
+            skipped_zero_bank,
+        )
         for dto in candidate_bank[:10]:
             log.debug(
                 "BankDTO: id=%s, amount=%s, date=%s, currency_id=%s, company_id=%s",
@@ -2940,12 +2955,24 @@ class ReconciliationService:
             )
         
         candidate_book: List[JournalEntryDTO] = []
+        skipped_zero_book = 0
+
         for je in book_qs:
             tr = getattr(je, "transaction", None)
             tr_date = je.date or (tr.date if tr else None)
             tr_curr_id = tr.currency_id if tr else None
             tr_desc = tr.description if tr else ""
             tr_vec = _as_vec_list(getattr(tr, "description_embedding", None)) if tr else None
+
+            eff_amt = je.get_effective_amount()
+            if eff_amt is None:
+                # sem valor efetivo → não tentamos conciliar agora
+                skipped_zero_book += 1
+                continue
+            if q2(eff_amt) == Decimal("0.00"):
+                # valor efetivo 0 → fora desta etapa de conciliação
+                skipped_zero_book += 1
+                continue
         
             candidate_book.append(
                 JournalEntryDTO(
@@ -2953,14 +2980,18 @@ class ReconciliationService:
                     company_id=je.company_id,
                     transaction_id=je.transaction_id,
                     date=tr_date,
-                    effective_amount=je.get_effective_amount(),
+                    effective_amount=eff_amt,
                     currency_id=tr_curr_id,
                     description=tr_desc,
                     embedding=tr_vec,
                 )
             )
         
-        log.debug("Created %d JournalEntryDTOs", len(candidate_book))
+        log.debug(
+            "Created %d JournalEntryDTOs (skipped %d with zero effective_amount)",
+            len(candidate_book),
+            skipped_zero_book,
+        )
         for dto in candidate_book[:10]:
             log.debug(
                 "BookDTO: id=%s, tx_id=%s, amount=%s, date=%s, currency_id=%s, company_id=%s",
@@ -3110,10 +3141,11 @@ class ReconciliationService:
         }
 
         log.info(
-            "Recon task: company=%s config_id=%s pipeline_id=%s banks=%d books=%d suggestions=%d duration=%.3fs",
+            "Recon task: company=%s config_id=%s pipeline_id=%s banks=%d books=%d suggestions=%d duration=%.3fs (skipped_zero_bank=%d, skipped_zero_book=%d)",
             company_id, config_id, pipeline_id,
             bank_candidate_count, book_candidate_count,
             suggestion_count, duration,
+            skipped_zero_bank, skipped_zero_book,
         )
         
         return {
