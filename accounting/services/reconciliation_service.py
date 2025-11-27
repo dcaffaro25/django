@@ -880,294 +880,6 @@ class ReconciliationPipelineEngine:
                                 cb_exc,
                             )
 
-    def _run_one_to_many_fast(self, banks, books, stage: StageConfig):
-        """
-        FAST variant of one-to-many:
-
-        Same semantics as _run_one_to_many, but we cap the number of candidate
-        books per bank based on amount/date proximity to reduce combinatorial
-        explosion on large datasets.
-        """
-        available_books = [
-            b for b in books
-            if b.id not in self.used_books and b.company_id == self.company_id
-        ]
-        win = stage.candidate_window_days
-        max_k = max(int(stage.max_alternatives_per_anchor or 1), 1)
-
-        # hard cap of local candidates per bank
-        MAX_LOCAL_BOOKS = 128
-
-        log.debug(
-            "_run_one_to_many_fast: banks=%d books=%d win=%d amount_tol=%s "
-            "allow_mixed=%s max_k=%d max_local_books=%d",
-            len(banks), len(books), win, stage.amount_tol,
-            stage.allow_mixed_signs, max_k, MAX_LOCAL_BOOKS,
-        )
-
-        def add_candidate(sug: dict, buf: list[dict]) -> None:
-            score = float(sug.get("confidence_score", 0.0))
-            if len(buf) < max_k:
-                buf.append(sug)
-                return
-            worst_idx = min(
-                range(len(buf)),
-                key=lambda i: float(buf[i].get("confidence_score", 0.0)),
-            )
-            if score > float(buf[worst_idx].get("confidence_score", 0.0)):
-                buf[worst_idx] = sug
-
-        for bank in banks:
-            if self._time_exceeded():
-                return
-            if bank.id in self.used_banks:
-                continue
-
-            bank_amt = bank.amount_base or Decimal("0")
-            bank_sign = _sign(bank_amt)
-
-            # date window
-            local_books = [
-                b for b in available_books
-                if b.date and bank.date and abs((bank.date - b.date).days) <= win
-            ]
-            if not local_books:
-                continue
-
-            # sign filtering if mixed_signs is False
-            if not stage.allow_mixed_signs and bank_sign != 0:
-                if bank_sign > 0:
-                    local_books = [
-                        b for b in local_books
-                        if (b.amount_base or Decimal("0")) >= 0
-                    ]
-                else:
-                    local_books = [
-                        b for b in local_books
-                        if (b.amount_base or Decimal("0")) <= 0
-                    ]
-                if not local_books:
-                    continue
-
-            # CAP: keep only the closest candidates by amount + date
-            if len(local_books) > MAX_LOCAL_BOOKS:
-                target = q2(bank_amt)
-
-                def sort_key(b):
-                    amt = b.amount_base or Decimal("0")
-                    amt_diff = abs(q2(amt) - target)
-                    date_diff = (
-                        abs((b.date - bank.date).days)
-                        if b.date and bank.date
-                        else 9999
-                    )
-                    return (amt_diff, date_diff)
-
-                before = len(local_books)
-                local_books = sorted(local_books, key=sort_key)[:MAX_LOCAL_BOOKS]
-                log.debug(
-                    "_run_one_to_many_fast: bank_id=%s capped local_books from %d to %d",
-                    bank.id, before, len(local_books),
-                )
-
-            book_amounts = [(b.amount_base or Decimal("0")) for b in local_books]
-            if not book_amounts:
-                continue
-
-            has_pos = any(a > 0 for a in book_amounts)
-            has_neg = any(a < 0 for a in book_amounts)
-            mixed_signs = has_pos and has_neg
-
-            candidates: list[dict] = []
-
-            # ---- PATH 1: mixed-sign search (only if allowed) ----
-            if mixed_signs and stage.allow_mixed_signs:
-                combo = self._find_mixed_one_to_many_group(bank, local_books, stage)
-                if combo:
-                    book_dates = [b.date for b in combo if b.date]
-                    book_span = (
-                        (max(book_dates) - min(book_dates)).days
-                        if len(book_dates) >= 2
-                        else 0
-                    )
-                    bank_avg = bank.date
-                    book_avg = self._weighted_avg_date(combo)
-                    avg_delta = (
-                        abs((bank_avg - book_avg).days)
-                        if (bank_avg and book_avg)
-                        else win + 1
-                    )
-
-                    sim = self._cosine_similarity(
-                        bank.embedding or [], _avg_embedding(combo)
-                    )
-                    scores = compute_match_scores(
-                        embed_sim=sim,
-                        amount_diff=Decimal("0"),
-                        amount_tol=stage.amount_tol or CENT,
-                        date_diff=avg_delta,
-                        date_tol=stage.avg_date_delta_days or 1,
-                        currency_match=1.0,
-                        weights=self.stage_weights,
-                    )
-                    sug = self._make_suggestion(
-                        "one_to_many",
-                        [bank],
-                        list(combo),
-                        scores["global_score"],
-                        stage=stage,
-                        weights=self.stage_weights,
-                        component_scores=scores,
-                        extra={
-                            "book_span_days_measured": book_span,
-                            "avg_date_delta_days_measured": avg_delta,
-                            "mixed_signs": True,
-                        },
-                    )
-                    add_candidate(sug, candidates)
-
-            # ---- PATH 2: same-sign / bounded search ----
-            target = q2(bank_amt)
-            tol = stage.amount_tol or Decimal("0")
-
-            min_possible = sum(a for a in book_amounts if a < 0)
-            max_possible = sum(a for a in book_amounts if a > 0)
-            L = target - tol
-            U = target + tol
-            if U < min_possible or L > max_possible:
-                if candidates:
-                    candidates.sort(
-                        key=lambda s: float(s["confidence_score"]), reverse=True
-                    )
-                    best = candidates[0]
-                    self._record(best)
-                    for alt in candidates[1:]:
-                        self.suggestions.append(alt)
-                        if self._on_suggestion:
-                            try:
-                                self._on_suggestion(alt)
-                            except Exception as cb_exc:
-                                log.warning(
-                                    "on_suggestion callback failed (alt one_to_many_fast): %s",
-                                    cb_exc,
-                                )
-                continue
-
-            all_non_negative = all(a >= 0 for a in book_amounts)
-            use_prefix_bounds = all_non_negative and target >= 0
-
-            max_size = min(stage.max_group_size_book, len(local_books))
-
-            prefix_max: List[Decimal] = []
-            if use_prefix_bounds:
-                amounts_desc = sorted(book_amounts, reverse=True)
-                acc = Decimal("0")
-                for amt in amounts_desc:
-                    acc += amt
-                    prefix_max.append(acc)
-                if q2(prefix_max[-1]) + tol < target:
-                    if candidates:
-                        candidates.sort(
-                            key=lambda s: float(s["confidence_score"]), reverse=True
-                        )
-                        best = candidates[0]
-                        self._record(best)
-                        for alt in candidates[1:]:
-                            self.suggestions.append(alt)
-                            if self._on_suggestion:
-                                try:
-                                    self._on_suggestion(alt)
-                                except Exception as cb_exc:
-                                    log.warning(
-                                        "on_suggestion callback failed (alt many_to_many_fast): %s",
-                                        cb_exc,
-                                    )
-                    continue
-
-            for size in range(1, max_size + 1):
-                if self._time_exceeded():
-                    return
-
-                if use_prefix_bounds and q2(prefix_max[size - 1]) + tol < target:
-                    continue
-
-                for combo in combinations(local_books, size):
-                    if self._time_exceeded():
-                        return
-
-                    if any(x.id in self.used_books for x in combo):
-                        continue
-
-                    total = sum((b.amount_base for b in combo), Decimal("0"))
-                    diff = abs(q2(total) - target)
-                    if diff > stage.amount_tol:
-                        continue
-                    if any(b.currency_id != bank.currency_id for b in combo):
-                        continue
-
-                    book_dates = [b.date for b in combo if b.date]
-                    book_span = (
-                        (max(book_dates) - min(book_dates)).days
-                        if len(book_dates) >= 2
-                        else 0
-                    )
-                    if stage.group_span_days and book_span > stage.group_span_days:
-                        continue
-
-                    bank_avg = bank.date
-                    book_avg = self._weighted_avg_date(combo)
-                    avg_delta = (
-                        abs((bank_avg - book_avg).days)
-                        if (bank_avg and book_avg)
-                        else win + 1
-                    )
-                    if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
-                        continue
-
-                    sim = self._cosine_similarity(
-                        bank.embedding or [], _avg_embedding(combo)
-                    )
-                    scores = compute_match_scores(
-                        embed_sim=sim,
-                        amount_diff=Decimal("0"),
-                        amount_tol=stage.amount_tol or CENT,
-                        date_diff=avg_delta,
-                        date_tol=stage.avg_date_delta_days or 1,
-                        currency_match=1.0,
-                        weights=self.stage_weights,
-                    )
-                    sug = self._make_suggestion(
-                        "one_to_many",
-                        [bank],
-                        list(combo),
-                        scores["global_score"],
-                        stage=stage,
-                        weights=self.stage_weights,
-                        component_scores=scores,
-                        extra={
-                            "book_span_days_measured": book_span,
-                            "avg_date_delta_days_measured": avg_delta,
-                            "mixed_signs": False,
-                        },
-                    )
-                    add_candidate(sug, candidates)
-
-            if candidates:
-                candidates.sort(
-                    key=lambda s: float(s["confidence_score"]), reverse=True
-                )
-                best = candidates[0]
-                self._record(best)
-                for alt in candidates[1:]:
-                    self.suggestions.append(alt)
-                    if self._on_suggestion:
-                        try:
-                            self._on_suggestion(alt)
-                        except Exception as cb_exc:
-                            log.warning(
-                                "on_suggestion callback failed (alt many_to_many_fast): %s",
-                                cb_exc,
-                            )
 
     
     def _run_many_to_one(self, banks, books, stage: StageConfig):
@@ -1396,300 +1108,6 @@ class ReconciliationPipelineEngine:
                                 "on_suggestion callback failed (alt many_to_many): %s",
                                 cb_exc,
                             )
-
-    def _run_many_to_one_fast(self, banks, books, stage: StageConfig):
-        """
-        FAST variant of many-to-one:
-
-        Same semantics as _run_many_to_one but with a hard cap on the number
-        of candidate banks per book based on amount/date proximity.
-        """
-        available_banks = [
-            b for b in banks
-            if b.id not in self.used_banks and b.company_id == self.company_id
-        ]
-        win = stage.candidate_window_days
-        max_k = max(int(stage.max_alternatives_per_anchor or 1), 1)
-
-        MAX_LOCAL_BANKS = 128
-
-        log.debug(
-            "_run_many_to_one_fast: banks=%d books=%d win=%d amount_tol=%s "
-            "allow_mixed=%s max_k=%d max_local_banks=%d",
-            len(banks), len(books), win, stage.amount_tol,
-            stage.allow_mixed_signs, max_k, MAX_LOCAL_BANKS,
-        )
-
-        def add_candidate(sug: dict, buf: list[dict]) -> None:
-            score = float(sug.get("confidence_score", 0.0))
-            if len(buf) < max_k:
-                buf.append(sug)
-                return
-            worst_idx = min(
-                range(len(buf)),
-                key=lambda i: float(buf[i].get("confidence_score", 0.0)),
-            )
-            if score > float(buf[worst_idx].get("confidence_score", 0.0)):
-                buf[worst_idx] = sug
-
-        for book in books:
-            if self._time_exceeded():
-                return
-            if book.id in self.used_books:
-                continue
-
-            book_amt = book.amount_base or Decimal("0")
-            book_sign = _sign(book_amt)
-
-            local_banks = [
-                b for b in available_banks
-                if b.date and book.date and abs((b.date - book.date).days) <= win
-            ]
-            if not local_banks:
-                continue
-
-            bank_amounts = [(b.amount_base or Decimal("0")) for b in local_banks]
-            if not bank_amounts:
-                continue
-
-            has_pos = any(a > 0 for a in bank_amounts)
-            has_neg = any(a < 0 for a in bank_amounts)
-            mixed_signs = has_pos and has_neg
-
-            if not stage.allow_mixed_signs and book_sign != 0:
-                if book_sign > 0:
-                    local_banks = [
-                        b for b in local_banks
-                        if (b.amount_base or Decimal("0")) >= 0
-                    ]
-                else:
-                    local_banks = [
-                        b for b in local_banks
-                        if (b.amount_base or Decimal("0")) <= 0
-                    ]
-                if not local_banks:
-                    continue
-                bank_amounts = [(b.amount_base or Decimal("0")) for b in local_banks]
-                has_pos = any(a > 0 for a in bank_amounts)
-                has_neg = any(a < 0 for a in bank_amounts)
-                mixed_signs = has_pos and has_neg
-
-            # CAP: limit local_banks per book
-            if len(local_banks) > MAX_LOCAL_BANKS:
-                target = q2(book_amt)
-
-                def sort_key(b):
-                    amt = b.amount_base or Decimal("0")
-                    amt_diff = abs(q2(amt) - target)
-                    date_diff = (
-                        abs((b.date - book.date).days)
-                        if b.date and book.date
-                        else 9999
-                    )
-                    return (amt_diff, date_diff)
-
-                before = len(local_banks)
-                local_banks = sorted(local_banks, key=sort_key)[:MAX_LOCAL_BANKS]
-                bank_amounts = [(b.amount_base or Decimal("0")) for b in local_banks]
-                log.debug(
-                    "_run_many_to_one_fast: book_id=%s capped local_banks from %d to %d",
-                    book.id, before, len(local_banks),
-                )
-
-            candidates: list[dict] = []
-
-            # ---- PATH 1: mixed-sign via DFS ----
-            if mixed_signs and stage.allow_mixed_signs:
-                combo = self._find_mixed_many_to_one_group(book, local_banks, stage)
-                if combo:
-                    bank_dates = [b.date for b in combo if b.date]
-                    bank_span = (
-                        (max(bank_dates) - min(bank_dates)).days
-                        if len(bank_dates) >= 2
-                        else 0
-                    )
-                    bank_avg = self._weighted_avg_date(combo)
-                    book_avg = book.date
-                    avg_delta = (
-                        abs((bank_avg - book_avg).days)
-                        if (bank_avg and book_avg)
-                        else win + 1
-                    )
-
-                    sim = self._cosine_similarity(
-                        _avg_embedding(combo), book.embedding or []
-                    )
-                    scores = compute_match_scores(
-                        embed_sim=sim,
-                        amount_diff=Decimal("0"),
-                        amount_tol=stage.amount_tol or CENT,
-                        date_diff=avg_delta,
-                        date_tol=stage.avg_date_delta_days or 1,
-                        currency_match=1.0,
-                        weights=self.stage_weights,
-                    )
-                    sug = self._make_suggestion(
-                        "many_to_one",
-                        list(combo),
-                        [book],
-                        scores["global_score"],
-                        stage=stage,
-                        weights=self.stage_weights,
-                        component_scores=scores,
-                        extra={
-                            "bank_span_days_measured": bank_span,
-                            "avg_date_delta_days_measured": avg_delta,
-                            "mixed_signs": True,
-                        },
-                    )
-                    add_candidate(sug, candidates)
-
-            # ---- PATH 2: same-sign bounded search ----
-            target = q2(book_amt)
-            tol = stage.amount_tol or Decimal("0")
-
-            min_possible = sum(a for a in bank_amounts if a < 0)
-            max_possible = sum(a for a in bank_amounts if a > 0)
-            L = target - tol
-            U = target + tol
-            if U < min_possible or L > max_possible:
-                if candidates:
-                    candidates.sort(
-                        key=lambda s: float(s["confidence_score"]), reverse=True
-                    )
-                    best = candidates[0]
-                    self._record(best)
-                    for alt in candidates[1:]:
-
-                        self.suggestions.append(alt)
-                        if self._on_suggestion:
-                            try:
-                                self._on_suggestion(alt)
-                            except Exception as cb_exc:
-                                log.warning(
-                                    "on_suggestion callback failed (alt many_to_one_fast): %s",
-                                    cb_exc,
-                                )
-                continue
-
-            all_non_negative = all(a >= 0 for a in bank_amounts)
-            use_prefix_bounds = all_non_negative and target >= 0
-
-            max_size = min(stage.max_group_size_bank, len(local_banks))
-
-            prefix_max: List[Decimal] = []
-            if use_prefix_bounds:
-                amounts_desc = sorted(bank_amounts, reverse=True)
-                acc = Decimal("0")
-                for amt in amounts_desc:
-                    acc += amt
-                    prefix_max.append(acc)
-                if q2(prefix_max[-1]) + tol < target:
-                    if candidates:
-                        candidates.sort(
-                            key=lambda s: float(s["confidence_score"]), reverse=True
-                        )
-                        best = candidates[0]
-                        self._record(best)
-                        for alt in candidates[1:]:
-
-                            self.suggestions.append(alt)
-                            if self._on_suggestion:
-                                try:
-                                    self._on_suggestion(alt)
-                                except Exception as cb_exc:
-                                    log.warning(
-                                        "on_suggestion callback failed (alt many_to_many_fast): %s",
-                                        cb_exc,
-                                    )
-                    continue
-
-            for size in range(1, max_size + 1):
-                if self._time_exceeded():
-                    return
-
-                if use_prefix_bounds and q2(prefix_max[size - 1]) + tol < target:
-                    continue
-
-                for combo in combinations(local_banks, size):
-                    if self._time_exceeded():
-                        return
-
-                    if any(x.id in self.used_banks for x in combo):
-                        continue
-
-                    total = sum((b.amount_base for b in combo), Decimal("0"))
-                    diff = abs(q2(total) - target)
-                    if diff > stage.amount_tol:
-                        continue
-                    if any(b.currency_id != book.currency_id for b in combo):
-                        continue
-
-                    bank_dates = [b.date for b in combo if b.date]
-                    bank_span = (
-                        (max(bank_dates) - min(bank_dates)).days
-                        if len(bank_dates) >= 2
-                        else 0
-                    )
-                    if stage.group_span_days and bank_span > stage.group_span_days:
-                        continue
-
-                    bank_avg = self._weighted_avg_date(combo)
-                    book_avg = book.date
-                    avg_delta = (
-                        abs((bank_avg - book_avg).days)
-                        if (bank_avg and book_avg)
-                        else win + 1
-                    )
-                    if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
-                        continue
-
-                    sim = self._cosine_similarity(
-                        _avg_embedding(combo), book.embedding or []
-                    )
-                    scores = compute_match_scores(
-                        embed_sim=sim,
-                        amount_diff=Decimal("0"),
-                        amount_tol=stage.amount_tol or CENT,
-                        date_diff=avg_delta,
-                        date_tol=stage.avg_date_delta_days or 1,
-                        currency_match=1.0,
-                        weights=self.stage_weights,
-                    )
-                    sug = self._make_suggestion(
-                        "many_to_one",
-                        list(combo),
-                        [book],
-                        scores["global_score"],
-                        stage=stage,
-                        weights=self.stage_weights,
-                        component_scores=scores,
-                        extra={
-                            "bank_span_days_measured": bank_span,
-                            "avg_date_delta_days_measured": avg_delta,
-                            "mixed_signs": False,
-                        },
-                    )
-                    add_candidate(sug, candidates)
-
-            if candidates:
-                candidates.sort(
-                    key=lambda s: float(s["confidence_score"]), reverse=True
-                )
-                best = candidates[0]
-                self._record(best)
-                for alt in candidates[1:]:
-                    self.suggestions.append(alt)
-                    if self._on_suggestion:
-                        try:
-                            self._on_suggestion(alt)
-                        except Exception as cb_exc:
-                            log.warning(
-                                "on_suggestion callback failed (alt many_to_many_fast): %s",
-                                cb_exc,
-                            )
-
-    
 
 
     def _run_fuzzy_1to1(self, banks, books, stage: StageConfig):
@@ -2101,266 +1519,6 @@ class ReconciliationPipelineEngine:
                                 cb_exc,
                             )
 
-    def _run_many_to_many_fast(self, banks, books, stage: StageConfig):
-        """
-        FAST variant of many-to-many matching.
-
-        Similar to _run_many_to_many but we cap the date-window size for both
-        bank and book sides around the anchor bank to keep the search tractable.
-        """
-        sorted_banks = [b for b in banks if b.company_id == self.company_id]
-        sorted_banks.sort(key=lambda b: b.date)
-        sorted_books = [e for e in books if e.company_id == self.company_id]
-        sorted_books.sort(key=lambda e: e.date)
-    
-        win = stage.candidate_window_days
-        max_k = max(int(stage.max_alternatives_per_anchor or 1), 1)
-
-        MAX_BANK_WINDOW = 64
-        MAX_BOOK_WINDOW = 64
-
-        log.debug(
-            "_run_many_to_many_fast: banks=%d books=%d win=%d amount_tol=%s "
-            "allow_mixed=%s max_k=%d max_bank_window=%d max_book_window=%d",
-            len(sorted_banks), len(sorted_books), win, stage.amount_tol,
-            stage.allow_mixed_signs, max_k, MAX_BANK_WINDOW, MAX_BOOK_WINDOW,
-        )
-
-        def add_candidate(sug: dict, buf: list[dict]) -> None:
-            score = float(sug.get("confidence_score", 0.0))
-            if len(buf) < max_k:
-                buf.append(sug)
-                return
-            worst_idx = min(
-                range(len(buf)),
-                key=lambda i: float(buf[i].get("confidence_score", 0.0)),
-            )
-            if score > float(buf[worst_idx].get("confidence_score", 0.0)):
-                buf[worst_idx] = sug
-    
-        for bank in sorted_banks:
-            if self._time_exceeded():
-                return
-            if bank.id in self.used_banks:
-                continue
-
-            bank_amt = bank.amount_base or Decimal("0")
-            bank_sign = _sign(bank_amt)
-    
-            start = bank.date - timedelta(days=win)
-            end = bank.date + timedelta(days=win)
-            bank_window = [b for b in sorted_banks if start <= b.date <= end]
-            book_window = [e for e in sorted_books if start <= e.date <= end]
-            if not bank_window or not book_window:
-                continue
-
-            if not stage.allow_mixed_signs and bank_sign != 0:
-                if bank_sign > 0:
-                    bank_window = [
-                        b for b in bank_window
-                        if (b.amount_base or Decimal("0")) >= 0
-                    ]
-                    book_window = [
-                        e for e in book_window
-                        if (e.amount_base or Decimal("0")) >= 0
-                    ]
-                else:
-                    bank_window = [
-                        b for b in bank_window
-                        if (b.amount_base or Decimal("0")) <= 0
-                    ]
-                    book_window = [
-                        e for e in book_window
-                        if (e.amount_base or Decimal("0")) <= 0
-                    ]
-                if not bank_window or not book_window:
-                    continue
-
-            # CAP: limit bank_window and book_window sizes
-            if len(bank_window) > MAX_BANK_WINDOW:
-                others = [b for b in bank_window if b.id != bank.id]
-
-                def sort_key_bank(bk):
-                    amt = bk.amount_base or Decimal("0")
-                    amt_diff = abs(q2(amt) - q2(bank_amt))
-                    date_diff = (
-                        abs((bk.date - bank.date).days)
-                        if bk.date and bank.date
-                        else 9999
-                    )
-                    return (amt_diff, date_diff)
-
-                others_sorted = sorted(others, key=sort_key_bank)
-                before = len(bank_window)
-                bank_window = [bank] + others_sorted[: MAX_BANK_WINDOW - 1]
-                log.debug(
-                    "_run_many_to_many_fast: anchor bank_id=%s capped bank_window from %d to %d",
-                    bank.id, before, len(bank_window),
-                )
-
-            if len(book_window) > MAX_BOOK_WINDOW:
-                # approximate target as |bank_amt| to bias by scale
-                approximate_target = q2(bank_amt)
-
-                def sort_key_book(e):
-                    amt = e.amount_base or Decimal("0")
-                    amt_diff = abs(q2(amt) - approximate_target)
-                    date_diff = (
-                        abs((e.date - bank.date).days)
-                        if e.date and bank.date
-                        else 9999
-                    )
-                    return (amt_diff, date_diff)
-
-                before = len(book_window)
-                book_window = sorted(book_window, key=sort_key_book)[:MAX_BOOK_WINDOW]
-                log.debug(
-                    "_run_many_to_many_fast: anchor bank_id=%s capped book_window from %d to %d",
-                    bank.id, before, len(book_window),
-                )
-
-            if not bank_window or not book_window:
-                continue
-
-            candidates: list[dict] = []
-            tol = stage.amount_tol or Decimal("0")
-    
-            for i in range(1, min(stage.max_group_size_bank, len(bank_window)) + 1):
-                if self._time_exceeded():
-                    return
-
-                for bank_combo in combinations(bank_window, i):
-                    if self._time_exceeded():
-                        return
-                    if bank.id != min(b.id for b in bank_combo):
-                        continue
-                    if any(bc.id in self.used_banks for bc in bank_combo):
-                        continue
-    
-                    sum_bank = sum((b.amount_base for b in bank_combo), Decimal("0"))
-                    target = q2(sum_bank)
-
-                    book_amounts = [
-                        e.amount_base for e in book_window if e.amount_base is not None
-                    ]
-                    if not book_amounts:
-                        continue
-
-                    min_possible = sum(a for a in book_amounts if a < 0)
-                    max_possible = sum(a for a in book_amounts if a > 0)
-                    L = target - tol
-                    U = target + tol
-                    if U < min_possible or L > max_possible:
-                        continue
-
-                    all_non_negative = all(a >= 0 for a in book_amounts)
-                    use_prefix_bounds = all_non_negative and target >= 0
-
-                    book_prefix_max: List[Decimal] = []
-                    if use_prefix_bounds:
-                        book_amounts_desc = sorted(book_amounts, reverse=True)
-                        acc = Decimal("0")
-                        for amt in book_amounts_desc:
-                            acc += amt
-                            book_prefix_max.append(acc)
-                        if q2(book_prefix_max[-1]) + tol < target:
-                            continue
-    
-                    max_book_group_size = min(
-                        stage.max_group_size_book, len(book_window)
-                    )
-
-                    for j in range(1, max_book_group_size + 1):
-                        if self._time_exceeded():
-                            return
-
-                        if use_prefix_bounds and q2(book_prefix_max[j - 1]) + tol < target:
-                            continue
-
-                        for book_combo in combinations(book_window, j):
-                            if self._time_exceeded():
-                                return
-                            if any(bk.id in self.used_books for bk in book_combo):
-                                continue
-    
-                            sum_book = sum(
-                                (e.amount_base for e in book_combo), Decimal("0")
-                            )
-                            diff = abs(q2(sum_book) - target)
-                            if diff > stage.amount_tol:
-                                continue
-                            if any(
-                                b.currency_id != e.currency_id
-                                for b in bank_combo
-                                for e in book_combo
-                            ):
-                                continue
-    
-                            bank_span = self._date_span_days(bank_combo)
-                            book_span = self._date_span_days(book_combo)
-                            if stage.group_span_days:
-                                if bank_span > stage.group_span_days:
-                                    continue
-                                if book_span > stage.group_span_days:
-                                    continue
-    
-                            bank_avg = self._weighted_avg_date(bank_combo)
-                            book_avg = self._weighted_avg_date(book_combo)
-                            avg_delta = (
-                                abs((bank_avg - book_avg).days)
-                                if (bank_avg and book_avg)
-                                else win + 1
-                            )
-                            if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
-                                continue
-    
-                            emb_bank = _avg_embedding(bank_combo)
-                            emb_book = _avg_embedding(book_combo)
-                            embed_sim = self._cosine_similarity(emb_bank, emb_book)
-    
-                            scores = compute_match_scores(
-                                embed_sim=embed_sim,
-                                amount_diff=Decimal("0"),
-                                amount_tol=stage.amount_tol or CENT,
-                                date_diff=avg_delta,
-                                date_tol=stage.avg_date_delta_days or 1,
-                                currency_match=1.0,
-                                weights=self.stage_weights,
-                            )
-    
-                            sug = self._make_suggestion(
-                                "many_to_many",
-                                list(bank_combo),
-                                list(book_combo),
-                                scores["global_score"],
-                                stage=stage,
-                                weights=self.stage_weights,
-                                component_scores=scores,
-                                extra={
-                                    "bank_span_days_measured": bank_span,
-                                    "book_span_days_measured": book_span,
-                                    "avg_date_delta_days_measured": avg_delta,
-                                    "mixed_signs_allowed": stage.allow_mixed_signs,
-                                },
-                            )
-                            add_candidate(sug, candidates)
-
-            if candidates:
-                candidates.sort(
-                    key=lambda s: float(s["confidence_score"]), reverse=True
-                )
-                best = candidates[0]
-                self._record(best)
-                for alt in candidates[1:]:
-                    self.suggestions.append(alt)
-                    if self._on_suggestion:
-                        try:
-                            self._on_suggestion(alt)
-                        except Exception as cb_exc:
-                            log.warning(
-                                "on_suggestion callback failed (alt many_to_many_fast): %s",
-                                cb_exc,
-                            )
 
 
     # ------------------------ Internal helpers ------------------------
@@ -2548,7 +1706,1093 @@ class ReconciliationPipelineEngine:
             except Exception as cb_exc:
                 log.warning("on_suggestion callback failed: %s", cb_exc)
 
+    # ----------------------------------------------------------------------
+    # Adaptive strategy selection and candidate preparation
+    # ----------------------------------------------------------------------
+    def _adaptive_select_strategy(
+        self,
+        banks: List[BankTransactionDTO],
+        books: List[JournalEntryDTO],
+        stage: StageConfig,
+    ) -> dict:
+        """
+        Determine the best search strategy and parameters based on data size and characteristics.
+        
+        Returns a dict with fields:
+          - strategy:   "exact", "branch_and_bound", "beam", etc.
+          - max_size:   maximum subset size to explore (books or banks)
+          - max_cands:  maximum number of local candidates to retain after pre-filtering
+          - beam_width: beam width for beam search (if used)
+        """
+        n_banks = len(banks)
+        n_books = len(books)
+        # Count non-zero and mixed-sign samples
+        bank_signs = [_sign(b.amount_base) for b in banks]
+        book_signs = [_sign(e.amount_base) for e in books]
+        has_mixed_banks = 1 in bank_signs and -1 in bank_signs
+        has_mixed_books = 1 in book_signs and -1 in book_signs
+        
+        # Base result
+        result = {
+            "strategy": "exact",
+            "max_size": max(stage.max_group_size_book, stage.max_group_size_bank),
+            "max_cands": None,
+            "beam_width": None,
+        }
+        
+        # Decide candidate cap: larger sets require pruning
+        if n_books > 40 or n_banks > 40:
+            result["max_cands"] = 64  # keep only 64 local candidates
+        elif n_books > 20 or n_banks > 20:
+            result["max_cands"] = 32
+        
+        # Set a beam width for heuristic search
+        # Larger data sets use a moderate beam; smaller sets use exact search
+        if (n_books > 50 or n_banks > 50) and not has_mixed_books and not has_mixed_banks:
+            # data too large for full enumeration, use beam search
+            result["strategy"] = "beam"
+            result["beam_width"] = 10
+            result["max_size"] = stage.max_group_size_book
+        else:
+            result["strategy"] = "exact"
+    
+        return result
+    
+    def _prepare_candidates(
+        self,
+        bank: BankTransactionDTO,
+        books: List[JournalEntryDTO],
+        stage: StageConfig,
+        max_local: Optional[int] = None,
+    ) -> List[JournalEntryDTO]:
+        """
+        Select candidate books near the bank in date and currency, with optional cap.
+        
+        Handles same-sign filtering and returns a list sorted by (amount diff, date diff).
+        """
+        win = stage.candidate_window_days
+        bank_amt = bank.amount_base or Decimal("0")
+        bank_sign = _sign(bank_amt)
+        
+        # Filter by company, date window, and currency
+        local_books = [
+            b for b in books
+            if b.company_id == self.company_id
+            and b.currency_id == bank.currency_id
+            and b.date and bank.date
+            and abs((b.date - bank.date).days) <= win
+        ]
+        
+        # Filter by sign if mixed signs are not allowed
+        if not stage.allow_mixed_signs and bank_sign != 0:
+            if bank_sign > 0:
+                local_books = [b for b in local_books if _sign(b.amount_base) >= 0]
+            else:
+                local_books = [b for b in local_books if _sign(b.amount_base) <= 0]
+        
+        # If no cap or small list, return all
+        if not max_local or len(local_books) <= max_local:
+            return local_books
+        
+        # Otherwise sort by combined (amount diff, date diff) and cap
+        target = q2(bank_amt)
+        def sort_key(b):
+            amt_diff = abs(q2(b.amount_base or Decimal("0")) - target)
+            date_diff = abs((b.date - bank.date).days) if b.date and bank.date else 9999
+            return (amt_diff, date_diff)
+        
+        local_sorted = sorted(local_books, key=sort_key)
+        return local_sorted[:max_local]
+    
+    def _evaluate_and_record_candidates(
+        self,
+        match_type: str,
+        bank: BankTransactionDTO,
+        combos: List[List[JournalEntryDTO]],
+        stage: StageConfig,
+        extra_info: Optional[dict] = None,
+    ) -> None:
+        """
+        Given a list of book combos for a single bank, compute scores, sort, and record suggestions.
+        
+        extra_info: additional data to include in the suggestion's 'extra' field
+        """
+        candidates: List[dict] = []
+        for combo in combos:
+            # Compute measured spans and weighted avg date delta
+            book_dates = [b.date for b in combo if b.date]
+            book_span = (max(book_dates) - min(book_dates)).days if len(book_dates) >= 2 else 0
+            bank_avg_date = bank.date
+            books_avg_date = self._weighted_avg_date(combo)
+            avg_delta = abs((bank_avg_date - books_avg_date).days) if bank_avg_date and books_avg_date else stage.candidate_window_days + 1
+            
+            # Skip if out of date range
+            if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
+                continue
+            
+            # Cosine similarity
+            sim = self._cosine_similarity(bank.embedding or [], _avg_embedding(combo))
+            scores = compute_match_scores(
+                embed_sim=sim,
+                amount_diff=Decimal("0"),
+                amount_tol=stage.amount_tol or CENT,
+                date_diff=avg_delta,
+                date_tol=stage.avg_date_delta_days or 1,
+                currency_match=1.0,
+                weights=self.stage_weights,
+            )
+            suggestion = self._make_suggestion(
+                match_type,
+                [bank],
+                combo,
+                scores["global_score"],
+                stage=stage,
+                weights=self.stage_weights,
+                component_scores=scores,
+                extra={
+                    "book_span_days_measured": book_span,
+                    "avg_date_delta_days_measured": avg_delta,
+                    "mixed_signs": extra_info.get("mixed_signs") if extra_info else False,
+                    "engine": extra_info.get("engine") if extra_info else "fast_v2",
+                },
+            )
+            candidates.append(suggestion)
+        
+        # Sort candidates and record up to max_alternatives_per_anchor
+        if not candidates:
+            return
+        candidates.sort(key=lambda s: float(s["confidence_score"]), reverse=True)
+        best = candidates[0]
+        self._record(best)
+        for alt in candidates[1:stage.max_alternatives_per_anchor]:
+            self.suggestions.append(alt)
+            if self._on_suggestion:
+                try:
+                    self._on_suggestion(alt)
+                except Exception as cb_exc:
+                    log.warning("on_suggestion callback failed: %s", cb_exc)
+    
+    # ----------------------------------------------------------------------
+    # Fast variants (placed at the bottom of ReconciliationPipelineEngine)
+    # ----------------------------------------------------------------------
+    def _run_one_to_many_fast(self, banks, books, stage: StageConfig):
+        """
+        Improved fast variant for one-to-many matching.
+        
+        Uses adaptive strategy selection (exact vs beam search) and candidate pruning.
+        """
+        # Determine strategy parameters
+        strategy_cfg = self._adaptive_select_strategy(banks, books, stage)
+        max_local = strategy_cfg.get("max_cands")
+        beam_width = strategy_cfg.get("beam_width")
+        strategy   = strategy_cfg.get("strategy")
+        
+        for bank in banks:
+            if self._time_exceeded():
+                return
+            if bank.id in self.used_banks:
+                continue
+            
+            # Pre-select candidate books for this bank
+            local_books = self._prepare_candidates(bank, books, stage, max_local=max_local)
+            if not local_books:
+                continue
+            
+            combos: List[List[JournalEntryDTO]] = []
+            target = q2(bank.amount_base or Decimal("0"))
+            
+            # Mixed-sign check
+            book_signs = [_sign(b.amount_base) for b in local_books]
+            has_mixed_books = (1 in book_signs and -1 in book_signs)
+            
+            # Path 1: Mixed-sign via DFS if allowed
+            if has_mixed_books and stage.allow_mixed_signs:
+                subset = self._find_mixed_one_to_many_group(bank, local_books, stage)
+                if subset:
+                    combos.append(list(subset))
+            
+            # Path 2: Same-sign / bounded search
+            # Generate candidate combos up to max_group_size
+            max_size = min(stage.max_group_size_book, len(local_books))
+            if strategy == "exact" or max_size <= 2:
+                # Full enumeration for small groups
+                for size in range(1, max_size + 1):
+                    if self._time_exceeded():
+                        return
+                    for combo in combinations(local_books, size):
+                        total = sum((b.amount_base for b in combo), Decimal("0"))
+                        diff = abs(q2(total) - target)
+                        if diff > stage.amount_tol:
+                            continue
+                        if any(b.currency_id != bank.currency_id for b in combo):
+                            continue
+                        combos.append(list(combo))
+            else:
+                # Beam search for larger groups
+                # Start with 1-book combos, then expand
+                beam = []
+                for b in local_books:
+                    diff = abs(q2(b.amount_base) - target)
+                    if diff <= stage.amount_tol:
+                        beam.append([b])
+                # Expand beam
+                for depth in range(2, max_size + 1):
+                    if self._time_exceeded():
+                        return
+                    next_beam = []
+                    for combo in beam:
+                        # Sum amounts of current combo
+                        partial_sum = sum((x.amount_base for x in combo), Decimal("0"))
+                        for b in local_books:
+                            if b.id in [x.id for x in combo]:
+                                continue
+                            new_combo = combo + [b]
+                            total = partial_sum + b.amount_base
+                            diff = abs(q2(total) - target)
+                            if diff <= stage.amount_tol:
+                                next_beam.append(new_combo)
+                    # Score partial combos by amount difference and trim beam
+                    next_beam.sort(key=lambda c: abs(q2(sum((x.amount_base for x in c), Decimal("0"))) - target))
+                    beam = next_beam[:beam_width]
+                combos.extend(beam)
+            
+            self._evaluate_and_record_candidates(
+                match_type="one_to_many",
+                bank=bank,
+                combos=combos,
+                stage=stage,
+                extra_info={"mixed_signs": has_mixed_books, "engine": "beam" if strategy == "beam" else "exact"},
+            )
+    
+    def _run_many_to_one_fast(self, banks, books, stage: StageConfig):
+        """
+        Improved fast variant for many-to-one matching.
+        
+        Uses adaptive strategy selection, candidate pruning, and optional beam search.
+        """
+        # Determine strategy parameters
+        strategy_cfg = self._adaptive_select_strategy(banks, books, stage)
+        max_local = strategy_cfg.get("max_cands")
+        beam_width = strategy_cfg.get("beam_width")
+        strategy   = strategy_cfg.get("strategy")
+        
+        for book in books:
+            if self._time_exceeded():
+                return
+            if book.id in self.used_books:
+                continue
+            
+            # Pre-select candidate banks for this book
+            win = stage.candidate_window_days
+            local_banks = [
+                b for b in banks
+                if b.id not in self.used_banks
+                and b.company_id == self.company_id
+                and b.currency_id == book.currency_id
+                and b.date and book.date
+                and abs((b.date - book.date).days) <= win
+            ]
+            if not local_banks:
+                continue
+            
+            # Filter by sign if mixed signs not allowed
+            book_sign = _sign(book.amount_base or Decimal("0"))
+            if not stage.allow_mixed_signs and book_sign != 0:
+                if book_sign > 0:
+                    local_banks = [b for b in local_banks if _sign(b.amount_base) >= 0]
+                else:
+                    local_banks = [b for b in local_banks if _sign(b.amount_base) <= 0]
+            
+            # Cap local banks if necessary
+            if max_local and len(local_banks) > max_local:
+                target = q2(book.amount_base or Decimal("0"))
+                def sort_key(b):
+                    amt_diff = abs(q2(b.amount_base or Decimal("0")) - target)
+                    date_diff = abs((b.date - book.date).days) if b.date and book.date else 9999
+                    return (amt_diff, date_diff)
+                local_banks = sorted(local_banks, key=sort_key)[:max_local]
+            
+            bank_signs = [_sign(b.amount_base) for b in local_banks]
+            has_mixed_banks = (1 in bank_signs and -1 in bank_signs)
+            
+            combos: List[List[BankTransactionDTO]] = []
+            target = q2(book.amount_base or Decimal("0"))
+            
+            # Path 1: Mixed-sign via DFS
+            if has_mixed_banks and stage.allow_mixed_signs:
+                subset = self._find_mixed_many_to_one_group(book, local_banks, stage)
+                if subset:
+                    combos.append(list(subset))
+            
+            # Path 2: Same-sign / bounded search
+            max_size = min(stage.max_group_size_bank, len(local_banks))
+            if strategy == "exact" or max_size <= 2:
+                # Full enumeration
+                for size in range(1, max_size + 1):
+                    if self._time_exceeded():
+                        return
+                    for combo in combinations(local_banks, size):
+                        total = sum((b.amount_base for b in combo), Decimal("0"))
+                        diff = abs(q2(total) - target)
+                        if diff > stage.amount_tol:
+                            continue
+                        if any(b.currency_id != book.currency_id for b in combo):
+                            continue
+                        combos.append(list(combo))
+            else:
+                # Beam search
+                beam = []
+                for b in local_banks:
+                    diff = abs(q2(b.amount_base) - target)
+                    if diff <= stage.amount_tol:
+                        beam.append([b])
+                for depth in range(2, max_size + 1):
+                    if self._time_exceeded():
+                        return
+                    next_beam = []
+                    for combo in beam:
+                        partial_sum = sum((x.amount_base for x in combo), Decimal("0"))
+                        for b in local_banks:
+                            if b.id in [x.id for x in combo]:
+                                continue
+                            new_combo = combo + [b]
+                            total = partial_sum + b.amount_base
+                            diff = abs(q2(total) - target)
+                            if diff <= stage.amount_tol:
+                                next_beam.append(new_combo)
+                    next_beam.sort(key=lambda c: abs(q2(sum((x.amount_base for x in c), Decimal("0"))) - target))
+                    beam = next_beam[:beam_width]
+                combos.extend(beam)
+            
+            # Evaluate suggestions
+            candidates: List[dict] = []
+            for combo in combos:
+                bank_dates = [b.date for b in combo if b.date]
+                bank_span = (max(bank_dates) - min(bank_dates)).days if len(bank_dates) >= 2 else 0
+                bank_avg_date = self._weighted_avg_date(combo)
+                book_avg_date = book.date
+                avg_delta = abs((bank_avg_date - book_avg_date).days) if bank_avg_date and book_avg_date else stage.candidate_window_days + 1
+                if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
+                    continue
+                sim = self._cosine_similarity(_avg_embedding(combo), book.embedding or [])
+                scores = compute_match_scores(
+                    embed_sim=sim,
+                    amount_diff=Decimal("0"),
+                    amount_tol=stage.amount_tol or CENT,
+                    date_diff=avg_delta,
+                    date_tol=stage.avg_date_delta_days or 1,
+                    currency_match=1.0,
+                    weights=self.stage_weights,
+                )
+                suggestion = self._make_suggestion(
+                    "many_to_one",
+                    combo,
+                    [book],
+                    scores["global_score"],
+                    stage=stage,
+                    weights=self.stage_weights,
+                    component_scores=scores,
+                    extra={
+                        "bank_span_days_measured": bank_span,
+                        "avg_date_delta_days_measured": avg_delta,
+                        "mixed_signs": has_mixed_banks,
+                        "engine": "beam" if strategy == "beam" else "exact",
+                    },
+                )
+                candidates.append(suggestion)
+            
+            # Sort and record top suggestions
+            if candidates:
+                candidates.sort(key=lambda s: float(s["confidence_score"]), reverse=True)
+                best = candidates[0]
+                self._record(best)
+                for alt in candidates[1:stage.max_alternatives_per_anchor]:
+                    self.suggestions.append(alt)
+                    if self._on_suggestion:
+                        try:
+                            self._on_suggestion(alt)
+                        except Exception as cb_exc:
+                            log.warning("on_suggestion callback failed: %s", cb_exc)
+    
+    def _run_many_to_many_fast(self, banks, books, stage: StageConfig):
+        """
+        Improved fast variant for many-to-many matching.
+        
+        Uses adaptive strategy selection and candidate preselection for both banks and books.
+        """
+        # Determine global strategy parameters
+        strategy_cfg = self._adaptive_select_strategy(banks, books, stage)
+        max_local_banks = strategy_cfg.get("max_cands") or 64
+        max_local_books = strategy_cfg.get("max_cands") or 64
+        beam_width = strategy_cfg.get("beam_width")
+        strategy   = strategy_cfg.get("strategy")
+        
+        # Sort by date for window extraction
+        banks_sorted = sorted([b for b in banks if b.company_id == self.company_id], key=lambda b: b.date)
+        books_sorted = sorted([e for e in books if e.company_id == self.company_id], key=lambda e: e.date)
+        win = stage.candidate_window_days
+        
+        for anchor_bank in banks_sorted:
+            if self._time_exceeded():
+                return
+            if anchor_bank.id in self.used_banks:
+                continue
+            
+            anchor_amt = anchor_bank.amount_base or Decimal("0")
+            anchor_sign = _sign(anchor_amt)
+            
+            # Extract date windows
+            start = anchor_bank.date - timedelta(days=win)
+            end   = anchor_bank.date + timedelta(days=win)
+            local_banks = [b for b in banks_sorted if start <= b.date <= end]
+            local_books = [e for e in books_sorted if start <= e.date <= end]
+            
+            # Filter by sign if mixed not allowed
+            if not stage.allow_mixed_signs and anchor_sign != 0:
+                if anchor_sign > 0:
+                    local_banks = [b for b in local_banks if _sign(b.amount_base) >= 0]
+                    local_books = [e for e in local_books if _sign(e.amount_base) >= 0]
+                else:
+                    local_banks = [b for b in local_banks if _sign(b.amount_base) <= 0]
+                    local_books = [e for e in local_books if _sign(e.amount_base) <= 0]
+            
+            # Cap local banks and books
+            if len(local_banks) > max_local_banks:
+                target = q2(anchor_amt)
+                def sort_key(b):
+                    amt_diff = abs(q2(b.amount_base or Decimal("0")) - target)
+                    date_diff = abs((b.date - anchor_bank.date).days) if b.date and anchor_bank.date else 9999
+                    return (amt_diff, date_diff)
+                local_banks = [anchor_bank] + sorted(
+                    [b for b in local_banks if b.id != anchor_bank.id],
+                    key=sort_key
+                )[:max_local_banks - 1]
+            if len(local_books) > max_local_books:
+                target = q2(anchor_amt)
+                def sort_key(e):
+                    amt_diff = abs(q2(e.amount_base or Decimal("0")) - target)
+                    date_diff = abs((e.date - anchor_bank.date).days) if e.date and anchor_bank.date else 9999
+                    return (amt_diff, date_diff)
+                local_books = sorted(local_books, key=sort_key)[:max_local_books]
+            
+            # Generate candidate bank groups
+            bank_groups = []
+            max_bank_size = min(stage.max_group_size_bank, len(local_banks))
+            if strategy == "exact" or max_bank_size <= 2:
+                for i in range(1, max_bank_size + 1):
+                    for combo in combinations(local_banks, i):
+                        if anchor_bank.id != min(b.id for b in combo):
+                            continue
+                        if any(bc.id in self.used_banks for bc in combo):
+                            continue
+                        bank_groups.append(combo)
+            else:
+                # Beam search on bank side
+                bank_beam = [[anchor_bank]]
+                for depth in range(2, max_bank_size + 1):
+                    if self._time_exceeded():
+                        return
+                    next_beam = []
+                    for combo in bank_beam:
+                        partial_sum = sum((b.amount_base for b in combo), Decimal("0"))
+                        for b in local_banks:
+                            if b.id in [x.id for x in combo]:
+                                continue
+                            new_combo = combo + [b]
+                            sum_bank = partial_sum + b.amount_base
+                            if abs(q2(sum_bank) - q2(sum_bank)) <= stage.amount_tol:
+                                next_beam.append(new_combo)
+                    next_beam.sort(key=lambda c: abs(q2(sum((x.amount_base for x in c), Decimal("0"))) - q2(sum((x.amount_base for x in c), Decimal("0")))))
+                    bank_beam = next_beam[:beam_width]
+                bank_groups.extend(bank_beam)
+            
+            # Evaluate each bank group with book groups
+            for bank_combo in bank_groups:
+                if self._time_exceeded():
+                    return
+                sum_bank = sum((b.amount_base for b in bank_combo), Decimal("0"))
+                target   = q2(sum_bank)
+                
+                # Build book groups
+                book_groups = []
+                max_book_size = min(stage.max_group_size_book, len(local_books))
+                if strategy == "exact" or max_book_size <= 2:
+                    for j in range(1, max_book_size + 1):
+                        for book_combo in combinations(local_books, j):
+                            if any(bk.id in self.used_books for bk in book_combo):
+                                continue
+                            total_book = sum((e.amount_base for e in book_combo), Decimal("0"))
+                            diff = abs(q2(total_book) - target)
+                            if diff > stage.amount_tol:
+                                continue
+                            if any(b.currency_id != e.currency_id for b in bank_combo for e in book_combo):
+                                continue
+                            book_groups.append(book_combo)
+                else:
+                    # Beam search on book side
+                    book_beam = []
+                    for e in local_books:
+                        diff = abs(q2(e.amount_base or Decimal("0")) - target)
+                        if diff <= stage.amount_tol:
+                            book_beam.append([e])
+                    for depth in range(2, max_book_size + 1):
+                        if self._time_exceeded():
+                            return
+                        next_beam = []
+                        for combo in book_beam:
+                            partial_sum = sum((e.amount_base for e in combo), Decimal("0"))
+                            for e in local_books:
+                                if e.id in [x.id for x in combo]:
+                                    continue
+                                new_combo = combo + [e]
+                                total_book = partial_sum + e.amount_base
+                                diff = abs(q2(total_book) - target)
+                                if diff <= stage.amount_tol:
+                                    next_beam.append(new_combo)
+                        next_beam.sort(key=lambda c: abs(q2(sum((x.amount_base for x in c), Decimal("0"))) - target))
+                        book_beam = next_beam[:beam_width]
+                    book_groups.extend(book_beam)
+                
+                # Score and record suggestions
+                for book_combo in book_groups:
+                    bank_dates = [b.date for b in bank_combo if b.date]
+                    book_dates = [e.date for e in book_combo if e.date]
+                    bank_span = (max(bank_dates) - min(bank_dates)).days if len(bank_dates) >= 2 else 0
+                    book_span = (max(book_dates) - min(book_dates)).days if len(book_dates) >= 2 else 0
+                    bank_avg  = self._weighted_avg_date(bank_combo)
+                    book_avg  = self._weighted_avg_date(book_combo)
+                    avg_delta = abs((bank_avg - book_avg).days) if bank_avg and book_avg else stage.candidate_window_days + 1
+                    if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
+                        continue
+                    emb_bank = _avg_embedding(bank_combo)
+                    emb_book = _avg_embedding(book_combo)
+                    sim = self._cosine_similarity(emb_bank, emb_book)
+                    scores = compute_match_scores(
+                        embed_sim=sim,
+                        amount_diff=Decimal("0"),
+                        amount_tol=stage.amount_tol or CENT,
+                        date_diff=avg_delta,
+                        date_tol=stage.avg_date_delta_days or 1,
+                        currency_match=1.0,
+                        weights=self.stage_weights,
+                    )
+                    suggestion = self._make_suggestion(
+                        "many_to_many",
+                        list(bank_combo),
+                        list(book_combo),
+                        scores["global_score"],
+                        stage=stage,
+                        weights=self.stage_weights,
+                        component_scores=scores,
+                        extra={
+                            "bank_span_days_measured": bank_span,
+                            "book_span_days_measured": book_span,
+                            "avg_date_delta_days_measured": avg_delta,
+                            "mixed_signs_allowed": stage.allow_mixed_signs,
+                            "engine": "beam" if strategy == "beam" else "exact",
+                        },
+                    )
+                    self._record(suggestion)
+                    # Only keep the best N per anchor
+                    if len(self.suggestions) >= self.config.max_suggestions:
+                        return
 
+# ----------------------------------------------------------------------
+#  Advanced matching strategies
+#
+#  The following utility functions implement additional strategies for
+#  matching sets of transactions.  They are not currently wired into
+#  the default pipeline, but provide building blocks for future
+#  enhancements such as branch‑and‑bound search, beam search, vector
+#  embedding based pre‑selection and parallel execution.  These
+#  functions operate on simple Python types (lists of Decimal amounts
+#  and DTO objects) and return either combinations of indices or sets
+#  of candidate JournalEntryDTOs to be considered by higher level
+#  matching logic.
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import heapq
+import itertools
+
+
+def branch_and_bound_subset(amounts: List[Decimal], target: Decimal, tolerance: Decimal = Decimal("0.00"),
+                            max_size: Optional[int] = None) -> Optional[List[int]]:
+    """
+    Find a subset of `amounts` whose sum is within +/- `tolerance` of `target` using a
+    depth‑first branch‑and‑bound search.  The function returns a list of indices
+    into the original `amounts` list or None if no valid combination is found.
+
+    Parameters
+    ----------
+    amounts: List[Decimal]
+        A list of Decimal amounts.  Negative values are allowed.
+    target: Decimal
+        The target sum that the selected subset should approximate.
+    tolerance: Decimal
+        The allowed absolute difference between the subset sum and the target.  A
+        zero tolerance means exact matching.
+    max_size: Optional[int]
+        Maximum number of elements allowed in the subset.  If None, no limit is
+        enforced.  This can be used to limit the depth of the search to keep
+        combinatorial explosion in check.
+
+    Returns
+    -------
+    Optional[List[int]]
+        A list of indices of amounts that sum to within tolerance of the target,
+        or None if no such subset exists.
+    """
+    n = len(amounts)
+    if n == 0:
+        return None
+
+    # Normalize inputs
+    amounts = [Decimal(x) for x in amounts]
+    target = Decimal(target)
+    tol = Decimal(tolerance) if tolerance is not None else Decimal("0")
+
+    # Sort indices by absolute value descending to improve pruning.  We need to
+    # track original indices to reconstruct the subset later.
+    indexed = list(enumerate(amounts))
+    indexed.sort(key=lambda x: abs(x[1]), reverse=True)
+    sorted_indices, sorted_amounts = zip(*indexed)
+
+    # Precompute remaining min/max sums from each position.  For each i,
+    # rem_min[i] is the sum of all negative numbers from i onward, and
+    # rem_max[i] is the sum of all positive numbers from i onward.  These
+    # bounds allow us to prune branches that cannot reach the target ± tol.
+    rem_min = [Decimal("0")] * (n + 1)
+    rem_max = [Decimal("0")] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        amt = sorted_amounts[i]
+        if amt >= 0:
+            rem_max[i] = rem_max[i + 1] + amt
+            rem_min[i] = rem_min[i + 1]
+        else:
+            rem_min[i] = rem_min[i + 1] + amt
+            rem_max[i] = rem_max[i + 1]
+
+    result: Optional[List[int]] = None
+
+    def dfs(idx: int, chosen: List[int], current_sum: Decimal):
+        nonlocal result
+        if result is not None:
+            return
+        # If we exceeded the optional group size, stop exploring
+        if max_size is not None and len(chosen) > max_size:
+            return
+        # If we've considered all items, check if the sum is within tolerance
+        if idx == n:
+            if chosen and (target - tol) <= current_sum <= (target + tol):
+                result = chosen.copy()
+            return
+        # Calculate bounds on the sum reachable with remaining items
+        # The best we can do is current_sum + rem_min[idx] (if all remaining are negative)
+        # or current_sum + rem_max[idx] (if all remaining are positive)
+        min_possible = current_sum + rem_min[idx]
+        max_possible = current_sum + rem_max[idx]
+        # If the interval [min_possible, max_possible] does not intersect [target - tol, target + tol]
+        # then prune this branch
+        if max_possible < (target - tol) or min_possible > (target + tol):
+            return
+        # Branch 1: skip current item
+        dfs(idx + 1, chosen, current_sum)
+        if result is not None:
+            return
+        # Branch 2: include current item
+        dfs(idx + 1, chosen + [idx], current_sum + sorted_amounts[idx])
+
+    dfs(0, [], Decimal("0"))
+    if result is None:
+        return None
+    # Translate sorted indices back to original indices
+    return [sorted_indices[i] for i in result]
+
+
+def beam_search_subsets(amounts: List[Decimal], target: Decimal, tolerance: Decimal = Decimal("0.00"),
+                        beam_width: int = 5, max_size: Optional[int] = None) -> Optional[List[int]]:
+    """
+    Heuristic beam search for subset sum.  Maintains only the top `beam_width` partial
+    combinations at each depth, scoring them by absolute difference to the target.
+    Returns indices of a subset that sums within tolerance of the target, or None.
+
+    Parameters
+    ----------
+    amounts: List[Decimal]
+        Candidate amounts to choose from.
+    target: Decimal
+        The desired total.
+    tolerance: Decimal
+        Allowed deviation from the target.
+    beam_width: int
+        How many partial solutions to keep at each depth.
+    max_size: Optional[int]
+        Maximum size of subsets considered.  If None, no size limit.
+
+    Returns
+    -------
+    Optional[List[int]]
+        Indices of selected items, or None if not found.
+    """
+    n = len(amounts)
+    if n == 0:
+        return None
+    amounts = [Decimal(x) for x in amounts]
+    target = Decimal(target)
+    tol = Decimal(tolerance)
+    # Each entry in the beam is (score, current_sum, chosen_indices, next_index)
+    # where score is heuristic (abs difference to target).
+    initial_state = (abs(target), Decimal("0"), [], 0)
+    beam: List[tuple] = [initial_state]
+    while beam:
+        new_beam: List[tuple] = []
+        for score, current_sum, chosen, next_idx in beam:
+            if current_sum >= (target - tol) and current_sum <= (target + tol) and chosen:
+                return chosen
+            if next_idx >= n:
+                continue
+            # Option 1: skip the next item
+            new_beam.append((abs(current_sum - target), current_sum, chosen, next_idx + 1))
+            # Option 2: take the next item (if size limit permits)
+            if max_size is None or len(chosen) < max_size:
+                new_sum = current_sum + amounts[next_idx]
+                new_score = abs(new_sum - target)
+                new_beam.append((new_score, new_sum, chosen + [next_idx], next_idx + 1))
+        # Keep only the top beam_width states by smallest score (closest to target)
+        if not new_beam:
+            break
+        new_beam.sort(key=lambda x: x[0])
+        beam = new_beam[:beam_width]
+    return None
+
+
+def preselect_candidates_by_embedding(
+    bank: BankTransactionDTO,
+    books: List[JournalEntryDTO],
+    top_k: int = 10,
+    generic_terms: Optional[Iterable[str]] = None,
+    similarity_threshold: float = 0.3,
+) -> List[JournalEntryDTO]:
+    """
+    Pre‑select candidate JournalEntryDTOs for a given bank transaction by comparing
+    embedding similarity and filtering out obviously unrelated entries.
+
+    Parameters
+    ----------
+    bank: BankTransactionDTO
+        The transaction to match against.
+    books: List[JournalEntryDTO]
+        All available journal entries.
+    top_k: int
+        Maximum number of book entries to return based on embedding similarity.
+    generic_terms: Optional[Iterable[str]]
+        List of generic keywords that indicate a bank description is too broad
+        (e.g. 'boleto', 'transferência').  If the bank description contains
+        any of these, this function returns all books within the same date
+        window instead of filtering by embedding similarity.
+    similarity_threshold: float
+        Minimum cosine similarity required to consider a book entry as a
+        candidate.  If fewer than top_k exceed the threshold, the top
+        candidates by similarity are returned regardless.
+
+    Returns
+    -------
+    List[JournalEntryDTO]
+        A list of journal entries likely to match the bank transaction.
+    """
+    # If there is no embedding or the description is too generic, return all
+    # books for this bank (to be filtered later by other criteria).
+    if not bank.embedding:
+        return books[:]
+    desc_lower = (bank.description or "").lower()
+    if generic_terms:
+        for term in generic_terms:
+            if term.lower() in desc_lower:
+                return books[:]
+    # Compute similarity for each book
+    scored: List[tuple] = []
+    for b in books:
+        if not b.embedding:
+            continue
+        # Use the cosine similarity method defined on the engine for consistency
+        sim = 0.0
+        try:
+            # Approximate dot product and norms manually
+            dot = sum(float(x) * float(y) for x, y in zip(bank.embedding, b.embedding))
+            norm_bank = sum(float(x) * float(x) for x in bank.embedding) ** 0.5
+            norm_book = sum(float(y) * float(y) for y in b.embedding) ** 0.5
+            if norm_bank and norm_book:
+                sim = dot / (norm_bank * norm_book)
+        except Exception:
+            sim = 0.0
+        if sim >= similarity_threshold:
+            scored.append((sim, b))
+    # If we found enough above threshold, return the top_k by similarity
+    if len(scored) >= top_k:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [b for _, b in scored[:top_k]]
+    # Otherwise, return top_k by similarity regardless of threshold
+    # including those below threshold to ensure we always have candidates
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [b for _, b in scored[:top_k]]
+
+
+def subset_sum_candidates(
+    bank: BankTransactionDTO,
+    books: List[JournalEntryDTO],
+    stage: StageConfig,
+    method: str = "branch",
+    beam_width: int = 5,
+) -> List[JournalEntryDTO]:
+    """
+    Given a single bank transaction and a list of candidate journal entries,
+    attempt to find a subset of books whose sums match the bank amount within
+    tolerance using one of the available subset algorithms.
+
+    This utility wraps the lower level branch‑and‑bound and beam search
+    functions, translating from DTOs into amounts and back again.
+
+    Parameters
+    ----------
+    bank: BankTransactionDTO
+        The bank transaction to match.
+    books: List[JournalEntryDTO]
+        Candidate journal entries (already filtered by date, currency, etc.).
+    stage: StageConfig
+        Provides the amount tolerance and max_group_size_book for this stage.
+    method: str
+        Either 'branch' or 'beam' to select the underlying search algorithm.
+    beam_width: int
+        Beam width to use if method == 'beam'.
+
+    Returns
+    -------
+    List[JournalEntryDTO]
+        A list of journal entries forming a valid group if found, otherwise empty.
+    """
+    amounts = [b.amount_base or Decimal("0") for b in books]
+    target = q2(bank.amount_base)
+    tol = stage.amount_tol or Decimal("0")
+    max_size = stage.max_group_size_book
+    idxs: Optional[List[int]] = None
+    if method == "beam":
+        idxs = beam_search_subsets(amounts, target, tol, beam_width=beam_width, max_size=max_size)
+    else:
+        # Default to branch‑and‑bound
+        idxs = branch_and_bound_subset(amounts, target, tolerance=tol, max_size=max_size)
+    if idxs is None:
+        return []
+    return [books[i] for i in idxs]
+
+
+def match_in_parallel(
+    banks: List[BankTransactionDTO],
+    books: List[JournalEntryDTO],
+    stage: StageConfig,
+    worker_fn: Callable[[BankTransactionDTO, List[JournalEntryDTO], StageConfig], List[JournalEntryDTO]],
+    max_workers: int = 4,
+) -> List[dict]:
+    """
+    Perform matching of multiple bank transactions against the same set of book entries
+    using a worker function in parallel.  Each worker receives a bank transaction
+    and should return a list of JournalEntryDTOs forming a potential match.  The
+    function collects suggestions into the unified format used by
+    ReconciliationPipelineEngine._make_suggestion (match_type 'parallel').
+
+    Parameters
+    ----------
+    banks: List[BankTransactionDTO]
+        Bank transactions to match.
+    books: List[JournalEntryDTO]
+        Candidate journal entries (should already be filtered for date/currency).
+    stage: StageConfig
+        Stage configuration providing tolerances and group limits.
+    worker_fn: Callable
+        A function taking (bank, books, stage) and returning list[JournalEntryDTO]
+        representing a match.  Typically, this will call subset_sum_candidates
+        with either branch‑and‑bound or beam search.
+    max_workers: int
+        Maximum number of concurrent workers.
+
+    Returns
+    -------
+    List[dict]
+        A list of suggestion dictionaries compatible with the Reconciliation
+        pipeline.
+    """
+    suggestions: List[dict] = []
+    used_banks: set[int] = set()
+    used_books: set[int] = set()
+    def task(bank: BankTransactionDTO) -> Optional[dict]:
+        # Skip if already matched (another worker may have used it)
+        if bank.id in used_banks:
+            return None
+        # Filter books to those not used yet and matching company/currency
+        local_books = [b for b in books if b.id not in used_books and b.company_id == bank.company_id and b.currency_id == bank.currency_id]
+        if not local_books:
+            return None
+        combo = worker_fn(bank, local_books, stage)
+        if not combo:
+            return None
+        # Mark used items
+        used_banks.add(bank.id)
+        used_books.update([b.id for b in combo])
+        # Build suggestion dict
+        extra = {
+            "parallel": True,
+            "worker": worker_fn.__name__
+        }
+        # Local helper to assemble stats (using small helper function)
+        sum_bank = float(q2(bank.amount_base))
+        sum_books = float(q2(sum((e.amount_base for e in combo), Decimal("0"))))
+        abs_diff = float(abs(sum_bank - sum_books))
+        sugg = {
+            "match_type": "parallel",
+            "bank_ids": [bank.id],
+            "journal_entries_ids": [b.id for b in combo],
+            "bank_stats": {
+                "count": 1,
+                "sum_amount": sum_bank,
+                "min_date": bank.date.isoformat() if bank.date else None,
+                "weighted_avg_date": bank.date.isoformat() if bank.date else None,
+                "max_date": bank.date.isoformat() if bank.date else None,
+            },
+            "book_stats": {
+                "count": len(combo),
+                "sum_amount": sum_books,
+                "min_date": min(b.date for b in combo).isoformat() if combo else None,
+                "weighted_avg_date": None,
+                "max_date": max(b.date for b in combo).isoformat() if combo else None,
+            },
+            "bank_lines": f"BANK#{bank.id} | {bank.date.isoformat() if bank.date else 'N/A'} | {q2(bank.amount_base)} | {bank.description}",
+            "book_lines": "\n".join([
+                f"BOOK#{e.id} | {e.date.isoformat() if e.date else 'N/A'} | {q2(e.amount_base)} | {e.description}"
+                for e in combo
+            ]),
+            "abs_amount_diff": abs_diff,
+            "confidence_score": 1.0,
+            "confidence_weights": {
+                "embedding": 0.0,
+                "amount": 1.0,
+                "currency": 0.0,
+                "date": 0.0,
+            },
+            "match_parameters": {
+                "amount_tolerance": float(stage.amount_tol),
+                "max_group_size_bank": 1,
+                "max_group_size_book": stage.max_group_size_book,
+                "parallel": True,
+            },
+            "extra": extra,
+        }
+        return sugg
+    # Use ThreadPoolExecutor to process multiple banks concurrently
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_bank = {executor.submit(task, bank): bank for bank in banks}
+        for future in as_completed(future_to_bank):
+            res = future.result()
+            if res:
+                suggestions.append(res)
+    return suggestions
+
+# ------------------------------------------------------------
+# Função adaptativa para selecionar algoritmo/parametrização
+# ------------------------------------------------------------
+
+def adaptive_match_candidates(
+    bank: BankTransactionDTO,
+    books: List[JournalEntryDTO],
+    stage: StageConfig,
+    *,
+    generic_terms: Optional[Iterable[str]] = None,
+    top_k_factor: float = 0.5,
+    min_top_k: int = 10,
+    beam_width_base: int = 5,
+    soft_time_limit: Optional[float] = None,
+    verbose: bool = False,
+) -> List[JournalEntryDTO]:
+    """
+    Escolhe dinamicamente o algoritmo e parâmetros de matching mais adequados
+    para um banco e um conjunto de livros, com base na quantidade de candidatos,
+    tamanho máximo do grupo e qualidade da descrição.
+
+    Heurísticas usadas:
+      * Se o conjunto de candidatos é pequeno (≤15) ou o grupo máximo é ≤2,
+        usa branch-and-bound com busca exata.
+      * Para conjuntos médios (≤50) e grupos até 3, ainda usa branch-and-bound,
+        mas aplica pré-selecção por embeddings se a descrição for informativa.
+      * Para conjuntos grandes (>50) ou grupos ≥4, usa beam search
+        com feixe ajustado ao número de candidatos.
+      * Se a descrição contém termos genéricos (e.g. 'boleto'), ignora embeddings.
+      * Se há soft_time_limit e muitos candidatos, prefere beam search.
+    Parâmetros:
+      bank: lançamento bancário para conciliar.
+      books: lista de JournalEntryDTO filtrados por data/moeda/empresa.
+      stage: StageConfig com tolerância de valor e tamanho de grupo.
+      generic_terms: lista de termos que tornam a descrição genérica.
+      top_k_factor: fração de candidatos mantida na pré-selecção (>=0).
+      min_top_k: mínimo de candidatos na pré-selecção.
+      beam_width_base: base do feixe para beam search (≥1).
+      soft_time_limit: limite de tempo (em segundos) para preferir heurística.
+      verbose: imprime decisões no log/console (opcional).
+    Retorna:
+      Lista de JournalEntryDTO que corresponde ao banco, ou [] se nenhum.
+    """
+    # Se não há livros, retorna vazio
+    if not books:
+        return []
+    n_books = len(books)
+    max_group = stage.max_group_size_book
+
+    # Verifica se descrição do banco é genérica
+    desc_lower = (bank.description or "").lower()
+    generic = False
+    if generic_terms:
+        for term in generic_terms:
+            if term.lower() in desc_lower:
+                generic = True
+                break
+
+    # Aplica pré-selecção por embeddings se não genérica e houver embedding
+    candidates: List[JournalEntryDTO] = books
+    if not generic and bank.embedding and n_books > min_top_k:
+        top_k = max(min_top_k, int(n_books * top_k_factor))
+        candidates = preselect_candidates_by_embedding(
+            bank,
+            books,
+            top_k=top_k,
+            generic_terms=generic_terms,
+        )
+        if verbose:
+            log.debug(f"Pré-selecionados {len(candidates)} de {n_books} livros para banco {bank.id}")
+
+    n_candidates = len(candidates)
+
+    # Decide o método de busca (branch ou beam)
+    method = "branch"
+    beam_width = beam_width_base
+
+    # Grandes conjuntos ou grupos grandes => beam
+    if (max_group or 0) >= 4 or n_candidates > 50:
+        method = "beam"
+    elif n_candidates > 30 and (max_group or 0) >= 3:
+        method = "beam"
+    # Limite de tempo => beam search se muitos candidatos
+    if soft_time_limit is not None and n_candidates > 20:
+        method = "beam"
+
+    # Ajusta largura do feixe
+    if method == "beam":
+        beam_width = max(beam_width_base, n_candidates // 10 + 1)
+        if verbose:
+            log.debug(f"Usando beam search (beam_width={beam_width}) para banco {bank.id}")
+    else:
+        if verbose:
+            log.debug(f"Usando branch-and-bound para banco {bank.id}")
+
+    # Executa a procura de subconjunto com o método escolhido
+    match = subset_sum_candidates(bank, candidates, stage, method=method, beam_width=beam_width)
+    return match or []
 
 
 # ----------------------------------------------------------------------
