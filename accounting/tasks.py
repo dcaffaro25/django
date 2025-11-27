@@ -45,8 +45,8 @@ from multitenancy.utils import resolve_tenant
 
 from accounting.utils import update_journal_entries_and_transaction_flags
 
-logger = get_task_logger(__name__)
-log = logging.getLogger(__name__)
+logger = logging.getLogger("recon")
+log = logger 
 
 import json
 
@@ -133,6 +133,13 @@ def compare_two_engines_task(self, db_id: int, data: Dict[str, Any], tenant_id: 
     Cria duas ReconciliationTask filhas, dispara as tasks em filas separadas e aguarda (poll)
     um curto período para coletar resultados; grava um resumo comparativo em parent_task.result["comparisons"].
     """
+    logger.info(
+        "compare_two_engines_task START: db_id=%s tenant_id=%s bank_ids=%s book_ids=%s",
+        db_id,
+        tenant_id,
+        (data or {}).get("bank_ids"),
+        (data or {}).get("book_ids"),
+    )
     parent_task = ReconciliationTask.objects.get(id=db_id)
     run_uuid = str(uuid.uuid4())
     now = timezone.now()
