@@ -15,6 +15,8 @@ from decimal import Decimal, ROUND_HALF_UP
 from itertools import combinations
 from typing import Callable, Dict, Iterable, List, Optional, Union
 from multitenancy.utils import resolve_tenant
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 #from .embedding_service import BankTransactionDTO, JournalEntryDTO, run_single_config, run_pipeline
 from datetime import date as _date
 
@@ -336,6 +338,11 @@ class ReconciliationPipelineEngine:
 
         self._seen_groups: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
 
+        # Thread-safe locks for parallel processing
+        self._lock = threading.Lock()
+        self._used_banks_lock = threading.Lock()
+        self._used_books_lock = threading.Lock()
+
         # callback opcional para stream de sugestões
         self._on_suggestion = on_suggestion
 
@@ -353,6 +360,9 @@ class ReconciliationPipelineEngine:
         
         # NEW: whether to use _fast stage handlers when available
         self.fast: bool = bool(getattr(config, "fast", False))
+        
+        # Thread pool size for parallel processing (default to 8, can be overridden)
+        self._thread_pool_size = getattr(config, "thread_pool_size", 8)
         
     def _time_exceeded(self) -> bool:
         """
@@ -1698,32 +1708,37 @@ class ReconciliationPipelineEngine:
         """
         Record a suggestion and mark participating IDs as used, but skip exact duplicates.
         A duplicate is any suggestion with the same set of bank_ids and book_ids.
+        Thread-safe version for parallel processing.
         """
         bank_key = tuple(sorted(suggestion["bank_ids"]))
         book_key = tuple(sorted(suggestion["journal_entries_ids"]))
         key = (bank_key, book_key)
 
-        if key in self._seen_groups:
+        with self._lock:
+            if key in self._seen_groups:
+                log.debug(
+                    "Skipping duplicate suggestion: banks=%s books=%s",
+                    bank_key,
+                    book_key,
+                )
+                return
+
+            self._seen_groups.add(key)
+
             log.debug(
-                "Skipping duplicate suggestion: banks=%s books=%s",
-                bank_key,
-                book_key,
+                "Recording suggestion: type=%s, bank_ids=%s, journal_ids=%s, confidence=%.4f",
+                suggestion["match_type"],
+                suggestion["bank_ids"],
+                suggestion["journal_entries_ids"],
+                suggestion["confidence_score"],
             )
-            return
 
-        self._seen_groups.add(key)
-
-        log.debug(
-            "Recording suggestion: type=%s, bank_ids=%s, journal_ids=%s, confidence=%.4f",
-            suggestion["match_type"],
-            suggestion["bank_ids"],
-            suggestion["journal_entries_ids"],
-            suggestion["confidence_score"],
-        )
-
-        self.suggestions.append(suggestion)
-        self.used_banks.update(suggestion["bank_ids"])
-        self.used_books.update(suggestion["journal_entries_ids"])
+            self.suggestions.append(suggestion)
+            
+            with self._used_banks_lock:
+                self.used_banks.update(suggestion["bank_ids"])
+            with self._used_books_lock:
+                self.used_books.update(suggestion["journal_entries_ids"])
 
         # Dispara callback (para persistência incremental, etc.)
         if self._on_suggestion:
@@ -1901,11 +1916,215 @@ class ReconciliationPipelineEngine:
     # ----------------------------------------------------------------------
     # Fast variants (placed at the bottom of ReconciliationPipelineEngine)
     # ----------------------------------------------------------------------
+    def _process_one_bank_otm_fast(
+        self,
+        bank: BankTransactionDTO,
+        books: List[JournalEntryDTO],
+        stage: StageConfig,
+        max_local: Optional[int],
+        beam_width: Optional[int],
+        strategy: str,
+    ) -> None:
+        """
+        Process a single bank for one-to-many matching (thread-safe helper).
+        """
+        # Check if already used (thread-safe check)
+        with self._used_banks_lock:
+            if bank.id in self.used_banks:
+                return
+        
+        # Pre-select candidate books for this bank
+        local_books = self._prepare_candidates(bank, books, stage, max_local=max_local)
+        if bank.embedding and len(local_books) > stage.max_group_size_book * 4:
+            top_k = min(len(local_books), (max_local or len(local_books)), 32)
+            local_books = preselect_candidates_by_embedding(bank, local_books, top_k=top_k)
+        if not local_books:
+            log.debug("OTM_FAST bank=%s no candidates survived prefilter", bank.id)
+            return
+        book_items = _build_fast_items(local_books)
+        log.debug(
+            "OTM_FAST bank=%s amount=%s candidates=%s max_group=%s",
+            bank.id,
+            bank.amount_base,
+            len(book_items),
+            stage.max_group_size_book,
+        )
+        
+        combos: List[List[JournalEntryDTO]] = []
+        target = q2(bank.amount_base or Decimal("0"))
+        
+        # Mixed-sign check
+        book_signs = [item.sign for item in book_items]
+        has_mixed_books = (1 in book_signs and -1 in book_signs)
+        if has_mixed_books and not stage.allow_mixed_signs:
+            log.debug("OTM_FAST bank=%s mixed_signs_blocked", bank.id)
+        
+        # Path 1: Mixed-sign via DFS if allowed
+        if has_mixed_books and stage.allow_mixed_signs:
+            log.debug("OTM_FAST bank=%s entering mixed-sign DFS path", bank.id)
+            subset = self._find_mixed_one_to_many_group(bank, [item.dto for item in book_items], stage)
+            if subset:
+                combos.append(list(subset))
+                log.debug("OTM_FAST bank=%s mixed DFS produced group size=%s", bank.id, len(subset))
+            else:
+                log.debug("OTM_FAST bank=%s mixed DFS produced no group", bank.id)
+        
+        # Path 2: Same-sign / bounded search
+        # Generate candidate combos up to max_group_size
+        max_size = min(stage.max_group_size_book, len(book_items))
+        if strategy == "exact" or max_size <= 2:
+            # Full enumeration for small groups
+            log.debug("OTM_FAST bank=%s using exact enumeration max_size=%s", bank.id, max_size)
+            for size in range(1, max_size + 1):
+                if self._time_exceeded():
+                    return
+                for combo in combinations(book_items, size):
+                    total = sum((c.amount for c in combo), Decimal("0"))
+                    diff = abs(q2(total) - target)
+                    if diff > stage.amount_tol:
+                        continue
+                    combo_dtos = [c.dto for c in combo]
+                    log.debug(
+                        "OTM_FAST bank=%s exact_combo size=%s total=%s diff=%s members=%s",
+                        bank.id,
+                        size,
+                        total,
+                        diff,
+                        [(d.id, d.amount_base, d.date) for d in combo_dtos],
+                    )
+                    combos.append(combo_dtos)
+        else:
+            # Beam search for larger groups
+            # Start with 1-book combos, then expand
+            log.debug(
+                "OTM_FAST bank=%s using beam_search max_size=%s beam_width=%s",
+                bank.id,
+                max_size,
+                beam_width,
+            )
+            beam: List[tuple[Decimal, tuple[int, ...]]] = []
+            for idx, item in enumerate(book_items):
+                diff = abs(item.amount_q2 - target)
+                if diff <= stage.amount_tol:
+                    beam.append((item.amount, (idx,)))
+                    log.debug(
+                        "OTM_FAST bank=%s beam_seed idx=%s amount=%s diff=%s book_id=%s",
+                        bank.id,
+                        idx,
+                        item.amount,
+                        diff,
+                        item.dto.id,
+                    )
+            # Record any single-book hits immediately
+            recorded_state_keys: set[tuple[int, ...]] = set()
+            initial_hits = [
+                state for state in beam if abs(q2(state[0]) - target) <= stage.amount_tol
+            ]
+            if initial_hits:
+                recorded_state_keys = {state[1] for state in initial_hits}
+                combos_from_hits = [[book_items[i].dto for i in state[1]] for state in initial_hits]
+                combos.extend(combos_from_hits)
+                for combo_dtos in combos_from_hits:
+                    log.debug(
+                        "OTM_FAST bank=%s beam_hit total=%s members=%s",
+                        bank.id,
+                        sum((dto.amount_base for dto in combo_dtos), Decimal("0")),
+                        [(d.id, d.amount_base, d.date) for d in combo_dtos],
+                    )
+            if max_size <= 1:
+                log.debug("OTM_FAST bank=%s max_size<=1 skipping beam expansion", bank.id)
+            else:
+                # Expand beam
+                for depth in range(2, max_size + 1):
+                    if self._time_exceeded():
+                        return
+                    next_beam: List[tuple[Decimal, tuple[int, ...]]] = []
+                    for partial_sum, idxs in beam:
+                        for idx, item in enumerate(book_items):
+                            if idx in idxs:
+                                continue
+                            new_total = partial_sum + item.amount
+                            diff = abs(q2(new_total) - target)
+                            if diff <= stage.amount_tol:
+                                next_idxs = idxs + (idx,)
+                                next_beam.append((new_total, next_idxs))
+                                log.debug(
+                                    "OTM_FAST bank=%s beam_extend depth=%s total=%s diff=%s members=%s",
+                                    bank.id,
+                                    depth,
+                                    new_total,
+                                    diff,
+                                    [(book_items[i].dto.id, book_items[i].amount, book_items[i].dto.date) for i in next_idxs],
+                                )
+                    # Score partial combos by amount difference and trim beam
+                    next_beam.sort(key=lambda state: abs(q2(state[0]) - target))
+                    beam = next_beam[:beam_width]
+            combos_from_beam = [
+                [book_items[i].dto for i in state[1]]
+                for state in beam
+                if state[1] not in recorded_state_keys
+            ]
+            for combo_dtos in combos_from_beam:
+                log.debug(
+                    "OTM_FAST bank=%s beam_combo total=%s members=%s",
+                    bank.id,
+                    sum((dto.amount_base for dto in combo_dtos), Decimal("0")),
+                    [(d.id, d.amount_base, d.date) for d in combo_dtos],
+                )
+            combos.extend(combos_from_beam)
+            log.debug("OTM_FAST bank=%s beam combos=%s", bank.id, len(combos_from_beam))
+
+            # If beam search failed to find anything, fall back to branch-and-bound subset search
+            if not combos:
+                amounts = [item.amount_q2 for item in book_items]
+                bb_indices = branch_and_bound_subset(
+                    amounts=amounts,
+                    target=target,
+                    tolerance=stage.amount_tol,
+                    max_size=stage.max_group_size_book,
+                )
+                if bb_indices:
+                    bb_combo = [book_items[i].dto for i in bb_indices]
+                    total_bb = sum((b.amount_base for b in bb_combo), Decimal("0"))
+                    diff_bb = abs(q2(total_bb) - target)
+                    log.debug(
+                        "OTM_FAST bank=%s branch_and_bound hit total=%s diff=%s members=%s",
+                        bank.id,
+                        total_bb,
+                        diff_bb,
+                        [(d.id, d.amount_base, d.date) for d in bb_combo],
+                    )
+                    combos.append(bb_combo)
+        
+        log.debug(
+            "OTM_FAST bank=%s combos_ready=%s detail=%s",
+            bank.id,
+            len(combos),
+            [
+                {
+                    "book_ids": [b.id for b in combo],
+                    "amounts": [b.amount_base for b in combo],
+                    "dates": [b.date for b in combo],
+                    "total": sum((b.amount_base for b in combo), Decimal("0")),
+                    "diff": abs(q2(sum((b.amount_base for b in combo), Decimal("0"))) - target),
+                }
+                for combo in combos[:5]
+            ],
+        )
+        self._evaluate_and_record_candidates(
+            match_type="one_to_many",
+            bank=bank,
+            combos=combos,
+            stage=stage,
+            extra_info={"mixed_signs": has_mixed_books, "engine": "beam" if strategy == "beam" else "exact"},
+        )
+    
     def _run_one_to_many_fast(self, banks, books, stage: StageConfig):
         """
         Improved fast variant for one-to-many matching.
         
         Uses adaptive strategy selection (exact vs beam search) and candidate pruning.
+        Now processes banks in parallel using ThreadPoolExecutor.
         """
         # Determine strategy parameters
         strategy_cfg = self._adaptive_select_strategy(banks, books, stage)
@@ -1913,190 +2132,308 @@ class ReconciliationPipelineEngine:
         beam_width = strategy_cfg.get("beam_width")
         strategy   = strategy_cfg.get("strategy")
         log.debug(
-            "OTM_FAST stage=%s strategy=%s max_local=%s beam_width=%s tol=%s mixed=%s",
+            "OTM_FAST stage=%s strategy=%s max_local=%s beam_width=%s tol=%s mixed=%s threads=%s",
             stage.type,
             strategy,
             max_local,
             beam_width,
             stage.amount_tol,
             stage.allow_mixed_signs,
+            self._thread_pool_size,
         )
         
-        for bank in banks:
-            if self._time_exceeded():
-                return
-            if bank.id in self.used_banks:
-                continue
-            
-            # Pre-select candidate books for this bank
-            local_books = self._prepare_candidates(bank, books, stage, max_local=max_local)
-            if bank.embedding and len(local_books) > stage.max_group_size_book * 4:
-                top_k = min(len(local_books), (max_local or len(local_books)), 32)
-                local_books = preselect_candidates_by_embedding(bank, local_books, top_k=top_k)
-            if not local_books:
-                log.debug("OTM_FAST bank=%s no candidates survived prefilter", bank.id)
-                continue
-            book_items = _build_fast_items(local_books)
-            log.debug(
-                "OTM_FAST bank=%s amount=%s candidates=%s max_group=%s",
-                bank.id,
-                bank.amount_base,
-                len(book_items),
-                stage.max_group_size_book,
-            )
-            
-            combos: List[List[JournalEntryDTO]] = []
-            target = q2(bank.amount_base or Decimal("0"))
-            
-            # Mixed-sign check
-            book_signs = [item.sign for item in book_items]
-            has_mixed_books = (1 in book_signs and -1 in book_signs)
-            if has_mixed_books and not stage.allow_mixed_signs:
-                log.debug("OTM_FAST bank=%s mixed_signs_blocked", bank.id)
-            
-            # Path 1: Mixed-sign via DFS if allowed
-            if has_mixed_books and stage.allow_mixed_signs:
-                log.debug("OTM_FAST bank=%s entering mixed-sign DFS path", bank.id)
-                subset = self._find_mixed_one_to_many_group(bank, [item.dto for item in book_items], stage)
-                if subset:
-                    combos.append(list(subset))
-                    log.debug("OTM_FAST bank=%s mixed DFS produced group size=%s", bank.id, len(subset))
-                else:
-                    log.debug("OTM_FAST bank=%s mixed DFS produced no group", bank.id)
-            
-            # Path 2: Same-sign / bounded search
-            # Generate candidate combos up to max_group_size
-            max_size = min(stage.max_group_size_book, len(book_items))
-            if strategy == "exact" or max_size <= 2:
-                # Full enumeration for small groups
-                log.debug("OTM_FAST bank=%s using exact enumeration max_size=%s", bank.id, max_size)
-                for size in range(1, max_size + 1):
-                    if self._time_exceeded():
-                        return
-                    for combo in combinations(book_items, size):
-                        total = sum((c.amount for c in combo), Decimal("0"))
-                        diff = abs(q2(total) - target)
-                        if diff > stage.amount_tol:
-                            continue
-                        combo_dtos = [c.dto for c in combo]
-                        log.debug(
-                            "OTM_FAST bank=%s exact_combo size=%s total=%s diff=%s members=%s",
-                            bank.id,
-                            size,
-                            total,
-                            diff,
-                            [(d.id, d.amount_base, d.date) for d in combo_dtos],
-                        )
-                        combos.append(combo_dtos)
-            else:
-                # Beam search for larger groups
-                # Start with 1-book combos, then expand
-                log.debug(
-                    "OTM_FAST bank=%s using beam_search max_size=%s beam_width=%s",
-                    bank.id,
-                    max_size,
+        # Filter out already-used banks (thread-safe check)
+        available_banks = []
+        with self._used_banks_lock:
+            for bank in banks:
+                if bank.id not in self.used_banks:
+                    available_banks.append(bank)
+        
+        if not available_banks:
+            log.debug("OTM_FAST no available banks to process")
+            return
+        
+        # Process banks in parallel
+        with ThreadPoolExecutor(max_workers=self._thread_pool_size) as executor:
+            futures = {
+                executor.submit(
+                    self._process_one_bank_otm_fast,
+                    bank,
+                    books,
+                    stage,
+                    max_local,
                     beam_width,
-                )
-                beam: List[tuple[Decimal, tuple[int, ...]]] = []
-                for idx, item in enumerate(book_items):
-                    diff = abs(item.amount_q2 - target)
-                    if diff <= stage.amount_tol:
-                        beam.append((item.amount, (idx,)))
-                        log.debug(
-                            "OTM_FAST bank=%s beam_seed idx=%s amount=%s diff=%s book_id=%s",
-                            bank.id,
-                            idx,
-                            item.amount,
-                            diff,
-                            item.dto.id,
-                        )
-                # Record any single-book hits immediately
-                recorded_state_keys: set[tuple[int, ...]] = set()
-                initial_hits = [
-                    state for state in beam if abs(q2(state[0]) - target) <= stage.amount_tol
-                ]
-                if initial_hits:
-                    recorded_state_keys = {state[1] for state in initial_hits}
-                    combos_from_hits = [[book_items[i].dto for i in state[1]] for state in initial_hits]
-                    combos.extend(combos_from_hits)
-                    for combo_dtos in combos_from_hits:
-                        log.debug(
-                            "OTM_FAST bank=%s beam_hit total=%s members=%s",
-                            bank.id,
-                            sum((dto.amount_base for dto in combo_dtos), Decimal("0")),
-                            [(d.id, d.amount_base, d.date) for d in combo_dtos],
-                        )
-                if max_size <= 1:
-                    log.debug("OTM_FAST bank=%s max_size<=1 skipping beam expansion", bank.id)
-                else:
-                    # Expand beam
-                    for depth in range(2, max_size + 1):
-                        if self._time_exceeded():
-                            return
-                        next_beam: List[tuple[Decimal, tuple[int, ...]]] = []
-                        for partial_sum, idxs in beam:
-                            for idx, item in enumerate(book_items):
-                                if idx in idxs:
-                                    continue
-                                new_total = partial_sum + item.amount
-                                diff = abs(q2(new_total) - target)
-                                if diff <= stage.amount_tol:
-                                    next_idxs = idxs + (idx,)
-                                    next_beam.append((new_total, next_idxs))
-                                    log.debug(
-                                        "OTM_FAST bank=%s beam_extend depth=%s total=%s diff=%s members=%s",
-                                        bank.id,
-                                        depth,
-                                        new_total,
-                                        diff,
-                                        [(book_items[i].dto.id, book_items[i].amount, book_items[i].dto.date) for i in next_idxs],
-                                    )
-                        # Score partial combos by amount difference and trim beam
-                        next_beam.sort(key=lambda state: abs(q2(state[0]) - target))
-                        beam = next_beam[:beam_width]
-                combos_from_beam = [
-                    [book_items[i].dto for i in state[1]]
-                    for state in beam
-                    if state[1] not in recorded_state_keys
-                ]
-                for combo_dtos in combos_from_beam:
+                    strategy,
+                ): bank.id
+                for bank in available_banks
+            }
+            
+            for future in as_completed(futures):
+                bank_id = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    log.error("OTM_FAST bank=%s processing failed: %s", bank_id, exc, exc_info=True)
+                if self._time_exceeded():
+                    log.debug("OTM_FAST time limit reached, cancelling remaining tasks")
+                    break
+    
+    def _process_one_book_mto_fast(
+        self,
+        book: JournalEntryDTO,
+        banks: List[BankTransactionDTO],
+        stage: StageConfig,
+        max_local: Optional[int],
+        beam_width: Optional[int],
+        strategy: str,
+    ) -> None:
+        """
+        Process a single book for many-to-one matching (thread-safe helper).
+        """
+        # Check if already used (thread-safe check)
+        with self._used_books_lock:
+            if book.id in self.used_books:
+                return
+        
+        # Pre-select candidate banks for this book
+        win = stage.candidate_window_days
+        with self._used_banks_lock:
+            used_banks_snapshot = self.used_banks.copy()
+        local_banks = [
+            b for b in banks
+            if b.id not in used_banks_snapshot
+            and b.company_id == self.company_id
+            and b.currency_id == book.currency_id
+            and b.date and book.date
+            and abs((b.date - book.date).days) <= win
+        ]
+        if not local_banks:
+            log.debug("MTO_FAST book=%s no banks in window", book.id)
+            return
+        
+        # Filter by sign if mixed signs not allowed
+        book_sign = _sign(book.amount_base or Decimal("0"))
+        if not stage.allow_mixed_signs and book_sign != 0:
+            before = len(local_banks)
+            if book_sign > 0:
+                local_banks = [b for b in local_banks if _sign(b.amount_base) >= 0]
+            else:
+                local_banks = [b for b in local_banks if _sign(b.amount_base) <= 0]
+            log.debug(
+                "MTO_FAST book=%s filtered_by_sign before=%s after=%s book_sign=%s",
+                book.id,
+                before,
+                len(local_banks),
+                book_sign,
+            )
+        
+        # Cap local banks if necessary
+        if max_local and len(local_banks) > max_local:
+            target = q2(book.amount_base or Decimal("0"))
+            def sort_key(b):
+                amt_diff = abs(q2(b.amount_base or Decimal("0")) - target)
+                date_diff = abs((b.date - book.date).days) if b.date and book.date else 9999
+                return (amt_diff, date_diff)
+            local_banks = sorted(local_banks, key=sort_key)[:max_local]
+            log.debug(
+                "MTO_FAST book=%s trimmed_candidates to=%s max_local=%s",
+                book.id,
+                len(local_banks),
+                max_local,
+            )
+        
+        bank_items = _build_fast_items(local_banks)
+        bank_signs = [item.sign for item in bank_items]
+        has_mixed_banks = (1 in bank_signs and -1 in bank_signs)
+        
+        combos: List[List[BankTransactionDTO]] = []
+        target = q2(book.amount_base or Decimal("0"))
+        
+        # Path 1: Mixed-sign via DFS
+        if has_mixed_banks and not stage.allow_mixed_signs:
+            log.debug("MTO_FAST book=%s mixed_signs_blocked", book.id)
+        if has_mixed_banks and stage.allow_mixed_signs:
+            log.debug("MTO_FAST book=%s entering mixed-sign DFS path", book.id)
+            subset = self._find_mixed_many_to_one_group(book, [item.dto for item in bank_items], stage)
+            if subset:
+                combos.append(list(subset))
+                log.debug("MTO_FAST book=%s mixed DFS produced group size=%s", book.id, len(subset))
+            else:
+                log.debug("MTO_FAST book=%s mixed DFS produced no group", book.id)
+        
+        # Path 2: Same-sign / bounded search
+        max_size = min(stage.max_group_size_bank, len(bank_items))
+        if strategy == "exact" or max_size <= 2:
+            # Full enumeration
+            log.debug("MTO_FAST book=%s using exact enumeration max_size=%s", book.id, max_size)
+            for size in range(1, max_size + 1):
+                if self._time_exceeded():
+                    return
+                for combo in combinations(bank_items, size):
+                    total = sum((c.amount for c in combo), Decimal("0"))
+                    diff = abs(q2(total) - target)
+                    if diff > stage.amount_tol:
+                        continue
+                    combo_dtos = [c.dto for c in combo]
                     log.debug(
-                        "OTM_FAST bank=%s beam_combo total=%s members=%s",
-                        bank.id,
+                        "MTO_FAST book=%s exact_combo size=%s total=%s diff=%s members=%s",
+                        book.id,
+                        size,
+                        total,
+                        diff,
+                        [(d.id, d.amount_base, d.date) for d in combo_dtos],
+                    )
+                    combos.append(combo_dtos)
+        else:
+            # Beam search
+            log.debug(
+                "MTO_FAST book=%s using beam_search max_size=%s beam_width=%s",
+                book.id,
+                max_size,
+                beam_width,
+            )
+            beam: List[tuple[Decimal, tuple[int, ...]]] = []
+            for idx, item in enumerate(bank_items):
+                diff = abs(item.amount_q2 - target)
+                if diff <= stage.amount_tol:
+                    beam.append((item.amount, (idx,)))
+                    log.debug(
+                        "MTO_FAST book=%s beam_seed idx=%s amount=%s diff=%s bank_id=%s",
+                        book.id,
+                        idx,
+                        item.amount,
+                        diff,
+                        item.dto.id,
+                    )
+            recorded_state_keys: set[tuple[int, ...]] = set()
+            initial_hits = [
+                state for state in beam if abs(q2(state[0]) - target) <= stage.amount_tol
+            ]
+            if initial_hits:
+                recorded_state_keys = {state[1] for state in initial_hits}
+                combos_from_hits = [[bank_items[i].dto for i in state[1]] for state in initial_hits]
+                combos.extend(combos_from_hits)
+                for combo_dtos in combos_from_hits:
+                    log.debug(
+                        "MTO_FAST book=%s beam_hit total=%s members=%s",
+                        book.id,
                         sum((dto.amount_base for dto in combo_dtos), Decimal("0")),
                         [(d.id, d.amount_base, d.date) for d in combo_dtos],
                     )
-                combos.extend(combos_from_beam)
-                log.debug("OTM_FAST bank=%s beam combos=%s", bank.id, len(beam))
-            
-            log.debug(
-                "OTM_FAST bank=%s combos_ready=%s detail=%s",
-                bank.id,
-                len(combos),
-                [
-                    {
-                        "book_ids": [b.id for b in combo],
-                        "amounts": [b.amount_base for b in combo],
-                        "dates": [b.date for b in combo],
-                        "total": sum((b.amount_base for b in combo), Decimal("0")),
-                        "diff": abs(q2(sum((b.amount_base for b in combo), Decimal("0"))) - target),
-                    }
-                    for combo in combos[:5]
-                ],
+            if max_size <= 1:
+                log.debug("MTO_FAST book=%s max_size<=1 skipping beam expansion", book.id)
+            else:
+                for depth in range(2, max_size + 1):
+                    if self._time_exceeded():
+                        return
+                    next_beam: List[tuple[Decimal, tuple[int, ...]]] = []
+                    for partial_sum, idxs in beam:
+                        for idx, item in enumerate(bank_items):
+                            if idx in idxs:
+                                continue
+                            new_total = partial_sum + item.amount
+                            diff = abs(q2(new_total) - target)
+                            if diff <= stage.amount_tol:
+                                next_idxs = idxs + (idx,)
+                                next_beam.append((new_total, next_idxs))
+                                log.debug(
+                                    "MTO_FAST book=%s beam_extend depth=%s total=%s diff=%s members=%s",
+                                    book.id,
+                                    depth,
+                                    new_total,
+                                    diff,
+                                    [(bank_items[i].dto.id, bank_items[i].amount, bank_items[i].dto.date) for i in next_idxs],
+                                )
+                    next_beam.sort(key=lambda state: abs(q2(state[0]) - target))
+                    beam = next_beam[:beam_width]
+            combos_from_beam = [
+                [bank_items[i].dto for i in state[1]]
+                for state in beam
+                if state[1] not in recorded_state_keys
+            ]
+            for combo_dtos in combos_from_beam:
+                log.debug(
+                    "MTO_FAST book=%s beam_combo total=%s members=%s",
+                    book.id,
+                    sum((dto.amount_base for dto in combo_dtos), Decimal("0")),
+                    [(d.id, d.amount_base, d.date) for d in combo_dtos],
+                )
+            combos.extend(combos_from_beam)
+            log.debug("MTO_FAST book=%s beam combos=%s", book.id, len(beam))
+        
+        # Evaluate suggestions
+        candidates: List[dict] = []
+        for combo in combos:
+            bank_dates = [b.date for b in combo if b.date]
+            bank_span = (max(bank_dates) - min(bank_dates)).days if len(bank_dates) >= 2 else 0
+            bank_avg_date = self._weighted_avg_date(combo)
+            book_avg_date = book.date
+            avg_delta = abs((bank_avg_date - book_avg_date).days) if bank_avg_date and book_avg_date else stage.candidate_window_days + 1
+            if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
+                continue
+            sim = self._cosine_similarity(_avg_embedding(combo), book.embedding or [])
+            scores = compute_match_scores(
+                embed_sim=sim,
+                amount_diff=Decimal("0"),
+                amount_tol=stage.amount_tol or CENT,
+                date_diff=avg_delta,
+                date_tol=stage.avg_date_delta_days or 1,
+                currency_match=1.0,
+                weights=self.stage_weights,
             )
-            self._evaluate_and_record_candidates(
-                match_type="one_to_many",
-                bank=bank,
-                combos=combos,
+            suggestion = self._make_suggestion(
+                "many_to_one",
+                combo,
+                [book],
+                scores["global_score"],
                 stage=stage,
-                extra_info={"mixed_signs": has_mixed_books, "engine": "beam" if strategy == "beam" else "exact"},
+                weights=self.stage_weights,
+                component_scores=scores,
+                extra={
+                    "bank_span_days_measured": bank_span,
+                    "avg_date_delta_days_measured": avg_delta,
+                    "mixed_signs": has_mixed_banks,
+                    "engine": "beam" if strategy == "beam" else "exact",
+                },
             )
+            candidates.append(suggestion)
+        
+        # Sort and record top suggestions
+        log.debug(
+            "MTO_FAST book=%s combos_ready=%s candidates_ready=%s detail=%s",
+            book.id,
+            len(combos),
+            len(candidates),
+            [
+                {
+                    "bank_ids": [b.id for b in combo],
+                    "amounts": [b.amount_base for b in combo],
+                    "dates": [b.date for b in combo],
+                    "total": sum((b.amount_base for b in combo), Decimal("0")),
+                    "diff": abs(q2(sum((b.amount_base for b in combo), Decimal("0"))) - target),
+                }
+                for combo in combos[:5]
+            ],
+        )
+        if candidates:
+            candidates.sort(key=lambda s: float(s["confidence_score"]), reverse=True)
+            best = candidates[0]
+            self._record(best)
+            for alt in candidates[1:stage.max_alternatives_per_anchor]:
+                with self._lock:
+                    self.suggestions.append(alt)
+                if self._on_suggestion:
+                    try:
+                        self._on_suggestion(alt)
+                    except Exception as cb_exc:
+                        log.warning("on_suggestion callback failed: %s", cb_exc)
     
     def _run_many_to_one_fast(self, banks, books, stage: StageConfig):
         """
         Improved fast variant for many-to-one matching.
         
         Uses adaptive strategy selection, candidate pruning, and optional beam search.
+        Now processes books in parallel using ThreadPoolExecutor.
         """
         # Determine strategy parameters
         strategy_cfg = self._adaptive_select_strategy(banks, books, stage)
@@ -2104,250 +2441,51 @@ class ReconciliationPipelineEngine:
         beam_width = strategy_cfg.get("beam_width")
         strategy   = strategy_cfg.get("strategy")
         log.debug(
-            "MTO_FAST stage=%s strategy=%s max_local=%s beam_width=%s tol=%s mixed=%s",
+            "MTO_FAST stage=%s strategy=%s max_local=%s beam_width=%s tol=%s mixed=%s threads=%s",
             stage.type,
             strategy,
             max_local,
             beam_width,
             stage.amount_tol,
             stage.allow_mixed_signs,
+            self._thread_pool_size,
         )
         
-        for book in books:
-            if self._time_exceeded():
-                return
-            if book.id in self.used_books:
-                continue
-            
-            # Pre-select candidate banks for this book
-            win = stage.candidate_window_days
-            local_banks = [
-                b for b in banks
-                if b.id not in self.used_banks
-                and b.company_id == self.company_id
-                and b.currency_id == book.currency_id
-                and b.date and book.date
-                and abs((b.date - book.date).days) <= win
-            ]
-            if not local_banks:
-                log.debug("MTO_FAST book=%s no banks in window", book.id)
-                continue
-            
-            # Filter by sign if mixed signs not allowed
-            book_sign = _sign(book.amount_base or Decimal("0"))
-            if not stage.allow_mixed_signs and book_sign != 0:
-                before = len(local_banks)
-                if book_sign > 0:
-                    local_banks = [b for b in local_banks if _sign(b.amount_base) >= 0]
-                else:
-                    local_banks = [b for b in local_banks if _sign(b.amount_base) <= 0]
-                log.debug(
-                    "MTO_FAST book=%s filtered_by_sign before=%s after=%s book_sign=%s",
-                    book.id,
-                    before,
-                    len(local_banks),
-                    book_sign,
-                )
-            
-            # Cap local banks if necessary
-            if max_local and len(local_banks) > max_local:
-                target = q2(book.amount_base or Decimal("0"))
-                def sort_key(b):
-                    amt_diff = abs(q2(b.amount_base or Decimal("0")) - target)
-                    date_diff = abs((b.date - book.date).days) if b.date and book.date else 9999
-                    return (amt_diff, date_diff)
-                local_banks = sorted(local_banks, key=sort_key)[:max_local]
-                log.debug(
-                    "MTO_FAST book=%s trimmed_candidates to=%s max_local=%s",
-                    book.id,
-                    len(local_banks),
+        # Filter out already-used books (thread-safe check)
+        available_books = []
+        with self._used_books_lock:
+            for book in books:
+                if book.id not in self.used_books:
+                    available_books.append(book)
+        
+        if not available_books:
+            log.debug("MTO_FAST no available books to process")
+            return
+        
+        # Process books in parallel
+        with ThreadPoolExecutor(max_workers=self._thread_pool_size) as executor:
+            futures = {
+                executor.submit(
+                    self._process_one_book_mto_fast,
+                    book,
+                    banks,
+                    stage,
                     max_local,
-                )
-            
-            bank_items = _build_fast_items(local_banks)
-            bank_signs = [item.sign for item in bank_items]
-            has_mixed_banks = (1 in bank_signs and -1 in bank_signs)
-            
-            combos: List[List[BankTransactionDTO]] = []
-            target = q2(book.amount_base or Decimal("0"))
-            
-            # Path 1: Mixed-sign via DFS
-            if has_mixed_banks and not stage.allow_mixed_signs:
-                log.debug("MTO_FAST book=%s mixed_signs_blocked", book.id)
-            if has_mixed_banks and stage.allow_mixed_signs:
-                log.debug("MTO_FAST book=%s entering mixed-sign DFS path", book.id)
-                subset = self._find_mixed_many_to_one_group(book, [item.dto for item in bank_items], stage)
-                if subset:
-                    combos.append(list(subset))
-                    log.debug("MTO_FAST book=%s mixed DFS produced group size=%s", book.id, len(subset))
-                else:
-                    log.debug("MTO_FAST book=%s mixed DFS produced no group", book.id)
-            
-            # Path 2: Same-sign / bounded search
-            max_size = min(stage.max_group_size_bank, len(bank_items))
-            if strategy == "exact" or max_size <= 2:
-                # Full enumeration
-                log.debug("MTO_FAST book=%s using exact enumeration max_size=%s", book.id, max_size)
-                for size in range(1, max_size + 1):
-                    if self._time_exceeded():
-                        return
-                    for combo in combinations(bank_items, size):
-                        total = sum((c.amount for c in combo), Decimal("0"))
-                        diff = abs(q2(total) - target)
-                        if diff > stage.amount_tol:
-                            continue
-                        combo_dtos = [c.dto for c in combo]
-                        log.debug(
-                            "MTO_FAST book=%s exact_combo size=%s total=%s diff=%s members=%s",
-                            book.id,
-                            size,
-                            total,
-                            diff,
-                            [(d.id, d.amount_base, d.date) for d in combo_dtos],
-                        )
-                        combos.append(combo_dtos)
-            else:
-                # Beam search
-                log.debug(
-                    "MTO_FAST book=%s using beam_search max_size=%s beam_width=%s",
-                    book.id,
-                    max_size,
                     beam_width,
-                )
-                beam: List[tuple[Decimal, tuple[int, ...]]] = []
-                for idx, item in enumerate(bank_items):
-                    diff = abs(item.amount_q2 - target)
-                    if diff <= stage.amount_tol:
-                        beam.append((item.amount, (idx,)))
-                        log.debug(
-                            "MTO_FAST book=%s beam_seed idx=%s amount=%s diff=%s bank_id=%s",
-                            book.id,
-                            idx,
-                            item.amount,
-                            diff,
-                            item.dto.id,
-                        )
-                recorded_state_keys: set[tuple[int, ...]] = set()
-                initial_hits = [
-                    state for state in beam if abs(q2(state[0]) - target) <= stage.amount_tol
-                ]
-                if initial_hits:
-                    recorded_state_keys = {state[1] for state in initial_hits}
-                    combos_from_hits = [[bank_items[i].dto for i in state[1]] for state in initial_hits]
-                    combos.extend(combos_from_hits)
-                    for combo_dtos in combos_from_hits:
-                        log.debug(
-                            "MTO_FAST book=%s beam_hit total=%s members=%s",
-                            book.id,
-                            sum((dto.amount_base for dto in combo_dtos), Decimal("0")),
-                            [(d.id, d.amount_base, d.date) for d in combo_dtos],
-                        )
-                if max_size <= 1:
-                    log.debug("MTO_FAST book=%s max_size<=1 skipping beam expansion", book.id)
-                else:
-                    for depth in range(2, max_size + 1):
-                        if self._time_exceeded():
-                            return
-                        next_beam: List[tuple[Decimal, tuple[int, ...]]] = []
-                        for partial_sum, idxs in beam:
-                            for idx, item in enumerate(bank_items):
-                                if idx in idxs:
-                                    continue
-                                new_total = partial_sum + item.amount
-                                diff = abs(q2(new_total) - target)
-                                if diff <= stage.amount_tol:
-                                    next_idxs = idxs + (idx,)
-                                    next_beam.append((new_total, next_idxs))
-                                    log.debug(
-                                        "MTO_FAST book=%s beam_extend depth=%s total=%s diff=%s members=%s",
-                                        book.id,
-                                        depth,
-                                        new_total,
-                                        diff,
-                                        [(bank_items[i].dto.id, bank_items[i].amount, bank_items[i].dto.date) for i in next_idxs],
-                                    )
-                        next_beam.sort(key=lambda state: abs(q2(state[0]) - target))
-                        beam = next_beam[:beam_width]
-                combos_from_beam = [
-                    [bank_items[i].dto for i in state[1]]
-                    for state in beam
-                    if state[1] not in recorded_state_keys
-                ]
-                for combo_dtos in combos_from_beam:
-                    log.debug(
-                        "MTO_FAST book=%s beam_combo total=%s members=%s",
-                        book.id,
-                        sum((dto.amount_base for dto in combo_dtos), Decimal("0")),
-                        [(d.id, d.amount_base, d.date) for d in combo_dtos],
-                    )
-                combos.extend(combos_from_beam)
-                log.debug("MTO_FAST book=%s beam combos=%s", book.id, len(beam))
+                    strategy,
+                ): book.id
+                for book in available_books
+            }
             
-            # Evaluate suggestions
-            candidates: List[dict] = []
-            for combo in combos:
-                bank_dates = [b.date for b in combo if b.date]
-                bank_span = (max(bank_dates) - min(bank_dates)).days if len(bank_dates) >= 2 else 0
-                bank_avg_date = self._weighted_avg_date(combo)
-                book_avg_date = book.date
-                avg_delta = abs((bank_avg_date - book_avg_date).days) if bank_avg_date and book_avg_date else stage.candidate_window_days + 1
-                if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
-                    continue
-                sim = self._cosine_similarity(_avg_embedding(combo), book.embedding or [])
-                scores = compute_match_scores(
-                    embed_sim=sim,
-                    amount_diff=Decimal("0"),
-                    amount_tol=stage.amount_tol or CENT,
-                    date_diff=avg_delta,
-                    date_tol=stage.avg_date_delta_days or 1,
-                    currency_match=1.0,
-                    weights=self.stage_weights,
-                )
-                suggestion = self._make_suggestion(
-                    "many_to_one",
-                    combo,
-                    [book],
-                    scores["global_score"],
-                    stage=stage,
-                    weights=self.stage_weights,
-                    component_scores=scores,
-                    extra={
-                        "bank_span_days_measured": bank_span,
-                        "avg_date_delta_days_measured": avg_delta,
-                        "mixed_signs": has_mixed_banks,
-                        "engine": "beam" if strategy == "beam" else "exact",
-                    },
-                )
-                candidates.append(suggestion)
-            
-            # Sort and record top suggestions
-            log.debug(
-                "MTO_FAST book=%s combos_ready=%s candidates_ready=%s detail=%s",
-                book.id,
-                len(combos),
-                len(candidates),
-                [
-                    {
-                        "bank_ids": [b.id for b in combo],
-                        "amounts": [b.amount_base for b in combo],
-                        "dates": [b.date for b in combo],
-                        "total": sum((b.amount_base for b in combo), Decimal("0")),
-                        "diff": abs(q2(sum((b.amount_base for b in combo), Decimal("0"))) - target),
-                    }
-                    for combo in combos[:5]
-                ],
-            )
-            if candidates:
-                candidates.sort(key=lambda s: float(s["confidence_score"]), reverse=True)
-                best = candidates[0]
-                self._record(best)
-                for alt in candidates[1:stage.max_alternatives_per_anchor]:
-                    self.suggestions.append(alt)
-                    if self._on_suggestion:
-                        try:
-                            self._on_suggestion(alt)
-                        except Exception as cb_exc:
-                            log.warning("on_suggestion callback failed: %s", cb_exc)
+            for future in as_completed(futures):
+                book_id = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    log.error("MTO_FAST book=%s processing failed: %s", book_id, exc, exc_info=True)
+                if self._time_exceeded():
+                    log.debug("MTO_FAST time limit reached, cancelling remaining tasks")
+                    break
     
     def _run_many_to_many_fast(self, banks, books, stage: StageConfig):
         """
