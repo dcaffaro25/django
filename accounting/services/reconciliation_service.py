@@ -1978,7 +1978,16 @@ class ReconciliationPipelineEngine:
                         diff = abs(q2(total) - target)
                         if diff > stage.amount_tol:
                             continue
-                        combos.append([c.dto for c in combo])
+                        combo_dtos = [c.dto for c in combo]
+                        log.debug(
+                            "OTM_FAST bank=%s exact_combo size=%s total=%s diff=%s members=%s",
+                            bank.id,
+                            size,
+                            total,
+                            diff,
+                            [(d.id, d.amount_base, d.date) for d in combo_dtos],
+                        )
+                        combos.append(combo_dtos)
             else:
                 # Beam search for larger groups
                 # Start with 1-book combos, then expand
@@ -1993,6 +2002,14 @@ class ReconciliationPipelineEngine:
                     diff = abs(item.amount_q2 - target)
                     if diff <= stage.amount_tol:
                         beam.append((item.amount, (idx,)))
+                        log.debug(
+                            "OTM_FAST bank=%s beam_seed idx=%s amount=%s diff=%s book_id=%s",
+                            bank.id,
+                            idx,
+                            item.amount,
+                            diff,
+                            item.dto.id,
+                        )
                 # Expand beam
                 for depth in range(2, max_size + 1):
                     if self._time_exceeded():
@@ -2005,14 +2022,45 @@ class ReconciliationPipelineEngine:
                             new_total = partial_sum + item.amount
                             diff = abs(q2(new_total) - target)
                             if diff <= stage.amount_tol:
-                                next_beam.append((new_total, idxs + (idx,)))
+                                next_idxs = idxs + (idx,)
+                                next_beam.append((new_total, next_idxs))
+                                log.debug(
+                                    "OTM_FAST bank=%s beam_extend depth=%s total=%s diff=%s members=%s",
+                                    bank.id,
+                                    depth,
+                                    new_total,
+                                    diff,
+                                    [(book_items[i].dto.id, book_items[i].amount, book_items[i].dto.date) for i in next_idxs],
+                                )
                     # Score partial combos by amount difference and trim beam
                     next_beam.sort(key=lambda state: abs(q2(state[0]) - target))
                     beam = next_beam[:beam_width]
-                combos.extend([[book_items[i].dto for i in state[1]] for state in beam])
+                combos_from_beam = [[book_items[i].dto for i in state[1]] for state in beam]
+                for combo_dtos in combos_from_beam:
+                    log.debug(
+                        "OTM_FAST bank=%s beam_combo total=%s members=%s",
+                        bank.id,
+                        sum((dto.amount_base for dto in combo_dtos), Decimal("0")),
+                        [(d.id, d.amount_base, d.date) for d in combo_dtos],
+                    )
+                combos.extend(combos_from_beam)
                 log.debug("OTM_FAST bank=%s beam combos=%s", bank.id, len(beam))
             
-            log.debug("OTM_FAST bank=%s combos_ready=%s", bank.id, len(combos))
+            log.debug(
+                "OTM_FAST bank=%s combos_ready=%s detail=%s",
+                bank.id,
+                len(combos),
+                [
+                    {
+                        "book_ids": [b.id for b in combo],
+                        "amounts": [b.amount_base for b in combo],
+                        "dates": [b.date for b in combo],
+                        "total": sum((b.amount_base for b in combo), Decimal("0")),
+                        "diff": abs(q2(sum((b.amount_base for b in combo), Decimal("0"))) - target),
+                    }
+                    for combo in combos[:5]
+                ],
+            )
             self._evaluate_and_record_candidates(
                 match_type="one_to_many",
                 bank=bank,
@@ -2125,7 +2173,16 @@ class ReconciliationPipelineEngine:
                         diff = abs(q2(total) - target)
                         if diff > stage.amount_tol:
                             continue
-                        combos.append([c.dto for c in combo])
+                        combo_dtos = [c.dto for c in combo]
+                        log.debug(
+                            "MTO_FAST book=%s exact_combo size=%s total=%s diff=%s members=%s",
+                            book.id,
+                            size,
+                            total,
+                            diff,
+                            [(d.id, d.amount_base, d.date) for d in combo_dtos],
+                        )
+                        combos.append(combo_dtos)
             else:
                 # Beam search
                 log.debug(
@@ -2139,6 +2196,14 @@ class ReconciliationPipelineEngine:
                     diff = abs(item.amount_q2 - target)
                     if diff <= stage.amount_tol:
                         beam.append((item.amount, (idx,)))
+                        log.debug(
+                            "MTO_FAST book=%s beam_seed idx=%s amount=%s diff=%s bank_id=%s",
+                            book.id,
+                            idx,
+                            item.amount,
+                            diff,
+                            item.dto.id,
+                        )
                 for depth in range(2, max_size + 1):
                     if self._time_exceeded():
                         return
@@ -2150,10 +2215,27 @@ class ReconciliationPipelineEngine:
                             new_total = partial_sum + item.amount
                             diff = abs(q2(new_total) - target)
                             if diff <= stage.amount_tol:
-                                next_beam.append((new_total, idxs + (idx,)))
+                                next_idxs = idxs + (idx,)
+                                next_beam.append((new_total, next_idxs))
+                                log.debug(
+                                    "MTO_FAST book=%s beam_extend depth=%s total=%s diff=%s members=%s",
+                                    book.id,
+                                    depth,
+                                    new_total,
+                                    diff,
+                                    [(bank_items[i].dto.id, bank_items[i].amount, bank_items[i].dto.date) for i in next_idxs],
+                                )
                     next_beam.sort(key=lambda state: abs(q2(state[0]) - target))
                     beam = next_beam[:beam_width]
-                combos.extend([[bank_items[i].dto for i in state[1]] for state in beam])
+                combos_from_beam = [[bank_items[i].dto for i in state[1]] for state in beam]
+                for combo_dtos in combos_from_beam:
+                    log.debug(
+                        "MTO_FAST book=%s beam_combo total=%s members=%s",
+                        book.id,
+                        sum((dto.amount_base for dto in combo_dtos), Decimal("0")),
+                        [(d.id, d.amount_base, d.date) for d in combo_dtos],
+                    )
+                combos.extend(combos_from_beam)
                 log.debug("MTO_FAST book=%s beam combos=%s", book.id, len(beam))
             
             # Evaluate suggestions
@@ -2195,10 +2277,20 @@ class ReconciliationPipelineEngine:
             
             # Sort and record top suggestions
             log.debug(
-                "MTO_FAST book=%s combos_ready=%s candidates_ready=%s",
+                "MTO_FAST book=%s combos_ready=%s candidates_ready=%s detail=%s",
                 book.id,
                 len(combos),
                 len(candidates),
+                [
+                    {
+                        "bank_ids": [b.id for b in combo],
+                        "amounts": [b.amount_base for b in combo],
+                        "dates": [b.date for b in combo],
+                        "total": sum((b.amount_base for b in combo), Decimal("0")),
+                        "diff": abs(q2(sum((b.amount_base for b in combo), Decimal("0"))) - target),
+                    }
+                    for combo in combos[:5]
+                ],
             )
             if candidates:
                 candidates.sort(key=lambda s: float(s["confidence_score"]), reverse=True)
