@@ -2010,32 +2010,55 @@ class ReconciliationPipelineEngine:
                             diff,
                             item.dto.id,
                         )
-                # Expand beam
-                for depth in range(2, max_size + 1):
-                    if self._time_exceeded():
-                        return
-                    next_beam: List[tuple[Decimal, tuple[int, ...]]] = []
-                    for partial_sum, idxs in beam:
-                        for idx, item in enumerate(book_items):
-                            if idx in idxs:
-                                continue
-                            new_total = partial_sum + item.amount
-                            diff = abs(q2(new_total) - target)
-                            if diff <= stage.amount_tol:
-                                next_idxs = idxs + (idx,)
-                                next_beam.append((new_total, next_idxs))
-                                log.debug(
-                                    "OTM_FAST bank=%s beam_extend depth=%s total=%s diff=%s members=%s",
-                                    bank.id,
-                                    depth,
-                                    new_total,
-                                    diff,
-                                    [(book_items[i].dto.id, book_items[i].amount, book_items[i].dto.date) for i in next_idxs],
-                                )
-                    # Score partial combos by amount difference and trim beam
-                    next_beam.sort(key=lambda state: abs(q2(state[0]) - target))
-                    beam = next_beam[:beam_width]
-                combos_from_beam = [[book_items[i].dto for i in state[1]] for state in beam]
+                # Record any single-book hits immediately
+                recorded_state_keys: set[tuple[int, ...]] = set()
+                initial_hits = [
+                    state for state in beam if abs(q2(state[0]) - target) <= stage.amount_tol
+                ]
+                if initial_hits:
+                    recorded_state_keys = {state[1] for state in initial_hits}
+                    combos_from_hits = [[book_items[i].dto for i in state[1]] for state in initial_hits]
+                    combos.extend(combos_from_hits)
+                    for combo_dtos in combos_from_hits:
+                        log.debug(
+                            "OTM_FAST bank=%s beam_hit total=%s members=%s",
+                            bank.id,
+                            sum((dto.amount_base for dto in combo_dtos), Decimal("0")),
+                            [(d.id, d.amount_base, d.date) for d in combo_dtos],
+                        )
+                if max_size <= 1:
+                    log.debug("OTM_FAST bank=%s max_size<=1 skipping beam expansion", bank.id)
+                else:
+                    # Expand beam
+                    for depth in range(2, max_size + 1):
+                        if self._time_exceeded():
+                            return
+                        next_beam: List[tuple[Decimal, tuple[int, ...]]] = []
+                        for partial_sum, idxs in beam:
+                            for idx, item in enumerate(book_items):
+                                if idx in idxs:
+                                    continue
+                                new_total = partial_sum + item.amount
+                                diff = abs(q2(new_total) - target)
+                                if diff <= stage.amount_tol:
+                                    next_idxs = idxs + (idx,)
+                                    next_beam.append((new_total, next_idxs))
+                                    log.debug(
+                                        "OTM_FAST bank=%s beam_extend depth=%s total=%s diff=%s members=%s",
+                                        bank.id,
+                                        depth,
+                                        new_total,
+                                        diff,
+                                        [(book_items[i].dto.id, book_items[i].amount, book_items[i].dto.date) for i in next_idxs],
+                                    )
+                        # Score partial combos by amount difference and trim beam
+                        next_beam.sort(key=lambda state: abs(q2(state[0]) - target))
+                        beam = next_beam[:beam_width]
+                combos_from_beam = [
+                    [book_items[i].dto for i in state[1]]
+                    for state in beam
+                    if state[1] not in recorded_state_keys
+                ]
                 for combo_dtos in combos_from_beam:
                     log.debug(
                         "OTM_FAST bank=%s beam_combo total=%s members=%s",
@@ -2204,30 +2227,52 @@ class ReconciliationPipelineEngine:
                             diff,
                             item.dto.id,
                         )
-                for depth in range(2, max_size + 1):
-                    if self._time_exceeded():
-                        return
-                    next_beam: List[tuple[Decimal, tuple[int, ...]]] = []
-                    for partial_sum, idxs in beam:
-                        for idx, item in enumerate(bank_items):
-                            if idx in idxs:
-                                continue
-                            new_total = partial_sum + item.amount
-                            diff = abs(q2(new_total) - target)
-                            if diff <= stage.amount_tol:
-                                next_idxs = idxs + (idx,)
-                                next_beam.append((new_total, next_idxs))
-                                log.debug(
-                                    "MTO_FAST book=%s beam_extend depth=%s total=%s diff=%s members=%s",
-                                    book.id,
-                                    depth,
-                                    new_total,
-                                    diff,
-                                    [(bank_items[i].dto.id, bank_items[i].amount, bank_items[i].dto.date) for i in next_idxs],
-                                )
-                    next_beam.sort(key=lambda state: abs(q2(state[0]) - target))
-                    beam = next_beam[:beam_width]
-                combos_from_beam = [[bank_items[i].dto for i in state[1]] for state in beam]
+                recorded_state_keys: set[tuple[int, ...]] = set()
+                initial_hits = [
+                    state for state in beam if abs(q2(state[0]) - target) <= stage.amount_tol
+                ]
+                if initial_hits:
+                    recorded_state_keys = {state[1] for state in initial_hits}
+                    combos_from_hits = [[bank_items[i].dto for i in state[1]] for state in initial_hits]
+                    combos.extend(combos_from_hits)
+                    for combo_dtos in combos_from_hits:
+                        log.debug(
+                            "MTO_FAST book=%s beam_hit total=%s members=%s",
+                            book.id,
+                            sum((dto.amount_base for dto in combo_dtos), Decimal("0")),
+                            [(d.id, d.amount_base, d.date) for d in combo_dtos],
+                        )
+                if max_size <= 1:
+                    log.debug("MTO_FAST book=%s max_size<=1 skipping beam expansion", book.id)
+                else:
+                    for depth in range(2, max_size + 1):
+                        if self._time_exceeded():
+                            return
+                        next_beam: List[tuple[Decimal, tuple[int, ...]]] = []
+                        for partial_sum, idxs in beam:
+                            for idx, item in enumerate(bank_items):
+                                if idx in idxs:
+                                    continue
+                                new_total = partial_sum + item.amount
+                                diff = abs(q2(new_total) - target)
+                                if diff <= stage.amount_tol:
+                                    next_idxs = idxs + (idx,)
+                                    next_beam.append((new_total, next_idxs))
+                                    log.debug(
+                                        "MTO_FAST book=%s beam_extend depth=%s total=%s diff=%s members=%s",
+                                        book.id,
+                                        depth,
+                                        new_total,
+                                        diff,
+                                        [(bank_items[i].dto.id, bank_items[i].amount, bank_items[i].dto.date) for i in next_idxs],
+                                    )
+                        next_beam.sort(key=lambda state: abs(q2(state[0]) - target))
+                        beam = next_beam[:beam_width]
+                combos_from_beam = [
+                    [bank_items[i].dto for i in state[1]]
+                    for state in beam
+                    if state[1] not in recorded_state_keys
+                ]
                 for combo_dtos in combos_from_beam:
                     log.debug(
                         "MTO_FAST book=%s beam_combo total=%s members=%s",
