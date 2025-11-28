@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from itertools import combinations
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Union
 from multitenancy.utils import resolve_tenant
 #from .embedding_service import BankTransactionDTO, JournalEntryDTO, run_single_config, run_pipeline
 from datetime import date as _date
@@ -77,6 +77,15 @@ class JournalEntryDTO:
         return self.effective_amount
 
 
+@dataclass(frozen=True)
+class FastItem:
+    """Pre-computed metadata for fast matching paths."""
+    dto: Union[BankTransactionDTO, JournalEntryDTO]
+    amount: Decimal
+    amount_q2: Decimal
+    sign: int
+
+
 # ----------------------------------------------------------------------
 #  Stage and pipeline configuration
 # ----------------------------------------------------------------------
@@ -136,6 +145,23 @@ def _sign(x: Decimal | None) -> int:
     if x < 0:
         return -1
     return 0
+
+
+def _build_fast_items(items: Iterable[Union[BankTransactionDTO, JournalEntryDTO]]) -> List[FastItem]:
+    """Return immutable metadata for each candidate to avoid recomputation downstream."""
+    fast_items: List[FastItem] = []
+    for dto in items:
+        amt = dto.amount_base or Decimal("0")
+        fast_items.append(
+            FastItem(
+                dto=dto,
+                amount=amt,
+                amount_q2=q2(amt),
+                sign=_sign(amt),
+            )
+        )
+    return fast_items
+
 
 def _as_vec_list(vec) -> Optional[List[float]]:
     """
@@ -1904,14 +1930,18 @@ class ReconciliationPipelineEngine:
             
             # Pre-select candidate books for this bank
             local_books = self._prepare_candidates(bank, books, stage, max_local=max_local)
+            if bank.embedding and len(local_books) > stage.max_group_size_book * 4:
+                top_k = min(len(local_books), (max_local or len(local_books)), 32)
+                local_books = preselect_candidates_by_embedding(bank, local_books, top_k=top_k)
             if not local_books:
                 log.debug("OTM_FAST bank=%s no candidates survived prefilter", bank.id)
                 continue
+            book_items = _build_fast_items(local_books)
             log.debug(
                 "OTM_FAST bank=%s amount=%s candidates=%s max_group=%s",
                 bank.id,
                 bank.amount_base,
-                len(local_books),
+                len(book_items),
                 stage.max_group_size_book,
             )
             
@@ -1919,7 +1949,7 @@ class ReconciliationPipelineEngine:
             target = q2(bank.amount_base or Decimal("0"))
             
             # Mixed-sign check
-            book_signs = [_sign(b.amount_base) for b in local_books]
+            book_signs = [item.sign for item in book_items]
             has_mixed_books = (1 in book_signs and -1 in book_signs)
             if has_mixed_books and not stage.allow_mixed_signs:
                 log.debug("OTM_FAST bank=%s mixed_signs_blocked", bank.id)
@@ -1927,7 +1957,7 @@ class ReconciliationPipelineEngine:
             # Path 1: Mixed-sign via DFS if allowed
             if has_mixed_books and stage.allow_mixed_signs:
                 log.debug("OTM_FAST bank=%s entering mixed-sign DFS path", bank.id)
-                subset = self._find_mixed_one_to_many_group(bank, local_books, stage)
+                subset = self._find_mixed_one_to_many_group(bank, [item.dto for item in book_items], stage)
                 if subset:
                     combos.append(list(subset))
                     log.debug("OTM_FAST bank=%s mixed DFS produced group size=%s", bank.id, len(subset))
@@ -1936,21 +1966,19 @@ class ReconciliationPipelineEngine:
             
             # Path 2: Same-sign / bounded search
             # Generate candidate combos up to max_group_size
-            max_size = min(stage.max_group_size_book, len(local_books))
+            max_size = min(stage.max_group_size_book, len(book_items))
             if strategy == "exact" or max_size <= 2:
                 # Full enumeration for small groups
                 log.debug("OTM_FAST bank=%s using exact enumeration max_size=%s", bank.id, max_size)
                 for size in range(1, max_size + 1):
                     if self._time_exceeded():
                         return
-                    for combo in combinations(local_books, size):
-                        total = sum((b.amount_base for b in combo), Decimal("0"))
+                    for combo in combinations(book_items, size):
+                        total = sum((c.amount for c in combo), Decimal("0"))
                         diff = abs(q2(total) - target)
                         if diff > stage.amount_tol:
                             continue
-                        if any(b.currency_id != bank.currency_id for b in combo):
-                            continue
-                        combos.append(list(combo))
+                        combos.append([c.dto for c in combo])
             else:
                 # Beam search for larger groups
                 # Start with 1-book combos, then expand
@@ -1960,31 +1988,28 @@ class ReconciliationPipelineEngine:
                     max_size,
                     beam_width,
                 )
-                beam = []
-                for b in local_books:
-                    diff = abs(q2(b.amount_base) - target)
+                beam: List[tuple[Decimal, tuple[int, ...]]] = []
+                for idx, item in enumerate(book_items):
+                    diff = abs(item.amount_q2 - target)
                     if diff <= stage.amount_tol:
-                        beam.append([b])
+                        beam.append((item.amount, (idx,)))
                 # Expand beam
                 for depth in range(2, max_size + 1):
                     if self._time_exceeded():
                         return
-                    next_beam = []
-                    for combo in beam:
-                        # Sum amounts of current combo
-                        partial_sum = sum((x.amount_base for x in combo), Decimal("0"))
-                        for b in local_books:
-                            if b.id in [x.id for x in combo]:
+                    next_beam: List[tuple[Decimal, tuple[int, ...]]] = []
+                    for partial_sum, idxs in beam:
+                        for idx, item in enumerate(book_items):
+                            if idx in idxs:
                                 continue
-                            new_combo = combo + [b]
-                            total = partial_sum + b.amount_base
-                            diff = abs(q2(total) - target)
+                            new_total = partial_sum + item.amount
+                            diff = abs(q2(new_total) - target)
                             if diff <= stage.amount_tol:
-                                next_beam.append(new_combo)
+                                next_beam.append((new_total, idxs + (idx,)))
                     # Score partial combos by amount difference and trim beam
-                    next_beam.sort(key=lambda c: abs(q2(sum((x.amount_base for x in c), Decimal("0"))) - target))
+                    next_beam.sort(key=lambda state: abs(q2(state[0]) - target))
                     beam = next_beam[:beam_width]
-                combos.extend(beam)
+                combos.extend([[book_items[i].dto for i in state[1]] for state in beam])
                 log.debug("OTM_FAST bank=%s beam combos=%s", bank.id, len(beam))
             
             log.debug("OTM_FAST bank=%s combos_ready=%s", bank.id, len(combos))
@@ -2068,7 +2093,8 @@ class ReconciliationPipelineEngine:
                     max_local,
                 )
             
-            bank_signs = [_sign(b.amount_base) for b in local_banks]
+            bank_items = _build_fast_items(local_banks)
+            bank_signs = [item.sign for item in bank_items]
             has_mixed_banks = (1 in bank_signs and -1 in bank_signs)
             
             combos: List[List[BankTransactionDTO]] = []
@@ -2079,7 +2105,7 @@ class ReconciliationPipelineEngine:
                 log.debug("MTO_FAST book=%s mixed_signs_blocked", book.id)
             if has_mixed_banks and stage.allow_mixed_signs:
                 log.debug("MTO_FAST book=%s entering mixed-sign DFS path", book.id)
-                subset = self._find_mixed_many_to_one_group(book, local_banks, stage)
+                subset = self._find_mixed_many_to_one_group(book, [item.dto for item in bank_items], stage)
                 if subset:
                     combos.append(list(subset))
                     log.debug("MTO_FAST book=%s mixed DFS produced group size=%s", book.id, len(subset))
@@ -2087,21 +2113,19 @@ class ReconciliationPipelineEngine:
                     log.debug("MTO_FAST book=%s mixed DFS produced no group", book.id)
             
             # Path 2: Same-sign / bounded search
-            max_size = min(stage.max_group_size_bank, len(local_banks))
+            max_size = min(stage.max_group_size_bank, len(bank_items))
             if strategy == "exact" or max_size <= 2:
                 # Full enumeration
                 log.debug("MTO_FAST book=%s using exact enumeration max_size=%s", book.id, max_size)
                 for size in range(1, max_size + 1):
                     if self._time_exceeded():
                         return
-                    for combo in combinations(local_banks, size):
-                        total = sum((b.amount_base for b in combo), Decimal("0"))
+                    for combo in combinations(bank_items, size):
+                        total = sum((c.amount for c in combo), Decimal("0"))
                         diff = abs(q2(total) - target)
                         if diff > stage.amount_tol:
                             continue
-                        if any(b.currency_id != book.currency_id for b in combo):
-                            continue
-                        combos.append(list(combo))
+                        combos.append([c.dto for c in combo])
             else:
                 # Beam search
                 log.debug(
@@ -2110,28 +2134,26 @@ class ReconciliationPipelineEngine:
                     max_size,
                     beam_width,
                 )
-                beam = []
-                for b in local_banks:
-                    diff = abs(q2(b.amount_base) - target)
+                beam: List[tuple[Decimal, tuple[int, ...]]] = []
+                for idx, item in enumerate(bank_items):
+                    diff = abs(item.amount_q2 - target)
                     if diff <= stage.amount_tol:
-                        beam.append([b])
+                        beam.append((item.amount, (idx,)))
                 for depth in range(2, max_size + 1):
                     if self._time_exceeded():
                         return
-                    next_beam = []
-                    for combo in beam:
-                        partial_sum = sum((x.amount_base for x in combo), Decimal("0"))
-                        for b in local_banks:
-                            if b.id in [x.id for x in combo]:
+                    next_beam: List[tuple[Decimal, tuple[int, ...]]] = []
+                    for partial_sum, idxs in beam:
+                        for idx, item in enumerate(bank_items):
+                            if idx in idxs:
                                 continue
-                            new_combo = combo + [b]
-                            total = partial_sum + b.amount_base
-                            diff = abs(q2(total) - target)
+                            new_total = partial_sum + item.amount
+                            diff = abs(q2(new_total) - target)
                             if diff <= stage.amount_tol:
-                                next_beam.append(new_combo)
-                    next_beam.sort(key=lambda c: abs(q2(sum((x.amount_base for x in c), Decimal("0"))) - target))
+                                next_beam.append((new_total, idxs + (idx,)))
+                    next_beam.sort(key=lambda state: abs(q2(state[0]) - target))
                     beam = next_beam[:beam_width]
-                combos.extend(beam)
+                combos.extend([[bank_items[i].dto for i in state[1]] for state in beam])
                 log.debug("MTO_FAST book=%s beam combos=%s", book.id, len(beam))
             
             # Evaluate suggestions
