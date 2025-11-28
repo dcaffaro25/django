@@ -202,7 +202,15 @@ def compare_two_engines_task(self, db_id: int, data: Dict[str, Any], tenant_id: 
         args=(fast_row.id, fast_data, tenant_id, auto_match_100, True),
         queue="recon_fast",
     )
-
+    
+    legacy_row.task_id = legacy_async.id
+    legacy_row.updated_at = timezone.now()
+    legacy_row.save(update_fields=["task_id", "updated_at"])
+    
+    fast_row.task_id = fast_async.id
+    fast_row.updated_at = timezone.now()
+    fast_row.save(update_fields=["task_id", "updated_at"])
+    
     # Poll for a short time (caller can re-query parent task later)
     max_wait_s = int(getattr(settings, "COMPARE_MAX_WAIT_S", 600))
     poll = float(getattr(settings, "COMPARE_POLL_INTERVAL_S", 2.0))

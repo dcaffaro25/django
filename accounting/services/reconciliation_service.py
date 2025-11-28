@@ -1886,6 +1886,15 @@ class ReconciliationPipelineEngine:
         max_local = strategy_cfg.get("max_cands")
         beam_width = strategy_cfg.get("beam_width")
         strategy   = strategy_cfg.get("strategy")
+        log.debug(
+            "OTM_FAST stage=%s strategy=%s max_local=%s beam_width=%s tol=%s mixed=%s",
+            stage.type,
+            strategy,
+            max_local,
+            beam_width,
+            stage.amount_tol,
+            stage.allow_mixed_signs,
+        )
         
         for bank in banks:
             if self._time_exceeded():
@@ -1896,7 +1905,15 @@ class ReconciliationPipelineEngine:
             # Pre-select candidate books for this bank
             local_books = self._prepare_candidates(bank, books, stage, max_local=max_local)
             if not local_books:
+                log.debug("OTM_FAST bank=%s no candidates survived prefilter", bank.id)
                 continue
+            log.debug(
+                "OTM_FAST bank=%s amount=%s candidates=%s max_group=%s",
+                bank.id,
+                bank.amount_base,
+                len(local_books),
+                stage.max_group_size_book,
+            )
             
             combos: List[List[JournalEntryDTO]] = []
             target = q2(bank.amount_base or Decimal("0"))
@@ -1904,18 +1921,25 @@ class ReconciliationPipelineEngine:
             # Mixed-sign check
             book_signs = [_sign(b.amount_base) for b in local_books]
             has_mixed_books = (1 in book_signs and -1 in book_signs)
+            if has_mixed_books and not stage.allow_mixed_signs:
+                log.debug("OTM_FAST bank=%s mixed_signs_blocked", bank.id)
             
             # Path 1: Mixed-sign via DFS if allowed
             if has_mixed_books and stage.allow_mixed_signs:
+                log.debug("OTM_FAST bank=%s entering mixed-sign DFS path", bank.id)
                 subset = self._find_mixed_one_to_many_group(bank, local_books, stage)
                 if subset:
                     combos.append(list(subset))
+                    log.debug("OTM_FAST bank=%s mixed DFS produced group size=%s", bank.id, len(subset))
+                else:
+                    log.debug("OTM_FAST bank=%s mixed DFS produced no group", bank.id)
             
             # Path 2: Same-sign / bounded search
             # Generate candidate combos up to max_group_size
             max_size = min(stage.max_group_size_book, len(local_books))
             if strategy == "exact" or max_size <= 2:
                 # Full enumeration for small groups
+                log.debug("OTM_FAST bank=%s using exact enumeration max_size=%s", bank.id, max_size)
                 for size in range(1, max_size + 1):
                     if self._time_exceeded():
                         return
@@ -1930,6 +1954,12 @@ class ReconciliationPipelineEngine:
             else:
                 # Beam search for larger groups
                 # Start with 1-book combos, then expand
+                log.debug(
+                    "OTM_FAST bank=%s using beam_search max_size=%s beam_width=%s",
+                    bank.id,
+                    max_size,
+                    beam_width,
+                )
                 beam = []
                 for b in local_books:
                     diff = abs(q2(b.amount_base) - target)
@@ -1955,7 +1985,9 @@ class ReconciliationPipelineEngine:
                     next_beam.sort(key=lambda c: abs(q2(sum((x.amount_base for x in c), Decimal("0"))) - target))
                     beam = next_beam[:beam_width]
                 combos.extend(beam)
+                log.debug("OTM_FAST bank=%s beam combos=%s", bank.id, len(beam))
             
+            log.debug("OTM_FAST bank=%s combos_ready=%s", bank.id, len(combos))
             self._evaluate_and_record_candidates(
                 match_type="one_to_many",
                 bank=bank,
@@ -1975,6 +2007,15 @@ class ReconciliationPipelineEngine:
         max_local = strategy_cfg.get("max_cands")
         beam_width = strategy_cfg.get("beam_width")
         strategy   = strategy_cfg.get("strategy")
+        log.debug(
+            "MTO_FAST stage=%s strategy=%s max_local=%s beam_width=%s tol=%s mixed=%s",
+            stage.type,
+            strategy,
+            max_local,
+            beam_width,
+            stage.amount_tol,
+            stage.allow_mixed_signs,
+        )
         
         for book in books:
             if self._time_exceeded():
@@ -1993,15 +2034,24 @@ class ReconciliationPipelineEngine:
                 and abs((b.date - book.date).days) <= win
             ]
             if not local_banks:
+                log.debug("MTO_FAST book=%s no banks in window", book.id)
                 continue
             
             # Filter by sign if mixed signs not allowed
             book_sign = _sign(book.amount_base or Decimal("0"))
             if not stage.allow_mixed_signs and book_sign != 0:
+                before = len(local_banks)
                 if book_sign > 0:
                     local_banks = [b for b in local_banks if _sign(b.amount_base) >= 0]
                 else:
                     local_banks = [b for b in local_banks if _sign(b.amount_base) <= 0]
+                log.debug(
+                    "MTO_FAST book=%s filtered_by_sign before=%s after=%s book_sign=%s",
+                    book.id,
+                    before,
+                    len(local_banks),
+                    book_sign,
+                )
             
             # Cap local banks if necessary
             if max_local and len(local_banks) > max_local:
@@ -2011,6 +2061,12 @@ class ReconciliationPipelineEngine:
                     date_diff = abs((b.date - book.date).days) if b.date and book.date else 9999
                     return (amt_diff, date_diff)
                 local_banks = sorted(local_banks, key=sort_key)[:max_local]
+                log.debug(
+                    "MTO_FAST book=%s trimmed_candidates to=%s max_local=%s",
+                    book.id,
+                    len(local_banks),
+                    max_local,
+                )
             
             bank_signs = [_sign(b.amount_base) for b in local_banks]
             has_mixed_banks = (1 in bank_signs and -1 in bank_signs)
@@ -2019,15 +2075,22 @@ class ReconciliationPipelineEngine:
             target = q2(book.amount_base or Decimal("0"))
             
             # Path 1: Mixed-sign via DFS
+            if has_mixed_banks and not stage.allow_mixed_signs:
+                log.debug("MTO_FAST book=%s mixed_signs_blocked", book.id)
             if has_mixed_banks and stage.allow_mixed_signs:
+                log.debug("MTO_FAST book=%s entering mixed-sign DFS path", book.id)
                 subset = self._find_mixed_many_to_one_group(book, local_banks, stage)
                 if subset:
                     combos.append(list(subset))
+                    log.debug("MTO_FAST book=%s mixed DFS produced group size=%s", book.id, len(subset))
+                else:
+                    log.debug("MTO_FAST book=%s mixed DFS produced no group", book.id)
             
             # Path 2: Same-sign / bounded search
             max_size = min(stage.max_group_size_bank, len(local_banks))
             if strategy == "exact" or max_size <= 2:
                 # Full enumeration
+                log.debug("MTO_FAST book=%s using exact enumeration max_size=%s", book.id, max_size)
                 for size in range(1, max_size + 1):
                     if self._time_exceeded():
                         return
@@ -2041,6 +2104,12 @@ class ReconciliationPipelineEngine:
                         combos.append(list(combo))
             else:
                 # Beam search
+                log.debug(
+                    "MTO_FAST book=%s using beam_search max_size=%s beam_width=%s",
+                    book.id,
+                    max_size,
+                    beam_width,
+                )
                 beam = []
                 for b in local_banks:
                     diff = abs(q2(b.amount_base) - target)
@@ -2063,6 +2132,7 @@ class ReconciliationPipelineEngine:
                     next_beam.sort(key=lambda c: abs(q2(sum((x.amount_base for x in c), Decimal("0"))) - target))
                     beam = next_beam[:beam_width]
                 combos.extend(beam)
+                log.debug("MTO_FAST book=%s beam combos=%s", book.id, len(beam))
             
             # Evaluate suggestions
             candidates: List[dict] = []
@@ -2102,6 +2172,12 @@ class ReconciliationPipelineEngine:
                 candidates.append(suggestion)
             
             # Sort and record top suggestions
+            log.debug(
+                "MTO_FAST book=%s combos_ready=%s candidates_ready=%s",
+                book.id,
+                len(combos),
+                len(candidates),
+            )
             if candidates:
                 candidates.sort(key=lambda s: float(s["confidence_score"]), reverse=True)
                 best = candidates[0]
@@ -2126,6 +2202,15 @@ class ReconciliationPipelineEngine:
         max_local_books = strategy_cfg.get("max_cands") or 64
         beam_width = strategy_cfg.get("beam_width")
         strategy   = strategy_cfg.get("strategy")
+        log.debug(
+            "MTM_FAST stage=%s strategy=%s max_local_banks=%s max_local_books=%s beam_width=%s tol=%s",
+            stage.type,
+            strategy,
+            max_local_banks,
+            max_local_books,
+            beam_width,
+            stage.amount_tol,
+        )
         
         # Sort by date for window extraction
         banks_sorted = sorted([b for b in banks if b.company_id == self.company_id], key=lambda b: b.date)
@@ -2146,15 +2231,32 @@ class ReconciliationPipelineEngine:
             end   = anchor_bank.date + timedelta(days=win)
             local_banks = [b for b in banks_sorted if start <= b.date <= end]
             local_books = [e for e in books_sorted if start <= e.date <= end]
+            log.debug(
+                "MTM_FAST anchor_bank=%s window_days=%s banks=%s books=%s",
+                anchor_bank.id,
+                win,
+                len(local_banks),
+                len(local_books),
+            )
             
             # Filter by sign if mixed not allowed
             if not stage.allow_mixed_signs and anchor_sign != 0:
+                before_banks = len(local_banks)
+                before_books = len(local_books)
                 if anchor_sign > 0:
                     local_banks = [b for b in local_banks if _sign(b.amount_base) >= 0]
                     local_books = [e for e in local_books if _sign(e.amount_base) >= 0]
                 else:
                     local_banks = [b for b in local_banks if _sign(b.amount_base) <= 0]
                     local_books = [e for e in local_books if _sign(e.amount_base) <= 0]
+                log.debug(
+                    "MTM_FAST anchor_bank=%s sign_filter applied banks:%s->%s books:%s->%s",
+                    anchor_bank.id,
+                    before_banks,
+                    len(local_banks),
+                    before_books,
+                    len(local_books),
+                )
             
             # Cap local banks and books
             if len(local_banks) > max_local_banks:
@@ -2167,6 +2269,11 @@ class ReconciliationPipelineEngine:
                     [b for b in local_banks if b.id != anchor_bank.id],
                     key=sort_key
                 )[:max_local_banks - 1]
+                log.debug(
+                    "MTM_FAST anchor_bank=%s trimmed banks to=%s",
+                    anchor_bank.id,
+                    len(local_banks),
+                )
             if len(local_books) > max_local_books:
                 target = q2(anchor_amt)
                 def sort_key(e):
@@ -2174,6 +2281,11 @@ class ReconciliationPipelineEngine:
                     date_diff = abs((e.date - anchor_bank.date).days) if e.date and anchor_bank.date else 9999
                     return (amt_diff, date_diff)
                 local_books = sorted(local_books, key=sort_key)[:max_local_books]
+                log.debug(
+                    "MTM_FAST anchor_bank=%s trimmed books to=%s",
+                    anchor_bank.id,
+                    len(local_books),
+                )
             
             # Generate candidate bank groups
             bank_groups = []
@@ -2186,9 +2298,20 @@ class ReconciliationPipelineEngine:
                         if any(bc.id in self.used_banks for bc in combo):
                             continue
                         bank_groups.append(combo)
+                log.debug(
+                    "MTM_FAST anchor_bank=%s exact bank_groups=%s",
+                    anchor_bank.id,
+                    len(bank_groups),
+                )
             else:
                 # Beam search on bank side
                 bank_beam = [[anchor_bank]]
+                log.debug(
+                    "MTM_FAST anchor_bank=%s beam bank search max_size=%s beam=%s",
+                    anchor_bank.id,
+                    max_bank_size,
+                    beam_width,
+                )
                 for depth in range(2, max_bank_size + 1):
                     if self._time_exceeded():
                         return
@@ -2205,6 +2328,11 @@ class ReconciliationPipelineEngine:
                     next_beam.sort(key=lambda c: abs(q2(sum((x.amount_base for x in c), Decimal("0"))) - q2(sum((x.amount_base for x in c), Decimal("0")))))
                     bank_beam = next_beam[:beam_width]
                 bank_groups.extend(bank_beam)
+                log.debug(
+                    "MTM_FAST anchor_bank=%s beam bank_groups=%s",
+                    anchor_bank.id,
+                    len(bank_beam),
+                )
             
             # Evaluate each bank group with book groups
             for bank_combo in bank_groups:
@@ -2228,9 +2356,22 @@ class ReconciliationPipelineEngine:
                             if any(b.currency_id != e.currency_id for b in bank_combo for e in book_combo):
                                 continue
                             book_groups.append(book_combo)
+                    log.debug(
+                        "MTM_FAST anchor_bank=%s bank_combo=%s exact book_groups=%s",
+                        anchor_bank.id,
+                        [b.id for b in bank_combo],
+                        len(book_groups),
+                    )
                 else:
                     # Beam search on book side
                     book_beam = []
+                    log.debug(
+                        "MTM_FAST anchor_bank=%s bank_combo=%s beam book search max_size=%s beam=%s",
+                        anchor_bank.id,
+                        [b.id for b in bank_combo],
+                        max_book_size,
+                        beam_width,
+                    )
                     for e in local_books:
                         diff = abs(q2(e.amount_base or Decimal("0")) - target)
                         if diff <= stage.amount_tol:
@@ -2252,6 +2393,12 @@ class ReconciliationPipelineEngine:
                         next_beam.sort(key=lambda c: abs(q2(sum((x.amount_base for x in c), Decimal("0"))) - target))
                         book_beam = next_beam[:beam_width]
                     book_groups.extend(book_beam)
+                    log.debug(
+                        "MTM_FAST anchor_bank=%s bank_combo=%s beam book_groups=%s",
+                        anchor_bank.id,
+                        [b.id for b in bank_combo],
+                        len(book_beam),
+                    )
                 
                 # Score and record suggestions
                 for book_combo in book_groups:
@@ -2293,6 +2440,13 @@ class ReconciliationPipelineEngine:
                         },
                     )
                     self._record(suggestion)
+                    log.debug(
+                        "MTM_FAST anchor_bank=%s recorded bank_combo=%s book_combo=%s score=%s",
+                        anchor_bank.id,
+                        [b.id for b in bank_combo],
+                        [e.id for e in book_combo],
+                        scores["global_score"],
+                    )
                     # Only keep the best N per anchor
                     if len(self.suggestions) >= self.config.max_suggestions:
                         return
