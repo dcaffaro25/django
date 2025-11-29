@@ -143,13 +143,20 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         
         data = serializer.validated_data
+        
+        # Get company from tenant (set by middleware)
+        company = getattr(request, 'tenant', None)
+        if not company or company == 'all':
+            return Response(
+                {'error': 'Company/tenant not found in request'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        company_id = company.id if hasattr(company, 'id') else company
+        
         template = FinancialStatementTemplate.objects.get(
             id=data['template_id'],
-            company_id=request.user.company_id,
+            company_id=company_id,
         )
-        
-        # Get company ID
-        company_id = request.user.company_id
         
         # Generate statement
         generator = FinancialStatementGenerator(company_id=company_id)
@@ -554,7 +561,14 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def quick_balance_sheet(self, request, tenant_id=None):
         """Quick balance sheet for current period."""
-        company_id = request.user.company_id
+        # Get company from tenant (set by middleware)
+        company = getattr(request, 'tenant', None)
+        if not company or company == 'all':
+            return Response(
+                {'error': 'Company/tenant not found in request'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        company_id = company.id if hasattr(company, 'id') else company
         
         # Get default balance sheet template
         template = FinancialStatementTemplate.objects.filter(
@@ -591,7 +605,14 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def quick_income_statement(self, request, tenant_id=None):
         """Quick income statement for current period."""
-        company_id = request.user.company_id
+        # Get company from tenant (set by middleware)
+        company = getattr(request, 'tenant', None)
+        if not company or company == 'all':
+            return Response(
+                {'error': 'Company/tenant not found in request'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        company_id = company.id if hasattr(company, 'id') else company
         
         # Get default income statement template
         template = FinancialStatementTemplate.objects.filter(
