@@ -214,18 +214,36 @@ class Account(TenantAwareBaseModel, MPTTModel):
     
     def calculate_balance(self, include_pending=False, beginning_date=None, end_date=None):
         if self.is_leaf():
-            entries = self.journal_entries.filter(state='posted')
+            # Use JournalEntry.objects.filter like get_current_balance does
+            entries = JournalEntry.objects.filter(
+                account=self,
+                state='posted'
+            )
             if include_pending:
-                entries = entries | self.journal_entries.filter(state='pending')
+                entries = entries | JournalEntry.objects.filter(
+                    account=self,
+                    state='pending'
+                )
 
-            date_filter = Q()
+            # Apply date filters
             if beginning_date:
-                date_filter &= Q(date__gte=beginning_date)
+                entries = entries.filter(
+                    Q(date__gte=beginning_date) | (Q(date__isnull=True) & Q(transaction__date__gte=beginning_date))
+                )
             if end_date:
-                date_filter &= Q(date__lte=end_date)
+                entries = entries.filter(
+                    Q(date__lte=end_date) | (Q(date__isnull=True) & Q(transaction__date__lte=end_date))
+                )
 
-            entries = entries.filter(date_filter)
-            return entries.aggregate(balance=Sum('amount'))['balance']
+            # Calculate balance: sum of (debit - credit) * account_direction
+            result = entries.aggregate(
+                total_debit=Sum('debit_amount'),
+                total_credit=Sum('credit_amount')
+            )
+            total_debit = result['total_debit'] or Decimal('0.00')
+            total_credit = result['total_credit'] or Decimal('0.00')
+            balance = (total_debit - total_credit) * self.account_direction
+            return balance
         else:
             return sum(child.calculate_balance(include_pending, beginning_date, end_date) for child in self.get_children())
 

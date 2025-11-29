@@ -167,4 +167,5 @@ class GenerateStatementRequestSerializer(serializers.Serializer):
         default='draft'
     )
     notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    include_pending = serializers.BooleanField(required=False, default=False)
 

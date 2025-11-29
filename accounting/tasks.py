@@ -104,6 +104,12 @@ DEFAULT_SUGGESTION_FLUSH_INTERVAL = int(getattr(settings, "RECON_SUGGESTION_FLUS
 # -----------------------
 @shared_task(bind=True)
 def recalc_unposted_flags_task(self) -> dict:
+    """
+    Recalculate flags for unposted transactions.
+    This is a legacy task - consider using recalculate_status_task instead.
+    """
+    from accounting.utils import update_journal_entries_and_transaction_flags
+    
     updated_count = 0
     with transaction.atomic():
         unposted_txs = (
@@ -118,6 +124,47 @@ def recalc_unposted_flags_task(self) -> dict:
                 update_journal_entries_and_transaction_flags(entries)
                 updated_count += 1
     return {"updated_transactions": updated_count}
+
+
+@shared_task(bind=True)
+def recalculate_status_task(self, transaction_ids=None, company_id=None) -> dict:
+    """
+    Comprehensive task to recalculate transaction and journal entry status.
+    
+    This task:
+    - Checks transaction balance
+    - Updates transaction state based on journal entry states
+    - Updates all flags (is_balanced, is_reconciled, is_posted, is_cash)
+    - Can be run for specific transactions or all transactions
+    
+    Parameters
+    ----------
+    transaction_ids: Optional[List[int]]
+        Specific transaction IDs to recalculate
+    company_id: Optional[int]
+        Company ID to filter transactions
+    
+    Returns
+    -------
+    dict
+        Statistics about what was updated
+    """
+    from accounting.utils import recalculate_transaction_and_journal_entry_status
+    
+    try:
+        stats = recalculate_transaction_and_journal_entry_status(
+            transaction_ids=transaction_ids,
+            company_id=company_id
+        )
+        return {
+            "success": True,
+            **stats
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 
 # -----------------------

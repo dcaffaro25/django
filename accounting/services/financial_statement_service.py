@@ -39,6 +39,7 @@ class FinancialStatementGenerator:
         status: str = 'draft',
         generated_by=None,
         notes: Optional[str] = None,
+        include_pending: bool = False,
     ) -> FinancialStatement:
         """
         Generate a financial statement from a template.
@@ -107,6 +108,7 @@ class FinancialStatementGenerator:
                 as_of_date,
                 template.report_type,
                 line_values,
+                include_pending=include_pending,
             )
             line_values[line_template.line_number] = value
             
@@ -144,6 +146,7 @@ class FinancialStatementGenerator:
         as_of_date: date,
         report_type: str,
         line_values: Dict[int, Decimal],
+        include_pending: bool = False,
     ) -> Decimal:
         """Calculate the value for a single line item."""
         
@@ -167,6 +170,7 @@ class FinancialStatementGenerator:
                 accounts,
                 as_of_date,
                 line_template.calculation_type,
+                include_pending=include_pending,
             )
         elif report_type == 'income_statement':
             # Income statement: use period activity
@@ -175,6 +179,7 @@ class FinancialStatementGenerator:
                 start_date,
                 end_date,
                 line_template.calculation_type,
+                include_pending=include_pending,
             )
         elif report_type == 'cash_flow':
             # Cash flow: specific logic
@@ -183,6 +188,7 @@ class FinancialStatementGenerator:
                 start_date,
                 end_date,
                 line_template.calculation_type,
+                include_pending=include_pending,
             )
         else:
             # Default: period activity
@@ -191,6 +197,7 @@ class FinancialStatementGenerator:
                 start_date,
                 end_date,
                 line_template.calculation_type,
+                include_pending=include_pending,
             )
     
     def _get_accounts_for_line(
@@ -238,6 +245,7 @@ class FinancialStatementGenerator:
         accounts: List[Account],
         as_of_date: date,
         calculation_type: str,
+        include_pending: bool = False,
     ) -> Decimal:
         """Calculate balance sheet line (as of specific date)."""
         total = Decimal('0.00')
@@ -245,7 +253,7 @@ class FinancialStatementGenerator:
         for account in accounts:
             # Get balance as of date
             balance = account.calculate_balance(
-                include_pending=False,
+                include_pending=include_pending,
                 beginning_date=None,
                 end_date=as_of_date,
             ) or Decimal('0.00')
@@ -264,19 +272,24 @@ class FinancialStatementGenerator:
         start_date: date,
         end_date: date,
         calculation_type: str,
+        include_pending: bool = False,
     ) -> Decimal:
         """Calculate income statement line (period activity)."""
         total = Decimal('0.00')
         
         for account in accounts:
             # Get period activity
+            if include_pending:
+                state_filter = Q(state__in=['posted', 'pending'])
+            else:
+                state_filter = Q(state='posted')
+            
             entries = JournalEntry.objects.filter(
                 account=account,
                 transaction__date__gte=start_date,
                 transaction__date__lte=end_date,
-                state='posted',
                 transaction__company_id=self.company_id,
-            )
+            ).filter(state_filter)
             
             if calculation_type == 'difference':
                 # Debit - Credit
@@ -312,6 +325,7 @@ class FinancialStatementGenerator:
         start_date: date,
         end_date: date,
         calculation_type: str,
+        include_pending: bool = False,
     ) -> Decimal:
         """Calculate cash flow line (cash accounts only)."""
         # Filter to cash/bank accounts
@@ -325,13 +339,13 @@ class FinancialStatementGenerator:
         for account in cash_accounts:
             # Get beginning balance
             beginning_balance = account.calculate_balance(
-                include_pending=False,
+                include_pending=include_pending,
                 end_date=start_date,
             ) or Decimal('0.00')
             
             # Get ending balance
             ending_balance = account.calculate_balance(
-                include_pending=False,
+                include_pending=include_pending,
                 end_date=end_date,
             ) or Decimal('0.00')
             
@@ -347,6 +361,7 @@ class FinancialStatementGenerator:
         start_date: date,
         end_date: date,
         calculation_type: str,
+        include_pending: bool = False,
     ) -> Decimal:
         """Calculate period balance (generic)."""
         return self._calculate_income_statement_line(
@@ -354,6 +369,7 @@ class FinancialStatementGenerator:
             start_date,
             end_date,
             calculation_type,
+            include_pending=include_pending,
         )
     
     def _evaluate_formula(

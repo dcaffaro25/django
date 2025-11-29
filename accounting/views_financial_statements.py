@@ -169,6 +169,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             status=data.get('status', 'draft'),
             generated_by=request.user,
             notes=data.get('notes'),
+            include_pending=data.get('include_pending', False),
         )
         
         # Return JSON with additional format options

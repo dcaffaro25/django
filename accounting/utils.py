@@ -91,6 +91,145 @@ def update_journal_entries_and_transaction_flags(journal_entries):
 
             tx.save(update_fields=['is_balanced', 'is_reconciled'])
 
+
+def recalculate_transaction_and_journal_entry_status(transaction_ids=None, company_id=None):
+    """
+    Recalculate and update the status of transactions and their journal entries.
+    
+    This function:
+    1. Checks if transactions are balanced (debits = credits)
+    2. Updates transaction.state based on journal entry states
+    3. Updates transaction.is_posted flag
+    4. Updates journal entry flags (is_cash, is_reconciled)
+    5. Updates transaction flags (is_balanced, is_reconciled)
+    
+    Parameters
+    ----------
+    transaction_ids: Optional[List[int]]
+        Specific transaction IDs to recalculate. If None, recalculates all.
+    company_id: Optional[int]
+        If provided, only recalculate transactions for this company.
+    
+    Returns
+    -------
+    dict
+        Statistics about what was updated
+    """
+    from accounting.models import Transaction, JournalEntry
+    
+    stats = {
+        'transactions_checked': 0,
+        'transactions_updated': 0,
+        'journal_entries_updated': 0,
+        'state_changes': 0,
+    }
+    
+    # Build query
+    query = Transaction.objects.select_related('company', 'currency', 'entity')
+    if transaction_ids:
+        query = query.filter(id__in=transaction_ids)
+    if company_id:
+        query = query.filter(company_id=company_id)
+    
+    with transaction.atomic():
+        for tx in query.prefetch_related('journal_entries__account__bank_account', 'journal_entries__reconciliations'):
+            stats['transactions_checked'] += 1
+            updated = False
+            
+            # Get all journal entries for this transaction
+            journal_entries = list(tx.journal_entries.all())
+            
+            if not journal_entries:
+                continue
+            
+            # 1. Check if transaction is balanced
+            sums = tx.journal_entries.aggregate(
+                total_debits=Coalesce(Sum('debit_amount'), Decimal('0')),
+                total_credits=Coalesce(Sum('credit_amount'), Decimal('0')),
+            )
+            is_balanced = (sums['total_debits'] == sums['total_credits'])
+            
+            if tx.is_balanced != is_balanced:
+                tx.is_balanced = is_balanced
+                updated = True
+            
+            # 2. Check journal entry states to determine transaction state
+            all_posted = all(je.state == 'posted' for je in journal_entries)
+            all_pending = all(je.state == 'pending' for je in journal_entries)
+            all_canceled = all(je.state == 'canceled' for je in journal_entries)
+            has_posted = any(je.state == 'posted' for je in journal_entries)
+            has_canceled = any(je.state == 'canceled' for je in journal_entries)
+            
+            # Determine transaction state
+            new_state = tx.state
+            if all_canceled:
+                new_state = 'canceled'
+            elif all_posted:
+                new_state = 'posted'
+            elif all_pending:
+                new_state = 'pending'
+            elif has_posted and has_canceled:
+                new_state = 'mixed'  # Some posted, some canceled
+            elif has_posted:
+                new_state = 'partial'  # Some posted, some pending
+            
+            if tx.state != new_state:
+                tx.state = new_state
+                stats['state_changes'] += 1
+                updated = True
+            
+            # 3. Update is_posted flag
+            new_is_posted = (new_state == 'posted')
+            if tx.is_posted != new_is_posted:
+                tx.is_posted = new_is_posted
+                updated = True
+            
+            # 4. Update journal entry flags
+            for je in journal_entries:
+                je_updated = False
+                
+                # Check is_cash
+                is_cash = bool(
+                    je.bank_designation_pending or (
+                        je.account and getattr(je.account, 'bank_account_id', None)
+                    )
+                )
+                if je.is_cash != is_cash:
+                    je.is_cash = is_cash
+                    je_updated = True
+                
+                # Check is_reconciled
+                is_reconciled = je.reconciliations.filter(
+                    status__in=['matched', 'approved']
+                ).exists()
+                if je.is_reconciled != is_reconciled:
+                    je.is_reconciled = is_reconciled
+                    je_updated = True
+                
+                if je_updated:
+                    je.save(update_fields=['is_cash', 'is_reconciled'])
+                    stats['journal_entries_updated'] += 1
+            
+            # 5. Update transaction reconciliation flag
+            bank_entries = tx.journal_entries.filter(
+                Q(account__bank_account__isnull=False) | Q(bank_designation_pending=True)
+            )
+            if not bank_entries.exists():
+                new_is_reconciled = False
+            else:
+                new_is_reconciled = not bank_entries.exclude(is_reconciled=True).exists()
+            
+            if tx.is_reconciled != new_is_reconciled:
+                tx.is_reconciled = new_is_reconciled
+                updated = True
+            
+            # Save transaction if updated
+            if updated:
+                tx.save(update_fields=['is_balanced', 'is_reconciled', 'state', 'is_posted'])
+                stats['transactions_updated'] += 1
+    
+    return stats
+
 def decode_ofx_content(data_dict):
     """
     Based on the data_dict, we decide:
