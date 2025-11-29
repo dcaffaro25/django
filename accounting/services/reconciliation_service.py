@@ -766,10 +766,15 @@ class ReconciliationPipelineEngine:
                     book_avg = self._weighted_avg_date(combo)
                     avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
 
+                    # Calculate actual amount difference
+                    bank_total = bank.amount_base or Decimal("0")
+                    book_total = sum((b.amount_base for b in combo), Decimal("0"))
+                    amount_diff = abs(q2(bank_total) - q2(book_total))
+
                     sim = self._cosine_similarity(bank.embedding or [], _avg_embedding(combo))
                     scores = compute_match_scores(
                         embed_sim=sim,
-                        amount_diff=Decimal("0"),
+                        amount_diff=amount_diff,
                         amount_tol=stage.amount_tol or CENT,
                         date_diff=avg_delta,
                         date_tol=stage.avg_date_delta_days or 1,
@@ -875,10 +880,11 @@ class ReconciliationPipelineEngine:
                     if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                         continue
 
+                    # Use the already-calculated diff as amount_diff
                     sim = self._cosine_similarity(bank.embedding or [], _avg_embedding(combo))
                     scores = compute_match_scores(
                         embed_sim=sim,
-                        amount_diff=Decimal("0"),
+                        amount_diff=diff,
                         amount_tol=stage.amount_tol or CENT,
                         date_diff=avg_delta,
                         date_tol=stage.avg_date_delta_days or 1,
@@ -995,10 +1001,15 @@ class ReconciliationPipelineEngine:
                     book_avg = book.date
                     avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
 
+                    # Calculate actual amount difference
+                    bank_total = sum((b.amount_base for b in combo), Decimal("0"))
+                    book_total = book.amount_base or Decimal("0")
+                    amount_diff = abs(q2(bank_total) - q2(book_total))
+
                     sim = self._cosine_similarity(_avg_embedding(combo), book.embedding or [])
                     scores = compute_match_scores(
                         embed_sim=sim,
-                        amount_diff=Decimal("0"),
+                        amount_diff=amount_diff,
                         amount_tol=stage.amount_tol or CENT,
                         date_diff=avg_delta,
                         date_tol=stage.avg_date_delta_days or 1,
@@ -1104,10 +1115,11 @@ class ReconciliationPipelineEngine:
                     if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                         continue
 
+                    # Use the already-calculated diff as amount_diff
                     sim = self._cosine_similarity(_avg_embedding(combo), book.embedding or [])
                     scores = compute_match_scores(
                         embed_sim=sim,
-                        amount_diff=Decimal("0"),
+                        amount_diff=diff,
                         amount_tol=stage.amount_tol or CENT,
                         date_diff=avg_delta,
                         date_tol=stage.avg_date_delta_days or 1,
@@ -1513,9 +1525,10 @@ class ReconciliationPipelineEngine:
                             emb_book = _avg_embedding(book_combo)
                             embed_sim = self._cosine_similarity(emb_bank, emb_book)
     
+                            # Use the already-calculated diff as amount_diff
                             scores = compute_match_scores(
                                 embed_sim=embed_sim,
-                                amount_diff=Decimal("0"),
+                                amount_diff=diff,
                                 amount_tol=stage.amount_tol or CENT,
                                 date_diff=avg_delta,
                                 date_tol=stage.avg_date_delta_days or 1,
@@ -1810,10 +1823,12 @@ class ReconciliationPipelineEngine:
         Select candidate books near the bank in date and currency, with optional cap.
         
         Handles same-sign filtering and returns a list sorted by (amount diff, date diff).
+        For small amounts, prioritizes same-day matches using date-based grouping.
         """
         win = stage.candidate_window_days
         bank_amt = bank.amount_base or Decimal("0")
         bank_sign = _sign(bank_amt)
+        abs_bank_amt = abs(bank_amt)
         
         # Filter by company, date window, and currency
         local_books = [
@@ -1834,6 +1849,62 @@ class ReconciliationPipelineEngine:
         # If no cap or small list, return all
         if not max_local or len(local_books) <= max_local:
             return local_books
+        
+        # Date-based grouping optimization for small amounts
+        # Small amounts are more likely to match on the same day
+        SMALL_AMOUNT_THRESHOLD = Decimal("1000.00")  # Consider amounts < $1000 as "small"
+        USE_DATE_GROUPING = abs_bank_amt < SMALL_AMOUNT_THRESHOLD
+        
+        if USE_DATE_GROUPING and bank.date:
+            log.debug(
+                "OTM_FAST bank=%s using date_grouping (amount=%s < threshold=%s) candidates=%s",
+                bank.id,
+                abs_bank_amt,
+                SMALL_AMOUNT_THRESHOLD,
+                len(local_books),
+            )
+            # Group candidates by date proximity: same day, ±1 day, ±2 days, etc.
+            target_date = bank.date
+            grouped_by_date: Dict[int, List[JournalEntryDTO]] = {}
+            
+            for b in local_books:
+                if not b.date:
+                    continue
+                date_diff = abs((b.date - target_date).days)
+                grouped_by_date.setdefault(date_diff, []).append(b)
+            
+            # Prioritize same-day matches, then ±1 day, ±2 days, etc.
+            target = q2(bank_amt)
+            result: List[JournalEntryDTO] = []
+            same_day_count = len(grouped_by_date.get(0, []))
+            
+            for date_diff in sorted(grouped_by_date.keys()):
+                same_date_group = grouped_by_date[date_diff]
+                # Within each date group, sort by amount difference
+                same_date_group.sort(key=lambda b: abs(q2(b.amount_base or Decimal("0")) - target))
+                result.extend(same_date_group)
+                
+                # Early exit if we have enough candidates from same/close dates
+                if len(result) >= max_local:
+                    log.debug(
+                        "OTM_FAST bank=%s date_grouping: same_day=%s total_selected=%s from_date_diff=%s",
+                        bank.id,
+                        same_day_count,
+                        len(result),
+                        date_diff,
+                    )
+                    break
+            
+            # If we still need more, fill from remaining groups
+            if len(result) < max_local:
+                remaining = [b for b in local_books if b not in result]
+                remaining.sort(key=lambda b: (
+                    abs((b.date - target_date).days) if b.date else 9999,
+                    abs(q2(b.amount_base or Decimal("0")) - target)
+                ))
+                result.extend(remaining[:max_local - len(result)])
+            
+            return result[:max_local]
         
         # Otherwise sort by combined (amount diff, date diff) and cap
         target = q2(bank_amt)
@@ -1871,11 +1942,16 @@ class ReconciliationPipelineEngine:
             if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                 continue
             
+            # Calculate actual amount difference
+            bank_total = bank.amount_base or Decimal("0")
+            book_total = sum((b.amount_base for b in combo), Decimal("0"))
+            amount_diff = abs(q2(bank_total) - q2(book_total))
+            
             # Cosine similarity
             sim = self._cosine_similarity(bank.embedding or [], _avg_embedding(combo))
             scores = compute_match_scores(
                 embed_sim=sim,
-                amount_diff=Decimal("0"),
+                amount_diff=amount_diff,
                 amount_tol=stage.amount_tol or CENT,
                 date_diff=avg_delta,
                 date_tol=stage.avg_date_delta_days or 1,
@@ -2230,17 +2306,66 @@ class ReconciliationPipelineEngine:
         # Cap local banks if necessary
         if max_local and len(local_banks) > max_local:
             target = q2(book.amount_base or Decimal("0"))
-            def sort_key(b):
-                amt_diff = abs(q2(b.amount_base or Decimal("0")) - target)
-                date_diff = abs((b.date - book.date).days) if b.date and book.date else 9999
-                return (amt_diff, date_diff)
-            local_banks = sorted(local_banks, key=sort_key)[:max_local]
-            log.debug(
-                "MTO_FAST book=%s trimmed_candidates to=%s max_local=%s",
-                book.id,
-                len(local_banks),
-                max_local,
-            )
+            book_amt = book.amount_base or Decimal("0")
+            abs_book_amt = abs(book_amt)
+            
+            # Date-based grouping optimization for small amounts
+            SMALL_AMOUNT_THRESHOLD = Decimal("1000.00")
+            USE_DATE_GROUPING = abs_book_amt < SMALL_AMOUNT_THRESHOLD
+            
+            if USE_DATE_GROUPING and book.date:
+                # Group candidates by date proximity: same day, ±1 day, ±2 days, etc.
+                target_date = book.date
+                grouped_by_date: Dict[int, List[BankTransactionDTO]] = {}
+                
+                for b in local_banks:
+                    if not b.date:
+                        continue
+                    date_diff = abs((b.date - target_date).days)
+                    grouped_by_date.setdefault(date_diff, []).append(b)
+                
+                # Prioritize same-day matches, then ±1 day, ±2 days, etc.
+                result: List[BankTransactionDTO] = []
+                
+                for date_diff in sorted(grouped_by_date.keys()):
+                    same_date_group = grouped_by_date[date_diff]
+                    # Within each date group, sort by amount difference
+                    same_date_group.sort(key=lambda b: abs(q2(b.amount_base or Decimal("0")) - target))
+                    result.extend(same_date_group)
+                    
+                    # Early exit if we have enough candidates from same/close dates
+                    if len(result) >= max_local:
+                        break
+                
+                # If we still need more, fill from remaining groups
+                if len(result) < max_local:
+                    remaining = [b for b in local_banks if b not in result]
+                    remaining.sort(key=lambda b: (
+                        abs((b.date - target_date).days) if b.date else 9999,
+                        abs(q2(b.amount_base or Decimal("0")) - target)
+                    ))
+                    result.extend(remaining[:max_local - len(result)])
+                
+                local_banks = result[:max_local]
+                log.debug(
+                    "MTO_FAST book=%s date_grouped trimmed_candidates to=%s max_local=%s (small_amount=%s)",
+                    book.id,
+                    len(local_banks),
+                    max_local,
+                    abs_book_amt < SMALL_AMOUNT_THRESHOLD,
+                )
+            else:
+                def sort_key(b):
+                    amt_diff = abs(q2(b.amount_base or Decimal("0")) - target)
+                    date_diff = abs((b.date - book.date).days) if b.date and book.date else 9999
+                    return (amt_diff, date_diff)
+                local_banks = sorted(local_banks, key=sort_key)[:max_local]
+                log.debug(
+                    "MTO_FAST book=%s trimmed_candidates to=%s max_local=%s",
+                    book.id,
+                    len(local_banks),
+                    max_local,
+                )
         
         bank_items = _build_fast_items(local_banks)
         bank_signs = [item.sign for item in bank_items]
@@ -2371,10 +2496,16 @@ class ReconciliationPipelineEngine:
             avg_delta = abs((bank_avg_date - book_avg_date).days) if bank_avg_date and book_avg_date else stage.candidate_window_days + 1
             if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                 continue
+            
+            # Calculate actual amount difference
+            bank_total = sum((b.amount_base for b in combo), Decimal("0"))
+            book_total = book.amount_base or Decimal("0")
+            amount_diff = abs(q2(bank_total) - q2(book_total))
+            
             sim = self._cosine_similarity(_avg_embedding(combo), book.embedding or [])
             scores = compute_match_scores(
                 embed_sim=sim,
-                amount_diff=Decimal("0"),
+                amount_diff=amount_diff,
                 amount_tol=stage.amount_tol or CENT,
                 date_diff=avg_delta,
                 date_tol=stage.avg_date_delta_days or 1,
@@ -2708,12 +2839,18 @@ class ReconciliationPipelineEngine:
                     avg_delta = abs((bank_avg - book_avg).days) if bank_avg and book_avg else stage.candidate_window_days + 1
                     if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                         continue
+                    
+                    # Calculate actual amount difference
+                    bank_total = sum((b.amount_base for b in bank_combo), Decimal("0"))
+                    book_total = sum((e.amount_base for e in book_combo), Decimal("0"))
+                    amount_diff = abs(q2(bank_total) - q2(book_total))
+                    
                     emb_bank = _avg_embedding(bank_combo)
                     emb_book = _avg_embedding(book_combo)
                     sim = self._cosine_similarity(emb_bank, emb_book)
                     scores = compute_match_scores(
                         embed_sim=sim,
-                        amount_diff=Decimal("0"),
+                        amount_diff=amount_diff,
                         amount_tol=stage.amount_tol or CENT,
                         date_diff=avg_delta,
                         date_tol=stage.avg_date_delta_days or 1,
