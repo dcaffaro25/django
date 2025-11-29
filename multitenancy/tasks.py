@@ -571,6 +571,26 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
     dt_ms = int((time.monotonic() - t0) * 1000)
     logger.info("import_end run_id=%s committed=%s elapsed_ms=%d", run_id, committed_flag, dt_ms)
 
+    # Trigger embedding generation for imported records (only if committed, not preview)
+    if committed_flag:
+        try:
+            # Import here to avoid circular dependencies
+            from accounting.tasks import generate_missing_embeddings
+            
+            logger.info(
+                "import_end run_id=%s triggering generate_missing_embeddings task",
+                run_id,
+            )
+            # Call asynchronously so it doesn't block the import response
+            generate_missing_embeddings.delay()
+        except Exception as e:
+            # Don't fail the import if embedding generation fails
+            logger.warning(
+                "import_end run_id=%s failed to trigger embedding generation: %s",
+                run_id,
+                e,
+            )
+
     return {
         "committed": committed_flag,
         "reason": (None if commit else "preview"),
