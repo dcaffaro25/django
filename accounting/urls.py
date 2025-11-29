@@ -21,6 +21,11 @@ from .views import (
     ReconciliationConfigViewSet,
     ReconciliationPipelineViewSet,
 )
+from .views_financial_statements import (
+    FinancialStatementTemplateViewSet,
+    FinancialStatementViewSet,
+    FinancialStatementComparisonViewSet,
+)
 from .views import (
     EmbeddingBackfillView,
     EmbeddingTaskStatusView,
@@ -50,6 +55,9 @@ router.register('entities-mini', EntityMiniViewSet)
 router.register(r"reconciliation-tasks", ReconciliationTaskViewSet, basename="reconciliationtask")
 router.register(r'reconciliation_configs', ReconciliationConfigViewSet, basename="reconciliation-configs")  # 👈 new
 router.register(r"reconciliation-pipelines", ReconciliationPipelineViewSet, basename="reconciliation-pipelines")
+router.register(r'financial-statement-templates', FinancialStatementTemplateViewSet, basename="financial-statement-templates")
+router.register(r'financial-statements', FinancialStatementViewSet, basename="financial-statements")
+router.register(r'financial-statement-comparisons', FinancialStatementComparisonViewSet, basename="financial-statement-comparisons")
 
 urlpatterns = [
     # IMPORTANT: no extra 'api/' here because the project urls already mount this file at /<tenant>/api/
