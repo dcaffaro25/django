@@ -27,7 +27,7 @@ from .serializers_financial_statements import (
     ComparisonRequestSerializer,
 )
 from .services.financial_statement_service import FinancialStatementGenerator
-from .models import Currency
+from .models import Currency, Account
 
 
 class FinancialStatementTemplateViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
@@ -102,6 +102,29 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     
     queryset = FinancialStatement.objects.all()
     serializer_class = FinancialStatementSerializer
+    
+    def _get_company_currency(self, company_id):
+        """
+        Get currency for a company.
+        Tries to get currency from company's accounts, falls back to first available currency.
+        
+        Parameters
+        ----------
+        company_id: int
+            Company ID
+            
+        Returns
+        -------
+        Currency or None
+            Currency instance or None if no currency found
+        """
+        # Try to get currency from company's accounts
+        account = Account.objects.filter(company_id=company_id).select_related('currency').first()
+        if account and account.currency:
+            return account.currency
+        
+        # Fallback to first available currency (Currency is global)
+        return Currency.objects.first()
     
     def get_queryset(self):
         qs = super().get_queryset()
@@ -840,8 +863,8 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             include_pending=data.get('include_pending', False),
         )
         
-        # Get currency for formatting (use first currency for company, or None)
-        currency = Currency.objects.filter(company_id=company_id).first()
+        # Get currency for formatting
+        currency = self._get_company_currency(company_id)
         
         # Return formatted versions based on format parameter
         format_param = request.query_params.get('format', 'json')
