@@ -174,7 +174,19 @@ class FinancialStatement(TenantAwareBaseModel):
         related_name='statements'
     )
     
-    report_type = models.CharField(max_length=50)  # Denormalized for filtering
+    REPORT_TYPE_CHOICES = [
+        ('balance_sheet', 'Balance Sheet'),
+        ('income_statement', 'Income Statement (P&L)'),
+        ('cash_flow', 'Cash Flow Statement'),
+        ('trial_balance', 'Trial Balance'),
+        ('general_ledger', 'General Ledger'),
+        ('custom', 'Custom Report'),
+    ]
+    
+    report_type = models.CharField(
+        max_length=50,
+        choices=REPORT_TYPE_CHOICES
+    )  # Denormalized for filtering
     name = models.CharField(max_length=200)  # Denormalized template name
     
     # Period
