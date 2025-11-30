@@ -213,24 +213,75 @@ class FinancialStatementGenerator:
         
         # Filter by account IDs
         if line_template.account_ids:
-            return list(accounts.filter(id__in=line_template.account_ids))
-        
+            accounts = list(accounts.filter(id__in=line_template.account_ids))
         # Filter by code prefix
-        if line_template.account_code_prefix:
-            accounts = accounts.filter(
+        elif line_template.account_code_prefix:
+            accounts = list(accounts.filter(
                 account_code__startswith=line_template.account_code_prefix
-            )
-        
+            ))
         # Filter by path contains
-        if line_template.account_path_contains:
+        elif line_template.account_path_contains:
             # This requires checking account paths - simplified for now
             matching_accounts = []
             for account in accounts:
                 if line_template.account_path_contains in account.get_path():
                     matching_accounts.append(account)
-            return matching_accounts
+            accounts = matching_accounts
+        else:
+            accounts = list(accounts)
         
-        return list(accounts)
+        # Remove duplicates: if a parent account is in the list, exclude its descendants
+        # This prevents double-counting since parent.calculate_balance() already sums children
+        return self._deduplicate_account_hierarchy(accounts)
+    
+    def _deduplicate_account_hierarchy(self, accounts: List[Account]) -> List[Account]:
+        """
+        Remove accounts that are descendants of other accounts in the list.
+        This prevents double-counting since parent accounts already include their children.
+        
+        Parameters
+        ----------
+        accounts: List[Account]
+            List of accounts (may include parents and children)
+        
+        Returns
+        -------
+        List[Account]
+            Deduplicated list (only top-level accounts in the hierarchy)
+        """
+        if not accounts:
+            return []
+        
+        # Build a set of all account IDs for quick lookup
+        account_ids = {acc.id for acc in accounts}
+        result = []
+        
+        for account in accounts:
+            # Check if this account is a descendant of any other account in the list
+            is_descendant = False
+            
+            # Get all ancestors of this account (excluding self)
+            try:
+                ancestors = account.get_ancestors(include_self=False)
+                ancestor_ids = {anc.id for anc in ancestors}
+                
+                # If any ancestor is in our account list, this account is a descendant
+                if ancestor_ids & account_ids:
+                    is_descendant = True
+            except Exception:
+                # Fallback: check parent chain manually
+                current = account.parent
+                while current:
+                    if current.id in account_ids:
+                        is_descendant = True
+                        break
+                    current = current.parent
+            
+            # Only include accounts that are not descendants of others in the list
+            if not is_descendant:
+                result.append(account)
+        
+        return result
     
     def _get_account_ids_for_line(
         self,
@@ -252,11 +303,13 @@ class FinancialStatementGenerator:
         
         for account in accounts:
             # Get balance as of date
-            balance = account.calculate_balance(
+            # For parent accounts, calculate_balance will sum children automatically
+            balance = self._calculate_account_balance_with_children(
+                account=account,
                 include_pending=include_pending,
                 beginning_date=None,
                 end_date=as_of_date,
-            ) or Decimal('0.00')
+            )
             
             # Apply account direction
             if calculation_type == 'balance':
@@ -265,6 +318,60 @@ class FinancialStatementGenerator:
             total += balance
         
         return total
+    
+    def _calculate_account_balance_with_children(
+        self,
+        account: Account,
+        include_pending: bool,
+        beginning_date: Optional[date],
+        end_date: Optional[date],
+    ) -> Decimal:
+        """
+        Calculate account balance, ensuring children are properly included for parent accounts.
+        
+        This method ensures that when calculating a parent account balance, it properly
+        sums all children accounts that belong to the same company.
+        """
+        if account.is_leaf():
+            # Leaf account: calculate directly from journal entries
+            return account.calculate_balance(
+                include_pending=include_pending,
+                beginning_date=beginning_date,
+                end_date=end_date,
+            ) or Decimal('0.00')
+        else:
+            # Parent account: sum all children
+            # Ensure we only get children from the same company
+            children = account.get_children().filter(company_id=self.company_id)
+            
+            if not children.exists():
+                log.warning(
+                    "Parent account %s (id=%s) has no children for company %s",
+                    account.name,
+                    account.id,
+                    self.company_id
+                )
+                return Decimal('0.00')
+            
+            total = Decimal('0.00')
+            for child in children:
+                child_balance = self._calculate_account_balance_with_children(
+                    account=child,
+                    include_pending=include_pending,
+                    beginning_date=beginning_date,
+                    end_date=end_date,
+                )
+                total += child_balance
+            
+            log.debug(
+                "Parent account %s (id=%s) balance: %s (from %s children)",
+                account.name,
+                account.id,
+                total,
+                children.count()
+            )
+            
+            return total
     
     def _calculate_income_statement_line(
         self,
@@ -278,44 +385,58 @@ class FinancialStatementGenerator:
         total = Decimal('0.00')
         
         for account in accounts:
-            # Get period activity
-            if include_pending:
-                state_filter = Q(state__in=['posted', 'pending'])
+            if account.is_leaf():
+                # Leaf account: calculate from journal entries
+                if include_pending:
+                    state_filter = Q(state__in=['posted', 'pending'])
+                else:
+                    state_filter = Q(state='posted')
+                
+                entries = JournalEntry.objects.filter(
+                    account=account,
+                    transaction__date__gte=start_date,
+                    transaction__date__lte=end_date,
+                    transaction__company_id=self.company_id,
+                ).filter(state_filter)
+                
+                if calculation_type == 'difference':
+                    # Debit - Credit
+                    debit_total = entries.aggregate(
+                        total=Sum('debit_amount')
+                    )['total'] or Decimal('0.00')
+                    credit_total = entries.aggregate(
+                        total=Sum('credit_amount')
+                    )['total'] or Decimal('0.00')
+                    balance = debit_total - credit_total
+                elif calculation_type == 'balance':
+                    # Apply account direction
+                    debit_total = entries.aggregate(
+                        total=Sum('debit_amount')
+                    )['total'] or Decimal('0.00')
+                    credit_total = entries.aggregate(
+                        total=Sum('credit_amount')
+                    )['total'] or Decimal('0.00')
+                    balance = (debit_total - credit_total) * account.account_direction
+                else:
+                    # Sum
+                    balance = entries.aggregate(
+                        total=Sum(F('debit_amount') - F('credit_amount'))
+                    )['total'] or Decimal('0.00')
+                
+                total += balance
             else:
-                state_filter = Q(state='posted')
-            
-            entries = JournalEntry.objects.filter(
-                account=account,
-                transaction__date__gte=start_date,
-                transaction__date__lte=end_date,
-                transaction__company_id=self.company_id,
-            ).filter(state_filter)
-            
-            if calculation_type == 'difference':
-                # Debit - Credit
-                debit_total = entries.aggregate(
-                    total=Sum('debit_amount')
-                )['total'] or Decimal('0.00')
-                credit_total = entries.aggregate(
-                    total=Sum('credit_amount')
-                )['total'] or Decimal('0.00')
-                balance = debit_total - credit_total
-            elif calculation_type == 'balance':
-                # Apply account direction
-                debit_total = entries.aggregate(
-                    total=Sum('debit_amount')
-                )['total'] or Decimal('0.00')
-                credit_total = entries.aggregate(
-                    total=Sum('credit_amount')
-                )['total'] or Decimal('0.00')
-                balance = (debit_total - credit_total) * account.account_direction
-            else:
-                # Sum
-                balance = entries.aggregate(
-                    total=Sum(F('debit_amount') - F('credit_amount'))
-                )['total'] or Decimal('0.00')
-            
-            total += balance
+                # Parent account: sum children's period activity
+                children = account.get_children().filter(company_id=self.company_id)
+                for child in children:
+                    # Recursively calculate child balance for the period
+                    child_balance = self._calculate_income_statement_line(
+                        accounts=[child],
+                        start_date=start_date,
+                        end_date=end_date,
+                        calculation_type=calculation_type,
+                        include_pending=include_pending,
+                    )
+                    total += child_balance
         
         return total
     
@@ -337,17 +458,21 @@ class FinancialStatementGenerator:
         # Calculate period change in cash
         total = Decimal('0.00')
         for account in cash_accounts:
-            # Get beginning balance
-            beginning_balance = account.calculate_balance(
+            # Get beginning balance (using helper to ensure children are included)
+            beginning_balance = self._calculate_account_balance_with_children(
+                account=account,
                 include_pending=include_pending,
+                beginning_date=None,
                 end_date=start_date,
-            ) or Decimal('0.00')
+            )
             
-            # Get ending balance
-            ending_balance = account.calculate_balance(
+            # Get ending balance (using helper to ensure children are included)
+            ending_balance = self._calculate_account_balance_with_children(
+                account=account,
                 include_pending=include_pending,
+                beginning_date=None,
                 end_date=end_date,
-            ) or Decimal('0.00')
+            )
             
             # Change = ending - beginning
             change = ending_balance - beginning_balance
