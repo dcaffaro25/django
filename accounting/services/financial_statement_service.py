@@ -138,6 +138,118 @@ class FinancialStatementGenerator:
         
         return statement
     
+    def preview_statement(
+        self,
+        template: FinancialStatementTemplate,
+        start_date: date,
+        end_date: date,
+        currency_id: Optional[int] = None,
+        as_of_date: Optional[date] = None,
+        include_pending: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Preview a financial statement without saving to database.
+        Returns the same data structure as a generated statement but without DB records.
+        
+        Parameters
+        ----------
+        template: FinancialStatementTemplate
+            Template defining the statement structure
+        start_date: date
+            Start of reporting period
+        end_date: date
+            End of reporting period
+        currency_id: Optional[int]
+            Currency ID (defaults to company's base currency)
+        as_of_date: Optional[date]
+            For balance sheet: specific date. For P&L: same as end_date
+        include_pending: bool
+            Include pending journal entries
+        
+        Returns
+        -------
+        Dict[str, Any]
+            Statement data with lines (same structure as serializer)
+        """
+        if as_of_date is None:
+            as_of_date = end_date
+        
+        if currency_id is None:
+            currency = Currency.objects.first()
+            if not currency:
+                raise ValueError("No currency specified and no default currency found")
+        else:
+            currency = Currency.objects.get(id=currency_id)
+        
+        # Generate lines without saving
+        line_templates = template.line_templates.all().order_by('line_number')
+        line_values: Dict[int, Decimal] = {}
+        lines_data = []
+        
+        for line_template in line_templates:
+            value = self._calculate_line_value(
+                line_template,
+                start_date,
+                end_date,
+                as_of_date,
+                template.report_type,
+                line_values,
+                include_pending=include_pending,
+            )
+            line_values[line_template.line_number] = value
+            
+            lines_data.append({
+                'line_number': line_template.line_number,
+                'label': line_template.label,
+                'line_type': line_template.line_type,
+                'balance': float(value),
+                'debit_amount': 0.0,  # Could calculate if needed
+                'credit_amount': 0.0,  # Could calculate if needed
+                'indent_level': line_template.indent_level,
+                'is_bold': line_template.is_bold,
+            })
+        
+        # Calculate totals
+        totals = self._calculate_totals_dict(line_values, template.report_type)
+        
+        return {
+            'template_id': template.id,
+            'template_name': template.name,
+            'report_type': template.report_type,
+            'name': template.name,
+            'start_date': start_date,
+            'end_date': end_date,
+            'as_of_date': as_of_date,
+            'currency': {
+                'id': currency.id,
+                'code': currency.code,
+                'symbol': getattr(currency, 'symbol', currency.code),
+            },
+            'status': 'preview',
+            'lines': lines_data,
+            **totals,
+        }
+    
+    def _calculate_totals_dict(
+        self,
+        line_values: Dict[int, Decimal],
+        report_type: str,
+    ) -> Dict[str, Any]:
+        """Calculate totals as dictionary (for preview)."""
+        totals = {
+            'total_assets': None,
+            'total_liabilities': None,
+            'total_equity': None,
+            'net_income': None,
+        }
+        
+        # Basic implementation - can be enhanced based on template structure
+        if report_type == 'income_statement':
+            # Calculate net income from lines (simplified)
+            totals['net_income'] = float(sum(line_values.values()))
+        
+        return totals
+    
     def _calculate_line_value(
         self,
         line_template: FinancialStatementLineTemplate,

@@ -374,12 +374,43 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         lines.append("        tr:hover { background-color: #f5f5f5; }")
         lines.append("        .header-row { background-color: #ecf0f1; font-weight: bold; }")
         lines.append("        .total-row { background-color: #e8f5e9; font-weight: bold; }")
-        lines.append("        .indent-1 { padding-left: 20px; }")
-        lines.append("        .indent-2 { padding-left: 40px; }")
-        lines.append("        .indent-3 { padding-left: 60px; }")
         lines.append("        .amount { text-align: right; font-family: 'Courier New', monospace; }")
         lines.append("        .metadata { color: #7f8c8d; font-size: 0.9em; margin-top: 30px; }")
         lines.append("        .negative { color: #e74c3c; }")
+        lines.append("        /* Font sizes based on indent level */")
+        lines.append("        .font-level-0 { font-size: 1em; }")
+        lines.append("        .font-level-1 { font-size: 0.95em; }")
+        lines.append("        .font-level-2 { font-size: 0.9em; }")
+        lines.append("        .font-level-3 { font-size: 0.85em; }")
+        lines.append("        .font-level-4 { font-size: 0.8em; }")
+        lines.append("        /* Collapsible rows */")
+        lines.append("        .collapsible-row { cursor: pointer; }")
+        lines.append("        .collapsible-row:hover { background-color: #e3f2fd !important; }")
+        lines.append("        .collapsible-content { display: none; }")
+        lines.append("        .collapsible-content.expanded { display: table-row; }")
+        lines.append("        .toggle-icon { display: inline-block; width: 12px; margin-right: 5px; }")
+        lines.append("        .toggle-icon::before { content: '▶'; }")
+        lines.append("        .toggle-icon.expanded::before { content: '▼'; }")
+        lines.append("    </style>")
+        lines.append("    </style>")
+        lines.append("    <script>")
+        lines.append("        function toggleRow(rowId) {")
+        lines.append("            const rows = document.querySelectorAll('[data-parent=\"' + rowId + '\"]');")
+        lines.append("            const icon = document.getElementById('icon-' + rowId);")
+        lines.append("            let isExpanded = icon && icon.classList.contains('expanded');")
+        lines.append("            rows.forEach(function(row) {")
+        lines.append("                if (isExpanded) {")
+        lines.append("                    row.style.display = 'none';")
+        lines.append("                } else {")
+        lines.append("                    row.style.display = '';")
+        lines.append("                }")
+        lines.append("            });")
+        lines.append("            if (icon) {")
+        lines.append("                icon.classList.toggle('expanded');")
+        lines.append("            }")
+        lines.append("        }")
+        lines.append("    </script>")
+        lines.append("</head>")
         lines.append("    </style>")
         lines.append("</head>")
         lines.append("<body>")
@@ -441,8 +472,29 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             elif line.line_type in ('total', 'subtotal'):
                 row_class = "total-row"
             
-            # Indent class
-            indent_class = f"indent-{line.indent_level}" if line.indent_level > 0 else ""
+            # Indent style and font size - only apply to label column
+            indent_level = line.indent_level
+            indent_style = f"padding-left: {indent_level * 20}px;" if indent_level > 0 else ""
+            font_class = f"font-level-{min(indent_level, 4)}"
+            indent_attr = f" style='{indent_style}'" if indent_style else ""
+            
+            # Check if this row has children (for collapsible functionality)
+            has_children = False
+            parent_row_id = None
+            if indent_level < 4:  # Only make rows with potential children collapsible
+                # Check if next line has higher indent
+                all_lines = list(statement.lines.all().order_by('line_number'))
+                current_idx = next((i for i, l in enumerate(all_lines) if l.line_number == line.line_number), -1)
+                if current_idx >= 0 and current_idx < len(all_lines) - 1:
+                    next_line = all_lines[current_idx + 1]
+                    has_children = next_line.indent_level > indent_level
+                
+                # Find parent row ID if this is a child
+                if indent_level > 0:
+                    for i in range(current_idx - 1, -1, -1):
+                        if all_lines[i].indent_level < indent_level:
+                            parent_row_id = f"row-{all_lines[i].line_number}"
+                            break
             
             # Format amounts
             debit = self._format_amount(line.debit_amount, statement.currency, html=True)
@@ -460,9 +512,21 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 label = line.label
                 line_num = str(line.line_number)
             
-            lines.append(f"            <tr class='{row_class}'>")
+            # Add toggle icon if row has children
+            toggle_icon = ""
+            row_id = f"row-{line.line_number}"
+            onclick_attr = ""
+            if has_children:
+                toggle_icon = f"<span id='icon-{row_id}' class='toggle-icon'></span>"
+                row_class += " collapsible-row"
+                onclick_attr = f" onclick=\"toggleRow('{row_id}')\""
+            
+            # Add data-parent attribute if this is a child row
+            data_parent_attr = f" data-parent='{parent_row_id}'" if parent_row_id else ""
+            
+            lines.append(f"            <tr class='{row_class}'{onclick_attr}{data_parent_attr}>")
             lines.append(f"                <td>{line_num}</td>")
-            lines.append(f"                <td class='{indent_class}'>{label}</td>")
+            lines.append(f"                <td class='{font_class}'{indent_attr}>{toggle_icon}{label}</td>")
             lines.append(f"                <td class='amount'>{debit}</td>")
             lines.append(f"                <td class='amount'>{credit}</td>")
             lines.append(f"                <td class='amount'>{balance}</td>")
@@ -532,6 +596,82 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 formatted = f"<span class='negative'>{formatted}</span>"
         
         return formatted
+    
+    def _format_preview_as_markdown(self, preview_data, currency):
+        """Format preview data as Markdown."""
+        lines = []
+        lines.append(f"# {preview_data['name']} (Preview)")
+        lines.append("")
+        lines.append(f"**Report Type:** {preview_data['report_type']}")
+        lines.append(f"**Period:** {preview_data['start_date']} to {preview_data['end_date']}")
+        if currency:
+            lines.append(f"**Currency:** {currency.code}")
+        lines.append("**Status:** Preview (not saved)")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        lines.append("| Line | Label | Balance |")
+        lines.append("|------|-------|---------|")
+        for line_data in preview_data.get('lines', []):
+            indent = "  " * line_data.get('indent_level', 0)
+            label = f"{indent}{line_data['label']}"
+            balance = self._format_amount(Decimal(str(line_data.get('balance', 0))), currency) if currency else "0.00"
+            if line_data.get('is_bold', False):
+                row = f"| **{line_data['line_number']}** | **{label}** | **{balance}** |"
+            else:
+                row = f"| {line_data['line_number']} | {label} | {balance} |"
+            lines.append(row)
+        lines.append("")
+        lines.append("*This is a preview. No data has been saved.*")
+        return "\n".join(lines)
+    
+    def _format_preview_as_html(self, preview_data, currency):
+        """Format preview data as HTML."""
+        class MockLine:
+            def __init__(self, data):
+                self.line_number = data.get('line_number', 0)
+                self.label = data.get('label', '')
+                self.line_type = data.get('line_type', 'account')
+                self.debit_amount = Decimal(str(data.get('debit_amount', 0)))
+                self.credit_amount = Decimal(str(data.get('credit_amount', 0)))
+                self.balance = Decimal(str(data.get('balance', 0)))
+                self.indent_level = data.get('indent_level', 0)
+                self.is_bold = data.get('is_bold', False)
+        
+        class MockStatement:
+            def __init__(self, data):
+                self.name = data.get('name', 'Financial Statement')
+                self.report_type = data.get('report_type', '')
+                self.start_date = data.get('start_date')
+                self.end_date = data.get('end_date')
+                self.as_of_date = data.get('as_of_date')
+                self.status = 'preview'
+                self.notes = None
+                self.currency = currency
+                self.total_assets = data.get('total_assets')
+                self.total_liabilities = data.get('total_liabilities')
+                self.total_equity = data.get('total_equity')
+                self.net_income = data.get('net_income')
+                self.generated_at = timezone.now()
+                self.generated_by = None
+                self._lines_list = [MockLine(line) for line in data.get('lines', [])]
+            
+            def get_report_type_display(self):
+                return self.report_type.replace('_', ' ').title()
+        
+        class LinesManager:
+            def __init__(self, lines_list):
+                self._lines_list = lines_list
+            def all(self):
+                return self._lines_list
+            def order_by(self, *args):
+                return self._lines_list
+        
+        mock_statement = MockStatement(preview_data)
+        mock_statement.lines = LinesManager(mock_statement._lines_list)
+        html = self._format_as_html(mock_statement)
+        html = html.replace(f"<h1>{preview_data['name']}</h1>", f"<h1>{preview_data['name']} <span style='color: #f39c12;'>(Preview)</span></h1>")
+        return html
     
     def _format_time_series_as_markdown(self, series_data, currency):
         """Format time series data as Markdown."""
@@ -622,9 +762,6 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         lines.append("        th { background-color: #3498db; color: white; padding: 12px; text-align: left; }")
         lines.append("        td { padding: 10px; border-bottom: 1px solid #ddd; }")
         lines.append("        tr:hover { background-color: #f5f5f5; }")
-        lines.append("        .indent-1 { padding-left: 20px; }")
-        lines.append("        .indent-2 { padding-left: 40px; }")
-        lines.append("        .indent-3 { padding-left: 60px; }")
         lines.append("        .amount { text-align: right; font-family: 'Courier New', monospace; }")
         lines.append("        .metadata { color: #7f8c8d; font-size: 0.9em; margin-top: 30px; }")
         lines.append("        .negative { color: #e74c3c; }")
@@ -667,7 +804,11 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 if line_info['line_type'] in ('header', 'spacer'):
                     continue
                 
-                indent_class = f"indent-{line_info.get('indent_level', 0)}" if line_info.get('indent_level', 0) > 0 else ""
+                # Indent style - only apply to label column
+                indent_level = line_info.get('indent_level', 0)
+                indent_style = f"padding-left: {indent_level * 20}px;" if indent_level > 0 else ""
+                indent_attr = f" style='{indent_style}'" if indent_style else ""
+                
                 label = line_info['label']
                 line_num = str(line_info['line_number'])
                 
@@ -679,7 +820,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 
                 lines.append("            <tr>")
                 lines.append(f"                <td>{line_num}</td>")
-                lines.append(f"                <td class='{indent_class}'>{label}</td>")
+                lines.append(f"                <td{indent_attr}>{label}</td>")
                 
                 # Add values for each period
                 for period in periods:
@@ -980,7 +1121,81 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         
         serializer = self.get_serializer(statement)
         return Response(serializer.data)
-
+    
+    @action(detail=False, methods=['post'])
+    def preview(self, request, tenant_id=None):
+        """
+        Preview a financial statement without saving to database.
+        
+        POST /api/financial-statements/preview/
+        {
+            "template_id": 1,
+            "start_date": "2025-01-01",
+            "end_date": "2025-12-31",
+            "as_of_date": "2025-12-31",  // optional
+            "currency_id": 1,  // optional
+            "include_pending": false
+        }
+        """
+        serializer = GenerateStatementRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        
+        # Get company from tenant
+        company = getattr(request, 'tenant', None)
+        if not company or company == 'all':
+            return Response(
+                {'error': 'Company/tenant not found in request'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        company_id = company.id if hasattr(company, 'id') else company
+        
+        try:
+            template = FinancialStatementTemplate.objects.get(
+                id=data['template_id'],
+                company_id=company_id,
+            )
+        except FinancialStatementTemplate.DoesNotExist:
+            return Response(
+                {'error': 'Template not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Generate preview (without saving)
+        generator = FinancialStatementGenerator(company_id=company_id)
+        preview_data = generator.preview_statement(
+            template=template,
+            start_date=data['start_date'],
+            end_date=data['end_date'],
+            as_of_date=data.get('as_of_date'),
+            currency_id=data.get('currency_id'),
+            include_pending=data.get('include_pending', False),
+        )
+        
+        # Return formatted versions based on format parameter
+        format_param = request.query_params.get('format', 'json')
+        currency = Currency.objects.get(id=preview_data['currency']['id']) if preview_data.get('currency') else None
+        
+        if format_param == 'markdown':
+            return Response(
+                self._format_preview_as_markdown(preview_data, currency),
+                content_type='text/markdown',
+                status=status.HTTP_200_OK
+            )
+        elif format_param == 'html':
+            return Response(
+                self._format_preview_as_html(preview_data, currency),
+                content_type='text/html',
+                status=status.HTTP_200_OK
+            )
+        else:
+            # Default JSON, but include formatted versions
+            preview_data['formatted'] = {
+                'markdown': self._format_preview_as_markdown(preview_data, currency),
+                'html': self._format_preview_as_html(preview_data, currency),
+            }
+            return Response(preview_data, status=status.HTTP_200_OK)
+    
 
 class FinancialStatementComparisonViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     """
