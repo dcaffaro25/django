@@ -300,7 +300,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         
         # Lines
         for line in statement.lines.all().order_by('line_number'):
-            indent = "  " * line.indent_level
+            indent = "&nbsp;" * (4 * line.indent_level)
             label = f"{indent}{line.label}"
             
             # Format amounts
@@ -374,7 +374,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         lines.append("        tr:hover { background-color: #f5f5f5; }")
         lines.append("        .header-row { background-color: #ecf0f1; font-weight: bold; }")
         lines.append("        .total-row { background-color: #e8f5e9; font-weight: bold; }")
-        lines.append("        .amount { text-align: right; font-family: 'Courier New', monospace; }")
+        lines.append("        .amount { text-align: right; font-family: Arial, sans-serif; }")
         lines.append("        .metadata { color: #7f8c8d; font-size: 0.9em; margin-top: 30px; }")
         lines.append("        .negative { color: #e74c3c; }")
         lines.append("        /* Font sizes based on indent level */")
@@ -613,7 +613,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         lines.append("| Line | Label | Balance |")
         lines.append("|------|-------|---------|")
         for line_data in preview_data.get('lines', []):
-            indent = "  " * line_data.get('indent_level', 0)
+            indent = "&nbsp;" * (4 * line_data.get('indent_level', 0))
             label = f"{indent}{line_data['label']}"
             balance = self._format_amount(Decimal(str(line_data.get('balance', 0))), currency) if currency else "0.00"
             if line_data.get('is_bold', False):
@@ -759,7 +759,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             if line_info['line_type'] in ('header', 'spacer'):
                 continue
             
-            indent = "  " * line_info.get('indent_level', 0)
+            indent = "&nbsp;" * (4 * line_info.get('indent_level', 0))
             label = f"{indent}{line_info['label']}"
             
             # Build row - if bold, make entire row bold
@@ -812,7 +812,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             lines.append("        th { background-color: #3498db; color: white; padding: 12px; text-align: left; }")
             lines.append("        td { padding: 10px; border-bottom: 1px solid #ddd; }")
             lines.append("        tr:hover { background-color: #f5f5f5; }")
-            lines.append("        .amount { text-align: right; font-family: 'Courier New', monospace; }")
+            lines.append("        .amount { text-align: right; font-family: Arial, sans-serif; }")
             lines.append("        .metadata { color: #7f8c8d; font-size: 0.9em; margin-top: 30px; }")
             lines.append("        .negative { color: #e74c3c; }")
             lines.append("        .dimension-section { margin-top: 40px; page-break-inside: avoid; }")
@@ -878,7 +878,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             lines.append("        th { background-color: #3498db; color: white; padding: 12px; text-align: left; }")
             lines.append("        td { padding: 10px; border-bottom: 1px solid #ddd; }")
             lines.append("        tr:hover { background-color: #f5f5f5; }")
-            lines.append("        .amount { text-align: right; font-family: 'Courier New', monospace; }")
+            lines.append("        .amount { text-align: right; font-family: Arial, sans-serif; }")
             lines.append("        .metadata { color: #7f8c8d; font-size: 0.9em; margin-top: 30px; }")
             lines.append("        .negative { color: #e74c3c; }")
             lines.append("        /* Font sizes based on indent level */")
@@ -970,6 +970,299 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         # Footer
         lines.append("</body>")
         lines.append("</html>")
+        
+        return "\n".join(lines)
+    
+    def _format_comparisons_as_markdown(self, comparison_data, currency):
+        """Format comparison data as Markdown."""
+        lines = []
+        
+        # Check if dimension breakdown (multiple periods)
+        if 'periods' in comparison_data:
+            # Multiple periods with dimension
+            lines.append(f"# {comparison_data.get('template_name', 'Financial Statement')} - Comparisons")
+            lines.append("")
+            lines.append(f"**Report Type:** {comparison_data.get('report_type', '')}")
+            lines.append(f"**Period:** {comparison_data['start_date']} to {comparison_data['end_date']}")
+            lines.append(f"**Dimension:** {comparison_data.get('dimension', '')}")
+            if currency:
+                lines.append(f"**Currency:** {currency.code}")
+            if comparison_data.get('is_preview'):
+                lines.append("**Status:** Preview (not saved)")
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+            
+            # Format each period
+            for period_data in comparison_data['periods']:
+                lines.append(f"## {period_data.get('period_label', 'Period')}")
+                lines.append("")
+                period_md = self._format_single_comparison_markdown(period_data, currency)
+                # Skip header from period_md
+                period_lines = period_md.split('\n')
+                skip_header = True
+                for p_line in period_lines:
+                    if skip_header and (p_line.startswith('#') or p_line.startswith('**') or p_line == '' or p_line.startswith('---')):
+                        continue
+                    if p_line.startswith('## Current Period'):
+                        skip_header = False
+                    if not skip_header:
+                        lines.append(p_line)
+                lines.append("")
+                lines.append("---")
+                lines.append("")
+            
+            return "\n".join(lines)
+        else:
+            # Single period comparison
+            return self._format_single_comparison_markdown(comparison_data, currency)
+    
+    def _format_single_comparison_markdown(self, comparison_data, currency):
+        """Format a single comparison as Markdown."""
+        lines = []
+        
+        statement = comparison_data.get('statement', {})
+        comparisons = comparison_data.get('comparisons', {})
+        
+        # Header
+        lines.append(f"# {statement.get('name', 'Financial Statement')} - Comparisons")
+        lines.append("")
+        lines.append(f"**Period:** {statement.get('start_date')} to {statement.get('end_date')}")
+        if currency:
+            lines.append(f"**Currency:** {currency.code}")
+        if comparison_data.get('is_preview'):
+            lines.append("**Status:** Preview (not saved)")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        
+        # Statement lines table
+        lines.append("## Current Period")
+        lines.append("")
+        lines.append("| Line | Label | Balance |")
+        lines.append("|------|-------|---------|")
+        
+        for line in statement.get('lines', []):
+            balance = self._format_amount(Decimal(str(line['balance'])), currency) if currency else str(line['balance'])
+            lines.append(f"| {line['line_number']} | {line['label']} | {balance} |")
+        
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        
+        # Comparisons
+        for comp_type, comp_data in comparisons.items():
+            if 'error' in comp_data:
+                lines.append(f"## {comp_type.replace('_', ' ').title()}")
+                lines.append(f"*Error: {comp_data['error']}*")
+                lines.append("")
+                continue
+            
+            lines.append(f"## {comp_type.replace('_', ' ').title()}")
+            lines.append("")
+            lines.append(f"**Comparison Period:** {comp_data.get('start_date')} to {comp_data.get('end_date')}")
+            lines.append("")
+            lines.append("| Line | Label | Current | Comparison | Change | % Change |")
+            lines.append("|------|-------|---------|------------|--------|---------|")
+            
+            comp_lines = comp_data.get('lines', {})
+            for line in statement.get('lines', []):
+                line_num = str(line['line_number'])
+                comp_info = comp_lines.get(line_num, {})
+                
+                current_val = Decimal(str(line['balance']))
+                comp_val = Decimal(str(comp_info.get('comparison_value', 0)))
+                abs_change = comp_info.get('absolute_change', 0)
+                pct_change = comp_info.get('percentage_change', 0)
+                
+                current_fmt = self._format_amount(current_val, currency) if currency else str(current_val)
+                comp_fmt = self._format_amount(comp_val, currency) if currency else str(comp_val)
+                change_fmt = self._format_amount(Decimal(str(abs_change)), currency) if currency else str(abs_change)
+                
+                lines.append(f"| {line_num} | {line['label']} | {current_fmt} | {comp_fmt} | {change_fmt} | {pct_change:.2f}% |")
+            
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+        
+        return "\n".join(lines)
+    
+    def _format_comparisons_as_html(self, comparison_data, currency):
+        """Format comparison data as HTML."""
+        # Check if dimension breakdown
+        if 'periods' in comparison_data:
+            # Multiple periods
+            lines = []
+            lines.append("<!DOCTYPE html>")
+            lines.append("<html lang='en'>")
+            lines.append("<head>")
+            lines.append("    <meta charset='UTF-8'>")
+            lines.append("    <meta name='viewport' content='width=device-width, initial-scale=1.0'>")
+            lines.append(f"    <title>{comparison_data.get('template_name', 'Comparisons')}</title>")
+            lines.append("    <style>")
+            lines.append("        body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }")
+            lines.append("        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }")
+            lines.append("        h2 { color: #34495e; margin-top: 30px; border-bottom: 2px solid #95a5a6; padding-bottom: 5px; }")
+            lines.append("        table { width: 100%; border-collapse: collapse; margin: 20px 0; }")
+            lines.append("        th { background-color: #3498db; color: white; padding: 12px; text-align: left; }")
+            lines.append("        td { padding: 10px; border-bottom: 1px solid #ddd; }")
+            lines.append("        tr:hover { background-color: #f5f5f5; }")
+            lines.append("        .amount { text-align: right; font-family: Arial, sans-serif; }")
+            lines.append("        .metadata { color: #7f8c8d; font-size: 0.9em; margin-top: 30px; }")
+            lines.append("        .negative { color: #e74c3c; }")
+            lines.append("        .positive { color: #27ae60; }")
+            lines.append("        .dimension-section { margin-top: 40px; page-break-inside: avoid; }")
+            lines.append("    </style>")
+            lines.append("</head>")
+            lines.append("<body>")
+            lines.append(f"    <h1>{comparison_data.get('template_name', 'Comparisons')}</h1>")
+            lines.append("    <div class='metadata'>")
+            lines.append(f"        <p><strong>Report Type:</strong> {comparison_data.get('report_type', '')}</p>")
+            lines.append(f"        <p><strong>Period:</strong> {comparison_data['start_date']} to {comparison_data['end_date']}</p>")
+            lines.append(f"        <p><strong>Dimension:</strong> {comparison_data.get('dimension', '')}</p>")
+            if currency:
+                lines.append(f"        <p><strong>Currency:</strong> {currency.code}</p>")
+            lines.append("    </div>")
+            
+            for period_data in comparison_data['periods']:
+                lines.append(f"    <div class='dimension-section'>")
+                lines.append(f"        <h2>{period_data.get('period_label', 'Period')}</h2>")
+                period_html = self._format_single_comparison_html(period_data, currency, include_header=False)
+                # Extract content from period_html
+                period_lines = period_html.split('\n')
+                for p_line in period_lines:
+                    if '<body>' in p_line or '</body>' in p_line or '</html>' in p_line or '<!DOCTYPE' in p_line or '<html' in p_line or '<head>' in p_line or '</head>' in p_line:
+                        continue
+                    if '<h1>' in p_line:
+                        continue
+                    lines.append(f"        {p_line}")
+                lines.append("    </div>")
+            
+            lines.append("</body>")
+            lines.append("</html>")
+            return "\n".join(lines)
+        else:
+            # Single period
+            return self._format_single_comparison_html(comparison_data, currency, include_header=True)
+    
+    def _format_single_comparison_html(self, comparison_data, currency, include_header=True):
+        """Format a single comparison as HTML."""
+        lines = []
+        
+        statement = comparison_data.get('statement', {})
+        comparisons = comparison_data.get('comparisons', {})
+        
+        if include_header:
+            lines.append("<!DOCTYPE html>")
+            lines.append("<html lang='en'>")
+            lines.append("<head>")
+            lines.append("    <meta charset='UTF-8'>")
+            lines.append("    <meta name='viewport' content='width=device-width, initial-scale=1.0'>")
+            lines.append(f"    <title>{statement.get('name', 'Comparisons')}</title>")
+            lines.append("    <style>")
+            lines.append("        body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }")
+            lines.append("        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }")
+            lines.append("        h2 { color: #34495e; margin-top: 30px; border-bottom: 2px solid #95a5a6; padding-bottom: 5px; }")
+            lines.append("        table { width: 100%; border-collapse: collapse; margin: 20px 0; }")
+            lines.append("        th { background-color: #3498db; color: white; padding: 12px; text-align: left; }")
+            lines.append("        td { padding: 10px; border-bottom: 1px solid #ddd; }")
+            lines.append("        tr:hover { background-color: #f5f5f5; }")
+            lines.append("        .amount { text-align: right; font-family: Arial, sans-serif; }")
+            lines.append("        .metadata { color: #7f8c8d; font-size: 0.9em; margin-top: 30px; }")
+            lines.append("        .negative { color: #e74c3c; }")
+            lines.append("        .positive { color: #27ae60; }")
+            lines.append("    </style>")
+            lines.append("</head>")
+            lines.append("<body>")
+            lines.append(f"    <h1>{statement.get('name', 'Financial Statement')} - Comparisons</h1>")
+            lines.append("    <div class='metadata'>")
+            lines.append(f"        <p><strong>Period:</strong> {statement.get('start_date')} to {statement.get('end_date')}</p>")
+            if currency:
+                lines.append(f"        <p><strong>Currency:</strong> {currency.code}</p>")
+            if comparison_data.get('is_preview'):
+                lines.append("        <p><strong>Status:</strong> <span style='color: #f39c12;'>Preview (not saved)</span></p>")
+            lines.append("    </div>")
+        
+        # Current period table
+        lines.append("    <h2>Current Period</h2>")
+        lines.append("    <table>")
+        lines.append("        <thead>")
+        lines.append("            <tr>")
+        lines.append("                <th>Line</th>")
+        lines.append("                <th>Label</th>")
+        lines.append("                <th class='amount'>Balance</th>")
+        lines.append("            </tr>")
+        lines.append("        </thead>")
+        lines.append("        <tbody>")
+        
+        for line in statement.get('lines', []):
+            balance = self._format_amount(Decimal(str(line['balance'])), currency, html=True) if currency else str(line['balance'])
+            lines.append("            <tr>")
+            lines.append(f"                <td>{line['line_number']}</td>")
+            lines.append(f"                <td>{line['label']}</td>")
+            lines.append(f"                <td class='amount'>{balance}</td>")
+            lines.append("            </tr>")
+        
+        lines.append("        </tbody>")
+        lines.append("    </table>")
+        
+        # Comparisons tables
+        for comp_type, comp_data in comparisons.items():
+            if 'error' in comp_data:
+                lines.append(f"    <h2>{comp_type.replace('_', ' ').title()}</h2>")
+                lines.append(f"    <p><em>Error: {comp_data['error']}</em></p>")
+                continue
+            
+            lines.append(f"    <h2>{comp_type.replace('_', ' ').title()}</h2>")
+            lines.append("    <div class='metadata'>")
+            lines.append(f"        <p><strong>Comparison Period:</strong> {comp_data.get('start_date')} to {comp_data.get('end_date')}</p>")
+            lines.append("    </div>")
+            lines.append("    <table>")
+            lines.append("        <thead>")
+            lines.append("            <tr>")
+            lines.append("                <th>Line</th>")
+            lines.append("                <th>Label</th>")
+            lines.append("                <th class='amount'>Current</th>")
+            lines.append("                <th class='amount'>Comparison</th>")
+            lines.append("                <th class='amount'>Change</th>")
+            lines.append("                <th class='amount'>% Change</th>")
+            lines.append("            </tr>")
+            lines.append("        </thead>")
+            lines.append("        <tbody>")
+            
+            comp_lines = comp_data.get('lines', {})
+            for line in statement.get('lines', []):
+                line_num = str(line['line_number'])
+                comp_info = comp_lines.get(line_num, {})
+                
+                current_val = Decimal(str(line['balance']))
+                comp_val = Decimal(str(comp_info.get('comparison_value', 0)))
+                abs_change = Decimal(str(comp_info.get('absolute_change', 0)))
+                pct_change = comp_info.get('percentage_change', 0)
+                
+                current_fmt = self._format_amount(current_val, currency, html=True) if currency else str(current_val)
+                comp_fmt = self._format_amount(comp_val, currency, html=True) if currency else str(comp_val)
+                change_fmt = self._format_amount(abs_change, currency, html=True) if currency else str(abs_change)
+                
+                # Color code change
+                change_class = "positive" if abs_change >= 0 else "negative"
+                pct_class = "positive" if pct_change >= 0 else "negative"
+                
+                lines.append("            <tr>")
+                lines.append(f"                <td>{line_num}</td>")
+                lines.append(f"                <td>{line['label']}</td>")
+                lines.append(f"                <td class='amount'>{current_fmt}</td>")
+                lines.append(f"                <td class='amount'>{comp_fmt}</td>")
+                lines.append(f"                <td class='amount {change_class}'>{change_fmt}</td>")
+                lines.append(f"                <td class='amount {pct_class}'>{pct_change:.2f}%</td>")
+                lines.append("            </tr>")
+            
+            lines.append("        </tbody>")
+            lines.append("    </table>")
+        
+        if include_header:
+            lines.append("</body>")
+            lines.append("</html>")
         
         return "\n".join(lines)
     
@@ -1238,7 +1531,30 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 include_pending=data.get('include_pending', False),
             )
         
-        return Response(result, status=status.HTTP_200_OK)
+        # Get currency for formatting
+        currency = self._get_company_currency(company_id)
+        
+        # Return formatted versions based on format parameter
+        format_param = request.query_params.get('format', 'json')
+        if format_param == 'markdown':
+            return Response(
+                self._format_comparisons_as_markdown(result, currency),
+                content_type='text/markdown',
+                status=status.HTTP_200_OK
+            )
+        elif format_param == 'html':
+            return Response(
+                self._format_comparisons_as_html(result, currency),
+                content_type='text/html',
+                status=status.HTTP_200_OK
+            )
+        else:
+            # Default JSON, but include formatted versions in response
+            result['formatted'] = {
+                'markdown': self._format_comparisons_as_markdown(result, currency),
+                'html': self._format_comparisons_as_html(result, currency),
+            }
+            return Response(result, status=status.HTTP_200_OK)
     
     @action(detail=False, methods=['get'])
     def quick_income_statement(self, request, tenant_id=None):
