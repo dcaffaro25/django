@@ -259,7 +259,77 @@ def format_period_label(date_obj: date, dimension: str) -> str:
         raise ValueError(f"Unknown dimension: {dimension}")
 
 
-def get_comparison_period(current_start: date, current_end: date, comparison_type: str) -> Tuple[date, date]:
+def get_previous_period_by_dimension(current_start: date, current_end: date, dimension: str) -> Tuple[date, date]:
+    """
+    Get the previous period of the same dimension.
+    
+    For example, if current period is January 2025 (month dimension),
+    returns December 2024. If current period is Q1 2025 (quarter dimension),
+    returns Q4 2024.
+    
+    Parameters
+    ----------
+    current_start: date
+        Start of current period
+    current_end: date
+        End of current period
+    dimension: str
+        Time dimension ('day', 'week', 'month', 'quarter', 'semester', 'year')
+    
+    Returns
+    -------
+    Tuple[date, date]
+        (comparison_start, comparison_end) for the previous period of the same dimension
+    """
+    if dimension == 'day':
+        # Previous day
+        comparison_end = current_start - timedelta(days=1)
+        comparison_start = comparison_end
+    elif dimension == 'week':
+        # Previous week (7 days before)
+        comparison_end = current_start - timedelta(days=1)
+        comparison_start = comparison_end - timedelta(days=6)
+    elif dimension == 'month':
+        # Previous month
+        if current_start.month == 1:
+            comparison_end = date(current_start.year - 1, 12, 31)
+            comparison_start = date(current_start.year - 1, 12, 1)
+        else:
+            comparison_end = get_period_end(current_start.replace(month=current_start.month - 1, day=1), dimension)
+            comparison_start = date(current_start.year, current_start.month - 1, 1)
+    elif dimension == 'quarter':
+        # Previous quarter
+        quarter = (current_start.month - 1) // 3 + 1
+        if quarter == 1:
+            # Previous quarter is Q4 of previous year
+            comparison_end = date(current_start.year - 1, 12, 31)
+            comparison_start = date(current_start.year - 1, 10, 1)
+        else:
+            # Previous quarter is 3 months earlier
+            prev_quarter_month = ((quarter - 2) * 3) + 1
+            comparison_start = date(current_start.year, prev_quarter_month, 1)
+            comparison_end = get_period_end(comparison_start, dimension)
+    elif dimension == 'semester':
+        # Previous semester
+        if current_start.month <= 6:
+            # Current is H1, previous is H2 of previous year
+            comparison_end = date(current_start.year - 1, 12, 31)
+            comparison_start = date(current_start.year - 1, 7, 1)
+        else:
+            # Current is H2, previous is H1 of same year
+            comparison_end = date(current_start.year, 6, 30)
+            comparison_start = date(current_start.year, 1, 1)
+    elif dimension == 'year':
+        # Previous year
+        comparison_end = date(current_start.year - 1, 12, 31)
+        comparison_start = date(current_start.year - 1, 1, 1)
+    else:
+        raise ValueError(f"Unknown dimension: {dimension}")
+    
+    return comparison_start, comparison_end
+
+
+def get_comparison_period(current_start: date, current_end: date, comparison_type: str, dimension: Optional[str] = None) -> Tuple[date, date]:
     """
     Get the comparison period dates based on comparison type.
     
@@ -271,17 +341,24 @@ def get_comparison_period(current_start: date, current_end: date, comparison_typ
         End of current period
     comparison_type: str
         Type of comparison:
-        - 'previous_period': Same length, previous period
+        - 'previous_period': Same length, previous period (or previous dimension period if dimension provided)
         - 'previous_year': Same period, previous year
         - 'ytd_previous_year': Year-to-date, previous year
         - 'last_12_months': Rolling 12 months ending at current_end
         - 'same_period_last_year': Exact same dates, previous year
+    dimension: Optional[str]
+        Time dimension. If provided and comparison_type is 'previous_period',
+        uses dimension-aware previous period calculation.
     
     Returns
     -------
     Tuple[date, date]
         (comparison_start, comparison_end)
     """
+    if comparison_type == 'previous_period' and dimension:
+        # Use dimension-aware previous period
+        return get_previous_period_by_dimension(current_start, current_end, dimension)
+    
     period_length = (current_end - current_start).days + 1
     
     if comparison_type == 'previous_period':

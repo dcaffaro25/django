@@ -1006,7 +1006,7 @@ class FinancialStatementGenerator:
             for period in periods:
                 period_data = self._generate_comparison_for_period(
                     template, period['start_date'], period['end_date'],
-                    comparison_types, include_pending
+                    comparison_types, include_pending, dimension=dimension
                 )
                 period_data['period_key'] = period['key']
                 period_data['period_label'] = period['label']
@@ -1016,7 +1016,7 @@ class FinancialStatementGenerator:
         else:
             # Original behavior: single period comparison
             return self._generate_comparison_for_period(
-                template, start_date, end_date, comparison_types, include_pending
+                template, start_date, end_date, comparison_types, include_pending, dimension=None
             )
     
     def _generate_comparison_for_period(
@@ -1026,6 +1026,7 @@ class FinancialStatementGenerator:
         end_date: date,
         comparison_types: List[str],
         include_pending: bool,
+        dimension: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Generate comparison for a single period."""
         from accounting.utils_time_dimensions import (
@@ -1042,10 +1043,29 @@ class FinancialStatementGenerator:
             include_pending=include_pending,
         )
         
-        # Get current line values
+        # Get current line values and calculation metadata
         current_lines = {}
+        current_line_metadata = {}
         for line in statement.lines.all():
             current_lines[line.line_number] = line.balance
+            # Get calculation metadata for this line
+            line_template = line.line_template
+            if line_template:
+                current_line_metadata[line.line_number] = {
+                    'account_ids': line.account_ids or [],
+                    'calculation_type': line_template.calculation_type,
+                    'formula': line_template.formula if line_template.calculation_type == 'formula' else None,
+                    'account_code_prefix': line_template.account_code_prefix,
+                    'account_path_contains': line_template.account_path_contains,
+                }
+            else:
+                current_line_metadata[line.line_number] = {
+                    'account_ids': line.account_ids or [],
+                    'calculation_type': 'unknown',
+                    'formula': None,
+                    'account_code_prefix': None,
+                    'account_path_contains': None,
+                }
         
         # Generate comparisons
         comparisons = {}
@@ -1055,7 +1075,8 @@ class FinancialStatementGenerator:
                 comp_start, comp_end = get_comparison_period(
                     start_date,
                     end_date,
-                    comp_type
+                    comp_type,
+                    dimension=dimension
                 )
                 
                 # Generate comparison statement
@@ -1067,10 +1088,24 @@ class FinancialStatementGenerator:
                     include_pending=include_pending,
                 )
                 
-                # Calculate comparisons for each line
+                # Get comparison line values and metadata
                 comp_lines = {}
+                comp_line_metadata = {}
                 for line in comp_statement.lines.all():
                     comp_lines[line.line_number] = line.balance
+                    line_template = line.line_template
+                    if line_template:
+                        comp_line_metadata[line.line_number] = {
+                            'account_ids': line.account_ids or [],
+                            'calculation_type': line_template.calculation_type,
+                            'formula': line_template.formula if line_template.calculation_type == 'formula' else None,
+                        }
+                    else:
+                        comp_line_metadata[line.line_number] = {
+                            'account_ids': line.account_ids or [],
+                            'calculation_type': 'unknown',
+                            'formula': None,
+                        }
                 
                 # Calculate comparison metrics
                 line_comparisons = {}
@@ -1078,16 +1113,50 @@ class FinancialStatementGenerator:
                     current_val = current_lines.get(line_num, Decimal('0.00'))
                     comp_val = comp_lines.get(line_num, Decimal('0.00'))
                     
-                    line_comparisons[line_num] = calculate_period_comparison(
+                    comparison_result = calculate_period_comparison(
                         current_val,
                         comp_val,
                         comp_type
                     )
+                    
+                    # Add calculation memory
+                    comparison_result['calculation_memory'] = {
+                        'current_period': {
+                            'start_date': str(start_date),
+                            'end_date': str(end_date),
+                            'value': float(current_val),
+                            'metadata': current_line_metadata.get(line_num, {}),
+                        },
+                        'comparison_period': {
+                            'start_date': str(comp_start),
+                            'end_date': str(comp_end),
+                            'value': float(comp_val),
+                            'metadata': comp_line_metadata.get(line_num, {}),
+                        },
+                        'comparison_type': comp_type,
+                        'dimension': dimension,
+                        'include_pending': include_pending,
+                    }
+                    
+                    line_comparisons[line_num] = comparison_result
                 
                 comparisons[comp_type] = {
                     'start_date': comp_start,
                     'end_date': comp_end,
                     'lines': line_comparisons,
+                    'calculation_memory': {
+                        'dimension': dimension,
+                        'comparison_type': comp_type,
+                        'current_period': {
+                            'start_date': str(start_date),
+                            'end_date': str(end_date),
+                        },
+                        'comparison_period': {
+                            'start_date': str(comp_start),
+                            'end_date': str(comp_end),
+                        },
+                        'include_pending': include_pending,
+                    },
                 }
                 
             except Exception as e:
@@ -1096,22 +1165,51 @@ class FinancialStatementGenerator:
                     'error': str(e)
                 }
         
+        # Build statement lines with calculation metadata
+        statement_lines = []
+        for line in statement.lines.all():
+            line_data = {
+                'line_number': line.line_number,
+                'label': line.label,
+                'balance': float(line.balance),
+                'indent_level': line.indent_level,
+                'is_bold': line.is_bold,
+            }
+            
+            # Add calculation memory for statement lines
+            line_template = line.line_template
+            if line_template:
+                line_data['calculation_memory'] = {
+                    'account_ids': line.account_ids or [],
+                    'calculation_type': line_template.calculation_type,
+                    'formula': line_template.formula if line_template.calculation_type == 'formula' else None,
+                    'account_code_prefix': line_template.account_code_prefix,
+                    'account_path_contains': line_template.account_path_contains,
+                    'start_date': str(start_date),
+                    'end_date': str(end_date),
+                    'include_pending': include_pending,
+                }
+            else:
+                line_data['calculation_memory'] = {
+                    'account_ids': line.account_ids or [],
+                    'calculation_type': 'unknown',
+                    'formula': None,
+                    'account_code_prefix': None,
+                    'account_path_contains': None,
+                    'start_date': str(start_date),
+                    'end_date': str(end_date),
+                    'include_pending': include_pending,
+                }
+            
+            statement_lines.append(line_data)
+        
         return {
             'statement': {
                 'id': statement.id,
                 'name': statement.name,
                 'start_date': statement.start_date,
                 'end_date': statement.end_date,
-                'lines': [
-                    {
-                        'line_number': line.line_number,
-                        'label': line.label,
-                        'balance': float(line.balance),
-                        'indent_level': line.indent_level,
-                        'is_bold': line.is_bold,
-                    }
-                    for line in statement.lines.all()
-                ],
+                'lines': statement_lines,
             },
             'comparisons': comparisons,
         }
