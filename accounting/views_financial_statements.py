@@ -1018,7 +1018,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             return self._format_single_comparison_markdown(comparison_data, currency)
     
     def _format_single_comparison_markdown(self, comparison_data, currency):
-        """Format a single comparison as Markdown."""
+        """Format a single comparison as Markdown - all comparisons in one table."""
         lines = []
         
         statement = comparison_data.get('statement', {})
@@ -1033,57 +1033,97 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         if comparison_data.get('is_preview'):
             lines.append("**Status:** Preview (not saved)")
         lines.append("")
-        lines.append("---")
-        lines.append("")
         
-        # Statement lines table
-        lines.append("## Current Period")
-        lines.append("")
-        lines.append("| Line | Label | Balance |")
-        lines.append("|------|-------|---------|")
-        
-        for line in statement.get('lines', []):
-            balance = self._format_amount(Decimal(str(line['balance'])), currency) if currency else str(line['balance'])
-            lines.append(f"| {line['line_number']} | {line['label']} | {balance} |")
-        
-        lines.append("")
-        lines.append("---")
-        lines.append("")
-        
-        # Comparisons
+        # Build comparison period info
+        comp_periods = []
+        valid_comparisons = {}
         for comp_type, comp_data in comparisons.items():
             if 'error' in comp_data:
-                lines.append(f"## {comp_type.replace('_', ' ').title()}")
-                lines.append(f"*Error: {comp_data['error']}*")
-                lines.append("")
                 continue
-            
-            lines.append(f"## {comp_type.replace('_', ' ').title()}")
+            comp_periods.append(f"**{comp_type.replace('_', ' ').title()}:** {comp_data.get('start_date')} to {comp_data.get('end_date')}")
+            valid_comparisons[comp_type] = comp_data
+        
+        if comp_periods:
+            lines.append(" | ".join(comp_periods))
             lines.append("")
-            lines.append(f"**Comparison Period:** {comp_data.get('start_date')} to {comp_data.get('end_date')}")
-            lines.append("")
-            lines.append("| Line | Label | Current | Comparison | Change | % Change |")
-            lines.append("|------|-------|---------|------------|--------|---------|")
+        
+        lines.append("---")
+        lines.append("")
+        
+        # Build table header - single table with all comparisons
+        header_cols = ["Line", "Label"]
+        header_cols.append("Current Period")
+        
+        for comp_type, comp_data in valid_comparisons.items():
+            comp_label = comp_type.replace('_', ' ').title()
+            header_cols.extend([f"{comp_label}", f"Change", f"% Change"])
+        
+        lines.append("| " + " | ".join(header_cols) + " |")
+        lines.append("|" + "|".join(["---"] * len(header_cols)) + "|")
+        
+        # Build rows
+        for line in statement.get('lines', []):
+            row_cols = []
             
-            comp_lines = comp_data.get('lines', {})
-            for line in statement.get('lines', []):
-                line_num = str(line['line_number'])
+            # Line number
+            row_cols.append(str(line['line_number']))
+            
+            # Label with indentation
+            indent = "&nbsp;" * (4 * line.get('indent_level', 0))
+            label = f"{indent}{line['label']}"
+            if line.get('is_bold', False):
+                label = f"**{label}**"
+            row_cols.append(label)
+            
+            # Current period value
+            current_val = Decimal(str(line['balance']))
+            current_fmt = self._format_amount(current_val, currency) if currency else str(current_val)
+            if line.get('is_bold', False):
+                current_fmt = f"**{current_fmt}**"
+            row_cols.append(current_fmt)
+            
+            # Each comparison
+            for comp_type, comp_data in valid_comparisons.items():
+                comp_lines = comp_data.get('lines', {})
+                line_num = line['line_number']  # Use integer key
                 comp_info = comp_lines.get(line_num, {})
                 
-                current_val = Decimal(str(line['balance']))
+                # Comparison value
                 comp_val = Decimal(str(comp_info.get('comparison_value', 0)))
-                abs_change = comp_info.get('absolute_change', 0)
-                pct_change = comp_info.get('percentage_change', 0)
-                
-                current_fmt = self._format_amount(current_val, currency) if currency else str(current_val)
                 comp_fmt = self._format_amount(comp_val, currency) if currency else str(comp_val)
-                change_fmt = self._format_amount(Decimal(str(abs_change)), currency) if currency else str(abs_change)
+                if line.get('is_bold', False):
+                    comp_fmt = f"**{comp_fmt}**"
+                row_cols.append(comp_fmt)
                 
-                lines.append(f"| {line_num} | {line['label']} | {current_fmt} | {comp_fmt} | {change_fmt} | {pct_change:.2f}% |")
+                # Change
+                abs_change = comp_info.get('absolute_change', 0)
+                if abs_change is None:
+                    change_fmt = "-"
+                else:
+                    change_fmt = self._format_amount(Decimal(str(abs_change)), currency) if currency else str(abs_change)
+                if line.get('is_bold', False):
+                    change_fmt = f"**{change_fmt}**"
+                row_cols.append(change_fmt)
+                
+                # Percentage change
+                pct_change = comp_info.get('percentage_change')
+                if pct_change is None:
+                    pct_fmt = "-"
+                else:
+                    pct_fmt = f"{float(pct_change):.2f}%"
+                if line.get('is_bold', False):
+                    pct_fmt = f"**{pct_fmt}**"
+                row_cols.append(pct_fmt)
             
-            lines.append("")
-            lines.append("---")
-            lines.append("")
+            lines.append("| " + " | ".join(row_cols) + " |")
+        
+        lines.append("")
+        
+        # Add error messages if any
+        for comp_type, comp_data in comparisons.items():
+            if 'error' in comp_data:
+                lines.append(f"**{comp_type.replace('_', ' ').title()}:** *Error: {comp_data['error']}*")
+                lines.append("")
         
         return "\n".join(lines)
     
@@ -1146,7 +1186,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             return self._format_single_comparison_html(comparison_data, currency, include_header=True)
     
     def _format_single_comparison_html(self, comparison_data, currency, include_header=True):
-        """Format a single comparison as HTML."""
+        """Format a single comparison as HTML - all comparisons in one table."""
         lines = []
         
         statement = comparison_data.get('statement', {})
@@ -1165,12 +1205,18 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             lines.append("        h2 { color: #34495e; margin-top: 30px; border-bottom: 2px solid #95a5a6; padding-bottom: 5px; }")
             lines.append("        table { width: 100%; border-collapse: collapse; margin: 20px 0; }")
             lines.append("        th { background-color: #3498db; color: white; padding: 12px; text-align: left; }")
+            lines.append("        th.amount { text-align: right; }")
             lines.append("        td { padding: 10px; border-bottom: 1px solid #ddd; }")
             lines.append("        tr:hover { background-color: #f5f5f5; }")
             lines.append("        .amount { text-align: right; font-family: Arial, sans-serif; }")
             lines.append("        .metadata { color: #7f8c8d; font-size: 0.9em; margin-top: 30px; }")
             lines.append("        .negative { color: #e74c3c; }")
             lines.append("        .positive { color: #27ae60; }")
+            lines.append("        .font-level-0 { font-size: 1em; }")
+            lines.append("        .font-level-1 { font-size: 0.95em; }")
+            lines.append("        .font-level-2 { font-size: 0.9em; }")
+            lines.append("        .font-level-3 { font-size: 0.85em; }")
+            lines.append("        .font-level-4 { font-size: 0.8em; }")
             lines.append("    </style>")
             lines.append("</head>")
             lines.append("<body>")
@@ -1181,84 +1227,113 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 lines.append(f"        <p><strong>Currency:</strong> {currency.code}</p>")
             if comparison_data.get('is_preview'):
                 lines.append("        <p><strong>Status:</strong> <span style='color: #f39c12;'>Preview (not saved)</span></p>")
-            lines.append("    </div>")
-        
-        # Current period table
-        lines.append("    <h2>Current Period</h2>")
-        lines.append("    <table>")
-        lines.append("        <thead>")
-        lines.append("            <tr>")
-        lines.append("                <th>Line</th>")
-        lines.append("                <th>Label</th>")
-        lines.append("                <th class='amount'>Balance</th>")
-        lines.append("            </tr>")
-        lines.append("        </thead>")
-        lines.append("        <tbody>")
-        
-        for line in statement.get('lines', []):
-            balance = self._format_amount(Decimal(str(line['balance'])), currency, html=True) if currency else str(line['balance'])
-            lines.append("            <tr>")
-            lines.append(f"                <td>{line['line_number']}</td>")
-            lines.append(f"                <td>{line['label']}</td>")
-            lines.append(f"                <td class='amount'>{balance}</td>")
-            lines.append("            </tr>")
-        
-        lines.append("        </tbody>")
-        lines.append("    </table>")
-        
-        # Comparisons tables
-        for comp_type, comp_data in comparisons.items():
-            if 'error' in comp_data:
-                lines.append(f"    <h2>{comp_type.replace('_', ' ').title()}</h2>")
-                lines.append(f"    <p><em>Error: {comp_data['error']}</em></p>")
-                continue
             
-            lines.append(f"    <h2>{comp_type.replace('_', ' ').title()}</h2>")
-            lines.append("    <div class='metadata'>")
-            lines.append(f"        <p><strong>Comparison Period:</strong> {comp_data.get('start_date')} to {comp_data.get('end_date')}</p>")
+            # Add comparison period info
+            comp_periods = []
+            for comp_type, comp_data in comparisons.items():
+                if 'error' not in comp_data:
+                    comp_periods.append(f"<strong>{comp_type.replace('_', ' ').title()}:</strong> {comp_data.get('start_date')} to {comp_data.get('end_date')}")
+            if comp_periods:
+                lines.append("        <p>" + " | ".join(comp_periods) + "</p>")
+            
             lines.append("    </div>")
+        
+        # Build single table with all comparisons
+        valid_comparisons = {k: v for k, v in comparisons.items() if 'error' not in v}
+        
+        if valid_comparisons:
             lines.append("    <table>")
             lines.append("        <thead>")
             lines.append("            <tr>")
             lines.append("                <th>Line</th>")
             lines.append("                <th>Label</th>")
-            lines.append("                <th class='amount'>Current</th>")
-            lines.append("                <th class='amount'>Comparison</th>")
-            lines.append("                <th class='amount'>Change</th>")
-            lines.append("                <th class='amount'>% Change</th>")
+            lines.append("                <th class='amount'>Current Period</th>")
+            
+            for comp_type, comp_data in valid_comparisons.items():
+                comp_label = comp_type.replace('_', ' ').title()
+                lines.append(f"                <th class='amount' colspan='3'>{comp_label}</th>")
+            
+            lines.append("            </tr>")
+            lines.append("            <tr>")
+            lines.append("                <th></th>")
+            lines.append("                <th></th>")
+            lines.append("                <th class='amount'></th>")
+            
+            for comp_type, comp_data in valid_comparisons.items():
+                lines.append("                <th class='amount'>Amount</th>")
+                lines.append("                <th class='amount'>Change</th>")
+                lines.append("                <th class='amount'>% Change</th>")
+            
             lines.append("            </tr>")
             lines.append("        </thead>")
             lines.append("        <tbody>")
             
-            comp_lines = comp_data.get('lines', {})
             for line in statement.get('lines', []):
-                line_num = str(line['line_number'])
-                comp_info = comp_lines.get(line_num, {})
-                
-                current_val = Decimal(str(line['balance']))
-                comp_val = Decimal(str(comp_info.get('comparison_value', 0)))
-                abs_change = Decimal(str(comp_info.get('absolute_change', 0)))
-                pct_change = comp_info.get('percentage_change', 0)
-                
-                current_fmt = self._format_amount(current_val, currency, html=True) if currency else str(current_val)
-                comp_fmt = self._format_amount(comp_val, currency, html=True) if currency else str(comp_val)
-                change_fmt = self._format_amount(abs_change, currency, html=True) if currency else str(abs_change)
-                
-                # Color code change
-                change_class = "positive" if abs_change >= 0 else "negative"
-                pct_class = "positive" if pct_change >= 0 else "negative"
+                indent_level = line.get('indent_level', 0)
+                is_bold = line.get('is_bold', False)
+                indent_style = f"padding-left: {indent_level * 20}px;" if indent_level > 0 else ""
+                font_class = f"font-level-{min(indent_level, 4)}"
+                bold_style = "font-weight: bold;" if is_bold else ""
+                style_attr = f" style='{indent_style}{bold_style}'" if (indent_style or bold_style) else ""
                 
                 lines.append("            <tr>")
-                lines.append(f"                <td>{line_num}</td>")
-                lines.append(f"                <td>{line['label']}</td>")
+                lines.append(f"                <td>{line['line_number']}</td>")
+                lines.append(f"                <td class='{font_class}'{style_attr}>{line['label']}</td>")
+                
+                # Current period value
+                current_val = Decimal(str(line['balance']))
+                current_fmt = self._format_amount(current_val, currency, html=True) if currency else str(current_val)
+                if is_bold:
+                    current_fmt = f"<strong>{current_fmt}</strong>"
                 lines.append(f"                <td class='amount'>{current_fmt}</td>")
-                lines.append(f"                <td class='amount'>{comp_fmt}</td>")
-                lines.append(f"                <td class='amount {change_class}'>{change_fmt}</td>")
-                lines.append(f"                <td class='amount {pct_class}'>{pct_change:.2f}%</td>")
+                
+                # Each comparison
+                for comp_type, comp_data in valid_comparisons.items():
+                    comp_lines = comp_data.get('lines', {})
+                    line_num = line['line_number']  # Use integer key
+                    comp_info = comp_lines.get(line_num, {})
+                    
+                    # Comparison value
+                    comp_val = Decimal(str(comp_info.get('comparison_value', 0)))
+                    comp_fmt = self._format_amount(comp_val, currency, html=True) if currency else str(comp_val)
+                    if is_bold:
+                        comp_fmt = f"<strong>{comp_fmt}</strong>"
+                    lines.append(f"                <td class='amount'>{comp_fmt}</td>")
+                    
+                    # Change
+                    abs_change = comp_info.get('absolute_change', 0)
+                    if abs_change is None:
+                        change_fmt = "-"
+                        change_class = ""
+                    else:
+                        abs_change_decimal = Decimal(str(abs_change))
+                        change_fmt = self._format_amount(abs_change_decimal, currency, html=True) if currency else str(abs_change)
+                        change_class = "positive" if abs_change_decimal >= 0 else "negative"
+                        if is_bold:
+                            change_fmt = f"<strong>{change_fmt}</strong>"
+                    lines.append(f"                <td class='amount {change_class}'>{change_fmt}</td>")
+                    
+                    # Percentage change
+                    pct_change = comp_info.get('percentage_change')
+                    if pct_change is None:
+                        pct_fmt = "-"
+                        pct_class = ""
+                    else:
+                        pct_fmt = f"{float(pct_change):.2f}%"
+                        pct_class = "positive" if pct_change >= 0 else "negative"
+                        if is_bold:
+                            pct_fmt = f"<strong>{pct_fmt}</strong>"
+                    lines.append(f"                <td class='amount {pct_class}'>{pct_fmt}</td>")
+                
                 lines.append("            </tr>")
             
             lines.append("        </tbody>")
             lines.append("    </table>")
+        
+        # Add error messages if any
+        for comp_type, comp_data in comparisons.items():
+            if 'error' in comp_data:
+                lines.append(f"    <p><strong>{comp_type.replace('_', ' ').title()}:</strong> <em>Error: {comp_data['error']}</em></p>")
         
         if include_header:
             lines.append("</body>")

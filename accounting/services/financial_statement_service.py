@@ -1107,6 +1107,8 @@ class FinancialStatementGenerator:
                         'line_number': line.line_number,
                         'label': line.label,
                         'balance': float(line.balance),
+                        'indent_level': line.indent_level,
+                        'is_bold': line.is_bold,
                     }
                     for line in statement.lines.all()
                 ],
