@@ -8,7 +8,7 @@ from accounting data.
 import logging
 from decimal import Decimal
 from datetime import date
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Any
 from django.db.models import Q, Sum, F
 from django.db import transaction
 
