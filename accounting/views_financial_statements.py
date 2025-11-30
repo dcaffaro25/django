@@ -27,6 +27,7 @@ from .serializers_financial_statements import (
     ComparisonRequestSerializer,
 )
 from .services.financial_statement_service import FinancialStatementGenerator
+from .models import Currency
 
 
 class FinancialStatementTemplateViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
@@ -278,8 +279,6 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         for line in statement.lines.all().order_by('line_number'):
             indent = "  " * line.indent_level
             label = f"{indent}{line.label}"
-            if line.is_bold:
-                label = f"**{label}**"
             
             # Format amounts
             debit = self._format_amount(line.debit_amount, statement.currency)
@@ -296,7 +295,13 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 lines.append("")
                 continue
             
-            lines.append(f"| {line.line_number} | {label} | {debit} | {credit} | {balance} |")
+            # If bold, make entire row bold (label and all data)
+            if line.is_bold:
+                row = f"| **{line.line_number}** | **{label}** | **{debit}** | **{credit}** | **{balance}** |"
+            else:
+                row = f"| {line.line_number} | {label} | {debit} | {credit} | {balance} |"
+            
+            lines.append(row)
         
         # Totals
         lines.append("")
@@ -421,13 +426,19 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             credit = self._format_amount(line.credit_amount, statement.currency, html=True)
             balance = self._format_amount(line.balance, statement.currency, html=True)
             
-            # Bold label if needed
-            label = line.label
+            # If bold, make entire row bold (all cells)
             if line.is_bold:
-                label = f"<strong>{label}</strong>"
+                label = f"<strong>{line.label}</strong>"
+                line_num = f"<strong>{line.line_number}</strong>"
+                debit = f"<strong>{debit}</strong>"
+                credit = f"<strong>{credit}</strong>"
+                balance = f"<strong>{balance}</strong>"
+            else:
+                label = line.label
+                line_num = str(line.line_number)
             
             lines.append(f"            <tr class='{row_class}'>")
-            lines.append(f"                <td>{line.line_number}</td>")
+            lines.append(f"                <td>{line_num}</td>")
             lines.append(f"                <td class='{indent_class}'>{label}</td>")
             lines.append(f"                <td class='amount'>{debit}</td>")
             lines.append(f"                <td class='amount'>{credit}</td>")
@@ -498,6 +509,180 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 formatted = f"<span class='negative'>{formatted}</span>"
         
         return formatted
+    
+    def _format_time_series_as_markdown(self, series_data, currency):
+        """Format time series data as Markdown."""
+        lines = []
+        
+        # Header
+        lines.append(f"# {series_data['template_name']}")
+        lines.append("")
+        lines.append(f"**Report Type:** {series_data['report_type']}")
+        lines.append(f"**Period:** {series_data['start_date']} to {series_data['end_date']}")
+        lines.append(f"**Dimension:** {series_data['dimension']}")
+        if currency:
+            lines.append(f"**Currency:** {currency.code}")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        
+        # Get all periods from first line (assuming all lines have same periods)
+        if not series_data['lines']:
+            lines.append("*No data available*")
+            return "\n".join(lines)
+        
+        first_line = series_data['lines'][0]
+        periods = first_line['data']
+        
+        # Build table header
+        header = "| Line | Label |"
+        separator = "|------|-------|"
+        for period in periods:
+            header += f" {period['period_label']} |"
+            separator += " " + "-" * len(period['period_label']) + " |"
+        lines.append(header)
+        lines.append(separator)
+        
+        # Add each line
+        for line_info in series_data['lines']:
+            if line_info['line_type'] in ('header', 'spacer'):
+                continue
+            
+            indent = "  " * line_info.get('indent_level', 0)
+            label = f"{indent}{line_info['label']}"
+            
+            # Build row - if bold, make entire row bold
+            is_bold = line_info.get('is_bold', False)
+            if is_bold:
+                row = f"| **{line_info['line_number']}** | **{label}** |"
+            else:
+                row = f"| {line_info['line_number']} | {label} |"
+            
+            # Add values for each period
+            for period in periods:
+                # Find matching period value
+                period_value = next(
+                    (p['value'] for p in line_info['data'] if p['period_key'] == period['period_key']),
+                    0.0
+                )
+                formatted_value = self._format_amount(Decimal(str(period_value)), currency) if currency else str(period_value)
+                
+                # If bold, make value bold too
+                if is_bold:
+                    formatted_value = f"**{formatted_value}**"
+                
+                row += f" {formatted_value} |"
+            
+            lines.append(row)
+        
+        # Footer
+        lines.append("")
+        lines.append("---")
+        
+        return "\n".join(lines)
+    
+    def _format_time_series_as_html(self, series_data, currency):
+        """Format time series data as HTML."""
+        lines = []
+        
+        # HTML header
+        lines.append("<!DOCTYPE html>")
+        lines.append("<html lang='en'>")
+        lines.append("<head>")
+        lines.append("    <meta charset='UTF-8'>")
+        lines.append("    <meta name='viewport' content='width=device-width, initial-scale=1.0'>")
+        lines.append(f"    <title>{series_data['template_name']}</title>")
+        lines.append("    <style>")
+        lines.append("        body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }")
+        lines.append("        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }")
+        lines.append("        table { width: 100%; border-collapse: collapse; margin: 20px 0; }")
+        lines.append("        th { background-color: #3498db; color: white; padding: 12px; text-align: left; }")
+        lines.append("        td { padding: 10px; border-bottom: 1px solid #ddd; }")
+        lines.append("        tr:hover { background-color: #f5f5f5; }")
+        lines.append("        .indent-1 { padding-left: 20px; }")
+        lines.append("        .indent-2 { padding-left: 40px; }")
+        lines.append("        .indent-3 { padding-left: 60px; }")
+        lines.append("        .amount { text-align: right; font-family: 'Courier New', monospace; }")
+        lines.append("        .metadata { color: #7f8c8d; font-size: 0.9em; margin-top: 30px; }")
+        lines.append("        .negative { color: #e74c3c; }")
+        lines.append("    </style>")
+        lines.append("</head>")
+        lines.append("<body>")
+        
+        # Title
+        lines.append(f"    <h1>{series_data['template_name']}</h1>")
+        
+        # Metadata
+        lines.append("    <div class='metadata'>")
+        lines.append(f"        <p><strong>Report Type:</strong> {series_data['report_type']}</p>")
+        lines.append(f"        <p><strong>Period:</strong> {series_data['start_date']} to {series_data['end_date']}</p>")
+        lines.append(f"        <p><strong>Dimension:</strong> {series_data['dimension']}</p>")
+        if currency:
+            lines.append(f"        <p><strong>Currency:</strong> {currency.code}</p>")
+        lines.append("    </div>")
+        
+        # Table
+        if not series_data['lines']:
+            lines.append("    <p><em>No data available</em></p>")
+        else:
+            first_line = series_data['lines'][0]
+            periods = first_line['data']
+            
+            lines.append("    <table>")
+            lines.append("        <thead>")
+            lines.append("            <tr>")
+            lines.append("                <th>Line</th>")
+            lines.append("                <th>Label</th>")
+            for period in periods:
+                lines.append(f"                <th class='amount'>{period['period_label']}</th>")
+            lines.append("            </tr>")
+            lines.append("        </thead>")
+            lines.append("        <tbody>")
+            
+            # Add each line
+            for line_info in series_data['lines']:
+                if line_info['line_type'] in ('header', 'spacer'):
+                    continue
+                
+                indent_class = f"indent-{line_info.get('indent_level', 0)}" if line_info.get('indent_level', 0) > 0 else ""
+                label = line_info['label']
+                line_num = str(line_info['line_number'])
+                
+                # If bold, wrap all cells in <strong>
+                is_bold = line_info.get('is_bold', False)
+                if is_bold:
+                    label = f"<strong>{label}</strong>"
+                    line_num = f"<strong>{line_num}</strong>"
+                
+                lines.append("            <tr>")
+                lines.append(f"                <td>{line_num}</td>")
+                lines.append(f"                <td class='{indent_class}'>{label}</td>")
+                
+                # Add values for each period
+                for period in periods:
+                    # Find matching period value
+                    period_value = next(
+                        (p['value'] for p in line_info['data'] if p['period_key'] == period['period_key']),
+                        0.0
+                    )
+                    formatted_value = self._format_amount(Decimal(str(period_value)), currency, html=True) if currency else str(period_value)
+                    
+                    # If bold, make value bold too
+                    if is_bold:
+                        formatted_value = f"<strong>{formatted_value}</strong>"
+                    
+                    lines.append(f"                <td class='amount'>{formatted_value}</td>")
+                
+                lines.append("            </tr>")
+            
+            lines.append("        </tbody>")
+            lines.append("    </table>")
+        
+        # Footer
+        lines.append("</body>")
+        lines.append("</html>")
+        
+        return "\n".join(lines)
     
     @action(detail=True, methods=['get'])
     def export_excel(self, request, pk=None, tenant_id=None):
@@ -655,7 +840,30 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             include_pending=data.get('include_pending', False),
         )
         
-        return Response(series_data, status=status.HTTP_200_OK)
+        # Get currency for formatting (use first currency for company, or None)
+        currency = Currency.objects.filter(company_id=company_id).first()
+        
+        # Return formatted versions based on format parameter
+        format_param = request.query_params.get('format', 'json')
+        if format_param == 'markdown':
+            return Response(
+                self._format_time_series_as_markdown(series_data, currency),
+                content_type='text/markdown',
+                status=status.HTTP_200_OK
+            )
+        elif format_param == 'html':
+            return Response(
+                self._format_time_series_as_html(series_data, currency),
+                content_type='text/html',
+                status=status.HTTP_200_OK
+            )
+        else:
+            # Default JSON, but include formatted versions in response
+            series_data['formatted'] = {
+                'markdown': self._format_time_series_as_markdown(series_data, currency),
+                'html': self._format_time_series_as_html(series_data, currency),
+            }
+            return Response(series_data, status=status.HTTP_200_OK)
     
     @action(detail=False, methods=['post'])
     def with_comparisons(self, request, tenant_id=None):

@@ -757,6 +757,8 @@ class FinancialStatementGenerator:
                 'line_number': line_template.line_number,
                 'label': line_template.label,
                 'line_type': line_template.line_type,
+                'indent_level': line_template.indent_level,
+                'is_bold': line_template.is_bold,
                 'data': line_series,
             }
         
