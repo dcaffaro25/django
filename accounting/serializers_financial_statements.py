@@ -176,9 +176,12 @@ class TimeSeriesRequestSerializer(serializers.Serializer):
     template_id = serializers.IntegerField()
     start_date = serializers.DateField()
     end_date = serializers.DateField()
-    dimension = serializers.ChoiceField(
-        choices=['day', 'week', 'month', 'quarter', 'semester', 'year'],
-        default='month'
+    dimension = serializers.CharField(required=False, default='month')
+    # Support both single dimension string or list of dimensions
+    dimensions = serializers.ListField(
+        child=serializers.ChoiceField(choices=['day', 'week', 'month', 'quarter', 'semester', 'year']),
+        required=False,
+        allow_null=True
     )
     line_numbers = serializers.ListField(
         child=serializers.IntegerField(),
@@ -186,6 +189,19 @@ class TimeSeriesRequestSerializer(serializers.Serializer):
         allow_null=True
     )
     include_pending = serializers.BooleanField(required=False, default=False)
+    
+    def validate(self, data):
+        """Handle dimension vs dimensions."""
+        if 'dimensions' in data and data['dimensions']:
+            # If dimensions list is provided, use it
+            data['dimension'] = data['dimensions']
+        elif 'dimension' in data and isinstance(data['dimension'], str):
+            # Single dimension string
+            if data['dimension'] not in ['day', 'week', 'month', 'quarter', 'semester', 'year']:
+                raise serializers.ValidationError({
+                    'dimension': 'Invalid dimension. Must be one of: day, week, month, quarter, semester, year'
+                })
+        return data
 
 
 class ComparisonRequestSerializer(serializers.Serializer):
@@ -204,6 +220,12 @@ class ComparisonRequestSerializer(serializers.Serializer):
         ]),
         required=False,
         default=['previous_period', 'previous_year']
+    )
+    dimension = serializers.ChoiceField(
+        choices=['day', 'week', 'month', 'quarter', 'semester', 'year'],
+        required=False,
+        allow_null=True,
+        help_text="Time dimension to break down current period. If provided, compares each sub-period."
     )
     include_pending = serializers.BooleanField(required=False, default=False)
 

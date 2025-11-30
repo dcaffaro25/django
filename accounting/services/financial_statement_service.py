@@ -8,7 +8,7 @@ from accounting data.
 import logging
 from decimal import Decimal
 from datetime import date
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Set, Any, Union
 from django.db.models import Q, Sum, F
 from django.db import transaction
 
@@ -805,7 +805,7 @@ class FinancialStatementGenerator:
         template: FinancialStatementTemplate,
         start_date: date,
         end_date: date,
-        dimension: str = 'month',
+        dimension: Optional[Union[str, List[str]]] = 'month',
         line_numbers: Optional[List[int]] = None,
         include_pending: bool = False,
     ) -> Dict[str, Any]:
@@ -820,8 +820,9 @@ class FinancialStatementGenerator:
             Start of the period
         end_date: date
             End of the period
-        dimension: str
-            Time dimension ('day', 'week', 'month', 'quarter', 'semester', 'year')
+        dimension: Union[str, List[str]]
+            Time dimension(s) ('day', 'week', 'month', 'quarter', 'semester', 'year')
+            Can be a single dimension string or a list of dimensions
         line_numbers: Optional[List[int]]
             Specific line numbers to include. If None, includes all lines.
         include_pending: bool
@@ -830,8 +831,49 @@ class FinancialStatementGenerator:
         Returns
         -------
         Dict[str, Any]
-            Time series data with periods and values
+            Time series data with periods and values.
+            If multiple dimensions, returns dict with dimension as key.
+            If single dimension, returns the data directly.
         """
+        from accounting.utils_time_dimensions import generate_periods
+        
+        # Handle multiple dimensions
+        dimensions = dimension if isinstance(dimension, list) else [dimension]
+        
+        if len(dimensions) > 1:
+            # Multiple dimensions: return dict with dimension as key
+            result = {
+                'template_id': template.id,
+                'template_name': template.name,
+                'report_type': template.report_type,
+                'dimensions': dimensions,
+                'start_date': start_date,
+                'end_date': end_date,
+                'data': {}
+            }
+            
+            for dim in dimensions:
+                result['data'][dim] = self._generate_single_dimension_time_series(
+                    template, start_date, end_date, dim, line_numbers, include_pending
+                )
+            
+            return result
+        else:
+            # Single dimension: return current structure
+            return self._generate_single_dimension_time_series(
+                template, start_date, end_date, dimensions[0], line_numbers, include_pending
+            )
+    
+    def _generate_single_dimension_time_series(
+        self,
+        template: FinancialStatementTemplate,
+        start_date: date,
+        end_date: date,
+        dimension: str,
+        line_numbers: Optional[List[int]],
+        include_pending: bool,
+    ) -> Dict[str, Any]:
+        """Generate time series for a single dimension."""
         from accounting.utils_time_dimensions import generate_periods
         
         periods = generate_periods(start_date, end_date, dimension)
@@ -884,12 +926,32 @@ class FinancialStatementGenerator:
             'lines': list(series_data.values()),
         }
     
+    def preview_time_series(
+        self,
+        template: FinancialStatementTemplate,
+        start_date: date,
+        end_date: date,
+        dimension: Optional[Union[str, List[str]]] = 'month',
+        line_numbers: Optional[List[int]] = None,
+        include_pending: bool = False,
+    ) -> Dict[str, Any]:
+        """Preview time series without saving (same as generate_time_series but marked as preview)."""
+        result = self.generate_time_series(
+            template, start_date, end_date, dimension, line_numbers, include_pending
+        )
+        if isinstance(dimension, list) or (isinstance(result, dict) and 'data' in result):
+            result['is_preview'] = True
+        else:
+            result['is_preview'] = True
+        return result
+    
     def generate_with_comparisons(
         self,
         template: FinancialStatementTemplate,
         start_date: date,
         end_date: date,
         comparison_types: List[str],
+        dimension: Optional[str] = None,
         include_pending: bool = False,
     ) -> Dict[str, Any]:
         """
@@ -910,14 +972,62 @@ class FinancialStatementGenerator:
             - 'ytd_previous_year'
             - 'last_12_months'
             - 'same_period_last_year'
+        dimension: Optional[str]
+            Time dimension to break down current period ('month', 'quarter', etc.)
+            If provided, breaks down current period by dimension and compares each sub-period
         include_pending: bool
             Include pending journal entries
         
         Returns
         -------
         Dict[str, Any]
-            Statement data with comparisons
+            Statement data with comparisons.
+            If dimension is provided, returns breakdown by dimension periods.
         """
+        from accounting.utils_time_dimensions import (
+            get_comparison_period,
+            calculate_period_comparison,
+            generate_periods,
+        )
+        
+        # If dimension is provided, break down current period by dimension
+        if dimension:
+            periods = generate_periods(start_date, end_date, dimension)
+            result = {
+                'template_id': template.id,
+                'template_name': template.name,
+                'report_type': template.report_type,
+                'dimension': dimension,
+                'start_date': start_date,
+                'end_date': end_date,
+                'periods': []
+            }
+            
+            for period in periods:
+                period_data = self._generate_comparison_for_period(
+                    template, period['start_date'], period['end_date'],
+                    comparison_types, include_pending
+                )
+                period_data['period_key'] = period['key']
+                period_data['period_label'] = period['label']
+                result['periods'].append(period_data)
+            
+            return result
+        else:
+            # Original behavior: single period comparison
+            return self._generate_comparison_for_period(
+                template, start_date, end_date, comparison_types, include_pending
+            )
+    
+    def _generate_comparison_for_period(
+        self,
+        template: FinancialStatementTemplate,
+        start_date: date,
+        end_date: date,
+        comparison_types: List[str],
+        include_pending: bool,
+    ) -> Dict[str, Any]:
+        """Generate comparison for a single period."""
         from accounting.utils_time_dimensions import (
             get_comparison_period,
             calculate_period_comparison,
@@ -980,10 +1090,6 @@ class FinancialStatementGenerator:
                     'lines': line_comparisons,
                 }
                 
-                # Optionally keep comparison statements for audit trail
-                # For now, we keep them but mark as draft
-                # You can delete them if needed: comp_statement.delete()
-                
             except Exception as e:
                 log.warning(f"Failed to generate comparison {comp_type}: {e}")
                 comparisons[comp_type] = {
@@ -1007,4 +1113,20 @@ class FinancialStatementGenerator:
             },
             'comparisons': comparisons,
         }
+    
+    def preview_with_comparisons(
+        self,
+        template: FinancialStatementTemplate,
+        start_date: date,
+        end_date: date,
+        comparison_types: List[str],
+        dimension: Optional[str] = None,
+        include_pending: bool = False,
+    ) -> Dict[str, Any]:
+        """Preview comparisons without saving statements."""
+        result = self.generate_with_comparisons(
+            template, start_date, end_date, comparison_types, dimension, include_pending
+        )
+        result['is_preview'] = True
+        return result
 

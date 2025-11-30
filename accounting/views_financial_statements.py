@@ -674,7 +674,53 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return html
     
     def _format_time_series_as_markdown(self, series_data, currency):
-        """Format time series data as Markdown."""
+        """Format time series data as Markdown. Handles both single and multiple dimensions."""
+        lines = []
+        
+        # Check if multiple dimensions
+        if 'data' in series_data and 'dimensions' in series_data:
+            # Multiple dimensions
+            lines.append(f"# {series_data['template_name']}")
+            lines.append("")
+            lines.append(f"**Report Type:** {series_data['report_type']}")
+            lines.append(f"**Period:** {series_data['start_date']} to {series_data['end_date']}")
+            lines.append(f"**Dimensions:** {', '.join(series_data['dimensions'])}")
+            if currency:
+                lines.append(f"**Currency:** {currency.code}")
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+            
+            # Format each dimension
+            for dimension in series_data['dimensions']:
+                dim_data = series_data['data'][dimension]
+                lines.append(f"## {dimension.title()} Dimension")
+                lines.append("")
+                # _format_single_dimension_markdown returns a string, split it into lines
+                dim_markdown = self._format_single_dimension_markdown(dim_data, currency)
+                # Skip the header since we already have it above
+                dim_lines = dim_markdown.split('\n')
+                # Skip first few header lines and add the rest
+                skip_header = True
+                for dim_line in dim_lines:
+                    if skip_header and (dim_line.startswith('#') or dim_line.startswith('**') or dim_line == ''):
+                        continue
+                    if dim_line.startswith('---'):
+                        skip_header = False
+                        continue
+                    if not skip_header:
+                        lines.append(dim_line)
+                lines.append("")
+                lines.append("---")
+                lines.append("")
+            
+            return "\n".join(lines)
+        else:
+            # Single dimension
+            return self._format_single_dimension_markdown(series_data, currency)
+    
+    def _format_single_dimension_markdown(self, series_data, currency):
+        """Format a single dimension time series as Markdown."""
         lines = []
         
         # Header
@@ -685,14 +731,16 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         lines.append(f"**Dimension:** {series_data['dimension']}")
         if currency:
             lines.append(f"**Currency:** {currency.code}")
+        if series_data.get('is_preview'):
+            lines.append("**Status:** Preview (not saved)")
         lines.append("")
         lines.append("---")
         lines.append("")
         
         # Get all periods from first line (assuming all lines have same periods)
-        if not series_data['lines']:
+        if not series_data.get('lines'):
             lines.append("*No data available*")
-            return "\n".join(lines)
+            return lines
         
         first_line = series_data['lines'][0]
         periods = first_line['data']
@@ -745,41 +793,117 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return "\n".join(lines)
     
     def _format_time_series_as_html(self, series_data, currency):
-        """Format time series data as HTML."""
+        """Format time series data as HTML. Handles both single and multiple dimensions."""
+        # Check if multiple dimensions
+        if 'data' in series_data and 'dimensions' in series_data:
+            # Multiple dimensions - create sections for each
+            lines = []
+            lines.append("<!DOCTYPE html>")
+            lines.append("<html lang='en'>")
+            lines.append("<head>")
+            lines.append("    <meta charset='UTF-8'>")
+            lines.append("    <meta name='viewport' content='width=device-width, initial-scale=1.0'>")
+            lines.append(f"    <title>{series_data['template_name']}</title>")
+            lines.append("    <style>")
+            lines.append("        body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }")
+            lines.append("        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }")
+            lines.append("        h2 { color: #34495e; margin-top: 30px; border-bottom: 2px solid #95a5a6; padding-bottom: 5px; }")
+            lines.append("        table { width: 100%; border-collapse: collapse; margin: 20px 0; }")
+            lines.append("        th { background-color: #3498db; color: white; padding: 12px; text-align: left; }")
+            lines.append("        td { padding: 10px; border-bottom: 1px solid #ddd; }")
+            lines.append("        tr:hover { background-color: #f5f5f5; }")
+            lines.append("        .amount { text-align: right; font-family: 'Courier New', monospace; }")
+            lines.append("        .metadata { color: #7f8c8d; font-size: 0.9em; margin-top: 30px; }")
+            lines.append("        .negative { color: #e74c3c; }")
+            lines.append("        .dimension-section { margin-top: 40px; page-break-inside: avoid; }")
+            lines.append("        /* Font sizes based on indent level */")
+            lines.append("        .font-level-0 { font-size: 1em; }")
+            lines.append("        .font-level-1 { font-size: 0.95em; }")
+            lines.append("        .font-level-2 { font-size: 0.9em; }")
+            lines.append("        .font-level-3 { font-size: 0.85em; }")
+            lines.append("        .font-level-4 { font-size: 0.8em; }")
+            lines.append("    </style>")
+            lines.append("</head>")
+            lines.append("<body>")
+            lines.append(f"    <h1>{series_data['template_name']}</h1>")
+            lines.append("    <div class='metadata'>")
+            lines.append(f"        <p><strong>Report Type:</strong> {series_data['report_type']}</p>")
+            lines.append(f"        <p><strong>Period:</strong> {series_data['start_date']} to {series_data['end_date']}</p>")
+            lines.append(f"        <p><strong>Dimensions:</strong> {', '.join(series_data['dimensions'])}</p>")
+            if currency:
+                lines.append(f"        <p><strong>Currency:</strong> {currency.code}</p>")
+            lines.append("    </div>")
+            
+            # Format each dimension
+            for dimension in series_data['dimensions']:
+                dim_data = series_data['data'][dimension]
+                lines.append(f"    <div class='dimension-section'>")
+                lines.append(f"        <h2>{dimension.title()} Dimension</h2>")
+                dim_html = self._format_single_dimension_html(dim_data, currency, include_header=False)
+                # Extract table content from dim_html
+                dim_lines = dim_html.split('\n')
+                in_table = False
+                for dim_line in dim_lines:
+                    if '<table>' in dim_line:
+                        in_table = True
+                    if in_table:
+                        lines.append(f"        {dim_line}")
+                    if '</table>' in dim_line:
+                        in_table = False
+                lines.append("    </div>")
+            
+            lines.append("</body>")
+            lines.append("</html>")
+            return "\n".join(lines)
+        else:
+            # Single dimension
+            return self._format_single_dimension_html(series_data, currency, include_header=True)
+    
+    def _format_single_dimension_html(self, series_data, currency, include_header=True):
+        """Format a single dimension time series as HTML."""
         lines = []
         
-        # HTML header
-        lines.append("<!DOCTYPE html>")
-        lines.append("<html lang='en'>")
-        lines.append("<head>")
-        lines.append("    <meta charset='UTF-8'>")
-        lines.append("    <meta name='viewport' content='width=device-width, initial-scale=1.0'>")
-        lines.append(f"    <title>{series_data['template_name']}</title>")
-        lines.append("    <style>")
-        lines.append("        body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }")
-        lines.append("        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }")
-        lines.append("        table { width: 100%; border-collapse: collapse; margin: 20px 0; }")
-        lines.append("        th { background-color: #3498db; color: white; padding: 12px; text-align: left; }")
-        lines.append("        td { padding: 10px; border-bottom: 1px solid #ddd; }")
-        lines.append("        tr:hover { background-color: #f5f5f5; }")
-        lines.append("        .amount { text-align: right; font-family: 'Courier New', monospace; }")
-        lines.append("        .metadata { color: #7f8c8d; font-size: 0.9em; margin-top: 30px; }")
-        lines.append("        .negative { color: #e74c3c; }")
-        lines.append("    </style>")
-        lines.append("</head>")
-        lines.append("<body>")
-        
-        # Title
-        lines.append(f"    <h1>{series_data['template_name']}</h1>")
-        
-        # Metadata
-        lines.append("    <div class='metadata'>")
-        lines.append(f"        <p><strong>Report Type:</strong> {series_data['report_type']}</p>")
-        lines.append(f"        <p><strong>Period:</strong> {series_data['start_date']} to {series_data['end_date']}</p>")
-        lines.append(f"        <p><strong>Dimension:</strong> {series_data['dimension']}</p>")
-        if currency:
-            lines.append(f"        <p><strong>Currency:</strong> {currency.code}</p>")
-        lines.append("    </div>")
+        if include_header:
+            # HTML header
+            lines.append("<!DOCTYPE html>")
+            lines.append("<html lang='en'>")
+            lines.append("<head>")
+            lines.append("    <meta charset='UTF-8'>")
+            lines.append("    <meta name='viewport' content='width=device-width, initial-scale=1.0'>")
+            lines.append(f"    <title>{series_data['template_name']}</title>")
+            lines.append("    <style>")
+            lines.append("        body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }")
+            lines.append("        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }")
+            lines.append("        table { width: 100%; border-collapse: collapse; margin: 20px 0; }")
+            lines.append("        th { background-color: #3498db; color: white; padding: 12px; text-align: left; }")
+            lines.append("        td { padding: 10px; border-bottom: 1px solid #ddd; }")
+            lines.append("        tr:hover { background-color: #f5f5f5; }")
+            lines.append("        .amount { text-align: right; font-family: 'Courier New', monospace; }")
+            lines.append("        .metadata { color: #7f8c8d; font-size: 0.9em; margin-top: 30px; }")
+            lines.append("        .negative { color: #e74c3c; }")
+            lines.append("        /* Font sizes based on indent level */")
+            lines.append("        .font-level-0 { font-size: 1em; }")
+            lines.append("        .font-level-1 { font-size: 0.95em; }")
+            lines.append("        .font-level-2 { font-size: 0.9em; }")
+            lines.append("        .font-level-3 { font-size: 0.85em; }")
+            lines.append("        .font-level-4 { font-size: 0.8em; }")
+            lines.append("    </style>")
+            lines.append("</head>")
+            lines.append("<body>")
+            
+            # Title
+            lines.append(f"    <h1>{series_data['template_name']}</h1>")
+            
+            # Metadata
+            lines.append("    <div class='metadata'>")
+            lines.append(f"        <p><strong>Report Type:</strong> {series_data['report_type']}</p>")
+            lines.append(f"        <p><strong>Period:</strong> {series_data['start_date']} to {series_data['end_date']}</p>")
+            lines.append(f"        <p><strong>Dimension:</strong> {series_data['dimension']}</p>")
+            if currency:
+                lines.append(f"        <p><strong>Currency:</strong> {currency.code}</p>")
+            if series_data.get('is_preview'):
+                lines.append("        <p><strong>Status:</strong> <span style='color: #f39c12;'>Preview (not saved)</span></p>")
+            lines.append("    </div>")
         
         # Table
         if not series_data['lines']:
@@ -804,9 +928,10 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 if line_info['line_type'] in ('header', 'spacer'):
                     continue
                 
-                # Indent style - only apply to label column
+                # Indent style and font size - only apply to label column
                 indent_level = line_info.get('indent_level', 0)
                 indent_style = f"padding-left: {indent_level * 20}px;" if indent_level > 0 else ""
+                font_class = f"font-level-{min(indent_level, 4)}"
                 indent_attr = f" style='{indent_style}'" if indent_style else ""
                 
                 label = line_info['label']
@@ -820,7 +945,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 
                 lines.append("            <tr>")
                 lines.append(f"                <td>{line_num}</td>")
-                lines.append(f"                <td{indent_attr}>{label}</td>")
+                lines.append(f"                <td class='{font_class}'{indent_attr}>{label}</td>")
                 
                 # Add values for each period
                 for period in periods:
@@ -993,16 +1118,35 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
         
+        # Check if preview mode
+        is_preview = request.query_params.get('preview', 'false').lower() == 'true'
+        
+        # Get dimension(s) - support both single string and list
+        dimension = data.get('dimension', 'month')
+        # If dimensions list is provided, use it; otherwise use single dimension
+        if 'dimensions' in data and data.get('dimensions'):
+            dimension = data['dimensions']
+        
         # Generate time series
         generator = FinancialStatementGenerator(company_id=company_id)
-        series_data = generator.generate_time_series(
-            template=template,
-            start_date=data['start_date'],
-            end_date=data['end_date'],
-            dimension=data['dimension'],
-            line_numbers=data.get('line_numbers'),
-            include_pending=data.get('include_pending', False),
-        )
+        if is_preview:
+            series_data = generator.preview_time_series(
+                template=template,
+                start_date=data['start_date'],
+                end_date=data['end_date'],
+                dimension=dimension,
+                line_numbers=data.get('line_numbers'),
+                include_pending=data.get('include_pending', False),
+            )
+        else:
+            series_data = generator.generate_time_series(
+                template=template,
+                start_date=data['start_date'],
+                end_date=data['end_date'],
+                dimension=dimension,
+                line_numbers=data.get('line_numbers'),
+                include_pending=data.get('include_pending', False),
+            )
         
         # Get currency for formatting
         currency = self._get_company_currency(company_id)
@@ -1035,11 +1179,14 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         Generate financial statement with period comparisons.
         
         POST /api/financial-statements/with_comparisons/
+        POST /api/financial-statements/with_comparisons/?preview=true  // Preview mode (no DB save)
+        
         {
             "template_id": 1,
             "start_date": "2025-01-01",
             "end_date": "2025-12-31",
             "comparison_types": ["previous_period", "previous_year"],
+            "dimension": "month",  // optional: break down current period by dimension (month, quarter, etc.)
             "include_pending": false
         }
         """
@@ -1067,15 +1214,29 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
         
+        # Check if preview mode
+        is_preview = request.query_params.get('preview', 'false').lower() == 'true'
+        
         # Generate with comparisons
         generator = FinancialStatementGenerator(company_id=company_id)
-        result = generator.generate_with_comparisons(
-            template=template,
-            start_date=data['start_date'],
-            end_date=data['end_date'],
-            comparison_types=data.get('comparison_types', ['previous_period', 'previous_year']),
-            include_pending=data.get('include_pending', False),
-        )
+        if is_preview:
+            result = generator.preview_with_comparisons(
+                template=template,
+                start_date=data['start_date'],
+                end_date=data['end_date'],
+                comparison_types=data.get('comparison_types', ['previous_period', 'previous_year']),
+                dimension=data.get('dimension'),
+                include_pending=data.get('include_pending', False),
+            )
+        else:
+            result = generator.generate_with_comparisons(
+                template=template,
+                start_date=data['start_date'],
+                end_date=data['end_date'],
+                comparison_types=data.get('comparison_types', ['previous_period', 'previous_year']),
+                dimension=data.get('dimension'),
+                include_pending=data.get('include_pending', False),
+            )
         
         return Response(result, status=status.HTTP_200_OK)
     
