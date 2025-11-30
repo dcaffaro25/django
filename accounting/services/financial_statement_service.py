@@ -209,7 +209,8 @@ class FinancialStatementGenerator:
         
         # Filter by specific account
         if line_template.account:
-            return [line_template.account]
+            # Expand parent account to include all leaf descendants
+            return self._expand_to_leaf_accounts([line_template.account])
         
         # Filter by account IDs
         if line_template.account_ids:
@@ -230,9 +231,125 @@ class FinancialStatementGenerator:
         else:
             accounts = list(accounts)
         
-        # Remove duplicates: if a parent account is in the list, exclude its descendants
-        # This prevents double-counting since parent.calculate_balance() already sums children
-        return self._deduplicate_account_hierarchy(accounts)
+        # Expand all accounts to their leaf descendants
+        # This ensures parent accounts are replaced by their leaf children
+        return self._expand_to_leaf_accounts(accounts)
+    
+    def _expand_to_leaf_accounts(self, accounts: List[Account]) -> List[Account]:
+        """
+        Expand accounts to include all leaf descendants.
+        If an account is a leaf, it's included as-is.
+        If an account is a parent, it's replaced by all its leaf descendants.
+        
+        Parameters
+        ----------
+        accounts: List[Account]
+            List of accounts (may include parents and children)
+        
+        Returns
+        -------
+        List[Account]
+            List of only leaf accounts (all parents expanded)
+        """
+        leaf_accounts = []
+        
+        log.debug(
+            "Expanding %s accounts to leaf accounts",
+            len(accounts)
+        )
+        
+        for account in accounts:
+            if account.is_leaf():
+                # Leaf account: include directly
+                leaf_accounts.append(account)
+                log.debug(
+                    "Including leaf account %s (id=%s, bank_account_id=%s)",
+                    account.name,
+                    account.id,
+                    account.bank_account_id
+                )
+            else:
+                # Parent account: get all leaf descendants
+                leaf_descendants = self._get_leaf_descendants(account)
+                leaf_accounts.extend(leaf_descendants)
+                log.debug(
+                    "Expanded parent account %s (id=%s) to %s leaf accounts: %s",
+                    account.name,
+                    account.id,
+                    len(leaf_descendants),
+                    [(acc.name, acc.id, acc.bank_account_id) for acc in leaf_descendants]
+                )
+        
+        # Remove duplicates by ID
+        seen_ids = set()
+        unique_leaf_accounts = []
+        for acc in leaf_accounts:
+            if acc.id not in seen_ids:
+                seen_ids.add(acc.id)
+                unique_leaf_accounts.append(acc)
+        
+        log.debug(
+            "Expanded to %s unique leaf accounts (from %s original accounts)",
+            len(unique_leaf_accounts),
+            len(accounts)
+        )
+        
+        return unique_leaf_accounts
+    
+    def _get_leaf_descendants(self, account: Account) -> List[Account]:
+        """
+        Get all leaf descendants of an account (recursively).
+        
+        Parameters
+        ----------
+        account: Account
+            Parent account
+        
+        Returns
+        -------
+        List[Account]
+            All leaf accounts that are descendants of this account
+        """
+        leaf_accounts = []
+        
+        # Get direct children from same company
+        children = account.get_children().filter(company_id=self.company_id)
+        
+        log.debug(
+            "Getting leaf descendants for account %s (id=%s), found %s children",
+            account.name,
+            account.id,
+            children.count()
+        )
+        
+        for child in children:
+            if child.is_leaf():
+                # Leaf: add to list
+                leaf_accounts.append(child)
+                log.debug(
+                    "Added leaf account %s (id=%s) to descendants",
+                    child.name,
+                    child.id
+                )
+            else:
+                # Parent: recursively get its leaf descendants
+                child_leaves = self._get_leaf_descendants(child)
+                leaf_accounts.extend(child_leaves)
+                log.debug(
+                    "Expanded parent account %s (id=%s) to %s leaf descendants",
+                    child.name,
+                    child.id,
+                    len(child_leaves)
+                )
+        
+        log.debug(
+            "Account %s (id=%s) has %s total leaf descendants",
+            account.name,
+            account.id,
+            len(leaf_accounts)
+        )
+        
+        return leaf_accounts
     
     def _deduplicate_account_hierarchy(self, accounts: List[Account]) -> List[Account]:
         """
@@ -449,35 +566,61 @@ class FinancialStatementGenerator:
         include_pending: bool = False,
     ) -> Decimal:
         """Calculate cash flow line (cash accounts only)."""
-        # Filter to cash/bank accounts
+        # Accounts should already be expanded to leaf accounts by _get_accounts_for_line
+        # Filter to cash/bank accounts (only leaf accounts with bank_account)
         cash_accounts = [acc for acc in accounts if acc.bank_account is not None]
         
+        log.debug(
+            "Cash flow calculation: %s accounts provided, %s have bank_account",
+            len(accounts),
+            len(cash_accounts)
+        )
+        
         if not cash_accounts:
+            log.warning(
+                "No cash accounts found in %s accounts for cash flow calculation",
+                len(accounts)
+            )
             return Decimal('0.00')
         
         # Calculate period change in cash
         total = Decimal('0.00')
         for account in cash_accounts:
-            # Get beginning balance (using helper to ensure children are included)
-            beginning_balance = self._calculate_account_balance_with_children(
-                account=account,
+            log.debug(
+                "Calculating cash flow for account %s (id=%s, bank_account_id=%s)",
+                account.name,
+                account.id,
+                account.bank_account_id
+            )
+            
+            # For leaf accounts, calculate balance directly
+            # Get beginning balance
+            beginning_balance = account.calculate_balance(
                 include_pending=include_pending,
                 beginning_date=None,
                 end_date=start_date,
-            )
+            ) or Decimal('0.00')
             
-            # Get ending balance (using helper to ensure children are included)
-            ending_balance = self._calculate_account_balance_with_children(
-                account=account,
+            # Get ending balance
+            ending_balance = account.calculate_balance(
                 include_pending=include_pending,
                 beginning_date=None,
                 end_date=end_date,
-            )
+            ) or Decimal('0.00')
             
             # Change = ending - beginning
             change = ending_balance - beginning_balance
             total += change
+            
+            log.debug(
+                "Account %s: beginning=%s, ending=%s, change=%s",
+                account.name,
+                beginning_balance,
+                ending_balance,
+                change
+            )
         
+        log.debug("Total cash flow change: %s", total)
         return total
     
     def _calculate_period_balance(
