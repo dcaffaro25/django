@@ -169,3 +169,41 @@ class GenerateStatementRequestSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     include_pending = serializers.BooleanField(required=False, default=False)
 
+
+class TimeSeriesRequestSerializer(serializers.Serializer):
+    """Serializer for time series requests."""
+    
+    template_id = serializers.IntegerField()
+    start_date = serializers.DateField()
+    end_date = serializers.DateField()
+    dimension = serializers.ChoiceField(
+        choices=['day', 'week', 'month', 'quarter', 'semester', 'year'],
+        default='month'
+    )
+    line_numbers = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        allow_null=True
+    )
+    include_pending = serializers.BooleanField(required=False, default=False)
+
+
+class ComparisonRequestSerializer(serializers.Serializer):
+    """Serializer for comparison requests."""
+    
+    template_id = serializers.IntegerField()
+    start_date = serializers.DateField()
+    end_date = serializers.DateField()
+    comparison_types = serializers.ListField(
+        child=serializers.ChoiceField(choices=[
+            'previous_period',
+            'previous_year',
+            'ytd_previous_year',
+            'last_12_months',
+            'same_period_last_year',
+        ]),
+        required=False,
+        default=['previous_period', 'previous_year']
+    )
+    include_pending = serializers.BooleanField(required=False, default=False)
+

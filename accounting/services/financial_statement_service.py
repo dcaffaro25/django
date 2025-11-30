@@ -419,4 +419,210 @@ class FinancialStatementGenerator:
             statement.net_income = Decimal('0.00')
             # Calculate from lines
             statement.save(update_fields=['net_income'])
+    
+    def generate_time_series(
+        self,
+        template: FinancialStatementTemplate,
+        start_date: date,
+        end_date: date,
+        dimension: str = 'month',
+        line_numbers: Optional[List[int]] = None,
+        include_pending: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Generate a time series for specific lines grouped by time dimension.
+        
+        Parameters
+        ----------
+        template: FinancialStatementTemplate
+            Template to use
+        start_date: date
+            Start of the period
+        end_date: date
+            End of the period
+        dimension: str
+            Time dimension ('day', 'week', 'month', 'quarter', 'semester', 'year')
+        line_numbers: Optional[List[int]]
+            Specific line numbers to include. If None, includes all lines.
+        include_pending: bool
+            Include pending journal entries
+        
+        Returns
+        -------
+        Dict[str, Any]
+            Time series data with periods and values
+        """
+        from accounting.utils_time_dimensions import generate_periods
+        
+        periods = generate_periods(start_date, end_date, dimension)
+        line_templates = template.line_templates.all().order_by('line_number')
+        
+        if line_numbers:
+            line_templates = line_templates.filter(line_number__in=line_numbers)
+        
+        series_data = {}
+        
+        for line_template in line_templates:
+            line_series = []
+            
+            for period in periods:
+                # Calculate value for this line in this period
+                value = self._calculate_line_value(
+                    line_template,
+                    period['start_date'],
+                    period['end_date'],
+                    period['end_date'],  # as_of_date
+                    template.report_type,
+                    {},  # line_values not used for time series
+                    include_pending=include_pending,
+                )
+                
+                line_series.append({
+                    'period_key': period['key'],
+                    'period_label': period['label'],
+                    'start_date': period['start_date'],
+                    'end_date': period['end_date'],
+                    'value': float(value),
+                })
+            
+            series_data[line_template.line_number] = {
+                'line_number': line_template.line_number,
+                'label': line_template.label,
+                'line_type': line_template.line_type,
+                'data': line_series,
+            }
+        
+        return {
+            'template_id': template.id,
+            'template_name': template.name,
+            'report_type': template.report_type,
+            'dimension': dimension,
+            'start_date': start_date,
+            'end_date': end_date,
+            'lines': list(series_data.values()),
+        }
+    
+    def generate_with_comparisons(
+        self,
+        template: FinancialStatementTemplate,
+        start_date: date,
+        end_date: date,
+        comparison_types: List[str],
+        include_pending: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Generate financial statement with comparisons.
+        
+        Parameters
+        ----------
+        template: FinancialStatementTemplate
+            Template to use
+        start_date: date
+            Start of current period
+        end_date: date
+            End of current period
+        comparison_types: List[str]
+            List of comparison types:
+            - 'previous_period'
+            - 'previous_year'
+            - 'ytd_previous_year'
+            - 'last_12_months'
+            - 'same_period_last_year'
+        include_pending: bool
+            Include pending journal entries
+        
+        Returns
+        -------
+        Dict[str, Any]
+            Statement data with comparisons
+        """
+        from accounting.utils_time_dimensions import (
+            get_comparison_period,
+            calculate_period_comparison,
+        )
+        
+        # Generate current period statement
+        statement = self.generate_statement(
+            template=template,
+            start_date=start_date,
+            end_date=end_date,
+            status='draft',
+            include_pending=include_pending,
+        )
+        
+        # Get current line values
+        current_lines = {}
+        for line in statement.lines.all():
+            current_lines[line.line_number] = line.balance
+        
+        # Generate comparisons
+        comparisons = {}
+        
+        for comp_type in comparison_types:
+            try:
+                comp_start, comp_end = get_comparison_period(
+                    start_date,
+                    end_date,
+                    comp_type
+                )
+                
+                # Generate comparison statement
+                comp_statement = self.generate_statement(
+                    template=template,
+                    start_date=comp_start,
+                    end_date=comp_end,
+                    status='draft',
+                    include_pending=include_pending,
+                )
+                
+                # Calculate comparisons for each line
+                comp_lines = {}
+                for line in comp_statement.lines.all():
+                    comp_lines[line.line_number] = line.balance
+                
+                # Calculate comparison metrics
+                line_comparisons = {}
+                for line_num in current_lines:
+                    current_val = current_lines.get(line_num, Decimal('0.00'))
+                    comp_val = comp_lines.get(line_num, Decimal('0.00'))
+                    
+                    line_comparisons[line_num] = calculate_period_comparison(
+                        current_val,
+                        comp_val,
+                        comp_type
+                    )
+                
+                comparisons[comp_type] = {
+                    'start_date': comp_start,
+                    'end_date': comp_end,
+                    'lines': line_comparisons,
+                }
+                
+                # Optionally keep comparison statements for audit trail
+                # For now, we keep them but mark as draft
+                # You can delete them if needed: comp_statement.delete()
+                
+            except Exception as e:
+                log.warning(f"Failed to generate comparison {comp_type}: {e}")
+                comparisons[comp_type] = {
+                    'error': str(e)
+                }
+        
+        return {
+            'statement': {
+                'id': statement.id,
+                'name': statement.name,
+                'start_date': statement.start_date,
+                'end_date': statement.end_date,
+                'lines': [
+                    {
+                        'line_number': line.line_number,
+                        'label': line.label,
+                        'balance': float(line.balance),
+                    }
+                    for line in statement.lines.all()
+                ],
+            },
+            'comparisons': comparisons,
+        }
 

@@ -23,6 +23,8 @@ from .serializers_financial_statements import (
     FinancialStatementSerializer,
     FinancialStatementComparisonSerializer,
     GenerateStatementRequestSerializer,
+    TimeSeriesRequestSerializer,
+    ComparisonRequestSerializer,
 )
 from .services.financial_statement_service import FinancialStatementGenerator
 
@@ -602,6 +604,108 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         
         serializer = self.get_serializer(statement)
         return Response(serializer.data)
+    
+    @action(detail=False, methods=['post'])
+    def time_series(self, request, tenant_id=None):
+        """
+        Generate time series data for financial statement lines.
+        
+        POST /api/financial-statements/time_series/
+        {
+            "template_id": 1,
+            "start_date": "2025-01-01",
+            "end_date": "2025-12-31",
+            "dimension": "month",  // day, week, month, quarter, semester, year
+            "line_numbers": [1, 2, 3],  // optional, specific lines
+            "include_pending": false
+        }
+        """
+        serializer = TimeSeriesRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        
+        # Get company from tenant
+        company = getattr(request, 'tenant', None)
+        if not company or company == 'all':
+            return Response(
+                {'error': 'Company/tenant not found in request'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        company_id = company.id if hasattr(company, 'id') else company
+        
+        try:
+            template = FinancialStatementTemplate.objects.get(
+                id=data['template_id'],
+                company_id=company_id,
+            )
+        except FinancialStatementTemplate.DoesNotExist:
+            return Response(
+                {'error': 'Template not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Generate time series
+        generator = FinancialStatementGenerator(company_id=company_id)
+        series_data = generator.generate_time_series(
+            template=template,
+            start_date=data['start_date'],
+            end_date=data['end_date'],
+            dimension=data['dimension'],
+            line_numbers=data.get('line_numbers'),
+            include_pending=data.get('include_pending', False),
+        )
+        
+        return Response(series_data, status=status.HTTP_200_OK)
+    
+    @action(detail=False, methods=['post'])
+    def with_comparisons(self, request, tenant_id=None):
+        """
+        Generate financial statement with period comparisons.
+        
+        POST /api/financial-statements/with_comparisons/
+        {
+            "template_id": 1,
+            "start_date": "2025-01-01",
+            "end_date": "2025-12-31",
+            "comparison_types": ["previous_period", "previous_year"],
+            "include_pending": false
+        }
+        """
+        serializer = ComparisonRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        
+        # Get company from tenant
+        company = getattr(request, 'tenant', None)
+        if not company or company == 'all':
+            return Response(
+                {'error': 'Company/tenant not found in request'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        company_id = company.id if hasattr(company, 'id') else company
+        
+        try:
+            template = FinancialStatementTemplate.objects.get(
+                id=data['template_id'],
+                company_id=company_id,
+            )
+        except FinancialStatementTemplate.DoesNotExist:
+            return Response(
+                {'error': 'Template not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Generate with comparisons
+        generator = FinancialStatementGenerator(company_id=company_id)
+        result = generator.generate_with_comparisons(
+            template=template,
+            start_date=data['start_date'],
+            end_date=data['end_date'],
+            comparison_types=data.get('comparison_types', ['previous_period', 'previous_year']),
+            include_pending=data.get('include_pending', False),
+        )
+        
+        return Response(result, status=status.HTTP_200_OK)
     
     @action(detail=False, methods=['get'])
     def quick_income_statement(self, request, tenant_id=None):
