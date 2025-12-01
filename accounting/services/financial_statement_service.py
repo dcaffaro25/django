@@ -312,6 +312,177 @@ class FinancialStatementGenerator:
                 include_pending=include_pending,
             )
     
+    def _calculate_line_value_with_metadata(
+        self,
+        line_template: FinancialStatementLineTemplate,
+        start_date: date,
+        end_date: date,
+        as_of_date: date,
+        report_type: str,
+        line_values: Dict[int, Decimal],
+        include_pending: bool = False,
+    ) -> tuple[Decimal, Dict[str, Any]]:
+        """
+        Calculate the value for a single line item with calculation metadata.
+        Returns (value, calculation_memory) tuple.
+        """
+        calculation_memory = {
+            'calculation_type': line_template.calculation_type,
+            'report_type': report_type,
+            'start_date': str(start_date),
+            'end_date': str(end_date),
+            'as_of_date': str(as_of_date),
+            'accounts': [],
+        }
+        
+        # Handle different line types
+        if line_template.line_type in ('header', 'spacer'):
+            calculation_memory['reason'] = 'Line type is header/spacer'
+            return Decimal('0.00'), calculation_memory
+        
+        # Handle formula-based lines
+        if line_template.calculation_type == 'formula' and line_template.formula:
+            value = self._evaluate_formula(line_template.formula, line_values)
+            calculation_memory['formula'] = line_template.formula
+            calculation_memory['line_values_used'] = {k: float(v) for k, v in line_values.items()}
+            calculation_memory['result'] = float(value)
+            return value, calculation_memory
+        
+        # Get accounts for this line
+        accounts = self._get_accounts_for_line(line_template)
+        if not accounts:
+            calculation_memory['reason'] = 'No accounts found for this line'
+            return Decimal('0.00'), calculation_memory
+        
+        # Calculate based on report type with metadata
+        if report_type == 'cash_flow':
+            value, account_details = self._calculate_cash_flow_line_with_metadata(
+                accounts,
+                start_date,
+                end_date,
+                line_template.calculation_type,
+                include_pending=include_pending,
+            )
+            calculation_memory['accounts'] = account_details
+            calculation_memory['total'] = float(value)
+        else:
+            # For other report types, use basic calculation
+            value = self._calculate_line_value(
+                line_template, start_date, end_date, as_of_date,
+                report_type, line_values, include_pending
+            )
+            calculation_memory['accounts'] = [
+                {'id': acc.id, 'name': acc.name, 'bank_account_id': acc.bank_account_id}
+                for acc in accounts
+            ]
+            calculation_memory['total'] = float(value)
+        
+        return value, calculation_memory
+    
+    def _calculate_cash_flow_line_with_metadata(
+        self,
+        accounts: List[Account],
+        start_date: date,
+        end_date: date,
+        calculation_type: str,
+        include_pending: bool = False,
+    ) -> tuple[Decimal, List[Dict[str, Any]]]:
+        """
+        Calculate cash flow line with detailed metadata for each account.
+        Returns (total, account_details) tuple.
+        """
+        # Filter to cash/bank accounts
+        cash_accounts = [acc for acc in accounts if acc.bank_account is not None]
+        account_details = []
+        
+        if not cash_accounts:
+            account_details.append({
+                'reason': 'No cash accounts found (accounts without bank_account_id)',
+                'all_accounts': [
+                    {'id': acc.id, 'name': acc.name, 'bank_account_id': acc.bank_account_id}
+                    for acc in accounts
+                ]
+            })
+            return Decimal('0.00'), account_details
+        
+        total = Decimal('0.00')
+        
+        for account in cash_accounts:
+            account_detail = {
+                'id': account.id,
+                'name': account.name,
+                'account_code': account.account_code,
+                'bank_account_id': account.bank_account_id,
+                'account_direction': account.account_direction,
+                'calculation_type': calculation_type,
+            }
+            
+            if calculation_type == 'sum':
+                state_filter = Q(state='posted')
+                if include_pending:
+                    state_filter = Q(state__in=['posted', 'pending'])
+                
+                entries = JournalEntry.objects.filter(
+                    account=account,
+                    transaction__date__gte=start_date,
+                    transaction__date__lte=end_date,
+                    transaction__company_id=self.company_id,
+                ).filter(state_filter)
+                
+                debit_total = entries.aggregate(
+                    total=Sum('debit_amount')
+                )['total'] or Decimal('0.00')
+                credit_total = entries.aggregate(
+                    total=Sum('credit_amount')
+                )['total'] or Decimal('0.00')
+                
+                change = (debit_total - credit_total) * account.account_direction
+                
+                account_detail['debit_total'] = float(debit_total)
+                account_detail['credit_total'] = float(credit_total)
+                account_detail['account_direction'] = account.account_direction
+                account_detail['change'] = float(change)
+                account_detail['entry_count'] = entries.count()
+                
+            elif calculation_type == 'balance':
+                # Cumulative ending balance from all journal entries up to end_date
+                ending_balance = self._calculate_cumulative_ending_balance(
+                    account=account,
+                    as_of_date=end_date,
+                    include_pending=include_pending,
+                )
+                change = ending_balance
+                
+                account_detail['opening_balance'] = float(account.balance or Decimal('0.00'))
+                account_detail['balance_date'] = str(account.balance_date) if account.balance_date else None
+                account_detail['ending_balance'] = float(ending_balance)
+                account_detail['value'] = float(ending_balance)
+                
+            else:
+                # Difference or default
+                beginning_balance = account.calculate_balance(
+                    include_pending=include_pending,
+                    beginning_date=None,
+                    end_date=start_date,
+                ) or Decimal('0.00')
+                
+                ending_balance = account.calculate_balance(
+                    include_pending=include_pending,
+                    beginning_date=None,
+                    end_date=end_date,
+                ) or Decimal('0.00')
+                
+                change = ending_balance - beginning_balance
+                
+                account_detail['beginning_balance'] = float(beginning_balance)
+                account_detail['ending_balance'] = float(ending_balance)
+                account_detail['change'] = float(change)
+            
+            total += change
+            account_details.append(account_detail)
+        
+        return total, account_details
+    
     def _get_accounts_for_line(
         self,
         line_template: FinancialStatementLineTemplate,
@@ -553,6 +724,89 @@ class FinancialStatementGenerator:
             total += balance
         
         return total
+    
+    def _calculate_cumulative_ending_balance(
+        self,
+        account: Account,
+        as_of_date: date,
+        include_pending: bool = False,
+    ) -> Decimal:
+        """
+        Calculate cumulative ending balance by summing all journal entries up to as_of_date.
+        
+        This method:
+        1. Takes the account's validated opening balance (account.balance as of account.balance_date)
+        2. Adds all journal entries from balance_date to as_of_date
+        3. Returns the absolute cumulative balance (not a period change)
+        
+        This is used for 'ending_balance' calculation type (e.g., Cash Balance line).
+        """
+        if not account.is_leaf():
+            # Parent account: sum all children's ending balances
+            children = account.get_children().filter(company_id=self.company_id)
+            total = Decimal('0.00')
+            for child in children:
+                total += self._calculate_cumulative_ending_balance(
+                    account=child,
+                    as_of_date=as_of_date,
+                    include_pending=include_pending,
+                )
+            return total
+        
+        # Leaf account: calculate from opening balance + journal entries
+        opening_balance = account.balance or Decimal('0.00')
+        balance_date = account.balance_date
+        
+        # Build state filter
+        state_filter = Q(state='posted')
+        if include_pending:
+            state_filter = Q(state__in=['posted', 'pending'])
+        
+        # Sum all journal entries from balance_date to as_of_date
+        entries = JournalEntry.objects.filter(
+            account=account,
+            transaction__company_id=self.company_id,
+        ).filter(state_filter)
+        
+        # Only include entries after balance_date and up to as_of_date
+        if balance_date:
+            entries = entries.filter(
+                Q(transaction__date__gt=balance_date) &
+                Q(transaction__date__lte=as_of_date)
+            )
+        else:
+            entries = entries.filter(transaction__date__lte=as_of_date)
+        
+        totals = entries.aggregate(
+            total_debit=Sum('debit_amount'),
+            total_credit=Sum('credit_amount')
+        )
+        
+        total_debit = totals['total_debit'] or Decimal('0.00')
+        total_credit = totals['total_credit'] or Decimal('0.00')
+        
+        # Calculate change with account direction
+        change = (total_debit - total_credit) * account.account_direction
+        
+        # Final balance = opening + change
+        # Note: opening_balance should already be in the correct sign convention
+        ending_balance = opening_balance + change
+        
+        log.debug(
+            "Cumulative ending balance for %s (id=%s) as of %s: "
+            "opening=%s, debit=%s, credit=%s, direction=%s, change=%s, ending=%s",
+            account.name,
+            account.id,
+            as_of_date,
+            opening_balance,
+            total_debit,
+            total_credit,
+            account.account_direction,
+            change,
+            ending_balance
+        )
+        
+        return ending_balance
     
     def _calculate_account_balance_from_closing(
         self,
@@ -806,23 +1060,13 @@ class FinancialStatementGenerator:
                 # Apply account direction for cash flow (inflows - outflows)
                 change = (debit_total - credit_total) * account.account_direction
             elif calculation_type == 'balance':
-                # Balance: Use last closing balance + transactions after closing date
-                # Get beginning balance from closing
-                beginning_balance = self._calculate_account_balance_from_closing(
-                    account=account,
-                    as_of_date=start_date,
-                    include_pending=include_pending,
-                )
-                
-                # Get ending balance from closing
-                ending_balance = self._calculate_account_balance_from_closing(
+                # Balance: Cumulative ending balance from all journal entries up to end_date
+                # Sums opening balance + all entries to get the final balance for that period
+                change = self._calculate_cumulative_ending_balance(
                     account=account,
                     as_of_date=end_date,
                     include_pending=include_pending,
                 )
-                
-                # Change = ending - beginning
-                change = ending_balance - beginning_balance
             else:
                 # Difference or default: Calculate period change
                 beginning_balance = account.calculate_balance(
@@ -924,6 +1168,7 @@ class FinancialStatementGenerator:
         dimension: Optional[Union[str, List[str]]] = 'month',
         line_numbers: Optional[List[int]] = None,
         include_pending: bool = False,
+        include_metadata: bool = False,
     ) -> Dict[str, Any]:
         """
         Generate a time series for specific lines grouped by time dimension.
@@ -943,6 +1188,8 @@ class FinancialStatementGenerator:
             Specific line numbers to include. If None, includes all lines.
         include_pending: bool
             Include pending journal entries
+        include_metadata: bool
+            Include calculation memory and metadata for debugging
         
         Returns
         -------
@@ -970,14 +1217,14 @@ class FinancialStatementGenerator:
             
             for dim in dimensions:
                 result['data'][dim] = self._generate_single_dimension_time_series(
-                    template, start_date, end_date, dim, line_numbers, include_pending
+                    template, start_date, end_date, dim, line_numbers, include_pending, include_metadata
                 )
             
             return result
         else:
             # Single dimension: return current structure
             return self._generate_single_dimension_time_series(
-                template, start_date, end_date, dimensions[0], line_numbers, include_pending
+                template, start_date, end_date, dimensions[0], line_numbers, include_pending, include_metadata
             )
     
     def _generate_single_dimension_time_series(
@@ -988,6 +1235,7 @@ class FinancialStatementGenerator:
         dimension: str,
         line_numbers: Optional[List[int]],
         include_pending: bool,
+        include_metadata: bool = False,
     ) -> Dict[str, Any]:
         """Generate time series for a single dimension."""
         from accounting.utils_time_dimensions import generate_periods
@@ -1003,27 +1251,50 @@ class FinancialStatementGenerator:
         for line_template in line_templates:
             line_series = []
             
+            # Get accounts for this line (for metadata)
+            accounts = self._get_accounts_for_line(line_template) if include_metadata else []
+            
             for period in periods:
                 # Calculate value for this line in this period
-                value = self._calculate_line_value(
-                    line_template,
-                    period['start_date'],
-                    period['end_date'],
-                    period['end_date'],  # as_of_date
-                    template.report_type,
-                    {},  # line_values not used for time series
-                    include_pending=include_pending,
-                )
-                
-                line_series.append({
-                    'period_key': period['key'],
-                    'period_label': period['label'],
-                    'start_date': period['start_date'],
-                    'end_date': period['end_date'],
-                    'value': float(value),
-                })
+                if include_metadata:
+                    value, calculation_memory = self._calculate_line_value_with_metadata(
+                        line_template,
+                        period['start_date'],
+                        period['end_date'],
+                        period['end_date'],  # as_of_date
+                        template.report_type,
+                        {},  # line_values not used for time series
+                        include_pending=include_pending,
+                    )
+                    
+                    line_series.append({
+                        'period_key': period['key'],
+                        'period_label': period['label'],
+                        'start_date': period['start_date'],
+                        'end_date': period['end_date'],
+                        'value': float(value),
+                        'calculation_memory': calculation_memory,
+                    })
+                else:
+                    value = self._calculate_line_value(
+                        line_template,
+                        period['start_date'],
+                        period['end_date'],
+                        period['end_date'],  # as_of_date
+                        template.report_type,
+                        {},  # line_values not used for time series
+                        include_pending=include_pending,
+                    )
+                    
+                    line_series.append({
+                        'period_key': period['key'],
+                        'period_label': period['label'],
+                        'start_date': period['start_date'],
+                        'end_date': period['end_date'],
+                        'value': float(value),
+                    })
             
-            series_data[line_template.line_number] = {
+            line_data = {
                 'line_number': line_template.line_number,
                 'label': line_template.label,
                 'line_type': line_template.line_type,
@@ -1031,6 +1302,30 @@ class FinancialStatementGenerator:
                 'is_bold': line_template.is_bold,
                 'data': line_series,
             }
+            
+            # Add line metadata if requested
+            if include_metadata:
+                line_data['metadata'] = {
+                    'calculation_type': line_template.calculation_type,
+                    'account_id': line_template.account_id,
+                    'account_ids': line_template.account_ids,
+                    'account_code_prefix': line_template.account_code_prefix,
+                    'account_path_contains': line_template.account_path_contains,
+                    'formula': line_template.formula,
+                    'resolved_accounts': [
+                        {
+                            'id': acc.id,
+                            'name': acc.name,
+                            'account_code': acc.account_code,
+                            'bank_account_id': acc.bank_account_id,
+                            'account_direction': acc.account_direction,
+                            'is_leaf': acc.is_leaf(),
+                        }
+                        for acc in accounts
+                    ],
+                }
+            
+            series_data[line_template.line_number] = line_data
         
         return {
             'template_id': template.id,
@@ -1050,10 +1345,11 @@ class FinancialStatementGenerator:
         dimension: Optional[Union[str, List[str]]] = 'month',
         line_numbers: Optional[List[int]] = None,
         include_pending: bool = False,
+        include_metadata: bool = False,
     ) -> Dict[str, Any]:
         """Preview time series without saving (same as generate_time_series but marked as preview)."""
         result = self.generate_time_series(
-            template, start_date, end_date, dimension, line_numbers, include_pending
+            template, start_date, end_date, dimension, line_numbers, include_pending, include_metadata
         )
         if isinstance(dimension, list) or (isinstance(result, dict) and 'data' in result):
             result['is_preview'] = True
