@@ -735,11 +735,10 @@ class FinancialStatementGenerator:
         Calculate cumulative ending balance by summing all journal entries up to as_of_date.
         
         This method:
-        1. Takes the account's validated opening balance (account.balance as of account.balance_date)
-        2. Adds all journal entries from balance_date to as_of_date
-        3. Returns the absolute cumulative balance (not a period change)
+        1. If as_of_date >= balance_date: Uses opening balance + entries from balance_date to as_of_date
+        2. If as_of_date < balance_date: Sums ALL entries up to as_of_date (ignores opening balance)
         
-        This is used for 'ending_balance' calculation type (e.g., Cash Balance line).
+        This handles cases where balance_date is set to a future date relative to the period being calculated.
         """
         if not account.is_leaf():
             # Parent account: sum all children's ending balances
@@ -753,7 +752,7 @@ class FinancialStatementGenerator:
                 )
             return total
         
-        # Leaf account: calculate from opening balance + journal entries
+        # Leaf account: calculate from journal entries
         opening_balance = account.balance or Decimal('0.00')
         balance_date = account.balance_date
         
@@ -762,20 +761,25 @@ class FinancialStatementGenerator:
         if include_pending:
             state_filter = Q(state__in=['posted', 'pending'])
         
-        # Sum all journal entries from balance_date to as_of_date
+        # Determine calculation approach based on as_of_date vs balance_date
         entries = JournalEntry.objects.filter(
             account=account,
             transaction__company_id=self.company_id,
         ).filter(state_filter)
         
-        # Only include entries after balance_date and up to as_of_date
-        if balance_date:
+        if balance_date and as_of_date >= balance_date:
+            # Normal case: as_of_date is after balance_date
+            # Use opening balance + entries from balance_date to as_of_date
             entries = entries.filter(
                 Q(transaction__date__gt=balance_date) &
                 Q(transaction__date__lte=as_of_date)
             )
+            use_opening_balance = True
         else:
+            # as_of_date is BEFORE balance_date (or no balance_date set)
+            # Sum ALL entries from the beginning up to as_of_date
             entries = entries.filter(transaction__date__lte=as_of_date)
+            use_opening_balance = False
         
         totals = entries.aggregate(
             total_debit=Sum('debit_amount'),
@@ -788,17 +792,22 @@ class FinancialStatementGenerator:
         # Calculate change with account direction
         change = (total_debit - total_credit) * account.account_direction
         
-        # Final balance = opening + change
-        # Note: opening_balance should already be in the correct sign convention
-        ending_balance = opening_balance + change
+        # Final balance
+        if use_opening_balance:
+            ending_balance = opening_balance + change
+        else:
+            # No opening balance - just the sum of all entries
+            ending_balance = change
         
         log.debug(
             "Cumulative ending balance for %s (id=%s) as of %s: "
-            "opening=%s, debit=%s, credit=%s, direction=%s, change=%s, ending=%s",
+            "balance_date=%s, use_opening=%s, opening=%s, debit=%s, credit=%s, direction=%s, change=%s, ending=%s",
             account.name,
             account.id,
             as_of_date,
-            opening_balance,
+            balance_date,
+            use_opening_balance,
+            opening_balance if use_opening_balance else 'N/A',
             total_debit,
             total_credit,
             account.account_direction,
