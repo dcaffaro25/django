@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import List, Dict, Any, Optional, Tuple
 from django.db.models import Q, Count, F
 from django.db import transaction as db_transaction
-from django.contrib.postgres.search import CosineDistance
+from pgvector.django import CosineDistance
 
 from accounting.models import (
     BankTransaction,
