@@ -1501,6 +1501,274 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
 
         return Response({"results": results}, status=status.HTTP_200_OK)
     
+    @action(detail=False, methods=['post'])
+    def suggest_matches(self, request, tenant_id=None):
+        """
+        Suggest book transactions for unmatched bank transactions based on historical matches.
+        
+        POST /api/bank-transactions/suggest_matches/
+        {
+            "bank_transaction_ids": [1, 2, 3],
+            "max_suggestions_per_bank": 5,
+            "min_confidence": 0.3,
+            "min_match_count": 1
+        }
+        """
+        from accounting.services.bank_transaction_suggestion_service import BankTransactionSuggestionService
+        
+        # Get company from tenant
+        company = getattr(request, 'tenant', None)
+        if not company or company == 'all':
+            return Response(
+                {'error': 'Company/tenant not found in request'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        company_id = company.id if hasattr(company, 'id') else company
+        
+        bank_transaction_ids = request.data.get('bank_transaction_ids', [])
+        if not bank_transaction_ids:
+            return Response(
+                {'error': 'bank_transaction_ids is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        max_suggestions = request.data.get('max_suggestions_per_bank', 5)
+        min_confidence = request.data.get('min_confidence', 0.3)
+        min_match_count = request.data.get('min_match_count', 1)
+        
+        service = BankTransactionSuggestionService(company_id=company_id)
+        result = service.suggest_book_transactions(
+            bank_transaction_ids=bank_transaction_ids,
+            max_suggestions_per_bank=max_suggestions,
+            min_confidence=min_confidence,
+            min_match_count=min_match_count,
+        )
+        
+        return Response(result, status=status.HTTP_200_OK)
+    
+    @action(detail=False, methods=['post'])
+    def create_suggestions(self, request, tenant_id=None):
+        """
+        Create transactions and journal entries from approved suggestions and auto-match them.
+        Supports two types of suggestions:
+        1. use_existing_book: Use an existing unmatched journal entry + create complementing entries
+        2. create_new: Create a new transaction + all journal entries
+        
+        POST /api/bank-transactions/create_suggestions/
+        {
+            "suggestions": [
+                {
+                    // Type 1: Use existing book entry
+                    "suggestion_type": "use_existing_book",
+                    "bank_transaction_id": 1,
+                    "existing_journal_entry_id": 100,
+                    "complementing_journal_entries": [
+                        {
+                            "account_id": 10,
+                            "debit_amount": "500.00",
+                            "credit_amount": null,
+                            "description": "Payment to vendor",
+                            "cost_center_id": null
+                        }
+                    ]
+                },
+                {
+                    // Type 2: Create new transaction
+                    "suggestion_type": "create_new",
+                    "bank_transaction_id": 2,
+                    "transaction": {
+                        "date": "2025-01-15",
+                        "entity_id": 1,
+                        "description": "Payment to vendor",
+                        "amount": "1000.00",
+                        "currency_id": 1,
+                        "state": "pending"
+                    },
+                    "journal_entries": [
+                        {
+                            "account_id": 10,
+                            "debit_amount": "1000.00",
+                            "credit_amount": null,
+                            "description": "Payment to vendor",
+                            "cost_center_id": null
+                        },
+                        {
+                            "account_id": 5,
+                            "debit_amount": null,
+                            "credit_amount": "1000.00",
+                            "description": "Payment to vendor",
+                            "cost_center_id": null
+                        }
+                    ]
+                }
+            ]
+        }
+        """
+        from accounting.services.bank_transaction_suggestion_service import BankTransactionSuggestionService
+        from accounting.utils import update_journal_entries_and_transaction_flags
+        from decimal import Decimal
+        from django.db import transaction as db_transaction
+        
+        # Get company from tenant
+        company = getattr(request, 'tenant', None)
+        if not company or company == 'all':
+            return Response(
+                {'error': 'Company/tenant not found in request'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        company_id = company.id if hasattr(company, 'id') else company
+        
+        suggestions_data = request.data.get('suggestions', [])
+        if not suggestions_data:
+            return Response(
+                {'error': 'suggestions is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        created_transactions = []
+        created_reconciliations = []
+        errors = []
+        
+        service = BankTransactionSuggestionService(company_id=company_id)
+        
+        for suggestion_data in suggestions_data:
+            try:
+                with db_transaction.atomic():
+                    bank_transaction_id = suggestion_data.get('bank_transaction_id')
+                    if not bank_transaction_id:
+                        errors.append({'suggestion': suggestion_data, 'error': 'bank_transaction_id is required'})
+                        continue
+                    
+                    # Get bank transaction
+                    try:
+                        bank_tx = BankTransaction.objects.get(
+                            id=bank_transaction_id,
+                            company_id=company_id,
+                        )
+                    except BankTransaction.DoesNotExist:
+                        errors.append({
+                            'bank_transaction_id': bank_transaction_id,
+                            'error': 'Bank transaction not found'
+                        })
+                        continue
+                    
+                    suggestion_type = suggestion_data.get('suggestion_type', 'create_new')
+                    
+                    if suggestion_type == 'use_existing_book':
+                        # Use existing journal entry + create complementing entries
+                        # Get existing journal entry ID from the suggestion structure
+                        existing_je_data = suggestion_data.get('existing_journal_entry', {})
+                        existing_je_id = existing_je_data.get('id') or suggestion_data.get('existing_journal_entry_id')
+                        
+                        if not existing_je_id:
+                            errors.append({
+                                'bank_transaction_id': bank_transaction_id,
+                                'error': 'existing_journal_entry.id or existing_journal_entry_id is required for use_existing_book type'
+                            })
+                            continue
+                        
+                        try:
+                            existing_je = JournalEntry.objects.get(
+                                id=existing_je_id,
+                                company_id=company_id,
+                            )
+                        except JournalEntry.DoesNotExist:
+                            errors.append({
+                                'bank_transaction_id': bank_transaction_id,
+                                'existing_journal_entry_id': existing_je_id,
+                                'error': 'Existing journal entry not found'
+                            })
+                            continue
+                        
+                        # Get the transaction for the existing journal entry
+                        transaction = existing_je.transaction
+                        journal_entries = [existing_je]
+                        
+                        # Create complementing journal entries
+                        complementing_entries = suggestion_data.get('complementing_journal_entries', [])
+                        for je_data in complementing_entries:
+                            journal_entry = JournalEntry.objects.create(
+                                company_id=company_id,
+                                transaction=transaction,
+                                account_id=je_data.get('account_id'),
+                                cost_center_id=je_data.get('cost_center_id'),
+                                debit_amount=Decimal(str(je_data['debit_amount'])) if je_data.get('debit_amount') else None,
+                                credit_amount=Decimal(str(je_data['credit_amount'])) if je_data.get('credit_amount') else None,
+                                description=je_data.get('description', transaction.description),
+                                date=transaction.date,
+                                state='pending',
+                            )
+                            journal_entries.append(journal_entry)
+                    
+                    else:
+                        # Create new transaction and journal entries
+                        tx_data = suggestion_data.get('transaction', {})
+                        transaction = Transaction.objects.create(
+                            company_id=company_id,
+                            date=tx_data.get('date'),
+                            entity_id=tx_data.get('entity_id'),
+                            description=tx_data.get('description', bank_tx.description),
+                            amount=Decimal(str(tx_data.get('amount', abs(bank_tx.amount)))),
+                            currency_id=tx_data.get('currency_id', bank_tx.currency_id),
+                            state=tx_data.get('state', 'pending'),
+                        )
+                        
+                        # Create journal entries
+                        journal_entries = []
+                        je_data_list = suggestion_data.get('journal_entries', [])
+                        
+                        for je_data in je_data_list:
+                            journal_entry = JournalEntry.objects.create(
+                                company_id=company_id,
+                                transaction=transaction,
+                                account_id=je_data.get('account_id'),
+                                cost_center_id=je_data.get('cost_center_id'),
+                                debit_amount=Decimal(str(je_data['debit_amount'])) if je_data.get('debit_amount') else None,
+                                credit_amount=Decimal(str(je_data['credit_amount'])) if je_data.get('credit_amount') else None,
+                                description=je_data.get('description', transaction.description),
+                                date=transaction.date,
+                                state='pending',
+                            )
+                            journal_entries.append(journal_entry)
+                    
+                    # Update transaction and journal entry flags
+                    update_journal_entries_and_transaction_flags(journal_entries)
+                    
+                    # Create reconciliation and match
+                    reconciliation = Reconciliation.objects.create(
+                        company_id=company_id,
+                        status='matched',
+                        reference=f"Auto-matched from suggestion for bank_tx_{bank_tx.id}",
+                    )
+                    reconciliation.bank_transactions.add(bank_tx)
+                    reconciliation.journal_entries.add(*journal_entries)
+                    
+                    created_transactions.append({
+                        'transaction_id': transaction.id,
+                        'bank_transaction_id': bank_tx.id,
+                        'journal_entry_ids': [je.id for je in journal_entries],
+                    })
+                    created_reconciliations.append({
+                        'reconciliation_id': reconciliation.id,
+                        'bank_transaction_id': bank_tx.id,
+                        'transaction_id': transaction.id,
+                    })
+            
+            except Exception as e:
+                import traceback
+                errors.append({
+                    'suggestion': suggestion_data,
+                    'error': str(e),
+                    'traceback': traceback.format_exc(),
+                })
+                log.error(f"Error creating suggestion: {e}", exc_info=True)
+        
+        return Response({
+            'created_transactions': created_transactions,
+            'created_reconciliations': created_reconciliations,
+            'errors': errors,
+        }, status=status.HTTP_200_OK)
+    
     @action(detail=False, methods=['get'])
     def unreconciled(self, request, tenant_id):
         unreconciled_transactions = BankTransaction.objects.filter(reconciliations__isnull=True)
