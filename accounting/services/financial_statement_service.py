@@ -531,22 +531,98 @@ class FinancialStatementGenerator:
         total = Decimal('0.00')
         
         for account in accounts:
-            # Get balance as of date
-            # For parent accounts, calculate_balance will sum children automatically
-            balance = self._calculate_account_balance_with_children(
-                account=account,
-                include_pending=include_pending,
-                beginning_date=None,
-                end_date=as_of_date,
-            )
-            
-            # Apply account direction
             if calculation_type == 'balance':
-                balance = balance * account.account_direction
+                # Balance: Use last closing balance + transactions after closing date
+                balance = self._calculate_account_balance_from_closing(
+                    account=account,
+                    as_of_date=as_of_date,
+                    include_pending=include_pending,
+                )
+            else:
+                # Sum or difference: Calculate from journal entries in period
+                balance = self._calculate_account_balance_with_children(
+                    account=account,
+                    include_pending=include_pending,
+                    beginning_date=None,
+                    end_date=as_of_date,
+                )
+                # Apply account direction for sum
+                if calculation_type == 'sum':
+                    balance = balance * account.account_direction
             
             total += balance
         
         return total
+    
+    def _calculate_account_balance_from_closing(
+        self,
+        account: Account,
+        as_of_date: date,
+        include_pending: bool = False,
+    ) -> Decimal:
+        """
+        Calculate account balance using last closing balance + transactions after closing date.
+        This is used for 'balance' calculation_type.
+        
+        The closing balance (account.balance) is the validated balance as of account.balance_date.
+        We add all transactions after that date up to as_of_date, applying account_direction.
+        """
+        if account.is_leaf():
+            # Get the last closing balance and date
+            closing_balance = account.balance
+            closing_date = account.balance_date
+            
+            # If as_of_date is before or equal to closing_date, return closing balance with direction
+            if as_of_date <= closing_date:
+                return closing_balance * account.account_direction
+            
+            # Get transactions after closing date up to as_of_date
+            state_filter = Q(state='posted')
+            if include_pending:
+                state_filter = Q(state__in=['posted', 'pending'])
+            
+            transactions = JournalEntry.objects.filter(
+                account=account,
+                transaction__date__gt=closing_date,
+                transaction__date__lte=as_of_date,
+                transaction__company_id=self.company_id,
+            ).filter(state_filter).aggregate(
+                total_debit=Sum('debit_amount'),
+                total_credit=Sum('credit_amount')
+            )
+            
+            total_debit = transactions['total_debit'] or Decimal('0.00')
+            total_credit = transactions['total_credit'] or Decimal('0.00')
+            
+            # Calculate change: (debit - credit) * account_direction
+            change = (total_debit - total_credit) * account.account_direction
+            
+            # Final balance = closing balance (with direction) + change (with direction)
+            # Both are normalized by account_direction
+            return closing_balance * account.account_direction + change
+        else:
+            # Parent account: sum all children
+            children = account.get_children().filter(company_id=self.company_id)
+            
+            if not children.exists():
+                log.warning(
+                    "Parent account %s (id=%s) has no children for company %s",
+                    account.name,
+                    account.id,
+                    self.company_id
+                )
+                return Decimal('0.00')
+            
+            total = Decimal('0.00')
+            for child in children:
+                child_balance = self._calculate_account_balance_from_closing(
+                    account=child,
+                    as_of_date=as_of_date,
+                    include_pending=include_pending,
+                )
+                total += child_balance
+            
+            return total
     
     def _calculate_account_balance_with_children(
         self,
@@ -629,7 +705,7 @@ class FinancialStatementGenerator:
                 ).filter(state_filter)
                 
                 if calculation_type == 'difference':
-                    # Debit - Credit
+                    # Debit - Credit (no account direction)
                     debit_total = entries.aggregate(
                         total=Sum('debit_amount')
                     )['total'] or Decimal('0.00')
@@ -638,7 +714,14 @@ class FinancialStatementGenerator:
                     )['total'] or Decimal('0.00')
                     balance = debit_total - credit_total
                 elif calculation_type == 'balance':
-                    # Apply account direction
+                    # Balance: Use last closing balance + transactions after closing date
+                    balance = self._calculate_account_balance_from_closing(
+                        account=account,
+                        as_of_date=end_date,
+                        include_pending=include_pending,
+                    )
+                else:
+                    # Sum: Period movements with account direction (e.g., cash flow)
                     debit_total = entries.aggregate(
                         total=Sum('debit_amount')
                     )['total'] or Decimal('0.00')
@@ -646,11 +729,6 @@ class FinancialStatementGenerator:
                         total=Sum('credit_amount')
                     )['total'] or Decimal('0.00')
                     balance = (debit_total - credit_total) * account.account_direction
-                else:
-                    # Sum
-                    balance = entries.aggregate(
-                        total=Sum(F('debit_amount') - F('credit_amount'))
-                    )['total'] or Decimal('0.00')
                 
                 total += balance
             else:
@@ -705,31 +783,69 @@ class FinancialStatementGenerator:
                 account.bank_account_id
             )
             
-            # For leaf accounts, calculate balance directly
-            # Get beginning balance
-            beginning_balance = account.calculate_balance(
-                include_pending=include_pending,
-                beginning_date=None,
-                end_date=start_date,
-            ) or Decimal('0.00')
+            if calculation_type == 'sum':
+                # Sum: Period movements with account direction (inflows - outflows)
+                state_filter = Q(state='posted')
+                if include_pending:
+                    state_filter = Q(state__in=['posted', 'pending'])
+                
+                entries = JournalEntry.objects.filter(
+                    account=account,
+                    transaction__date__gte=start_date,
+                    transaction__date__lte=end_date,
+                    transaction__company_id=self.company_id,
+                ).filter(state_filter)
+                
+                debit_total = entries.aggregate(
+                    total=Sum('debit_amount')
+                )['total'] or Decimal('0.00')
+                credit_total = entries.aggregate(
+                    total=Sum('credit_amount')
+                )['total'] or Decimal('0.00')
+                
+                # Apply account direction for cash flow (inflows - outflows)
+                change = (debit_total - credit_total) * account.account_direction
+            elif calculation_type == 'balance':
+                # Balance: Use last closing balance + transactions after closing date
+                # Get beginning balance from closing
+                beginning_balance = self._calculate_account_balance_from_closing(
+                    account=account,
+                    as_of_date=start_date,
+                    include_pending=include_pending,
+                )
+                
+                # Get ending balance from closing
+                ending_balance = self._calculate_account_balance_from_closing(
+                    account=account,
+                    as_of_date=end_date,
+                    include_pending=include_pending,
+                )
+                
+                # Change = ending - beginning
+                change = ending_balance - beginning_balance
+            else:
+                # Difference or default: Calculate period change
+                beginning_balance = account.calculate_balance(
+                    include_pending=include_pending,
+                    beginning_date=None,
+                    end_date=start_date,
+                ) or Decimal('0.00')
+                
+                ending_balance = account.calculate_balance(
+                    include_pending=include_pending,
+                    beginning_date=None,
+                    end_date=end_date,
+                ) or Decimal('0.00')
+                
+                change = ending_balance - beginning_balance
             
-            # Get ending balance
-            ending_balance = account.calculate_balance(
-                include_pending=include_pending,
-                beginning_date=None,
-                end_date=end_date,
-            ) or Decimal('0.00')
-            
-            # Change = ending - beginning
-            change = ending_balance - beginning_balance
             total += change
             
             log.debug(
-                "Account %s: beginning=%s, ending=%s, change=%s",
+                "Account %s: change=%s (calculation_type=%s)",
                 account.name,
-                beginning_balance,
-                ending_balance,
-                change
+                change,
+                calculation_type
             )
         
         log.debug("Total cash flow change: %s", total)
