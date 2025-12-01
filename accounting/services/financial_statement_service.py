@@ -8,8 +8,8 @@ from accounting data.
 import logging
 from decimal import Decimal
 from datetime import date
-from typing import Dict, List, Optional, Set, Any, Union
-from django.db.models import Q, Sum, F
+from typing import Dict, List, Optional, Set, Any, Union, Tuple
+from django.db.models import Q, Sum, F, Min, Max
 from django.db import transaction
 
 from accounting.models import Account, JournalEntry, Currency
@@ -446,7 +446,7 @@ class FinancialStatementGenerator:
                 
             elif calculation_type == 'balance':
                 # Cumulative ending balance from all journal entries up to end_date
-                ending_balance = self._calculate_cumulative_ending_balance(
+                ending_balance, balance_metadata = self._calculate_cumulative_ending_balance_with_metadata(
                     account=account,
                     as_of_date=end_date,
                     include_pending=include_pending,
@@ -457,6 +457,7 @@ class FinancialStatementGenerator:
                 account_detail['balance_date'] = str(account.balance_date) if account.balance_date else None
                 account_detail['ending_balance'] = float(ending_balance)
                 account_detail['value'] = float(ending_balance)
+                account_detail['balance_calculation'] = balance_metadata
                 
             else:
                 # Difference or default
@@ -740,17 +741,53 @@ class FinancialStatementGenerator:
         
         This handles cases where balance_date is set to a future date relative to the period being calculated.
         """
+        balance, _ = self._calculate_cumulative_ending_balance_with_metadata(
+            account=account,
+            as_of_date=as_of_date,
+            include_pending=include_pending,
+        )
+        return balance
+    
+    def _calculate_cumulative_ending_balance_with_metadata(
+        self,
+        account: Account,
+        as_of_date: date,
+        include_pending: bool = False,
+    ) -> Tuple[Decimal, Dict[str, Any]]:
+        """
+        Calculate cumulative ending balance with detailed metadata for debugging.
+        
+        Returns:
+            Tuple of (ending_balance, metadata_dict)
+        """
         if not account.is_leaf():
             # Parent account: sum all children's ending balances
             children = account.get_children().filter(company_id=self.company_id)
             total = Decimal('0.00')
+            children_details = []
+            
             for child in children:
-                total += self._calculate_cumulative_ending_balance(
+                child_balance, child_metadata = self._calculate_cumulative_ending_balance_with_metadata(
                     account=child,
                     as_of_date=as_of_date,
                     include_pending=include_pending,
                 )
-            return total
+                total += child_balance
+                children_details.append({
+                    'account_id': child.id,
+                    'account_name': child.name,
+                    'account_code': child.account_code,
+                    'balance_contribution': float(child_balance),
+                    'details': child_metadata,
+                })
+            
+            metadata = {
+                'is_parent': True,
+                'children_count': len(children_details),
+                'children': children_details,
+                'total_from_children': float(total),
+            }
+            return total, metadata
         
         # Leaf account: calculate from journal entries
         opening_balance = account.balance or Decimal('0.00')
@@ -775,11 +812,22 @@ class FinancialStatementGenerator:
                 Q(transaction__date__lte=as_of_date)
             )
             use_opening_balance = True
+            calculation_mode = 'from_balance_date'
         else:
             # as_of_date is BEFORE balance_date (or no balance_date set)
             # Sum ALL entries from the beginning up to as_of_date
             entries = entries.filter(transaction__date__lte=as_of_date)
             use_opening_balance = False
+            calculation_mode = 'from_beginning'
+        
+        # Get entry count before aggregation
+        entry_count = entries.count()
+        
+        # Get date range of entries for debugging
+        date_range = entries.aggregate(
+            min_date=Min('transaction__date'),
+            max_date=Max('transaction__date')
+        )
         
         totals = entries.aggregate(
             total_debit=Sum('debit_amount'),
@@ -790,7 +838,8 @@ class FinancialStatementGenerator:
         total_credit = totals['total_credit'] or Decimal('0.00')
         
         # Calculate change with account direction
-        change = (total_debit - total_credit) * account.account_direction
+        net_movement = total_debit - total_credit
+        change = net_movement * account.account_direction
         
         # Final balance
         if use_opening_balance:
@@ -798,6 +847,32 @@ class FinancialStatementGenerator:
         else:
             # No opening balance - just the sum of all entries
             ending_balance = change
+        
+        metadata = {
+            'is_parent': False,
+            'calculation_mode': calculation_mode,
+            'as_of_date': str(as_of_date),
+            'account_balance_date': str(balance_date) if balance_date else None,
+            'used_opening_balance': use_opening_balance,
+            'stored_opening_balance': float(opening_balance),
+            'entry_count': entry_count,
+            'entries_date_range': {
+                'min_date': str(date_range['min_date']) if date_range['min_date'] else None,
+                'max_date': str(date_range['max_date']) if date_range['max_date'] else None,
+            },
+            'total_debit': float(total_debit),
+            'total_credit': float(total_credit),
+            'net_movement': float(net_movement),
+            'account_direction': account.account_direction,
+            'adjusted_change': float(change),
+            'ending_balance': float(ending_balance),
+            'calculation_explanation': (
+                f"{'Opening balance (' + str(float(opening_balance)) + ') + ' if use_opening_balance else ''}"
+                f"Net movement ({float(net_movement)}) × direction ({account.account_direction}) = "
+                f"{'(' + str(float(opening_balance)) + ' + ' + str(float(change)) + ') = ' if use_opening_balance else ''}"
+                f"{float(ending_balance)}"
+            ),
+        }
         
         log.debug(
             "Cumulative ending balance for %s (id=%s) as of %s: "
@@ -815,7 +890,7 @@ class FinancialStatementGenerator:
             ending_balance
         )
         
-        return ending_balance
+        return ending_balance, metadata
     
     def _calculate_account_balance_from_closing(
         self,
