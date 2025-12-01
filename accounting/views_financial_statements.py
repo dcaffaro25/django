@@ -294,6 +294,13 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         lines.append("---")
         lines.append("")
         
+        # Add HTML style block for no-wrap (works in markdown renderers that support HTML)
+        lines.append("<style>")
+        lines.append("table { white-space: nowrap; }")
+        lines.append("th, td { white-space: nowrap; }")
+        lines.append("</style>")
+        lines.append("")
+        
         # Table header
         lines.append("| Line | Label | Debit | Credit | Balance |")
         lines.append("|------|-------|-------|--------|---------|")
@@ -369,8 +376,8 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         lines.append("        h2 { color: #34495e; margin-top: 30px; }")
         lines.append("        h3 { color: #7f8c8d; margin-top: 20px; }")
         lines.append("        table { width: 100%; border-collapse: collapse; margin: 20px 0; }")
-        lines.append("        th { background-color: #3498db; color: white; padding: 12px; text-align: left; }")
-        lines.append("        td { padding: 10px; border-bottom: 1px solid #ddd; }")
+        lines.append("        th { background-color: #3498db; color: white; padding: 12px; text-align: left; white-space: nowrap; }")
+        lines.append("        td { padding: 10px; border-bottom: 1px solid #ddd; white-space: nowrap; }")
         lines.append("        tr:hover { background-color: #f5f5f5; }")
         lines.append("        .header-row { background-color: #ecf0f1; font-weight: bold; }")
         lines.append("        .total-row { background-color: #e8f5e9; font-weight: bold; }")

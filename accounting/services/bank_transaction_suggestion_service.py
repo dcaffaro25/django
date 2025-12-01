@@ -106,7 +106,7 @@ class BankTransactionSuggestionService:
         """Generate suggestions for a single bank transaction."""
         
         # Get embedding for this bank transaction
-        if not bank_tx.description_embedding:
+        if bank_tx.description_embedding is None:
             # Generate embedding if not present
             cleaned_desc = clean_description_for_embedding(bank_tx.description)
             try:
@@ -191,7 +191,7 @@ class BankTransactionSuggestionService:
             )
         
         # Use vector similarity search
-        if bank_tx.description_embedding:
+        if bank_tx.description_embedding is not None:
             # CosineDistance returns distance (0-2), convert to similarity (0-1)
             matched_bank_txs = matched_bank_txs.annotate(
                 distance=CosineDistance('description_embedding', bank_tx.description_embedding),
@@ -336,7 +336,7 @@ class BankTransactionSuggestionService:
         )
         
         # Use vector similarity search on transaction descriptions
-        if bank_tx.description_embedding:
+        if bank_tx.description_embedding is not None:
             unmatched_journal_entries = unmatched_journal_entries.filter(
                 transaction__description_embedding__isnull=False,
             ).annotate(
