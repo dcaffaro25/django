@@ -487,11 +487,22 @@ class BankTransactionSuggestionService:
                     f"(account_id={existing_account_id}, bank_tx={bank_tx.id})"
                 )
             
+            # Calculate if the combined entries would be balanced
+            total_debit = (journal_entry.debit_amount or Decimal('0')) + sum(
+                Decimal(ce['debit_amount'] or '0') for ce in filtered_complementing
+            )
+            total_credit = (journal_entry.credit_amount or Decimal('0')) + sum(
+                Decimal(ce['credit_amount'] or '0') for ce in filtered_complementing
+            )
+            is_balanced = abs(total_debit - total_credit) < Decimal('0.01')
+            
             suggestion = {
                 'suggestion_type': 'use_existing_book',
                 'confidence_score': round(confidence, 4),
                 'similarity': round(similarity, 4),
                 'amount_match_score': round(amount_match_score, 4),
+                'is_balanced': is_balanced,
+                'balance_difference': str(total_debit - total_credit) if not is_balanced else None,
                 'existing_journal_entry': {
                     'id': journal_entry.id,
                     'transaction_id': journal_entry.transaction_id,
@@ -639,37 +650,20 @@ class BankTransactionSuggestionService:
             
             if balancing_account:
                 # Check if this account is already in the journal entries
-                # If so, adjust the existing entry instead of creating opposing entries on same account
-                existing_entry_idx = None
-                for idx, je in enumerate(journal_entry_suggestions):
-                    if je['account_id'] == balancing_account.id:
-                        existing_entry_idx = idx
-                        break
+                # If so, we CANNOT add a balancing entry (would create opposing entries on same account)
+                account_already_used = any(
+                    je['account_id'] == balancing_account.id 
+                    for je in journal_entry_suggestions
+                )
                 
-                if existing_entry_idx is not None:
-                    # Adjust existing entry instead of adding opposing entry on same account
-                    existing_entry = journal_entry_suggestions[existing_entry_idx]
-                    existing_debit = Decimal(existing_entry['debit_amount'] or '0')
-                    existing_credit = Decimal(existing_entry['credit_amount'] or '0')
-                    
-                    # Calculate net amount after adjustment
-                    # Current net = debit - credit (positive means debit, negative means credit)
-                    current_net = existing_debit - existing_credit
-                    # Difference > 0 means we need more credit, < 0 means we need more debit
-                    new_net = current_net - difference
-                    
-                    if abs(new_net) < Decimal('0.01'):
-                        # Entry nets to zero - remove it entirely
-                        journal_entry_suggestions.pop(existing_entry_idx)
-                        log.debug(f"Removed entry that netted to zero after adjustment")
-                    elif new_net > 0:
-                        # Net positive = debit entry
-                        existing_entry['debit_amount'] = str(new_net)
-                        existing_entry['credit_amount'] = None
-                    else:
-                        # Net negative = credit entry
-                        existing_entry['debit_amount'] = None
-                        existing_entry['credit_amount'] = str(-new_net)
+                if account_already_used:
+                    # Cannot balance using this account - it's already in use
+                    # Log warning but don't try to adjust (that would cancel out the entry)
+                    log.warning(
+                        f"Cannot add balancing entry for bank_tx {bank_tx.id}: "
+                        f"account {balancing_account.id} already in use. "
+                        f"Suggestion will be unbalanced by {difference}"
+                    )
                 else:
                     # No existing entry for this account, safe to add new entry
                     if difference > 0:
@@ -702,12 +696,30 @@ class BankTransactionSuggestionService:
                     f"suggestion may be unbalanced (diff: {difference})"
                 )
         
+        # Validate: must have at least 1 journal entry
+        if not journal_entry_suggestions:
+            log.warning(
+                f"Skipping suggestion for bank_tx {bank_tx.id}: no journal entries could be generated"
+            )
+            return None
+        
+        # Check if transaction is balanced (debits == credits)
+        final_debit = sum(
+            Decimal(je['debit_amount'] or '0') for je in journal_entry_suggestions
+        )
+        final_credit = sum(
+            Decimal(je['credit_amount'] or '0') for je in journal_entry_suggestions
+        )
+        is_balanced = abs(final_debit - final_credit) < Decimal('0.01')
+        
         # Build transaction suggestion
         suggestion = {
             'suggestion_type': suggestion_type,
             'confidence_score': round(confidence, 4),
             'match_count': len(matches),
             'pattern': pattern,
+            'is_balanced': is_balanced,
+            'balance_difference': str(final_debit - final_credit) if not is_balanced else None,
             'transaction': {
                 'date': bank_tx.date.isoformat(),
                 'entity_id': bank_tx.bank_account.entity_id,
