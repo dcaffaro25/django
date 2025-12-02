@@ -652,29 +652,24 @@ class BankTransactionSuggestionService:
                     existing_debit = Decimal(existing_entry['debit_amount'] or '0')
                     existing_credit = Decimal(existing_entry['credit_amount'] or '0')
                     
-                    if difference > 0:
-                        # Need more credit - either reduce debit or increase credit
-                        if existing_debit > 0:
-                            new_debit = existing_debit - difference
-                            if new_debit >= 0:
-                                existing_entry['debit_amount'] = str(new_debit) if new_debit > 0 else None
-                            else:
-                                existing_entry['debit_amount'] = None
-                                existing_entry['credit_amount'] = str(-new_debit)
-                        else:
-                            existing_entry['credit_amount'] = str(existing_credit + difference)
+                    # Calculate net amount after adjustment
+                    # Current net = debit - credit (positive means debit, negative means credit)
+                    current_net = existing_debit - existing_credit
+                    # Difference > 0 means we need more credit, < 0 means we need more debit
+                    new_net = current_net - difference
+                    
+                    if abs(new_net) < Decimal('0.01'):
+                        # Entry nets to zero - remove it entirely
+                        journal_entry_suggestions.pop(existing_entry_idx)
+                        log.debug(f"Removed entry that netted to zero after adjustment")
+                    elif new_net > 0:
+                        # Net positive = debit entry
+                        existing_entry['debit_amount'] = str(new_net)
+                        existing_entry['credit_amount'] = None
                     else:
-                        # Need more debit - either reduce credit or increase debit
-                        abs_diff = -difference
-                        if existing_credit > 0:
-                            new_credit = existing_credit - abs_diff
-                            if new_credit >= 0:
-                                existing_entry['credit_amount'] = str(new_credit) if new_credit > 0 else None
-                            else:
-                                existing_entry['credit_amount'] = None
-                                existing_entry['debit_amount'] = str(-new_credit)
-                        else:
-                            existing_entry['debit_amount'] = str(existing_debit + abs_diff)
+                        # Net negative = credit entry
+                        existing_entry['debit_amount'] = None
+                        existing_entry['credit_amount'] = str(-new_net)
                 else:
                     # No existing entry for this account, safe to add new entry
                     if difference > 0:
