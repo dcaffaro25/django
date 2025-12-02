@@ -424,8 +424,8 @@ class FinancialStatementGenerator:
                 
                 entries = JournalEntry.objects.filter(
                     account=account,
-                    transaction__date__gte=start_date,
-                    transaction__date__lte=end_date,
+                    date__gte=start_date,
+                    date__lte=end_date,
                     transaction__company_id=self.company_id,
                 ).filter(state_filter)
                 
@@ -808,15 +808,15 @@ class FinancialStatementGenerator:
             # Normal case: as_of_date is after balance_date
             # Use opening balance + entries from balance_date to as_of_date
             entries = entries.filter(
-                Q(transaction__date__gt=balance_date) &
-                Q(transaction__date__lte=as_of_date)
+                Q(date__gt=balance_date) &
+                Q(date__lte=as_of_date)
             )
             use_opening_balance = True
             calculation_mode = 'from_balance_date'
         else:
             # as_of_date is BEFORE balance_date (or no balance_date set)
             # Sum ALL entries from the beginning up to as_of_date
-            entries = entries.filter(transaction__date__lte=as_of_date)
+            entries = entries.filter(date__lte=as_of_date)
             use_opening_balance = False
             calculation_mode = 'from_beginning'
         
@@ -825,8 +825,8 @@ class FinancialStatementGenerator:
         
         # Get date range of entries for debugging
         date_range = entries.aggregate(
-            min_date=Min('transaction__date'),
-            max_date=Max('transaction__date')
+            min_date=Min('date'),
+            max_date=Max('date')
         )
         
         totals = entries.aggregate(
@@ -921,8 +921,8 @@ class FinancialStatementGenerator:
             
             transactions = JournalEntry.objects.filter(
                 account=account,
-                transaction__date__gt=closing_date,
-                transaction__date__lte=as_of_date,
+                date__gt=closing_date,
+                date__lte=as_of_date,
                 transaction__company_id=self.company_id,
             ).filter(state_filter).aggregate(
                 total_debit=Sum('debit_amount'),
@@ -1037,8 +1037,8 @@ class FinancialStatementGenerator:
                 
                 entries = JournalEntry.objects.filter(
                     account=account,
-                    transaction__date__gte=start_date,
-                    transaction__date__lte=end_date,
+                    date__gte=start_date,
+                    date__lte=end_date,
                     transaction__company_id=self.company_id,
                 ).filter(state_filter)
                 
@@ -1129,8 +1129,8 @@ class FinancialStatementGenerator:
                 
                 entries = JournalEntry.objects.filter(
                     account=account,
-                    transaction__date__gte=start_date,
-                    transaction__date__lte=end_date,
+                    date__gte=start_date,
+                    date__lte=end_date,
                     transaction__company_id=self.company_id,
                 ).filter(state_filter)
                 
