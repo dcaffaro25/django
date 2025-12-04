@@ -172,7 +172,7 @@ class Account(TenantAwareBaseModel, MPTTModel):
         order_insertion_by = ['account_code']    
 
     class Meta:
-        unique_together = ('company', 'account_code', 'name')
+        unique_together = ('company', 'account_code', 'parent', 'name')
         indexes = [
             HnswIndex(
                 name="acct_emb_hnsw",

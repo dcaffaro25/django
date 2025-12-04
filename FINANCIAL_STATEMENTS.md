@@ -600,6 +600,7 @@ POST /api/financial-statements/time_series/
 **Query Parameters:**
 - `format`: `json` (default), `markdown`, or `html`
 - `preview`: `true` to generate preview without saving
+- `include_metadata`: `true` to include detailed calculation metadata for debugging
 
 **Response:** Time series data with values grouped by period
 
@@ -1010,11 +1011,19 @@ Debit amount minus Credit amount.
 #### `balance`
 Uses `account_direction` to determine normal balance (debit/credit).
 
-**Use Case:** Standard balance sheet and income statement calculations.
+**Use Case:** Standard balance sheet and income statement calculations, including Cash Balance lines in Cash Flow statements.
 
 **Account Direction:**
 - `1`: Debit normal (Assets, Expenses)
 - `-1`: Credit normal (Liabilities, Equity, Revenue)
+
+**Cash Balance Calculation:**
+For Cash Flow statements with `calculation_type='balance'`, the system calculates the **cumulative ending balance** as of each period's end date:
+
+1. If `as_of_date >= account.balance_date`: Uses stored opening balance + journal entries from `balance_date` to `as_of_date`
+2. If `as_of_date < account.balance_date` (or no `balance_date`): Sums ALL journal entries from the beginning up to `as_of_date`
+
+This ensures Cash Balance shows the running total, not just period changes.
 
 #### `formula`
 References other lines using formula syntax.
@@ -1030,6 +1039,125 @@ References other lines using formula syntax.
 - `"L1 + L2"`: Sum of lines 1 and 2
 - `"L10 - L20"`: Line 10 minus line 20
 - `"(L1 + L2) - L3"`: Sum of lines 1 and 2, minus line 3
+
+---
+
+## Calculation Metadata (Debugging)
+
+### Overview
+
+When troubleshooting financial statement calculations, you can request detailed metadata showing exactly how each value was computed. This is particularly useful for understanding Cash Balance calculations.
+
+### Enabling Metadata
+
+Add `include_metadata=true` query parameter to time series requests:
+
+```
+POST /api/financial-statements/time_series/?include_metadata=true
+{
+  "template_id": 1,
+  "start_date": "2020-01-01",
+  "end_date": "2025-12-31",
+  "dimension": "month"
+}
+```
+
+### Metadata Structure for Balance Calculations
+
+For lines with `calculation_type='balance'`, each period's data includes a `calculation_metadata` object with detailed breakdown:
+
+#### Leaf Account Metadata
+```json
+{
+  "calculation_metadata": {
+    "accounts": [
+      {
+        "id": 123,
+        "name": "Cash - Checking",
+        "account_code": "1010",
+        "calculation_type": "balance",
+        "opening_balance": 0.0,
+        "balance_date": "2025-08-01",
+        "ending_balance": -34089.19,
+        "value": -34089.19,
+        "balance_calculation": {
+          "is_parent": false,
+          "calculation_mode": "from_beginning",
+          "as_of_date": "2020-01-31",
+          "account_balance_date": "2025-08-01",
+          "used_opening_balance": false,
+          "stored_opening_balance": 0.0,
+          "entry_count": 145,
+          "entries_date_range": {
+            "min_date": "2019-03-15",
+            "max_date": "2020-01-28"
+          },
+          "total_debit": 50000.00,
+          "total_credit": 84089.19,
+          "net_movement": -34089.19,
+          "account_direction": 1,
+          "adjusted_change": -34089.19,
+          "ending_balance": -34089.19,
+          "calculation_explanation": "Net movement (-34089.19) × direction (1) = -34089.19"
+        }
+      }
+    ]
+  }
+}
+```
+
+#### Parent Account Metadata
+For parent accounts, the metadata shows the sum of children:
+```json
+{
+  "balance_calculation": {
+    "is_parent": true,
+    "children_count": 3,
+    "children": [
+      {
+        "account_id": 124,
+        "account_name": "Cash - Bradesco",
+        "account_code": "1010.01",
+        "balance_contribution": -20000.00,
+        "details": { ... }
+      },
+      {
+        "account_id": 125,
+        "account_name": "Cash - Safra",
+        "account_code": "1010.02",
+        "balance_contribution": -14089.19,
+        "details": { ... }
+      }
+    ],
+    "total_from_children": -34089.19
+  }
+}
+```
+
+### Key Metadata Fields
+
+| Field | Description |
+|-------|-------------|
+| `calculation_mode` | `"from_beginning"` (sum all entries) or `"from_balance_date"` (use stored balance + entries) |
+| `used_opening_balance` | Whether the account's stored `balance` was used as starting point |
+| `stored_opening_balance` | The account's stored `balance` field value |
+| `account_balance_date` | The date the stored balance is valid as of |
+| `entry_count` | Number of journal entries included in calculation |
+| `entries_date_range` | Min/max transaction dates of included entries |
+| `total_debit` / `total_credit` | Raw sums of debit and credit amounts |
+| `net_movement` | `total_debit - total_credit` before direction applied |
+| `account_direction` | `1` (debit normal) or `-1` (credit normal) |
+| `adjusted_change` | Net movement × account direction |
+| `ending_balance` | Final calculated balance |
+| `calculation_explanation` | Human-readable formula showing the calculation |
+
+### Debugging Use Cases
+
+1. **Cash Balance showing 0**: Check `entry_count` - if 0, no journal entries matched the date range
+2. **Unexpected values**: Compare `total_debit` and `total_credit` against expected amounts
+3. **Wrong sign**: Check `account_direction` - may need to adjust the account's normal balance setting
+4. **Missing historical data**: Check `entries_date_range` - entries may be outside expected range
+5. **Balance date issues**: If `calculation_mode` is `"from_beginning"`, the stored `balance_date` is after the period being calculated
 
 ---
 
@@ -1461,5 +1589,5 @@ For issues or questions:
 
 ---
 
-*Last Updated: 2025-11-30*
+*Last Updated: 2025-12-01*
 
