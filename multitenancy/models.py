@@ -421,3 +421,167 @@ class ImportSnapshot(models.Model):
             models.Index(fields=["table_hash"]),
         ]
 
+
+class ImportTransformationRule(TenantAwareBaseModel):
+    """
+    Defines how to transform a specific Excel sheet into a target model format.
+    Multiple rules can exist for different sheets in the same file.
+    
+    ETL Pipeline: Transform → Substitute → Validate → Import
+    """
+    name = models.CharField(max_length=100)
+    description = models.TextField(blank=True, null=True)
+    
+    # SOURCE CONFIGURATION
+    source_sheet_name = models.CharField(
+        max_length=100,
+        help_text="Name of the Excel sheet to process (case-insensitive matching)"
+    )
+    skip_rows = models.IntegerField(
+        default=0,
+        help_text="Number of rows to skip at the beginning (headers, titles, etc.)"
+    )
+    header_row = models.IntegerField(
+        default=0,
+        help_text="Row number (0-indexed after skip_rows) containing column headers"
+    )
+    
+    # TARGET CONFIGURATION
+    target_model = models.CharField(
+        max_length=100,
+        help_text="Target model name: Transaction, JournalEntry, BankTransaction, etc."
+    )
+    
+    # COLUMN MAPPINGS - Required columns from source (case-insensitive)
+    column_mappings = models.JSONField(
+        default=dict,
+        help_text="""
+        Map source columns to target fields (case-insensitive matching).
+        Format: {"Source Column Name": "target_field_name"}
+        Example: {"Data Lançamento": "date", "Valor": "amount"}
+        All mapped columns are REQUIRED - import fails if any is missing.
+        """
+    )
+    
+    # COLUMN CONCATENATIONS - Combine multiple columns
+    column_concatenations = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="""
+        Combine multiple source columns into one target field.
+        Format: {
+            "target_field": {
+                "columns": ["Col1", "Col2", "Col3"],
+                "separator": " | ",
+                "template": "{Col1} - Doc: {Col2}"
+            }
+        }
+        If template is provided, it overrides separator.
+        """
+    )
+    
+    # COMPUTED COLUMNS - Derived values using expressions
+    computed_columns = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="""
+        Compute values using Python expressions.
+        Format: {"target_field": "expression"}
+        Available context: row (dict with all columns), Decimal, datetime, re, abs, str, int, float
+        Example: {"amount": "abs(Decimal(str(row['Valor']).replace(',', '.')))"}
+        """
+    )
+    
+    # DEFAULT VALUES - Static defaults for missing fields
+    default_values = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="""
+        Default values for fields not in source.
+        Format: {"field_name": value}
+        Example: {"currency_id": 12, "state": "pending"}
+        """
+    )
+    
+    # ROW FILTER - Skip rows that don't match condition
+    row_filter = models.TextField(
+        blank=True,
+        null=True,
+        help_text="""
+        Python expression to filter rows. Return True to include, False to skip.
+        Available context: row (dict with all columns)
+        Example: "row.get('Valor') and row['Valor'] != 0"
+        """
+    )
+    
+    # EXECUTION ORDER
+    execution_order = models.IntegerField(
+        default=0,
+        help_text="Order of execution when processing multiple sheets"
+    )
+    is_active = models.BooleanField(default=True)
+    
+    class Meta:
+        ordering = ['execution_order', 'name']
+        indexes = [
+            models.Index(fields=['company', 'source_sheet_name']),
+            models.Index(fields=['company', 'is_active']),
+        ]
+
+    def __str__(self):
+        return f"{self.name}: {self.source_sheet_name} → {self.target_model}"
+
+
+class ETLPipelineLog(TenantAwareBaseModel):
+    """
+    Log each ETL pipeline execution for debugging and audit.
+    """
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('transforming', 'Transforming'),
+        ('substituting', 'Substituting'),
+        ('validating', 'Validating'),
+        ('importing', 'Importing'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+        ('partial', 'Partial Success'),
+    ]
+    
+    file_name = models.CharField(max_length=255)
+    file_hash = models.CharField(max_length=64, blank=True, null=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    is_preview = models.BooleanField(default=False, help_text="True if this was a preview run (no commit)")
+    
+    # Sheets info
+    sheets_found = models.JSONField(default=list)
+    sheets_processed = models.JSONField(default=list)
+    sheets_skipped = models.JSONField(default=list)
+    sheets_failed = models.JSONField(default=list)
+    
+    # Row counts
+    total_rows_input = models.IntegerField(default=0)
+    total_rows_transformed = models.IntegerField(default=0)
+    total_rows_imported = models.IntegerField(default=0)
+    
+    # Results by model
+    records_created = models.JSONField(default=dict)
+    
+    # Messages
+    warnings = models.JSONField(default=list)
+    errors = models.JSONField(default=list)
+    
+    # Timing
+    started_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(blank=True, null=True)
+    duration_seconds = models.FloatField(blank=True, null=True)
+    
+    class Meta:
+        ordering = ['-started_at']
+        indexes = [
+            models.Index(fields=['company', '-started_at']),
+            models.Index(fields=['company', 'status']),
+            models.Index(fields=['file_hash']),
+        ]
+
+    def __str__(self):
+        return f"ETL [{self.status}] {self.file_name} @ {self.started_at}"

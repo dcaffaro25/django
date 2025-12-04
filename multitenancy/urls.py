@@ -2,11 +2,17 @@
 
 from django.urls import path, include, re_path
 from rest_framework.routers import DefaultRouter
-from .views import CustomUserViewSet, CompanyViewSet, EntityViewSet, EntityTreeView, LoginView, LogoutView, IntegrationRuleViewSet, ChangePasswordView, UserCreateView, PasswordResetForceView, AdminForcePasswordView, SubstitutionRuleViewSet
+from .views import (
+    CustomUserViewSet, CompanyViewSet, EntityViewSet, EntityTreeView,
+    LoginView, LogoutView, IntegrationRuleViewSet, ChangePasswordView,
+    UserCreateView, PasswordResetForceView, AdminForcePasswordView,
+    SubstitutionRuleViewSet, ValidateRuleView, ExecuteRuleView, BulkImportAPIView,
+    # ETL Pipeline views
+    ImportTransformationRuleViewSet, ETLPipelineLogViewSet,
+    ETLPipelinePreviewView, ETLPipelineExecuteView, ETLPipelineAnalyzeView,
+)
 from accounting.views import CurrencyViewSet
-from .api_utils import BulkImportPreview, BulkImportExecute
-from .views import ValidateRuleView, ExecuteRuleView, BulkImportAPIView#, TriggerListView
-from .api_utils import BulkImportTemplateDownloadView
+from .api_utils import BulkImportPreview, BulkImportExecute, BulkImportTemplateDownloadView
 
 
 router = DefaultRouter()
@@ -18,6 +24,10 @@ router.register(r'companies', CompanyViewSet, basename='company')
 router.register(r'currencies', CurrencyViewSet)
 router.register(r'integration-rules', IntegrationRuleViewSet)
 router.register(r'substitution-rules', SubstitutionRuleViewSet, basename='substitutionrule')
+
+# ETL Pipeline routers
+router.register(r'etl/transformation-rules', ImportTransformationRuleViewSet, basename='etl-transformation-rule')
+router.register(r'etl/logs', ETLPipelineLogViewSet, basename='etl-log')
 
 urlpatterns = [
     re_path(r'^login/?$', LoginView.as_view(), name='login'),
@@ -37,4 +47,9 @@ urlpatterns = [
     re_path(r'^api/core/bulk-import-preview/?$', BulkImportPreview.as_view(), name='bulk-import-preview'),
     re_path(r'^api/core/bulk-import-execute/?$', BulkImportExecute.as_view(), name='bulk-import-execute'),
     re_path(r'^api/core/bulk-import-template/?$', BulkImportTemplateDownloadView.as_view(), name='bulk-import-template'),
+    
+    # ETL Pipeline endpoints
+    re_path(r'^api/core/etl/preview/?$', ETLPipelinePreviewView.as_view(), name='etl-preview'),
+    re_path(r'^api/core/etl/execute/?$', ETLPipelineExecuteView.as_view(), name='etl-execute'),
+    re_path(r'^api/core/etl/analyze/?$', ETLPipelineAnalyzeView.as_view(), name='etl-analyze'),
 ]
