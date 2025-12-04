@@ -1819,9 +1819,13 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     else:
                         # Create new transaction and journal entries
                         tx_data = suggestion_data.get('transaction', {})
+                        # Parse date string to date object
+                        tx_date = tx_data.get('date')
+                        if isinstance(tx_date, str):
+                            tx_date = datetime.strptime(tx_date, '%Y-%m-%d').date()
                         transaction = Transaction.objects.create(
                             company_id=company_id,
-                            date=tx_data.get('date'),
+                            date=tx_date,
                             entity_id=tx_data.get('entity_id'),
                             description=tx_data.get('description', bank_tx.description),
                             amount=Decimal(str(tx_data.get('amount', abs(bank_tx.amount)))),
