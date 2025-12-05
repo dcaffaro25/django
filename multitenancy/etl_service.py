@@ -368,6 +368,20 @@ class ETLPipelineService:
                         if field not in transformed or transformed[field] is None:
                             transformed[field] = default_value
                     
+                    # 5. Extract extra_fields_for_trigger (not saved to model, passed to triggers)
+                    extra_fields = {}
+                    for target_field, source_col in (rule.extra_fields_for_trigger or {}).items():
+                        source_lower = str(source_col).lower().strip()
+                        actual_col = available_columns.get(source_lower, source_col)
+                        value = row_dict.get(actual_col)
+                        if pd.isna(value):
+                            value = None
+                        extra_fields[target_field] = value
+                    
+                    # Store extra_fields in a special key (will be removed before import)
+                    if extra_fields:
+                        transformed['__extra_fields__'] = extra_fields
+                    
                     # Add row to results
                     transformed_rows.append(transformed)
                     
@@ -735,6 +749,15 @@ class ETLPipelineService:
     
     def _import_data(self) -> dict:
         """Import transformed data using existing bulk import logic."""
+        # Extract __extra_fields__ from rows before import (they're not model fields)
+        extra_fields_by_model: Dict[str, List[dict]] = {}
+        
+        for model_name, rows in self.transformed_data.items():
+            extra_fields_by_model[model_name] = []
+            for row in rows:
+                extra_fields = row.pop('__extra_fields__', {})
+                extra_fields_by_model[model_name].append(extra_fields)
+        
         # Convert to sheets format expected by execute_import_job
         sheets = []
         for model_name, rows in self.transformed_data.items():
@@ -754,8 +777,8 @@ class ETLPipelineService:
         )
         
         # Update log with import stats
+        records_created = {}
         if self.log:
-            records_created = {}
             for model_name, outputs in result.get('results', {}).items():
                 created_count = sum(1 for o in outputs if o.get('status') == 'success' and o.get('action') == 'create')
                 if created_count > 0:
@@ -765,7 +788,84 @@ class ETLPipelineService:
             self.log.total_rows_imported = sum(records_created.values())
             self.log.save()
         
+        # Trigger IntegrationRule events for created records
+        self._trigger_events_for_created_records(result, extra_fields_by_model)
+        
         return result
+    
+    def _trigger_events_for_created_records(self, import_result: dict, extra_fields_by_model: Dict[str, List[dict]]):
+        """
+        Trigger IntegrationRule events for each created record.
+        
+        For example, when a Transaction is created, trigger 'transaction_created' event
+        with the transaction data and any extra_fields from the transformation.
+        """
+        from multitenancy.tasks import trigger_integration_event
+        
+        # Map model names to trigger events
+        MODEL_EVENT_MAP = {
+            'Transaction': 'transaction_created',
+            'JournalEntry': 'journal_entry_created',
+        }
+        
+        for model_name, outputs in import_result.get('results', {}).items():
+            event_name = MODEL_EVENT_MAP.get(model_name)
+            if not event_name:
+                continue
+            
+            # Get the rule to check if triggers are enabled
+            rule = self.transformation_rules.get(model_name)
+            trigger_options = (rule.trigger_options or {}) if rule else {}
+            
+            if not trigger_options.get('enabled', True):
+                logger.info(f"ETL: Triggers disabled for {model_name}")
+                continue
+            
+            # Check if this specific event is enabled
+            allowed_events = trigger_options.get('events', [event_name])
+            if event_name not in allowed_events:
+                continue
+            
+            use_celery = trigger_options.get('use_celery', True)
+            extra_fields_list = extra_fields_by_model.get(model_name, [])
+            
+            # Trigger event for each created record
+            for idx, output in enumerate(outputs):
+                if output.get('status') != 'success' or output.get('action') != 'create':
+                    continue
+                
+                record_data = output.get('data', {})
+                record_id = record_data.get('id')
+                
+                if not record_id:
+                    continue
+                
+                # Get extra_fields for this row
+                extra_fields = extra_fields_list[idx] if idx < len(extra_fields_list) else {}
+                
+                # Build trigger payload
+                payload = {
+                    f'{model_name.lower()}_id': record_id,
+                    model_name.lower(): record_data,
+                    'extra_fields': extra_fields,
+                    'source': 'etl_import',
+                    'log_id': self.log.id if self.log else None,
+                }
+                
+                logger.info(f"ETL: Triggering {event_name} for {model_name} id={record_id}")
+                
+                try:
+                    if use_celery:
+                        trigger_integration_event.delay(self.company_id, event_name, payload)
+                    else:
+                        trigger_integration_event(self.company_id, event_name, payload)
+                except Exception as e:
+                    self._add_warning(
+                        warning_type='trigger_error',
+                        message=f"Error triggering {event_name} for {model_name} id={record_id}: {str(e)}",
+                        model=model_name,
+                        record_id=record_id
+                    )
     
     def _preview_data(self) -> dict:
         """Return preview of transformed data (all rows)."""

@@ -240,6 +240,10 @@ class IntegrationRule(TenantAwareBaseModel):
     TRIGGER_CHOICES = [
         ('payroll_approved', 'Payroll Approved'),
         ('payroll_created', 'Payroll Created'),
+        # ETL triggers
+        ('transaction_created', 'Transaction Created (ETL)'),
+        ('journal_entry_created', 'Journal Entry Created (ETL)'),
+        ('etl_import_completed', 'ETL Import Completed'),
         # Add more triggers
     ]
 
@@ -535,6 +539,44 @@ class ImportTransformationRule(TenantAwareBaseModel):
         - Negative amount + debit-normal account (direction=1) → credit_amount
         - Positive amount + credit-normal account (direction=-1) → credit_amount
         - Negative amount + credit-normal account (direction=-1) → debit_amount
+        """
+    )
+    
+    # EXTRA FIELDS FOR TRIGGER - Pass additional data to IntegrationRules
+    extra_fields_for_trigger = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="""
+        Map Excel columns to extra fields that will be passed to IntegrationRule triggers.
+        These fields are NOT saved to the target model, but included in the trigger payload.
+        
+        Format: {"target_field_name": "Source Column Name"}
+        Example: {"account_path": "Conta", "cost_center_path": "Centro de Custo"}
+        
+        When a Transaction is created, the trigger payload will include:
+        {
+            "transaction_id": 123,
+            "transaction": {...},
+            "extra_fields": {
+                "account_path": "Assets > Banks > Bradesco",
+                "cost_center_path": "Operations"
+            }
+        }
+        """
+    )
+    
+    # TRIGGER OPTIONS - Control which events are fired
+    trigger_options = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="""
+        Configure which IntegrationRule triggers to fire after import.
+        
+        Format: {
+            "enabled": true,                    # Enable/disable triggers
+            "events": ["transaction_created"],  # List of events to trigger
+            "use_celery": true                  # Run triggers async via Celery
+        }
         """
     )
     

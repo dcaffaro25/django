@@ -292,7 +292,7 @@ class ImportTransformationRuleSerializer(serializers.ModelSerializer):
             'source_sheet_name', 'skip_rows', 'header_row',
             'target_model', 'column_mappings', 'column_concatenations',
             'computed_columns', 'default_values', 'row_filter',
-            'journal_entry_options',
+            'journal_entry_options', 'extra_fields_for_trigger', 'trigger_options',
             'execution_order', 'is_active',
             'created_at', 'updated_at',
         ]

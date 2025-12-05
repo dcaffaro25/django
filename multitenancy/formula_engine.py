@@ -145,6 +145,98 @@ def to_decimal(value, places=2):
     quant_str = "1." + ("0" * places)
     return dec_val.quantize(Decimal(quant_str), rounding=ROUND_HALF_UP)
 
+
+# -----------------------------------------------
+# ACCOUNT LOOKUP HELPERS (for IntegrationRules)
+# -----------------------------------------------
+
+def lookup_account_by_path(path: str, company_id: int, path_separator: str = ' > ') -> Optional[Account]:
+    """
+    Look up an Account by its hierarchical path.
+    
+    Args:
+        path: Account path like "Assets > Banks > Bradesco"
+        company_id: Company ID to search within
+        path_separator: Separator used in the path (default: ' > ')
+        
+    Returns:
+        Account instance or None if not found
+    """
+    if not path or not company_id:
+        return None
+    
+    path_parts = [p.strip() for p in str(path).split(path_separator) if p.strip()]
+    if not path_parts:
+        return None
+    
+    # Traverse the account tree
+    parent = None
+    account = None
+    
+    for part_name in path_parts:
+        account = Account.objects.filter(
+            company_id=company_id,
+            name__iexact=part_name,
+            parent=parent
+        ).first()
+        
+        if not account:
+            return None
+        
+        parent = account
+    
+    return account
+
+
+def lookup_account_by_code(code: str, company_id: int) -> Optional[Account]:
+    """Look up an Account by its account_code."""
+    if not code or not company_id:
+        return None
+    return Account.objects.filter(
+        company_id=company_id,
+        account_code__iexact=str(code).strip()
+    ).first()
+
+
+def lookup_account_by_name(name: str, company_id: int) -> Optional[Account]:
+    """Look up an Account by its name (first match)."""
+    if not name or not company_id:
+        return None
+    return Account.objects.filter(
+        company_id=company_id,
+        name__iexact=str(name).strip()
+    ).first()
+
+
+def calculate_debit_credit(amount: Decimal, account: Account) -> Dict[str, Optional[Decimal]]:
+    """
+    Calculate debit_amount and credit_amount based on amount sign and account direction.
+    
+    Args:
+        amount: The amount (can be positive or negative)
+        account: Account instance with account_direction
+        
+    Returns:
+        Dict with 'debit_amount' and 'credit_amount' keys
+    """
+    if not account:
+        return {'debit_amount': None, 'credit_amount': None}
+    
+    abs_amount = abs(Decimal(str(amount)))
+    direction = account.account_direction
+    
+    # Logic:
+    # - Positive amount + debit-normal (1) → debit
+    # - Negative amount + debit-normal (1) → credit
+    # - Positive amount + credit-normal (-1) → credit
+    # - Negative amount + credit-normal (-1) → debit
+    
+    if (amount >= 0 and direction == 1) or (amount < 0 and direction == -1):
+        return {'debit_amount': abs_amount, 'credit_amount': None}
+    else:
+        return {'debit_amount': None, 'credit_amount': abs_amount}
+
+
 Row = Union[Dict[str, Any], List[Any]]
 
 def _normalize(value: str) -> str:
@@ -773,12 +865,23 @@ def execute_rule(company_id: int, rule: str, payload: list):
         "str": str,
         "int": int,
         "float": float,
+        "abs": abs,
+        "Decimal": Decimal,
         "sum_group": sum_group,
         "max_group": max_group,
         "min_group": min_group,
         "debug_log": debug_log,
         "to_decimal": to_decimal,
         "company_id": company_id,
+        # Account lookup helpers
+        "lookup_account_by_path": lambda path, sep=' > ': lookup_account_by_path(path, company_id, sep),
+        "lookup_account_by_code": lambda code: lookup_account_by_code(code, company_id),
+        "lookup_account_by_name": lambda name: lookup_account_by_name(name, company_id),
+        "calculate_debit_credit": calculate_debit_credit,
+        # Models for direct access
+        "Account": Account,
+        "Transaction": Transaction,
+        "JournalEntry": JournalEntry,
     }
 
     exec_env = {"__builtins__": None, "context": context}
