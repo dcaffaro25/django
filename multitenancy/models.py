@@ -518,30 +518,6 @@ class ImportTransformationRule(TenantAwareBaseModel):
         """
     )
     
-    # JOURNAL ENTRY OPTIONS - Special handling for JournalEntry target model
-    journal_entry_options = models.JSONField(
-        default=dict,
-        blank=True,
-        help_text="""
-        Special options for JournalEntry target model. Enables automatic debit/credit
-        calculation based on amount sign and account direction.
-        
-        Format: {
-            "amount_field": "amount",           # Field containing the amount value
-            "account_lookup_field": "account_path",  # Field containing account identifier
-            "account_lookup_type": "path",      # "path", "code", "id", or "name"
-            "path_separator": " > ",            # Separator for path-based lookup
-            "auto_debit_credit": true           # Auto-calculate debit/credit from amount sign
-        }
-        
-        When auto_debit_credit is true:
-        - Positive amount + debit-normal account (direction=1) → debit_amount
-        - Negative amount + debit-normal account (direction=1) → credit_amount
-        - Positive amount + credit-normal account (direction=-1) → credit_amount
-        - Negative amount + credit-normal account (direction=-1) → debit_amount
-        """
-    )
-    
     # EXTRA FIELDS FOR TRIGGER - Pass additional data to IntegrationRules
     extra_fields_for_trigger = models.JSONField(
         default=dict,

@@ -5,16 +5,17 @@ ETL Pipeline Service for Excel file transformation, substitution, and import.
 Pipeline Flow:
 1. TRANSFORMATION: Read Excel sheets, apply ImportTransformationRules
 2. SUBSTITUTION: Apply SubstitutionRules to clean/standardize data
-3. POST-PROCESS: Apply model-specific logic (e.g., JournalEntry debit/credit calculation)
-4. VALIDATION: Validate data before import
-5. IMPORT: Create records using existing bulk import logic
+3. VALIDATION: Validate data before import
+4. IMPORT: Create records using existing bulk import logic
+5. TRIGGERS: Fire IntegrationRule events for created records
 
 Features:
 - Case-insensitive column matching
 - Continues processing other sheets on error
 - Returns all rows in preview mode
 - No cross-sheet dependencies
-- JournalEntry: Auto debit/credit based on amount sign and account direction
+- Extra fields can be passed to IntegrationRules via extra_fields_for_trigger
+- Use IntegrationRules with create_transaction_with_entries() for Transaction + JournalEntries
 """
 
 import hashlib
@@ -488,141 +489,14 @@ class ETLPipelineService:
     def _post_process_data(self):
         """
         Post-process transformed data after substitution.
-        Handles special cases like JournalEntry debit/credit calculation.
+        
+        This is a placeholder for any model-specific processing that needs
+        to happen after substitution but before validation/import.
+        
+        For JournalEntry creation from Transactions, use IntegrationRules
+        with the create_transaction_with_entries() helper function.
         """
-        for model_name, rows in self.transformed_data.items():
-            rule = self.transformation_rules.get(model_name)
-            if not rule:
-                continue
-            
-            # Handle JournalEntry special processing
-            if model_name == 'JournalEntry' and rule.journal_entry_options:
-                self._post_process_journal_entries(rows, rule.journal_entry_options)
-    
-    def _post_process_journal_entries(self, rows: List[dict], options: dict):
-        """
-        Process JournalEntry rows to calculate debit/credit amounts.
-        
-        Looks up accounts (after substitution) and calculates debit_amount/credit_amount
-        based on the amount sign and account direction.
-        
-        Args:
-            rows: List of transformed row dicts
-            options: journal_entry_options from the transformation rule
-        """
-        from accounting.models import Account
-        
-        amount_field = options.get('amount_field', 'amount')
-        account_lookup_field = options.get('account_lookup_field', 'account_path')
-        account_lookup_type = options.get('account_lookup_type', 'path')
-        path_separator = options.get('path_separator', ' > ')
-        auto_debit_credit = options.get('auto_debit_credit', True)
-        
-        if not auto_debit_credit:
-            return
-        
-        logger.info(f"ETL: Post-processing {len(rows)} JournalEntry rows with auto debit/credit")
-        
-        # Cache for account lookups to avoid repeated queries
-        account_cache: Dict[str, Optional[Account]] = {}
-        
-        for idx, row in enumerate(rows):
-            row_number = idx + 1
-            
-            # Get the amount value
-            amount_value = row.get(amount_field)
-            if amount_value is None:
-                self._add_warning(
-                    warning_type='missing_amount',
-                    message=f"JournalEntry row {row_number}: Missing amount field '{amount_field}'",
-                    row_number=row_number
-                )
-                continue
-            
-            # Convert amount to Decimal
-            try:
-                if isinstance(amount_value, str):
-                    # Handle Brazilian format: 1.234,56 -> 1234.56
-                    amount_value = amount_value.replace('.', '').replace(',', '.')
-                amount = Decimal(str(amount_value))
-            except (InvalidOperation, ValueError) as e:
-                self._add_error(
-                    error_type='invalid_amount',
-                    message=f"JournalEntry row {row_number}: Invalid amount value '{amount_value}'",
-                    stage='post_process',
-                    row_number=row_number
-                )
-                continue
-            
-            # Get the account lookup value
-            account_lookup_value = row.get(account_lookup_field)
-            if not account_lookup_value:
-                self._add_warning(
-                    warning_type='missing_account',
-                    message=f"JournalEntry row {row_number}: Missing account field '{account_lookup_field}'",
-                    row_number=row_number
-                )
-                continue
-            
-            # Look up the account (with caching)
-            cache_key = f"{account_lookup_type}:{account_lookup_value}"
-            if cache_key in account_cache:
-                account = account_cache[cache_key]
-            else:
-                account = self._lookup_account(
-                    account_lookup_value,
-                    account_lookup_type,
-                    path_separator
-                )
-                account_cache[cache_key] = account
-            
-            if not account:
-                self._add_error(
-                    error_type='account_not_found',
-                    message=f"JournalEntry row {row_number}: Account not found for '{account_lookup_field}' = '{account_lookup_value}'",
-                    stage='post_process',
-                    row_number=row_number,
-                    lookup_type=account_lookup_type,
-                    lookup_value=str(account_lookup_value)
-                )
-                continue
-            
-            # Set account_id in the row
-            row['account_id'] = account.id
-            
-            # Calculate debit/credit based on amount sign and account direction
-            # account_direction: 1 = debit-normal (Assets, Expenses)
-            # account_direction: -1 = credit-normal (Liabilities, Equity, Revenue)
-            account_direction = account.account_direction
-            abs_amount = abs(amount)
-            
-            # Logic:
-            # - Positive amount + debit-normal (1) → debit
-            # - Negative amount + debit-normal (1) → credit
-            # - Positive amount + credit-normal (-1) → credit
-            # - Negative amount + credit-normal (-1) → debit
-            
-            if (amount >= 0 and account_direction == 1) or (amount < 0 and account_direction == -1):
-                row['debit_amount'] = abs_amount
-                row['credit_amount'] = None
-            else:
-                row['debit_amount'] = None
-                row['credit_amount'] = abs_amount
-            
-            # Remove the temporary amount field (it's now split into debit/credit)
-            if amount_field not in ('debit_amount', 'credit_amount'):
-                row.pop(amount_field, None)
-            
-            # Remove the account lookup field if it's not account_id
-            if account_lookup_field not in ('account_id', 'account'):
-                row.pop(account_lookup_field, None)
-            
-            logger.debug(
-                f"ETL: Row {row_number}: amount={amount}, direction={account_direction} → "
-                f"debit={row.get('debit_amount')}, credit={row.get('credit_amount')}"
-            )
-        
-        logger.info(f"ETL: Completed post-processing JournalEntry rows")
+        pass  # No special post-processing needed - use IntegrationRules instead
     
     def _lookup_account(self, value: Any, lookup_type: str, path_separator: str = ' > ') -> Optional[Any]:
         """

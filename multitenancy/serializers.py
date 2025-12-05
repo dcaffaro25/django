@@ -292,7 +292,7 @@ class ImportTransformationRuleSerializer(serializers.ModelSerializer):
             'source_sheet_name', 'skip_rows', 'header_row',
             'target_model', 'column_mappings', 'column_concatenations',
             'computed_columns', 'default_values', 'row_filter',
-            'journal_entry_options', 'extra_fields_for_trigger', 'trigger_options',
+            'extra_fields_for_trigger', 'trigger_options',
             'execution_order', 'is_active',
             'created_at', 'updated_at',
         ]
@@ -311,23 +311,6 @@ class ImportTransformationRuleSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 f"Unknown target model '{value}'. Valid models: {list(MODEL_APP_MAP.keys())}"
             )
-        return value
-    
-    def validate_journal_entry_options(self, value):
-        """Validate journal_entry_options structure."""
-        if not value:
-            return value
-        
-        if not isinstance(value, dict):
-            raise serializers.ValidationError("journal_entry_options must be a dictionary")
-        
-        valid_lookup_types = ['path', 'code', 'id', 'name']
-        lookup_type = value.get('account_lookup_type', 'path')
-        if lookup_type not in valid_lookup_types:
-            raise serializers.ValidationError(
-                f"account_lookup_type must be one of: {valid_lookup_types}"
-            )
-        
         return value
 
 

@@ -237,6 +237,303 @@ def calculate_debit_credit(amount: Decimal, account: Account) -> Dict[str, Optio
         return {'debit_amount': None, 'credit_amount': abs_amount}
 
 
+def create_transaction_with_entries(payload: Dict[str, Any], company_id: int) -> Dict[str, Any]:
+    """
+    Create a Transaction with two balanced JournalEntries from a generic payload.
+    
+    This function extracts relevant fields for Transaction and JournalEntry,
+    ignoring any extra fields that don't match model fields.
+    
+    Payload can include:
+    - Transaction fields: date, description, amount, entity_id, currency_id, state
+    - Bank account: bank_account_id (looks up associated Account for bank entry)
+    - Opposing account: account_path, account_id, or account_code
+    - Optional: cost_center_id, cost_center_path
+    - Any other fields are ignored
+    
+    Creates:
+    1. Transaction record
+    2. JournalEntry for bank account (from bank_account_id → Account with that bank_account)
+    3. JournalEntry for opposing account (from account_path/account_id/account_code)
+    
+    The debit/credit is determined by:
+    - Bank account entry: follows the amount sign (positive=debit for asset, negative=credit)
+    - Opposing account entry: opposite of bank entry to balance
+    
+    Args:
+        payload: Dict with all fields (extra fields are ignored)
+        company_id: Company ID for all records
+        
+    Returns:
+        Dict with 'transaction', 'bank_journal_entry', 'opposing_journal_entry', 'errors', 'warnings'
+    """
+    from accounting.models import Account, BankAccount
+    from accounting.serializers import TransactionSerializer, JournalEntrySerializer
+    
+    result = {
+        'transaction': None,
+        'bank_journal_entry': None,
+        'opposing_journal_entry': None,
+        'errors': [],
+        'warnings': [],
+    }
+    
+    # -------------------------------------------------------------------------
+    # 1. Extract and validate required fields
+    # -------------------------------------------------------------------------
+    
+    amount_raw = payload.get('amount')
+    if amount_raw is None:
+        result['errors'].append("Missing required field: 'amount'")
+        return result
+    
+    try:
+        # Handle Brazilian format if needed
+        if isinstance(amount_raw, str):
+            amount_raw = amount_raw.replace('.', '').replace(',', '.')
+        amount = Decimal(str(amount_raw))
+    except Exception as e:
+        result['errors'].append(f"Invalid amount value: {amount_raw}")
+        return result
+    
+    abs_amount = abs(amount)
+    
+    # Date
+    date = payload.get('date')
+    if not date:
+        result['errors'].append("Missing required field: 'date'")
+        return result
+    
+    # Description
+    description = payload.get('description', '')
+    
+    # Entity
+    entity_id = payload.get('entity_id')
+    if not entity_id:
+        result['errors'].append("Missing required field: 'entity_id'")
+        return result
+    
+    # Currency
+    currency_id = payload.get('currency_id')
+    if not currency_id:
+        result['errors'].append("Missing required field: 'currency_id'")
+        return result
+    
+    # -------------------------------------------------------------------------
+    # 2. Look up Bank Account and its associated Account
+    # -------------------------------------------------------------------------
+    
+    bank_account_id = payload.get('bank_account_id')
+    bank_account = None
+    bank_ledger_account = None
+    
+    if bank_account_id:
+        try:
+            bank_account = BankAccount.objects.filter(
+                company_id=company_id,
+                id=int(bank_account_id)
+            ).first()
+        except (ValueError, TypeError):
+            pass
+        
+        if bank_account:
+            # Find the Account linked to this BankAccount
+            bank_ledger_account = Account.objects.filter(
+                company_id=company_id,
+                bank_account_id=bank_account.id
+            ).first()
+            
+            if not bank_ledger_account:
+                result['warnings'].append(f"No ledger Account found for BankAccount {bank_account_id}")
+    else:
+        result['warnings'].append("No bank_account_id provided - bank journal entry will not be created")
+    
+    # -------------------------------------------------------------------------
+    # 3. Look up Opposing Account
+    # -------------------------------------------------------------------------
+    
+    opposing_account = None
+    
+    # Try account_id first
+    account_id = payload.get('account_id')
+    if account_id:
+        try:
+            opposing_account = Account.objects.filter(
+                company_id=company_id,
+                id=int(account_id)
+            ).first()
+        except (ValueError, TypeError):
+            pass
+    
+    # Try account_code
+    if not opposing_account:
+        account_code = payload.get('account_code')
+        if account_code:
+            opposing_account = lookup_account_by_code(str(account_code), company_id)
+    
+    # Try account_path
+    if not opposing_account:
+        account_path = payload.get('account_path')
+        path_separator = payload.get('path_separator', ' > ')
+        if account_path:
+            opposing_account = lookup_account_by_path(str(account_path), company_id, path_separator)
+    
+    if not opposing_account:
+        result['warnings'].append("No opposing account found (tried account_id, account_code, account_path)")
+    
+    # -------------------------------------------------------------------------
+    # 4. Look up Cost Center (optional)
+    # -------------------------------------------------------------------------
+    
+    cost_center_id = payload.get('cost_center_id')
+    # Could also support cost_center_path lookup here if needed
+    
+    # -------------------------------------------------------------------------
+    # 5. Create Transaction
+    # -------------------------------------------------------------------------
+    
+    transaction_data = {
+        'company': company_id,
+        'date': date,
+        'description': description,
+        'amount': abs_amount,
+        'entity_id': entity_id,
+        'currency_id': currency_id,
+        'state': payload.get('state', 'pending'),
+    }
+    
+    try:
+        tx_serializer = TransactionSerializer(data=transaction_data)
+        if tx_serializer.is_valid(raise_exception=True):
+            transaction_obj = tx_serializer.save()
+            result['transaction'] = {
+                'id': transaction_obj.id,
+                'date': str(transaction_obj.date),
+                'description': transaction_obj.description,
+                'amount': str(transaction_obj.amount),
+            }
+    except Exception as e:
+        result['errors'].append(f"Failed to create Transaction: {str(e)}")
+        return result
+    
+    # -------------------------------------------------------------------------
+    # 6. Calculate Debit/Credit for Journal Entries
+    # -------------------------------------------------------------------------
+    
+    # For bank transactions:
+    # - Positive amount (deposit/income): Bank account gets DEBIT (asset increases)
+    # - Negative amount (payment/expense): Bank account gets CREDIT (asset decreases)
+    
+    # The opposing account gets the opposite entry to balance
+    
+    if bank_ledger_account:
+        # Bank account is typically an asset (direction=1)
+        # Positive amount → debit bank, credit opposing
+        # Negative amount → credit bank, debit opposing
+        if amount >= 0:
+            bank_debit = abs_amount
+            bank_credit = None
+            opposing_debit = None
+            opposing_credit = abs_amount
+        else:
+            bank_debit = None
+            bank_credit = abs_amount
+            opposing_debit = abs_amount
+            opposing_credit = None
+    else:
+        # No bank account, skip bank entry
+        bank_debit = None
+        bank_credit = None
+        # Still create opposing entry if account exists
+        if amount >= 0:
+            opposing_debit = None
+            opposing_credit = abs_amount
+        else:
+            opposing_debit = abs_amount
+            opposing_credit = None
+    
+    # -------------------------------------------------------------------------
+    # 7. Create Bank Account Journal Entry
+    # -------------------------------------------------------------------------
+    
+    if bank_ledger_account:
+        bank_je_data = {
+            'company': company_id,
+            'transaction': transaction_obj.id,
+            'account': bank_ledger_account.id,
+            'date': date,
+            'description': description,
+            'debit_amount': bank_debit,
+            'credit_amount': bank_credit,
+            'cost_center': cost_center_id,
+            'state': 'pending',
+        }
+        
+        try:
+            bank_je_serializer = JournalEntrySerializer(data=bank_je_data)
+            if bank_je_serializer.is_valid(raise_exception=True):
+                bank_je = bank_je_serializer.save()
+                result['bank_journal_entry'] = {
+                    'id': bank_je.id,
+                    'account_id': bank_ledger_account.id,
+                    'account_name': bank_ledger_account.name,
+                    'debit_amount': str(bank_debit) if bank_debit else None,
+                    'credit_amount': str(bank_credit) if bank_credit else None,
+                }
+        except Exception as e:
+            result['errors'].append(f"Failed to create bank JournalEntry: {str(e)}")
+    
+    # -------------------------------------------------------------------------
+    # 8. Create Opposing Account Journal Entry
+    # -------------------------------------------------------------------------
+    
+    if opposing_account:
+        opposing_je_data = {
+            'company': company_id,
+            'transaction': transaction_obj.id,
+            'account': opposing_account.id,
+            'date': date,
+            'description': description,
+            'debit_amount': opposing_debit,
+            'credit_amount': opposing_credit,
+            'cost_center': cost_center_id,
+            'state': 'pending',
+        }
+        
+        try:
+            opposing_je_serializer = JournalEntrySerializer(data=opposing_je_data)
+            if opposing_je_serializer.is_valid(raise_exception=True):
+                opposing_je = opposing_je_serializer.save()
+                result['opposing_journal_entry'] = {
+                    'id': opposing_je.id,
+                    'account_id': opposing_account.id,
+                    'account_name': opposing_account.name,
+                    'account_path': opposing_account.get_path() if hasattr(opposing_account, 'get_path') else None,
+                    'debit_amount': str(opposing_debit) if opposing_debit else None,
+                    'credit_amount': str(opposing_credit) if opposing_credit else None,
+                }
+        except Exception as e:
+            result['errors'].append(f"Failed to create opposing JournalEntry: {str(e)}")
+    
+    # -------------------------------------------------------------------------
+    # 9. Update Transaction flags
+    # -------------------------------------------------------------------------
+    
+    try:
+        from accounting.utils import update_journal_entries_and_transaction_flags
+        journal_entries = []
+        if result['bank_journal_entry']:
+            journal_entries.append(JournalEntry.objects.get(id=result['bank_journal_entry']['id']))
+        if result['opposing_journal_entry']:
+            journal_entries.append(JournalEntry.objects.get(id=result['opposing_journal_entry']['id']))
+        if journal_entries:
+            update_journal_entries_and_transaction_flags(journal_entries)
+    except Exception as e:
+        result['warnings'].append(f"Could not update transaction flags: {str(e)}")
+    
+    return result
+
+
 Row = Union[Dict[str, Any], List[Any]]
 
 def _normalize(value: str) -> str:
@@ -878,6 +1175,8 @@ def execute_rule(company_id: int, rule: str, payload: list):
         "lookup_account_by_code": lambda code: lookup_account_by_code(code, company_id),
         "lookup_account_by_name": lambda name: lookup_account_by_name(name, company_id),
         "calculate_debit_credit": calculate_debit_credit,
+        # Transaction + JournalEntries creation helper
+        "create_transaction_with_entries": lambda payload: create_transaction_with_entries(payload, company_id),
         # Models for direct access
         "Account": Account,
         "Transaction": Transaction,
