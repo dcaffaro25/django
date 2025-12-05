@@ -742,27 +742,215 @@ class ETLPipelineService:
                     )
     
     def _preview_data(self) -> dict:
-        """Return preview of transformed data (all rows)."""
-        preview = {}
-        total_rows = 0
+        """
+        Return full preview of the pipeline including IntegrationRule outputs.
         
+        Runs the complete import + triggers in a transaction that gets rolled back,
+        so no actual data is persisted but user sees what WOULD be created.
+        """
+        from django.db import transaction as db_transaction
+        from multitenancy.models import IntegrationRule
+        from multitenancy.formula_engine import execute_rule
+        
+        preview = {
+            'transformed_data': {},
+            'would_create': {},
+            'integration_rules_preview': [],
+            'total_rows': 0,
+        }
+        
+        # Store transformed data preview
         for model_name, rows in self.transformed_data.items():
-            preview[model_name] = {
-                'row_count': len(rows),
-                'rows': rows,  # All rows
-                'sample_columns': list(rows[0].keys()) if rows else []
+            # Make a deep copy to avoid modifying original
+            rows_copy = [dict(row) for row in rows]
+            preview['transformed_data'][model_name] = {
+                'row_count': len(rows_copy),
+                'rows': rows_copy,
+                'sample_columns': list(rows_copy[0].keys()) if rows_copy else []
             }
-            total_rows += len(rows)
+            preview['total_rows'] += len(rows_copy)
+        
+        # Run full import + triggers in a transaction that will be rolled back
+        try:
+            with db_transaction.atomic():
+                # Create a savepoint we can rollback to
+                sid = db_transaction.savepoint()
+                
+                try:
+                    # Extract extra_fields before import
+                    extra_fields_by_model: Dict[str, List[dict]] = {}
+                    for model_name, rows in self.transformed_data.items():
+                        extra_fields_by_model[model_name] = []
+                        for row in rows:
+                            extra_fields = row.pop('__extra_fields__', {})
+                            extra_fields_by_model[model_name].append(extra_fields)
+                    
+                    # Run import
+                    sheets = []
+                    for model_name, rows in self.transformed_data.items():
+                        sheets.append({
+                            'model': model_name,
+                            'rows': rows
+                        })
+                    
+                    if sheets:
+                        import_result = execute_import_job(
+                            company_id=self.company_id,
+                            sheets=sheets,
+                            commit=True  # Commit within this transaction (will be rolled back)
+                        )
+                        
+                        # Capture what would be created
+                        for model_name, outputs in import_result.get('results', {}).items():
+                            created_records = []
+                            for output in outputs:
+                                if output.get('status') == 'success' and output.get('action') == 'create':
+                                    created_records.append(output.get('data', {}))
+                            
+                            if created_records:
+                                preview['would_create'][model_name] = {
+                                    'count': len(created_records),
+                                    'records': created_records
+                                }
+                        
+                        # Simulate IntegrationRule triggers and capture results
+                        preview['integration_rules_preview'] = self._simulate_integration_rules(
+                            import_result, 
+                            extra_fields_by_model
+                        )
+                    
+                finally:
+                    # Always rollback - this is just a preview
+                    db_transaction.savepoint_rollback(sid)
+                    
+        except Exception as e:
+            logger.warning(f"ETL Preview: Error during full preview simulation: {e}")
+            self._add_warning(
+                warning_type='preview_simulation_error',
+                message=f"Could not fully simulate import: {str(e)}. Showing transformed data only."
+            )
         
         if self.log:
-            self.log.total_rows_transformed = total_rows
+            self.log.total_rows_transformed = preview['total_rows']
             self.log.save()
         
-        return {
-            'preview': preview,
-            'total_rows': total_rows,
-            'models': list(preview.keys())
+        return preview
+    
+    def _simulate_integration_rules(self, import_result: dict, extra_fields_by_model: Dict[str, List[dict]]) -> List[dict]:
+        """
+        Simulate IntegrationRule execution for preview.
+        
+        Returns a list of what each integration rule WOULD create.
+        """
+        from multitenancy.models import IntegrationRule
+        from multitenancy.formula_engine import execute_rule
+        from django.db import transaction as db_transaction
+        
+        results = []
+        
+        MODEL_EVENT_MAP = {
+            'Transaction': 'transaction_created',
+            'JournalEntry': 'journal_entry_created',
         }
+        
+        for model_name, outputs in import_result.get('results', {}).items():
+            event_name = MODEL_EVENT_MAP.get(model_name)
+            if not event_name:
+                continue
+            
+            # Get the transformation rule to check trigger options
+            rule = self.transformation_rules.get(model_name)
+            trigger_options = (rule.trigger_options or {}) if rule else {}
+            
+            if not trigger_options.get('enabled', True):
+                continue
+            
+            allowed_events = trigger_options.get('events', [event_name])
+            if event_name not in allowed_events:
+                continue
+            
+            extra_fields_list = extra_fields_by_model.get(model_name, [])
+            
+            # Find IntegrationRules for this event
+            integration_rules = IntegrationRule.objects.filter(
+                company_id=self.company_id,
+                trigger_event=event_name,
+                is_active=True
+            ).order_by('execution_order')
+            
+            if not integration_rules.exists():
+                continue
+            
+            for idx, output in enumerate(outputs):
+                if output.get('status') != 'success' or output.get('action') != 'create':
+                    continue
+                
+                record_data = output.get('data', {})
+                record_id = record_data.get('id')
+                extra_fields = extra_fields_list[idx] if idx < len(extra_fields_list) else {}
+                
+                # Build payload
+                payload = {
+                    f'{model_name.lower()}_id': record_id,
+                    model_name.lower(): record_data,
+                    'extra_fields': extra_fields,
+                    'source': 'etl_preview',
+                }
+                
+                # Execute each integration rule
+                for int_rule in integration_rules:
+                    rule_result = {
+                        'rule_name': int_rule.name,
+                        'rule_id': int_rule.id,
+                        'trigger_event': event_name,
+                        'source_record': {
+                            'model': model_name,
+                            'id': record_id,
+                            'data': record_data
+                        },
+                        'extra_fields': extra_fields,
+                        'would_create': [],
+                        'errors': [],
+                    }
+                    
+                    try:
+                        # Run the rule in a nested savepoint
+                        sid = db_transaction.savepoint()
+                        try:
+                            result = execute_rule(self.company_id, int_rule.rule, [payload])
+                            
+                            # Capture what would be created by checking the database
+                            # Look for JournalEntries created for this transaction
+                            if model_name == 'Transaction' and record_id:
+                                from accounting.models import JournalEntry
+                                created_jes = JournalEntry.objects.filter(
+                                    transaction_id=record_id
+                                ).values('id', 'account_id', 'account__name', 'debit_amount', 'credit_amount', 'description')
+                                
+                                for je in created_jes:
+                                    rule_result['would_create'].append({
+                                        'model': 'JournalEntry',
+                                        'data': {
+                                            'account_id': je['account_id'],
+                                            'account_name': je['account__name'],
+                                            'debit_amount': str(je['debit_amount']) if je['debit_amount'] else None,
+                                            'credit_amount': str(je['credit_amount']) if je['credit_amount'] else None,
+                                            'description': je['description'],
+                                        }
+                                    })
+                            
+                            rule_result['rule_output'] = result
+                            
+                        finally:
+                            # Rollback this rule's changes
+                            db_transaction.savepoint_rollback(sid)
+                            
+                    except Exception as e:
+                        rule_result['errors'].append(str(e))
+                    
+                    results.append(rule_result)
+        
+        return results
     
     def _evaluate_expression(self, expression: str, context: dict, expr_type: str) -> Any:
         """Safely evaluate a Python expression."""

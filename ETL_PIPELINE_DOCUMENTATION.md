@@ -86,7 +86,7 @@ The ETL (Extract, Transform, Load) Pipeline provides a comprehensive system for 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/core/etl/analyze/` | POST | Analyze Excel file structure (sheets, columns, sample data) |
-| `/api/core/etl/preview/` | POST | Run full pipeline WITHOUT committing (preview mode) |
+| `/api/core/etl/preview/` | POST | Run full pipeline with simulation - shows what WOULD be created |
 | `/api/core/etl/execute/` | POST | Run full pipeline WITH commit to database |
 | `/api/core/etl/transformation-rules/` | GET/POST | List/Create transformation rules |
 | `/api/core/etl/transformation-rules/{id}/` | GET/PUT/DELETE | CRUD single transformation rule |
@@ -1071,6 +1071,138 @@ result = result  # Set result for rule completion
 2. **Use substitution rules for normalization** - Clean data before import
 
 3. **Keep transformation rules generic** - Use `extra_fields_for_trigger` for data needed by IntegrationRules
+
+---
+
+## Preview Response Format
+
+The `/api/core/etl/preview/` endpoint runs the **complete pipeline simulation** including IntegrationRules, then rolls back all changes. This shows exactly what WOULD be created.
+
+### Preview Response Structure
+
+```json
+{
+  "success": true,
+  "is_preview": true,
+  "duration_seconds": 1.23,
+  
+  "summary": {
+    "sheets_found": 2,
+    "sheets_processed": 1,
+    "sheets_skipped": 1,
+    "sheets_failed": 0,
+    "total_rows_transformed": 50
+  },
+  
+  "data": {
+    "transformed_data": {
+      "Transaction": {
+        "row_count": 50,
+        "sample_columns": ["date", "description", "amount", "entity_id", "currency_id", "__extra_fields__"],
+        "rows": [
+          {
+            "date": "2025-01-15",
+            "description": "PIX ENVIADO - FORNECEDOR",
+            "amount": "-500.00",
+            "entity_id": 10,
+            "currency_id": 12,
+            "__extra_fields__": {
+              "account_path": "Expenses > Services",
+              "bank_account_id": "5"
+            }
+          }
+        ]
+      }
+    },
+    
+    "would_create": {
+      "Transaction": {
+        "count": 50,
+        "records": [
+          {
+            "id": 123,
+            "date": "2025-01-15",
+            "description": "PIX ENVIADO - FORNECEDOR",
+            "amount": "500.00",
+            "entity_id": 10,
+            "currency_id": 12,
+            "state": "pending"
+          }
+        ]
+      }
+    },
+    
+    "integration_rules_preview": [
+      {
+        "rule_name": "Create JournalEntries from Transaction",
+        "rule_id": 5,
+        "trigger_event": "transaction_created",
+        "source_record": {
+          "model": "Transaction",
+          "id": 123,
+          "data": {
+            "id": 123,
+            "date": "2025-01-15",
+            "description": "PIX ENVIADO - FORNECEDOR",
+            "amount": "500.00"
+          }
+        },
+        "extra_fields": {
+          "account_path": "Expenses > Services",
+          "bank_account_id": "5"
+        },
+        "would_create": [
+          {
+            "model": "JournalEntry",
+            "data": {
+              "account_id": 10,
+              "account_name": "Bradesco Checking",
+              "debit_amount": null,
+              "credit_amount": "500.00",
+              "description": "PIX ENVIADO - FORNECEDOR"
+            }
+          },
+          {
+            "model": "JournalEntry",
+            "data": {
+              "account_id": 25,
+              "account_name": "Services",
+              "debit_amount": "500.00",
+              "credit_amount": null,
+              "description": "PIX ENVIADO - FORNECEDOR"
+            }
+          }
+        ],
+        "errors": []
+      }
+    ],
+    
+    "total_rows": 50
+  },
+  
+  "warnings": [],
+  "errors": []
+}
+```
+
+### Preview Sections Explained
+
+| Section | Description |
+|---------|-------------|
+| `transformed_data` | Data after transformation + substitution (before import) |
+| `would_create` | Records that WOULD be created by the direct import |
+| `integration_rules_preview` | What each IntegrationRule WOULD create |
+
+### How Preview Works
+
+1. **Transform** - Apply column mappings, concatenations, computed columns
+2. **Substitute** - Apply SubstitutionRules
+3. **Simulate Import** - Create records in a transaction
+4. **Simulate Triggers** - Execute IntegrationRules
+5. **Capture Results** - Record what would be created
+6. **Rollback** - Undo all changes (nothing persisted)
+
+This allows users to see the **complete end-to-end result** before committing
 
 4. **Test integration rules in sandbox** - Use `/api/core/test-rule/` endpoint
 
