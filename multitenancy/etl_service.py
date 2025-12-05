@@ -294,6 +294,7 @@ class ETLPipelineService:
             transformed_rows = []
             total_rows = len(df)
             filtered_count = 0
+            filtered_samples = []  # Store first few filtered rows for debugging
             
             for idx, row in df.iterrows():
                 row_dict = row.to_dict()
@@ -304,6 +305,14 @@ class ETLPipelineService:
                     if rule.row_filter:
                         if not self._evaluate_expression(rule.row_filter, row_dict, 'row_filter'):
                             filtered_count += 1
+                            # Capture first 3 filtered rows for debugging
+                            if len(filtered_samples) < 3:
+                                # Sanitize NaN values for JSON serialization
+                                sample = {k: (None if pd.isna(v) else v) for k, v in row_dict.items()}
+                                filtered_samples.append({
+                                    'row_number': row_number,
+                                    'data': sample
+                                })
                             continue
                     
                     # Build transformed row
@@ -315,6 +324,18 @@ class ETLPipelineService:
                         # Clean NaN values
                         if pd.isna(value):
                             value = None
+                        # Convert pandas Timestamp/datetime to date for date fields
+                        if target_field == 'date' and value is not None:
+                            if hasattr(value, 'date'):
+                                # pandas Timestamp or datetime
+                                value = value.date()
+                            elif isinstance(value, str) and 'T' in value:
+                                # ISO datetime string
+                                from datetime import datetime as dt
+                                try:
+                                    value = dt.fromisoformat(value.replace('Z', '+00:00')).date()
+                                except (ValueError, TypeError):
+                                    pass
                         transformed[target_field] = value
                     
                     # 2. Apply column concatenations
@@ -414,7 +435,9 @@ class ETLPipelineService:
                     message=f"Filtered out {filtered_count} rows from sheet '{sheet_name}' based on row_filter",
                     sheet=sheet_name,
                     filtered_count=filtered_count,
-                    total_rows=total_rows
+                    total_rows=total_rows,
+                    row_filter_expression=rule.row_filter,
+                    sample_filtered_rows=filtered_samples
                 )
             
             logger.info(f"ETL: Transformed {len(transformed_rows)} rows from sheet '{sheet_name}' to model '{target_model}'")
@@ -760,8 +783,28 @@ class ETLPipelineService:
             'import_errors': [],
             'integration_rules_preview': [],
             'integration_rules_available': [],
+            'transformation_rules_used': [],  # Metadata about rules that were applied
             'total_rows': 0,
         }
+        
+        # Add transformation rule metadata for debugging
+        for model_name, rule in self.transformation_rules.items():
+            preview['transformation_rules_used'].append({
+                'id': rule.id,
+                'name': rule.name,
+                'target_model': rule.target_model,
+                'source_sheet_name': rule.source_sheet_name,
+                'column_mappings': rule.column_mappings,
+                'column_concatenations': rule.column_concatenations,
+                'computed_columns': rule.computed_columns,
+                'default_values': rule.default_values,
+                'row_filter': rule.row_filter,
+                'extra_fields_for_trigger': rule.extra_fields_for_trigger,
+                'trigger_options': rule.trigger_options,
+                'skip_rows': rule.skip_rows,
+                'header_row': rule.header_row,
+                'execution_order': rule.execution_order,
+            })
         
         # Store transformed data preview
         for model_name, rows in self.transformed_data.items():
@@ -845,6 +888,25 @@ class ETLPipelineService:
                                     'fields': list(invalid_fields.keys()),
                                     'hint': "Use extra_fields_for_trigger in your transformation rule to pass these to IntegrationRules"
                                 })
+                    
+                    # Coerce dates from ISO format to date objects
+                    from datetime import datetime, date as date_type
+                    for model_name, rows in cleaned_data.items():
+                        for row in rows:
+                            if 'date' in row and row['date']:
+                                val = row['date']
+                                if isinstance(val, str):
+                                    # Parse ISO datetime string to date
+                                    try:
+                                        if 'T' in val:
+                                            row['date'] = datetime.fromisoformat(val.replace('Z', '+00:00')).date()
+                                        else:
+                                            row['date'] = datetime.strptime(val, '%Y-%m-%d').date()
+                                    except (ValueError, TypeError):
+                                        pass  # Leave as is, let validation catch it
+                                elif hasattr(val, 'date'):
+                                    # pandas Timestamp
+                                    row['date'] = val.date()
                     
                     # Filter out rows with null required fields (amount)
                     valid_rows_by_model: Dict[str, List[dict]] = {}
