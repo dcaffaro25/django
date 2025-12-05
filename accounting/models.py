@@ -172,7 +172,7 @@ class Account(TenantAwareBaseModel, MPTTModel):
         order_insertion_by = ['account_code']    
 
     class Meta:
-        unique_together = ('company', 'account_code', 'name')
+        unique_together = ('company', 'account_code', 'parent', 'name')
         indexes = [
             HnswIndex(
                 name="acct_emb_hnsw",
@@ -343,9 +343,81 @@ class Transaction(TenantAwareBaseModel):
             self.amount = Decimal(str(self.amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         return super().save(*args, **kwargs)
     
-    def check_balance(self):
-        sum([entry.debit_amount for entry in self.journal_entries.all()]) - sum(
-            [entry.credit_amount for entry in self.journal_entries.all()])
+    def check_balance(self) -> dict:
+        """
+        Check if this transaction is balanced (total debits = total credits).
+        
+        Returns a dict with:
+        - is_balanced: bool
+        - total_debit: Decimal
+        - total_credit: Decimal
+        - difference: Decimal (should be 0 if balanced)
+        """
+        entries = self.journal_entries.all()
+        
+        total_debit = sum(
+            (entry.debit_amount or Decimal('0.00')) for entry in entries
+        )
+        total_credit = sum(
+            (entry.credit_amount or Decimal('0.00')) for entry in entries
+        )
+        
+        difference = total_debit - total_credit
+        
+        return {
+            'is_balanced': abs(difference) < Decimal('0.01'),  # Allow for rounding
+            'total_debit': total_debit,
+            'total_credit': total_credit,
+            'difference': difference,
+            'entry_count': entries.count(),
+        }
+    
+    def validate_and_update_balance(self) -> dict:
+        """
+        Check balance and update is_balanced flag.
+        Returns the balance check result.
+        """
+        result = self.check_balance()
+        
+        # Update flag if changed
+        if self.is_balanced != result['is_balanced']:
+            self.is_balanced = result['is_balanced']
+            self.save(update_fields=['is_balanced'])
+        
+        return result
+    
+    def get_balance_summary(self) -> dict:
+        """
+        Get a summary of balance status for this transaction.
+        Useful for UI display.
+        """
+        balance_info = self.check_balance()
+        entries = self.journal_entries.select_related('account').all()
+        
+        entries_list = []
+        for entry in entries:
+            entries_list.append({
+                'id': entry.id,
+                'description': entry.description,
+                'debit_amount': float(entry.debit_amount or 0),
+                'credit_amount': float(entry.credit_amount or 0),
+                'account_id': entry.account_id,
+                'account_name': entry.account.name if entry.account else None,
+                'account_code': entry.account.account_code if entry.account else None,
+                'is_cash': entry.is_cash,
+            })
+        
+        return {
+            'transaction_id': self.id,
+            'date': str(self.date),
+            'description': self.description,
+            'amount': float(self.amount),
+            'is_balanced': balance_info['is_balanced'],
+            'total_debit': float(balance_info['total_debit']),
+            'total_credit': float(balance_info['total_credit']),
+            'difference': float(balance_info['difference']),
+            'entries': entries_list,
+        }
 
     def __str__(self):
         return f'{self.date} - {self.amount} - {self.description}'

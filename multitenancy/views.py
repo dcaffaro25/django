@@ -3,9 +3,15 @@ from rest_framework.views import APIView
 from django.contrib.auth import authenticate, login, logout
 from rest_framework import views, viewsets, generics, status, serializers
 from rest_framework.response import Response
-from .models import CustomUser, Company, Entity, IntegrationRule, SubstitutionRule
+from .models import CustomUser, Company, Entity, IntegrationRule, SubstitutionRule, ImportTransformationRule, ETLPipelineLog
 from .mixins import ScopedQuerysetMixin
-from .serializers import CustomUserSerializer, CompanySerializer, EntitySerializer, UserLoginSerializer, IntegrationRuleSerializer, EntityMiniSerializer, ChangePasswordSerializer, UserCreateSerializer, PasswordResetForceSerializer, SubstitutionRuleSerializer
+from .serializers import (
+    CustomUserSerializer, CompanySerializer, EntitySerializer, UserLoginSerializer,
+    IntegrationRuleSerializer, EntityMiniSerializer, ChangePasswordSerializer,
+    UserCreateSerializer, PasswordResetForceSerializer, SubstitutionRuleSerializer,
+    ImportTransformationRuleSerializer, ImportTransformationRuleListSerializer,
+    ETLPipelineLogSerializer, ETLPipelineLogListSerializer,
+)
 from .api_utils import create_csv_response, create_excel_response, _to_bool
 from rest_framework import permissions
 from rest_framework.authentication import SessionAuthentication
@@ -719,3 +725,272 @@ class BulkImportAPIView(APIView):
 
         http_status = status.HTTP_200_OK if result.get("committed") else status.HTTP_400_BAD_REQUEST
         return Response(result, status=http_status)
+
+
+# ============================================================================
+# ETL PIPELINE VIEWS
+# ============================================================================
+
+class ImportTransformationRuleViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
+    """
+    CRUD endpoints for ImportTransformationRule.
+    
+    GET /api/{tenant_id}/etl/transformation-rules/
+    POST /api/{tenant_id}/etl/transformation-rules/
+    GET /api/{tenant_id}/etl/transformation-rules/{id}/
+    PUT /api/{tenant_id}/etl/transformation-rules/{id}/
+    DELETE /api/{tenant_id}/etl/transformation-rules/{id}/
+    """
+    queryset = ImportTransformationRule.objects.all()
+    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+    
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return ImportTransformationRuleListSerializer
+        return ImportTransformationRuleSerializer
+    
+    def get_queryset(self):
+        qs = super().get_queryset()
+        # Filter by is_active if provided
+        is_active = self.request.query_params.get('is_active')
+        if is_active is not None:
+            qs = qs.filter(is_active=_to_bool(is_active))
+        # Filter by target_model if provided
+        target_model = self.request.query_params.get('target_model')
+        if target_model:
+            qs = qs.filter(target_model__iexact=target_model)
+        return qs.order_by('execution_order', 'name')
+    
+    @action(detail=False, methods=['get'])
+    def available_models(self, request, tenant_id=None):
+        """Return list of valid target models."""
+        from .tasks import MODEL_APP_MAP
+        return Response({
+            'models': list(MODEL_APP_MAP.keys())
+        })
+
+
+class ETLPipelineLogViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
+    """
+    Read-only endpoints for ETL pipeline logs.
+    
+    GET /api/{tenant_id}/etl/logs/
+    GET /api/{tenant_id}/etl/logs/{id}/
+    """
+    queryset = ETLPipelineLog.objects.all()
+    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+    
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return ETLPipelineLogListSerializer
+        return ETLPipelineLogSerializer
+    
+    def get_queryset(self):
+        qs = super().get_queryset()
+        # Filter by status if provided
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        # Filter by is_preview if provided
+        is_preview = self.request.query_params.get('is_preview')
+        if is_preview is not None:
+            qs = qs.filter(is_preview=_to_bool(is_preview))
+        return qs.order_by('-started_at')
+
+
+class ETLPipelinePreviewView(APIView):
+    """
+    Preview ETL pipeline transformation without committing.
+    
+    POST /api/{tenant_id}/etl/preview/
+    
+    Request:
+        - file: Excel file (multipart/form-data)
+    
+    Response:
+        - success: bool
+        - summary: {sheets_found, sheets_processed, etc.}
+        - data: {model_name: {row_count, rows, sample_columns}}
+        - errors: [{type, message, stage, ...}]
+        - warnings: [{type, message, ...}]
+    """
+    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+    
+    def post(self, request, tenant_id=None):
+        if 'file' not in request.FILES:
+            return Response(
+                {'error': 'No file provided. Upload an Excel file.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        company_id = request.data.get('company_id') or tenant_id
+        if not company_id:
+            return Response(
+                {'error': 'No company_id provided.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        from .etl_service import ETLPipelineService
+        
+        file = request.FILES['file']
+        service = ETLPipelineService(
+            company_id=int(company_id),
+            file=file,
+            commit=False  # Preview mode
+        )
+        
+        result = service.execute()
+        result = _scrub_json(result)
+        
+        http_status = status.HTTP_200_OK if result.get('success') else status.HTTP_400_BAD_REQUEST
+        return Response(result, status=http_status)
+
+
+class ETLPipelineExecuteView(APIView):
+    """
+    Execute ETL pipeline and commit to database.
+    
+    POST /api/{tenant_id}/etl/execute/
+    
+    Request:
+        - file: Excel file (multipart/form-data)
+    
+    Response:
+        - success: bool
+        - summary: {sheets_found, sheets_processed, etc.}
+        - import_result: {results, committed, etc.}
+        - errors: [{type, message, stage, ...}]
+        - warnings: [{type, message, ...}]
+    """
+    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+    
+    def post(self, request, tenant_id=None):
+        if 'file' not in request.FILES:
+            return Response(
+                {'error': 'No file provided. Upload an Excel file.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        company_id = request.data.get('company_id') or tenant_id
+        if not company_id:
+            return Response(
+                {'error': 'No company_id provided.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        from .etl_service import ETLPipelineService
+        
+        file = request.FILES['file']
+        service = ETLPipelineService(
+            company_id=int(company_id),
+            file=file,
+            commit=True  # Execute mode
+        )
+        
+        result = service.execute()
+        result = _scrub_json(result)
+        
+        http_status = status.HTTP_200_OK if result.get('success') else status.HTTP_400_BAD_REQUEST
+        return Response(result, status=http_status)
+
+
+class ETLPipelineAnalyzeView(APIView):
+    """
+    Analyze an Excel file and suggest transformation rules.
+    
+    POST /api/{tenant_id}/etl/analyze/
+    
+    Request:
+        - file: Excel file (multipart/form-data)
+    
+    Response:
+        - sheets: [{name, columns, row_count, sample_rows}]
+        - suggestions: [{sheet_name, suggested_target_model, suggested_mappings}]
+    """
+    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+    
+    def post(self, request, tenant_id=None):
+        if 'file' not in request.FILES:
+            return Response(
+                {'error': 'No file provided. Upload an Excel file.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        file = request.FILES['file']
+        
+        try:
+            xls = pd.read_excel(file, sheet_name=None)
+        except Exception as e:
+            return Response(
+                {'error': f'Failed to parse Excel file: {str(e)}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        sheets_info = []
+        for sheet_name, df in xls.items():
+            # Clean up dataframe
+            df = df.dropna(how='all')
+            
+            columns = [str(col) for col in df.columns]
+            row_count = len(df)
+            
+            # Get sample rows (first 5)
+            sample_rows = []
+            for idx, row in df.head(5).iterrows():
+                sample_row = {}
+                for col in columns:
+                    val = row.get(col)
+                    if pd.isna(val):
+                        val = None
+                    elif isinstance(val, (np.integer, np.floating)):
+                        val = float(val) if np.isnan(val) == False else None
+                    else:
+                        val = str(val) if val is not None else None
+                    sample_row[col] = val
+                sample_rows.append(sample_row)
+            
+            sheets_info.append({
+                'name': sheet_name,
+                'columns': columns,
+                'row_count': row_count,
+                'sample_rows': sample_rows,
+            })
+        
+        # Check for existing transformation rules
+        company_id = request.data.get('company_id') or tenant_id
+        existing_rules = []
+        if company_id:
+            existing_rules = list(
+                ImportTransformationRule.objects.filter(
+                    company_id=company_id,
+                    is_active=True
+                ).values('source_sheet_name', 'target_model', 'name')
+            )
+        
+        result = _scrub_json({
+            'sheets': sheets_info,
+            'existing_rules': existing_rules,
+            'file_name': getattr(file, 'name', 'unknown'),
+        })
+        
+        return Response(result, status=status.HTTP_200_OK)

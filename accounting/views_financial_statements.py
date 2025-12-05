@@ -1459,7 +1459,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         """
         Generate time series data for financial statement lines.
         
-        POST /api/financial-statements/time_series/
+        POST /api/financial-statements/time_series/?include_metadata=true
         {
             "template_id": 1,
             "start_date": "2025-01-01",
@@ -1468,6 +1468,11 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             "line_numbers": [1, 2, 3],  // optional, specific lines
             "include_pending": false
         }
+        
+        Query Parameters:
+        - preview=true: Returns preview without saving
+        - include_metadata=true: Includes calculation memory and metadata for debugging
+          (accounts used, calculation type, debit/credit breakdowns, etc.)
         """
         serializer = TimeSeriesRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -1496,6 +1501,9 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         # Check if preview mode
         is_preview = request.query_params.get('preview', 'false').lower() == 'true'
         
+        # Check if calculation metadata should be included (for debugging)
+        include_metadata = request.query_params.get('include_metadata', 'false').lower() == 'true'
+        
         # Get dimension(s) - support both single string and list
         dimension = data.get('dimension', 'month')
         # If dimensions list is provided, use it; otherwise use single dimension
@@ -1512,6 +1520,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 dimension=dimension,
                 line_numbers=data.get('line_numbers'),
                 include_pending=data.get('include_pending', False),
+                include_metadata=include_metadata,
             )
         else:
             series_data = generator.generate_time_series(
@@ -1521,6 +1530,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 dimension=dimension,
                 line_numbers=data.get('line_numbers'),
                 include_pending=data.get('include_pending', False),
+                include_metadata=include_metadata,
             )
         
         # Get currency for formatting

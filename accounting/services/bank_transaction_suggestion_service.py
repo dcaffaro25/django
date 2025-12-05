@@ -158,11 +158,51 @@ class BankTransactionSuggestionService:
                 )
                 
                 if suggestion:
+                    # Validate: check for duplicate accounts with opposing directions
+                    if self._has_opposing_entries_same_account(suggestion):
+                        log.warning(
+                            f"Skipping suggestion with opposing entries on same account: "
+                            f"bank_tx={bank_tx.id}, pattern={pattern}"
+                        )
+                        continue
                     suggestions.append(suggestion)
         
         # Sort by confidence and limit
         suggestions.sort(key=lambda x: x['confidence_score'], reverse=True)
         return suggestions[:max_suggestions]
+    
+    def _has_opposing_entries_same_account(self, suggestion: Dict[str, Any]) -> bool:
+        """
+        Check if a suggestion has opposing entries (debit and credit) on the same account.
+        This is invalid double-entry bookkeeping.
+        """
+        journal_entries = suggestion.get('journal_entries', [])
+        
+        # Track accounts and their directions
+        account_directions: Dict[int, set] = {}
+        
+        for je in journal_entries:
+            account_id = je.get('account_id')
+            if not account_id:
+                continue
+            
+            if account_id not in account_directions:
+                account_directions[account_id] = set()
+            
+            if je.get('debit_amount'):
+                account_directions[account_id].add('debit')
+            if je.get('credit_amount'):
+                account_directions[account_id].add('credit')
+        
+        # Check if any account has both debit and credit
+        for account_id, directions in account_directions.items():
+            if len(directions) > 1:
+                log.debug(
+                    f"Account {account_id} has opposing entries: {directions}"
+                )
+                return True
+        
+        return False
     
     def _find_historical_matches(
         self,
@@ -433,11 +473,36 @@ class BankTransactionSuggestionService:
                                 'cost_center_id': journal_entry.cost_center_id,
                             })
             
+            # Filter out any complementing entries that use the same account as the existing entry
+            # This would create opposing entries on the same account (invalid accounting)
+            existing_account_id = journal_entry.account_id
+            filtered_complementing = [
+                ce for ce in complementing_entries
+                if ce.get('account_id') != existing_account_id
+            ]
+            
+            if len(filtered_complementing) != len(complementing_entries):
+                log.warning(
+                    f"Removed complementing entry with same account as existing entry "
+                    f"(account_id={existing_account_id}, bank_tx={bank_tx.id})"
+                )
+            
+            # Calculate if the combined entries would be balanced
+            total_debit = (journal_entry.debit_amount or Decimal('0')) + sum(
+                Decimal(ce['debit_amount'] or '0') for ce in filtered_complementing
+            )
+            total_credit = (journal_entry.credit_amount or Decimal('0')) + sum(
+                Decimal(ce['credit_amount'] or '0') for ce in filtered_complementing
+            )
+            is_balanced = abs(total_debit - total_credit) < Decimal('0.01')
+            
             suggestion = {
                 'suggestion_type': 'use_existing_book',
                 'confidence_score': round(confidence, 4),
                 'similarity': round(similarity, 4),
                 'amount_match_score': round(amount_match_score, 4),
+                'is_balanced': is_balanced,
+                'balance_difference': str(total_debit - total_credit) if not is_balanced else None,
                 'existing_journal_entry': {
                     'id': journal_entry.id,
                     'transaction_id': journal_entry.transaction_id,
@@ -449,7 +514,7 @@ class BankTransactionSuggestionService:
                     'description': journal_entry.description or journal_entry.transaction.description,
                     'date': journal_entry.date.isoformat() if journal_entry.date else journal_entry.transaction.date.isoformat(),
                 },
-                'complementing_journal_entries': complementing_entries,
+                'complementing_journal_entries': filtered_complementing,
                 'bank_transaction_id': bank_tx.id,
                 'amount_difference': str(difference),
             }
@@ -466,24 +531,41 @@ class BankTransactionSuggestionService:
         """
         Find the account to use for complementing journal entries.
         Looks at historical patterns or uses the opposite side of the existing entry.
-        """
-        # Strategy 1: Use the account from the opposite side of the existing entry
-        # If existing entry is debit, complement should be credit (and vice versa)
-        # But we need to find what account was typically used
         
-        # Strategy 2: Look at historical matches to see what account was used
-        # For now, use a simple approach: find the bank account's GL account
+        IMPORTANT: Never returns the same account as existing_journal_entry to avoid
+        creating opposing entries on the same account (invalid accounting).
+        """
+        existing_account_id = existing_journal_entry.account_id
+        
+        # Strategy 1: Find the bank account's GL account
         bank_account = bank_tx.bank_account
         gl_account = Account.objects.filter(
             company_id=self.company_id,
             bank_account=bank_account,
         ).first()
         
-        if gl_account:
+        # Only return if it's a DIFFERENT account than the existing entry
+        if gl_account and gl_account.id != existing_account_id:
             return gl_account
         
-        # Fallback: use the existing entry's account (for balancing)
-        return existing_journal_entry.account
+        # Strategy 2: Look for other accounts in the same transaction
+        # Find a different account that was used in the same transaction
+        sibling_entries = JournalEntry.objects.filter(
+            transaction=existing_journal_entry.transaction,
+        ).exclude(
+            account_id=existing_account_id,
+        ).select_related('account').first()
+        
+        if sibling_entries and sibling_entries.account:
+            return sibling_entries.account
+        
+        # No suitable complement account found - return None
+        # Caller should handle this case (skip creating complement entry)
+        log.warning(
+            f"Could not find complement account for bank_tx {bank_tx.id} "
+            f"that is different from existing entry account {existing_account_id}"
+        )
+        return None
     
     def _build_suggestion(
         self,
@@ -567,35 +649,68 @@ class BankTransactionSuggestionService:
             ).first()
             
             if balancing_account:
-                if difference > 0:
-                    # Need credit to balance
-                    journal_entry_suggestions.append({
-                        'account_id': balancing_account.id,
-                        'account_code': balancing_account.account_code,
-                        'account_name': balancing_account.name,
-                        'debit_amount': None,
-                        'credit_amount': str(difference),
-                        'description': bank_tx.description,
-                        'cost_center_id': None,
-                    })
-                    total_credit += difference
+                # Check if this account is already in the journal entries
+                # If so, we CANNOT add a balancing entry (would create opposing entries on same account)
+                account_already_used = any(
+                    je['account_id'] == balancing_account.id 
+                    for je in journal_entry_suggestions
+                )
+                
+                if account_already_used:
+                    # Cannot balance using this account - it's already in use
+                    # Log warning but don't try to adjust (that would cancel out the entry)
+                    log.warning(
+                        f"Cannot add balancing entry for bank_tx {bank_tx.id}: "
+                        f"account {balancing_account.id} already in use. "
+                        f"Suggestion will be unbalanced by {difference}"
+                    )
                 else:
-                    # Need debit to balance
-                    journal_entry_suggestions.append({
-                        'account_id': balancing_account.id,
-                        'account_code': balancing_account.account_code,
-                        'account_name': balancing_account.name,
-                        'debit_amount': str(-difference),
-                        'credit_amount': None,
-                        'description': bank_tx.description,
-                        'cost_center_id': None,
-                    })
-                    total_debit += -difference
+                    # No existing entry for this account, safe to add new entry
+                    if difference > 0:
+                        # Need credit to balance
+                        journal_entry_suggestions.append({
+                            'account_id': balancing_account.id,
+                            'account_code': balancing_account.account_code,
+                            'account_name': balancing_account.name,
+                            'debit_amount': None,
+                            'credit_amount': str(difference),
+                            'description': bank_tx.description,
+                            'cost_center_id': None,
+                        })
+                        total_credit += difference
+                    else:
+                        # Need debit to balance
+                        journal_entry_suggestions.append({
+                            'account_id': balancing_account.id,
+                            'account_code': balancing_account.account_code,
+                            'account_name': balancing_account.name,
+                            'debit_amount': str(-difference),
+                            'credit_amount': None,
+                            'description': bank_tx.description,
+                            'cost_center_id': None,
+                        })
+                        total_debit += -difference
             else:
                 log.warning(
                     f"Could not find balancing account for bank_tx {bank_tx.id}, "
                     f"suggestion may be unbalanced (diff: {difference})"
                 )
+        
+        # Validate: must have at least 1 journal entry
+        if not journal_entry_suggestions:
+            log.warning(
+                f"Skipping suggestion for bank_tx {bank_tx.id}: no journal entries could be generated"
+            )
+            return None
+        
+        # Check if transaction is balanced (debits == credits)
+        final_debit = sum(
+            Decimal(je['debit_amount'] or '0') for je in journal_entry_suggestions
+        )
+        final_credit = sum(
+            Decimal(je['credit_amount'] or '0') for je in journal_entry_suggestions
+        )
+        is_balanced = abs(final_debit - final_credit) < Decimal('0.01')
         
         # Build transaction suggestion
         suggestion = {
@@ -603,6 +718,8 @@ class BankTransactionSuggestionService:
             'confidence_score': round(confidence, 4),
             'match_count': len(matches),
             'pattern': pattern,
+            'is_balanced': is_balanced,
+            'balance_difference': str(final_debit - final_credit) if not is_balanced else None,
             'transaction': {
                 'date': bank_tx.date.isoformat(),
                 'entity_id': bank_tx.bank_account.entity_id,

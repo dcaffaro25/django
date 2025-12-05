@@ -1,7 +1,7 @@
 # NORD/multitenancy/serializers.py
 
 from rest_framework import serializers
-from .models import CustomUser, Company, Entity, IntegrationRule, SubstitutionRule
+from .models import CustomUser, Company, Entity, IntegrationRule, SubstitutionRule, ImportTransformationRule, ETLPipelineLog
 from rest_framework.exceptions import ValidationError
 from django.contrib.auth import authenticate
 from accounting.models import Account, CostCenter
@@ -279,4 +279,73 @@ class SubstitutionRuleSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'company', 'model_name', 'field_name',
             'match_type', 'match_value', 'substitution_value',
+        ]
+
+
+class ImportTransformationRuleSerializer(serializers.ModelSerializer):
+    """Serializer for ETL transformation rules."""
+    
+    class Meta:
+        model = ImportTransformationRule
+        fields = [
+            'id', 'company', 'name', 'description',
+            'source_sheet_name', 'skip_rows', 'header_row',
+            'target_model', 'column_mappings', 'column_concatenations',
+            'computed_columns', 'default_values', 'row_filter',
+            'extra_fields_for_trigger', 'trigger_options',
+            'execution_order', 'is_active',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['created_at', 'updated_at']
+    
+    def validate_column_mappings(self, value):
+        """Ensure column_mappings is a valid dict."""
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("column_mappings must be a dictionary")
+        return value
+    
+    def validate_target_model(self, value):
+        """Validate that target_model is a known model."""
+        from .tasks import MODEL_APP_MAP
+        if value not in MODEL_APP_MAP:
+            raise serializers.ValidationError(
+                f"Unknown target model '{value}'. Valid models: {list(MODEL_APP_MAP.keys())}"
+            )
+        return value
+
+
+class ImportTransformationRuleListSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for listing transformation rules."""
+    
+    class Meta:
+        model = ImportTransformationRule
+        fields = [
+            'id', 'name', 'source_sheet_name', 'target_model',
+            'is_active', 'execution_order',
+        ]
+
+
+class ETLPipelineLogSerializer(serializers.ModelSerializer):
+    """Serializer for ETL pipeline execution logs."""
+    
+    class Meta:
+        model = ETLPipelineLog
+        fields = [
+            'id', 'company', 'file_name', 'file_hash', 'status', 'is_preview',
+            'sheets_found', 'sheets_processed', 'sheets_skipped', 'sheets_failed',
+            'total_rows_input', 'total_rows_transformed', 'total_rows_imported',
+            'records_created', 'warnings', 'errors',
+            'started_at', 'completed_at', 'duration_seconds',
+        ]
+        read_only_fields = fields
+
+
+class ETLPipelineLogListSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for listing ETL logs."""
+    
+    class Meta:
+        model = ETLPipelineLog
+        fields = [
+            'id', 'file_name', 'status', 'is_preview',
+            'total_rows_imported', 'started_at', 'duration_seconds',
         ]

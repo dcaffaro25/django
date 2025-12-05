@@ -924,6 +924,122 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             "status": "queued"
         })
     
+    # ==================== BALANCE VALIDATION WORKFLOW ====================
+    
+    @action(detail=False, methods=['get'], url_path='unbalanced')
+    def unbalanced(self, request, tenant_id=None):
+        """
+        List transactions that are not balanced (total debits != total credits).
+        
+        Query parameters:
+        - is_balanced: true/false (filter by is_balanced flag, default: false)
+        - date_from / date_to: filter by transaction date
+        - limit: max number of results (default 100)
+        """
+        qs = self.get_queryset()
+        
+        # Filter by is_balanced (default: show unbalanced)
+        is_balanced = request.query_params.get('is_balanced')
+        if is_balanced is not None:
+            qs = qs.filter(is_balanced=_to_bool(is_balanced))
+        else:
+            qs = qs.filter(is_balanced=False)
+        
+        # Date filters
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+        if date_from:
+            qs = qs.filter(date__gte=date_from)
+        if date_to:
+            qs = qs.filter(date__lte=date_to)
+        
+        # Limit results
+        limit = int(request.query_params.get('limit', 100))
+        qs = qs.order_by('-date', '-id')[:limit]
+        
+        # Return balance summary for each transaction
+        results = []
+        for tx in qs:
+            summary = tx.get_balance_summary()
+            results.append(summary)
+        
+        return Response({
+            'count': len(results),
+            'transactions': results
+        })
+    
+    @action(detail=True, methods=['get'], url_path='balance-status')
+    def balance_status(self, request, pk=None, tenant_id=None):
+        """
+        Get detailed balance status for a specific transaction.
+        Shows all entries and whether the transaction balances.
+        """
+        transaction = self.get_object()
+        return Response(transaction.get_balance_summary())
+    
+    @action(detail=True, methods=['post'], url_path='validate-balance')
+    def validate_balance(self, request, pk=None, tenant_id=None):
+        """
+        Validate transaction balance and update is_balanced flag.
+        Returns the validation result.
+        """
+        transaction = self.get_object()
+        result = transaction.validate_and_update_balance()
+        
+        return Response({
+            'transaction_id': transaction.id,
+            'is_balanced': result['is_balanced'],
+            'total_debit': float(result['total_debit']),
+            'total_credit': float(result['total_credit']),
+            'difference': float(result['difference']),
+            'entry_count': result['entry_count'],
+        })
+    
+    @action(detail=False, methods=['post'], url_path='bulk-validate-balance')
+    def bulk_validate_balance(self, request, tenant_id=None):
+        """
+        Validate balance for multiple transactions and update their is_balanced flag.
+        
+        POST body:
+        {
+            "transaction_ids": [1, 2, 3],  // Optional, if not provided validates all
+            "filter": {
+                "date_from": "2025-01-01",
+                "date_to": "2025-12-31"
+            }
+        }
+        """
+        transaction_ids = request.data.get('transaction_ids')
+        filter_params = request.data.get('filter', {})
+        
+        qs = self.get_queryset()
+        
+        if transaction_ids:
+            qs = qs.filter(id__in=transaction_ids)
+        
+        if filter_params.get('date_from'):
+            qs = qs.filter(date__gte=filter_params['date_from'])
+        if filter_params.get('date_to'):
+            qs = qs.filter(date__lte=filter_params['date_to'])
+        
+        results = {
+            'total': 0,
+            'balanced': 0,
+            'unbalanced': 0,
+        }
+        
+        for tx in qs:
+            result = tx.validate_and_update_balance()
+            results['total'] += 1
+            if result['is_balanced']:
+                results['balanced'] += 1
+            else:
+                results['unbalanced'] += 1
+        
+        return Response(results)
+    
+    # ==================== END BALANCE VALIDATION WORKFLOW ====================
+    
     # Automatically create a balancing journal entry
     @action(detail=True, methods=['post'])
     def create_balancing_entry(self, request, pk=None):
@@ -1703,9 +1819,13 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     else:
                         # Create new transaction and journal entries
                         tx_data = suggestion_data.get('transaction', {})
+                        # Parse date string to date object
+                        tx_date = tx_data.get('date')
+                        if isinstance(tx_date, str):
+                            tx_date = datetime.strptime(tx_date, '%Y-%m-%d').date()
                         transaction = Transaction.objects.create(
                             company_id=company_id,
-                            date=tx_data.get('date'),
+                            date=tx_date,
                             entity_id=tx_data.get('entity_id'),
                             description=tx_data.get('description', bank_tx.description),
                             amount=Decimal(str(tx_data.get('amount', abs(bank_tx.amount)))),
