@@ -1,0 +1,944 @@
+{
+  "CodeEditorCondicao": {
+    "subcontainer": "modalCodeEditorCondicao",
+    "height": 19.6,
+    "width": 12
+  },
+  "CodeEditorPayload": {
+    "container": "container2",
+    "subcontainer": "afd51",
+    "row": 4.8,
+    "height": 3.2,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 5,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "CodeEditorPayloadFiltrado": {
+    "container": "container2",
+    "subcontainer": "afd51",
+    "row": 8.8,
+    "height": 3.2,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 10,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "CodeEditorPayloadFiltrado2": {
+    "container": "container2",
+    "subcontainer": "afd51",
+    "row": 12.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 8,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "CodeEditorRegra": {
+    "subcontainer": "modalCodeEditorRegra",
+    "height": 19.6,
+    "width": 12
+  },
+  "CodeEditorSetup": {
+    "container": "container2",
+    "subcontainer": "afd51",
+    "row": 0.8,
+    "height": 3.2,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "Date10": {
+    "container": "TimeTrackingForm2",
+    "row": 0.2,
+    "height": 0.2,
+    "width": 12
+  },
+  "Date11": {
+    "container": "TimeTrackingForm2",
+    "row": 0.6,
+    "height": 0.2,
+    "width": 6
+  },
+  "Date12": {
+    "container": "TimeTrackingForm2",
+    "row": 0.6,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "Date13": {
+    "container": "RecurringAdjustmentForm2",
+    "row": 0.4,
+    "height": 0.2,
+    "width": 6
+  },
+  "Date14": {
+    "container": "RecurringAdjustmentForm2",
+    "row": 0.4,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "EditButton7": {
+    "container": "TimeTrackingForm2",
+    "rowGroup": "footer",
+    "row": 1,
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "EditButton8": {
+    "container": "RecurringAdjustmentForm2",
+    "rowGroup": "footer",
+    "row": 1,
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "EditButton9": {
+    "rowGroup": "footer",
+    "subcontainer": "modalFrame3",
+    "col": 10,
+    "height": 1,
+    "width": 2
+  },
+  "Field2": {
+    "container": "IntegrationRuleForm",
+    "row": 0.2,
+    "height": 1,
+    "width": 12
+  },
+  "Funcionario2": {
+    "type": "stack",
+    "container": "tabbedContainer2",
+    "subcontainer": "ef909",
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 1032,
+        "height": 520
+      }
+    }
+  },
+  "IntegrationRuleForm": {
+    "subcontainer": "modalFrame3",
+    "height": 19.4,
+    "width": 5,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "NewButton7": {
+    "container": "TimeTrackingForm2",
+    "rowGroup": "footer",
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "NewButton8": {
+    "container": "RecurringAdjustmentForm2",
+    "rowGroup": "footer",
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "NewButton9": {
+    "rowGroup": "footer",
+    "subcontainer": "modalFrame3",
+    "row": 1,
+    "col": 10,
+    "height": 1,
+    "width": 2
+  },
+  "Nome2": {
+    "container": "IntegrationRuleForm",
+    "height": 0.2,
+    "width": 12
+  },
+  "RecurringAdjustmentForm2": {
+    "container": "group9",
+    "subcontainer": "80487",
+    "col": 8,
+    "width": 4,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "TimeTrackingForm2": {
+    "container": "group8",
+    "subcontainer": "80487",
+    "col": 8,
+    "width": 4,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "button10": {
+    "subcontainer": "modalFrame4",
+    "row": 0.2,
+    "col": 10,
+    "height": 0.8,
+    "width": 1
+  },
+  "button11": {
+    "container": "listView2",
+    "col": 11,
+    "height": 1,
+    "width": 1
+  },
+  "button12": {
+    "container": "container2",
+    "rowGroup": "header",
+    "subcontainer": "afd51",
+    "row": 0,
+    "height": 0.8,
+    "width": 1
+  },
+  "button13": {
+    "container": "container2",
+    "subcontainer": "afd51",
+    "row": 4,
+    "col": 11,
+    "height": 0.8,
+    "width": 1,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "button14": {
+    "container": "container2",
+    "subcontainer": "afd51",
+    "row": 8,
+    "col": 11,
+    "height": 0.8,
+    "width": 1,
+    "stackPosition": {
+      "object": {
+        "ordinal": 2,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "button15": {
+    "container": "container2",
+    "subcontainer": "afd51",
+    "row": 12,
+    "col": 11,
+    "height": 0.8,
+    "width": 1,
+    "stackPosition": {
+      "object": {
+        "ordinal": 3,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "button7": {
+    "type": "stack",
+    "container": "group10",
+    "subcontainer": "20a2e",
+    "row": 0,
+    "col": 10,
+    "height": 0.8,
+    "width": 2,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 42,
+        "height": 32
+      }
+    }
+  },
+  "button8": {
+    "type": "stack",
+    "container": "group13",
+    "subcontainer": "20a2e",
+    "col": 10,
+    "height": 0.8,
+    "width": 2,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 42,
+        "height": 32
+      }
+    }
+  },
+  "button9": {
+    "container": "container2",
+    "subcontainer": "afd51",
+    "col": 11,
+    "height": 0.8,
+    "width": 1,
+    "stackPosition": {
+      "object": {
+        "ordinal": 6,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "checkbox10": {
+    "container": "RecurringAdjustmentForm2",
+    "row": 0.6,
+    "col": 6,
+    "height": 0.6,
+    "width": 6
+  },
+  "checkbox11": {
+    "container": "RecurringAdjustmentForm2",
+    "row": 1.2,
+    "col": 6,
+    "height": 0.6,
+    "width": 6
+  },
+  "checkbox12": {
+    "container": "RecurringAdjustmentForm2",
+    "row": 1.8,
+    "col": 6,
+    "height": 0.6,
+    "width": 6
+  },
+  "company5": {
+    "container": "IntegrationRuleForm",
+    "row": 1.2,
+    "height": 0.2,
+    "width": 12
+  },
+  "container2": {
+    "subcontainer": "modalFrame3",
+    "row": 0,
+    "col": 5,
+    "height": 1,
+    "width": 7,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "container3": {
+    "subcontainer": "modalFrame4",
+    "row": 1,
+    "height": 12,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "container4": {
+    "row": 0.2,
+    "height": 21.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "containerTitle1": {
+    "container": "container2",
+    "rowGroup": "header",
+    "subcontainer": "afd51",
+    "col": 1,
+    "height": 0.6,
+    "width": 8
+  },
+  "containerTitle2": {
+    "container": "container4",
+    "rowGroup": "header",
+    "height": 0.6,
+    "width": 12
+  },
+  "divider10": {
+    "container": "RecurringAdjustmentForm2",
+    "row": 2.4,
+    "height": 0.2,
+    "width": 12
+  },
+  "divider7": {
+    "container": "TimeTrackingForm2",
+    "row": 1.6,
+    "height": 0.2,
+    "width": 12
+  },
+  "divider8": {
+    "container": "TimeTrackingForm2",
+    "row": 1,
+    "height": 0.2,
+    "width": 12
+  },
+  "divider9": {
+    "container": "TimeTrackingForm2",
+    "row": 0.4,
+    "height": 0.2,
+    "width": 12
+  },
+  "formTitle15": {
+    "container": "TimeTrackingForm2",
+    "rowGroup": "header",
+    "height": 0.6,
+    "width": 12
+  },
+  "formTitle16": {
+    "container": "RecurringAdjustmentForm2",
+    "rowGroup": "header",
+    "height": 0.6,
+    "width": 12
+  },
+  "group10": {
+    "container": "group11",
+    "subcontainer": "20a2e",
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "group11": {
+    "container": "IntegrationRuleForm",
+    "row": 10.8,
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "group12": {
+    "container": "IntegrationRuleForm",
+    "row": 7,
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "group13": {
+    "container": "group12",
+    "subcontainer": "20a2e",
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "group7": {
+    "container": "tabbedContainer2",
+    "subcontainer": "46672",
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 4,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "group8": {
+    "container": "tabbedContainer2",
+    "subcontainer": "df07f",
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "group9": {
+    "container": "tabbedContainer2",
+    "subcontainer": "b7c00",
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 3,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "listView2": {
+    "container": "container3",
+    "subcontainer": "e5f54",
+    "height": 4,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "listViewTitle2": {
+    "container": "container3",
+    "rowGroup": "header",
+    "height": 0.6,
+    "width": 12
+  },
+  "modalCloseButton4": {
+    "rowGroup": "header",
+    "subcontainer": "modalFrame3",
+    "col": 9,
+    "height": 1
+  },
+  "modalCloseButton5": {
+    "rowGroup": "header",
+    "subcontainer": "modalCodeEditorRegra",
+    "col": 9,
+    "height": 1
+  },
+  "modalCloseButton6": {
+    "rowGroup": "header",
+    "subcontainer": "modalCodeEditorCondicao",
+    "col": 9,
+    "height": 1
+  },
+  "modalCloseButton7": {
+    "rowGroup": "header",
+    "subcontainer": "modalFrame4",
+    "col": 9,
+    "height": 1
+  },
+  "modalTitle4": {
+    "rowGroup": "header",
+    "subcontainer": "modalFrame3",
+    "height": 0.6,
+    "width": 9
+  },
+  "modalTitle5": {
+    "rowGroup": "header",
+    "subcontainer": "modalCodeEditorRegra",
+    "height": 1,
+    "width": 9
+  },
+  "modalTitle6": {
+    "rowGroup": "header",
+    "subcontainer": "modalCodeEditorCondicao",
+    "height": 0.6,
+    "width": 9
+  },
+  "modalTitle7": {
+    "rowGroup": "header",
+    "subcontainer": "modalFrame4",
+    "height": 1,
+    "width": 9
+  },
+  "navigation2": {
+    "container": "container4",
+    "subcontainer": "a1a7d",
+    "row": 0,
+    "height": 0.8,
+    "stackPosition": {
+      "object": {
+        "ordinal": 2,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "numberInput54": {
+    "container": "TimeTrackingForm2",
+    "row": 1.2,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput55": {
+    "container": "TimeTrackingForm2",
+    "row": 1.2,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput56": {
+    "container": "TimeTrackingForm2",
+    "row": 1.8,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput57": {
+    "container": "TimeTrackingForm2",
+    "row": 1.8,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput58": {
+    "container": "TimeTrackingForm2",
+    "row": 1.4,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput59": {
+    "container": "TimeTrackingForm2",
+    "row": 2,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput60": {
+    "container": "TimeTrackingForm2",
+    "row": 0.8,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput61": {
+    "container": "TimeTrackingForm2",
+    "row": 2,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput62": {
+    "container": "TimeTrackingForm2",
+    "row": 0.8,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput63": {
+    "container": "IntegrationRuleForm",
+    "row": 1.4,
+    "col": 8,
+    "height": 0.2,
+    "width": 4
+  },
+  "numberInput64": {
+    "container": "listView2",
+    "col": 8,
+    "height": 0.2
+  },
+  "select15": {
+    "container": "TimeTrackingForm2",
+    "height": 0.2,
+    "width": 12
+  },
+  "select16": {
+    "container": "RecurringAdjustmentForm2",
+    "row": 0.2,
+    "height": 0.2,
+    "width": 12
+  },
+  "select17": {
+    "container": "RecurringAdjustmentForm2",
+    "row": 0.6,
+    "height": 0.2,
+    "width": 6
+  },
+  "select18": {
+    "container": "IntegrationRuleForm",
+    "row": 1.4,
+    "height": 0.2,
+    "width": 8
+  },
+  "select19": {
+    "container": "listView2",
+    "height": 0.2,
+    "width": 8
+  },
+  "switch1": {
+    "container": "IntegrationRuleForm",
+    "rowGroup": "header",
+    "row": 0.2,
+    "height": 0.6,
+    "width": 7
+  },
+  "tabbedContainer2": {
+    "container": "container4",
+    "subcontainer": "a1a7d",
+    "row": 0,
+    "col": 3,
+    "height": 4,
+    "width": 9,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "table14": {
+    "container": "Funcionario2",
+    "subcontainer": "80487",
+    "height": 11,
+    "width": 12
+  },
+  "table15": {
+    "container": "group7",
+    "subcontainer": "80487",
+    "height": 11,
+    "width": 12
+  },
+  "table16": {
+    "container": "group8",
+    "subcontainer": "80487",
+    "height": 11,
+    "width": 8
+  },
+  "table17": {
+    "container": "tabbedContainer2",
+    "subcontainer": "9719f",
+    "height": 8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 2,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "table18": {
+    "container": "group9",
+    "subcontainer": "80487",
+    "height": 14,
+    "width": 8
+  },
+  "tabs2": {
+    "type": "stack",
+    "container": "tabbedContainer2",
+    "rowGroup": "header",
+    "subcontainer": "b7c00",
+    "height": 0.6,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 1032,
+        "height": 32
+      }
+    }
+  },
+  "tags2": {
+    "container": "RecurringAdjustmentForm2",
+    "row": 2.6,
+    "height": 0.8,
+    "width": 12
+  },
+  "text10": {
+    "container": "container2",
+    "subcontainer": "afd51",
+    "row": 4.2,
+    "height": 0.6,
+    "width": 10,
+    "stackPosition": {
+      "object": {
+        "ordinal": 4,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "text11": {
+    "subcontainer": "modalFrame4",
+    "row": 0.4,
+    "height": 0.6
+  },
+  "text12": {
+    "subcontainer": "modalFrame4",
+    "row": 0.4,
+    "col": 7,
+    "height": 0.6
+  },
+  "text3": {
+    "container": "container2",
+    "subcontainer": "afd51",
+    "row": 0.2,
+    "height": 0.6,
+    "width": 10,
+    "stackPosition": {
+      "object": {
+        "ordinal": 11,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "text6": {
+    "type": "stack",
+    "container": "group10",
+    "subcontainer": "20a2e",
+    "height": 0.6,
+    "width": 4,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 83,
+        "height": 24
+      }
+    }
+  },
+  "text7": {
+    "type": "stack",
+    "container": "group13",
+    "subcontainer": "20a2e",
+    "height": 0.6,
+    "width": 4,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 83,
+        "height": 24
+      }
+    }
+  },
+  "text8": {
+    "container": "container2",
+    "subcontainer": "afd51",
+    "row": 8.2,
+    "height": 0.6,
+    "width": 10,
+    "stackPosition": {
+      "object": {
+        "ordinal": 9,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "text9": {
+    "container": "container2",
+    "subcontainer": "afd51",
+    "row": 12.2,
+    "height": 0.6,
+    "width": 10,
+    "stackPosition": {
+      "object": {
+        "ordinal": 7,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "textArea4": {
+    "container": "RecurringAdjustmentForm2",
+    "row": 3.4,
+    "height": 1,
+    "width": 12
+  },
+  "textArea7": {
+    "container": "group11",
+    "subcontainer": "20a2e",
+    "row": 3.8,
+    "height": 1,
+    "width": 12
+  },
+  "textArea8": {
+    "container": "group12",
+    "subcontainer": "20a2e",
+    "row": 3.8,
+    "height": 1,
+    "width": 12
+  },
+  "textInput11": {
+    "container": "TimeTrackingForm2",
+    "row": 2.2,
+    "height": 0.2,
+    "width": 11
+  },
+  "textInput12": {
+    "container": "RecurringAdjustmentForm2",
+    "height": 0.2,
+    "width": 11
+  }
+}

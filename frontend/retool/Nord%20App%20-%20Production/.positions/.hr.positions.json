@@ -1,0 +1,610 @@
+{
+  "CPF": {
+    "container": "EmployeeForm",
+    "row": 0.2,
+    "height": 0.2,
+    "width": 12
+  },
+  "Cargo": {
+    "container": "PositionForm",
+    "height": 0.2,
+    "width": 12
+  },
+  "Date": {
+    "container": "TimeTrackingForm",
+    "row": 0.2,
+    "height": 0.2,
+    "width": 12
+  },
+  "Date5": {
+    "container": "RecurringAdjustmentForm",
+    "row": 0.4,
+    "height": 0.2,
+    "width": 6
+  },
+  "Date6": {
+    "container": "RecurringAdjustmentForm",
+    "row": 0.4,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "Date7": {
+    "container": "TimeTrackingForm",
+    "row": 0.6,
+    "height": 0.2,
+    "width": 6
+  },
+  "Date8": {
+    "container": "TimeTrackingForm",
+    "row": 0.6,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "Description": {
+    "container": "PositionForm",
+    "row": 0.2,
+    "height": 0.2,
+    "width": 12
+  },
+  "EditButton": {
+    "container": "EmployeeForm",
+    "rowGroup": "footer",
+    "row": 1,
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "EditButton2": {
+    "container": "PositionForm",
+    "rowGroup": "footer",
+    "row": 1,
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "EditButton3": {
+    "container": "TimeTrackingForm",
+    "rowGroup": "footer",
+    "row": 1,
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "EditButton4": {
+    "container": "RecurringAdjustmentForm",
+    "rowGroup": "footer",
+    "row": 1,
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "EmployeeForm": {
+    "container": "Funcionario",
+    "subcontainer": "80487",
+    "col": 8,
+    "width": 4,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "Funcionario": {
+    "container": "tabbedContainer1",
+    "subcontainer": "ef909",
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "NewButton": {
+    "container": "EmployeeForm",
+    "rowGroup": "footer",
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "NewButton2": {
+    "container": "PositionForm",
+    "rowGroup": "footer",
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "NewButton3": {
+    "container": "TimeTrackingForm",
+    "rowGroup": "footer",
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "NewButton4": {
+    "container": "RecurringAdjustmentForm",
+    "rowGroup": "footer",
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "Nome": {
+    "container": "EmployeeForm",
+    "height": 0.2,
+    "width": 12
+  },
+  "PositionForm": {
+    "container": "group4",
+    "subcontainer": "80487",
+    "col": 8,
+    "width": 4,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "RecurringAdjustmentForm": {
+    "container": "group6",
+    "subcontainer": "80487",
+    "col": 8,
+    "width": 4,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "TimeTrackingForm": {
+    "container": "group5",
+    "subcontainer": "80487",
+    "col": 8,
+    "width": 4,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "barChart1": {
+    "row": 12.2,
+    "col": 5,
+    "height": 6,
+    "width": 5
+  },
+  "button5": {
+    "container": "EmployeeForm",
+    "row": 1,
+    "height": 1,
+    "width": 2
+  },
+  "checkbox3": {
+    "container": "RecurringAdjustmentForm",
+    "row": 0.6,
+    "col": 6,
+    "height": 0.6,
+    "width": 6
+  },
+  "checkbox4": {
+    "container": "RecurringAdjustmentForm",
+    "row": 1.2,
+    "col": 6,
+    "height": 0.6,
+    "width": 6
+  },
+  "checkbox5": {
+    "container": "RecurringAdjustmentForm",
+    "row": 1.8,
+    "col": 6,
+    "height": 0.6,
+    "width": 6
+  },
+  "company": {
+    "container": "EmployeeForm",
+    "row": 0.4,
+    "height": 0.2,
+    "width": 12
+  },
+  "company2": {
+    "container": "PositionForm",
+    "row": 0.6,
+    "height": 0.2,
+    "width": 12
+  },
+  "date4": {
+    "container": "EmployeeForm",
+    "row": 0.6,
+    "height": 0.2,
+    "width": 6
+  },
+  "department": {
+    "container": "PositionForm",
+    "row": 0.4,
+    "height": 0.2,
+    "width": 12
+  },
+  "divider1": {
+    "container": "TimeTrackingForm",
+    "row": 1.6,
+    "height": 0.2,
+    "width": 12
+  },
+  "divider2": {
+    "container": "TimeTrackingForm",
+    "row": 1,
+    "height": 0.2,
+    "width": 12
+  },
+  "divider3": {
+    "container": "TimeTrackingForm",
+    "row": 0.4,
+    "height": 0.2,
+    "width": 12
+  },
+  "divider4": {
+    "container": "RecurringAdjustmentForm",
+    "row": 2.4,
+    "height": 0.2,
+    "width": 12
+  },
+  "form8": {
+    "subcontainer": "modalNewPosition",
+    "width": 4,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "formButton7": {
+    "container": "form8",
+    "rowGroup": "footer",
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "formTitle10": {
+    "container": "RecurringAdjustmentForm",
+    "rowGroup": "header",
+    "height": 0.6,
+    "width": 12
+  },
+  "formTitle11": {
+    "container": "form8",
+    "rowGroup": "header",
+    "height": 0.6,
+    "width": 12
+  },
+  "formTitle7": {
+    "container": "EmployeeForm",
+    "rowGroup": "header",
+    "height": 0.6,
+    "width": 12
+  },
+  "formTitle8": {
+    "container": "PositionForm",
+    "rowGroup": "header",
+    "height": 0.6,
+    "width": 12
+  },
+  "formTitle9": {
+    "container": "TimeTrackingForm",
+    "rowGroup": "header",
+    "height": 0.6,
+    "width": 12
+  },
+  "group4": {
+    "container": "tabbedContainer1",
+    "subcontainer": "46672",
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 4,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "group5": {
+    "container": "tabbedContainer1",
+    "subcontainer": "df07f",
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "group6": {
+    "container": "tabbedContainer1",
+    "subcontainer": "b7c00",
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 3,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "modalCloseButton3": {
+    "rowGroup": "header",
+    "subcontainer": "modalNewPosition",
+    "col": 9,
+    "height": 1
+  },
+  "modalTitle3": {
+    "rowGroup": "header",
+    "subcontainer": "modalNewPosition",
+    "height": 0.6,
+    "width": 9
+  },
+  "numberInput30": {
+    "container": "EmployeeForm",
+    "row": 0.6,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput31": {
+    "container": "PositionForm",
+    "row": 0.8,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput32": {
+    "container": "PositionForm",
+    "row": 0.8,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput33": {
+    "container": "PositionForm",
+    "row": 1,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput34": {
+    "container": "TimeTrackingForm",
+    "row": 1.2,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput35": {
+    "container": "TimeTrackingForm",
+    "row": 1.2,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput38": {
+    "container": "TimeTrackingForm",
+    "row": 1.8,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput39": {
+    "container": "TimeTrackingForm",
+    "row": 1.8,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput40": {
+    "container": "TimeTrackingForm",
+    "row": 1.4,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput41": {
+    "container": "TimeTrackingForm",
+    "row": 2,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput42": {
+    "container": "TimeTrackingForm",
+    "row": 0.8,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput43": {
+    "container": "TimeTrackingForm",
+    "row": 2,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput44": {
+    "container": "TimeTrackingForm",
+    "row": 0.8,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "numberInput45": {
+    "container": "form8",
+    "height": 0.2,
+    "width": 12
+  },
+  "numberInput46": {
+    "container": "form8",
+    "row": 0.2,
+    "height": 0.2,
+    "width": 12
+  },
+  "numberInput47": {
+    "container": "form8",
+    "row": 1,
+    "height": 0.2,
+    "width": 12
+  },
+  "numberInput48": {
+    "container": "form8",
+    "row": 1.2,
+    "height": 0.2,
+    "width": 12
+  },
+  "numberInput49": {
+    "container": "form8",
+    "row": 1.4,
+    "height": 0.2,
+    "width": 12
+  },
+  "select10": {
+    "container": "RecurringAdjustmentForm",
+    "row": 0.2,
+    "height": 0.2,
+    "width": 12
+  },
+  "select11": {
+    "container": "RecurringAdjustmentForm",
+    "row": 0.6,
+    "height": 0.2,
+    "width": 6
+  },
+  "select8": {
+    "container": "EmployeeForm",
+    "row": 0.8,
+    "height": 0.2,
+    "width": 12
+  },
+  "select9": {
+    "container": "TimeTrackingForm",
+    "height": 0.2,
+    "width": 12
+  },
+  "statistic1": {
+    "row": 15,
+    "height": 0.8,
+    "width": 2
+  },
+  "tabbedContainer1": {
+    "row": 19.2,
+    "height": 4,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "table10": {
+    "container": "group5",
+    "subcontainer": "80487",
+    "height": 11,
+    "width": 8
+  },
+  "table11": {
+    "container": "tabbedContainer1",
+    "subcontainer": "9719f",
+    "height": 8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 2,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "table12": {
+    "container": "group6",
+    "subcontainer": "80487",
+    "height": 14,
+    "width": 8
+  },
+  "table8": {
+    "container": "Funcionario",
+    "subcontainer": "80487",
+    "height": 11,
+    "width": 8
+  },
+  "table9": {
+    "container": "group4",
+    "subcontainer": "80487",
+    "height": 11,
+    "width": 8
+  },
+  "tabs1": {
+    "container": "tabbedContainer1",
+    "rowGroup": "header",
+    "subcontainer": "b7c00",
+    "height": 0.6,
+    "width": 12
+  },
+  "tags1": {
+    "container": "RecurringAdjustmentForm",
+    "row": 2.6,
+    "height": 0.8,
+    "width": 12
+  },
+  "textArea1": {
+    "container": "RecurringAdjustmentForm",
+    "row": 3.4,
+    "height": 1,
+    "width": 12
+  },
+  "textInput4": {
+    "container": "RecurringAdjustmentForm",
+    "height": 0.2,
+    "width": 11
+  },
+  "textInput5": {
+    "container": "TimeTrackingForm",
+    "row": 2.2,
+    "height": 0.2,
+    "width": 11
+  },
+  "textInput6": {
+    "container": "form8",
+    "row": 0.4,
+    "height": 0.2,
+    "width": 12
+  },
+  "textInput7": {
+    "container": "form8",
+    "row": 0.6,
+    "height": 0.2,
+    "width": 12
+  },
+  "textInput8": {
+    "container": "form8",
+    "row": 0.8,
+    "height": 0.2,
+    "width": 12
+  }
+}

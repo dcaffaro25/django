@@ -1,0 +1,1184 @@
+{
+  "AmountTolerance2": {
+    "container": "collapsibleContainer16",
+    "subcontainer": "53ea8",
+    "row": 3,
+    "height": 0.2,
+    "width": 6,
+    "stackPosition": {
+      "object": {
+        "ordinal": 3,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "BankReconciliationParameters3": {
+    "row": 6.2,
+    "height": 8,
+    "width": 4
+  },
+  "BankReconciliationParameters4": {
+    "row": 14.2,
+    "height": 8,
+    "width": 4
+  },
+  "BankToCombine2": {
+    "container": "collapsibleContainer16",
+    "subcontainer": "53ea8",
+    "row": 1.2,
+    "height": 0.2,
+    "width": 6,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "BookToCombine2": {
+    "container": "collapsibleContainer16",
+    "subcontainer": "53ea8",
+    "row": 1.2,
+    "col": 6,
+    "height": 0.2,
+    "width": 6,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "DateTolerance2": {
+    "container": "collapsibleContainer16",
+    "subcontainer": "53ea8",
+    "row": 3,
+    "col": 6,
+    "height": 0.2,
+    "width": 6,
+    "stackPosition": {
+      "object": {
+        "ordinal": 2,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "MaxSuggestions2": {
+    "container": "collapsibleContainer16",
+    "subcontainer": "53ea8",
+    "row": 4.8,
+    "col": 6,
+    "height": 0.2,
+    "width": 6,
+    "stackPosition": {
+      "object": {
+        "ordinal": 6,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "MinConfidence2": {
+    "container": "collapsibleContainer16",
+    "subcontainer": "53ea8",
+    "row": 4.8,
+    "height": 0.2,
+    "width": 6,
+    "stackPosition": {
+      "object": {
+        "ordinal": 4,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "bankTransactionsInput2": {
+    "container": "form15",
+    "row": 0.2,
+    "height": 0.2,
+    "width": 12
+  },
+  "barChart3": {
+    "type": "stack",
+    "container": "group58",
+    "subcontainer": "c9c98",
+    "col": 2,
+    "height": 5.8,
+    "width": 10,
+    "stackPosition": {
+      "object": {
+        "ordinal": 2,
+        "widthType": "fill",
+        "width": 1387,
+        "height": 232
+      }
+    }
+  },
+  "button39": {
+    "container": "container18",
+    "rowGroup": "header",
+    "subcontainer": "9fde9",
+    "col": 10,
+    "height": 1,
+    "width": 2
+  },
+  "button40": {
+    "container": "container18",
+    "rowGroup": "header",
+    "subcontainer": "9fde9",
+    "col": 8,
+    "height": 1,
+    "width": 2
+  },
+  "buttonGroup4": {
+    "type": "stack",
+    "container": "container21",
+    "subcontainer": "c9c98",
+    "row": 0,
+    "col": 3,
+    "height": 1,
+    "width": 9,
+    "stackPosition": {
+      "object": {
+        "ordinal": 2,
+        "widthType": "auto",
+        "width": 586.5755208333334,
+        "height": 40
+      }
+    }
+  },
+  "buttonGroup5": {
+    "type": "stack",
+    "container": "group54",
+    "subcontainer": "c9c98",
+    "row": 0.6,
+    "height": 1,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "auto",
+        "width": 586.5755208333334,
+        "height": 40
+      }
+    }
+  },
+  "buttonGroup6": {
+    "type": "stack",
+    "container": "group59",
+    "subcontainer": "c9c98",
+    "col": 8,
+    "height": 1,
+    "width": 4,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "auto",
+        "width": 458,
+        "height": 40
+      }
+    }
+  },
+  "buttonShowDetailPendencias2": {
+    "type": "stack",
+    "container": "group60",
+    "subcontainer": "c9c98",
+    "row": 0.6,
+    "height": 1,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "auto",
+        "width": 229,
+        "height": 40
+      }
+    }
+  },
+  "collapsibleContainer16": {
+    "type": "stack",
+    "container": "group64",
+    "subcontainer": "27d6c",
+    "height": 4,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 339,
+        "height": 48
+      }
+    }
+  },
+  "collapsibleContainer17": {
+    "type": "stack",
+    "container": "group64",
+    "subcontainer": "27d6c",
+    "row": 8.4,
+    "height": 4,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 2,
+        "widthType": "fixed",
+        "width": 339,
+        "height": 48
+      }
+    }
+  },
+  "collapsibleContainer18": {
+    "type": "stack",
+    "container": "group64",
+    "subcontainer": "27d6c",
+    "row": 12.4,
+    "height": 4,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 339,
+        "height": 200
+      }
+    }
+  },
+  "collapsibleTitle16": {
+    "container": "collapsibleContainer16",
+    "rowGroup": "header",
+    "height": 0.8,
+    "width": 9
+  },
+  "collapsibleTitle17": {
+    "container": "collapsibleContainer17",
+    "rowGroup": "header",
+    "height": 0.8,
+    "width": 9
+  },
+  "collapsibleTitle18": {
+    "container": "collapsibleContainer18",
+    "rowGroup": "header",
+    "height": 0.8,
+    "width": 9
+  },
+  "collapsibleToggle16": {
+    "container": "collapsibleContainer16",
+    "rowGroup": "header",
+    "col": 9,
+    "height": 0.8
+  },
+  "collapsibleToggle17": {
+    "container": "collapsibleContainer17",
+    "rowGroup": "header",
+    "col": 9,
+    "height": 0.8
+  },
+  "collapsibleToggle18": {
+    "container": "collapsibleContainer18",
+    "rowGroup": "header",
+    "col": 9,
+    "height": 0.8
+  },
+  "companyInput13": {
+    "container": "form15",
+    "height": 0.2,
+    "width": 12
+  },
+  "container18": {
+    "subcontainer": "modalImportTransactions2",
+    "height": 24.4,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "container19": {
+    "type": "stack",
+    "container": "group61",
+    "subcontainer": "d5693",
+    "row": 4.2,
+    "height": 1,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fill",
+        "width": "100px",
+        "height": 400
+      }
+    }
+  },
+  "container20": {
+    "type": "stack",
+    "container": "group62",
+    "subcontainer": "c9c98",
+    "row": 0,
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fill",
+        "width": "100px-349-863-247",
+        "height": 152
+      }
+    }
+  },
+  "container21": {
+    "type": "stack",
+    "container": "group62",
+    "subcontainer": "c9c98",
+    "row": 3.8,
+    "height": 20,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 400,
+        "height": 900
+      }
+    }
+  },
+  "containerTitle19": {
+    "type": "stack",
+    "container": "container18",
+    "rowGroup": "header",
+    "subcontainer": "9fde9",
+    "row": 0.2,
+    "height": 0.6,
+    "width": 4,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 472,
+        "height": 32
+      }
+    }
+  },
+  "containerTitle20": {
+    "type": "stack",
+    "container": "group60",
+    "subcontainer": "c9c98",
+    "height": 0.6,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "auto",
+        "width": 1664,
+        "height": 32
+      }
+    }
+  },
+  "containerTitle21": {
+    "container": "container21",
+    "rowGroup": "header",
+    "height": 0.6,
+    "width": 12
+  },
+  "dateRangeBank2": {
+    "container": "collapsibleContainer17",
+    "subcontainer": "53ea8",
+    "row": 1.8,
+    "height": 0.2,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "dateRangeBook2": {
+    "container": "collapsibleContainer18",
+    "subcontainer": "08456",
+    "row": 0.2,
+    "col": 1,
+    "height": 0.2,
+    "width": 10,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "divider16": {
+    "subcontainer": "modalFrame8",
+    "row": 10.8,
+    "height": 0.2,
+    "width": 4
+  },
+  "divider17": {
+    "container": "container20",
+    "subcontainer": "c9c98",
+    "row": 3.8,
+    "col": 1,
+    "height": 0.2,
+    "width": 10,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "divider18": {
+    "container": "form15",
+    "row": 3.2,
+    "col": 1,
+    "height": 0.2,
+    "width": 10
+  },
+  "divider19": {
+    "container": "form15",
+    "row": 13,
+    "col": 1,
+    "height": 0.2,
+    "width": 10
+  },
+  "divider20": {
+    "container": "form15",
+    "row": 1.6,
+    "col": 1,
+    "height": 0.2,
+    "width": 10
+  },
+  "fileDropzoneBook2": {
+    "type": "stack",
+    "container": "group49",
+    "subcontainer": "bc13f",
+    "row": 3.8,
+    "height": 3,
+    "width": 5,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 400,
+        "height": 120
+      }
+    }
+  },
+  "form15": {
+    "subcontainer": "modalManualConciliation2",
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "formBankAccounts2": {
+    "row": 4.2,
+    "col": 1,
+    "height": 0.2,
+    "width": 1
+  },
+  "formBanks2": {
+    "row": 4.2,
+    "height": 0.4,
+    "width": 1
+  },
+  "formButton14": {
+    "rowGroup": "footer",
+    "subcontainer": "modalManualConciliation2",
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "group48": {
+    "container": "container18",
+    "subcontainer": "9fde9",
+    "height": 22,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "group49": {
+    "type": "stack",
+    "container": "group48",
+    "subcontainer": "9fde9",
+    "height": 12.8,
+    "width": 5,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 400,
+        "height": 512
+      }
+    }
+  },
+  "group50": {
+    "container": "group53",
+    "subcontainer": "c9c98",
+    "row": 0,
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "group51": {
+    "type": "stack",
+    "container": "group58",
+    "subcontainer": "c9c98",
+    "row": 5.8,
+    "height": 1,
+    "width": 2,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fill",
+        "width": 238,
+        "height": 40
+      }
+    }
+  },
+  "group52": {
+    "type": "stack",
+    "container": "group57",
+    "subcontainer": "c9c98",
+    "height": 1,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fill",
+        "width": 1250,
+        "height": 300
+      }
+    }
+  },
+  "group53": {
+    "type": "stack",
+    "container": "group55",
+    "subcontainer": "c9c98",
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fill",
+        "width": 905,
+        "height": 320
+      }
+    }
+  },
+  "group54": {
+    "type": "stack",
+    "container": "group55",
+    "subcontainer": "c9c98",
+    "row": 3.8,
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fill",
+        "width": 1206,
+        "height": 344
+      }
+    }
+  },
+  "group55": {
+    "container": "container20",
+    "subcontainer": "c9c98",
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "group56": {
+    "type": "stack",
+    "container": "group52",
+    "subcontainer": "c9c98",
+    "row": 7,
+    "height": 3.8,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "auto",
+        "width": 329,
+        "height": 168
+      }
+    }
+  },
+  "group57": {
+    "container": "container19",
+    "subcontainer": "c9c98",
+    "height": 8.2,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "group58": {
+    "type": "stack",
+    "container": "group52",
+    "subcontainer": "c9c98",
+    "height": 7,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 1115,
+        "height": 300
+      }
+    }
+  },
+  "group59": {
+    "container": "container19",
+    "rowGroup": "header",
+    "subcontainer": "c9c98",
+    "height": 1,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "group60": {
+    "type": "stack",
+    "container": "group59",
+    "subcontainer": "c9c98",
+    "row": 4.8,
+    "height": 3.8,
+    "width": 8,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "auto",
+        "width": 817,
+        "height": 80
+      }
+    }
+  },
+  "group61": {
+    "row": 0.4,
+    "height": 3.8,
+    "width": 12
+  },
+  "group62": {
+    "type": "stack",
+    "container": "group61",
+    "subcontainer": "d5693",
+    "row": 5.2,
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fill",
+        "width": 1025,
+        "height": 1600
+      }
+    }
+  },
+  "group63": {
+    "type": "stack",
+    "container": "group59",
+    "subcontainer": "c9c98",
+    "row": 1,
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 2,
+        "widthType": "auto",
+        "width": 250,
+        "height": 320
+      }
+    }
+  },
+  "group64": {
+    "container": "container21",
+    "subcontainer": "c9c98",
+    "row": 1.6,
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "isDeletedInput5": {
+    "container": "form15",
+    "row": 14.6,
+    "height": 0.6,
+    "width": 12
+  },
+  "journalEntriesInput2": {
+    "container": "form15",
+    "row": 1.8,
+    "height": 0.2,
+    "width": 12
+  },
+  "manageBanks2": {
+    "row": 4.2,
+    "col": 2,
+    "height": 2
+  },
+  "maxBankAmount2": {
+    "container": "collapsibleContainer17",
+    "subcontainer": "53ea8",
+    "row": 0,
+    "col": 6,
+    "height": 0.2,
+    "width": 6,
+    "stackPosition": {
+      "object": {
+        "ordinal": 4,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "maxBookAmount2": {
+    "container": "collapsibleContainer18",
+    "subcontainer": "08456",
+    "row": 0,
+    "col": 6,
+    "height": 0.2,
+    "width": 5,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "minBankAmount2": {
+    "container": "collapsibleContainer17",
+    "subcontainer": "53ea8",
+    "row": 0,
+    "height": 0.2,
+    "width": 6,
+    "stackPosition": {
+      "object": {
+        "ordinal": 3,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "minBookAmount2": {
+    "container": "collapsibleContainer18",
+    "subcontainer": "08456",
+    "row": 0,
+    "col": 1,
+    "height": 0.2,
+    "width": 5,
+    "stackPosition": {
+      "object": {
+        "ordinal": 2,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "modalCloseButton36": {
+    "rowGroup": "header",
+    "subcontainer": "modalFrame8",
+    "col": 9,
+    "height": 1
+  },
+  "modalCloseButton38": {
+    "rowGroup": "header",
+    "subcontainer": "modalImportTransactions2",
+    "col": 9,
+    "height": 1
+  },
+  "modalCloseButton39": {
+    "rowGroup": "header",
+    "subcontainer": "modalManualConciliation2",
+    "col": 9,
+    "height": 1
+  },
+  "modalTitle34": {
+    "rowGroup": "header",
+    "subcontainer": "modalFrame8",
+    "height": 0.6,
+    "width": 9
+  },
+  "modalTitle35": {
+    "rowGroup": "header",
+    "subcontainer": "modalManualConciliation2",
+    "height": 0.6,
+    "width": 9
+  },
+  "multiselect6": {
+    "type": "stack",
+    "container": "collapsibleContainer17",
+    "subcontainer": "53ea8",
+    "row": 5.4,
+    "height": 0.2,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 350,
+        "height": 64
+      }
+    }
+  },
+  "notesInput2": {
+    "container": "form15",
+    "row": 13.6,
+    "height": 1,
+    "width": 12
+  },
+  "referenceInput2": {
+    "container": "form15",
+    "row": 13.4,
+    "height": 0.2,
+    "width": 12
+  },
+  "splitButton2": {
+    "type": "stack",
+    "container": "group51",
+    "subcontainer": "c9c98",
+    "row": 2,
+    "height": 1,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 110,
+        "height": 40
+      }
+    }
+  },
+  "statistic4": {
+    "type": "stack",
+    "container": "group56",
+    "subcontainer": "c9c98",
+    "height": 0.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "auto",
+        "width": 328,
+        "height": 72
+      }
+    }
+  },
+  "statistic5": {
+    "type": "stack",
+    "container": "group56",
+    "subcontainer": "c9c98",
+    "row": 0.8,
+    "height": 0.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "auto",
+        "width": 328,
+        "height": 72
+      }
+    }
+  },
+  "statusInput2": {
+    "container": "form15",
+    "row": 13.2,
+    "height": 0.2,
+    "width": 12
+  },
+  "switchSameBank2": {
+    "container": "collapsibleContainer16",
+    "subcontainer": "53ea8",
+    "row": 0.2,
+    "height": 0.6,
+    "width": 6,
+    "stackPosition": {
+      "object": {
+        "ordinal": 5,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "switchSameEntity2": {
+    "container": "collapsibleContainer16",
+    "subcontainer": "53ea8",
+    "row": 0.2,
+    "col": 6,
+    "height": 0.6,
+    "width": 6,
+    "stackPosition": {
+      "object": {
+        "ordinal": 7,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "table43": {
+    "type": "stack",
+    "container": "group48",
+    "subcontainer": "9fde9",
+    "col": 5,
+    "height": 13,
+    "width": 7,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fill",
+        "width": "100px",
+        "height": 535
+      }
+    }
+  },
+  "table44": {
+    "container": "group54",
+    "subcontainer": "c9c98",
+    "row": 1.6,
+    "height": 7.6,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "table45": {
+    "container": "table44",
+    "height": 1,
+    "width": 6
+  },
+  "table46": {
+    "container": "table44",
+    "col": 6,
+    "height": 1,
+    "width": 6
+  },
+  "table47": {
+    "row": 22.2,
+    "height": 8,
+    "width": 12
+  },
+  "tableBank2": {
+    "type": "stack",
+    "container": "group50",
+    "subcontainer": "c9c98",
+    "row": 0.6,
+    "height": 8,
+    "width": 6,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 482,
+        "height": 320
+      }
+    }
+  },
+  "tableBook2": {
+    "type": "stack",
+    "container": "group50",
+    "subcontainer": "c9c98",
+    "row": 0.6,
+    "col": 6,
+    "height": 8,
+    "width": 6,
+    "stackPosition": {
+      "object": {
+        "ordinal": 3,
+        "widthType": "fixed",
+        "width": 482,
+        "height": 320
+      }
+    }
+  },
+  "text39": {
+    "container": "group50",
+    "subcontainer": "c9c98",
+    "height": 0.6,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "text40": {
+    "container": "group50",
+    "subcontainer": "c9c98",
+    "col": 6,
+    "height": 0.6,
+    "stackPosition": {
+      "object": {
+        "ordinal": 2,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "text41": {
+    "container": "form15",
+    "row": 0.4,
+    "height": 1.2,
+    "width": 12
+  },
+  "text42": {
+    "container": "form15",
+    "row": 2,
+    "height": 1.2,
+    "width": 12
+  },
+  "text43": {
+    "container": "form15",
+    "row": 3.4,
+    "height": 1.6,
+    "width": 12
+  },
+  "textInput23": {
+    "container": "collapsibleContainer17",
+    "subcontainer": "53ea8",
+    "row": 3.6,
+    "height": 0.2,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 2,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "toggleAllowRowSelection2": {
+    "type": "stack",
+    "container": "group63",
+    "subcontainer": "27d6c",
+    "row": 8,
+    "height": 1,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 100,
+        "height": 40
+      }
+    }
+  },
+  "toggleButton4": {
+    "type": "stack",
+    "container": "group51",
+    "subcontainer": "c9c98",
+    "height": 1,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 3,
+        "widthType": "fixed",
+        "width": 100,
+        "height": 40
+      }
+    }
+  },
+  "toggleButton5": {
+    "type": "stack",
+    "container": "group51",
+    "subcontainer": "c9c98",
+    "row": 1,
+    "height": 1,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 100,
+        "height": 40
+      }
+    }
+  },
+  "toggleShowParametros2": {
+    "type": "stack",
+    "container": "group63",
+    "subcontainer": "27d6c",
+    "row": 7,
+    "height": 1,
+    "width": 2,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 120,
+        "height": 40
+      }
+    }
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "toolscriptVersion": "1.0.0",
+  "version": "43.0.9",
+  "pageUuid": "e3abc5e0-76fc-11f0-a95f-f36fe4dd63cd",
+  "appTemplate": {
+    "appThemeId": "custom",
+    "preloadedAppJavaScript": "function updateJournalEntry(updatedKey, updatedValue) {\n  try {\n    // Step 1: Log key and value for debugging\n    console.log(\"Updated Key:\", updatedKey);\n    console.log(\"Updated Value:\", updatedValue);\n\n    // Step 2: Retrieve the current ListViewUpdatedValue\n    let tempData = JSON.parse(JSON.stringify(ListViewUpdatedValue.value || {}));\n    console.log(\"Current ListViewUpdatedValue:\", tempData);\n\n    // Step 3: Access the journal_entries array\n    let journalEntries = tempData.journal_entries || [];\n    console.log(\"Current journal_entries:\", journalEntries);\n\n    // Step 4: Determine the index of the row being updated\n    const i = table5.selectedRowIndex; // Index of the selected row\n    if (i < 0 || i >= journalEntries.length) {\n      utils.showNotification({ title: \"Error\", message: \"Invalid row index.\", type: \"error\" });\n      console.error(\"Error: Invalid row index:\", i);\n      return;\n    }\n\n    // Step 5: Update the specific key in the selected journal entry\n    journalEntries[i] = {\n      ...journalEntries[i], // Preserve other fields\n      [updatedKey]: updatedValue // Update only the specified key\n    };\n\n    // Step 6: Save back to ListViewUpdatedValue\n    tempData.journal_entries = journalEntries;\n    ListViewUpdatedValue.setValue(tempData);\n\n    // Step 7: Log the updated object\n    console.log(\"Updated ListViewUpdatedValue:\", tempData);\n\n    // Success Notification\n    utils.showNotification({ title: \"Success\", message: \"Value updated successfully!\", type: \"success\" });\n  } catch (error) {\n    console.error(\"An unexpected error occurred:\", error);\n    utils.showNotification({ title: \"Error\", message: \"Unexpected error occurred.\", type: \"error\" });\n  }\n}\n",
+    "pageCodeFolders": {
+      "object": {
+        "home": {
+          "array": []
+        },
+        "planoContas2": {
+          "array": []
+        },
+        "Transacoes": {
+          "array": []
+        },
+        "page2": {
+          "array": []
+        },
+        "configuracoes": {
+          "array": []
+        },
+        "page3": {
+          "array": []
+        },
+        "hr": {
+          "array": []
+        },
+        "bankReconciliation": {
+          "array": []
+        },
+        "cadastroContabilidade": {
+          "array": []
+        },
+        "cadastroBilling": {
+          "array": []
+        },
+        "bankReconciliation2": {
+          "array": []
+        },
+        "login": {
+          "array": []
+        },
+        "configuracoes2": {
+          "array": []
+        },
+        "page4": {
+          "array": []
+        },
+        "page5": {
+          "array": []
+        }
+      }
+    },
+    "notificationsSettings": {
+      "object": {
+        "globalQueryShowFailureToast": true,
+        "globalQueryShowSuccessToast": false,
+        "globalQueryToastDuration": 4.5,
+        "globalToastPosition": "topCenter"
+      }
+    },
+    "queryStatusVisibility": true,
+    "rootScreen": "login",
+    "appThemeName": "Custom app theme",
+    "version": "3.313.0",
+    "experimentalDataTabEnabled": true
+  }
+}

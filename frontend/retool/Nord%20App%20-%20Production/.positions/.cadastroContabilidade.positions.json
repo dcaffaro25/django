@@ -1,0 +1,935 @@
+{
+  "AccountForm": {
+    "subcontainer": "modalAccount",
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "BankAccountForm": {
+    "subcontainer": "modalBankAccount",
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "BankForm": {
+    "subcontainer": "modalBank",
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "CostCenterForm": {
+    "subcontainer": "modalCostCenter",
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "EditButton14": {
+    "rowGroup": "footer",
+    "subcontainer": "modalEntidade",
+    "row": 1,
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "EditButton15": {
+    "rowGroup": "footer",
+    "subcontainer": "modalAccount",
+    "row": 1,
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "EditButton16": {
+    "container": "CostCenterForm",
+    "rowGroup": "footer",
+    "row": 1,
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "EntityForm": {
+    "subcontainer": "modalEntidade",
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "NewButton14": {
+    "rowGroup": "footer",
+    "subcontainer": "modalEntidade",
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "NewButton15": {
+    "rowGroup": "footer",
+    "subcontainer": "modalAccount",
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "NewButton16": {
+    "container": "CostCenterForm",
+    "rowGroup": "footer",
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "accountCodeInput": {
+    "container": "AccountForm",
+    "row": 0.4,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "accountDirectionInput": {
+    "container": "AccountForm",
+    "row": 0.4,
+    "col": 3,
+    "height": 0.2
+  },
+  "accountNumberInput": {
+    "container": "BankAccountForm",
+    "row": 0.6,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "accountTypeInput": {
+    "container": "BankAccountForm",
+    "row": 0.2,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "accountsInput": {
+    "container": "EntityForm",
+    "row": 1.4,
+    "height": 5.2,
+    "width": 6
+  },
+  "balanceDateInput": {
+    "container": "BankAccountForm",
+    "row": 0.8,
+    "height": 0.2,
+    "width": 6
+  },
+  "balanceDateInput2": {
+    "container": "CostCenterForm",
+    "row": 3.6,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "balanceInput": {
+    "container": "BankAccountForm",
+    "row": 0.8,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "balanceInput2": {
+    "container": "AccountForm",
+    "row": 0.6,
+    "height": 0.2,
+    "width": 6
+  },
+  "balanceInput3": {
+    "container": "CostCenterForm",
+    "row": 3.6,
+    "height": 0.2,
+    "width": 6
+  },
+  "bankCodeInput": {
+    "container": "BankForm",
+    "row": 0.2,
+    "height": 0.2,
+    "width": 6
+  },
+  "bankInput": {
+    "container": "BankAccountForm",
+    "row": 0.4,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "branchIdInput": {
+    "container": "BankAccountForm",
+    "row": 0.6,
+    "height": 0.2,
+    "width": 6
+  },
+  "breadcrumbs1": {
+    "row": 0.2,
+    "height": 0.6,
+    "width": 11
+  },
+  "button26": {
+    "rowGroup": "footer",
+    "subcontainer": "modalBankAccount",
+    "height": 1,
+    "width": 2
+  },
+  "button27": {
+    "rowGroup": "footer",
+    "subcontainer": "modalBankAccount",
+    "row": 1,
+    "height": 1,
+    "width": 2
+  },
+  "button28": {
+    "rowGroup": "footer",
+    "subcontainer": "modalBank",
+    "height": 1,
+    "width": 2
+  },
+  "button29": {
+    "rowGroup": "footer",
+    "subcontainer": "modalBank",
+    "row": 1,
+    "height": 1,
+    "width": 2
+  },
+  "centerTypeInput": {
+    "container": "CostCenterForm",
+    "row": 0,
+    "col": 8,
+    "height": 0.2,
+    "width": 4
+  },
+  "collapsibleContainer4": {
+    "container": "group40",
+    "subcontainer": "5de92",
+    "row": 0,
+    "height": 4,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "collapsibleContainer5": {
+    "container": "group40",
+    "subcontainer": "5de92",
+    "row": 8,
+    "height": 4,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 2,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "collapsibleContainer6": {
+    "container": "group40",
+    "subcontainer": "5de92",
+    "row": 12,
+    "height": 4,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 3,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "collapsibleContainer7": {
+    "container": "group40",
+    "subcontainer": "5de92",
+    "row": 16,
+    "height": 4,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 4,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "collapsibleContainer8": {
+    "row": 1.4,
+    "height": 4,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "collapsibleContainer9": {
+    "container": "group40",
+    "subcontainer": "5de92",
+    "row": 4,
+    "height": 4,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "collapsibleTitle4": {
+    "container": "collapsibleContainer4",
+    "rowGroup": "header",
+    "height": 0.8,
+    "width": 9
+  },
+  "collapsibleTitle5": {
+    "container": "collapsibleContainer5",
+    "rowGroup": "header",
+    "height": 0.8,
+    "width": 9
+  },
+  "collapsibleTitle6": {
+    "container": "collapsibleContainer6",
+    "rowGroup": "header",
+    "height": 0.8
+  },
+  "collapsibleTitle7": {
+    "container": "collapsibleContainer7",
+    "rowGroup": "header",
+    "height": 0.8,
+    "width": 9
+  },
+  "collapsibleTitle8": {
+    "container": "collapsibleContainer8",
+    "rowGroup": "header",
+    "height": 0.8,
+    "width": 9
+  },
+  "collapsibleTitle9": {
+    "container": "collapsibleContainer9",
+    "rowGroup": "header",
+    "height": 0.8,
+    "width": 9
+  },
+  "collapsibleToggle4": {
+    "container": "collapsibleContainer4",
+    "rowGroup": "header",
+    "col": 9,
+    "height": 0.8
+  },
+  "collapsibleToggle5": {
+    "container": "collapsibleContainer5",
+    "rowGroup": "header",
+    "col": 9,
+    "height": 0.8
+  },
+  "collapsibleToggle6": {
+    "container": "collapsibleContainer6",
+    "rowGroup": "header",
+    "col": 9,
+    "height": 0.8
+  },
+  "collapsibleToggle7": {
+    "container": "collapsibleContainer7",
+    "rowGroup": "header",
+    "col": 9,
+    "height": 0.8
+  },
+  "collapsibleToggle8": {
+    "container": "collapsibleContainer8",
+    "rowGroup": "header",
+    "col": 9,
+    "height": 0.8
+  },
+  "collapsibleToggle9": {
+    "container": "collapsibleContainer9",
+    "rowGroup": "header",
+    "col": 9,
+    "height": 0.8
+  },
+  "companyInput": {
+    "container": "EntityForm",
+    "row": 0,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "companyInput2": {
+    "container": "BankAccountForm",
+    "row": 1,
+    "height": 0.2,
+    "width": 12
+  },
+  "companyInput3": {
+    "container": "AccountForm",
+    "height": 0.2,
+    "width": 6
+  },
+  "costCentersInput": {
+    "container": "EntityForm",
+    "row": 1.4,
+    "col": 6,
+    "height": 5.2,
+    "width": 6
+  },
+  "countryInput": {
+    "container": "BankForm",
+    "row": 0.2,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "currencyInput": {
+    "container": "BankAccountForm",
+    "row": 0.4,
+    "height": 0.2,
+    "width": 6
+  },
+  "currencyInput2": {
+    "container": "AccountForm",
+    "row": 0.4,
+    "height": 0.2
+  },
+  "date15": {
+    "container": "AccountForm",
+    "row": 0.6,
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "descriptionInput": {
+    "container": "CostCenterForm",
+    "row": 1.8,
+    "height": 0.2,
+    "width": 12
+  },
+  "entityInput": {
+    "container": "BankAccountForm",
+    "height": 0.2,
+    "width": 12
+  },
+  "form12": {
+    "subcontainer": "modalNewPosition2",
+    "width": 11,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "formButton11": {
+    "container": "form12",
+    "rowGroup": "footer",
+    "col": 8,
+    "height": 1,
+    "width": 4
+  },
+  "formTitle23": {
+    "container": "form12",
+    "rowGroup": "header",
+    "height": 0.6,
+    "width": 12
+  },
+  "formTitle24": {
+    "container": "EntityForm",
+    "rowGroup": "header",
+    "height": 0.6,
+    "width": 12
+  },
+  "group40": {
+    "container": "collapsibleContainer8",
+    "subcontainer": "fd113",
+    "height": 3.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "group42": {
+    "container": "EntityForm",
+    "row": 0.4,
+    "height": 1,
+    "width": 6
+  },
+  "group43": {
+    "container": "EntityForm",
+    "row": 0.4,
+    "col": 6,
+    "height": 1,
+    "width": 6
+  },
+  "icon2": {
+    "type": "stack",
+    "container": "group42",
+    "subcontainer": "108be",
+    "row": 4.2,
+    "col": 5,
+    "height": 0.6,
+    "width": 1,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 32,
+        "height": 25
+      }
+    }
+  },
+  "icon3": {
+    "type": "stack",
+    "container": "group43",
+    "subcontainer": "108be",
+    "row": 4.8,
+    "col": 6,
+    "height": 0.6,
+    "width": 1,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 32,
+        "height": 24
+      }
+    }
+  },
+  "inheritAccountsInput": {
+    "type": "stack",
+    "container": "group42",
+    "subcontainer": "108be",
+    "row": 4.2,
+    "height": 0.6,
+    "width": 5,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "auto",
+        "width": 273.3479817708333,
+        "height": 24
+      }
+    }
+  },
+  "inheritCostCentersInput": {
+    "type": "stack",
+    "container": "group43",
+    "subcontainer": "108be",
+    "row": 4.2,
+    "col": 6,
+    "height": 0.6,
+    "width": 6,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "auto",
+        "width": 328.0113525390625,
+        "height": 24
+      }
+    }
+  },
+  "isActiveInput": {
+    "container": "AccountForm",
+    "row": 11.2,
+    "col": 6,
+    "height": 0.6,
+    "width": 6
+  },
+  "modalCloseButton12": {
+    "rowGroup": "header",
+    "subcontainer": "modalNewPosition2",
+    "col": 9,
+    "height": 1
+  },
+  "modalCloseButton13": {
+    "rowGroup": "header",
+    "subcontainer": "modalEntidade",
+    "col": 9,
+    "height": 1
+  },
+  "modalCloseButton14": {
+    "rowGroup": "header",
+    "subcontainer": "modalEntidadeFC",
+    "col": 9,
+    "height": 1
+  },
+  "modalCloseButton15": {
+    "rowGroup": "header",
+    "subcontainer": "modalBankAccount",
+    "col": 9,
+    "height": 1
+  },
+  "modalCloseButton16": {
+    "rowGroup": "header",
+    "subcontainer": "modalBankAccountsFS",
+    "col": 9,
+    "height": 1
+  },
+  "modalCloseButton17": {
+    "rowGroup": "header",
+    "subcontainer": "modalAccount",
+    "col": 9,
+    "height": 1
+  },
+  "modalCloseButton18": {
+    "rowGroup": "header",
+    "subcontainer": "modalCostCenter",
+    "col": 9,
+    "height": 1
+  },
+  "modalCloseButton19": {
+    "rowGroup": "header",
+    "subcontainer": "modalBank",
+    "col": 9,
+    "height": 1
+  },
+  "modalCloseButton20": {
+    "rowGroup": "header",
+    "subcontainer": "modalBankFS",
+    "col": 9,
+    "height": 1
+  },
+  "modalCloseButton21": {
+    "rowGroup": "header",
+    "subcontainer": "modalAccountFS",
+    "col": 9,
+    "height": 1
+  },
+  "modalCloseButton22": {
+    "rowGroup": "header",
+    "subcontainer": "modalFrame6",
+    "col": 9,
+    "height": 1
+  },
+  "modalTitle10": {
+    "rowGroup": "header",
+    "subcontainer": "modalNewPosition2",
+    "height": 0.6,
+    "width": 9
+  },
+  "modalTitle11": {
+    "rowGroup": "header",
+    "subcontainer": "modalEntidade",
+    "height": 0.6,
+    "width": 9
+  },
+  "modalTitle12": {
+    "rowGroup": "header",
+    "subcontainer": "modalEntidadeFC",
+    "height": 0.6,
+    "width": 9
+  },
+  "modalTitle13": {
+    "rowGroup": "header",
+    "subcontainer": "modalBankAccount",
+    "row": 0.2,
+    "height": 0.6,
+    "width": 9
+  },
+  "modalTitle14": {
+    "rowGroup": "header",
+    "subcontainer": "modalBankAccountsFS",
+    "height": 0.6,
+    "width": 9
+  },
+  "modalTitle15": {
+    "rowGroup": "header",
+    "subcontainer": "modalAccount",
+    "height": 0.6,
+    "width": 9
+  },
+  "modalTitle16": {
+    "rowGroup": "header",
+    "subcontainer": "modalCostCenter",
+    "height": 0.6,
+    "width": 9
+  },
+  "modalTitle17": {
+    "rowGroup": "header",
+    "subcontainer": "modalBank",
+    "height": 0.6,
+    "width": 9
+  },
+  "modalTitle18": {
+    "rowGroup": "header",
+    "subcontainer": "modalBankFS",
+    "height": 0.6,
+    "width": 9
+  },
+  "modalTitle19": {
+    "rowGroup": "header",
+    "subcontainer": "modalAccountFS",
+    "height": 0.6,
+    "width": 9
+  },
+  "modalTitle20": {
+    "rowGroup": "header",
+    "subcontainer": "modalFrame6",
+    "height": 0.6,
+    "width": 9
+  },
+  "nameInput": {
+    "container": "EntityForm",
+    "height": 0.2,
+    "width": 6
+  },
+  "nameInput2": {
+    "container": "BankAccountForm",
+    "row": 0.2,
+    "height": 0.2,
+    "width": 6
+  },
+  "nameInput3": {
+    "container": "AccountForm",
+    "col": 6,
+    "height": 0.2,
+    "width": 6
+  },
+  "nameInput5": {
+    "container": "BankForm",
+    "row": 0,
+    "height": 0.2,
+    "width": 12
+  },
+  "nameInput6": {
+    "container": "CostCenterForm",
+    "height": 0.2,
+    "width": 8
+  },
+  "numberInput89": {
+    "container": "form12",
+    "height": 0.2,
+    "width": 12
+  },
+  "numberInput90": {
+    "container": "form12",
+    "row": 0.2,
+    "height": 0.2,
+    "width": 12
+  },
+  "numberInput91": {
+    "container": "form12",
+    "row": 1,
+    "height": 0.2,
+    "width": 12
+  },
+  "numberInput92": {
+    "container": "form12",
+    "row": 1.2,
+    "height": 0.2,
+    "width": 12
+  },
+  "numberInput93": {
+    "container": "form12",
+    "row": 1.4,
+    "height": 0.2,
+    "width": 12
+  },
+  "numberInput94": {
+    "container": "CostCenterForm",
+    "row": 3.8,
+    "height": 0.2,
+    "width": 4
+  },
+  "parentIdInput": {
+    "container": "EntityForm",
+    "row": 0.2,
+    "height": 0.2,
+    "width": 12
+  },
+  "parentIdInput2": {
+    "container": "AccountForm",
+    "row": 0.2,
+    "height": 0.2,
+    "width": 12
+  },
+  "selectBankAccount": {
+    "container": "AccountForm",
+    "row": 0.8,
+    "height": 0.2,
+    "width": 6
+  },
+  "table36": {
+    "container": "collapsibleContainer4",
+    "subcontainer": "fd113",
+    "row": 0,
+    "height": 6.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "table37": {
+    "subcontainer": "modalEntidadeFC",
+    "height": 23.8,
+    "width": 12
+  },
+  "tableAccount": {
+    "container": "collapsibleContainer6",
+    "subcontainer": "fd113",
+    "height": 8.8,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "tableAccount2": {
+    "subcontainer": "modalAccountFS",
+    "height": 23.8,
+    "width": 12
+  },
+  "tableBankAccount": {
+    "container": "collapsibleContainer5",
+    "subcontainer": "fd113",
+    "height": 8.2,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "tableBankAccount3": {
+    "container": "collapsibleContainer9",
+    "subcontainer": "fd113",
+    "height": 8.2,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "tableBankAccount4": {
+    "subcontainer": "modalBankFS",
+    "height": 23.8,
+    "width": 12
+  },
+  "tableBankAccount5": {
+    "subcontainer": "modalBankAccountsFS",
+    "height": 23.8,
+    "width": 12
+  },
+  "tableCostCenter": {
+    "container": "collapsibleContainer7",
+    "subcontainer": "fd113",
+    "height": 8.4,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "tableCostCenter2": {
+    "subcontainer": "modalFrame6",
+    "height": 23.8,
+    "width": 12
+  },
+  "textArea10": {
+    "container": "AccountForm",
+    "row": 8,
+    "col": 6,
+    "height": 1,
+    "width": 6
+  },
+  "textArea11": {
+    "container": "AccountForm",
+    "row": 2,
+    "height": 1,
+    "width": 6
+  },
+  "textArea9": {
+    "container": "AccountForm",
+    "row": 1,
+    "height": 1,
+    "width": 6
+  },
+  "textInput17": {
+    "container": "form12",
+    "row": 0.4,
+    "height": 0.2,
+    "width": 12
+  },
+  "textInput18": {
+    "container": "form12",
+    "row": 0.6,
+    "height": 0.2,
+    "width": 12
+  },
+  "textInput19": {
+    "container": "form12",
+    "row": 0.8,
+    "height": 0.2,
+    "width": 12
+  },
+  "textInput27": {
+    "container": "collapsibleContainer6",
+    "rowGroup": "header",
+    "row": 0.6,
+    "height": 0.2,
+    "width": 6
+  }
+}

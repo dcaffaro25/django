@@ -1,0 +1,149 @@
+{
+  "button41": {
+    "row": 0.4,
+    "height": 1,
+    "width": 2
+  },
+  "buttonGroup7": {
+    "container": "linkCard1",
+    "subcontainer": "00030",
+    "col": 7,
+    "height": 1,
+    "width": 5,
+    "stackPosition": {
+      "object": {
+        "ordinal": 5,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "container22": {
+    "container": "gridView1",
+    "height": 1,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "containerFooter1": {
+    "container": "linkCard1",
+    "subcontainer": "00030",
+    "row": 2.6,
+    "height": 0.6,
+    "width": 8,
+    "stackPosition": {
+      "object": {
+        "ordinal": 4,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "containerTitle22": {
+    "container": "container22",
+    "rowGroup": "header",
+    "height": 0.6,
+    "width": 12
+  },
+  "containerTitle23": {
+    "container": "linkCard1",
+    "subcontainer": "00030",
+    "row": 1.2,
+    "height": 0.6,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 1,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "containerTitle24": {
+    "container": "linkCard1",
+    "subcontainer": "00030",
+    "row": 1.8,
+    "height": 0.6,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 2,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "gridView1": {
+    "row": 1.6,
+    "height": 22.4,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "linkCard1": {
+    "container": "container22",
+    "subcontainer": "00030",
+    "height": 4,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "spacer1": {
+    "container": "linkCard1",
+    "subcontainer": "00030",
+    "row": 1,
+    "height": 0.2,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 0,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "spacer2": {
+    "container": "linkCard1",
+    "subcontainer": "00030",
+    "row": 2.4,
+    "height": 0.2,
+    "width": 12,
+    "stackPosition": {
+      "object": {
+        "ordinal": 3,
+        "widthType": "fixed",
+        "width": 0,
+        "height": 0
+      }
+    }
+  },
+  "textInput24": {
+    "row": 0.4,
+    "col": 2,
+    "height": 0.2,
+    "width": 10
+  }
+}

@@ -1,0 +1,79 @@
+import { createContext, useContext, useState, useEffect, ReactNode } from "react"
+import { useQuery } from "@tanstack/react-query"
+import { apiClient } from "@/lib/api-client"
+import type { Company } from "@/types"
+
+interface TenantContextType {
+  tenant: Company | null
+  tenants: Company[]
+  isLoading: boolean
+  setTenant: (tenant: Company | null) => void
+  switchTenant: (tenantSubdomain: string) => void
+}
+
+const TenantContext = createContext<TenantContextType | undefined>(undefined)
+
+export function TenantProvider({ children }: { children: ReactNode }) {
+  const [tenant, setTenantState] = useState<Company | null>(null)
+
+  // Fetch available tenants (companies)
+  const { data: tenants = [], isLoading } = useQuery({
+    queryKey: ["companies"],
+    queryFn: () => apiClient.get<Company[]>("/api/core/companies/"),
+    enabled: true, // Always fetch, but might need auth
+  })
+
+  // Load tenant from localStorage on mount
+  useEffect(() => {
+    const storedTenant = localStorage.getItem("selected_tenant")
+    if (storedTenant) {
+      try {
+        const parsed = JSON.parse(storedTenant)
+        setTenantState(parsed)
+        apiClient.setTenantId(parsed.subdomain)
+      } catch (error) {
+        console.error("Failed to parse tenant from localStorage", error)
+        localStorage.removeItem("selected_tenant")
+      }
+    }
+  }, [])
+
+  const setTenant = (newTenant: Company | null) => {
+    setTenantState(newTenant)
+    if (newTenant) {
+      localStorage.setItem("selected_tenant", JSON.stringify(newTenant))
+      apiClient.setTenantId(newTenant.subdomain)
+    } else {
+      localStorage.removeItem("selected_tenant")
+      apiClient.setTenantId(null)
+    }
+  }
+
+  const switchTenant = (tenantSubdomain: string) => {
+    const foundTenant = tenants.find((t) => t.subdomain === tenantSubdomain)
+    if (foundTenant) {
+      setTenant(foundTenant)
+    } else {
+      console.error(`Tenant with subdomain ${tenantSubdomain} not found`)
+    }
+  }
+
+  const value: TenantContextType = {
+    tenant,
+    tenants,
+    isLoading,
+    setTenant,
+    switchTenant,
+  }
+
+  return <TenantContext.Provider value={value}>{children}</TenantContext.Provider>
+}
+
+export function useTenant() {
+  const context = useContext(TenantContext)
+  if (context === undefined) {
+    throw new Error("useTenant must be used within a TenantProvider")
+  }
+  return context
+}
+
