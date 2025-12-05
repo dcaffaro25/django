@@ -749,13 +749,17 @@ class ETLPipelineService:
         so no actual data is persisted but user sees what WOULD be created.
         """
         from django.db import transaction as db_transaction
+        from django.apps import apps
         from multitenancy.models import IntegrationRule
         from multitenancy.formula_engine import execute_rule
         
         preview = {
             'transformed_data': {},
             'would_create': {},
+            'would_fail': {},
+            'import_errors': [],
             'integration_rules_preview': [],
+            'integration_rules_available': [],
             'total_rows': 0,
         }
         
@@ -770,6 +774,21 @@ class ETLPipelineService:
             }
             preview['total_rows'] += len(rows_copy)
         
+        # Check for available IntegrationRules
+        MODEL_EVENT_MAP = {
+            'Transaction': 'transaction_created',
+            'JournalEntry': 'journal_entry_created',
+        }
+        for model_name in self.transformed_data.keys():
+            event_name = MODEL_EVENT_MAP.get(model_name)
+            if event_name:
+                rules = IntegrationRule.objects.filter(
+                    company_id=self.company_id,
+                    trigger_event=event_name,
+                    is_active=True
+                ).values('id', 'name', 'trigger_event')
+                preview['integration_rules_available'].extend(list(rules))
+        
         # Run full import + triggers in a transaction that will be rolled back
         try:
             with db_transaction.atomic():
@@ -777,21 +796,97 @@ class ETLPipelineService:
                 sid = db_transaction.savepoint()
                 
                 try:
-                    # Extract extra_fields before import
+                    # Extract extra_fields and filter invalid model fields before import
                     extra_fields_by_model: Dict[str, List[dict]] = {}
+                    cleaned_data: Dict[str, List[dict]] = {}
+                    
                     for model_name, rows in self.transformed_data.items():
                         extra_fields_by_model[model_name] = []
-                        for row in rows:
+                        cleaned_data[model_name] = []
+                        
+                        # Get valid model fields
+                        app_label = MODEL_APP_MAP.get(model_name)
+                        valid_fields = set()
+                        if app_label:
+                            try:
+                                model = apps.get_model(app_label, model_name)
+                                valid_fields = {f.name for f in model._meta.fields}
+                                # Also include _id variants for ForeignKey
+                                for f in model._meta.fields:
+                                    if hasattr(f, 'column'):
+                                        valid_fields.add(f.column)
+                            except LookupError:
+                                pass
+                        
+                        for idx, row in enumerate(rows):
                             extra_fields = row.pop('__extra_fields__', {})
+                            
+                            # Move invalid fields to extra_fields
+                            cleaned_row = {}
+                            invalid_fields = {}
+                            for key, value in row.items():
+                                # Check if this is a valid model field
+                                field_name = key.replace('_id', '') if key.endswith('_id') else key
+                                if key in valid_fields or field_name in valid_fields or not valid_fields:
+                                    cleaned_row[key] = value
+                                else:
+                                    invalid_fields[key] = value
+                            
+                            # Merge invalid fields into extra_fields
+                            extra_fields.update(invalid_fields)
                             extra_fields_by_model[model_name].append(extra_fields)
+                            cleaned_data[model_name].append(cleaned_row)
+                            
+                            if invalid_fields and idx == 0:
+                                # Log once about moved fields
+                                preview['import_errors'].append({
+                                    'type': 'fields_moved_to_extra',
+                                    'message': f"Fields not in {model_name} model moved to extra_fields: {list(invalid_fields.keys())}",
+                                    'fields': list(invalid_fields.keys()),
+                                    'hint': "Use extra_fields_for_trigger in your transformation rule to pass these to IntegrationRules"
+                                })
                     
-                    # Run import
+                    # Filter out rows with null required fields (amount)
+                    valid_rows_by_model: Dict[str, List[dict]] = {}
+                    failed_rows_by_model: Dict[str, List[dict]] = {}
+                    
+                    for model_name, rows in cleaned_data.items():
+                        valid_rows_by_model[model_name] = []
+                        failed_rows_by_model[model_name] = []
+                        valid_extra_fields = []
+                        
+                        for idx, row in enumerate(rows):
+                            # Check for null amount (required field for Transaction)
+                            if model_name == 'Transaction' and (row.get('amount') is None):
+                                failed_rows_by_model[model_name].append({
+                                    'row_number': idx + 1,
+                                    'reason': 'amount is null/missing',
+                                    'data': row
+                                })
+                            else:
+                                valid_rows_by_model[model_name].append(row)
+                                valid_extra_fields.append(extra_fields_by_model[model_name][idx])
+                        
+                        # Update extra_fields to only include valid rows
+                        extra_fields_by_model[model_name] = valid_extra_fields
+                    
+                    # Report failed rows
+                    for model_name, failed in failed_rows_by_model.items():
+                        if failed:
+                            preview['would_fail'][model_name] = {
+                                'count': len(failed),
+                                'rows': failed[:10],  # First 10 failed rows
+                                'total_failed': len(failed)
+                            }
+                    
+                    # Run import with valid rows only
                     sheets = []
-                    for model_name, rows in self.transformed_data.items():
-                        sheets.append({
-                            'model': model_name,
-                            'rows': rows
-                        })
+                    for model_name, rows in valid_rows_by_model.items():
+                        if rows:  # Only include if there are valid rows
+                            sheets.append({
+                                'model': model_name,
+                                'rows': rows
+                            })
                     
                     if sheets:
                         import_result = execute_import_job(
@@ -803,21 +898,42 @@ class ETLPipelineService:
                         # Capture what would be created
                         for model_name, outputs in import_result.get('results', {}).items():
                             created_records = []
+                            failed_records = []
+                            
                             for output in outputs:
                                 if output.get('status') == 'success' and output.get('action') == 'create':
                                     created_records.append(output.get('data', {}))
+                                elif output.get('status') == 'error':
+                                    failed_records.append({
+                                        'error': output.get('error'),
+                                        'data': output.get('data', {})
+                                    })
                             
                             if created_records:
                                 preview['would_create'][model_name] = {
                                     'count': len(created_records),
-                                    'records': created_records
+                                    'records': created_records[:20],  # First 20 records
+                                    'total': len(created_records)
                                 }
+                            
+                            if failed_records:
+                                preview['import_errors'].extend([{
+                                    'type': 'import_error',
+                                    'model': model_name,
+                                    'error': r['error'],
+                                    'data': r['data']
+                                } for r in failed_records[:5]])  # First 5 errors
                         
                         # Simulate IntegrationRule triggers and capture results
                         preview['integration_rules_preview'] = self._simulate_integration_rules(
                             import_result, 
                             extra_fields_by_model
                         )
+                    else:
+                        preview['import_errors'].append({
+                            'type': 'no_valid_rows',
+                            'message': 'No valid rows to import after filtering null amounts and invalid fields'
+                        })
                     
                 finally:
                     # Always rollback - this is just a preview
@@ -825,10 +941,12 @@ class ETLPipelineService:
                     
         except Exception as e:
             logger.warning(f"ETL Preview: Error during full preview simulation: {e}")
-            self._add_warning(
-                warning_type='preview_simulation_error',
-                message=f"Could not fully simulate import: {str(e)}. Showing transformed data only."
-            )
+            import traceback
+            preview['import_errors'].append({
+                'type': 'simulation_error',
+                'message': str(e),
+                'traceback': traceback.format_exc()
+            })
         
         if self.log:
             self.log.total_rows_transformed = preview['total_rows']
