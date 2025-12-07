@@ -17,11 +17,28 @@ export function TenantProvider({ children }: { children: ReactNode }) {
   const [tenant, setTenantState] = useState<Company | null>(null)
 
   // Fetch available tenants (companies)
-  const { data: tenants = [], isLoading } = useQuery({
+  // Only fetch if user is authenticated
+  const { data: tenantsData, isLoading } = useQuery({
     queryKey: ["companies"],
-    queryFn: () => apiClient.get<Company[]>("/api/core/companies/"),
-    enabled: true, // Always fetch, but might need auth
+    queryFn: async () => {
+      const response = await apiClient.get<Company[] | { results: Company[] }>("/api/core/companies/")
+      // Handle both array and paginated response formats
+      if (Array.isArray(response)) {
+        return response
+      }
+      // If it's a paginated response, extract the results
+      if (response && typeof response === 'object' && 'results' in response) {
+        return (response as { results: Company[] }).results
+      }
+      return []
+    },
+    enabled: !!localStorage.getItem("auth_token"), // Only fetch if authenticated
+    retry: false, // Don't retry on failure
+    staleTime: 5 * 60 * 1000, // Cache for 5 minutes
   })
+  
+  // Ensure tenants is always an array
+  const tenants = Array.isArray(tenantsData) ? tenantsData : []
 
   // Load tenant from localStorage on mount
   useEffect(() => {

@@ -6,7 +6,15 @@ export async function getTransactions(
   tenant: string,
   params?: Record<string, unknown>
 ): Promise<PaginatedResponse<Transaction>> {
-  return apiClient.get<PaginatedResponse<Transaction>>("/api/transactions/", params)
+  console.log("getTransactions - Called with tenant:", tenant, "params:", params)
+  try {
+    const result = await apiClient.get<PaginatedResponse<Transaction>>("/api/transactions/", params)
+    console.log("getTransactions - Success:", result)
+    return result
+  } catch (error) {
+    console.error("getTransactions - Error:", error)
+    throw error
+  }
 }
 
 export async function getTransaction(tenant: string, id: number): Promise<Transaction> {

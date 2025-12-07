@@ -72,25 +72,45 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
   return (
     <div
       className={cn(
-        "flex flex-col border-r bg-card transition-all duration-300",
-        collapsed ? "w-16" : "w-64"
+        "flex flex-col border-r bg-gradient-to-b from-background to-muted/20 transition-all duration-300 shadow-sm",
+        collapsed ? "w-20" : "w-72"
       )}
     >
-      <div className="flex h-16 items-center justify-between border-b px-4">
-        {!collapsed && <h1 className="text-lg font-semibold">NORD</h1>}
-        <Button variant="ghost" size="icon" onClick={onToggle}>
+      {/* Logo/Brand Section */}
+      <div className="flex h-20 items-center justify-between border-b px-6">
+        {!collapsed ? (
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary text-primary-foreground">
+              <span className="text-lg font-bold">N</span>
+            </div>
+            <div className="flex flex-col">
+              <h1 className="text-lg font-bold tracking-tight">NORD</h1>
+              <p className="text-xs text-muted-foreground">Accounting</p>
+            </div>
+          </div>
+        ) : (
+          <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary text-primary-foreground mx-auto">
+            <span className="text-lg font-bold">N</span>
+          </div>
+        )}
+        <Button 
+          variant="ghost" 
+          size="icon" 
+          onClick={onToggle}
+          className="h-8 w-8 hover:bg-accent"
+        >
           {collapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
         </Button>
       </div>
       
       {/* Tenant Selector */}
       {!collapsed && (
-        <div className="border-b p-4">
-          <label className="mb-2 block text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Tenant
+        <div className="border-b bg-muted/30 px-6 py-4">
+          <label className="mb-2.5 block text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Workspace
           </label>
           {isLoading ? (
-            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-11 w-full rounded-lg" />
           ) : (
             <Select
               value={tenant?.subdomain || ""}
@@ -99,26 +119,32 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
                 if (selected) setTenant(selected)
               }}
             >
-              <SelectTrigger>
-                <Building2 className="mr-2 h-4 w-4" />
-                <SelectValue placeholder="Select tenant" />
+              <SelectTrigger className="h-11 bg-background shadow-sm hover:bg-accent">
+                <Building2 className="mr-2.5 h-4 w-4 text-muted-foreground" />
+                <SelectValue placeholder="Select workspace" />
               </SelectTrigger>
               <SelectContent>
-                {tenants.map((t) => (
-                  <SelectItem key={t.id} value={t.subdomain}>
-                    {t.name}
-                  </SelectItem>
-                ))}
+                {Array.isArray(tenants) && tenants.length > 0 ? (
+                  tenants.map((t) => (
+                    <SelectItem key={t.id} value={t.subdomain}>
+                      {t.name}
+                    </SelectItem>
+                  ))
+                ) : (
+                  <SelectItem value="" disabled>No tenants available</SelectItem>
+                )}
               </SelectContent>
             </Select>
           )}
         </div>
       )}
-      <nav className="flex-1 space-y-1 overflow-y-auto p-4">
-        {navigation.map((section) => (
-          <div key={section.title} className="space-y-1">
+      
+      {/* Navigation */}
+      <nav className="flex-1 space-y-2 overflow-y-auto px-4 py-6">
+        {navigation.map((section, sectionIdx) => (
+          <div key={section.title} className={cn("space-y-1", sectionIdx > 0 && "mt-6")}>
             {!collapsed && (
-              <h2 className="px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              <h2 className="mb-2 px-3 text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
                 {section.title}
               </h2>
             )}
@@ -130,16 +156,22 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
                   to={item.path}
                   className={({ isActive }) =>
                     cn(
-                      "flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors",
+                      "group flex items-center gap-3 rounded-xl px-3.5 py-2.5 text-sm font-medium transition-all duration-200",
+                      "hover:bg-accent hover:text-accent-foreground",
+                      collapsed && "justify-center px-2",
                       isActive
-                        ? "bg-primary text-primary-foreground"
-                        : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
-                      collapsed && "justify-center"
+                        ? "bg-primary text-primary-foreground shadow-sm hover:bg-primary/90"
+                        : "text-muted-foreground"
                     )
                   }
                 >
-                  <Icon className="h-5 w-5 flex-shrink-0" />
-                  {!collapsed && <span>{item.label}</span>}
+                  <Icon className={cn(
+                    "h-5 w-5 flex-shrink-0 transition-transform group-hover:scale-110",
+                    collapsed && "mx-auto"
+                  )} />
+                  {!collapsed && (
+                    <span className="truncate">{item.label}</span>
+                  )}
                 </NavLink>
               )
             })}

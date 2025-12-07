@@ -14,7 +14,7 @@ export async function getEmployees(
   tenant: string,
   params?: Record<string, unknown>
 ): Promise<PaginatedResponse<Employee>> {
-  return apiClient.get<PaginatedResponse<Employee>>("/api/hr/employees", params)
+  return apiClient.get<PaginatedResponse<Employee>>("/api/hr/employees/", params)
 }
 
 export async function createEmployee(
@@ -41,7 +41,7 @@ export async function getPositions(
   tenant: string,
   params?: Record<string, unknown>
 ): Promise<PaginatedResponse<Position>> {
-  return apiClient.get<PaginatedResponse<Position>>("/api/hr/positions", params)
+  return apiClient.get<PaginatedResponse<Position>>("/api/hr/positions/", params)
 }
 
 export async function createPosition(
@@ -68,7 +68,7 @@ export async function getTimeTracking(
   tenant: string,
   params?: Record<string, unknown>
 ): Promise<PaginatedResponse<TimeTracking>> {
-  return apiClient.get<PaginatedResponse<TimeTracking>>("/api/hr/timetracking", params)
+  return apiClient.get<PaginatedResponse<TimeTracking>>("/api/hr/timetracking/", params)
 }
 
 export async function createTimeTracking(
@@ -99,7 +99,7 @@ export async function getPayrolls(
   tenant: string,
   params?: Record<string, unknown>
 ): Promise<PaginatedResponse<Payroll>> {
-  return apiClient.get<PaginatedResponse<Payroll>>("/api/hr/payrolls", params)
+  return apiClient.get<PaginatedResponse<Payroll>>("/api/hr/payrolls/", params)
 }
 
 export async function generateMonthlyPayroll(
@@ -123,7 +123,7 @@ export async function getRecurringAdjustments(
   params?: Record<string, unknown>
 ): Promise<PaginatedResponse<RecurringAdjustment>> {
   return apiClient.get<PaginatedResponse<RecurringAdjustment>>(
-    "/api/hr/recurring-adjustments",
+    "/api/hr/recurring-adjustments/",
     params
   )
 }

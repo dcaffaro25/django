@@ -75,6 +75,56 @@ export function useCreateReconciliationConfig() {
   })
 }
 
+export function useUpdateReconciliationConfig() {
+  const queryClient = useQueryClient()
+  const { toast } = useToast()
+  const { tenant } = useTenant()
+
+  return useMutation({
+    mutationFn: ({ id, data }: { id: number; data: Partial<ReconciliationConfig> }) =>
+      reconciliationApi.updateReconciliationConfig(tenant!.subdomain, id, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["reconciliation-configs", tenant?.subdomain] })
+      toast({
+        title: "Success",
+        description: "Reconciliation config updated successfully",
+      })
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Error",
+        description: error.response?.data?.detail || error.message || "Failed to update config",
+        variant: "destructive",
+      })
+    },
+  })
+}
+
+export function useDeleteReconciliationConfig() {
+  const queryClient = useQueryClient()
+  const { toast } = useToast()
+  const { tenant } = useTenant()
+
+  return useMutation({
+    mutationFn: (id: number) =>
+      reconciliationApi.deleteReconciliationConfig(tenant!.subdomain, id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["reconciliation-configs", tenant?.subdomain] })
+      toast({
+        title: "Success",
+        description: "Reconciliation config deleted successfully",
+      })
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Error",
+        description: error.response?.data?.detail || error.message || "Failed to delete config",
+        variant: "destructive",
+      })
+    },
+  })
+}
+
 export function useStartReconciliation() {
   const queryClient = useQueryClient()
   const { toast } = useToast()
@@ -99,6 +149,31 @@ export function useStartReconciliation() {
       toast({
         title: "Error",
         description: error.response?.data?.detail || error.message || "Failed to start task",
+        variant: "destructive",
+      })
+    },
+  })
+}
+
+export function useCancelReconciliationTask() {
+  const queryClient = useQueryClient()
+  const { toast } = useToast()
+  const { tenant } = useTenant()
+
+  return useMutation({
+    mutationFn: (taskId: number) =>
+      reconciliationApi.cancelReconciliationTask(tenant!.subdomain, taskId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["reconciliation-tasks", tenant?.subdomain] })
+      toast({
+        title: "Success",
+        description: "Reconciliation task cancelled",
+      })
+    },
+    onError: (error: any) => {
+      toast({
+        title: "Error",
+        description: error.response?.data?.detail || error.message || "Failed to cancel task",
         variant: "destructive",
       })
     },

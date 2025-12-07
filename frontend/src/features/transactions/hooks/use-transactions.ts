@@ -11,8 +11,13 @@ export function useTransactions(params?: Record<string, unknown>) {
   
   return useQuery({
     queryKey: ["transactions", tenant?.subdomain, params],
-    queryFn: () => transactionApi.getTransactions(tenant!.subdomain, params),
+    queryFn: () => {
+      console.log("useTransactions - Fetching transactions for tenant:", tenant!.subdomain, "with params:", params)
+      return transactionApi.getTransactions(tenant!.subdomain, params)
+    },
     enabled: !!tenant,
+    retry: 1,
+    retryDelay: 1000,
   })
 }
 

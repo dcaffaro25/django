@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { useNavigate } from "react-router-dom"
 import { useForm } from "react-hook-form"
 import { zodResolver } from "@hookform/resolvers/zod"
@@ -30,9 +30,15 @@ export function LoginPage() {
     resolver: zodResolver(loginSchema),
   })
 
-  // Redirect if already authenticated
+  // Redirect if already authenticated (using useEffect to avoid render-time navigation)
+  useEffect(() => {
+    if (isAuthenticated) {
+      navigate("/")
+    }
+  }, [isAuthenticated, navigate])
+
+  // Don't render the form if already authenticated
   if (isAuthenticated) {
-    navigate("/")
     return null
   }
 
@@ -46,9 +52,31 @@ export function LoginPage() {
       })
       navigate("/")
     } catch (error: any) {
+      console.error("Login error:", error)
+      console.error("Error response:", error.response?.data)
+      
+      // Extract error message from Django response
+      let errorMessage = "Invalid credentials"
+      if (error.response?.data) {
+        const data = error.response.data
+        if (data.detail) {
+          errorMessage = data.detail
+        } else if (data.non_field_errors) {
+          errorMessage = Array.isArray(data.non_field_errors) ? data.non_field_errors[0] : data.non_field_errors
+        } else if (data.username) {
+          errorMessage = Array.isArray(data.username) ? data.username[0] : data.username
+        } else if (data.password) {
+          errorMessage = Array.isArray(data.password) ? data.password[0] : data.password
+        } else if (typeof data === 'string') {
+          errorMessage = data
+        }
+      } else if (error.message) {
+        errorMessage = error.message
+      }
+      
       toast({
         title: "Login Failed",
-        description: error.response?.data?.detail || error.message || "Invalid credentials",
+        description: errorMessage,
         variant: "destructive",
       })
     } finally {

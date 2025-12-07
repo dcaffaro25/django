@@ -58,8 +58,10 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setTheme(defaultTheme)
     setIsTenantTheme(false)
     // }
+  }, [tenant])
 
-    // Apply CSS variables
+  // Apply CSS variables separately to avoid infinite loop
+  useEffect(() => {
     const root = document.documentElement
     root.style.setProperty("--primary", theme.primary)
     root.style.setProperty("--secondary", theme.secondary)
@@ -69,7 +71,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     root.style.setProperty("--info", theme.info)
     root.style.setProperty("--background", theme.background)
     root.style.setProperty("--foreground", theme.foreground)
-  }, [tenant, theme])
+  }, [theme])
 
   return (
     <ThemeContext.Provider value={{ theme, isTenantTheme }}>

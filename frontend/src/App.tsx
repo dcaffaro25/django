@@ -24,9 +24,16 @@ function PrivateRoute({ children }: { children: React.ReactNode }) {
 }
 
 function App() {
+  console.log("📱 App component rendering...")
+  
   return (
     <ErrorBoundary>
-      <BrowserRouter>
+      <BrowserRouter
+        future={{
+          v7_startTransition: true,
+          v7_relativeSplatPath: true,
+        }}
+      >
         <Routes>
           <Route path="/login" element={<LoginPage />} />
           <Route

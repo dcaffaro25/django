@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge"
 import { formatDate } from "@/lib/utils"
 import type { FinancialStatement, PaginatedResponse } from "@/types"
 import { apiClient } from "@/lib/api-client"
+import { useTenant } from "@/providers/TenantProvider"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -56,12 +57,14 @@ const columns: ColumnDef<FinancialStatement>[] = [
 ]
 
 export function FinancialStatementsPage() {
+  const { tenant } = useTenant()
   const { data, isLoading } = useQuery({
-    queryKey: ["financial-statements"],
+    queryKey: ["financial-statements", tenant?.subdomain],
     queryFn: () =>
       apiClient.get<PaginatedResponse<FinancialStatement>>(
         "/api/financial-statements/"
       ),
+    enabled: !!tenant, // Only fetch when tenant is set
   })
 
   const handleExport = async (id: number, format: "excel" | "markdown" | "html") => {

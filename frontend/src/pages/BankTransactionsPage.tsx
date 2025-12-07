@@ -11,6 +11,7 @@ import type { BankTransaction } from "@/types"
 import { useQuery } from "@tanstack/react-query"
 import { apiClient } from "@/lib/api-client"
 import type { PaginatedResponse } from "@/types"
+import { useTenant } from "@/providers/TenantProvider"
 
 const columns: ColumnDef<BankTransaction>[] = [
   {
@@ -40,27 +41,29 @@ const columns: ColumnDef<BankTransaction>[] = [
 ]
 
 export function BankTransactionsPage() {
+  const { tenant } = useTenant()
   const [activeTab, setActiveTab] = useState("all")
   const [page, setPage] = useState(1)
 
   const { data: allData, isLoading: allLoading } = useQuery({
-    queryKey: ["bank-transactions", "all", page],
+    queryKey: ["bank-transactions", tenant?.subdomain, "all", page],
     queryFn: () =>
       apiClient.get<PaginatedResponse<BankTransaction>>("/api/bank_transactions/", {
         page,
         page_size: 20,
       }),
+    enabled: !!tenant, // Only fetch when tenant is set
   })
 
   const { data: unreconciledData, isLoading: unreconciledLoading } = useQuery({
-    queryKey: ["bank-transactions", "unreconciled", page],
+    queryKey: ["bank-transactions", tenant?.subdomain, "unreconciled", page],
     queryFn: () =>
       apiClient.get<PaginatedResponse<BankTransaction>>("/api/bank_transactions/", {
         page,
         page_size: 20,
         unreconciled: true,
       }),
-    enabled: activeTab === "unreconciled",
+    enabled: !!tenant && activeTab === "unreconciled", // Only fetch when tenant is set and tab is active
   })
 
   const data = activeTab === "unreconciled" ? unreconciledData : allData

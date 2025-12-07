@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { ColumnDef } from "@tanstack/react-table"
 import { Plus, MoreHorizontal } from "lucide-react"
@@ -13,6 +13,7 @@ import { formatCurrency, formatDate } from "@/lib/utils"
 import type { Transaction, PaginatedResponse, Entity, Currency } from "@/types"
 import { useTransactions, usePostTransaction, useUnpostTransaction } from "@/features/transactions"
 import { useToast } from "@/components/ui/use-toast"
+import { useTenant } from "@/providers/TenantProvider"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -88,6 +89,7 @@ const columns: (onPost: (id: number) => void, onUnpost: (id: number) => void) =>
 
 export function TransactionsPage() {
   const { toast } = useToast()
+  const { tenant } = useTenant()
   const [page, setPage] = useState(1)
   const [filters, setFilters] = useState<Record<string, unknown>>({})
   const [selectedTransaction, setSelectedTransaction] = useState<Transaction | null>(null)
@@ -95,18 +97,86 @@ export function TransactionsPage() {
   const [modalOpen, setModalOpen] = useState(false)
   const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null)
 
-  const { data, isLoading } = useTransactions({ page, page_size: 20, ...filters })
+  const { data, isLoading, isError, error } = useTransactions({ page, page_size: 20, ...filters })
+  
+  // Debug logging
+  useEffect(() => {
+    if (tenant) {
+      console.log("TransactionsPage - Tenant selected:", tenant.subdomain)
+      console.log("TransactionsPage - Query state:", { isLoading, isError, hasData: !!data, error })
+      console.log("TransactionsPage - API Client tenant ID:", apiClient.getTenantId())
+    }
+  }, [tenant, isLoading, isError, data, error])
+  
+  // Show message if no tenant is selected
+  if (!tenant) {
+    return (
+      <div className="space-y-6">
+        <PageHeader
+          title="Transactions"
+          description="View and manage all accounting transactions"
+          breadcrumbs={[
+            { label: "Home", href: "/" },
+            { label: "Accounting", href: "/accounting" },
+            { label: "Transactions" },
+          ]}
+        />
+        <div className="flex h-64 items-center justify-center rounded-lg border bg-muted/50">
+          <div className="text-center">
+            <p className="text-lg font-medium text-muted-foreground">No tenant selected</p>
+            <p className="mt-2 text-sm text-muted-foreground">
+              Please select a tenant from the sidebar to view transactions
+            </p>
+          </div>
+        </div>
+      </div>
+    )
+  }
+  
+  // Show error message if query failed
+  if (isError) {
+    return (
+      <div className="space-y-6">
+        <PageHeader
+          title="Transactions"
+          description="View and manage all accounting transactions"
+          breadcrumbs={[
+            { label: "Home", href: "/" },
+            { label: "Accounting", href: "/accounting" },
+            { label: "Transactions" },
+          ]}
+        />
+        <div className="flex h-64 items-center justify-center rounded-lg border border-destructive bg-destructive/10">
+          <div className="text-center">
+            <p className="text-lg font-medium text-destructive">Failed to load transactions</p>
+            <p className="mt-2 text-sm text-muted-foreground">
+              {error instanceof Error ? error.message : "An error occurred while loading transactions"}
+            </p>
+            <Button
+              className="mt-4"
+              onClick={() => window.location.reload()}
+            >
+              Retry
+            </Button>
+          </div>
+        </div>
+      </div>
+    )
+  }
   const postMutation = usePostTransaction()
   const unpostMutation = useUnpostTransaction()
 
+  // Only fetch entities and currencies when tenant is available
   const { data: entitiesData } = useQuery({
-    queryKey: ["entities"],
+    queryKey: ["entities", tenant?.subdomain],
     queryFn: () => apiClient.get<PaginatedResponse<Entity>>("/api/entities/"),
+    enabled: !!tenant, // Only fetch when tenant is set
   })
 
   const { data: currenciesData } = useQuery({
-    queryKey: ["currencies"],
+    queryKey: ["currencies", tenant?.subdomain],
     queryFn: () => apiClient.get<PaginatedResponse<Currency>>("/api/currencies/"),
+    enabled: !!tenant, // Only fetch when tenant is set
   })
 
   const filterConfig: FilterConfig[] = [
@@ -166,24 +236,30 @@ export function TransactionsPage() {
           { label: "Transactions" },
         ]}
         actions={
-          <Button onClick={handleCreate}>
+          <Button onClick={handleCreate} size="lg" className="shadow-sm">
             <Plus className="mr-2 h-4 w-4" />
             Create Transaction
           </Button>
         }
       />
-      <FilterBar
-        filters={filters}
-        onFilterChange={setFilters}
-        filterConfig={filterConfig}
-        onClear={handleClearFilters}
-      />
-      <DataTable
-        columns={columns(handlePost, handleUnpost)}
-        data={data?.results ?? []}
-        loading={isLoading}
-        onRowClick={handleRowClick}
-      />
+      <div className="rounded-xl border bg-card shadow-sm">
+        <div className="p-6">
+          <FilterBar
+            filters={filters}
+            onFilterChange={setFilters}
+            filterConfig={filterConfig}
+            onClear={handleClearFilters}
+          />
+        </div>
+        <div className="border-t">
+          <DataTable
+            columns={columns(handlePost, handleUnpost)}
+            data={data?.results ?? []}
+            loading={isLoading}
+            onRowClick={handleRowClick}
+          />
+        </div>
+      </div>
       <TransactionDetailDrawer
         transaction={selectedTransaction}
         open={drawerOpen}
