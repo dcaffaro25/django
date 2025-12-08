@@ -288,3 +288,180 @@ class RecurrenceRangeView(APIView):
             return Response({"occurrences": [d.isoformat() for d in occurrences]})
         except Exception as e:
             return Response({"error": str(e)}, status=400)
+
+
+class TutorialView(APIView):
+    """
+    Tutorial endpoint that returns tutorial steps in HTML format suitable for a wizard component.
+    
+    Query parameters:
+    - audience: 'user', 'developer', or omit for all
+    - format: 'json' (default) or 'html'
+    - step_id: Optional, get a specific step by ID
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get(self, request):
+        from .tutorial_data import get_tutorial_steps, get_tutorial_step
+        
+        audience = request.query_params.get('audience')
+        format_type = request.query_params.get('format', 'json')
+        step_id = request.query_params.get('step_id')
+        
+        # Get specific step if requested
+        if step_id:
+            step = get_tutorial_step(step_id)
+            if not step:
+                return Response(
+                    {"error": f"Tutorial step '{step_id}' not found"},
+                    status=404
+                )
+            steps = [step]
+        else:
+            # Get all steps (optionally filtered by audience)
+            steps = get_tutorial_steps(audience)
+        
+        # Return HTML format if requested
+        if format_type == 'html':
+            from django.http import HttpResponse
+            html_content = self._generate_html(steps, audience)
+            return HttpResponse(html_content, content_type='text/html')
+        
+        # Return JSON format (default)
+        return Response({
+            "count": len(steps),
+            "audience": audience,
+            "steps": steps
+        })
+    
+    def _generate_html(self, steps, audience_filter):
+        """Generate a complete HTML page with all tutorial steps."""
+        html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NORD Accounting System - Tutorial</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f6f6f6;
+        }
+        .tutorial-container {
+            background: white;
+            border-radius: 8px;
+            padding: 30px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .wizard-step {
+            margin-bottom: 40px;
+            padding-bottom: 40px;
+            border-bottom: 2px solid #e5e5e5;
+        }
+        .wizard-step:last-child {
+            border-bottom: none;
+        }
+        .wizard-step h2 {
+            color: #025736;
+            margin-top: 0;
+            font-size: 28px;
+            border-bottom: 3px solid #025736;
+            padding-bottom: 10px;
+        }
+        .wizard-step h3 {
+            color: #059669;
+            margin-top: 25px;
+            font-size: 20px;
+        }
+        .wizard-step p {
+            margin: 15px 0;
+            font-size: 16px;
+        }
+        .wizard-step ul, .wizard-step ol {
+            margin: 15px 0;
+            padding-left: 30px;
+        }
+        .wizard-step li {
+            margin: 8px 0;
+            font-size: 15px;
+        }
+        .wizard-step code {
+            background: #f4f4f4;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+        }
+        .wizard-step pre {
+            background: #2d2d2d;
+            color: #f8f8f2;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+            margin: 15px 0;
+        }
+        .wizard-step pre code {
+            background: transparent;
+            color: inherit;
+            padding: 0;
+        }
+        .step-meta {
+            display: inline-block;
+            background: #e5e5e5;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            margin-bottom: 15px;
+            color: #666;
+        }
+        .step-meta.user {
+            background: #dbeafe;
+            color: #1e40af;
+        }
+        .step-meta.developer {
+            background: #fef3c7;
+            color: #92400e;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        .header h1 {
+            color: #025736;
+            font-size: 36px;
+            margin-bottom: 10px;
+        }
+        .header p {
+            color: #666;
+            font-size: 18px;
+        }
+    </style>
+</head>
+<body>
+    <div class="tutorial-container">
+        <div class="header">
+            <h1>NORD Accounting System - Complete Tutorial</h1>
+            <p>Comprehensive guide for users and developers</p>
+        </div>
+"""
+        
+        for step in steps:
+            audience_badge = step.get('audience', 'all')
+            html += f"""
+        <div class="wizard-step" data-audience="{step.get('audience')}" data-step-id="{step.get('id')}">
+            <span class="step-meta {audience_badge}">{audience_badge.upper()}</span>
+            {step.get('html', '')}
+        </div>
+"""
+        
+        html += """
+    </div>
+</body>
+</html>
+"""
+        return html
