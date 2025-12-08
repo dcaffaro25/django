@@ -1,0 +1,411 @@
+﻿[Django Settings] Running in LOCAL mode
+[Django Settings] Using database: interchange.proxy.rlwy.net
+[Django Settings] Celery broker: redis://localhost:6379/0
+[Django Settings] Celery EAGER mode: True
+python : System check identified some issues:
+No linha:1 caractere:1
++ python manage.py migrate 2>&1 | Out-File -FilePath 
+migrate_output.txt ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (System check ide 
+   ntified some issues::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+
+WARNINGS:
+?: (2_0.W001) Your URL pattern '^api/?$' has a route that 
+contains '(?P<', begins with a '^', or ends with a '$'. This 
+was likely an oversight when migrating to django.urls.path().
+?: (2_0.W001) Your URL pattern '^api/token/?$' 
+[name='token_obtain_pair'] has a route that contains '(?P<', 
+begins with a '^', or ends with a '$'. This was likely an 
+oversight when migrating to django.urls.path().
+?: (2_0.W001) Your URL pattern '^api/token/refresh/?$' 
+[name='token_refresh'] has a route that contains '(?P<', 
+begins with a '^', or ends with a '$'. This was likely an 
+oversight when migrating to django.urls.path().
+?: (2_0.W001) Your URL pattern '^rrule_preview/?$' 
+[name='rrule-preview'] has a route that contains '(?P<', 
+begins with a '^', or ends with a '$'. This was likely an 
+oversight when migrating to django.urls.path().
+Operations to perform:
+  Apply all migrations: ML, accounting, admin, auth, authtoken, billing, contenttypes, core, django_celery_results, feedback, hr, multitenancy, npl, sessions
+Running migrations:
+  Applying contenttypes.0001_initial... OK
+  Applying contenttypes.0002_remove_content_type_name... OK
+  Applying auth.0001_initial... OK
+  Applying auth.0002_alter_permission_name_max_length... OK
+  Applying auth.0003_alter_user_email_max_length... OK
+  Applying auth.0004_alter_user_username_opts... OK
+  Applying auth.0005_alter_user_last_login_null... OK
+  Applying auth.0006_require_contenttypes_0002... OK
+  Applying auth.0007_alter_validators_add_error_messages... OK
+  Applying auth.0008_alter_user_username_max_length... OK
+  Applying auth.0009_alter_user_last_name_max_length... OK
+  Applying auth.0010_alter_group_name_max_length... OK
+  Applying auth.0011_update_proxy_permissions... OK
+  Applying auth.0012_alter_user_first_name_max_length... OK
+  Applying multitenancy.0001_initial... OK
+  Applying multitenancy.0002_entity_level_entity_lft_entity_rght_entity_tree_id_and_more... OK
+  Applying multitenancy.0003_alter_company_name... OK
+  Applying multitenancy.0004_company_subdomain... OK
+  Applying multitenancy.0005_alter_company_subdomain... OK
+  Applying accounting.0001_initial... OK
+  Applying accounting.0002_alter_account_unique_together... OK
+  Applying accounting.0003_reconciliation_reconciled_by_and_more... OK
+  Applying accounting.0004_costcenter_allocationbase... OK
+  Applying multitenancy.0006_entity_accounts_entity_cost_centers_and_more... OK
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField Company.created_at received a 
+naive datetime (2024-12-28 11:53:05.656516) while time zone 
+support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField Company.updated_at received a 
+naive datetime (2024-12-28 11:53:05.656516) while time zone 
+support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField Entity.created_at received a 
+naive datetime (2024-12-28 11:53:05.656516) while time zone 
+support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField Entity.updated_at received a 
+naive datetime (2024-12-28 11:53:05.656516) while time zone 
+support is active.
+  warnings.warn(
+  Applying multitenancy.0007_alter_entity_managers_company_created_at_and_more... OK
+  Applying multitenancy.0008_alter_company_created_at_alter_company_updated_at_and_more... OK
+  Applying multitenancy.0009_alter_company_created_at_alter_company_updated_at_and_more... OK
+  Applying multitenancy.0010_alter_company_created_at_alter_company_updated_at_and_more... OK
+  Applying multitenancy.0011_alter_company_created_at_alter_company_updated_at_and_more... OK
+  Applying multitenancy.0012_alter_company_created_at_alter_company_updated_at_and_more... OK
+  Applying multitenancy.0013_alter_company_created_at_alter_company_updated_at_and_more... OK
+  Applying multitenancy.0014_alter_company_created_at_alter_company_updated_at_and_more... OK
+  Applying multitenancy.0015_remove_integrationrule_target_module_and_more... OK
+  Applying multitenancy.0016_integrationrule_execution_order_and_more... OK
+  Applying multitenancy.0017_substitutionrule... OK
+  Applying multitenancy.0018_alter_integrationrule_company_and_more... OK
+  Applying multitenancy.0019_alter_entity_unique_together... OK
+  Applying multitenancy.0020_customuser_email_last_sent_at_and_more... OK
+  Applying ML.0001_initial... OK
+  Applying ML.0002_mltrainingtask... OK
+  Applying ML.0003_remove_mltrainingtask_company_id_and_more... OK
+  Applying multitenancy.0021_integrationrule_use_celery_and_more... OK
+  Applying multitenancy.0022_substitutionrule_filter_conditions_and_more... OK
+  Applying multitenancy.0023_alter_substitutionrule_unique_together_and_more... OK
+  Applying multitenancy.0024_importsnapshot... OK
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField CostCenter.created_at received 
+a naive datetime (2024-12-28 11:55:42.949013) while time zone 
+support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField CostCenter.updated_at received 
+a naive datetime (2024-12-28 11:55:42.949013) while time zone 
+support is active.
+  warnings.warn(
+  Applying accounting.0005_costcenter_created_at_costcenter_created_by_and_more... OK
+  Applying accounting.0006_account_created_by_account_is_deleted_and_more... OK
+  Applying accounting.0007_alter_account_created_at_alter_account_updated_at_and_more... OK
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField AllocationBase.created_at 
+received a naive datetime (2024-12-28 17:09:50.891847) while 
+time zone support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField AllocationBase.updated_at 
+received a naive datetime (2024-12-28 17:09:50.891847) while 
+time zone support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField BankAccount.created_at received 
+a naive datetime (2024-12-28 17:09:50.891847) while time zone 
+support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField BankAccount.updated_at received 
+a naive datetime (2024-12-28 17:09:50.891847) while time zone 
+support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField BankTransaction.created_at 
+received a naive datetime (2024-12-28 17:09:50.891847) while 
+time zone support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField BankTransaction.updated_at 
+received a naive datetime (2024-12-28 17:09:50.891847) while 
+time zone support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField Currency.created_at received a 
+naive datetime (2024-12-28 17:09:50.891847) while time zone 
+support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField Currency.updated_at received a 
+naive datetime (2024-12-28 17:09:50.891847) while time zone 
+support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField JournalEntry.created_at 
+received a naive datetime (2024-12-28 17:09:50.891847) while 
+time zone support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField JournalEntry.updated_at 
+received a naive datetime (2024-12-28 17:09:50.891847) while 
+time zone support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField Reconciliation.created_at 
+received a naive datetime (2024-12-28 17:09:50.891847) while 
+time zone support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField Reconciliation.updated_at 
+received a naive datetime (2024-12-28 17:09:50.891847) while 
+time zone support is active.
+  warnings.warn(
+  Applying accounting.0008_remove_reconciliation_bank_transaction_and_more... OK
+  Applying accounting.0009_alter_account_created_at_alter_account_updated_at_and_more... OK
+  Applying accounting.0010_alter_account_created_at_alter_account_updated_at_and_more... OK
+  Applying accounting.0011_alter_account_created_at_alter_account_updated_at_and_more... OK
+  Applying accounting.0012_remove_bankaccount_account_holder_and_more... OK
+  Applying accounting.0013_banktransaction_tx_hash... OK
+  Applying accounting.0014_bankaccount_name... OK
+  Applying accounting.0015_remove_bankaccount_account_name_and_more... OK
+  Applying accounting.0016_bankaccount_branch_id... OK
+  Applying accounting.0017_remove_banktransaction_transaction_amount_and_more... OK
+  Applying accounting.0018_alter_banktransaction_account_number_and_more... OK
+  Applying accounting.0019_account_bank_account... OK
+  Applying accounting.0020_alter_account_company_alter_allocationbase_company_and_more... OK
+  Applying accounting.0021_remove_reconciliation_reconciled_by_and_more... OK
+  Applying accounting.0022_banktransaction_accounting__date_60a468_idx_and_more... OK
+  Applying accounting.0023_account_balance_date... OK
+  Applying accounting.0024_costcenter_balance_costcenter_balance_date... OK
+  Applying accounting.0025_banktransaction_balance_validated_and_more... OK
+  Applying accounting.0026_alter_bank_bank_code_alter_bank_name_and_more... OK
+  Applying accounting.0027_account_level_account_lft_account_parent_and_more... OK
+  Applying accounting.0028_alter_account_type... OK
+  Applying accounting.0029_alter_account_type... OK
+  Applying accounting.0030_journalentry_date_and_more... OK
+  Applying accounting.0031_remove_journalentry_accounting__entity__374ffe_idx_and_more... OK
+  Applying accounting.0032_remove_account_type_account_description_and_more... OK
+  Applying accounting.0033_account_examples_account_key_words... OK
+  Applying accounting.0034_reconciliationtask... OK
+  Applying accounting.0035_alter_reconciliationtask_status_reconciliationconfig... OK
+  Applying accounting.0036_alter_reconciliationconfig_unique_together_and_more... OK
+  Applying accounting.0037_remove_banktransaction_account_number_and_more... OK
+  Applying accounting.0038_remove_banktransaction_check_number_and_more... OK
+  Applying accounting.0039_alter_reconciliationconfig_bank_filters_and_more... OK
+  Applying accounting.0040_remove_banktransaction_accounting__entity__fddfbd_idx_and_more... OK
+  Applying accounting.0041_journalentry_bank_designation_pending_and_more... OK
+  Applying accounting.0042_alter_journalentry_account... OK
+  Applying accounting.0043_pgvector_inclusion... OK
+  Applying accounting.0044_account_account_description_embedding_and_more... OK
+  Applying accounting.0045_reconciliationpipeline_and_more... OK
+  Applying accounting.0046_journalentry_is_cash_journalentry_is_reconciled_and_more... OK
+  Applying accounting.0047_journalentry_description... OK
+  Applying accounting.0048_rename_date_tolerance_days_reconciliationpipelinestage_avg_date_delta_days_and_more... OK
+  Applying accounting.0049_reconciliationconfig_soft_time_limit_seconds_and_more... OK
+  Applying accounting.0050_reconciliationconfig_allow_mixed_signs... OK
+  Applying accounting.0051_reconciliationconfig_max_alternatives_per_match... OK
+  Applying accounting.0052_reconciliationsuggestion... OK
+  Applying accounting.0053_financialstatement_financialstatementtemplate_and_more... OK
+  Applying accounting.0054_alter_financialstatement_report_type... OK
+  Applying accounting.0055_alter_account_unique_together... OK
+  Applying admin.0001_initial... OK
+  Applying admin.0002_logentry_remove_auto_add... OK
+  Applying admin.0003_logentry_add_action_flag_choices... OK
+  Applying authtoken.0001_initial... OK
+  Applying authtoken.0002_auto_20160226_1747... OK
+  Applying authtoken.0003_tokenproxy... OK
+  Applying core.0001_initial... OK
+  Applying billing.0001_initial... OK
+  Applying billing.0002_businesspartnercategory_businesspartner_category... OK
+  Applying billing.0003_alter_invoiceline_total_price... OK
+  Applying core.0002_actionevent... OK
+  Applying core.0003_job... OK
+  Applying core.0004_remove_job_company_remove_job_is_deleted_and_more... OK
+  Applying django_celery_results.0001_initial... OK
+  Applying django_celery_results.0002_add_task_name_args_kwargs... OK
+  Applying django_celery_results.0003_auto_20181106_1101... OK
+  Applying django_celery_results.0004_auto_20190516_0412... OK
+  Applying django_celery_results.0005_taskresult_worker... OK
+  Applying django_celery_results.0006_taskresult_date_created... OK
+  Applying django_celery_results.0007_remove_taskresult_hidden... OK
+  Applying django_celery_results.0008_chordcounter... OK
+  Applying django_celery_results.0009_groupresult... OK
+  Applying django_celery_results.0010_remove_duplicate_indices... OK
+  Applying django_celery_results.0011_taskresult_periodic_task_name... OK
+  Applying django_celery_results.0012_taskresult_date_started... OK
+  Applying django_celery_results.0013_taskresult_django_cele_periodi_1993cf_idx... OK
+  Applying django_celery_results.0014_alter_taskresult_status... OK
+  Applying feedback.0001_initial... OK
+  Applying hr.0001_initial... OK
+  Applying hr.0002_employee_company... OK
+  Applying hr.0003_employee_is_active_position_alter_employee_position... OK
+  Applying hr.0004_rename_bank_hours_2021_2022_payroll_bank_hours_and_more... OK
+  Applying hr.0005_remove_payroll_course_discount_and_more... OK
+  Applying hr.0006_remove_bankhours_employee_remove_vacation_employee_and_more... OK
+  Applying hr.0007_alter_timetracking_unique_together... OK
+  Applying hr.0008_remove_timetracking_overtime_eligible_and_more... OK
+  Applying hr.0009_rename_month_timetracking_month_date_and_more... OK
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField Bonus.created_at received a 
+naive datetime (2024-12-28 17:26:44.470638) while time zone 
+support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField Bonus.updated_at received a 
+naive datetime (2024-12-28 17:26:44.470638) while time zone 
+support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField Employee.created_at received a 
+naive datetime (2024-12-28 17:26:44.470638) while time zone 
+support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField Employee.updated_at received a 
+naive datetime (2024-12-28 17:26:44.470638) while time zone 
+support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField KPI.created_at received a naive 
+datetime (2024-12-28 17:26:44.470638) while time zone support 
+is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField KPI.updated_at received a naive 
+datetime (2024-12-28 17:26:44.470638) while time zone support 
+is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField Payroll.created_at received a 
+naive datetime (2024-12-28 17:26:44.470638) while time zone 
+support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField Payroll.updated_at received a 
+naive datetime (2024-12-28 17:26:44.470638) while time zone 
+support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField Position.created_at received a 
+naive datetime (2024-12-28 17:26:44.470638) while time zone 
+support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField Position.updated_at received a 
+naive datetime (2024-12-28 17:26:44.470638) while time zone 
+support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField RecurringAdjustment.created_at 
+received a naive datetime (2024-12-28 17:26:44.470638) while 
+time zone support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField RecurringAdjustment.updated_at 
+received a naive datetime (2024-12-28 17:26:44.470638) while 
+time zone support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField TimeTracking.created_at 
+received a naive datetime (2024-12-28 17:26:44.470638) while 
+time zone support is active.
+  warnings.warn(
+C:\Users\DCaff\AppData\Local\Packages\PythonSoftwareFoundation
+.Python.3.9_qbz5n2kfra8p0\LocalCache\local-packages\Python39\s
+ite-packages\django\db\models\fields\__init__.py:1595: 
+RuntimeWarning: DateTimeField TimeTracking.updated_at 
+received a naive datetime (2024-12-28 17:26:44.470638) while 
+time zone support is active.
+  warnings.warn(
+  Applying hr.0010_bonus_company_bonus_created_at_bonus_created_by_and_more... OK
+  Applying hr.0011_recurringadjustment_default_account_and_more... OK
+  Applying hr.0012_alter_bonus_created_at_alter_bonus_updated_at_and_more... OK
+  Applying hr.0013_timetracking_status_alter_bonus_calculation_formula_and_more... OK
+  Applying hr.0014_alter_bonus_company_alter_employee_company_and_more... OK
+  Applying hr.0015_kpi_month_date... OK
+  Applying multitenancy.0025_importtransformationrule_etlpipelinelog... OK
+  Applying multitenancy.0026_importtransformationrule_extra_fields_for_trigger_and_more... OK
+  Applying multitenancy.0027_remove_importtransformationrule_journal_entry_options... OK
+  Applying npl.0001_initial... OK
+  Applying npl.0002_doctyperule_document_no_process_found_and_more... OK
+  Applying npl.0003_spanrule... OK
+  Applying npl.0004_document_processing_stats... OK
+  Applying npl.0005_document_embedding_mode... OK
+  Applying npl.0006_span_negative_anchor_count_span_strong_anchor_count_and_more... OK
+  Applying npl.0007_spanrule_doc_type... OK
+  Applying npl.0008_alter_doctyperule_doc_type_alter_spanrule_label... OK
+  Applying npl.0009_alter_spanrule_description_alter_spanrule_label_and_more... OK
+  Applying npl.0010_document_debug_mode_document_doc_type_anchors_and_more... OK
+  Applying npl.0011_document_store_file_alter_document_file_and_more... OK
+  Applying sessions.0001_initial... OK

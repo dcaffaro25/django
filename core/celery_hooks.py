@@ -19,6 +19,7 @@ def _header(headers, key, default=None):
 
 def _safe_json(obj):
     try:
+        import json
         json.dumps(obj)
         return obj
     except Exception:
@@ -30,17 +31,35 @@ def job_after_publish(sender=None, headers=None, body=None, **kwargs):
     task_id = _header(headers, "id") or kwargs.get("task_id")
     if not task_id:
         return
+    # Determine task type from task name
+    task_name = sender or ""
+    try:
+        from .task_manager import get_task_type
+        task_type = get_task_type(task_name)
+    except ImportError:
+        task_type = "other"
+    
+    # Use task_type as kind if job_kind not provided
+    job_kind = _header(headers, "job_kind") or task_type
+    
+    # Build meta dict with task_type
+    meta_dict = {"task_type": task_type}
+    existing_meta = _header(headers, "meta")
+    if existing_meta and isinstance(existing_meta, dict):
+        meta_dict.update(existing_meta)
+    
     Job.objects.update_or_create(
         task_id=task_id,
         defaults={
-            "task_name": sender or "",
+            "task_name": task_name,
             "state": STATE_MAP["SENT"],
-            "kind": _header(headers, "job_kind", sender or "other"),
+            "kind": job_kind,
             "tenant_id": _header(headers, "tenant_id"),
             "created_by_id": _header(headers, "user_id"),
             "queue": (kwargs.get("routing_key") or
                       (kwargs.get("properties") or {}).get("delivery_info", {}).get("routing_key")),
             "enqueued_at": now(),
+            "meta": meta_dict,
         },
     )
 
@@ -48,15 +67,33 @@ def job_after_publish(sender=None, headers=None, body=None, **kwargs):
 def job_task_prerun(sender=None, task_id=None, task=None, **kwargs):
     req = getattr(task, "request", None)
     headers = getattr(req, "headers", {}) if req else {}
+    
+    # Determine task type from task name
+    task_name = sender.name if sender else ""
+    from .task_manager import get_task_type
+    task_type = get_task_type(task_name)
+    
+    # Use task_type as kind if job_kind not provided
+    job_kind = _header(headers, "job_kind") or task_type
+    
     Job.objects.update_or_create(
         task_id=task_id,
         defaults={
-            "task_name": sender.name if sender else "",
-            "kind": _header(headers, "job_kind", sender.name if sender else "other"),
+            "task_name": task_name,
+            "kind": job_kind,
             "tenant_id": _header(headers, "tenant_id"),
             "created_by_id": _header(headers, "user_id"),
         },
     )
+    
+    # Update meta with task_type if not already set
+    job = Job.objects.filter(task_id=task_id).first()
+    if job:
+        meta = job.meta or {}
+        if "task_type" not in meta:
+            meta["task_type"] = task_type
+            Job.objects.filter(task_id=task_id).update(meta=meta)
+    
     Job.objects.filter(task_id=task_id).update(
         state=STATE_MAP["STARTED"],
         started_at=now(),

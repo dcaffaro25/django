@@ -1,0 +1,143 @@
+[Django Settings] Running in LOCAL mode
+[Django Settings] Using database: interchange.proxy.rlwy.net
+[Django Settings] Celery broker: redis://localhost:6379/0
+[Django Settings] Celery EAGER mode: True
+
+======================================================================
+  PostgreSQL Database Clone: Production -> Homologation
+======================================================================
+
+Source (Production): switchback.proxy.rlwy.net:17976/railway
+Target (Homologation): interchange.proxy.rlwy.net:47553/railway
+
+Connecting...
+  Connecting to switchback.proxy.rlwy.net:17976/railway...
+  Connecting to interchange.proxy.rlwy.net:47553/railway...
+Connected!
+
+Found 95 tables, copying 87 (skipping 8 system tables)
+----------------------------------------------------------------------
+  ML_mlmodel: 4 rows... ERROR: relation "ML_mlmodel" does not exist
+
+  ML_mltrainingtask: 10 rows... ERROR: relation "ML_mltrainingtask" does not exist
+
+  accounting_account: 249 rows... ERROR: relation "accounting_account" does not exist
+
+  accounting_allocationbase: 0 rows
+  accounting_bank: 9 rows... ERROR: relation "accounting_bank" does not exist
+
+  accounting_bankaccount: 7 rows... ERROR: relation "accounting_bankaccount" does not exist
+
+  accounting_banktransaction: 3892 rows... ERROR: relation "accounting_banktransaction" does not exist
+
+  accounting_costcenter: 0 rows
+  accounting_currency: 6 rows... ERROR: relation "accounting_currency" does not exist
+
+  accounting_financialstatement: 47 rows... ERROR: relation "accounting_financialstatement" does not exist
+
+  accounting_financialstatementcomparison: 0 rows
+  accounting_financialstatementline: 165 rows... ERROR: relation "accounting_financialstatementline" does not exist
+
+  accounting_financialstatementlinetemplate: 9 rows... ERROR: relation "accounting_financialstatementlinetemplate" does not exist
+
+  accounting_financialstatementtemplate: 2 rows... ERROR: relation "accounting_financialstatementtemplate" does not exist
+
+  accounting_journalentry: 4321 rows... ERROR: relation "accounting_journalentry" does not exist
+
+  accounting_reconciliation: 3816 rows... ERROR: relation "accounting_reconciliation" does not exist
+
+  accounting_reconciliation_bank_transactions: 3815 rows... ERROR: relation "accounting_reconciliation_bank_transactions" does not exist
+
+  accounting_reconciliation_journal_entries: 4185 rows... ERROR: relation "accounting_reconciliation_journal_entries" does not exist
+
+  accounting_reconciliationconfig: 14 rows... ERROR: relation "accounting_reconciliationconfig" does not exist
+
+  accounting_reconciliationpipeline: 1 rows... ERROR: relation "accounting_reconciliationpipeline" does not exist
+
+  accounting_reconciliationpipelinestage: 7 rows... ERROR: relation "accounting_reconciliationpipelinestage" does not exist
+
+  accounting_reconciliationsuggestion: 4373 rows... ERROR: relation "accounting_reconciliationsuggestion" does not exist
+
+  accounting_reconciliationtask: 467 rows... ERROR: relation "accounting_reconciliationtask" does not exist
+
+  accounting_rule: 0 rows
+  accounting_transaction: 4321 rows... ERROR: relation "accounting_transaction" does not exist
+
+  accounting_transaction_rules: 0 rows
+  auth_group: 0 rows
+  auth_group_permissions: 0 rows
+  authtoken_token: 6 rows... ERROR: relation "authtoken_token" does not exist
+
+  billing_businesspartner: 0 rows
+  billing_businesspartnercategory: 0 rows
+  billing_contract: 0 rows
+  billing_invoice: 0 rows
+  billing_invoiceline: 0 rows
+  billing_productservice: 0 rows
+  billing_productservicecategory: 0 rows
+  core_actionevent: 0 rows
+  core_financialindex: 0 rows
+  core_financialindexquoteforecast: 0 rows
+  core_indexquote: 0 rows
+  core_job: 658 rows... ERROR: relation "core_job" does not exist
+
+  feedback_candidate: 0 rows
+  feedback_candidateset: 0 rows
+  feedback_judgmentsession: 0 rows
+  feedback_modelversion: 0 rows
+  feedback_retrieverrun: 0 rows
+  feedback_userjudgment: 0 rows
+  hr_bonus: 0 rows
+  hr_employee: 0 rows
+  hr_kpi: 0 rows
+  hr_payroll: 0 rows
+  hr_position: 1 rows... ERROR: relation "hr_position" does not exist
+
+  hr_recurringadjustment: 0 rows
+  hr_recurringadjustment_default_account: 0 rows
+  hr_timetracking: 0 rows
+  multitenancy_company: 2 rows... ERROR: relation "multitenancy_company" does not exist
+
+  multitenancy_customuser: 6 rows... ERROR: relation "multitenancy_customuser" does not exist
+
+  multitenancy_customuser_groups: 0 rows
+  multitenancy_customuser_user_permissions: 0 rows
+  multitenancy_entity: 6 rows... ERROR: relation "multitenancy_entity" does not exist
+
+  multitenancy_entity_accounts: 0 rows
+  multitenancy_entity_cost_centers: 0 rows
+  multitenancy_etlpipelinelog: 9 rows... ERROR: relation "multitenancy_etlpipelinelog" does not exist
+
+  multitenancy_importsnapshot: 5 rows... ERROR: relation "multitenancy_importsnapshot" does not exist
+
+  multitenancy_importtransformationrule: 1 rows... ERROR: relation "multitenancy_importtransformationrule" does not exist
+
+  multitenancy_integrationrule: 0 rows
+  multitenancy_integrationrulelog: 0 rows
+  multitenancy_substitutionrule: 77 rows... ERROR: relation "multitenancy_substitutionrule" does not exist
+
+  npl_agreementplan: 0 rows
+  npl_calculation: 0 rows
+  npl_courtevent: 0 rows
+  npl_courteventevidence: 0 rows
+  npl_doctyperule: 72 rows... ERROR: relation "npl_doctyperule" does not exist
+
+  npl_document: 38 rows... ERROR: relation "npl_document" does not exist
+
+  npl_enforcementaction: 0 rows
+  npl_eventtype: 0 rows
+  npl_expropriation: 0 rows
+  npl_idpjentry: 0 rows
+  npl_pricingrun: 0 rows
+  npl_process: 1 rows... ERROR: relation "npl_process" does not exist
+
+  npl_processdeadline: 0 rows
+  npl_processpricing: 0 rows
+  npl_seizure: 0 rows
+  npl_span: 864 rows... ERROR: relation "npl_span" does not exist
+
+  npl_spanembedding: 0 rows
+  npl_spanrule: 31 rows... ERROR: relation "npl_spanrule" does not exist
+
+  npl_suspension: 0 rows
+----------------------------------------------------------------------

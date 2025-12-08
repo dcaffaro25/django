@@ -217,8 +217,23 @@ def _allowed_keys(model) -> set:
         if att:
             names.add(att)  # e.g. entity_id
     fk_aliases = {n + "_fk" for n in names}
+    
+    # Add *_path fields for foreign keys that support path lookups
+    # (e.g., account_path, cost_center_path for Account and CostCenter which are MPTT models)
+    path_aliases = set()
+    for f in model._meta.fields:
+        if isinstance(f, dj_models.ForeignKey):
+            related_model = getattr(f, "related_model", None)
+            if related_model and _is_mptt_model(related_model):
+                # This FK points to an MPTT model that supports path lookups
+                base_name = f.name
+                path_aliases.add(f"{base_name}_path")
+                # Also support code-based lookups for Account
+                if related_model.__name__ == "Account":
+                    path_aliases.add(f"{base_name}_code")
+    
     # allow path helper + id + __row_id and company_fk convenience
-    return names | fk_aliases | set(PATH_COLS) | {"__row_id", "id", "company_fk"}
+    return names | fk_aliases | path_aliases | set(PATH_COLS) | {"__row_id", "id", "company_fk"}
 
 
 def _filter_unknown(model, row: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
@@ -305,6 +320,171 @@ def _resolve_fk_id_on_field(model, field_name: str, raw_value, token_to_id: Dict
         raise ValueError(f"{fk_model.__name__} id={fk_id} not found for field '{field_name}'")
 
     return fk_id
+
+
+def _resolve_path_to_id(model, field_name: str, path_value: str, company_id: int, path_separator: str = PATH_SEP, lookup_cache: Optional[Any] = None) -> Optional[int]:
+    """
+    Resolve a path value to an ID for a foreign key field.
+    Supports Account and CostCenter (MPTT models) path lookups.
+    
+    Args:
+        model: The model containing the FK field
+        field_name: The FK field name (e.g., 'account', 'cost_center')
+        path_value: The path string (e.g., 'Assets > Banks > Bradesco')
+        company_id: Company ID for filtering
+        path_separator: Path separator (default: ' > ')
+        
+    Returns:
+        ID of the found record, or None if not found
+    """
+    if _is_missing(path_value):
+        return None
+    
+    try:
+        related_field = model._meta.get_field(field_name)
+        related_model = getattr(related_field, "related_model", None)
+        
+        if not related_model:
+            return None
+        
+        # Only support path lookups for MPTT models
+        if not _is_mptt_model(related_model):
+            return None
+        
+        # Use lookup cache if available (for Account model)
+        if lookup_cache and related_model.__name__ == "Account":
+            account = lookup_cache.get_account_by_path(path_value, path_separator)
+            return account.id if account else None
+        
+        # Fallback to database query
+        # Split path and traverse
+        path_parts = _split_path(str(path_value).strip())
+        if not path_parts:
+            return None
+        
+        # Traverse the tree
+        parent = None
+        instance = None
+        
+        for part_name in path_parts:
+            instance = related_model.objects.filter(
+                company_id=company_id,
+                name__iexact=part_name,
+                parent=parent
+            ).first()
+            
+            if not instance:
+                return None
+            
+            parent = instance
+        
+        return instance.id if instance else None
+        
+    except Exception as e:
+        logger.warning(f"Error resolving path '{path_value}' for field '{field_name}': {e}")
+        return None
+
+
+def _resolve_code_to_id(model, field_name: str, code_value: str, company_id: int, lookup_cache: Optional[Any] = None) -> Optional[int]:
+    """
+    Resolve a code value to an ID for a foreign key field.
+    Currently supports Account code lookups.
+    
+    Args:
+        model: The model containing the FK field
+        field_name: The FK field name (e.g., 'account')
+        code_value: The code string (e.g., '1.1.1.001')
+        company_id: Company ID for filtering
+        
+    Returns:
+        ID of the found record, or None if not found
+    """
+    if _is_missing(code_value):
+        return None
+    
+    try:
+        related_field = model._meta.get_field(field_name)
+        related_model = getattr(related_field, "related_model", None)
+        
+        if not related_model:
+            return None
+        
+        # Only support code lookups for Account model
+        if related_model.__name__ != "Account":
+            return None
+        
+        # Use lookup cache if available
+        if lookup_cache:
+            account = lookup_cache.get_account_by_code(code_value)
+            return account.id if account else None
+        
+        # Fallback to database query
+        instance = related_model.objects.filter(
+            company_id=company_id,
+            account_code__iexact=str(code_value).strip()
+        ).first()
+        
+        return instance.id if instance else None
+        
+    except Exception as e:
+        logger.warning(f"Error resolving code '{code_value}' for field '{field_name}': {e}")
+        return None
+
+
+def _apply_path_inputs(model, payload: dict, company_id: int, lookup_cache: Optional[Any] = None) -> dict:
+    """
+    Resolve '*_path' and '*_code' fields to '*_id' assignments.
+    Similar to _apply_fk_inputs but for path/code-based lookups.
+    
+    Supports:
+    - account_path -> account_id (for Account MPTT model)
+    - cost_center_path -> cost_center_id (for CostCenter MPTT model)
+    - account_code -> account_id (for Account model)
+    """
+    out = dict(payload)
+    
+    # Process *_path fields
+    for k in list(out.keys()):
+        if not k.endswith("_path"):
+            continue
+        
+        base = k[:-5]  # Remove '_path' suffix
+        path_value = out.pop(k, None)
+        
+        # Skip if already have *_id or if path is empty
+        if f"{base}_id" in out and out[f"{base}_id"]:
+            continue
+        
+        if _is_missing(path_value):
+            continue
+        
+        # Resolve path to ID
+        fk_id = _resolve_path_to_id(model, base, path_value, company_id, lookup_cache=lookup_cache)
+        if fk_id:
+            out[f"{base}_id"] = fk_id
+        # Don't raise error if path not found - let validation handle it
+    
+    # Process *_code fields (for Account)
+    for k in list(out.keys()):
+        if not k.endswith("_code"):
+            continue
+        
+        base = k[:-5]  # Remove '_code' suffix
+        code_value = out.pop(k, None)
+        
+        # Skip if already have *_id or if code is empty
+        if f"{base}_id" in out and out[f"{base}_id"]:
+            continue
+        
+        if _is_missing(code_value):
+            continue
+        
+        # Resolve code to ID
+        fk_id = _resolve_code_to_id(model, base, code_value, company_id, lookup_cache=lookup_cache)
+        if fk_id:
+            out[f"{base}_id"] = fk_id
+    
+    return out
 
 
 def _apply_fk_inputs(model, payload: dict, original_input: dict, token_to_id: Dict[str, int]) -> dict:
@@ -404,9 +584,21 @@ class RowResult:
     message: str
 
 
-@shared_task
-def run_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool) -> Dict[str, Any]:
-    return execute_import_job(company_id, sheets, commit)
+@shared_task(bind=True, name='import.run_import_job')
+def run_import_job(self, company_id: int, sheets: List[Dict[str, Any]], commit: bool) -> Dict[str, Any]:
+    """
+    Legacy Celery task wrapper for import job.
+    
+    For new code, use process_import_template_task from etl_tasks.py which includes
+    better statistics and error handling.
+    """
+    from .etl_tasks import process_import_template_task
+    return process_import_template_task(
+        company_id=company_id,
+        sheets=sheets,
+        commit=commit,
+        file_meta=None
+    )
 
 
 def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool) -> Dict[str, Any]:
@@ -456,12 +648,28 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
             raw_rows: List[Dict[str, Any]] = sheet.get("rows") or []
 
             # 1) substitutions + audit
-            rows, audit = apply_substitutions(
-                raw_rows,
-                company_id=company_id,
-                model_name=model_name,
-                return_audit=True
-            )
+            # Use a savepoint to isolate substitution queries from transaction errors
+            try:
+                sid = transaction.savepoint()
+                try:
+                    rows, audit = apply_substitutions(
+                        raw_rows,
+                        company_id=company_id,
+                        model_name=model_name,
+                        return_audit=True
+                    )
+                except Exception as e:
+                    # Rollback the savepoint if substitution fails
+                    transaction.savepoint_rollback(sid)
+                    logger.exception(f"Error applying substitutions for {model_name}: {e}")
+                    # Continue with raw rows if substitutions fail
+                    rows = raw_rows
+                    audit = []
+            except Exception as e:
+                # If savepoint creation fails (transaction already aborted), use raw rows
+                logger.warning(f"Transaction in failed state, skipping substitutions for {model_name}: {e}")
+                rows = raw_rows
+                audit = []
             audit_by_rowid: Dict[Any, List[dict]] = {}
             for ch in (audit or []):
                 key_norm = _norm_row_key(ch.get("__row_id"))
@@ -477,6 +685,24 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                 raw = dict(row or {})
                 rid_raw = raw.pop("__row_id", None)
                 rid = _norm_row_key(rid_raw)
+
+                # Use a savepoint for each row to isolate errors
+                row_sid = None
+                try:
+                    row_sid = transaction.savepoint()
+                except Exception:
+                    # If transaction is already in a failed state, skip this row
+                    logger.warning(f"Transaction in failed state, skipping row {rid} in {model_name}")
+                    outputs_by_model[model_name].append({
+                        "__row_id": rid,
+                        "status": "error",
+                        "action": None,
+                        "data": raw,
+                        "message": "Transaction in failed state - previous error occurred",
+                        "observations": _row_observations(audit_by_rowid, rid),
+                        "external_id": None,
+                    })
+                    continue
 
                 try:
                     # 2) filter unknowns (keep *_fk)
@@ -503,14 +729,17 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                             for c in PATH_COLS:
                                 filtered.pop(c, None)
 
-                    # 5) FK application: *_fk -> *_id and rescue base tokens to *_id
+                    # 5) Path resolution: *_path and *_code -> *_id (before FK resolution)
+                    filtered = _apply_path_inputs(model, filtered, company_id, lookup_cache=lookup_cache)
+                    
+                    # 6) FK application: *_fk -> *_id and rescue base tokens to *_id
                     filtered = _apply_fk_inputs(model, filtered, raw, token_to_id)
 
-                    # 6) coercions
+                    # 7) coercions
                     filtered = _coerce_boolean_fields(model, filtered)
                     filtered = _quantize_decimal_fields(model, filtered)
 
-                    # 7) create/update
+                    # 8) create/update
                     action = "create"
                     if "id" in filtered and filtered["id"]:
                         pk = _to_int_or_none_soft(filtered["id"])
@@ -523,16 +752,16 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                     else:
                         instance = model(**filtered)
 
-                    # 8) validate & save
+                    # 9) validate & save
                     if hasattr(instance, "full_clean"):
                         instance.full_clean()
                     instance.save()  # assign PK now (even in preview; will rollback later)
 
-                    # 9) register token->id (AFTER save to ensure an id exists)
+                    # 10) register token->id (AFTER save to ensure an id exists)
                     if rid:
                         token_to_id[rid] = int(instance.pk)
 
-                    # 10) success output
+                    # 11) success output
                     msg = "ok"
                     if unknown:
                         msg += f" | Ignoring unknown columns: {', '.join(unknown)}"
@@ -549,15 +778,36 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         "observations": _row_observations(audit_by_rowid, rid),
                         "external_id": None,
                     })
+                    # Commit the savepoint on success
+                    if row_sid:
+                        transaction.savepoint_commit(row_sid)
 
                 except Exception as e:
-                    logger.exception("row error on %s rid=%s: %s", model_name, rid, e)
+                    # Check if this is a database error that would abort the transaction
+                    from django.db import DatabaseError, IntegrityError
+                    is_db_error = isinstance(e, (DatabaseError, IntegrityError))
+                    
+                    logger.exception("row error on %s rid=%s: %s (is_db_error=%s)", 
+                                   model_name, rid, e, is_db_error)
+                    
+                    # Rollback the savepoint to isolate this error
+                    if row_sid:
+                        try:
+                            transaction.savepoint_rollback(row_sid)
+                        except Exception as rollback_err:
+                            # If rollback fails, the transaction is likely already aborted
+                            logger.warning(f"Failed to rollback savepoint for row {rid}: {rollback_err}")
+                    
+                    error_message = str(e)
+                    if is_db_error:
+                        error_message = f"Database error: {error_message}"
+                    
                     outputs_by_model[model_name].append({
                         "__row_id": rid,
                         "status": "error",
                         "action": None,
                         "data": raw,
-                        "message": str(e),
+                        "message": error_message,
                         "observations": _row_observations(audit_by_rowid, rid),
                         "external_id": None,
                     })

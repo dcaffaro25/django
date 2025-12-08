@@ -378,17 +378,24 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 CORS_ALLOW_CREDENTIALS = True
 
-CORS_ALLOWED_ORIGINS = [
-    "https://server-production-e754.up.railway.app",
-    "http://localhost:5173",
-    "https://nordventures.retool.com",
-    "https://82f3-8-242-11-50.ngrok-free.app",
-    
-]
+# In development, allow all origins for easier testing
+if DEBUG:
+    CORS_ALLOW_ALL_ORIGINS = True
+else:
+    CORS_ALLOWED_ORIGINS = [
+        "https://server-production-e754.up.railway.app",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+        "https://nordventures.retool.com",
+        "https://82f3-8-242-11-50.ngrok-free.app",
+    ]
 
 CSRF_TRUSTED_ORIGINS = [
     "https://server-production-e754.up.railway.app",
-    'http://localhost:5173', 
+    'http://localhost:5173',
+    'http://127.0.0.1:3000',
+    'http://localhost:3000',
     "https://nordventures.retool.com",
     "https://82f3-8-242-11-50.ngrok-free.app",
     ]

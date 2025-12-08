@@ -1,4 +1,5 @@
 from django.apps import apps
+import logging
 
 from multitenancy.signals import CHANGES_TRACKER, clear_changes, get_changes
 import unicodedata
@@ -32,6 +33,7 @@ import json
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 faker = Faker()
+logger = logging.getLogger(__name__)
 
 # Custom timeout exception
 class TimeoutException(Exception):
@@ -625,9 +627,11 @@ def apply_substitutions(
         rules_qs = rules_qs.filter(field_name__in=field_names)
     if column_names:
         rules_qs = rules_qs.filter(column_name__in=column_names)
+    # Evaluate queryset once so we can profile and reuse
+    rules_list = list(rules_qs)
     # agrupar regras
     grouped = {"model_field": {}, "column_name": {}, "column_index": {}}
-    for rl in rules_qs:
+    for rl in rules_list:
         if rl.model_name and rl.field_name:
             key = (rl.model_name, rl.field_name)
             grouped["model_field"].setdefault(key, []).append(rl)
@@ -638,6 +642,10 @@ def apply_substitutions(
     # trabalhar com cópia
     rows = deepcopy(payload)
     audit: List[Dict[str, Any]] = []
+    # Simple profiling accumulators
+    prof_start = time.perf_counter()
+    rule_time = defaultdict(float)
+    rule_hits = defaultdict(int)
     def _should_apply_rule(row_dict: Dict[str, Any], rl: SubstitutionRule, field: str, value: Any) -> Tuple[bool, Any]:
         """Avalia condições, tipo de correspondência e retorna (True, novo_valor) se aplicar."""
         # verifica condições
@@ -676,7 +684,10 @@ def apply_substitutions(
                 if mdl == model_name and fld in rec:
                     original = rec[fld]
                     for rl in rule_list:
+                        _t0 = time.perf_counter()
                         apply, new_value = _should_apply_rule(rec, rl, fld, rec[fld])
+                        rule_time[rl.id] += time.perf_counter() - _t0
+                        rule_hits[rl.id] += 1
                         if apply:
                             if new_value != original:
                                 rec[fld] = new_value
@@ -695,7 +706,10 @@ def apply_substitutions(
                 if col in rec:
                     original = rec[col]
                     for rl in rule_list:
+                        _t0 = time.perf_counter()
                         apply, new_value = _should_apply_rule(rec, rl, col, rec[col])
+                        rule_time[rl.id] += time.perf_counter() - _t0
+                        rule_hits[rl.id] += 1
                         if apply:
                             if new_value != original:
                                 rec[col] = new_value
@@ -720,8 +734,11 @@ def apply_substitutions(
                     original = rec[idx]
                     for rl in rule_list:
                         # constrói um dict simplificado para avaliar conditions (campo fictício col_x)
+                        _t0 = time.perf_counter()
                         row_dict_for_cond = {f"col_{i}": rec[i] for i in range(len(rec))}
                         apply, new_value = _should_apply_rule(row_dict_for_cond, rl, f"col_{idx}", rec[idx])
+                        rule_time[rl.id] += time.perf_counter() - _t0
+                        rule_hits[rl.id] += 1
                         if apply:
                             if new_value != original:
                                 rec[idx] = new_value
@@ -735,6 +752,25 @@ def apply_substitutions(
                                         "rule_name": _rule_name(rl),
                                     })
                             break
+    # Log profiling results if there are any rules
+    prof_total = time.perf_counter() - prof_start
+    if rule_time and prof_total > 0.01:
+        logger.info(f"ETL SUBSTITUTION PROFILE: Total time {prof_total:.3f}s for {len(rows)} rows ({prof_total/len(rows)*1000:.2f}ms per row)")
+        # Sort rules by total time
+        sorted_rules = sorted(rule_time.items(), key=lambda x: x[1], reverse=True)
+        for rule_id, total_time in sorted_rules[:10]:  # Top 10 slowest rules
+            hits = rule_hits.get(rule_id, 0)
+            avg_time = total_time / hits if hits > 0 else 0
+            # Try to get rule name
+            rule_name = f"Rule#{rule_id}"
+            try:
+                for rl in rules_list:
+                    if rl.id == rule_id:
+                        rule_name = _rule_name(rl)
+                        break
+            except:
+                pass
+            logger.info(f"ETL SUBSTITUTION PROFILE: Rule {rule_name} (id={rule_id}): {hits} hits, {total_time:.3f}s total, {avg_time*1000:.2f}ms avg")
     return (rows, audit) if return_audit else rows
 
 def apply_substitutions2(payload, company_id, model_name=None, field_names=None,

@@ -1,0 +1,993 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ETL Pipeline Preview</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #f5f5f5;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            padding: 30px;
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 500;
+            color: #333;
+        }
+        
+        select, input[type="file"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        
+        select {
+            cursor: pointer;
+        }
+        
+        input[type="file"] {
+            padding: 8px;
+        }
+        
+        .file-info {
+            margin-top: 5px;
+            font-size: 12px;
+            color: #666;
+        }
+        
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 4px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        
+        button:hover:not(:disabled) {
+            background: #0056b3;
+        }
+        
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+            color: #666;
+        }
+        
+        .loading.show {
+            display: block;
+        }
+        
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #007bff;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 10px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .results {
+            display: none;
+            margin-top: 30px;
+            padding-top: 30px;
+            border-top: 2px solid #eee;
+        }
+        
+        .results.show {
+            display: block;
+        }
+        
+        .success-badge {
+            display: inline-block;
+            padding: 5px 12px;
+            background: #28a745;
+            color: white;
+            border-radius: 4px;
+            font-size: 14px;
+            margin-bottom: 20px;
+        }
+        
+        .error-badge {
+            display: inline-block;
+            padding: 5px 12px;
+            background: #dc3545;
+            color: white;
+            border-radius: 4px;
+            font-size: 14px;
+            margin-bottom: 20px;
+        }
+        
+        .summary {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+        
+        .summary h3 {
+            margin-bottom: 10px;
+            color: #333;
+        }
+        
+        .summary-item {
+            margin: 5px 0;
+            color: #555;
+        }
+        
+        .tabs {
+            display: flex;
+            border-bottom: 2px solid #eee;
+            margin-bottom: 20px;
+        }
+        
+        .tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            border: none;
+            background: none;
+            color: #666;
+            font-size: 14px;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -2px;
+        }
+        
+        .tab.active {
+            color: #007bff;
+            border-bottom-color: #007bff;
+            font-weight: 500;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        .table-container {
+            overflow-x: auto;
+            max-height: 600px;
+            overflow-y: auto;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        
+        th, td {
+            padding: 10px;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }
+        
+        th {
+            background: #f8f9fa;
+            font-weight: 600;
+            position: sticky;
+            top: 0;
+            z-index: 1;
+            cursor: pointer;
+            user-select: none;
+            padding-right: 25px;
+            position: relative;
+        }
+        
+        th.sortable:hover {
+            background: #e9ecef;
+        }
+        
+        th.sortable::after {
+            content: '⇅';
+            position: absolute;
+            right: 8px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 12px;
+            color: #999;
+        }
+        
+        th.sort-asc::after {
+            content: '↑';
+            color: #007bff;
+        }
+        
+        th.sort-desc::after {
+            content: '↓';
+            color: #007bff;
+        }
+        
+        tr:hover {
+            background: #f8f9fa;
+        }
+        
+        .row-group {
+            background: #e8f4f8;
+            border-left: 3px solid #007bff;
+            margin-bottom: 20px;
+            padding: 15px;
+            border-radius: 4px;
+        }
+        
+        .row-group-header {
+            font-weight: 600;
+            color: #007bff;
+            margin-bottom: 10px;
+        }
+        
+        .record-type {
+            margin: 10px 0;
+            padding-left: 15px;
+        }
+        
+        .record-type-title {
+            font-weight: 600;
+            color: #555;
+            margin-bottom: 5px;
+        }
+        
+        .warnings, .errors {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 4px;
+        }
+        
+        .warnings {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+        }
+        
+        .errors {
+            background: #f8d7da;
+            border-left: 4px solid #dc3545;
+        }
+        
+        .warnings h4, .errors h4 {
+            margin-bottom: 10px;
+        }
+        
+        .warning-item, .error-item {
+            margin: 5px 0;
+            padding: 5px 0;
+            font-size: 13px;
+        }
+        
+        pre {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 4px;
+            overflow-x: auto;
+            font-size: 12px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .json-view {
+            font-family: 'Courier New', monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ETL Pipeline Preview</h1>
+        <p class="subtitle">Upload an Excel file to preview the transformation results without committing to the database.</p>
+        
+        <form id="uploadForm" enctype="multipart/form-data">
+            <div class="form-group">
+                <label for="company_id">Company:</label>
+                <select id="company_id" name="company_id" required>
+                    <option value="">-- Select Company --</option>
+                    {% for company in companies %}
+                    <option value="{{ company.id }}">{{ company.name }} (ID: {{ company.id }})</option>
+                    {% endfor %}
+                </select>
+            </div>
+            
+            <div class="form-group">
+                <label for="file">Excel File:</label>
+                <input type="file" id="file" name="file" accept=".xlsx,.xls" required>
+                <div class="file-info" id="fileInfo"></div>
+            </div>
+            
+            <div class="form-group">
+                <label for="row_limit">Row Limit (for testing):</label>
+                <input type="number" id="row_limit" name="row_limit" value="10" min="0" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                <small style="color: #666; font-size: 12px; display: block; margin-top: 5px;">
+                    Number of rows to process from each sheet. Default: 10 (for testing). Set to 0 to process all rows.
+                </small>
+            </div>
+            
+            <div class="form-group">
+                <label>
+                    <input type="checkbox" id="enableAutoJournalEntries" name="enable_auto_journal_entries">
+                    Auto-create Journal Entries for Transactions
+                </label>
+                <div id="autoJournalEntriesConfig" style="display: none; margin-top: 15px; padding: 15px; background: #f8f9fa; border-radius: 4px; border: 1px solid #ddd;">
+                    <div class="form-group" style="margin-bottom: 15px;">
+                        <label>
+                            <input type="checkbox" id="use_pending_bank_account" name="use_pending_bank_account">
+                            Use Pending Bank Account (creates journal entry without specific bank account)
+                        </label>
+                        <small style="color: #666; font-size: 12px; display: block; margin-top: 5px;">When enabled, creates journal entries with bank_designation_pending=True, allowing later assignment to a specific bank account</small>
+                    </div>
+                    <div class="form-group" id="bankAccountFieldGroup" style="margin-bottom: 15px;">
+                        <label for="bank_account_field">Bank Account Field (in extra_fields_for_trigger):</label>
+                        <input type="text" id="bank_account_field" name="bank_account_field" value="bank_account_id" placeholder="bank_account_id" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                        <small style="color: #666; font-size: 12px;">Field name from extra_fields_for_trigger that contains the bank account ID (ignored if using pending bank account)</small>
+                    </div>
+                    <div class="form-group" style="margin-bottom: 15px;">
+                        <label for="opposing_account_field">Opposing Account Field (in extra_fields_for_trigger):</label>
+                        <input type="text" id="opposing_account_field" name="opposing_account_field" value="account_path" placeholder="account_path" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                        <small style="color: #666; font-size: 12px;">Field name from extra_fields_for_trigger that contains the opposing account (path, code, or ID)</small>
+                    </div>
+                    <div class="form-group" style="margin-bottom: 15px;">
+                        <label for="opposing_account_lookup">Opposing Account Lookup Type:</label>
+                        <select id="opposing_account_lookup" name="opposing_account_lookup" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                            <option value="path" selected>Path (e.g., "Assets > Banks > Bradesco")</option>
+                            <option value="code">Code (e.g., "1.1.1.001")</option>
+                            <option value="id">ID (direct account ID)</option>
+                        </select>
+                    </div>
+                    <div class="form-group" style="margin-bottom: 15px;">
+                        <label for="path_separator">Path Separator:</label>
+                        <input type="text" id="path_separator" name="path_separator" value=" > " placeholder=" > " style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                        <small style="color: #666; font-size: 12px;">Separator used in account paths (default: " > ")</small>
+                    </div>
+                    <div class="form-group" style="margin-bottom: 0;">
+                        <label for="cost_center_field">Cost Center Field (optional):</label>
+                        <input type="text" id="cost_center_field" name="cost_center_field" value="" placeholder="cost_center_path" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                        <small style="color: #666; font-size: 12px;">Optional: Field name from extra_fields_for_trigger for cost center</small>
+                    </div>
+                </div>
+            </div>
+            
+            <button type="submit" id="submitBtn">Preview Transformation</button>
+        </form>
+        
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <p>Processing file... This may take a few moments.</p>
+        </div>
+        
+        <div class="results" id="results">
+            <div id="statusBadge"></div>
+            
+            <div class="tabs">
+                <button class="tab active" data-tab="summary">Summary</button>
+                <button class="tab" data-tab="grouped">Grouped by Row</button>
+                <button class="tab" data-tab="flat">All Records</button>
+                <button class="tab" data-tab="substitutions">Substitutions</button>
+                <button class="tab" data-tab="failed">Failed Rows</button>
+                <button class="tab" data-tab="raw">Raw JSON</button>
+            </div>
+            
+            <div class="tab-content active" id="tab-summary">
+                <div class="summary" id="summaryContent"></div>
+                <div id="warningsSection"></div>
+                <div id="errorsSection"></div>
+            </div>
+            
+            <div class="tab-content" id="tab-grouped">
+                <div id="groupedContent"></div>
+            </div>
+            
+            <div class="tab-content" id="tab-flat">
+                <div class="table-container" id="flatContent"></div>
+            </div>
+            
+            <div class="tab-content" id="tab-substitutions">
+                <div id="substitutionsContent"></div>
+            </div>
+            
+            <div class="tab-content" id="tab-failed">
+                <div id="failedContent"></div>
+            </div>
+            
+            <div class="tab-content" id="tab-raw">
+                <pre id="rawContent" class="json-view"></pre>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const form = document.getElementById('uploadForm');
+        const fileInput = document.getElementById('file');
+        const fileInfo = document.getElementById('fileInfo');
+        const loading = document.getElementById('loading');
+        const results = document.getElementById('results');
+        const submitBtn = document.getElementById('submitBtn');
+        
+        // File input change handler
+        fileInput.addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (file) {
+                const sizeMB = (file.size / (1024 * 1024)).toFixed(2);
+                fileInfo.textContent = `Selected: ${file.name} (${sizeMB} MB)`;
+            } else {
+                fileInfo.textContent = '';
+            }
+        });
+        
+        // Auto-create journal entries toggle
+        const enableAutoJournalEntries = document.getElementById('enableAutoJournalEntries');
+        const autoJournalEntriesConfig = document.getElementById('autoJournalEntriesConfig');
+        const usePendingBankAccount = document.getElementById('use_pending_bank_account');
+        const bankAccountFieldGroup = document.getElementById('bankAccountFieldGroup');
+        
+        enableAutoJournalEntries.addEventListener('change', function() {
+            autoJournalEntriesConfig.style.display = this.checked ? 'block' : 'none';
+        });
+        
+        // Show/hide bank account field based on pending bank account checkbox
+        usePendingBankAccount.addEventListener('change', function() {
+            bankAccountFieldGroup.style.display = this.checked ? 'none' : 'block';
+        });
+        
+        // Tab switching
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', function() {
+                const targetTab = this.dataset.tab;
+                
+                // Update tab buttons
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                this.classList.add('active');
+                
+                // Update tab content
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                document.getElementById(`tab-${targetTab}`).classList.add('active');
+            });
+        });
+        
+        // Form submission
+        form.addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const formData = new FormData(form);
+            const companyId = document.getElementById('company_id').value;
+            
+            if (!companyId) {
+                alert('Please select a company.');
+                return;
+            }
+            
+            // Add auto_create_journal_entries config if enabled
+            if (enableAutoJournalEntries.checked) {
+                const autoConfig = {
+                    enabled: true,
+                    use_pending_bank_account: usePendingBankAccount.checked || false,
+                    opposing_account_field: document.getElementById('opposing_account_field').value || 'account_path',
+                    opposing_account_lookup: document.getElementById('opposing_account_lookup').value || 'path',
+                    path_separator: document.getElementById('path_separator').value || ' > '
+                };
+                
+                // Only include bank_account_field if not using pending bank account
+                if (!usePendingBankAccount.checked) {
+                    autoConfig.bank_account_field = document.getElementById('bank_account_field').value || 'bank_account_id';
+                }
+                
+                const costCenterField = document.getElementById('cost_center_field').value.trim();
+                if (costCenterField) {
+                    autoConfig.cost_center_field = costCenterField;
+                }
+                
+                formData.append('auto_create_journal_entries', JSON.stringify(autoConfig));
+            }
+            
+            // Add row_limit to form data
+            const rowLimit = document.getElementById('row_limit').value;
+            if (rowLimit !== null && rowLimit !== '') {
+                formData.append('row_limit', rowLimit);
+            }
+            
+            // Show loading, hide results
+            loading.classList.add('show');
+            results.classList.remove('show');
+            submitBtn.disabled = true;
+            
+            try {
+                const response = await fetch('/etl/preview/', {
+                    method: 'POST',
+                    body: formData,
+                    headers: {
+                        'X-Requested-With': 'XMLHttpRequest',
+                    }
+                });
+                
+                const data = await response.json();
+                
+                // Hide loading, show results
+                loading.classList.remove('show');
+                results.classList.add('show');
+                submitBtn.disabled = false;
+                
+                // Display results
+                displayResults(data);
+                
+            } catch (error) {
+                loading.classList.remove('show');
+                submitBtn.disabled = false;
+                alert('Error: ' + error.message);
+            }
+        });
+        
+        function displayResults(data) {
+            // Status badge
+            const statusBadge = document.getElementById('statusBadge');
+            if (data.success) {
+                statusBadge.innerHTML = '<span class="success-badge">✓ Preview Successful</span>';
+            } else {
+                statusBadge.innerHTML = '<span class="error-badge">✗ Preview Failed</span>';
+            }
+            
+            // Summary
+            displaySummary(data);
+            
+            // Grouped by row
+            displayGrouped(data);
+            
+            // Flat records
+            displayFlat(data);
+            
+            // Substitutions
+            displaySubstitutions(data);
+            
+            // Failed rows
+            displayFailed(data);
+            
+            // Raw JSON
+            document.getElementById('rawContent').textContent = JSON.stringify(data, null, 2);
+        }
+        
+        function displaySummary(data) {
+            const summary = data.summary || {};
+            const summaryHtml = `
+                <h3>Summary</h3>
+                <div class="summary-item"><strong>Duration:</strong> ${data.duration_seconds || 0}s</div>
+                <div class="summary-item"><strong>File:</strong> ${data.file_name || 'N/A'}</div>
+                <div class="summary-item"><strong>Sheets Found:</strong> ${summary.sheets_found || 0}</div>
+                <div class="summary-item"><strong>Sheets Processed:</strong> ${summary.sheets_processed || 0}</div>
+                <div class="summary-item"><strong>Sheets Skipped:</strong> ${summary.sheets_skipped || 0}</div>
+                <div class="summary-item"><strong>Rows Transformed:</strong> ${summary.total_rows_transformed || 0}</div>
+            `;
+            document.getElementById('summaryContent').innerHTML = summaryHtml;
+            
+            // Warnings
+            if (data.warnings && data.warnings.length > 0) {
+                const warningsHtml = `
+                    <div class="warnings">
+                        <h4>⚠ Warnings (${data.warnings.length})</h4>
+                        ${data.warnings.slice(0, 10).map(w => `
+                            <div class="warning-item">
+                                <strong>[${w.type || 'warning'}]</strong> ${w.message || 'No message'}
+                                ${w.row_number ? ` - Row ${w.row_number}` : ''}
+                            </div>
+                        `).join('')}
+                        ${data.warnings.length > 10 ? `<div class="warning-item">... and ${data.warnings.length - 10} more warnings</div>` : ''}
+                    </div>
+                `;
+                document.getElementById('warningsSection').innerHTML = warningsHtml;
+            } else {
+                document.getElementById('warningsSection').innerHTML = '';
+            }
+            
+            // Errors
+            if (data.errors && data.errors.length > 0) {
+                const errorsHtml = `
+                    <div class="errors">
+                        <h4>❌ Errors (${data.errors.length})</h4>
+                        ${data.errors.slice(0, 10).map(e => `
+                            <div class="error-item">
+                                <strong>[${e.type || 'error'}]</strong> ${e.message || 'No message'}
+                            </div>
+                        `).join('')}
+                        ${data.errors.length > 10 ? `<div class="error-item">... and ${data.errors.length - 10} more errors</div>` : ''}
+                    </div>
+                `;
+                document.getElementById('errorsSection').innerHTML = errorsHtml;
+            } else {
+                document.getElementById('errorsSection').innerHTML = '';
+            }
+        }
+        
+        function displayGrouped(data) {
+            const grouped = data.data?.would_create_by_row || [];
+            const groupedContent = document.getElementById('groupedContent');
+            
+            if (grouped.length === 0) {
+                groupedContent.innerHTML = '<p>No records grouped by row.</p>';
+                return;
+            }
+            
+            let html = `<p>Showing ${grouped.length} Excel row(s) with created records:</p>`;
+            
+            grouped.forEach((rowGroup, idx) => {
+                const rowNum = rowGroup.excel_row_number || 'N/A';
+                const sheetName = rowGroup.excel_sheet || 'Unknown';
+                const created = rowGroup.created_records || {};
+                
+                html += `
+                    <div class="row-group">
+                        <div class="row-group-header">
+                            Row ${rowNum} - ${sheetName}
+                        </div>
+                `;
+                
+                for (const [model, records] of Object.entries(created)) {
+                    if (Array.isArray(records) && records.length > 0) {
+                        const displayRecords = records.slice(0, 5);
+                        const columns = Object.keys(records[0]);
+                        html += `
+                            <div class="record-type">
+                                <div class="record-type-title">${model} (${records.length} record(s)):</div>
+                                <table class="sortable-table">
+                                    <thead>
+                                        <tr>
+                                            ${columns.map(key => `<th>${key}</th>`).join('')}
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        ${displayRecords.map((record, idx) => `
+                                            <tr data-original-order="${idx}">
+                                                ${columns.map(key => `
+                                                    <td>${formatValue(record[key])}</td>
+                                                `).join('')}
+                                            </tr>
+                                        `).join('')}
+                                    </tbody>
+                                </table>
+                                ${records.length > 5 ? `<p><em>... and ${records.length - 5} more records</em></p>` : ''}
+                            </div>
+                        `;
+                    }
+                }
+                
+                html += `</div>`;
+            });
+            
+            groupedContent.innerHTML = html;
+            
+            // Make all tables sortable
+            groupedContent.querySelectorAll('table').forEach(table => {
+                makeTableSortable(table);
+            });
+        }
+        
+        function displayFlat(data) {
+            const wouldCreate = data.data?.would_create || {};
+            const flatContent = document.getElementById('flatContent');
+            
+            if (Object.keys(wouldCreate).length === 0) {
+                flatContent.innerHTML = '<p>No records would be created.</p>';
+                return;
+            }
+            
+            let html = '';
+            
+            for (const [modelName, modelData] of Object.entries(wouldCreate)) {
+                const records = modelData.records || [];
+                const total = modelData.total || records.length;
+                
+                html += `<h3>${modelName} (${total} record(s))</h3>`;
+                
+                if (records.length > 0) {
+                    const columns = Object.keys(records[0]);
+                    html += `
+                        <table class="sortable-table">
+                            <thead>
+                                <tr>
+                                    ${columns.map(col => `<th>${col}</th>`).join('')}
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${records.map((record, idx) => `
+                                    <tr data-original-order="${idx}">
+                                        ${columns.map(col => `
+                                            <td>${formatValue(record[col])}</td>
+                                        `).join('')}
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    `;
+                    
+                    if (total > records.length) {
+                        html += `<p><em>Showing first ${records.length} of ${total} records</em></p>`;
+                    }
+                }
+            }
+            
+            flatContent.innerHTML = html;
+            
+            // Make all tables sortable
+            flatContent.querySelectorAll('table').forEach(table => {
+                makeTableSortable(table);
+            });
+        }
+        
+        function displayFailed(data) {
+            const wouldFail = data.data?.would_fail || {};
+            const failedContent = document.getElementById('failedContent');
+            
+            if (Object.keys(wouldFail).length === 0) {
+                failedContent.innerHTML = '<p>No rows would fail.</p>';
+                return;
+            }
+            
+            let html = '';
+            
+            for (const [modelName, failData] of Object.entries(wouldFail)) {
+                const count = failData.count || 0;
+                const failedRows = failData.rows || [];
+                
+                html += `<h3>${modelName} - ${count} row(s) would fail</h3>`;
+                
+                if (failedRows.length > 0) {
+                    html += `
+                        <table class="sortable-table">
+                            <thead>
+                                <tr>
+                                    <th>Row Number</th>
+                                    <th>Excel Sheet</th>
+                                    <th>Reason</th>
+                                    <th>Data</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${failedRows.map((row, idx) => `
+                                    <tr data-original-order="${idx}">
+                                        <td>${row.row_number || 'N/A'}</td>
+                                        <td>${row.excel_sheet || 'Unknown'}</td>
+                                        <td>${row.reason || 'Unknown'}</td>
+                                        <td><pre style="margin:0;font-size:11px;">${JSON.stringify(row.data || {}, null, 2)}</pre></td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    `;
+                    
+                    if (count > failedRows.length) {
+                        html += `<p><em>Showing first ${failedRows.length} of ${count} failed rows</em></p>`;
+                    }
+                }
+            }
+            
+            failedContent.innerHTML = html;
+            
+            // Make all tables sortable
+            failedContent.querySelectorAll('table').forEach(table => {
+                makeTableSortable(table);
+            });
+        }
+        
+        function displaySubstitutions(data) {
+            // Check both data.data.substitutions_applied (from preview) and direct access
+            const substitutions = data.data?.substitutions_applied || data.substitutions_applied || [];
+            const substitutionsContent = document.getElementById('substitutionsContent');
+            
+            if (substitutions.length === 0) {
+                substitutionsContent.innerHTML = '<p>No substitutions were applied.</p>';
+                return;
+            }
+            
+            let html = `<p>Showing ${substitutions.length} record(s) with substitutions applied:</p>`;
+            
+            substitutions.forEach((subItem) => {
+                const model = subItem.model || 'Unknown';
+                const rowNum = subItem.row_number || 'N/A';
+                const sheet = subItem.sheet || 'Unknown';
+                const observations = subItem.observations || [];
+                
+                html += `
+                    <div class="row-group">
+                        <div class="row-group-header">
+                            ${model} - Row ${rowNum} (${sheet})
+                        </div>
+                `;
+                
+                if (observations.length > 0) {
+                    html += `
+                        <table class="sortable-table">
+                            <thead>
+                                <tr>
+                                    <th>Field</th>
+                                    <th>Original Value</th>
+                                    <th>New Value</th>
+                                    <th>Rule</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                    `;
+                    
+                    observations.forEach((obs, idx) => {
+                        // Parse observation string like: "campo 'field_name' alterado de 'old' para 'new' (regra id=123)"
+                        const match = obs.match(/campo '([^']+)' alterado de '([^']*)' para '([^']*)' \(regra id=(\d+)\)/);
+                        
+                        if (match) {
+                            const [, field, oldVal, newVal, ruleId] = match;
+                            html += `
+                                <tr data-original-order="${idx}">
+                                    <td><strong>${field}</strong></td>
+                                    <td>${formatValue(oldVal)}</td>
+                                    <td><strong style="color: #28a745;">${formatValue(newVal)}</strong></td>
+                                    <td>Rule #${ruleId}</td>
+                                </tr>
+                            `;
+                        } else {
+                            // Fallback: just display the observation as-is
+                            html += `
+                                <tr data-original-order="${idx}">
+                                    <td colspan="4">${obs}</td>
+                                </tr>
+                            `;
+                        }
+                    });
+                    
+                    html += `
+                            </tbody>
+                        </table>
+                    `;
+                } else {
+                    html += `<p><em>No substitution details available</em></p>`;
+                }
+                
+                html += `</div>`;
+            });
+            
+            substitutionsContent.innerHTML = html;
+            
+            // Make all tables sortable
+            substitutionsContent.querySelectorAll('table').forEach(table => {
+                makeTableSortable(table);
+            });
+        }
+        
+        function formatValue(value) {
+            if (value === null || value === undefined) {
+                return '<em>null</em>';
+            }
+            if (typeof value === 'object') {
+                return JSON.stringify(value);
+            }
+            return String(value);
+        }
+        
+        // Sorting functionality
+        function makeTableSortable(table) {
+            const headers = table.querySelectorAll('thead th');
+            headers.forEach((header, index) => {
+                header.classList.add('sortable');
+                header.addEventListener('click', () => {
+                    const tbody = table.querySelector('tbody');
+                    const rows = Array.from(tbody.querySelectorAll('tr'));
+                    
+                    // Determine current sort direction
+                    const isAsc = header.classList.contains('sort-asc');
+                    const isDesc = header.classList.contains('sort-desc');
+                    
+                    // Reset all headers
+                    headers.forEach(h => {
+                        h.classList.remove('sort-asc', 'sort-desc');
+                    });
+                    
+                    // Set new sort direction
+                    if (!isAsc && !isDesc) {
+                        header.classList.add('sort-asc');
+                        sortRows(rows, index, true);
+                    } else if (isAsc) {
+                        header.classList.add('sort-desc');
+                        sortRows(rows, index, false);
+                    } else {
+                        // Reset to original order (by data attribute if available)
+                        sortRows(rows, -1, true);
+                    }
+                    
+                    // Re-append sorted rows
+                    rows.forEach(row => tbody.appendChild(row));
+                });
+            });
+        }
+        
+        function sortRows(rows, columnIndex, ascending) {
+            if (columnIndex === -1) {
+                // Reset to original order
+                rows.sort((a, b) => {
+                    const orderA = parseInt(a.dataset.originalOrder) || 0;
+                    const orderB = parseInt(b.dataset.originalOrder) || 0;
+                    return orderA - orderB;
+                });
+                return;
+            }
+            
+            rows.forEach((row, idx) => {
+                if (!row.dataset.originalOrder) {
+                    row.dataset.originalOrder = idx;
+                }
+            });
+            
+            rows.sort((a, b) => {
+                const cellA = a.cells[columnIndex];
+                const cellB = b.cells[columnIndex];
+                
+                if (!cellA || !cellB) return 0;
+                
+                const textA = cellA.textContent.trim();
+                const textB = cellB.textContent.trim();
+                
+                // Try to parse as numbers
+                const numA = parseFloat(textA.replace(/[^0-9.-]/g, ''));
+                const numB = parseFloat(textB.replace(/[^0-9.-]/g, ''));
+                
+                if (!isNaN(numA) && !isNaN(numB)) {
+                    return ascending ? numA - numB : numB - numA;
+                }
+                
+                // Try to parse as dates
+                const dateA = new Date(textA);
+                const dateB = new Date(textB);
+                
+                if (!isNaN(dateA.getTime()) && !isNaN(dateB.getTime())) {
+                    return ascending ? dateA - dateB : dateB - dateA;
+                }
+                
+                // String comparison
+                return ascending 
+                    ? textA.localeCompare(textB, undefined, { numeric: true, sensitivity: 'base' })
+                    : textB.localeCompare(textA, undefined, { numeric: true, sensitivity: 'base' });
+            });
+        }
+    </script>
+</body>
+</html>
+

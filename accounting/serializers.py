@@ -159,7 +159,9 @@ class JournalEntrySerializer(serializers.ModelSerializer):
     
     account = FlexibleRelatedField(
         serializer_class=AccountSerializer,
-        unique_field='account_code'
+        unique_field='account_code',
+        required=False,
+        allow_null=True
     )
     
     bank_designation_pending = serializers.BooleanField(required=False)

@@ -11,6 +11,7 @@ from .views import (
     ImportTransformationRuleViewSet, ETLPipelineLogViewSet,
     ETLPipelinePreviewView, ETLPipelineExecuteView, ETLPipelineAnalyzeView,
 )
+from .views_etl_html import ETLPreviewHTMLView
 from accounting.views import CurrencyViewSet
 from .api_utils import BulkImportPreview, BulkImportExecute, BulkImportTemplateDownloadView
 
@@ -52,4 +53,7 @@ urlpatterns = [
     re_path(r'^api/core/etl/preview/?$', ETLPipelinePreviewView.as_view(), name='etl-preview'),
     re_path(r'^api/core/etl/execute/?$', ETLPipelineExecuteView.as_view(), name='etl-execute'),
     re_path(r'^api/core/etl/analyze/?$', ETLPipelineAnalyzeView.as_view(), name='etl-analyze'),
+    
+    # ETL Pipeline HTML interface
+    re_path(r'^etl/preview/?$', ETLPreviewHTMLView.as_view(), name='etl-preview-html'),
 ]

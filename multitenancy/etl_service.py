@@ -22,7 +22,8 @@ import hashlib
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, date
+from datetime import time as time_type
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -75,10 +76,18 @@ class ETLPipelineService:
         'False': False,
     }
     
-    def __init__(self, company_id: int, file, commit: bool = False):
+    def __init__(self, company_id: int, file, commit: bool = False, auto_create_journal_entries: Optional[dict] = None, row_limit: Optional[int] = None):
         self.company_id = company_id
         self.file = file
         self.commit = commit
+        self.auto_create_journal_entries = auto_create_journal_entries or {}
+        # row_limit: None = use default (10), 0 = process all rows, >0 = limit to that number
+        self.row_limit = row_limit if row_limit is not None else 10  # Default to 10 for testing
+        
+        # Initialize lookup cache for efficient FK resolution
+        from multitenancy.lookup_cache import LookupCache
+        self.lookup_cache = LookupCache(company_id)
+        self.lookup_cache.load()  # Pre-load all lookup data
         
         # State
         self.log: Optional[ETLPipelineLog] = None
@@ -167,6 +176,23 @@ class ETLPipelineService:
             is_preview=not self.commit,
         )
     
+    def _json_serialize(self, obj):
+        """Recursively convert datetime objects to ISO format strings for JSON serialization."""
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        elif isinstance(obj, date):
+            return obj.isoformat()
+        elif isinstance(obj, time_type):
+            return obj.isoformat()
+        elif isinstance(obj, dict):
+            return {k: self._json_serialize(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [self._json_serialize(item) for item in obj]
+        elif isinstance(obj, Decimal):
+            return str(obj)
+        else:
+            return obj
+    
     def _update_log_status(self, status: str):
         """Update log status."""
         if self.log:
@@ -175,8 +201,9 @@ class ETLPipelineService:
             self.log.sheets_processed = self.sheets_processed
             self.log.sheets_skipped = self.sheets_skipped
             self.log.sheets_failed = self.sheets_failed
-            self.log.warnings = self.warnings
-            self.log.errors = self.errors
+            # Convert datetime objects to strings for JSON serialization
+            self.log.warnings = self._json_serialize(self.warnings)
+            self.log.errors = self._json_serialize(self.errors)
             if status in ('completed', 'failed', 'partial'):
                 self.log.completed_at = timezone.now()
             self.log.save()
@@ -242,6 +269,19 @@ class ETLPipelineService:
                 )
                 self.sheets_skipped.append(sheet_name)
                 return
+            
+            # Apply row limit if specified (0 means process all rows)
+            original_row_count = len(df)
+            if self.row_limit > 0 and original_row_count > self.row_limit:
+                df = df.head(self.row_limit)
+                logger.info(f"ETL: Limiting sheet '{sheet_name}' to first {self.row_limit} rows (out of {original_row_count} total)")
+                self._add_warning(
+                    warning_type='row_limit',
+                    message=f"Processing only first {self.row_limit} rows of sheet '{sheet_name}' (total: {original_row_count})",
+                    sheet=sheet_name,
+                    total_rows=original_row_count,
+                    limited_to=self.row_limit
+                )
             
             # Build case-insensitive column lookup
             available_columns = {str(col).lower().strip(): str(col) for col in df.columns}
@@ -404,6 +444,26 @@ class ETLPipelineService:
                     if extra_fields:
                         transformed['__extra_fields__'] = extra_fields
                     
+                    # Additional post-transformation filter: Skip rows with null amount for Transaction model
+                    if rule.target_model == 'Transaction':
+                        amount = transformed.get('amount')
+                        # Check if amount is null or empty after transformation
+                        # Note: We allow 0 as a valid amount, only filter null/empty
+                        is_null_amount = (
+                            amount is None or 
+                            (isinstance(amount, str) and amount.strip() == '')
+                        )
+                        if is_null_amount:
+                            # Skip this row - it would fail validation anyway
+                            filtered_count += 1
+                            continue
+                    
+                    # Store Excel source row metadata for tracking and grouping
+                    # Use __excel_row_* prefix to avoid conflicts with model fields
+                    transformed['__excel_row_number'] = row_number
+                    transformed['__excel_sheet_name'] = sheet_name
+                    transformed['__excel_row_id'] = f"{sheet_name}:{row_number}"  # Unique identifier
+                    
                     # Add row to results
                     transformed_rows.append(transformed)
                     
@@ -509,6 +569,98 @@ class ETLPipelineService:
         
         return value
     
+    def _apply_substitutions_to_extra_fields(self, extra_fields: dict, auto_config: dict, substitution_rules_cache: Dict = None, apply_substitution_fast: callable = None) -> dict:
+        """
+        Apply substitutions to extra_fields based on target model and field.
+        
+        For example, if extra_fields contains 'account_path', we look for SubstitutionRules
+        for model='Account' and field='path', and apply those substitutions.
+        
+        Field mapping:
+        - account_path -> Account.path
+        - account_code -> Account.code
+        - account_id -> Account.id
+        - bank_account_id -> BankAccount.id
+        - cost_center_id -> CostCenter.id (if applicable)
+        """
+        from multitenancy.formula_engine import apply_substitutions
+        
+        if not extra_fields:
+            return extra_fields
+        
+        subst_start = time.time()
+        # Create a copy to avoid modifying original
+        substituted = dict(extra_fields)
+        
+        # Map extra field names to (model_name, field_name) tuples
+        field_mappings = {
+            'account_path': ('Account', 'path'),
+            'account_code': ('Account', 'code'),
+            'account_id': ('Account', 'id'),
+            'bank_account_id': ('BankAccount', 'id'),
+            'cost_center_id': ('CostCenter', 'id'),
+        }
+        
+        # Also check auto_config for field mappings
+        bank_account_field = auto_config.get('bank_account_field', 'bank_account_id')
+        opposing_account_field = auto_config.get('opposing_account_field', 'account_path')
+        cost_center_field = auto_config.get('cost_center_field')
+        opposing_account_lookup = auto_config.get('opposing_account_lookup', 'path')
+        
+        # Add mappings from auto_config
+        if opposing_account_field and opposing_account_field not in field_mappings:
+            # Determine target model and field based on lookup type
+            if opposing_account_lookup == 'path':
+                field_mappings[opposing_account_field] = ('Account', 'path')
+            elif opposing_account_lookup == 'code':
+                field_mappings[opposing_account_field] = ('Account', 'code')
+            elif opposing_account_lookup == 'id':
+                field_mappings[opposing_account_field] = ('Account', 'id')
+        
+        if cost_center_field and cost_center_field not in field_mappings:
+            field_mappings[cost_center_field] = ('CostCenter', 'id')
+        
+        # Apply substitutions for each field with detailed profiling
+        # Use fast substitution function that uses pre-loaded rules cache
+        field_timings = {}
+        for field_name, (target_model, target_field) in field_mappings.items():
+            if field_name in substituted and substituted[field_name] is not None:
+                value = substituted[field_name]
+                
+                # Apply substitutions using fast cached function
+                field_subst_start = time.time()
+                try:
+                    # Use the fast substitution function (defined in _import_transactions_with_journal_entries)
+                    # We need to access it from the outer scope
+                    new_value = apply_substitution_fast(value, target_model, target_field, row_context=extra_fields)
+                    field_subst_time = time.time() - field_subst_start
+                    field_timings[field_name] = field_subst_time
+                    if field_subst_time > 0.01:
+                        logger.info(f"ETL DEBUG: Substitution for {field_name} ({target_model}.{target_field}) took {field_subst_time:.3f}s")
+                    if new_value != value:
+                        logger.debug(f"ETL: Applied substitution to {field_name}: {value} -> {new_value}")
+                        substituted[field_name] = new_value
+                except Exception as e:
+                    field_subst_time = time.time() - field_subst_start
+                    field_timings[field_name] = field_subst_time
+                    logger.warning(f"ETL: Error applying substitutions to {field_name}: {e}")
+                    # Continue with original value
+        
+        # Log summary of field timings
+        if field_timings:
+            total_field_time = sum(field_timings.values())
+            if total_field_time > 0.05:
+                logger.info(f"ETL SUBSTITUTION PROFILE (extra_fields): Total {total_field_time:.3f}s across {len(field_timings)} fields")
+                for field_name, timing in sorted(field_timings.items(), key=lambda x: x[1], reverse=True):
+                    if timing > 0.01:
+                        logger.info(f"ETL SUBSTITUTION PROFILE (extra_fields): {field_name}: {timing:.3f}s")
+        
+        subst_total_time = time.time() - subst_start
+        if subst_total_time > 0.05:
+            logger.debug(f"ETL DEBUG: Total extra field substitutions took {subst_total_time:.3f}s")
+        
+        return substituted
+    
     def _post_process_data(self):
         """
         Post-process transformed data after substitution.
@@ -523,7 +675,7 @@ class ETLPipelineService:
     
     def _lookup_account(self, value: Any, lookup_type: str, path_separator: str = ' > ') -> Optional[Any]:
         """
-        Look up an Account by various methods.
+        Look up an Account by various methods using in-memory cache.
         
         Args:
             value: The lookup value
@@ -533,63 +685,34 @@ class ETLPipelineService:
         Returns:
             Account instance or None
         """
-        from accounting.models import Account
-        
         if not value:
             return None
         
+        lookup_start = time.time()
         try:
+            result = None
             if lookup_type == 'id':
-                return Account.objects.filter(
-                    company_id=self.company_id,
-                    id=int(value)
-                ).first()
+                result = self.lookup_cache.get_account_by_id(int(value))
             
             elif lookup_type == 'code':
-                return Account.objects.filter(
-                    company_id=self.company_id,
-                    account_code__iexact=str(value).strip()
-                ).first()
+                result = self.lookup_cache.get_account_by_code(str(value))
             
             elif lookup_type == 'name':
-                # Simple name lookup (may return first match if duplicates exist)
-                return Account.objects.filter(
-                    company_id=self.company_id,
-                    name__iexact=str(value).strip()
-                ).first()
+                result = self.lookup_cache.get_account_by_name(str(value))
             
             elif lookup_type == 'path':
-                # Parse path and traverse the tree
-                path_str = str(value).strip()
-                path_parts = [p.strip() for p in path_str.split(path_separator) if p.strip()]
-                
-                if not path_parts:
-                    return None
-                
-                # Traverse the account tree
-                parent = None
-                account = None
-                
-                for part_name in path_parts:
-                    account = Account.objects.filter(
-                        company_id=self.company_id,
-                        name__iexact=part_name,
-                        parent=parent
-                    ).first()
-                    
-                    if not account:
-                        # Try without parent constraint for more flexibility
-                        # (in case path has gaps or different structure)
-                        logger.debug(f"Account not found with parent constraint: {part_name}, trying without parent")
-                        return None
-                    
-                    parent = account
-                
-                return account
+                # Use lookup cache for path resolution
+                result = self.lookup_cache.get_account_by_path(str(value), path_separator)
             
             else:
                 logger.warning(f"Unknown account lookup type: {lookup_type}")
                 return None
+            
+            lookup_time = time.time() - lookup_start
+            if lookup_time > 0.01:
+                logger.debug(f"ETL DEBUG: Account lookup ({lookup_type}={value}) took {lookup_time:.3f}s")
+            
+            return result
                 
         except Exception as e:
             logger.error(f"Error looking up account: {e}")
@@ -627,7 +750,17 @@ class ETLPipelineService:
                         required_fields.append(field.name)
             
             for idx, row in enumerate(rows):
-                row_number = idx + 1
+                # Try to get Excel row number from metadata if available
+                excel_row_number = None
+                excel_sheet_name = None
+                if '__extra_fields__' in row:
+                    extra_fields = row.get('__extra_fields__', {})
+                    excel_row_number = extra_fields.get('__excel_row_number')
+                    excel_sheet_name = extra_fields.get('__excel_sheet_name')
+                
+                row_number = excel_row_number if excel_row_number else (idx + 1)
+                row_label = f"Row {row_number}" + (f" (Sheet: {excel_sheet_name})" if excel_sheet_name else "")
+                
                 for field in required_fields:
                     # Check both field name and field_id variant
                     field_id = f"{field}_id" if not field.endswith('_id') else field
@@ -638,9 +771,10 @@ class ETLPipelineService:
                        (field_fk not in row or row[field_fk] is None):
                         self._add_warning(
                             warning_type='missing_required_field',
-                            message=f"Row {row_number} in {model_name} is missing required field '{field}'",
+                            message=f"{row_label} in {model_name} is missing required field '{field}'",
                             model=model_name,
                             row_number=row_number,
+                            excel_sheet=excel_sheet_name,
                             field=field
                         )
     
@@ -670,13 +804,22 @@ class ETLPipelineService:
         result = execute_import_job(
             company_id=self.company_id,
             sheets=sheets,
-            commit=True
+            commit=True,
+            lookup_cache=self.lookup_cache
         )
+        
+        # Normalize result format: execute_import_job returns {'imports': [...]}
+        # Convert to {'results': {model_name: [outputs]}} format
+        normalized_result = {'results': {}}
+        for import_item in result.get('imports', []):
+            model_name = import_item.get('model')
+            outputs = import_item.get('result', [])
+            normalized_result['results'][model_name] = outputs
         
         # Update log with import stats
         records_created = {}
         if self.log:
-            for model_name, outputs in result.get('results', {}).items():
+            for model_name, outputs in normalized_result.get('results', {}).items():
                 created_count = sum(1 for o in outputs if o.get('status') == 'success' and o.get('action') == 'create')
                 if created_count > 0:
                     records_created[model_name] = created_count
@@ -685,10 +828,1187 @@ class ETLPipelineService:
             self.log.total_rows_imported = sum(records_created.values())
             self.log.save()
         
-        # Trigger IntegrationRule events for created records
-        self._trigger_events_for_created_records(result, extra_fields_by_model)
+        # Auto-create JournalEntries for Transactions (if enabled in request)
+        self._auto_create_journal_entries(normalized_result, extra_fields_by_model)
+        
+        # Trigger IntegrationRule events for created records (backward compatible)
+        self._trigger_events_for_created_records(normalized_result, extra_fields_by_model)
+        
+        return normalized_result
+    
+    def _import_transactions_with_journal_entries(self, transaction_sheets: List[dict], extra_fields_list: List[dict]) -> dict:
+        """
+        Import Transactions and create JournalEntries immediately after each Transaction,
+        all within the same transaction context. This ensures Transactions are accessible
+        when creating JournalEntries.
+        
+        Similar strategy to import template - create related records together before rollback.
+        This method manually processes Transactions and creates JournalEntries in the same loop,
+        all within the outer transaction context from _preview_data.
+        """
+        from accounting.models import Account, BankAccount, Transaction, JournalEntry
+        from accounting.serializers import TransactionSerializer, JournalEntrySerializer
+        from multitenancy.tasks import apply_substitutions, _filter_unknown, _attach_company_context
+        from multitenancy.tasks import _apply_path_inputs, _apply_fk_inputs, _coerce_boolean_fields, _quantize_decimal_fields
+        from multitenancy.tasks import _safe_model_dict, _row_observations, _norm_row_key
+        from django.apps import apps
+        
+        logger.info(f"ETL: Importing {len(transaction_sheets)} Transaction sheet(s) with auto-created JournalEntries")
+        
+        # Get auto-create configuration
+        auto_config = self.auto_create_journal_entries or {}
+        if not auto_config.get('enabled', False):
+            # If not enabled, just use normal import
+            from multitenancy.tasks import execute_import_job
+            return execute_import_job(
+                company_id=self.company_id,
+                sheets=transaction_sheets,
+                commit=False
+            )
+        
+        bank_account_field = auto_config.get('bank_account_field', 'bank_account_id')
+        opposing_account_field = auto_config.get('opposing_account_field', 'account_path')
+        opposing_account_lookup = auto_config.get('opposing_account_lookup', 'path')
+        path_separator = auto_config.get('path_separator', ' > ')
+        cost_center_field = auto_config.get('cost_center_field')
+        
+        # Process Transactions manually and create JournalEntries immediately
+        import time
+        transaction_outputs = []
+        journal_entry_outputs = []
+        token_to_id: Dict[str, int] = {}
+        
+        # Collect JournalEntries for bulk creation (performance optimization)
+        journal_entries_to_create: List[JournalEntry] = []
+        journal_entry_metadata: List[dict] = []  # Track metadata for output
+        
+        # Cache pending bank accounts by currency_id (major performance optimization)
+        # ensure_pending_bank_structs is expensive, so we call it once per currency
+        pending_bank_cache: Dict[int, tuple] = {}  # currency_id -> (pending_ba, pending_gl)
+        
+        # Pre-load substitution rules for Account.path to avoid DB queries per row
+        # This is a major performance optimization - saves ~0.13s per row
+        from multitenancy.models import SubstitutionRule
+        from multitenancy.formula_engine import _passes_conditions, _normalize
+        import re as regex_module
+        
+        substitution_rules_cache: Dict[tuple, List[SubstitutionRule]] = {}  # (model, field) -> [rules]
+        
+        # Pre-load rules for Account.path (most common case)
+        account_path_rules = list(SubstitutionRule.objects.filter(
+            company_id=self.company_id,
+            model_name='Account',
+            field_name='path'
+        ))
+        substitution_rules_cache[('Account', 'path')] = account_path_rules
+        if account_path_rules:
+            logger.info(f"ETL DEBUG: Pre-loaded {len(account_path_rules)} substitution rules for Account.path")
+        
+        def apply_substitution_fast(value: Any, model_name: str, field_name: str, row_context: dict = None) -> Any:
+            """
+            Fast substitution using pre-loaded rules cache.
+            Returns the substituted value or original if no substitution applies.
+            """
+            if value is None:
+                return value
+            
+            cache_key = (model_name, field_name)
+            rules = substitution_rules_cache.get(cache_key)
+            
+            # If not cached, load it (shouldn't happen often)
+            if rules is None:
+                rules = list(SubstitutionRule.objects.filter(
+                    company_id=self.company_id,
+                    model_name=model_name,
+                    field_name=field_name
+                ))
+                substitution_rules_cache[cache_key] = rules
+            
+            # Apply rules in order (first match wins)
+            row_context = row_context or {}
+            for rl in rules:
+                # Check filter conditions
+                if not _passes_conditions(row_context, getattr(rl, "filter_conditions", None)):
+                    continue
+                
+                # Check match type
+                mt = (rl.match_type or "exact").lower()
+                mv = rl.match_value
+                sv = rl.substitution_value
+                
+                if mt == "exact":
+                    if value == mv:
+                        return sv
+                elif mt == "regex":
+                    try:
+                        if regex_module.search(str(mv), str(value or "")):
+                            return regex_module.sub(str(mv), str(sv), str(value or ""))
+                    except regex_module.error:
+                        continue
+                elif mt == "caseless":
+                    if _normalize(value) == _normalize(mv):
+                        return sv
+            
+            return value
+        
+        model = apps.get_model('accounting', 'Transaction')
+        
+        total_start = time.time()
+        logger.info(f"ETL DEBUG: Starting transaction processing for {len(transaction_sheets)} sheet(s)")
+        
+        for sheet_idx, sheet in enumerate(transaction_sheets):
+            sheet_start = time.time()
+            raw_rows: List[Dict[str, Any]] = sheet.get("rows") or []
+            logger.info(f"ETL DEBUG: Sheet {sheet_idx + 1}: Processing {len(raw_rows)} raw rows")
+            
+            # Apply substitutions
+            subst_start = time.time()
+            rows, audit = apply_substitutions(
+                raw_rows,
+                company_id=self.company_id,
+                model_name='Transaction',
+                return_audit=True
+            )
+            subst_time = time.time() - subst_start
+            logger.info(f"ETL DEBUG: Substitutions took {subst_time:.3f}s for {len(rows)} rows ({subst_time/len(rows)*1000:.2f}ms per row)")
+            audit_by_rowid: Dict[Any, List[dict]] = {}
+            for ch in (audit or []):
+                key_norm = _norm_row_key(ch.get("__row_id"))
+                audit_by_rowid.setdefault(key_norm, []).append(ch)
+            
+            row_processing_start = time.time()
+            logger.info(f"ETL DEBUG: Starting row-by-row processing for {len(rows)} rows")
+            
+            for row_idx, row in enumerate(rows):
+                row_start = time.time()
+                if row_idx % 10 == 0:
+                    logger.info(f"ETL DEBUG: Processing row {row_idx + 1}/{len(rows)}")
+                raw = dict(row or {})
+                rid_raw = raw.pop("__row_id", None)
+                rid = _norm_row_key(rid_raw)
+                
+                try:
+                    filter_start = time.time()
+                    # Filter unknowns
+                    filtered, unknown = _filter_unknown(model, raw)
+                    
+                    # Company context
+                    filtered = _attach_company_context(model, filtered, self.company_id)
+                    
+                    # Path resolution
+                    path_start = time.time()
+                    filtered = _apply_path_inputs(model, filtered, self.company_id, lookup_cache=self.lookup_cache)
+                    path_time = time.time() - path_start
+                    if path_time > 0.01:
+                        logger.debug(f"ETL DEBUG: Row {row_idx + 1} path resolution took {path_time:.3f}s")
+                    
+                    # FK application
+                    fk_start = time.time()
+                    filtered = _apply_fk_inputs(model, filtered, raw, token_to_id)
+                    fk_time = time.time() - fk_start
+                    if fk_time > 0.01:
+                        logger.debug(f"ETL DEBUG: Row {row_idx + 1} FK resolution took {fk_time:.3f}s")
+                    
+                    # Coercions
+                    filtered = _coerce_boolean_fields(model, filtered)
+                    filtered = _quantize_decimal_fields(model, filtered)
+                    filter_time = time.time() - filter_start
+                    if filter_time > 0.1:
+                        logger.debug(f"ETL DEBUG: Row {row_idx + 1} filtering/processing took {filter_time:.3f}s")
+                    
+                    # Create Transaction
+                    action = "create"
+                    if "id" in filtered and filtered["id"]:
+                        pk = int(filtered["id"])
+                        instance = model.objects.get(id=pk)
+                        for k, v in filtered.items():
+                            setattr(instance, k, v)
+                        action = "update"
+                    else:
+                        instance = model(**filtered)
+                    
+                    # Validate & save
+                    save_start = time.time()
+                    # Skip full_clean for performance - we validate manually where needed
+                    # full_clean() validates FK relationships which causes DB queries
+                    # For ETL, we trust the data has been validated during transformation
+                    # validate_start = time.time()
+                    # if hasattr(instance, "full_clean"):
+                    #     instance.full_clean()
+                    # validate_time = time.time() - validate_start
+                    # if validate_time > 0.1:
+                    #     logger.info(f"ETL DEBUG: Row {row_idx + 1} Transaction full_clean took {validate_time:.3f}s")
+                    
+                    # Skip clean_fields() for performance - we already quantize decimals in _quantize_decimal_fields()
+                    # and save() also quantizes amounts. For ETL, we trust the data has been validated during transformation.
+                    # clean_fields_start = time.time()
+                    # if hasattr(instance, "clean_fields"):
+                    #     instance.clean_fields()
+                    # clean_fields_time = time.time() - clean_fields_start
+                    # if clean_fields_time > 0.1:
+                    #     logger.info(f"ETL DEBUG: Row {row_idx + 1} Transaction clean_fields took {clean_fields_time:.3f}s")
+                    
+                    db_save_start = time.time()
+                    instance.save()  # Transaction is now saved in the transaction context (save() quantizes amounts)
+                    db_save_time = time.time() - db_save_start
+                    logger.info(f"ETL DEBUG: Row {row_idx + 1} Transaction instance.save() took {db_save_time:.3f}s")
+                    if db_save_time > 0.5:
+                        logger.warning(f"ETL DEBUG: Row {row_idx + 1} Transaction save is VERY SLOW: {db_save_time:.3f}s")
+                    save_time = time.time() - save_start
+                    logger.info(f"ETL DEBUG: Row {row_idx + 1} total Transaction save took {save_time:.3f}s")
+                    
+                    # Register token->id
+                    if rid:
+                        token_to_id[rid] = int(instance.pk)
+                    
+                    # Success output for Transaction
+                    msg = "ok"
+                    if unknown:
+                        msg += f" | Ignoring unknown columns: {', '.join(unknown)}"
+                    
+                    safe_dict_start = time.time()
+                    transaction_data = _safe_model_dict(
+                        instance,
+                        exclude_fields=["created_by", "updated_by", "is_deleted", "is_active"]
+                    )
+                    safe_dict_time = time.time() - safe_dict_start
+                    if safe_dict_time > 0.1:
+                        logger.info(f"ETL DEBUG: Row {row_idx + 1} _safe_model_dict took {safe_dict_time:.3f}s")
+                    
+                    transaction_outputs.append({
+                        "__row_id": rid,
+                        "status": "success",
+                        "action": action,
+                        "data": transaction_data,
+                        "message": msg,
+                        "observations": _row_observations(audit_by_rowid, rid),
+                        "external_id": None,
+                    })
+                    
+                    # NOW create JournalEntries immediately after Transaction is saved
+                    # We're in the same transaction context, so the Transaction is accessible
+                    je_prep_start = time.time()
+                    extra_fields = extra_fields_list[row_idx] if row_idx < len(extra_fields_list) else {}
+                    
+                    # Apply substitutions to extra_fields before using them
+                    # For each field, check if there are substitutions for the target model
+                    subst_extra_start = time.time()
+                    substituted_extra_fields = self._apply_substitutions_to_extra_fields(
+                        extra_fields, 
+                        auto_config,
+                        substitution_rules_cache=substitution_rules_cache,
+                        apply_substitution_fast=apply_substitution_fast
+                    )
+                    subst_extra_time = time.time() - subst_extra_start
+                    logger.info(f"ETL DEBUG: Row {row_idx + 1} extra field substitutions took {subst_extra_time:.3f}s")
+                    if subst_extra_time > 0.5:
+                        logger.warning(f"ETL DEBUG: Row {row_idx + 1} extra field substitutions is VERY SLOW: {subst_extra_time:.3f}s")
+                    
+                    try:
+                        # Create JournalEntries for this Transaction
+                        amount = Decimal(str(instance.amount))
+                        abs_amount = abs(amount)
+                        
+                        # Check if we should use pending bank account
+                        use_pending_bank = auto_config.get('use_pending_bank_account', False)
+                        
+                        # For bank JournalEntry: Always use pending bank account if enabled
+                        bank_ledger_account = None
+                        bank_designation_pending = False
+                        
+                        if use_pending_bank:
+                            # Use cached pending bank account (major performance optimization)
+                            currency_id = instance.currency_id
+                            if currency_id not in pending_bank_cache:
+                                pending_start = time.time()
+                                from accounting.services.bank_structs import ensure_pending_bank_structs
+                                pending_ba, pending_gl = ensure_pending_bank_structs(
+                                    company_id=self.company_id,
+                                    currency_id=currency_id
+                                )
+                                pending_time = time.time() - pending_start
+                                logger.info(f"ETL DEBUG: ensure_pending_bank_structs for currency {currency_id} took {pending_time:.3f}s (cached for future rows)")
+                                if pending_time > 0.5:
+                                    logger.warning(f"ETL DEBUG: ensure_pending_bank_structs is VERY SLOW: {pending_time:.3f}s")
+                                pending_bank_cache[currency_id] = (pending_ba, pending_gl)
+                            else:
+                                pending_ba, pending_gl = pending_bank_cache[currency_id]
+                                logger.debug(f"ETL DEBUG: Row {row_idx + 1} using cached pending bank account for currency {currency_id}")
+                            
+                            bank_ledger_account = pending_gl
+                            bank_designation_pending = True
+                            logger.debug(f"ETL: Using pending bank account for Transaction {instance.id}")
+                        
+                        # For opposing JournalEntry: Always use account_path from template
+                        opposing_account = None
+                        account_path_value = substituted_extra_fields.get('account_path')
+                        
+                        # Detect path separator (could be \ or > )
+                        detected_separator = path_separator
+                        if account_path_value:
+                            if '\\' in account_path_value:
+                                detected_separator = '\\'
+                            elif ' > ' in account_path_value:
+                                detected_separator = ' > '
+                            elif '>' in account_path_value:
+                                detected_separator = '>'
+                        
+                        if account_path_value:
+                            # Look up account by path for opposing JournalEntry
+                            lookup_start = time.time()
+                            opposing_account = self._lookup_account(account_path_value, 'path', detected_separator)
+                            lookup_time = time.time() - lookup_start
+                            if lookup_time > 0.01:
+                                logger.debug(f"ETL DEBUG: Row {row_idx + 1} account path lookup took {lookup_time:.3f}s")
+                            if opposing_account:
+                                logger.debug(f"ETL: Found opposing account using account_path: {account_path_value} -> {opposing_account.id} ({opposing_account.name})")
+                            else:
+                                logger.warning(f"ETL: Account not found for path: {account_path_value} (separator: {detected_separator})")
+                                self._add_warning(
+                                    warning_type='account_not_found',
+                                    message=f"Account not found for path: {account_path_value}",
+                                    model='Transaction',
+                                    record_id=instance.id,
+                                    account_path=account_path_value
+                                )
+                        
+                        # Calculate debit/credit based on transaction amount and account direction
+                        # For bank account (pending): treat as asset (direction = 1)
+                        # For opposing account: use its actual account_direction
+                        if opposing_account:
+                            opp_direction = opposing_account.account_direction if hasattr(opposing_account, 'account_direction') else 1
+                        else:
+                            opp_direction = 1  # Default if account not found
+                        
+                        # Bank accounts are typically assets (direction = 1)
+                        # Positive amount in asset = debit, negative = credit
+                        # Opposing entry must balance (opposite)
+                        if amount >= 0:
+                            # Positive transaction: bank gets debit, opposing gets credit
+                            bank_debit, bank_credit = abs_amount, None
+                            opp_debit, opp_credit = None, abs_amount
+                        else:
+                            # Negative transaction: bank gets credit, opposing gets debit
+                            bank_debit, bank_credit = None, abs_amount
+                            opp_debit, opp_credit = abs_amount, None
+                        
+                        # Look up cost center (optional)
+                        cost_center_id = None
+                        if cost_center_field:
+                            cost_center_value = substituted_extra_fields.get(cost_center_field)
+                            if cost_center_value:
+                                try:
+                                    cost_center_id = int(cost_center_value)
+                                except (ValueError, TypeError):
+                                    pass
+                        
+                        # Create bank account JournalEntry
+                        # Always create bank JournalEntry if pending bank account is enabled
+                        if use_pending_bank:
+                            try:
+                                bank_je_create_start = time.time()
+                                # Get pending GL account from cache (already ensured by ensure_pending_bank_structs)
+                                pending_ba, pending_gl = pending_bank_cache[instance.currency_id]
+                                # Create JournalEntry instance directly (skip serializer for performance)
+                                # Set account_id to pending_gl.id since bulk_create bypasses save() which would set it
+                                bank_je = JournalEntry(
+                                    company_id=self.company_id,
+                                    transaction_id=instance.id,
+                                    date=instance.date,
+                                    description=instance.description or '',
+                                    debit_amount=bank_debit,
+                                    credit_amount=bank_credit,
+                                    cost_center_id=cost_center_id,
+                                    state='pending',
+                                    bank_designation_pending=True,
+                                    account_id=pending_gl.id  # Set to pending GL account (bulk_create bypasses save())
+                                )
+                                # Skip clean_fields() for performance - we already quantize decimals
+                                # and bulk_create will handle validation at DB level
+                                # bank_validate_start = time.time()
+                                # if hasattr(bank_je, "clean_fields"):
+                                #     bank_je.clean_fields()
+                                # bank_validate_time = time.time() - bank_validate_start
+                                # if bank_validate_time > 0.1:
+                                #     logger.info(f"ETL DEBUG: Row {row_idx + 1} bank JE validation took {bank_validate_time:.3f}s")
+                                journal_entries_to_create.append(bank_je)
+                                journal_entry_metadata.append({
+                                    'type': 'bank',
+                                    'transaction_id': instance.id,
+                                    'row_id': f"auto_je_bank_{instance.id}",
+                                    'account_path': "Pending Bank Account",
+                                    'debit_amount': bank_debit,
+                                    'credit_amount': bank_credit,
+                                })
+                                bank_je_time = time.time() - bank_je_create_start
+                                if bank_je_time > 0.05:
+                                    logger.info(f"ETL DEBUG: Row {row_idx + 1} bank JE creation took {bank_je_time:.3f}s")
+                            except Exception as je_error:
+                                # Include failed JournalEntry in output with error
+                                error_msg = str(je_error)
+                                if hasattr(je_error, 'detail'):
+                                    error_msg = str(je_error.detail)
+                                elif hasattr(je_error, 'message_dict'):
+                                    error_msg = str(je_error.message_dict)
+                                journal_entry_outputs.append({
+                                    '__row_id': f"auto_je_bank_{instance.id}",
+                                    'status': 'error',
+                                    'action': 'create',
+                                    'data': {
+                                        'transaction_id': instance.id,
+                                        'account_path': "Pending Bank Account",
+                                    },
+                                    'message': error_msg,
+                                    'observations': [],
+                                    'external_id': None,
+                                })
+                                logger.error(f"ETL: Error preparing bank JournalEntry for Transaction {instance.id}: {je_error}")
+                                self._add_warning(
+                                    warning_type='auto_journal_entry_error',
+                                    message=f"Error preparing bank JournalEntry for Transaction {instance.id}: {error_msg}",
+                                    model='Transaction',
+                                    record_id=instance.id
+                                )
+                        
+                        # Create opposing account JournalEntry
+                        # Always try to create if account_path was provided
+                        if account_path_value:
+                            if not opposing_account:
+                                # Account lookup failed, but we still want to show the error in output
+                                journal_entry_outputs.append({
+                                    '__row_id': f"auto_je_opp_{instance.id}",
+                                    'status': 'error',
+                                    'action': 'create',
+                                    'data': {
+                                        'transaction_id': instance.id,
+                                        'account_path': account_path_value,
+                                    },
+                                    'message': f"Account not found for path: {account_path_value}",
+                                    'observations': [],
+                                    'external_id': None,
+                                })
+                            else:
+                                # Account found, create opposing JournalEntry
+                                try:
+                                    # Create JournalEntry instance directly (skip serializer for performance)
+                                    opp_je_create_start = time.time()
+                                    opposing_je = JournalEntry(
+                                        company_id=self.company_id,
+                                        transaction_id=instance.id,
+                                        account_id=opposing_account.id,
+                                        date=instance.date,
+                                        description=instance.description or '',
+                                        debit_amount=opp_debit,
+                                        credit_amount=opp_credit,
+                                        cost_center_id=cost_center_id,
+                                        state='pending',
+                                        bank_designation_pending=False
+                                    )
+                                    # Skip clean_fields() for performance - we already quantize decimals
+                                    # and bulk_create will handle validation at DB level
+                                    # opp_validate_start = time.time()
+                                    # if hasattr(opposing_je, "clean_fields"):
+                                    #     opposing_je.clean_fields()
+                                    # opp_validate_time = time.time() - opp_validate_start
+                                    # if opp_validate_time > 0.1:
+                                    #     logger.info(f"ETL DEBUG: Row {row_idx + 1} opposing JE validation took {opp_validate_time:.3f}s")
+                                    journal_entries_to_create.append(opposing_je)
+                                    opp_je_time = time.time() - opp_je_create_start
+                                    if opp_je_time > 0.05:
+                                        logger.debug(f"ETL DEBUG: Row {row_idx + 1} opposing JE creation took {opp_je_time:.3f}s")
+                                    journal_entry_metadata.append({
+                                        'type': 'opposing',
+                                        'transaction_id': instance.id,
+                                        'row_id': f"auto_je_opp_{instance.id}",
+                                        'account_id': opposing_account.id,
+                                        'account_path': account_path_value,
+                                        'account_code': opposing_account.account_code if hasattr(opposing_account, 'account_code') else None,
+                                        'debit_amount': opp_debit,
+                                        'credit_amount': opp_credit,
+                                    })
+                                    logger.debug(f"ETL: Prepared opposing JournalEntry for Transaction {instance.id} with account {opposing_account.id} ({opposing_account.name})")
+                                except Exception as je_error:
+                                    # Include failed JournalEntry in output with error
+                                    error_msg = str(je_error)
+                                    if hasattr(je_error, 'detail'):
+                                        error_msg = str(je_error.detail)
+                                    elif hasattr(je_error, 'message_dict'):
+                                        error_msg = str(je_error.message_dict)
+                                    journal_entry_outputs.append({
+                                        '__row_id': f"auto_je_opp_{instance.id}",
+                                        'status': 'error',
+                                        'action': 'create',
+                                        'data': {
+                                            'transaction_id': instance.id,
+                                            'account_path': account_path_value,
+                                        },
+                                        'message': error_msg,
+                                        'observations': [],
+                                        'external_id': None,
+                                    })
+                                    logger.error(f"ETL: Error creating opposing JournalEntry for Transaction {instance.id}: {je_error}")
+                                    self._add_warning(
+                                        warning_type='auto_journal_entry_error',
+                                        message=f"Error creating opposing JournalEntry for Transaction {instance.id}: {error_msg}",
+                                        model='Transaction',
+                                        record_id=instance.id
+                                    )
+                                
+                    except Exception as e:
+                        logger.error(f"ETL: Error creating JournalEntries for Transaction {instance.id}: {e}", exc_info=True)
+                        self._add_warning(
+                            warning_type='auto_journal_entry_error',
+                            message=f"Error auto-creating JournalEntries for Transaction {instance.id}: {str(e)}",
+                            model='Transaction',
+                            record_id=instance.id
+                        )
+                    finally:
+                        je_prep_time = time.time() - je_prep_start
+                        if je_prep_time > 0.1:
+                            logger.debug(f"ETL DEBUG: Row {row_idx + 1} total JE preparation took {je_prep_time:.3f}s")
+                        row_time = time.time() - row_start
+                        if row_time > 0.2:
+                            logger.warning(f"ETL DEBUG: Row {row_idx + 1} total processing took {row_time:.3f}s (SLOW!)")
+                
+                except Exception as e:
+                    logger.exception(f"ETL: Error processing Transaction row {rid}: {e}")
+                    transaction_outputs.append({
+                        "__row_id": rid,
+                        "status": "error",
+                        "action": None,
+                        "data": raw,
+                        "message": str(e),
+                        "observations": _row_observations(audit_by_rowid, rid),
+                        "external_id": None,
+                    })
+            
+            row_processing_time = time.time() - row_processing_start
+            logger.info(f"ETL DEBUG: Sheet {sheet_idx + 1} row processing took {row_processing_time:.3f}s for {len(rows)} rows ({row_processing_time/len(rows):.3f}s per row)")
+            sheet_time = time.time() - sheet_start
+            logger.info(f"ETL DEBUG: Sheet {sheet_idx + 1} total time: {sheet_time:.3f}s")
+        
+        # Bulk create all JournalEntries at once (major performance optimization)
+        if journal_entries_to_create:
+            bulk_start = time.time()
+            logger.info(f"ETL: Bulk creating {len(journal_entries_to_create)} JournalEntries")
+            try:
+                created_jes = JournalEntry.objects.bulk_create(journal_entries_to_create, batch_size=500)
+                bulk_time = time.time() - bulk_start
+                logger.info(f"ETL: Successfully bulk created {len(created_jes)} JournalEntries in {bulk_time:.3f}s ({len(created_jes)/bulk_time:.1f} entries/sec)")
+                
+                # Map created JournalEntries to their metadata for output
+                for je, metadata in zip(created_jes, journal_entry_metadata):
+                    output_data = {
+                        'id': je.id,
+                        'transaction_id': metadata['transaction_id'],
+                        'account_path': metadata['account_path'],
+                        'debit_amount': str(metadata['debit_amount']) if metadata['debit_amount'] else None,
+                        'credit_amount': str(metadata['credit_amount']) if metadata['credit_amount'] else None,
+                        'bank_designation_pending': metadata['type'] == 'bank',
+                    }
+                    
+                    if metadata['type'] == 'opposing' and 'account_id' in metadata:
+                        output_data['account_id'] = metadata['account_id']
+                        output_data['account_code'] = metadata.get('account_code')
+                    elif metadata['type'] == 'bank':
+                        output_data['account_id'] = None
+                    
+                    journal_entry_outputs.append({
+                        '__row_id': metadata['row_id'],
+                        'status': 'success',
+                        'action': 'create',
+                        'data': output_data,
+                        'message': 'ok',
+                        'observations': [],
+                        'external_id': None,
+                    })
+            except Exception as bulk_error:
+                logger.error(f"ETL: Error bulk creating JournalEntries: {bulk_error}", exc_info=True)
+                # Add errors for all failed entries
+                for metadata in journal_entry_metadata:
+                    journal_entry_outputs.append({
+                        '__row_id': metadata['row_id'],
+                        'status': 'error',
+                        'action': 'create',
+                        'data': {
+                            'transaction_id': metadata['transaction_id'],
+                            'account_path': metadata.get('account_path', 'N/A'),
+                        },
+                        'message': f"Bulk create failed: {str(bulk_error)}",
+                        'observations': [],
+                        'external_id': None,
+                    })
+                self._add_warning(
+                    warning_type='bulk_journal_entry_error',
+                    message=f"Error bulk creating JournalEntries: {str(bulk_error)}",
+                    model='JournalEntry'
+                )
+        
+        # Build result structure
+        result = {
+            'imports': [
+                {
+                    'model': 'Transaction',
+                    'result': transaction_outputs
+                }
+            ]
+        }
+        
+        # Add JournalEntry outputs
+        if journal_entry_outputs:
+            result['imports'].append({
+                'model': 'JournalEntry',
+                'result': journal_entry_outputs
+            })
+        
+        total_time = time.time() - total_start
+        logger.info(f"ETL DEBUG: Total transaction processing time: {total_time:.3f}s")
+        logger.info(f"ETL DEBUG: Processed {len(transaction_outputs)} transactions, created {len(journal_entries_to_create)} journal entries")
+        if len(transaction_outputs) > 0:
+            logger.info(f"ETL DEBUG: Average time per transaction: {total_time/len(transaction_outputs):.3f}s")
         
         return result
+        
+        bank_account_field = auto_config.get('bank_account_field', 'bank_account_id')
+        opposing_account_field = auto_config.get('opposing_account_field', 'account_path')
+        opposing_account_lookup = auto_config.get('opposing_account_lookup', 'path')
+        path_separator = auto_config.get('path_separator', ' > ')
+        cost_center_field = auto_config.get('cost_center_field')
+        
+        # Process each Transaction and create JournalEntries immediately
+        for idx, output in enumerate(transaction_outputs):
+            if output.get('status') != 'success' or output.get('action') != 'create':
+                continue
+            
+            transaction_data = output.get('data', {})
+            transaction_id = transaction_data.get('id')
+            
+            if not transaction_id:
+                continue
+            
+            # Get the Transaction instance - it should be accessible in the same transaction
+            try:
+                transaction = Transaction.objects.get(id=transaction_id, company_id=self.company_id)
+            except Transaction.DoesNotExist:
+                logger.warning(f"ETL: Transaction {transaction_id} not found immediately after creation")
+                self._add_warning(
+                    warning_type='transaction_not_found',
+                    message=f"Transaction {transaction_id} not found (company_id={self.company_id})",
+                    model='Transaction',
+                    record_id=transaction_id
+                )
+                continue
+            
+            # Get extra_fields for this Transaction
+            extra_fields = extra_fields_list[idx] if idx < len(extra_fields_list) else {}
+            
+            try:
+                # Create JournalEntries for this Transaction
+                amount = Decimal(str(transaction.amount))
+                abs_amount = abs(amount)
+                
+                # Check if we should use pending bank account
+                use_pending_bank = auto_config.get('use_pending_bank_account', False)
+                
+                # Look up bank account
+                bank_ledger_account = None
+                bank_designation_pending = False
+                
+                if use_pending_bank:
+                    from accounting.services.bank_structs import ensure_pending_bank_structs
+                    pending_ba, pending_gl = ensure_pending_bank_structs(
+                        company_id=self.company_id,
+                        currency_id=transaction.currency_id
+                    )
+                    bank_ledger_account = pending_gl
+                    bank_designation_pending = True
+                else:
+                    bank_account_id_str = extra_fields.get(bank_account_field)
+                    if bank_account_id_str:
+                        try:
+                            bank_account_id = int(bank_account_id_str)
+                            bank_account = BankAccount.objects.filter(
+                                company_id=self.company_id,
+                                id=bank_account_id
+                            ).first()
+                            if bank_account:
+                                bank_ledger_account = Account.objects.filter(
+                                    company_id=self.company_id,
+                                    bank_account_id=bank_account.id
+                                ).first()
+                        except (ValueError, TypeError):
+                            pass
+                
+                # Look up opposing account
+                opposing_account = None
+                opposing_account_value = extra_fields.get(opposing_account_field)
+                
+                if opposing_account_value:
+                    if opposing_account_lookup == 'path':
+                        opposing_account = self._lookup_account(opposing_account_value, 'path', path_separator)
+                    elif opposing_account_lookup == 'code':
+                        opposing_account = self._lookup_account(opposing_account_value, 'code')
+                    elif opposing_account_lookup == 'id':
+                        try:
+                            account_id = int(opposing_account_value)
+                            opposing_account = Account.objects.filter(
+                                company_id=self.company_id,
+                                id=account_id
+                            ).first()
+                        except (ValueError, TypeError):
+                            pass
+                
+                # Calculate debit/credit
+                if amount >= 0:
+                    bank_debit, bank_credit = abs_amount, None
+                    opp_debit, opp_credit = None, abs_amount
+                else:
+                    bank_debit, bank_credit = None, abs_amount
+                    opp_debit, opp_credit = abs_amount, None
+                
+                # Look up cost center (optional)
+                cost_center_id = None
+                if cost_center_field:
+                    cost_center_value = substituted_extra_fields.get(cost_center_field)
+                    if cost_center_value:
+                        try:
+                            cost_center_id = int(cost_center_value)
+                        except (ValueError, TypeError):
+                            pass
+                
+                # Create bank account JournalEntry
+                if bank_ledger_account or use_pending_bank:
+                    bank_je_data = {
+                        'company': self.company_id,
+                        'transaction': transaction.id,
+                        'date': transaction.date,
+                        'description': transaction.description or '',
+                        'debit_amount': bank_debit,
+                        'credit_amount': bank_credit,
+                        'cost_center': cost_center_id,
+                        'state': 'pending',
+                        'bank_designation_pending': bank_designation_pending,
+                    }
+                    
+                    if bank_ledger_account and not bank_designation_pending:
+                        bank_je_data['account'] = bank_ledger_account.id
+                    
+                    bank_je_serializer = JournalEntrySerializer(data=bank_je_data, context={'lookup_cache': self.lookup_cache})
+                    if bank_je_serializer.is_valid(raise_exception=True):
+                        bank_je = bank_je_serializer.save()
+                        journal_entry_outputs.append({
+                            '__row_id': f"auto_je_bank_{transaction_id}",
+                            'status': 'success',
+                            'action': 'create',
+                            'data': {
+                                'id': bank_je.id,
+                                'account_id': bank_je.account_id,
+                                'account_name': bank_ledger_account.name if bank_ledger_account else "Pending Bank Account",
+                                'transaction_id': transaction.id,
+                                'debit_amount': str(bank_debit) if bank_debit else None,
+                                'credit_amount': str(bank_credit) if bank_credit else None,
+                                'bank_designation_pending': bank_designation_pending,
+                            },
+                            'message': 'ok',
+                            'observations': [],
+                            'external_id': None,
+                        })
+                
+                # Create opposing account JournalEntry
+                if opposing_account:
+                    opposing_je_data = {
+                        'company': self.company_id,
+                        'transaction': transaction.id,
+                        'account': opposing_account.id,
+                        'date': transaction.date,
+                        'description': transaction.description or '',
+                        'debit_amount': opp_debit,
+                        'credit_amount': opp_credit,
+                        'cost_center': cost_center_id,
+                        'state': 'pending',
+                    }
+                    
+                    opposing_je_serializer = JournalEntrySerializer(data=opposing_je_data, context={'lookup_cache': self.lookup_cache})
+                    if opposing_je_serializer.is_valid(raise_exception=True):
+                        opposing_je = opposing_je_serializer.save()
+                        journal_entry_outputs.append({
+                            '__row_id': f"auto_je_opp_{transaction_id}",
+                            'status': 'success',
+                            'action': 'create',
+                            'data': {
+                                'id': opposing_je.id,
+                                'account_id': opposing_account.id,
+                                'account_name': opposing_account.name,
+                                'transaction_id': transaction.id,
+                                'debit_amount': str(opp_debit) if opp_debit else None,
+                                'credit_amount': str(opp_credit) if opp_credit else None,
+                            },
+                            'message': 'ok',
+                            'observations': [],
+                            'external_id': None,
+                        })
+                        
+            except Exception as e:
+                logger.error(f"ETL: Error creating JournalEntries for Transaction {transaction_id}: {e}", exc_info=True)
+                self._add_warning(
+                    warning_type='auto_journal_entry_error',
+                    message=f"Error auto-creating JournalEntries for Transaction {transaction_id}: {str(e)}",
+                    model='Transaction',
+                    record_id=transaction_id
+                )
+        
+        # Add JournalEntry outputs to result
+        if journal_entry_outputs:
+            transaction_import_result.setdefault('imports', []).append({
+                'model': 'JournalEntry',
+                'result': journal_entry_outputs
+            })
+        
+        return transaction_import_result
+    
+    def _auto_create_journal_entries(self, import_result: dict, extra_fields_by_model: Dict[str, List[dict]]):
+        """
+        Automatically create JournalEntries for Transactions when auto_create_journal_entries is enabled.
+        This happens directly without IntegrationRules, but IntegrationRules can still fire afterward.
+        
+        Configuration comes from request parameter, not from transformation rule.
+        """
+        from accounting.models import Account, BankAccount, Transaction, JournalEntry
+        from accounting.serializers import JournalEntrySerializer
+        
+        # Check if we have any Transaction outputs
+        transaction_outputs = import_result.get('results', {}).get('Transaction', [])
+        if not transaction_outputs:
+            return
+        
+        # Check if auto-create is enabled (from request parameter)
+        auto_config = self.auto_create_journal_entries or {}
+        if not auto_config.get('enabled', False):
+            return
+        
+        logger.info(f"ETL: Auto-creating JournalEntries for {len(transaction_outputs)} Transactions")
+        
+        # Get configuration
+        bank_account_field = auto_config.get('bank_account_field', 'bank_account_id')
+        opposing_account_field = auto_config.get('opposing_account_field', 'account_path')
+        opposing_account_lookup = auto_config.get('opposing_account_lookup', 'path')
+        path_separator = auto_config.get('path_separator', ' > ')
+        cost_center_field = auto_config.get('cost_center_field')
+        
+        # Get extra_fields for Transactions
+        extra_fields_list = extra_fields_by_model.get('Transaction', [])
+        
+        # Track created JournalEntries for result
+        journal_entries_created = []
+        
+        # Collect all transaction IDs first, then bulk fetch them
+        # This is more efficient and works better in transaction contexts
+        transaction_ids = []
+        transaction_id_to_index = {}
+        
+        for idx, output in enumerate(transaction_outputs):
+            if output.get('status') != 'success' or output.get('action') != 'create':
+                continue
+            
+            transaction_data = output.get('data', {})
+            transaction_id = transaction_data.get('id')
+            
+            if not transaction_id:
+                error_msg = f"Transaction output at index {idx} has no ID"
+                logger.warning(f"ETL: {error_msg}, skipping JournalEntry creation")
+                logger.debug(f"ETL: Transaction output data: {transaction_data}")
+                self._add_warning(
+                    warning_type='missing_transaction_id',
+                    message=error_msg,
+                    model='Transaction',
+                    row_index=idx,
+                    output_data=transaction_data
+                )
+                continue
+            
+            transaction_ids.append(transaction_id)
+            transaction_id_to_index[transaction_id] = idx
+        
+        # Bulk fetch all Transactions at once (more efficient and works in transaction context)
+        if not transaction_ids:
+            logger.info("ETL: No valid Transaction IDs found for JournalEntry creation")
+            return
+        
+        try:
+            # Use filter().in_bulk() for efficient bulk lookup
+            # This works within the transaction context even in preview mode
+            # In preview mode, Transactions exist in the transaction context even if marked for rollback
+            # We need to query them before the transaction is actually rolled back
+            logger.debug(f"ETL: Looking up {len(transaction_ids)} Transactions: {transaction_ids[:5]}...")
+            
+            transactions_dict = Transaction.objects.filter(
+                id__in=transaction_ids,
+                company_id=self.company_id
+            ).in_bulk()
+            
+            logger.debug(f"ETL: Found {len(transactions_dict)} Transactions out of {len(transaction_ids)} requested")
+            
+            # Debug: Check if any transactions exist at all for this company
+            if len(transactions_dict) == 0:
+                total_for_company = Transaction.objects.filter(company_id=self.company_id).count()
+                logger.warning(f"ETL: No Transactions found. Total Transactions for company {self.company_id}: {total_for_company}")
+                # Try querying without company filter to see if IDs exist
+                any_transactions = Transaction.objects.filter(id__in=transaction_ids).count()
+                logger.warning(f"ETL: Transactions with these IDs exist (any company): {any_transactions}")
+            
+            if len(transactions_dict) < len(transaction_ids):
+                missing_ids = set(transaction_ids) - set(transactions_dict.keys())
+                logger.warning(f"ETL: {len(missing_ids)} Transactions not found: {missing_ids}")
+                for missing_id in missing_ids:
+                    idx = transaction_id_to_index.get(missing_id)
+                    if idx is not None:
+                        output = transaction_outputs[idx]
+                        transaction_data = output.get('data', {})
+                        self._add_warning(
+                            warning_type='transaction_not_found',
+                            message=f"Transaction {missing_id} not found (company_id={self.company_id})",
+                            model='Transaction',
+                            transaction_id=missing_id,
+                            company_id=self.company_id,
+                            row_index=idx,
+                            output_data=transaction_data
+                        )
+            
+            # Process each Transaction
+            for transaction_id, idx in transaction_id_to_index.items():
+                transaction = transactions_dict.get(transaction_id)
+                
+                if not transaction:
+                    error_msg = f"Transaction {transaction_id} not found (company_id={self.company_id})"
+                    logger.warning(f"ETL: {error_msg}, skipping JournalEntry creation")
+                    output = transaction_outputs[idx]
+                    transaction_data = output.get('data', {})
+                    logger.debug(f"ETL: Transaction data from output: {transaction_data}")
+                    self._add_warning(
+                        warning_type='transaction_not_found',
+                        message=error_msg,
+                        model='Transaction',
+                        transaction_id=transaction_id,
+                        company_id=self.company_id,
+                        row_index=idx,
+                        output_data=transaction_data
+                    )
+                    continue
+                
+                # Get extra_fields for this row
+                extra_fields = extra_fields_list[idx] if idx < len(extra_fields_list) else {}
+                
+                try:
+                    # Track JournalEntries created for this transaction
+                    transaction_jes = []
+                    
+                    logger.debug(f"ETL: Processing Transaction {transaction_id} for JournalEntry creation")
+                    
+                    amount = Decimal(str(transaction.amount))
+                    abs_amount = abs(amount)
+                    
+                    # Check if we should use pending bank account
+                    use_pending_bank = auto_config.get('use_pending_bank_account', False)
+                    
+                    # Look up bank account
+                    bank_ledger_account = None
+                    bank_designation_pending = False
+                    
+                    if use_pending_bank:
+                        # Use pending bank account feature
+                        from accounting.services.bank_structs import ensure_pending_bank_structs
+                        pending_ba, pending_gl = ensure_pending_bank_structs(
+                            company_id=self.company_id,
+                            currency_id=transaction.currency_id
+                        )
+                        bank_ledger_account = pending_gl
+                        bank_designation_pending = True
+                        logger.debug(f"ETL: Using pending bank account for Transaction {transaction_id}")
+                    else:
+                        # Look up specific bank account
+                        bank_account_id_str = extra_fields.get(bank_account_field)
+                        if bank_account_id_str:
+                            try:
+                                bank_account_id = int(bank_account_id_str)
+                                bank_account = BankAccount.objects.filter(
+                                    company_id=self.company_id,
+                                    id=bank_account_id
+                                ).first()
+                                if bank_account:
+                                    bank_ledger_account = Account.objects.filter(
+                                        company_id=self.company_id,
+                                        bank_account_id=bank_account.id
+                                    ).first()
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    # Look up opposing account
+                    opposing_account = None
+                    opposing_account_value = extra_fields.get(opposing_account_field)
+                    
+                    if opposing_account_value:
+                        if opposing_account_lookup == 'path':
+                            opposing_account = self._lookup_account(opposing_account_value, 'path', path_separator)
+                        elif opposing_account_lookup == 'code':
+                            opposing_account = self._lookup_account(opposing_account_value, 'code')
+                        elif opposing_account_lookup == 'id':
+                            try:
+                                account_id = int(opposing_account_value)
+                                opposing_account = Account.objects.filter(
+                                    company_id=self.company_id,
+                                    id=account_id
+                                ).first()
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    # Calculate debit/credit
+                    if amount >= 0:
+                        # Positive = deposit/income
+                        bank_debit, bank_credit = abs_amount, None
+                        opp_debit, opp_credit = None, abs_amount
+                    else:
+                        # Negative = payment/expense
+                        bank_debit, bank_credit = None, abs_amount
+                        opp_debit, opp_credit = abs_amount, None
+                    
+                    # Look up cost center (optional)
+                    cost_center_id = None
+                    if cost_center_field:
+                        cost_center_value = extra_fields.get(cost_center_field)
+                        if cost_center_value:
+                            # Could add cost center path lookup here if needed
+                            try:
+                                cost_center_id = int(cost_center_value)
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    # Create bank account JournalEntry
+                    # Create if we have a bank account OR if using pending bank account
+                    if bank_ledger_account or use_pending_bank:
+                        bank_je_data = {
+                            'company': self.company_id,
+                            'transaction': transaction.id,  # Use transaction instance ID
+                            'date': transaction.date,
+                            'description': transaction.description or '',
+                            'debit_amount': bank_debit,
+                            'credit_amount': bank_credit,
+                            'cost_center': cost_center_id,
+                            'state': 'pending',
+                            'bank_designation_pending': bank_designation_pending,
+                        }
+                        
+                        logger.debug(f"ETL: Creating bank JournalEntry for Transaction {transaction.id} (pending={bank_designation_pending})")
+                        
+                        # Only set account if not using pending bank account
+                        if bank_ledger_account and not bank_designation_pending:
+                            bank_je_data['account'] = bank_ledger_account.id
+                        
+                        bank_je_serializer = JournalEntrySerializer(data=bank_je_data, context={'lookup_cache': self.lookup_cache})
+                        if bank_je_serializer.is_valid(raise_exception=True):
+                            bank_je = bank_je_serializer.save()
+                            account_id = bank_je.account_id if bank_je.account_id else None
+                            account_name = bank_ledger_account.name if bank_ledger_account else "Pending Bank Account"
+                            
+                            # Verify transaction_id is set correctly
+                            actual_transaction_id = bank_je.transaction_id if hasattr(bank_je, 'transaction_id') else None
+                            if actual_transaction_id != transaction.id:
+                                logger.warning(f"ETL: JournalEntry {bank_je.id} transaction_id mismatch: expected {transaction.id}, got {actual_transaction_id}")
+                            
+                            transaction_jes.append({
+                                'id': bank_je.id,
+                                'account_id': account_id,
+                                'account_name': account_name,
+                                'type': 'bank',
+                                'transaction_id': actual_transaction_id or transaction.id,  # Use actual ID from saved object
+                                'debit_amount': str(bank_debit) if bank_debit else None,
+                                'credit_amount': str(bank_credit) if bank_credit else None,
+                                'bank_designation_pending': bank_designation_pending,
+                            })
+                            logger.debug(f"ETL: Created bank JournalEntry {bank_je.id} for Transaction {transaction.id} (pending={bank_designation_pending}, transaction_id={actual_transaction_id})")
+                    
+                    # Create opposing account JournalEntry
+                    if opposing_account:
+                        opposing_je_data = {
+                            'company': self.company_id,
+                            'transaction': transaction.id,  # Use transaction instance ID
+                            'account': opposing_account.id,
+                            'date': transaction.date,
+                            'description': transaction.description or '',
+                            'debit_amount': opp_debit,
+                            'credit_amount': opp_credit,
+                            'cost_center': cost_center_id,
+                            'state': 'pending',
+                        }
+                        
+                        logger.debug(f"ETL: Creating opposing JournalEntry for Transaction {transaction.id} with account {opposing_account.id}")
+                        
+                        opposing_je_serializer = JournalEntrySerializer(data=opposing_je_data, context={'lookup_cache': self.lookup_cache})
+                        if opposing_je_serializer.is_valid(raise_exception=True):
+                            opposing_je = opposing_je_serializer.save()
+                            
+                            # Verify transaction_id is set correctly
+                            actual_transaction_id = opposing_je.transaction_id if hasattr(opposing_je, 'transaction_id') else None
+                            if actual_transaction_id != transaction.id:
+                                logger.warning(f"ETL: JournalEntry {opposing_je.id} transaction_id mismatch: expected {transaction.id}, got {actual_transaction_id}")
+                            
+                            transaction_jes.append({
+                                'id': opposing_je.id,
+                                'account_id': opposing_account.id,
+                                'account_name': opposing_account.name,
+                                'type': 'opposing',
+                                'transaction_id': actual_transaction_id or transaction.id,  # Use actual ID from saved object
+                                'debit_amount': str(opp_debit) if opp_debit else None,
+                                'credit_amount': str(opp_credit) if opp_credit else None,
+                            })
+                            logger.debug(f"ETL: Created opposing JournalEntry {opposing_je.id} for Transaction {transaction.id} (transaction_id={actual_transaction_id})")
+                    
+                    # Add to main list
+                    journal_entries_created.extend(transaction_jes)
+                    
+                except Exception as e:
+                    self._add_warning(
+                        warning_type='auto_journal_entry_error',
+                        message=f"Error auto-creating JournalEntries for Transaction {transaction_id}: {str(e)}",
+                        model='Transaction',
+                        record_id=transaction_id
+                    )
+                    logger.error(f"ETL: Error auto-creating JournalEntries for Transaction {transaction_id}: {e}", exc_info=True)
+        
+        except Exception as e:
+            # Handle errors during bulk fetch or processing
+            error_msg = f"Error during bulk Transaction lookup or JournalEntry creation: {str(e)}"
+            logger.error(f"ETL: {error_msg}", exc_info=True)
+            self._add_warning(
+                warning_type='bulk_journal_entry_error',
+                message=error_msg,
+                model='Transaction',
+                transaction_count=len(transaction_ids),
+                error=str(e)
+            )
+        
+        # Update result with created JournalEntries
+        if journal_entries_created:
+            if 'JournalEntry' not in import_result.get('results', {}):
+                import_result.setdefault('results', {})['JournalEntry'] = []
+            
+            for je_data in journal_entries_created:
+                import_result['results']['JournalEntry'].append({
+                    '__row_id': None,
+                    'status': 'success',
+                    'action': 'create',
+                    'data': {
+                        'id': je_data['id'],
+                        'account_id': je_data['account_id'],
+                        'account_name': je_data.get('account_name'),
+                        'transaction_id': je_data['transaction_id'],
+                        'debit_amount': je_data['debit_amount'],
+                        'credit_amount': je_data['credit_amount'],
+                        'bank_designation_pending': je_data.get('bank_designation_pending', False),
+                    },
+                    'message': f"Auto-created {je_data['type']} JournalEntry",
+                })
+            
+            logger.info(f"ETL: Auto-created {len(journal_entries_created)} JournalEntries")
     
     def _trigger_events_for_created_records(self, import_result: dict, extra_fields_by_model: Dict[str, List[dict]]):
         """
@@ -833,6 +2153,9 @@ class ETLPipelineService:
                 preview['integration_rules_available'].extend(list(rules))
         
         # Run full import + triggers in a transaction that will be rolled back
+        # Initialize extra_fields_by_model outside try block so it's accessible later
+        extra_fields_by_model: Dict[str, List[dict]] = {}
+        
         try:
             with db_transaction.atomic():
                 # Create a savepoint we can rollback to
@@ -840,7 +2163,7 @@ class ETLPipelineService:
                 
                 try:
                     # Extract extra_fields and filter invalid model fields before import
-                    extra_fields_by_model: Dict[str, List[dict]] = {}
+                    extra_fields_by_model = {}
                     cleaned_data: Dict[str, List[dict]] = {}
                     
                     for model_name, rows in self.transformed_data.items():
@@ -864,6 +2187,11 @@ class ETLPipelineService:
                         for idx, row in enumerate(rows):
                             extra_fields = row.pop('__extra_fields__', {})
                             
+                            # Preserve Excel row metadata for tracking/grouping
+                            excel_row_number = row.pop('__excel_row_number', None)
+                            excel_sheet_name = row.pop('__excel_sheet_name', None)
+                            excel_row_id = row.pop('__excel_row_id', None)
+                            
                             # Move invalid fields to extra_fields
                             cleaned_row = {}
                             invalid_fields = {}
@@ -877,6 +2205,15 @@ class ETLPipelineService:
                             
                             # Merge invalid fields into extra_fields
                             extra_fields.update(invalid_fields)
+                            
+                            # Store Excel metadata in extra_fields so it's available for grouping
+                            if excel_row_number is not None:
+                                extra_fields['__excel_row_number'] = excel_row_number
+                            if excel_sheet_name is not None:
+                                extra_fields['__excel_sheet_name'] = excel_sheet_name
+                            if excel_row_id is not None:
+                                extra_fields['__excel_row_id'] = excel_row_id
+                            
                             extra_fields_by_model[model_name].append(extra_fields)
                             cleaned_data[model_name].append(cleaned_row)
                             
@@ -918,16 +2255,27 @@ class ETLPipelineService:
                         valid_extra_fields = []
                         
                         for idx, row in enumerate(rows):
+                            # Get Excel row metadata from extra_fields for better error reporting
+                            extra_fields = extra_fields_by_model[model_name][idx]
+                            excel_row_number = extra_fields.get('__excel_row_number', idx + 1)
+                            excel_sheet_name = extra_fields.get('__excel_sheet_name', 'Unknown')
+                            excel_row_id = extra_fields.get('__excel_row_id', f"{excel_sheet_name}:{excel_row_number}")
+                            
                             # Check for null amount (required field for Transaction)
-                            if model_name == 'Transaction' and (row.get('amount') is None):
+                            amount = row.get('amount')
+                            is_null_amount = amount is None or (isinstance(amount, str) and amount.strip() == '')
+                            
+                            if model_name == 'Transaction' and is_null_amount:
                                 failed_rows_by_model[model_name].append({
-                                    'row_number': idx + 1,
+                                    'row_number': excel_row_number,
+                                    'excel_sheet': excel_sheet_name,
+                                    'excel_row_id': excel_row_id,
                                     'reason': 'amount is null/missing',
                                     'data': row
                                 })
                             else:
                                 valid_rows_by_model[model_name].append(row)
-                                valid_extra_fields.append(extra_fields_by_model[model_name][idx])
+                                valid_extra_fields.append(extra_fields)
                         
                         # Update extra_fields to only include valid rows
                         extra_fields_by_model[model_name] = valid_extra_fields
@@ -951,46 +2299,308 @@ class ETLPipelineService:
                             })
                     
                     if sheets:
-                        import_result = execute_import_job(
-                            company_id=self.company_id,
-                            sheets=sheets,
-                            commit=True  # Commit within this transaction (will be rolled back)
-                        )
+                        # Separate Transaction sheets from other sheets
+                        transaction_sheets = [s for s in sheets if s.get('model') == 'Transaction']
+                        other_sheets = [s for s in sheets if s.get('model') != 'Transaction']
                         
-                        # Capture what would be created
-                        for model_name, outputs in import_result.get('results', {}).items():
+                        # Process Transactions with JournalEntries in the same transaction
+                        transaction_import_result = None
+                        if transaction_sheets and self.auto_create_journal_entries:
+                            # Custom import flow: create Transactions and JournalEntries together
+                            transaction_import_result = self._import_transactions_with_journal_entries(
+                                transaction_sheets, 
+                                extra_fields_by_model.get('Transaction', [])
+                            )
+                        
+                        # Process other sheets normally
+                        other_import_result = None
+                        if other_sheets:
+                            other_import_result = execute_import_job(
+                                company_id=self.company_id,
+                                sheets=other_sheets,
+                                commit=False,  # Preview mode - don't actually commit (transaction will rollback)
+                                lookup_cache=self.lookup_cache
+                            )
+                        
+                        # Merge results
+                        import_result = {'imports': []}
+                        if transaction_import_result:
+                            import_result['imports'].extend(transaction_import_result.get('imports', []))
+                        if other_import_result:
+                            import_result['imports'].extend(other_import_result.get('imports', []))
+                        
+                        # If Transactions were processed separately, we don't need to call _auto_create_journal_entries
+                        # because they were already created in _import_transactions_with_journal_entries
+                        normalized_import_result = {'results': {}}
+                        if not transaction_sheets or not self.auto_create_journal_entries:
+                            # Process all sheets normally and create JournalEntries after
+                            if not transaction_import_result and not other_import_result:
+                                import_result = execute_import_job(
+                                    company_id=self.company_id,
+                                    sheets=sheets,
+                                    commit=False,
+                                    lookup_cache=self.lookup_cache
+                                )
+                            
+                            # Normalize import_result format for auto-creation
+                            for import_item in import_result.get('imports', []):
+                                model_name = import_item.get('model')
+                                outputs = import_item.get('result', [])
+                                normalized_import_result['results'][model_name] = outputs
+                            
+                            # Auto-create JournalEntries for Transactions (if enabled)
+                            self._auto_create_journal_entries(normalized_import_result, extra_fields_by_model)
+                        else:
+                            # Transactions were processed with JournalEntries, normalize the result
+                            for import_item in import_result.get('imports', []):
+                                model_name = import_item.get('model')
+                                outputs = import_item.get('result', [])
+                                normalized_import_result['results'][model_name] = outputs
+                        
+                        # JournalEntries are already in import_result from _import_transactions_with_journal_entries
+                        # No need to add them again here
+                        
+                        # Capture what would be created, grouped by source Excel row
+                        # execute_import_job returns {'imports': [{'model': '...', 'result': [...]}]}
+                        
+                        # Track Excel row to created records mapping
+                        excel_row_groups: Dict[str, Dict[str, Any]] = {}
+                        
+                        # First pass: Build transaction_id -> excel_row_id mapping for JournalEntry grouping
+                        transaction_to_excel_row_map = {}
+                        for import_item in import_result.get('imports', []):
+                            model_name = import_item.get('model')
+                            if model_name == 'Transaction':
+                                outputs = import_item.get('result', [])
+                                model_extra_fields = extra_fields_by_model.get(model_name, [])
+                                for idx, output in enumerate(outputs):
+                                    if output.get('status') == 'success' and output.get('action') == 'create':
+                                        record_data = output.get('data', {})
+                                        transaction_id = record_data.get('id')
+                                        if transaction_id:
+                                            excel_row_info = model_extra_fields[idx] if idx < len(model_extra_fields) else {}
+                                            excel_row_id = excel_row_info.get('__excel_row_id')
+                                            excel_row_number = excel_row_info.get('__excel_row_number')
+                                            excel_sheet_name = excel_row_info.get('__excel_sheet_name', 'Unknown')
+                                            if not excel_row_id:
+                                                excel_row_id = f"{excel_sheet_name}:{excel_row_number or (idx + 1)}"
+                                            transaction_to_excel_row_map[transaction_id] = {
+                                                'excel_row_id': excel_row_id,
+                                                'excel_row_number': excel_row_number,
+                                                'excel_sheet_name': excel_sheet_name
+                                            }
+                        
+                        # Second pass: Process all models and group by Excel row
+                        for import_item in import_result.get('imports', []):
+                            model_name = import_item.get('model')
+                            outputs = import_item.get('result', [])
+                            
                             created_records = []
                             failed_records = []
                             
-                            for output in outputs:
+                            # Get the extra_fields for this model to track Excel row info
+                            model_extra_fields = extra_fields_by_model.get(model_name, [])
+                            
+                            for idx, output in enumerate(outputs):
                                 if output.get('status') == 'success' and output.get('action') == 'create':
-                                    created_records.append(output.get('data', {}))
+                                    record_data = output.get('data', {})
+                                    created_records.append(record_data)
+                                    
+                                    # Get Excel row metadata for this record
+                                    excel_row_info = model_extra_fields[idx] if idx < len(model_extra_fields) else {}
+                                    excel_row_id = excel_row_info.get('__excel_row_id')
+                                    excel_row_number = excel_row_info.get('__excel_row_number')
+                                    excel_sheet_name = excel_row_info.get('__excel_sheet_name', 'Unknown')
+                                    
+                                    # For JournalEntries, try to get Excel row from parent Transaction
+                                    if model_name == 'JournalEntry' and not excel_row_id:
+                                        transaction_id = record_data.get('transaction_id')
+                                        if transaction_id and transaction_id in transaction_to_excel_row_map:
+                                            tx_row_info = transaction_to_excel_row_map[transaction_id]
+                                            excel_row_id = tx_row_info['excel_row_id']
+                                            excel_row_number = tx_row_info['excel_row_number']
+                                            excel_sheet_name = tx_row_info['excel_sheet_name']
+                                    
+                                    # Use a default ID if not available
+                                    if not excel_row_id:
+                                        excel_row_id = f"{excel_sheet_name}:{excel_row_number or (idx + 1)}"
+                                    
+                                    # Group by Excel row
+                                    if excel_row_id not in excel_row_groups:
+                                        excel_row_groups[excel_row_id] = {
+                                            'excel_row_number': excel_row_number,
+                                            'excel_sheet_name': excel_sheet_name,
+                                            'excel_row_id': excel_row_id,
+                                            'created_records': {}
+                                        }
+                                    
+                                    if model_name not in excel_row_groups[excel_row_id]['created_records']:
+                                        excel_row_groups[excel_row_id]['created_records'][model_name] = []
+                                    
+                                    # Deduplicate by ID to avoid adding the same record twice
+                                    record_id = record_data.get('id')
+                                    if record_id:
+                                        # Check if this record already exists in the group
+                                        existing_ids = {r.get('id') for r in excel_row_groups[excel_row_id]['created_records'][model_name] if r.get('id')}
+                                        if record_id not in existing_ids:
+                                            excel_row_groups[excel_row_id]['created_records'][model_name].append(record_data)
+                                    else:
+                                        # If no ID, just append (shouldn't happen for saved records)
+                                        excel_row_groups[excel_row_id]['created_records'][model_name].append(record_data)
+                                    
                                 elif output.get('status') == 'error':
                                     failed_records.append({
-                                        'error': output.get('error'),
+                                        'error': output.get('message', 'Unknown error'),
                                         'data': output.get('data', {})
                                     })
                             
                             if created_records:
+                                # Deduplicate records by ID to avoid showing the same record twice
+                                seen_ids = set()
+                                unique_records = []
+                                for record in created_records:
+                                    record_id = record.get('id')
+                                    if record_id:
+                                        if record_id not in seen_ids:
+                                            seen_ids.add(record_id)
+                                            unique_records.append(record)
+                                    else:
+                                        # If no ID, include it (shouldn't happen for saved records)
+                                        unique_records.append(record)
+                                
                                 preview['would_create'][model_name] = {
-                                    'count': len(created_records),
-                                    'records': created_records[:20],  # First 20 records
-                                    'total': len(created_records)
+                                    'count': len(unique_records),
+                                    'records': unique_records[:50],  # First 50 records for better preview
+                                    'total': len(unique_records)
                                 }
                             
                             if failed_records:
                                 preview['import_errors'].extend([{
                                     'type': 'import_error',
                                     'model': model_name,
-                                    'error': r['error'],
-                                    'data': r['data']
+                                    'error': r.get('error', 'Unknown error'),
+                                    'data': r.get('data', {})
                                 } for r in failed_records[:5]])  # First 5 errors
                         
+                        # JournalEntries are already processed in the main loop above (lines 2134-2192)
+                        # No need to process them again here - that would cause duplicates
+                        auto_created_jes = []
+                        
                         # Simulate IntegrationRule triggers and capture results
-                        preview['integration_rules_preview'] = self._simulate_integration_rules(
-                            import_result, 
-                            extra_fields_by_model
-                        )
+                        # Skip IntegrationRules for Transactions if auto_create_journal_entries is enabled
+                        # to avoid duplicate JournalEntry creation
+                        if self.auto_create_journal_entries and self.auto_create_journal_entries.get('enabled', False):
+                            # Filter out transaction_created events to prevent duplicate JournalEntry creation
+                            preview['integration_rules_preview'] = []
+                            logger.info("ETL: Skipping IntegrationRules for Transactions (auto_create_journal_entries is enabled)")
+                        else:
+                            preview['integration_rules_preview'] = self._simulate_integration_rules(
+                                import_result, 
+                                extra_fields_by_model
+                            )
+                        
+                        # Collect all JournalEntries from IntegrationRules for both grouped and flat views
+                        all_journal_entries = []
+                        substitution_observations = []  # Collect substitution info for display
+                        
+                        for rule_preview in preview.get('integration_rules_preview', []):
+                            source_record = rule_preview.get('source_record', {})
+                            source_model = source_record.get('model')
+                            source_id = source_record.get('id')
+                            extra_fields = rule_preview.get('extra_fields', {})
+                            
+                            # Get Excel row info from extra_fields
+                            excel_row_id = extra_fields.get('__excel_row_id')
+                            if not excel_row_id:
+                                excel_row_number = extra_fields.get('__excel_row_number')
+                                excel_sheet_name = extra_fields.get('__excel_sheet_name', 'Unknown')
+                                excel_row_id = f"{excel_sheet_name}:{excel_row_number}" if excel_row_number else None
+                            
+                            # Add JournalEntries to grouped view
+                            if excel_row_id and excel_row_id in excel_row_groups:
+                                for created_item in rule_preview.get('would_create', []):
+                                    created_model = created_item.get('model')
+                                    created_data = created_item.get('data', {})
+                                    
+                                    if created_model not in excel_row_groups[excel_row_id]['created_records']:
+                                        excel_row_groups[excel_row_id]['created_records'][created_model] = []
+                                    
+                                    excel_row_groups[excel_row_id]['created_records'][created_model].append(created_data)
+                            
+                            # Also collect for flat view
+                            for created_item in rule_preview.get('would_create', []):
+                                created_model = created_item.get('model')
+                                if created_model == 'JournalEntry':
+                                    created_data = created_item.get('data', {})
+                                    all_journal_entries.append(created_data)
+                        
+                        # JournalEntries are already in preview['would_create']['JournalEntry'] from the main loop
+                        # Only add IntegrationRule-created JournalEntries if any exist (and auto_create is disabled)
+                        # Since auto_created_jes is now empty (we removed duplicate processing), this should only
+                        # contain IntegrationRule-created JournalEntries
+                        if all_journal_entries:
+                            # If JournalEntry already exists in would_create, merge the counts
+                            if 'JournalEntry' in preview.get('would_create', {}):
+                                existing_jes = preview['would_create']['JournalEntry'].get('records', [])
+                                existing_count = preview['would_create']['JournalEntry'].get('count', 0)
+                                # Deduplicate by ID to avoid showing the same JournalEntry twice
+                                existing_ids = {je.get('id') for je in existing_jes if je.get('id')}
+                                new_jes = [je for je in all_journal_entries if je.get('id') and je.get('id') not in existing_ids]
+                                if new_jes:
+                                    preview['would_create']['JournalEntry']['records'].extend(new_jes[:max(0, 50 - len(existing_jes))])
+                                    preview['would_create']['JournalEntry']['count'] = existing_count + len(new_jes)
+                                    preview['would_create']['JournalEntry']['total'] = existing_count + len(new_jes)
+                            else:
+                                preview['would_create']['JournalEntry'] = {
+                                    'count': len(all_journal_entries),
+                                    'records': all_journal_entries[:50],  # First 50 records
+                                    'total': len(all_journal_entries)
+                                }
+                        
+                        # Collect substitution observations from all outputs
+                        for import_item in import_result.get('imports', []):
+                            outputs = import_item.get('result', [])
+                            model_name = import_item.get('model')
+                            
+                            for idx, output in enumerate(outputs):
+                                observations = output.get('observations', [])
+                                if observations:
+                                    # Get Excel row info
+                                    model_extra_fields = extra_fields_by_model.get(model_name, [])
+                                    excel_row_info = model_extra_fields[idx] if idx < len(model_extra_fields) else {}
+                                    
+                                    substitution_observations.append({
+                                        'model': model_name,
+                                        'row_number': excel_row_info.get('__excel_row_number', idx + 1),
+                                        'sheet': excel_row_info.get('__excel_sheet_name', 'Unknown'),
+                                        'observations': observations,
+                                        'record_id': output.get('data', {}).get('id')
+                                    })
+                        
+                        # Add substitutions to preview
+                        if substitution_observations:
+                            preview['substitutions_applied'] = substitution_observations
+                        
+                        # Create grouped view by Excel row (includes Transactions and JournalEntries)
+                        if excel_row_groups:
+                            # Sort by sheet name and row number
+                            sorted_groups = sorted(
+                                excel_row_groups.items(),
+                                key=lambda x: (
+                                    x[1].get('excel_sheet_name', ''),
+                                    x[1].get('excel_row_number', 999999)
+                                )
+                            )
+                            
+                            preview['would_create_by_row'] = [
+                                {
+                                    'excel_sheet': group['excel_sheet_name'],
+                                    'excel_row_number': group['excel_row_number'],
+                                    'excel_row_id': group['excel_row_id'],
+                                    'created_records': group['created_records']
+                                }
+                                for _, group in sorted_groups
+                            ]
                     else:
                         preview['import_errors'].append({
                             'type': 'no_valid_rows',
@@ -1014,7 +2624,305 @@ class ETLPipelineService:
             self.log.total_rows_transformed = preview['total_rows']
             self.log.save()
         
+        # Build structured output for raw JSON
+        preview['structured_by_row'] = self._build_structured_output(preview, extra_fields_by_model)
+        
         return preview
+    
+    def _build_structured_output(self, preview: dict, extra_fields_by_model: Dict[str, List[dict]]) -> List[dict]:
+        """
+        Build a structured output that shows, for each Excel row:
+        - The transformed data (after substitutions)
+        - Transactions that would be created
+        - Journal Entries that would be created for each transaction
+        - Any errors or warnings for that row
+        
+        Follows JSON API best practices for error handling.
+        """
+        structured_rows = []
+        
+        # Get the would_create_by_row structure
+        would_create_by_row = preview.get('would_create_by_row', [])
+        
+        # Build a map of transaction_id -> journal_entries
+        transaction_to_journal_entries = {}
+        journal_entries = preview.get('would_create', {}).get('JournalEntry', {}).get('records', [])
+        for je in journal_entries:
+            tx_id = je.get('transaction_id')
+            if tx_id:
+                if tx_id not in transaction_to_journal_entries:
+                    transaction_to_journal_entries[tx_id] = []
+                transaction_to_journal_entries[tx_id].append(je)
+        
+        # Build a map of excel_row_id -> transformed data (after substitutions)
+        transformed_by_row = {}
+        for model_name, model_data in preview.get('transformed_data', {}).items():
+            rows = model_data.get('rows', [])
+            for row in rows:
+                excel_row_id = row.get('__excel_row_id')
+                if excel_row_id:
+                    if excel_row_id not in transformed_by_row:
+                        transformed_by_row[excel_row_id] = {}
+                    if model_name not in transformed_by_row[excel_row_id]:
+                        transformed_by_row[excel_row_id][model_name] = []
+                    transformed_by_row[excel_row_id][model_name].append(row)
+        
+        # Build a map of excel_row_id -> substitutions applied
+        substitutions_by_row = {}
+        for sub in preview.get('substitutions_applied', []):
+            excel_row_id = f"{sub.get('sheet', 'Unknown')}:{sub.get('row_number', 'N/A')}"
+            if excel_row_id not in substitutions_by_row:
+                substitutions_by_row[excel_row_id] = []
+            # Parse observations to extract substitution details
+            observations = sub.get('observations', [])
+            for obs in observations:
+                # Parse observation string like: "campo 'field_name' alterado de 'old' para 'new' (regra id=123)"
+                if isinstance(obs, str):
+                    import re
+                    match = re.match(r"campo '([^']+)' alterado de '([^']*)' para '([^']*)' \(regra id=(\d+)\)", obs)
+                    if match:
+                        substitutions_by_row[excel_row_id].append({
+                            'field': match.group(1),
+                            'original_value': match.group(2),
+                            'new_value': match.group(3),
+                            'rule_id': int(match.group(4))
+                        })
+                    else:
+                        # Fallback: include the raw observation
+                        substitutions_by_row[excel_row_id].append({
+                            'observation': obs
+                        })
+                elif isinstance(obs, dict):
+                    substitutions_by_row[excel_row_id].append(obs)
+        
+        # Build a map of transaction_id -> excel_row_id for error mapping
+        transaction_to_excel_row = {}
+        for row_group in would_create_by_row:
+            excel_row_id = row_group.get('excel_row_id')
+            created_records = row_group.get('created_records', {})
+            transactions = created_records.get('Transaction', [])
+            for transaction in transactions:
+                tx_id = transaction.get('id')
+                if tx_id:
+                    transaction_to_excel_row[tx_id] = excel_row_id
+        
+        # Build a map of transaction_id -> excel_row_id for error mapping
+        transaction_to_excel_row_map = {}
+        for row_group in would_create_by_row:
+            excel_row_id = row_group.get('excel_row_id')
+            created_records = row_group.get('created_records', {})
+            transactions = created_records.get('Transaction', [])
+            for transaction in transactions:
+                tx_id = transaction.get('id')
+                if tx_id:
+                    transaction_to_excel_row_map[tx_id] = excel_row_id
+        
+        # Build a map of excel_row_id -> errors (JSON API format)
+        errors_by_row = {}
+        for error in preview.get('import_errors', []):
+            # Try to extract row information from error
+            error_data = error.get('data', {})
+            excel_row_id = error_data.get('__excel_row_id')
+            if not excel_row_id:
+                # Try to get from extra_fields or other sources
+                excel_row_id = error.get('excel_row_id') or error.get('row_id')
+            
+            # If still not found, try to map via transaction_id
+            if not excel_row_id:
+                transaction_id = error_data.get('transaction_id')
+                if transaction_id:
+                    excel_row_id = transaction_to_excel_row_map.get(transaction_id)
+            
+            if excel_row_id:
+                if excel_row_id not in errors_by_row:
+                    errors_by_row[excel_row_id] = []
+                
+                # Format error according to JSON API best practices
+                error_obj = {
+                    'id': f"error_{len(errors_by_row[excel_row_id])}",
+                    'status': '400',  # Bad Request
+                    'code': error.get('type', 'unknown_error'),
+                    'title': self._get_error_title(error.get('type')),
+                    'detail': error.get('message') or error.get('error', 'Unknown error'),
+                    'source': {}
+                }
+                
+                # Add source pointer if field is available
+                if error.get('field'):
+                    error_obj['source']['pointer'] = f"/data/attributes/{error.get('field')}"
+                
+                # Add meta information
+                error_obj['meta'] = {
+                    'model': error.get('model'),
+                    'traceback': error.get('traceback') if error.get('traceback') else None
+                }
+                
+                # Remove None values from meta
+                error_obj['meta'] = {k: v for k, v in error_obj['meta'].items() if v is not None}
+                
+                errors_by_row[excel_row_id].append(error_obj)
+        
+        # Build a map of excel_row_id -> warnings (JSON API format)
+        warnings_by_row = {}
+        for warning in preview.get('warnings', []):
+            excel_row_id = warning.get('excel_row_id') or warning.get('row_id')
+            if not excel_row_id:
+                # Try to extract from record_id (which is transaction_id for Transaction warnings)
+                record_id = warning.get('record_id')
+                if record_id:
+                    # First try the transaction_to_excel_row_map we built above
+                    excel_row_id = transaction_to_excel_row_map.get(record_id)
+                    
+                    # If still not found, search through row groups
+                    if not excel_row_id:
+                        for row_group in would_create_by_row:
+                            created_records = row_group.get('created_records', {})
+                            for model_name, records in created_records.items():
+                                for record in records:
+                                    if record.get('id') == record_id:
+                                        excel_row_id = row_group.get('excel_row_id')
+                                        break
+                                if excel_row_id:
+                                    break
+                            if excel_row_id:
+                                break
+            
+            if excel_row_id:
+                if excel_row_id not in warnings_by_row:
+                    warnings_by_row[excel_row_id] = []
+                
+                # Format warning according to JSON API best practices
+                warning_obj = {
+                    'id': f"warning_{len(warnings_by_row[excel_row_id])}",
+                    'status': '200',  # OK but with warning
+                    'code': warning.get('type', 'unknown_warning'),
+                    'title': self._get_warning_title(warning.get('type')),
+                    'detail': warning.get('message', 'Unknown warning'),
+                    'meta': {
+                        'model': warning.get('model'),
+                        'record_id': warning.get('record_id'),
+                        'account_path': warning.get('account_path')
+                    }
+                }
+                
+                # Remove None values from meta
+                warning_obj['meta'] = {k: v for k, v in warning_obj['meta'].items() if v is not None}
+                
+                warnings_by_row[excel_row_id].append(warning_obj)
+        
+        # Process each row group
+        for row_group in would_create_by_row:
+            excel_row_id = row_group.get('excel_row_id')
+            excel_row_number = row_group.get('excel_row_number')
+            excel_sheet_name = row_group.get('excel_sheet', 'Unknown')
+            created_records = row_group.get('created_records', {})
+            
+            # Get transformed data for this row (after substitutions)
+            transformed_data = transformed_by_row.get(excel_row_id, {})
+            
+            # Get substitutions applied to this row
+            substitutions = substitutions_by_row.get(excel_row_id, [])
+            
+            # Get transactions for this row
+            transactions = created_records.get('Transaction', [])
+            
+            # For each transaction, get its journal entries
+            transactions_with_entries = []
+            for transaction in transactions:
+                tx_id = transaction.get('id')
+                journal_entries = transaction_to_journal_entries.get(tx_id, [])
+                
+                transactions_with_entries.append({
+                    'transaction': transaction,
+                    'journal_entries': journal_entries,
+                    'journal_entry_count': len(journal_entries)
+                })
+            
+            # Build structured row output
+            structured_row = {
+                'excel_row': {
+                    'sheet_name': excel_sheet_name,
+                    'row_number': excel_row_number,
+                    'row_id': excel_row_id
+                },
+                'transformed_data': transformed_data,  # Data after substitutions
+                'substitutions_applied': substitutions,
+                'transactions': transactions_with_entries,
+                'other_records': {k: v for k, v in created_records.items() if k != 'Transaction'},
+                'errors': errors_by_row.get(excel_row_id, []),
+                'warnings': warnings_by_row.get(excel_row_id, [])
+            }
+            
+            structured_rows.append(structured_row)
+        
+        # Add rows that have errors but no created records
+        for excel_row_id, errors in errors_by_row.items():
+            # Check if this row is already in structured_rows
+            if not any(row['excel_row']['row_id'] == excel_row_id for row in structured_rows):
+                # Extract row info from transformed data or errors
+                row_info = {}
+                if excel_row_id in transformed_by_row:
+                    # Try to get row info from transformed data
+                    for model_data in transformed_by_row[excel_row_id].values():
+                        if model_data:
+                            first_row = model_data[0]
+                            row_info = {
+                                'sheet_name': first_row.get('__excel_sheet_name', 'Unknown'),
+                                'row_number': first_row.get('__excel_row_number'),
+                                'row_id': excel_row_id
+                            }
+                            break
+                
+                if not row_info:
+                    # Fallback: parse from excel_row_id
+                    if ':' in excel_row_id:
+                        parts = excel_row_id.split(':', 1)
+                        row_info = {
+                            'sheet_name': parts[0],
+                            'row_number': parts[1] if len(parts) > 1 else None,
+                            'row_id': excel_row_id
+                        }
+                    else:
+                        row_info = {
+                            'sheet_name': 'Unknown',
+                            'row_number': None,
+                            'row_id': excel_row_id
+                        }
+                
+                structured_rows.append({
+                    'excel_row': row_info,
+                    'transformed_data': transformed_by_row.get(excel_row_id, {}),
+                    'substitutions_applied': substitutions_by_row.get(excel_row_id, []),
+                    'transactions': [],
+                    'other_records': {},
+                    'errors': errors,
+                    'warnings': warnings_by_row.get(excel_row_id, [])
+                })
+        
+        return structured_rows
+    
+    def _get_error_title(self, error_type: str) -> str:
+        """Get a human-readable title for an error type."""
+        titles = {
+            'validation_error': 'Validation Error',
+            'import_error': 'Import Error',
+            'simulation_error': 'Simulation Error',
+            'fields_moved_to_extra': 'Fields Moved to Extra',
+            'no_valid_rows': 'No Valid Rows',
+            'unknown_error': 'Unknown Error'
+        }
+        return titles.get(error_type, 'Error')
+    
+    def _get_warning_title(self, warning_type: str) -> str:
+        """Get a human-readable title for a warning type."""
+        titles = {
+            'no_rule': 'No Transformation Rule',
+            'row_limit': 'Row Limit Applied',
+            'account_not_found': 'Account Not Found',
+            'auto_journal_entry_error': 'Journal Entry Creation Error',
+            'unknown_warning': 'Warning'
+        }
+        return titles.get(warning_type, 'Warning')
     
     def _simulate_integration_rules(self, import_result: dict, extra_fields_by_model: Dict[str, List[dict]]) -> List[dict]:
         """
@@ -1033,7 +2941,11 @@ class ETLPipelineService:
             'JournalEntry': 'journal_entry_created',
         }
         
-        for model_name, outputs in import_result.get('results', {}).items():
+        # execute_import_job returns {'imports': [{'model': '...', 'result': [...]}]}
+        for import_item in import_result.get('imports', []):
+            model_name = import_item.get('model')
+            outputs = import_item.get('result', [])
+            
             event_name = MODEL_EVENT_MAP.get(model_name)
             if not event_name:
                 continue
@@ -1048,6 +2960,14 @@ class ETLPipelineService:
             allowed_events = trigger_options.get('events', [event_name])
             if event_name not in allowed_events:
                 continue
+            
+            # Skip IntegrationRules for transaction_created if auto_create_journal_entries is enabled
+            # to avoid duplicate JournalEntry creation
+            if event_name == 'transaction_created' and self.auto_create_journal_entries:
+                auto_config = self.auto_create_journal_entries or {}
+                if auto_config.get('enabled', False):
+                    logger.debug(f"ETL: Skipping IntegrationRules for {event_name} (auto_create_journal_entries is enabled)")
+                    continue
             
             extra_fields_list = extra_fields_by_model.get(model_name, [])
             
@@ -1235,8 +3155,9 @@ class ETLPipelineService:
             response['import_result'] = import_result
         
         # Include preview data if not committing
-        if not self.commit:
-            response['data'] = self._preview_data()
+        # Use the already-computed preview result instead of calling _preview_data() again
+        if not self.commit and import_result:
+            response['data'] = import_result
         
         return response
 

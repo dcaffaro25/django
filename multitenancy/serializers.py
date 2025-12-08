@@ -19,19 +19,42 @@ class FlexibleRelatedField(serializers.PrimaryKeyRelatedField):
         - Accept an int (primary key).
         - Accept a dict where exactly ONE of the fields in unique_field is given.
     - unique_field can be a single string OR a list/tuple of possible unique fields.
+    
+    Performance optimization: Accepts an optional lookup_cache to avoid database queries.
     """
 
-    def __init__(self, serializer_class=None, unique_field=None, **kwargs):
+    def __init__(self, serializer_class=None, unique_field=None, lookup_cache=None, **kwargs):
         """
         :param serializer_class: Serializer class to use when returning data.
         :param unique_field: a string or a list/tuple of possible unique fields
                             e.g. "username" or ("username", "email").
+        :param lookup_cache: Optional LookupCache instance for efficient lookups (ETL context).
+                            Can also be passed via serializer context.
         """
         self.serializer_class = serializer_class
         self.unique_field = unique_field
+        self.lookup_cache = lookup_cache
         super().__init__(**kwargs)
+    
+    def _get_lookup_cache(self):
+        """Get lookup cache from field or parent serializer context."""
+        if self.lookup_cache:
+            return self.lookup_cache
+        if self.parent and hasattr(self.parent, 'context'):
+            return self.parent.context.get('lookup_cache')
+        return None
 
     def get_queryset(self):
+        """Get queryset, but prefer lookup cache if available."""
+        # If we have a lookup cache, we can skip queryset creation for common models
+        lookup_cache = self._get_lookup_cache()
+        if lookup_cache:
+            model = self._get_related_model()
+            if model and model.__name__ in ("Account", "Entity", "Currency"):
+                # Return empty queryset since we'll use cache instead
+                # This prevents unnecessary database queries
+                return model.objects.none()
+        
         if self.queryset is not None:
             return self.queryset
         model = self.parent.Meta.model._meta.get_field(self.source).related_model
@@ -48,15 +71,31 @@ class FlexibleRelatedField(serializers.PrimaryKeyRelatedField):
         return super().to_representation(value)
 
     def to_internal_value(self, data):
-        queryset = self.get_queryset()
-        if queryset is None:
-            raise serializers.ValidationError("No queryset available for this field.")
-
         # 1) If we get an integer, treat it as the primary key
         if isinstance(data, int):
-            print(data)
-            print(self)
-            print(super().to_internal_value(data))
+            # Use lookup cache if available for common models
+            lookup_cache = self._get_lookup_cache()
+            if lookup_cache:
+                model = self._get_related_model()
+                if model:
+                    model_name = model.__name__
+                    if model_name == "Account":
+                        account = lookup_cache.get_account_by_id(data)
+                        if account:
+                            return account
+                    elif model_name == "Entity":
+                        entity = lookup_cache.get_entity_by_id(data)
+                        if entity:
+                            return entity
+                    elif model_name == "Currency":
+                        currency = lookup_cache.get_currency_by_id(data)
+                        if currency:
+                            return currency
+            
+            # Fallback to database query
+            queryset = self.get_queryset()
+            if queryset is None:
+                raise serializers.ValidationError("No queryset available for this field.")
             return super().to_internal_value(data)
 
         # 2) If data is a dict, we try to find exactly one matching field from unique_field
@@ -93,7 +132,36 @@ class FlexibleRelatedField(serializers.PrimaryKeyRelatedField):
             # Exactly one field is present
             field_name, lookup_value = present_fields[0]
 
-            # Try to fetch a record by that single field
+            # Try lookup cache first if available
+            lookup_cache = self._get_lookup_cache()
+            if lookup_cache:
+                model = self._get_related_model()
+                if model:
+                    model_name = model.__name__
+                    if model_name == "Account":
+                        if field_name == "account_code":
+                            account = lookup_cache.get_account_by_code(lookup_value)
+                            if account:
+                                return account
+                        elif field_name == "name":
+                            account = lookup_cache.get_account_by_name(lookup_value)
+                            if account:
+                                return account
+                    elif model_name == "Entity":
+                        if field_name == "name":
+                            entity = lookup_cache.get_entity_by_name(lookup_value)
+                            if entity:
+                                return entity
+                    elif model_name == "Currency":
+                        if field_name == "code":
+                            currency = lookup_cache.get_currency_by_code(lookup_value)
+                            if currency:
+                                return currency
+
+            # Fallback to database query
+            queryset = self.get_queryset()
+            if queryset is None:
+                raise serializers.ValidationError("No queryset available for this field.")
             try:
                 return queryset.get(**{field_name: lookup_value})
             except ObjectDoesNotExist:
@@ -105,6 +173,16 @@ class FlexibleRelatedField(serializers.PrimaryKeyRelatedField):
         raise serializers.ValidationError(
             "Invalid input: expected either an integer ID or a dict with exactly one unique field."
         )
+    
+    def _get_related_model(self):
+        """Get the related model for this field."""
+        try:
+            if self.parent and hasattr(self.parent, 'Meta') and hasattr(self.parent.Meta, 'model'):
+                model = self.parent.Meta.model._meta.get_field(self.source).related_model
+                return model
+        except (AttributeError, KeyError):
+            pass
+        return None
         
     def get_choices(self, cutoff=None):
         # Prevent the browsable API from trying to build a select widget by returning no choices.

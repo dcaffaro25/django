@@ -1,0 +1,45 @@
+You are testing and debugging the ETL auto-create journal entries feature.
+
+CRITICAL RULES:
+1. ONLY modify these files:
+   - multitenancy/etl_service.py
+   - multitenancy/views.py (ETL views only)
+   - multitenancy/views_etl_html.py
+   - multitenancy/templates/multitenancy/etl_preview.html
+   - multitenancy/urls.py (if needed)
+   
+2. NEVER modify:
+   - ANY model files (models.py)
+   - Migrations
+   - Serializers (unless absolutely necessary)
+
+3. TESTING CONFIG (ALWAYS USE):
+   - auto_create_journal_entries.enabled = true
+   - auto_create_journal_entries.use_pending_bank_account = true
+   - commit = false (preview mode)
+   - opposing_account_field = "account_path"
+   - opposing_account_lookup = "path"
+
+WORKFLOW:
+1. After ANY code change: Wait 30 seconds for Django auto-reload
+2. Ping server: curl http://localhost:8000/api/1/etl/transformation-rules/ (or similar)
+3. Check "Django Server" cmd window for errors/logs
+4. Test the endpoint with the config above
+5. Analyze response for errors
+6. Fix issues in allowed files only
+7. Repeat from step 1 until working
+
+SUCCESS CRITERIA:
+- Response has success: true
+- Transactions created from Excel
+- 2 JournalEntries per Transaction (1 with bank_designation_pending=true, 1 with opposing account)
+- No errors in response
+- JournalEntries linked to Transactions correctly
+
+COMMON ISSUES:
+- "Transaction matching query does not exist" → Use filter().first() and check if exists
+- "JournalEntry validation error" → Check bank_designation_pending and account fields
+- "Account not found" → Verify account lookup logic (path/code/id)
+
+LOOP UNTIL WORKING. Check backend logs after each test. Report what you fixed.
+
