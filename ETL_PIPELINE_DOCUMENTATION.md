@@ -1,5 +1,7 @@
 # ETL Pipeline Documentation
 
+**Complete Consolidated Guide** - This document contains all ETL system documentation including API usage, query building, testing methods, HTML interface, rule configuration, examples, and troubleshooting.
+
 ## Overview
 
 The ETL (Extract, Transform, Load) Pipeline provides a comprehensive system for importing data from Excel files into the database with automatic data transformation, substitution, validation, and optional integration rule triggers.
@@ -18,10 +20,11 @@ The ETL (Extract, Transform, Load) Pipeline provides a comprehensive system for 
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  STEP 1: TRANSFORMATION (ImportTransformationRule)                          │
 │  - Map source columns to target fields                                      │
+│  - Filter rows #we should filter out rows as soon as the columns mappings are done, to avoid processing rows that wont be in the output.
 │  - Concatenate multiple columns                                             │
 │  - Compute derived values                                                   │
 │  - Apply default values                                                     │
-│  - Filter rows                                                              │
+                                                              │
 │  - Extract extra fields for triggers                                        │
 └─────────────────────────────────────────────────────────────────────────────┘
                                │
@@ -70,12 +73,20 @@ The ETL (Extract, Transform, Load) Pipeline provides a comprehensive system for 
 ## Table of Contents
 
 1. [API Endpoints](#api-endpoints)
-2. [ImportTransformationRule](#importtransformationrule)
-3. [SubstitutionRule](#substitutionrule)
-4. [IntegrationRule](#integrationrule)
-5. [Helper Functions](#helper-functions)
-6. [Complete Examples](#complete-examples)
-7. [Error Handling](#error-handling)
+2. [Using the ETL System](#using-the-etl-system)
+   - [Query Building & Execution](#query-building--execution)
+   - [HTML Interface](#html-interface)
+   - [Testing Methods](#testing-methods)
+   - [Understanding Responses (v2 Schema)](#understanding-responses-v2-schema)
+3. [ImportTransformationRule](#importtransformationrule)
+4. [SubstitutionRule](#substitutionrule)
+5. [IntegrationRule](#integrationrule)
+6. [Helper Functions](#helper-functions)
+7. [Complete Examples](#complete-examples)
+8. [Error Handling & Troubleshooting](#error-handling--troubleshooting)
+9. [Preview Response Format (v2 Schema)](#preview-response-format-v2-schema)
+10. [Response Schema v2 Implementation Details](#response-schema-v2-implementation-details)
+11. [Valid Target Models](#valid-target-models)
 
 ---
 
@@ -109,6 +120,304 @@ The ETL (Extract, Transform, Load) Pipeline provides a comprehensive system for 
 | `/api/core/integration-rules/{id}/` | GET/PUT/DELETE | CRUD single integration rule |
 | `/api/core/validate-rule/` | POST | Validate integration rule syntax |
 | `/api/core/test-rule/` | POST | Test integration rule in sandbox |
+
+---
+
+## Using the ETL System
+
+### Query Building & Execution
+
+#### Required Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file` | File (multipart) | ✅ Yes | Excel file (.xlsx, .xls) to process |
+| `company_id` | Integer | ✅ Yes | ID of the company/tenant to process for |
+
+#### Optional Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `row_limit` | Integer | `10` (preview) | Number of rows to process (0 = all rows) |
+| `auto_create_journal_entries` | JSON String/Object | `None` | Auto-create journal entries configuration |
+| `use_celery` | Boolean/String | `false` | Process asynchronously via Celery |
+
+**Auto-Create Journal Entries Configuration:**
+```json
+{
+  "enabled": true,
+  "use_pending_bank_account": true,
+  "opposing_account_field": "account_path",
+  "opposing_account_lookup": "path",
+  "path_separator": " > "
+}
+```
+
+#### Getting Your Company ID
+
+**Option 1: Via Django Shell**
+```python
+python manage.py shell
+>>> from multitenancy.models import Company
+>>> Company.objects.filter(is_deleted=False).values('id', 'name')
+```
+
+**Option 2: Via SQL**
+```sql
+SELECT id, name FROM multitenancy_company WHERE is_deleted = false;
+```
+
+### HTML Interface
+
+The easiest way to test ETL preview is through the web interface.
+
+**Access URL:**
+```
+http://localhost:8000/etl/preview/
+```
+
+**Features:**
+- ✅ File upload form with drag-and-drop
+- ✅ Company selection dropdown
+- ✅ AJAX processing (no page reload)
+- ✅ Tabbed results view:
+  - **Summary** - Overview statistics
+  - **Grouped by Row** - Records organized by Excel row
+  - **All Records** - Flat list of all records
+  - **Failed Rows** - Validation failures
+  - **Raw JSON** - Complete API response
+
+**Usage:**
+1. Start Django server: `python manage.py runserver`
+2. Open browser: `http://localhost:8000/etl/preview/`
+3. Select company from dropdown
+4. Choose Excel file
+5. Click "Preview Transformation"
+6. View results in organized tabs
+
+### Testing Methods
+
+This section covers various methods for testing the ETL system, including API testing, debugging workflows, and common testing scenarios.
+
+#### Testing Workflow & Best Practices
+
+**Testing Configuration:**
+```json
+{
+  "auto_create_journal_entries": {
+    "enabled": true,
+    "use_pending_bank_account": true,
+    "opposing_account_field": "account_path",
+    "opposing_account_lookup": "path",
+    "path_separator": " > "
+  },
+  "commit": false  // Preview mode - don't commit to database
+}
+```
+
+**Testing Workflow:**
+
+1. **Wait for Server** - After code changes, wait 30+ seconds for Django auto-reload
+2. **Check Backend Logs** - Monitor Django server terminal for errors, stack traces, warnings
+3. **Test the Feature** - Send preview request with test Excel file
+4. **Analyze Results** - Check response for:
+   - ✅ `success: true`
+   - ✅ `data.rows[*].transactions` - Should have Transaction records
+   - ✅ `data.rows[*].transactions[*].journal_entries` - Should have JournalEntries per Transaction
+   - ❌ Any errors in `errors` array
+   - ❌ Any warnings in `warnings` array
+5. **Debug & Fix** - Use error messages, logs, and stack traces to identify issues
+6. **Iterate** - After each fix, wait for reload and re-test
+
+**Success Criteria:**
+- ✅ Request returns `success: true`
+- ✅ Transactions are created from Excel
+- ✅ 2 JournalEntries are created per Transaction (debit + credit pair)
+- ✅ No errors in response
+- ✅ JournalEntries correctly linked to Transactions
+- ✅ Debit/credit amounts calculated correctly based on amount sign
+
+**Common Issues & Solutions:**
+
+| Issue | Solution |
+|-------|----------|
+| "Transaction matching query does not exist" | Ensure using `Transaction.objects.filter().first()` and checking existence before proceeding |
+| "JournalEntry validation error" | Check `bank_designation_pending=True` for pending bank account, ensure account is set when `bank_designation_pending=False` |
+| "Account not found" | Verify account lookup logic (path/code/ID resolution) |
+| "Server not responding" | Wait longer (60s), check if Django server is running, verify port |
+
+**Logging for Debugging:**
+```python
+import logging
+logger = logging.getLogger(__name__)
+
+logger.info(f"ETL: Starting auto-create for {len(transaction_outputs)} Transactions")
+logger.debug(f"ETL: Transaction {transaction_id} found: {transaction is not None}")
+logger.debug(f"ETL: Using pending bank: {use_pending_bank}")
+logger.error(f"ETL: Error creating JournalEntry: {e}", exc_info=True)
+```
+
+#### Method 1: Python (requests library)
+
+```python
+import requests
+import json
+from pathlib import Path
+
+url = "http://localhost:8000/api/core/etl/preview/"
+file_path = r"C:\path\to\file.xlsx"
+company_id = 10
+
+# Optional: Auto-create journal entries config
+auto_config = {
+    "enabled": True,
+    "use_pending_bank_account": True,
+    "opposing_account_field": "account_path",
+    "opposing_account_lookup": "path",
+    "path_separator": " > "
+}
+
+with open(file_path, 'rb') as f:
+    files = {
+        'file': (Path(file_path).name, f, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    }
+    data = {
+        'company_id': company_id,
+        'row_limit': 0,  # 0 = all rows
+        'auto_create_journal_entries': json.dumps(auto_config)
+    }
+    
+    response = requests.post(url, files=files, data=data, timeout=300)
+    response.raise_for_status()
+    
+    result = response.json()
+    print(json.dumps(result, indent=2))
+```
+
+#### Method 2: cURL
+
+```bash
+curl -X POST "http://localhost:8000/api/core/etl/preview/" \
+  -F "file=@/path/to/file.xlsx" \
+  -F "company_id=10" \
+  -F "row_limit=0" \
+  -o response.json
+```
+
+**Windows PowerShell:**
+```powershell
+curl -X POST "http://localhost:8000/api/core/etl/preview/" `
+  -F "file=@`"C:\path\to\file.xlsx`"" `
+  -F "company_id=10" `
+  -o response.json
+```
+
+#### Method 3: PowerShell (Invoke-RestMethod)
+
+```powershell
+$filePath = "C:\path\to\file.xlsx"
+$url = "http://localhost:8000/api/core/etl/preview/"
+
+$form = @{
+    file = Get-Item -Path $filePath
+    company_id = 10
+    row_limit = 0
+}
+
+$response = Invoke-RestMethod -Uri $url -Method Post -Form $form
+$response | ConvertTo-Json -Depth 10 | Out-File -FilePath "response.json" -Encoding UTF8
+```
+
+#### Method 4: Postman
+
+1. Method: `POST`
+2. URL: `http://localhost:8000/api/core/etl/preview/`
+3. Body → form-data:
+   - `file` (File): Select Excel file
+   - `company_id` (Text): `10`
+   - `row_limit` (Text): `0` (optional)
+   - `auto_create_journal_entries` (Text): JSON string (optional)
+
+### Understanding Responses (v2 Schema)
+
+#### Response Structure (v2)
+
+The preview and execute responses now use the v2 schema format. Key sections:
+
+**Top-Level Fields:**
+- `schema_version: "2.0"` - Indicates response format version
+- `success` - Whether processing completed successfully
+- `log_id` - ID of the ETL log entry (can query later)
+- `file_name` - Name of processed Excel file
+- `file_hash` - SHA256 hash of the file
+- `is_preview` - `true` for preview, `false` for execute
+- `duration_seconds` - Processing time in seconds
+- `summary` - Aggregated statistics (see below)
+- `sheets` - Sheet processing status
+- `warnings` - Global non-blocking issues
+- `errors` - Global blocking errors
+- `data` - Canonical data block with `rows` and `transformations`
+
+#### Key Response Fields
+
+| Field | Description |
+|-------|-------------|
+| `schema_version` | Response schema version ("2.0") |
+| `success` | Whether processing completed successfully |
+| `log_id` | ID of the ETL log entry |
+| `duration_seconds` | Processing time in seconds |
+| `summary.sheets_found` | Total sheets in Excel file |
+| `summary.sheets_processed` | Sheets that had matching rules |
+| `summary.total_rows_transformed` | Excel rows transformed |
+| `summary.rows.ok` | Count of successfully processed rows |
+| `summary.rows.failed` | Count of failed rows |
+| `summary.rows.skipped` | Count of skipped rows |
+| `summary.models.Transaction.created` | Count of Transactions created |
+| `summary.models.JournalEntry.created` | Count of JournalEntries created |
+| `data.rows[*]` | ⭐ **Per-row canonical structure** (Most useful!) |
+| `data.transformations` | Global transformation metadata |
+| `warnings` | Non-blocking issues (global + row-level) |
+| `errors` | Blocking errors (global + row-level) |
+
+#### Understanding `data.rows[*]` (v2)
+
+This is the most useful structure for understanding how Excel rows map to database records. Each row contains:
+
+- **Excel metadata** (`excel_row`) - Sheet name, row number, row ID
+- **Status** - Overall row status (ok/failed/skipped)
+- **Source data** (`source_row`) - Optional original Excel row data
+- **Transformed data** (`transformed`) - DTOs after transformation
+- **Transformation metadata** (`transformation`) - Rule used, substitutions applied
+- **Created records** (`transactions`) - Actual/would-be created records grouped by transaction
+- **Row-level issues** (`warnings`, `errors`) - Problems specific to this row
+
+**Example:** To see what Excel row 115 created:
+```python
+# Find row 115 in response
+row_115 = next((r for r in response['data']['rows'] if r['excel_row']['row_number'] == 115), None)
+
+if row_115:
+    print(f"Status: {row_115['status']}")
+    print(f"Transactions: {len(row_115['transactions'])}")
+    for txn_bundle in row_115['transactions']:
+        print(f"  - Transaction ID: {txn_bundle['transaction']['id']}")
+        print(f"  - Journal Entries: {txn_bundle['journal_entry_count']}")
+```
+
+#### Preview vs Execute
+
+**Preview Mode** (`/api/core/etl/preview/`):
+- ✅ Safe - No database changes
+- ✅ Tests transformations before committing
+- ✅ Rolls back all transactions
+- ✅ Fast - No cleanup needed
+
+**Execute Mode** (`/api/core/etl/execute/`):
+- ⚠️ Commits to database
+- ⚠️ Creates actual records
+- ⚠️ Cannot undo easily
+
+**Best Practice:** Always preview first, then execute when ready.
 
 ---
 
@@ -1008,7 +1317,7 @@ result = result  # Set result for rule completion
 
 ---
 
-## Error Handling
+## Error Handling & Troubleshooting
 
 ### Transformation Errors
 
@@ -1062,6 +1371,75 @@ result = result  # Set result for rule completion
 }
 ```
 
+### Common Issues & Solutions
+
+#### Issue 1: Server Not Running
+```bash
+python manage.py runserver
+```
+
+#### Issue 2: Wrong Port
+Update URL if server runs on different port:
+```
+http://localhost:YOUR_PORT/api/core/etl/preview/
+```
+
+#### Issue 3: File Path with Spaces (Windows)
+**PowerShell:**
+```powershell
+-F "file=@`"C:\path with spaces\file.xlsx`""
+```
+
+**CMD:**
+```cmd
+-F "file=@\"C:\path with spaces\file.xlsx\""
+```
+
+#### Issue 4: Large Files / Timeout
+- Use `row_limit` to test with subset first
+- Increase timeout: `timeout=600` in requests
+- Use Celery: `use_celery=true`
+
+#### Issue 5: Response Too Large
+- Save to file instead of printing
+- Use `jq` to filter: `cat response.json | jq '.data.would_create_by_row[0:5]'`
+- Query specific sections in Python
+
+#### Issue 6: Transaction Matching Query Does Not Exist
+Ensure transactions exist before creating JournalEntries:
+- Use `Transaction.objects.filter().first()` and check if exists
+- Verify transaction ID is correctly linked
+
+#### Issue 7: JournalEntry Validation Error
+Check that:
+- `bank_designation_pending=True` when using pending bank account
+- `account` is set when `bank_designation_pending=False`
+- Transaction ID is correctly linked
+
+#### Issue 8: Account Not Found
+Verify account lookup logic:
+- Path resolution works correctly
+- Code resolution works correctly
+- ID resolution works correctly
+
+### Debugging Tips
+
+**After making code changes:**
+1. Wait at least 30 seconds for Django auto-reload
+2. Ping server to verify ready: `curl http://localhost:8000/api/core/etl/transformation-rules/`
+3. Monitor backend logs in Django server terminal
+4. Check API response `errors` and `warnings` fields
+
+**Add logging to debug:**
+```python
+import logging
+logger = logging.getLogger(__name__)
+
+logger.info(f"ETL: Starting auto-create for {len(transaction_outputs)} Transactions")
+logger.debug(f"ETL: Transaction {transaction_id} found: {transaction is not None}")
+logger.error(f"ETL: Error creating JournalEntry: {e}", exc_info=True)
+```
+
 ---
 
 ## Best Practices
@@ -1074,124 +1452,245 @@ result = result  # Set result for rule completion
 
 ---
 
-## Preview Response Format
+## Preview Response Format (v2 Schema)
 
 The `/api/core/etl/preview/` endpoint runs the **complete pipeline simulation** including IntegrationRules, then rolls back all changes. This shows exactly what WOULD be created.
 
-### Preview Response Structure
+**As of v2.0, the response format has been refactored to a cleaner, more canonical structure with per-row grouping.**
+
+### Response Schema Version
+
+All responses now include `schema_version: "2.0"` to indicate the API response format version.
+
+### Top-Level Response Structure (v2)
 
 ```json
 {
   "success": true,
+  "log_id": 54,
+  "file_name": "2025.01.xlsx",
+  "file_hash": "f2ab6f...",
   "is_preview": true,
-  "duration_seconds": 1.23,
+  "duration_seconds": 5.64,
+  "schema_version": "2.0",
   
   "summary": {
-    "sheets_found": 2,
+    "sheets_found": 8,
     "sheets_processed": 1,
-    "sheets_skipped": 1,
+    "sheets_skipped": 7,
     "sheets_failed": 0,
-    "total_rows_transformed": 50
+    "total_rows_transformed": 5,
+    "rows": {
+      "ok": 5,
+      "failed": 0,
+      "skipped": 0
+    },
+    "models": {
+      "Transaction": { "created": 5, "failed": 0 },
+      "JournalEntry": { "created": 10, "failed": 0 }
+    }
   },
+  
+  "sheets": {
+    "found": ["Sheet1", "Sheet2", ...],
+    "processed": ["Base Ajustada"],
+    "skipped": ["Summary", ...],
+    "failed": []
+  },
+  
+  "warnings": [
+    {
+      "type": "sheet_skipped",
+      "message": "Sheet 'Summary' skipped - no matching rule"
+    }
+  ],
+  "errors": [],
   
   "data": {
-    "transformed_data": {
-      "Transaction": {
-        "row_count": 50,
-        "sample_columns": ["date", "description", "amount", "entity_id", "currency_id", "__extra_fields__"],
-        "rows": [
-          {
-            "date": "2025-01-15",
-            "description": "PIX ENVIADO - FORNECEDOR",
-            "amount": "-500.00",
-            "entity_id": 10,
-            "currency_id": 12,
-            "__extra_fields__": {
-              "account_path": "Expenses > Services",
-              "bank_account_id": "5"
-            }
-          }
-        ]
-      }
-    },
-    
-    "would_create": {
-      "Transaction": {
-        "count": 50,
-        "records": [
-          {
-            "id": 123,
-            "date": "2025-01-15",
-            "description": "PIX ENVIADO - FORNECEDOR",
-            "amount": "500.00",
-            "entity_id": 10,
-            "currency_id": 12,
-            "state": "pending"
-          }
-        ]
-      }
-    },
-    
-    "integration_rules_preview": [
-      {
-        "rule_name": "Create JournalEntries from Transaction",
-        "rule_id": 5,
-        "trigger_event": "transaction_created",
-        "source_record": {
-          "model": "Transaction",
-          "id": 123,
-          "data": {
-            "id": 123,
-            "date": "2025-01-15",
-            "description": "PIX ENVIADO - FORNECEDOR",
-            "amount": "500.00"
-          }
-        },
-        "extra_fields": {
-          "account_path": "Expenses > Services",
-          "bank_account_id": "5"
-        },
-        "would_create": [
-          {
-            "model": "JournalEntry",
-            "data": {
-              "account_id": 10,
-              "account_name": "Bradesco Checking",
-              "debit_amount": null,
-              "credit_amount": "500.00",
-              "description": "PIX ENVIADO - FORNECEDOR"
-            }
-          },
-          {
-            "model": "JournalEntry",
-            "data": {
-              "account_id": 25,
-              "account_name": "Services",
-              "debit_amount": "500.00",
-              "credit_amount": null,
-              "description": "PIX ENVIADO - FORNECEDOR"
-            }
-          }
-        ],
-        "errors": []
-      }
-    ],
-    
-    "total_rows": 50
-  },
-  
-  "warnings": [],
-  "errors": []
+    "rows": [ /* see Per-Row Structure below */ ],
+    "transformations": { /* see Transformations Block below */ }
+  }
 }
 ```
 
-### Preview Sections Explained
+### Per-Row Structure: `data.rows[*]`
 
-| Section | Description |
-|---------|-------------|
-| `transformed_data` | Data after transformation + substitution (before import) |
-| `would_create` | Records that WOULD be created by the direct import |
-| `integration_rules_preview` | What each IntegrationRule WOULD create |
+Each element in `data.rows` represents one Excel row with all its related data:
+
+```json
+{
+  "excel_row": {
+    "sheet_name": "Base Ajustada",
+    "row_number": 2,
+    "row_id": "Base Ajustada:2"
+  },
+  
+  "status": "ok",  // "ok", "failed", "skipped", or "ignored"
+  
+  "source_row": {  // Optional: original Excel row data
+    "Valor": 3500,
+    "Emissão": "2025-01-19",
+    "Conta Contábil": "1.2.3.4.5",
+    "Tipo de Conta": "FORNECEDOR",
+    "Conta": "Hardware E Software",
+    "Nº Doc.": "Cabeamento",
+    "Pessoa": "Iw Comercio"
+  },
+  
+  "transformed": {  // DTOs after transformation
+    "Transaction": [
+      {
+        "amount": 3500,
+        "date": "2025-01-19",
+        "account_path": "Ativos\\Ativo Não Circulante\\Imobilizado\\Computadores e Periféricos",
+        "description": "FORNECEDOR | Hardware E Software | Cabeamento | Iw Comercio",
+        "state": "pending",
+        "entity_id": 10,
+        "currency_id": 12
+      }
+    ]
+  },
+  
+  "transformation": {
+    "rule_id": 1,
+    "rule_name": "teste",
+    "substitutions_applied": [
+      {
+        "field": "account_path",
+        "from": "1.2.3.4.5",
+        "to": "Ativos\\Ativo Não Circulante\\Imobilizado\\Computadores e Periféricos",
+        "rule_id": 3
+      }
+    ],
+    "extra_fields": ["account_path"]
+  },
+  
+  "transactions": [
+    {
+      "transaction": {
+        "id": 41951,
+        "created_at": "2025-12-08T21:54:17.523Z",
+        "updated_at": "2025-12-08T21:54:17.523Z",
+        "company": 4,
+        "date": "2025-01-19",
+        "entity": 10,
+        "description": "FORNECEDOR | Hardware E Software | Cabeamento | Iw Comercio",
+        "amount": "3500.00",
+        "currency": 12,
+        "state": "pending",
+        "balance_validated": false,
+        "description_embedding": null,
+        "is_balanced": false,
+        "is_reconciled": false,
+        "is_posted": false
+      },
+      "journal_entries": [
+        {
+          "id": 38845,
+          "transaction_id": 41951,
+          "account_path": "Pending Bank Account",
+          "debit_amount": "3500.00",
+          "credit_amount": null,
+          "bank_designation_pending": true,
+          "account_id": null
+        },
+        {
+          "id": 38846,
+          "transaction_id": 41951,
+          "account_path": "Ativo > Ativo Não Circulante > Imobilizado > Computadores e Periféricos > Valor Original",
+          "debit_amount": null,
+          "credit_amount": "3500.00",
+          "bank_designation_pending": false,
+          "account_id": 1213,
+          "account_code": null
+        }
+      ],
+      "journal_entry_count": 2
+    }
+  ],
+  
+  "other_records": {
+    "JournalEntry": [ /* JEs not linked to transactions, if any */ ]
+  },
+  
+  "warnings": [
+    {
+      "code": "ACCOUNT_NOT_FOUND",
+      "message": "Account 1.1.3.05 not found",
+      "field": "account_code"
+    }
+  ],
+  
+  "errors": [
+    {
+      "code": "VALIDATION_ERROR",
+      "message": "Invalid amount",
+      "field": "amount"
+    }
+  ]
+}
+```
+
+#### Row Status Values
+
+| Status | Description |
+|--------|-------------|
+| `ok` | Row successfully transformed and mapped to created records |
+| `failed` | Row has blocking errors and would not create records |
+| `skipped` | Row was explicitly skipped (e.g. by filter/rule) |
+| `ignored` | Row was not processed (non-error state) |
+
+### Transformations Block: `data.transformations`
+
+Global transformation-related fields are consolidated here:
+
+```json
+{
+  "rules_used": [
+    {
+      "id": 1,
+      "name": "teste",
+      "target_model": "Transaction",
+      "source_sheet_name": "Base Ajustada",
+      "column_mappings": {
+        "Valor": "amount",
+        "Emissão": "date",
+        "Conta Contábil": "account_path"
+      },
+      "column_concatenations": {
+        "description": {
+          "columns": ["Tipo de Conta", "Conta", "Nº Doc.", "Pessoa"],
+          "separator": " | "
+        }
+      },
+      "computed_columns": {},
+      "default_values": {
+        "state": "pending",
+        "entity_id": 10,
+        "currency_id": 12
+      },
+      "row_filter": "row.get('Valor') and ...",
+      "extra_fields_for_trigger": {},
+      "trigger_options": {},
+      "skip_rows": 0,
+      "header_row": 0,
+      "execution_order": 0
+    }
+  ],
+  
+  "import_errors": [
+    {
+      "type": "fields_moved_to_extra",
+      "message": "Fields not in Transaction model moved to extra_fields: ['account_path']",
+      "fields": ["account_path"],
+      "hint": "Use extra_fields_for_trigger in your transformation rule to pass these to IntegrationRules"
+    }
+  ],
+  
+  "integration_rules_available": [],
+  "integration_rules_preview": []
+}
+```
 
 ### How Preview Works
 
@@ -1202,7 +1701,25 @@ The `/api/core/etl/preview/` endpoint runs the **complete pipeline simulation** 
 5. **Capture Results** - Record what would be created
 6. **Rollback** - Undo all changes (nothing persisted)
 
-This allows users to see the **complete end-to-end result** before committing
+This allows users to see the **complete end-to-end result** before committing.
+
+### Migration from v1 to v2
+
+**Breaking Changes:**
+- `import_result` field removed - no longer in response
+- `data` structure changed - now contains `rows` and `transformations` only
+- Legacy fields removed:
+  - `data.transformed_data` (now in `data.rows[*].transformed`)
+  - `data.would_create` (now in `data.rows[*].transactions` and `other_records`)
+  - `data.would_create_by_row` (now `data.rows`)
+  - `data.would_fail` (now in `data.rows[*]` where `status: "failed"`)
+
+**Migration Guide:**
+- Use `data.rows[*]` instead of `would_create_by_row`
+- Access transformed data via `data.rows[*].transformed`
+- Access created records via `data.rows[*].transactions`
+- Compute summary from `data.rows` (or use the provided `summary` block)
+- Find transformation rules in `data.transformations.rules_used`
 
 4. **Test integration rules in sandbox** - Use `/api/core/test-rule/` endpoint
 
@@ -1211,6 +1728,80 @@ This allows users to see the **complete end-to-end result** before committing
 6. **Handle errors gracefully** - Check `errors` and `warnings` in responses
 
 7. **Use Celery for heavy operations** - Set `use_celery: true` in trigger_options
+
+---
+
+## Response Schema v2 Implementation Details
+
+### Files Modified
+
+The v2 response schema refactoring was implemented in:
+
+- **`multitenancy/etl_service.py`** - Core refactoring:
+  - `_build_v2_response_rows()` - Builds canonical per-row structure
+  - `_build_v2_response_summary()` - Computes summary from rows
+  - `_build_v2_response_transformations()` - Builds transformations block
+  - `_build_response()` - Updated to use v2 format
+  - `_preview_data()` - Stores `extra_fields_by_model` as instance variable
+  - `_import_data()` - Builds compatible structure for execute mode
+
+### Helper Methods
+
+**`_build_v2_response_rows(import_result, extra_fields_by_model)`**
+- Builds canonical per-row structure (`data.rows`)
+- Groups transactions with their journal entries
+- Maps Excel row metadata to created records
+- Extracts transformation metadata (rules, substitutions, extra fields)
+- Handles failed rows separately
+- Includes row-level warnings and errors
+
+**`_build_v2_response_summary(v2_rows)`**
+- Computes summary statistics from `data.rows`
+- Counts rows by status (ok/failed/skipped)
+- Counts models created (Transaction, JournalEntry)
+- Aggregates sheet-level statistics
+
+**`_build_v2_response_transformations(import_result)`**
+- Consolidates transformation-related fields
+- Includes `rules_used`, `import_errors`, `integration_rules_available`, `integration_rules_preview`
+
+### Response Builder Changes
+
+**`_build_response()`** now:
+- Adds `schema_version: "2.0"` to all responses
+- Removes `import_result` field entirely
+- Builds v2 `data` structure using helper methods
+- Computes summary using `_build_v2_response_summary()`
+- Works for both preview (`commit=False`) and execute (`commit=True`) modes
+
+### Execute Mode Compatibility
+
+For execute mode (`commit=True`):
+- `_import_data()` builds a compatible structure
+- Creates `would_create_by_row` from actual created records
+- Preserves Excel row metadata via `extra_fields_by_model` and `source_rows_by_id`
+- Response format is identical to preview (except `is_preview: false`)
+
+### Testing the v2 Schema
+
+**Preview endpoint** (`POST /api/core/etl/preview/`):
+- Verify `schema_version: "2.0"` present
+- Verify `data.rows` structure is correct
+- Verify `data.transformations` contains expected data
+- Verify `summary.rows` and `summary.models` match `data.rows` contents
+- Verify no `import_result` field
+
+**Execute endpoint** (`POST /api/core/etl/execute/`):
+- Verify same v2 format returned
+- Verify `is_preview: false`
+- Verify actual database records match response
+
+**Edge cases to test:**
+- Empty file
+- Failed rows
+- Skipped rows
+- Multiple transactions per row
+- JournalEntries without transactions
 
 ---
 

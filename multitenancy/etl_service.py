@@ -103,6 +103,7 @@ class ETLPipelineService:
         self.sheets_failed: List[str] = []
         self.transformed_data: Dict[str, List[dict]] = {}  # model_name -> rows
         self.transformation_rules: Dict[str, ImportTransformationRule] = {}  # model_name -> rule
+        self.extra_fields_by_model: Dict[str, List[dict]] = {}  # Store for v2 response building
         
     def execute(self) -> dict:
         """Main entry point - runs the full pipeline."""
@@ -781,13 +782,13 @@ class ETLPipelineService:
     def _import_data(self) -> dict:
         """Import transformed data using existing bulk import logic."""
         # Extract __extra_fields__ from rows before import (they're not model fields)
-        extra_fields_by_model: Dict[str, List[dict]] = {}
+        self.extra_fields_by_model = {}
         
         for model_name, rows in self.transformed_data.items():
-            extra_fields_by_model[model_name] = []
+            self.extra_fields_by_model[model_name] = []
             for row in rows:
                 extra_fields = row.pop('__extra_fields__', {})
-                extra_fields_by_model[model_name].append(extra_fields)
+                self.extra_fields_by_model[model_name].append(extra_fields)
         
         # Convert to sheets format expected by execute_import_job
         sheets = []
@@ -829,12 +830,119 @@ class ETLPipelineService:
             self.log.save()
         
         # Auto-create JournalEntries for Transactions (if enabled in request)
-        self._auto_create_journal_entries(normalized_result, extra_fields_by_model)
+        self._auto_create_journal_entries(normalized_result, self.extra_fields_by_model)
         
         # Trigger IntegrationRule events for created records (backward compatible)
-        self._trigger_events_for_created_records(normalized_result, extra_fields_by_model)
+        self._trigger_events_for_created_records(normalized_result, self.extra_fields_by_model)
         
-        return normalized_result
+        # For execute mode, we still return a structure compatible with v2 format
+        # Build a simplified import_result structure that can be processed by _build_v2_data
+        import_result_for_response = {
+            'transformed_data': {},
+            'would_create': {},
+            'would_fail': {},
+            'import_errors': [],
+            'integration_rules_preview': [],
+            'integration_rules_available': [],
+            'transformation_rules_used': [],
+            'total_rows': sum(len(rows) for rows in self.transformed_data.values()),
+            'would_create_by_row': [],
+            'substitutions_applied': []
+        }
+        
+        # Build transformed_data structure (for reference)
+        for model_name, rows in self.transformed_data.items():
+            # Preserve a copy with metadata for building rows
+            rows_copy = []
+            for idx, row in enumerate(rows):
+                row_copy = dict(row)
+                # Add back Excel metadata from extra_fields
+                if idx < len(self.extra_fields_by_model.get(model_name, [])):
+                    extra_fields = self.extra_fields_by_model[model_name][idx]
+                    row_copy['__excel_row_id'] = extra_fields.get('__excel_row_id')
+                    row_copy['__excel_row_number'] = extra_fields.get('__excel_row_number')
+                    row_copy['__excel_sheet_name'] = extra_fields.get('__excel_sheet_name')
+                rows_copy.append(row_copy)
+            
+            import_result_for_response['transformed_data'][model_name] = {
+                'row_count': len(rows_copy),
+                'rows': rows_copy,
+                'sample_columns': list(rows_copy[0].keys()) if rows_copy else []
+            }
+        
+        # Build would_create structure from normalized_result
+        for model_name, outputs in normalized_result.get('results', {}).items():
+            created_records = []
+            for idx, output in enumerate(outputs):
+                if output.get('status') == 'success' and output.get('action') == 'create':
+                    record_data = output.get('data', {})
+                    if record_data:
+                        # Add Excel row metadata if available
+                        if idx < len(self.extra_fields_by_model.get(model_name, [])):
+                            extra_fields = self.extra_fields_by_model[model_name][idx]
+                            record_data['__excel_row_id'] = extra_fields.get('__excel_row_id')
+                            record_data['__excel_row_number'] = extra_fields.get('__excel_row_number')
+                            record_data['__excel_sheet_name'] = extra_fields.get('__excel_sheet_name')
+                        created_records.append(record_data)
+            
+            if created_records:
+                import_result_for_response['would_create'][model_name] = {
+                    'count': len(created_records),
+                    'records': created_records
+                }
+        
+        # Build would_create_by_row by grouping records by Excel row
+        would_create_by_row_dict = {}
+        for model_name, model_data in import_result_for_response['would_create'].items():
+            records = model_data.get('records', [])
+            for record in records:
+                excel_row_id = record.get('__excel_row_id')
+                if not excel_row_id:
+                    continue
+                
+                if excel_row_id not in would_create_by_row_dict:
+                    excel_sheet = record.get('__excel_sheet_name', 'Unknown')
+                    excel_row_number = record.get('__excel_row_number')
+                    would_create_by_row_dict[excel_row_id] = {
+                        'excel_sheet': excel_sheet,
+                        'excel_row_number': excel_row_number,
+                        'excel_row_id': excel_row_id,
+                        'created_records': {}
+                    }
+                
+                if model_name not in would_create_by_row_dict[excel_row_id]['created_records']:
+                    would_create_by_row_dict[excel_row_id]['created_records'][model_name] = []
+                
+                # Remove internal metadata before adding to created_records
+                clean_record = {k: v for k, v in record.items() if not k.startswith('__')}
+                would_create_by_row_dict[excel_row_id]['created_records'][model_name].append(clean_record)
+        
+        # Convert to list and sort
+        import_result_for_response['would_create_by_row'] = sorted(
+            would_create_by_row_dict.values(),
+            key=lambda x: (x.get('excel_sheet', ''), x.get('excel_row_number', 999999))
+        )
+        
+        # Add transformation rules used
+        for model_name, rule in self.transformation_rules.items():
+            import_result_for_response['transformation_rules_used'].append({
+                'id': rule.id,
+                'name': rule.name,
+                'target_model': rule.target_model,
+                'source_sheet_name': rule.source_sheet_name,
+                'column_mappings': rule.column_mappings,
+                'column_concatenations': rule.column_concatenations,
+                'computed_columns': rule.computed_columns,
+                'default_values': rule.default_values,
+                'row_filter': rule.row_filter,
+                'extra_fields_for_trigger': rule.extra_fields_for_trigger,
+                'trigger_options': rule.trigger_options,
+                'skip_rows': rule.skip_rows,
+                'header_row': rule.header_row,
+                'execution_order': rule.execution_order,
+            })
+        
+        return import_result_for_response
     
     def _import_transactions_with_journal_entries(self, transaction_sheets: List[dict], extra_fields_list: List[dict]) -> dict:
         """
@@ -2153,8 +2261,8 @@ class ETLPipelineService:
                 preview['integration_rules_available'].extend(list(rules))
         
         # Run full import + triggers in a transaction that will be rolled back
-        # Initialize extra_fields_by_model outside try block so it's accessible later
-        extra_fields_by_model: Dict[str, List[dict]] = {}
+        # Initialize extra_fields_by_model and store as instance variable
+        self.extra_fields_by_model = {}
         
         try:
             with db_transaction.atomic():
@@ -2225,6 +2333,9 @@ class ETLPipelineService:
                                     'fields': list(invalid_fields.keys()),
                                     'hint': "Use extra_fields_for_trigger in your transformation rule to pass these to IntegrationRules"
                                 })
+                    
+                    # Store extra_fields_by_model as instance variable for v2 response building
+                    self.extra_fields_by_model = extra_fields_by_model
                     
                     # Coerce dates from ISO format to date objects
                     from datetime import datetime, date as date_type
@@ -2624,8 +2735,9 @@ class ETLPipelineService:
             self.log.total_rows_transformed = preview['total_rows']
             self.log.save()
         
-        # Build structured output for raw JSON
-        preview['structured_by_row'] = self._build_structured_output(preview, extra_fields_by_model)
+        # Build structured output for raw JSON (legacy format, kept for backward compatibility)
+        # Note: This is used by _build_v2_response_rows to extract row-level warnings/errors
+        preview['structured_by_row'] = self._build_structured_output(preview, self.extra_fields_by_model)
         
         return preview
     
@@ -3115,8 +3227,320 @@ class ETLPipelineService:
         self.warnings.append(warning)
         logger.warning(f"ETL Warning: {message}")
     
+    def _build_v2_response_rows(self, import_result: dict, extra_fields_by_model: Dict[str, List[dict]]) -> List[dict]:
+        """
+        Build the canonical data.rows structure for v2 response format.
+        
+        Each row groups all relevant information: Excel metadata, transformed data,
+        transformation metadata, created records, warnings, and errors.
+        """
+        rows = []
+        
+        # Get existing structures
+        would_create_by_row = import_result.get('would_create_by_row', [])
+        transformed_data = import_result.get('transformed_data', {})
+        would_fail = import_result.get('would_fail', {})
+        
+        # Build maps for efficient lookup
+        # Map: excel_row_id -> transformed data
+        transformed_by_row = {}
+        for model_name, model_data in transformed_data.items():
+            model_rows = model_data.get('rows', [])
+            for row in model_rows:
+                excel_row_id = row.get('__excel_row_id')
+                if excel_row_id:
+                    if excel_row_id not in transformed_by_row:
+                        transformed_by_row[excel_row_id] = {}
+                    if model_name not in transformed_by_row[excel_row_id]:
+                        transformed_by_row[excel_row_id][model_name] = []
+                    # Remove internal metadata from transformed row
+                    clean_row = {k: v for k, v in row.items() if not k.startswith('__')}
+                    transformed_by_row[excel_row_id][model_name].append(clean_row)
+        
+        # Map: excel_row_id -> source row data (if available)
+        source_rows_by_id = {}
+        # Try to get source rows from transformed data
+        for model_name, model_data in transformed_data.items():
+            model_rows = model_data.get('rows', [])
+            for row in model_rows:
+                excel_row_id = row.get('__excel_row_id')
+                if excel_row_id and '__source_row__' in row:
+                    source_rows_by_id[excel_row_id] = row['__source_row__']
+        
+        # Map: excel_row_id -> rule applied
+        rule_by_row = {}
+        for model_name, rule in self.transformation_rules.items():
+            # We need to map rows to rules - for now, use model_name match
+            for excel_row_id in transformed_by_row.keys():
+                if model_name in transformed_by_row.get(excel_row_id, {}):
+                    rule_by_row[excel_row_id] = {
+                        'id': rule.id,
+                        'name': rule.name
+                    }
+        
+        # Map: excel_row_id -> substitutions applied
+        substitutions_by_row = {}
+        for sub in import_result.get('substitutions_applied', []):
+            excel_row_id = f"{sub.get('sheet', 'Unknown')}:{sub.get('row_number', 'N/A')}"
+            if excel_row_id not in substitutions_by_row:
+                substitutions_by_row[excel_row_id] = []
+            
+            observations = sub.get('observations', [])
+            for obs in observations:
+                if isinstance(obs, str):
+                    import re
+                    match = re.match(r"campo '([^']+)' alterado de '([^']*)' para '([^']*)' \(regra id=(\d+)\)", obs)
+                    if match:
+                        substitutions_by_row[excel_row_id].append({
+                            'field': match.group(1),
+                            'from': match.group(2),
+                            'to': match.group(3),
+                            'rule_id': int(match.group(4))
+                        })
+                elif isinstance(obs, dict):
+                    substitutions_by_row[excel_row_id].append(obs)
+        
+        # Map: excel_row_id -> extra fields
+        extra_fields_by_row = {}
+        for model_name, extra_fields_list in extra_fields_by_model.items():
+            for idx, extra_fields in enumerate(extra_fields_list):
+                excel_row_id = extra_fields.get('__excel_row_id')
+                if excel_row_id:
+                    # Get extra fields (excluding internal metadata)
+                    clean_extra = {k: v for k, v in extra_fields.items() if not k.startswith('__')}
+                    if clean_extra:
+                        if excel_row_id not in extra_fields_by_row:
+                            extra_fields_by_row[excel_row_id] = []
+                        extra_fields_by_row[excel_row_id].extend(list(clean_extra.keys()))
+        
+        # Map: excel_row_id -> errors and warnings
+        # Extract from structured_by_row if available (from preview), otherwise build from import_errors
+        errors_by_row = {}
+        warnings_by_row = {}
+        
+        structured_by_row = import_result.get('structured_by_row', [])
+        if structured_by_row:
+            for structured_row in structured_by_row:
+                excel_row_id = structured_row.get('excel_row', {}).get('row_id')
+                if excel_row_id:
+                    errors_by_row[excel_row_id] = structured_row.get('errors', [])
+                    warnings_by_row[excel_row_id] = structured_row.get('warnings', [])
+        else:
+            # Fallback: try to extract from import_errors and warnings
+            # This is a simplified extraction - full mapping would require transaction_id -> row mapping
+            pass  # For now, leave empty - can be enhanced later if needed
+        
+        # Process successful rows (with created records)
+        for row_group in would_create_by_row:
+            excel_row_id = row_group.get('excel_row_id')
+            excel_sheet = row_group.get('excel_sheet', 'Unknown')
+            excel_row_number = row_group.get('excel_row_number')
+            created_records = row_group.get('created_records', {})
+            
+            # Build transactions list
+            transactions_list = []
+            transactions = created_records.get('Transaction', [])
+            
+            # Map transaction_id -> journal_entries
+            journal_entries_by_tx = {}
+            journal_entries = created_records.get('JournalEntry', [])
+            for je in journal_entries:
+                tx_id = je.get('transaction_id')
+                if tx_id:
+                    if tx_id not in journal_entries_by_tx:
+                        journal_entries_by_tx[tx_id] = []
+                    journal_entries_by_tx[tx_id].append(je)
+            
+            for transaction in transactions:
+                tx_id = transaction.get('id')
+                transactions_list.append({
+                    'transaction': transaction,
+                    'journal_entries': journal_entries_by_tx.get(tx_id, []),
+                    'journal_entry_count': len(journal_entries_by_tx.get(tx_id, []))
+                })
+            
+            # Build other_records (non-Transaction records)
+            other_records = {k: v for k, v in created_records.items() if k not in ['Transaction', 'JournalEntry']}
+            # Add JournalEntries not linked to transactions
+            unlinked_jes = [je for je in journal_entries if not je.get('transaction_id')]
+            if unlinked_jes:
+                other_records.setdefault('JournalEntry', []).extend(unlinked_jes)
+            
+            # Determine status
+            status = 'ok' if transactions_list or other_records else 'failed'
+            
+            # Get rule info
+            rule_info = rule_by_row.get(excel_row_id, {})
+            
+            # Build row result
+            row_result = {
+                'excel_row': {
+                    'sheet_name': excel_sheet,
+                    'row_number': excel_row_number,
+                    'row_id': excel_row_id
+                },
+                'status': status,
+                'source_row': source_rows_by_id.get(excel_row_id),
+                'transformed': transformed_by_row.get(excel_row_id, {}),
+                'transformation': {
+                    'rule_id': rule_info.get('id'),
+                    'rule_name': rule_info.get('name'),
+                    'substitutions_applied': substitutions_by_row.get(excel_row_id, []),
+                    'extra_fields': list(set(extra_fields_by_row.get(excel_row_id, [])))
+                },
+                'transactions': transactions_list,
+                'other_records': other_records,
+                'warnings': warnings_by_row.get(excel_row_id, []),
+                'errors': errors_by_row.get(excel_row_id, [])
+            }
+            
+            rows.append(row_result)
+        
+        # Process failed rows
+        for model_name, failed_data in would_fail.items():
+            failed_rows = failed_data.get('rows', [])
+            for failed_row in failed_rows:
+                excel_row_id = failed_row.get('excel_row_id')
+                if not excel_row_id:
+                    excel_sheet = failed_row.get('excel_sheet', 'Unknown')
+                    excel_row_number = failed_row.get('row_number')
+                    excel_row_id = f"{excel_sheet}:{excel_row_number}" if excel_row_number else None
+                
+                # Skip if already processed
+                if excel_row_id and any(r['excel_row']['row_id'] == excel_row_id for r in rows):
+                    continue
+                
+                # Build error
+                error = {
+                    'code': 'VALIDATION_ERROR',
+                    'message': failed_row.get('reason', 'Validation failed'),
+                    'field': failed_row.get('field')
+                }
+                
+                row_result = {
+                    'excel_row': {
+                        'sheet_name': failed_row.get('excel_sheet', 'Unknown'),
+                        'row_number': failed_row.get('row_number'),
+                        'row_id': excel_row_id or f"{failed_row.get('excel_sheet', 'Unknown')}:{failed_row.get('row_number', 'N/A')}"
+                    },
+                    'status': 'failed',
+                    'source_row': failed_row.get('data'),
+                    'transformed': transformed_by_row.get(excel_row_id, {}),
+                    'transformation': {
+                        'rule_id': None,
+                        'rule_name': None,
+                        'substitutions_applied': [],
+                        'extra_fields': []
+                    },
+                    'transactions': [],
+                    'other_records': {},
+                    'warnings': [],
+                    'errors': [error]
+                }
+                
+                rows.append(row_result)
+        
+        # Sort rows by sheet name and row number
+        def sort_key(row):
+            excel_row = row['excel_row']
+            return (excel_row.get('sheet_name', ''), excel_row.get('row_number', 999999))
+        
+        rows.sort(key=sort_key)
+        
+        return rows
+    
+    def _build_v2_summary(self, rows: List[dict]) -> dict:
+        """
+        Build the v2 summary from rows data.
+        
+        Computes:
+        - total_rows_transformed from rows count
+        - rows.ok/failed/skipped counts
+        - models.created/failed counts
+        """
+        summary = {
+            'sheets_found': len(self.sheets_found),
+            'sheets_processed': len(self.sheets_processed),
+            'sheets_skipped': len(self.sheets_skipped),
+            'sheets_failed': len(self.sheets_failed),
+            'total_rows_transformed': len(rows),
+            'rows': {
+                'ok': 0,
+                'failed': 0,
+                'skipped': 0
+            },
+            'models': {}
+        }
+        
+        # Count rows by status
+        for row in rows:
+            status = row.get('status', 'unknown')
+            if status == 'ok':
+                summary['rows']['ok'] += 1
+            elif status == 'failed':
+                summary['rows']['failed'] += 1
+            elif status in ['skipped', 'ignored']:
+                summary['rows']['skipped'] += 1
+        
+        # Count models
+        transaction_count = 0
+        journal_entry_count = 0
+        
+        for row in rows:
+            transactions = row.get('transactions', [])
+            transaction_count += len(transactions)
+            
+            for tx_bundle in transactions:
+                journal_entry_count += len(tx_bundle.get('journal_entries', []))
+            
+            # Count other JournalEntries
+            other_jes = row.get('other_records', {}).get('JournalEntry', [])
+            journal_entry_count += len(other_jes)
+        
+        summary['models'] = {
+            'Transaction': {
+                'created': transaction_count,
+                'failed': 0  # TODO: track failures per model if needed
+            },
+            'JournalEntry': {
+                'created': journal_entry_count,
+                'failed': 0
+            }
+        }
+        
+        return summary
+    
+    def _build_v2_data(self, import_result: dict, extra_fields_by_model: Dict[str, List[dict]]) -> dict:
+        """
+        Build the v2 data structure with rows and transformations.
+        """
+        # Build rows
+        rows = self._build_v2_response_rows(import_result, extra_fields_by_model)
+        
+        # Build transformations block
+        transformations = {
+            'rules_used': import_result.get('transformation_rules_used', []),
+            'import_errors': import_result.get('import_errors', []),
+            'integration_rules_available': import_result.get('integration_rules_available', []),
+            'integration_rules_preview': import_result.get('integration_rules_preview', [])
+        }
+        
+        return {
+            'rows': rows,
+            'transformations': transformations
+        }
+    
     def _build_response(self, start_time: float, success: bool, import_result: dict = None) -> dict:
-        """Build the final response."""
+        """
+        Build the final response in v2 format.
+        
+        v2 Format:
+        - schema_version: "2.0"
+        - Single canonical data block (no import_result duplication)
+        - data.rows: per-row canonical structure
+        - data.transformations: global transformation metadata
+        - summary computed from data.rows
+        """
         duration = time.monotonic() - start_time
         
         if self.log:
@@ -3124,6 +3548,7 @@ class ETLPipelineService:
             self.log.total_rows_input = sum(len(rows) for rows in self.transformed_data.values())
             self.log.save()
         
+        # Build base response
         response = {
             'success': success,
             'log_id': self.log.id if self.log else None,
@@ -3131,14 +3556,7 @@ class ETLPipelineService:
             'file_hash': self.file_hash,
             'is_preview': not self.commit,
             'duration_seconds': round(duration, 2),
-            
-            'summary': {
-                'sheets_found': len(self.sheets_found),
-                'sheets_processed': len(self.sheets_processed),
-                'sheets_skipped': len(self.sheets_skipped),
-                'sheets_failed': len(self.sheets_failed),
-                'total_rows_transformed': sum(len(rows) for rows in self.transformed_data.values()),
-            },
+            'schema_version': '2.0',
             
             'sheets': {
                 'found': self.sheets_found,
@@ -3151,13 +3569,39 @@ class ETLPipelineService:
             'warnings': self.warnings,
         }
         
+        # Build v2 data structure if we have import_result
         if import_result:
-            response['import_result'] = import_result
-        
-        # Include preview data if not committing
-        # Use the already-computed preview result instead of calling _preview_data() again
-        if not self.commit and import_result:
-            response['data'] = import_result
+            # Build data.rows and data.transformations
+            data = self._build_v2_data(import_result, self.extra_fields_by_model)
+            response['data'] = data
+            
+            # Build summary from rows
+            summary = self._build_v2_summary(data['rows'])
+            response['summary'] = summary
+        else:
+            # No import result - build minimal summary
+            response['summary'] = {
+                'sheets_found': len(self.sheets_found),
+                'sheets_processed': len(self.sheets_processed),
+                'sheets_skipped': len(self.sheets_skipped),
+                'sheets_failed': len(self.sheets_failed),
+                'total_rows_transformed': 0,
+                'rows': {
+                    'ok': 0,
+                    'failed': 0,
+                    'skipped': 0
+                },
+                'models': {}
+            }
+            response['data'] = {
+                'rows': [],
+                'transformations': {
+                    'rules_used': [],
+                    'import_errors': [],
+                    'integration_rules_available': [],
+                    'integration_rules_preview': []
+                }
+            }
         
         return response
 
