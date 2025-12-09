@@ -724,7 +724,7 @@ class BankTransactionSuggestionService:
                 'date': bank_tx.date.isoformat(),
                 'entity_id': bank_tx.bank_account.entity_id,
                 'description': bank_tx.description,
-                'amount': str(abs(bank_tx.amount)),
+                'amount': str(bank_tx.amount),  # Preserve sign from bank transaction
                 'currency_id': bank_tx.currency.id,
                 'state': 'pending',
             },

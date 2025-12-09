@@ -1828,7 +1828,7 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                             date=tx_date,
                             entity_id=tx_data.get('entity_id'),
                             description=tx_data.get('description', bank_tx.description),
-                            amount=Decimal(str(tx_data.get('amount', abs(bank_tx.amount)))),
+                            amount=Decimal(str(tx_data.get('amount', bank_tx.amount))),  # Preserve sign from bank transaction
                             currency_id=tx_data.get('currency_id', bank_tx.currency_id),
                             state=tx_data.get('state', 'pending'),
                         )

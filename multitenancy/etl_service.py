@@ -780,63 +780,77 @@ class ETLPipelineService:
                         )
     
     def _import_data(self) -> dict:
-        """Import transformed data using existing bulk import logic."""
-        # Extract __extra_fields__ from rows before import (they're not model fields)
-        self.extra_fields_by_model = {}
+        """
+        Import transformed data using existing bulk import logic.
         
-        for model_name, rows in self.transformed_data.items():
-            self.extra_fields_by_model[model_name] = []
-            for row in rows:
-                extra_fields = row.pop('__extra_fields__', {})
-                self.extra_fields_by_model[model_name].append(extra_fields)
-        
-        # Convert to sheets format expected by execute_import_job
-        sheets = []
-        for model_name, rows in self.transformed_data.items():
-            sheets.append({
-                'model': model_name,
-                'rows': rows
-            })
-        
-        if not sheets:
-            return {'message': 'No data to import'}
-        
-        # Use existing import logic
-        result = execute_import_job(
-            company_id=self.company_id,
-            sheets=sheets,
-            commit=True,
-            lookup_cache=self.lookup_cache
-        )
-        
-        # Normalize result format: execute_import_job returns {'imports': [...]}
-        # Convert to {'results': {model_name: [outputs]}} format
-        normalized_result = {'results': {}}
-        for import_item in result.get('imports', []):
-            model_name = import_item.get('model')
-            outputs = import_item.get('result', [])
-            normalized_result['results'][model_name] = outputs
-        
-        # Update log with import stats
-        records_created = {}
-        if self.log:
-            for model_name, outputs in normalized_result.get('results', {}).items():
-                created_count = sum(1 for o in outputs if o.get('status') == 'success' and o.get('action') == 'create')
-                if created_count > 0:
-                    records_created[model_name] = created_count
+        IMPORTANT: This entire method is wrapped in a single atomic transaction
+        to ensure all-or-nothing behavior. If any step fails (import, auto-create
+        journal entries, or integration rule triggers), the entire operation is
+        rolled back, preventing partial data in the database.
+        """
+        # Wrap everything in a single atomic transaction
+        with transaction.atomic():
+            # Extract __extra_fields__ from rows before import (they're not model fields)
+            self.extra_fields_by_model = {}
             
-            self.log.records_created = records_created
-            self.log.total_rows_imported = sum(records_created.values())
-            self.log.save()
+            for model_name, rows in self.transformed_data.items():
+                self.extra_fields_by_model[model_name] = []
+                for row in rows:
+                    extra_fields = row.pop('__extra_fields__', {})
+                    self.extra_fields_by_model[model_name].append(extra_fields)
+            
+            # Convert to sheets format expected by execute_import_job
+            sheets = []
+            for model_name, rows in self.transformed_data.items():
+                sheets.append({
+                    'model': model_name,
+                    'rows': rows
+                })
+            
+            if not sheets:
+                return {'message': 'No data to import'}
+            
+            # Use existing import logic
+            # Note: execute_import_job has its own transaction.atomic(), which becomes
+            # a savepoint within this outer transaction, allowing proper rollback
+            result = execute_import_job(
+                company_id=self.company_id,
+                sheets=sheets,
+                commit=True,  # This will commit the inner transaction, but outer transaction wraps everything
+                lookup_cache=self.lookup_cache
+            )
+            
+            # Normalize result format: execute_import_job returns {'imports': [...]}
+            # Convert to {'results': {model_name: [outputs]}} format
+            normalized_result = {'results': {}}
+            for import_item in result.get('imports', []):
+                model_name = import_item.get('model')
+                outputs = import_item.get('result', [])
+                normalized_result['results'][model_name] = outputs
+            
+            # Update log with import stats (log update happens inside transaction)
+            records_created = {}
+            if self.log:
+                for model_name, outputs in normalized_result.get('results', {}).items():
+                    created_count = sum(1 for o in outputs if o.get('status') == 'success' and o.get('action') == 'create')
+                    if created_count > 0:
+                        records_created[model_name] = created_count
+                
+                self.log.records_created = records_created
+                self.log.total_rows_imported = sum(records_created.values())
+                self.log.save()
+            
+            # Auto-create JournalEntries for Transactions (if enabled in request)
+            # This runs inside the same transaction - if it fails, everything rolls back
+            self._auto_create_journal_entries(normalized_result, self.extra_fields_by_model)
+            
+            # Trigger IntegrationRule events for created records (backward compatible)
+            # This also runs inside the same transaction - if any trigger fails, everything rolls back
+            self._trigger_events_for_created_records(normalized_result, self.extra_fields_by_model)
         
-        # Auto-create JournalEntries for Transactions (if enabled in request)
-        self._auto_create_journal_entries(normalized_result, self.extra_fields_by_model)
-        
-        # Trigger IntegrationRule events for created records (backward compatible)
-        self._trigger_events_for_created_records(normalized_result, self.extra_fields_by_model)
-        
+        # Transaction commits here (or rolls back if any exception occurred)
         # For execute mode, we still return a structure compatible with v2 format
-        # Build a simplified import_result structure that can be processed by _build_v2_data
+        # Build response structure (this is just data transformation, no DB operations)
         import_result_for_response = {
             'transformed_data': {},
             'would_create': {},
