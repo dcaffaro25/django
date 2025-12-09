@@ -605,7 +605,8 @@ def execute_import_job(
     company_id: int, 
     sheets: List[Dict[str, Any]], 
     commit: bool,
-    import_metadata: Dict[str, Any] = None
+    import_metadata: Dict[str, Any] = None,
+    lookup_cache: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Importer with token->id mapping for FK resolution and a single atomic transaction.
@@ -621,6 +622,7 @@ def execute_import_job(
         sheets: List of sheet dictionaries with model and rows
         commit: Whether to commit (True) or preview (False)
         import_metadata: Optional metadata dict for notes (source, filename, function, etc.)
+        lookup_cache: Optional LookupCache instance for efficient FK resolution (ETL context)
     """
     run_id = uuid.uuid4().hex[:8]
     logger.info("import_start run_id=%s commit=%s sheet_count=%d", run_id, bool(commit), len(sheets))

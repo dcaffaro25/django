@@ -264,10 +264,22 @@ def parse_ofx_text(ofx_text):
         "bank_code": "0237",
         "account_id": "1084/1448",
         "transactions": [
-          { "transaction_type": "CREDIT", "date": <date>, "amount": 20.0, "memo": "..."},
+          { 
+            "transaction_type": "CREDIT", 
+            "date": <date>, 
+            "amount": 20.0, 
+            "memo": "...",  # Combined NAME | MEMO for backward compatibility
+            "description": "NAME | MEMO"  # Combined NAME and MEMO fields
+          },
           ...
         ]
       }
+    
+    The description field combines <NAME> (payee/description) and <MEMO> fields:
+    - If both exist: "NAME | MEMO"
+    - If only NAME exists: "NAME"
+    - If only MEMO exists: "MEMO"
+    - If neither exists: ""
     """
     if not ofx_text:
         raise ValueError("Empty OFX text provided.")
@@ -295,12 +307,34 @@ def parse_ofx_text(ofx_text):
         posted_match = re.search(r"<DTPOSTED>(\d+)", block)
         # Allow both dot and comma as decimal separators:
         amount_match = re.search(r"<TRNAMT>([-\d\.,]+)", block)
-        memo_match = re.search(r"<MEMO>(.*)", block)
+        # Extract both NAME (description/payee) and MEMO fields
+        # OFX tags can be self-closing or have closing tags, handle both cases
+        # Pattern: <NAME>content</NAME> or <NAME>content<next_tag or end
+        name_match = re.search(r"<NAME>(.*?)(?:</NAME>|(?=<[A-Z/])|$)", block, re.DOTALL)
+        memo_match = re.search(r"<MEMO>(.*?)(?:</MEMO>|(?=<[A-Z/])|$)", block, re.DOTALL)
         
         trn_type = trn_type_match.group(1).strip() if trn_type_match else None
         dtposted_str = posted_match.group(1).strip() if posted_match else None
         amount_str = amount_match.group(1).strip() if amount_match else None
+        
+        # Extract NAME and MEMO, handling multiline content
+        name_val = name_match.group(1).strip() if name_match else ""
         memo_val = memo_match.group(1).strip() if memo_match else ""
+        
+        # Combine NAME and MEMO into description field
+        # If both exist, combine them with a separator
+        # If only one exists, use that
+        description_parts = []
+        if name_val:
+            description_parts.append(name_val)
+        if memo_val:
+            description_parts.append(memo_val)
+        
+        # Join with " | " if both exist, otherwise use the single value
+        description = " | ".join(description_parts) if len(description_parts) > 1 else (description_parts[0] if description_parts else "")
+        
+        # Keep memo field for backward compatibility
+        memo_val = description  # Use combined description as memo for backward compatibility
         
         # Debug prints (remove or comment out in production)
         print('block:', block)
@@ -327,7 +361,8 @@ def parse_ofx_text(ofx_text):
             "transaction_type": trn_type,
             "date": date_val.isoformat() if date_val else None,  # "YYYY-MM-DD"
             "amount": amt_val,
-            "memo": memo_val,
+            "memo": memo_val,  # This will be the combined description
+            "description": description,  # Explicit description field with combined NAME | MEMO
         })
 
     return {

@@ -1424,7 +1424,8 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     tx_date = None
                 tx_amount = tx.get("amount", 0.0)
                 tx_type = tx.get("transaction_type", "")
-                tx_desc = tx.get("memo", "")
+                # Prefer description field (which combines NAME | MEMO), fallback to memo for backward compatibility
+                tx_desc = tx.get("description") or tx.get("memo", "")
                 # build tx_hash using same fields as in create
                 tx_hash = generate_ofx_transaction_hash(
                     date_str=tx_date_str or "",
@@ -1895,10 +1896,30 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     update_journal_entries_and_transaction_flags(journal_entries)
                     
                     # Create reconciliation and match
+                    # Add notes metadata
+                    from multitenancy.utils import build_notes_metadata
+                    from crum import get_current_user
+                    
+                    current_user = get_current_user()
+                    user_name = current_user.username if current_user and current_user.is_authenticated else None
+                    user_id = current_user.id if current_user and current_user.is_authenticated else None
+                    
+                    reconciliation_notes = build_notes_metadata(
+                        source='Bank Transaction Suggestion',
+                        function='BankTransactionViewSet.create_suggestions',
+                        user=user_name,
+                        user_id=user_id,
+                        bank_transaction_id=bank_tx.id,
+                        transaction_id=transaction.id,
+                        suggestion_type=suggestion_type,
+                        reconciliation_type='manual_from_suggestion'
+                    )
+                    
                     reconciliation = Reconciliation.objects.create(
                         company_id=company_id,
                         status='matched',
                         reference=f"Auto-matched from suggestion for bank_tx_{bank_tx.id}",
+                        notes=reconciliation_notes,
                     )
                     reconciliation.bank_transactions.add(bank_tx)
                     reconciliation.journal_entries.add(*journal_entries)
@@ -2243,12 +2264,33 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     
                 bank_ids_str = ", ".join(str(x) for x in bank_ids_used)
                 journal_ids_str = ", ".join(str(x) for x in journal_ids_used)
-                combined_notes = (
-                    f"{notes}\n"
-                    f"Bank IDs: {bank_ids_str}\n"
-                    f"Journal IDs: {journal_ids_str}\n"
-                    f"Difference: {final_diff}"
+                
+                # Build notes metadata
+                from multitenancy.utils import build_notes_metadata
+                from crum import get_current_user
+                
+                current_user = get_current_user()
+                user_name = current_user.username if current_user and current_user.is_authenticated else None
+                user_id = current_user.id if current_user and current_user.is_authenticated else None
+                
+                reconciliation_notes_metadata = build_notes_metadata(
+                    source='Reconciliation',
+                    function='BankTransactionViewSet.finalize_reconciliation_matches',
+                    user=user_name,
+                    user_id=user_id,
+                    reconciliation_type='manual',
+                    bank_ids=bank_ids_str,
+                    journal_ids=journal_ids_str,
+                    difference=str(final_diff),
+                    status=rec_status,
                 )
+                
+                # Combine with existing notes if any
+                combined_notes = reconciliation_notes_metadata
+                if notes:
+                    combined_notes = f"{reconciliation_notes_metadata}\n\n--- User Notes ---\n{notes}\nBank IDs: {bank_ids_str}\nJournal IDs: {journal_ids_str}\nDifference: {final_diff}"
+                else:
+                    combined_notes = f"{reconciliation_notes_metadata}\nBank IDs: {bank_ids_str}\nJournal IDs: {journal_ids_str}\nDifference: {final_diff}"
     
                 rec = Reconciliation.objects.create(
                     company_id=company_id,
@@ -2695,12 +2737,33 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     
                     bank_ids_str = ", ".join(str(x) for x in bank_ids_used)
                     journal_ids_str = ", ".join(str(x) for x in journal_ids_used)
-                    combined_notes = (
-                        f"{notes}\n"
-                        f"Bank IDs: {bank_ids_str}\n"
-                        f"Journal IDs: {journal_ids_str}\n"
-                        f"Difference: {final_diff}"
+                    
+                    # Build notes metadata
+                    from multitenancy.utils import build_notes_metadata
+                    from crum import get_current_user
+                    
+                    current_user = get_current_user()
+                    user_name = current_user.username if current_user and current_user.is_authenticated else None
+                    user_id = current_user.id if current_user and current_user.is_authenticated else None
+                    
+                    reconciliation_notes_metadata = build_notes_metadata(
+                        source='Reconciliation',
+                        function='BankTransactionViewSet.finalize_reconciliation_matches',
+                        user=user_name,
+                        user_id=user_id,
+                        reconciliation_type='manual',
+                        bank_ids=bank_ids_str,
+                        journal_ids=journal_ids_str,
+                        difference=str(final_diff),
+                        status=rec_status,
                     )
+                    
+                    # Combine with existing notes if any
+                    combined_notes = reconciliation_notes_metadata
+                    if notes:
+                        combined_notes = f"{reconciliation_notes_metadata}\n\n--- User Notes ---\n{notes}\nBank IDs: {bank_ids_str}\nJournal IDs: {journal_ids_str}\nDifference: {final_diff}"
+                    else:
+                        combined_notes = f"{reconciliation_notes_metadata}\nBank IDs: {bank_ids_str}\nJournal IDs: {journal_ids_str}\nDifference: {final_diff}"
     
                     rec = Reconciliation.objects.create(
                         company_id=company_id,
