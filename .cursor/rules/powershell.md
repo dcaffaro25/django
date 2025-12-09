@@ -1,6 +1,4 @@
-# Cursor Rules for Django Project
-
-## Git Commands - PowerShell Syntax
+# Git Commands - PowerShell Syntax
 
 **CRITICAL**: Always push changes in a single command using PowerShell syntax.
 
