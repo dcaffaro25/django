@@ -164,17 +164,17 @@ class PlainAdmin(FastDeleteMixin, AuditColsMixin, admin.ModelAdmin):
 
 @admin.register(Company)
 class CompanyAdmin(PlainAdmin):
-    list_display = ("id", "name", "subdomain", "created_at")
-    search_fields = ("name", "subdomain", "id")
-    list_filter = ("created_at",)
+    list_display = ("id", "name", "subdomain", "notes", "created_at")
+    search_fields = ("name", "subdomain", "id", "notes")
+    list_filter = ("created_at", "notes")
     # if you also use autocomplete to Company somewhere else:
     # date_hierarchy = "created_at"
 
 @admin.register(Entity)
 class EntityAdmin(CompanyScopedAdmin):
-    list_display = ("id", "name", "company")
-    search_fields = ("name", "id", "company__name")
-    list_filter = ("company",)
+    list_display = ("id", "name", "company", "notes")
+    search_fields = ("name", "id", "company__name", "notes")
+    list_filter = ("company", "notes")
     autocomplete_fields = ("company",)
 
 # Ensure the User admin has search_fields (for ReconciliationConfig.user autocomplete)

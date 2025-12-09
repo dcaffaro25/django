@@ -1833,6 +1833,25 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                             state=tx_data.get('state', 'pending'),
                         )
                         
+                        # Add notes metadata
+                        if hasattr(transaction, 'notes'):
+                            from multitenancy.utils import build_notes_metadata
+                            from crum import get_current_user
+                            
+                            current_user = get_current_user()
+                            user_name = current_user.username if current_user and current_user.is_authenticated else None
+                            user_id = current_user.id if current_user and current_user.is_authenticated else None
+                            
+                            transaction.notes = build_notes_metadata(
+                                source='Bank Transaction Suggestion',
+                                function='BankTransactionViewSet.create_suggestions',
+                                user=user_name,
+                                user_id=user_id,
+                                bank_transaction_id=bank_tx.id,
+                                suggestion_type=suggestion_type
+                            )
+                            transaction.save(update_fields=['notes'])
+                        
                         # Create journal entries
                         journal_entries = []
                         je_data_list = suggestion_data.get('journal_entries', [])
@@ -1849,6 +1868,27 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                                 date=transaction.date,
                                 state='pending',
                             )
+                            
+                            # Add notes metadata
+                            if hasattr(journal_entry, 'notes'):
+                                from multitenancy.utils import build_notes_metadata
+                                from crum import get_current_user
+                                
+                                current_user = get_current_user()
+                                user_name = current_user.username if current_user and current_user.is_authenticated else None
+                                user_id = current_user.id if current_user and current_user.is_authenticated else None
+                                
+                                journal_entry.notes = build_notes_metadata(
+                                    source='Bank Transaction Suggestion',
+                                    function='BankTransactionViewSet.create_suggestions',
+                                    user=user_name,
+                                    user_id=user_id,
+                                    bank_transaction_id=bank_tx.id,
+                                    transaction_id=transaction.id,
+                                    suggestion_type=suggestion_type
+                                )
+                                journal_entry.save(update_fields=['notes'])
+                            
                             journal_entries.append(journal_entry)
                     
                     # Update transaction and journal entry flags

@@ -38,17 +38,17 @@ class CurrencyAdmin(PlainAdmin):
 
 @admin.register(Bank)
 class BankAdmin(PlainAdmin):
-    list_display = ("id", "bank_code", "name", "country", "is_active")
-    list_filter = ("is_active", "country")
-    search_fields = ("bank_code", "name", "country")
+    list_display = ("id", "bank_code", "name", "country", "is_active", "notes")
+    list_filter = ("is_active", "country", "notes")
+    search_fields = ("bank_code", "name", "country", "notes")
 
 @admin.register(BankAccount)
 class BankAccountAdmin(CompanyScopedAdmin):
-    list_display = ("id", "name", "bank", "account_number", "entity", "currency", "branch_id", "company")
-    list_filter = ("bank", "currency", "entity", "company")
+    list_display = ("id", "name", "bank", "account_number", "entity", "currency", "branch_id", "company", "notes")
+    list_filter = ("bank", "currency", "entity", "company", "notes")
     autocomplete_fields = ("company", "entity", "bank", "currency")
     search_fields = (
-        "name", "account_number", "branch_id",
+        "name", "account_number", "branch_id", "notes",
         "bank__name", "bank__bank_code",
         "entity__name",
         "currency__code",
@@ -56,17 +56,17 @@ class BankAccountAdmin(CompanyScopedAdmin):
 
 @admin.register(Account)
 class AccountAdmin(CompanyScopedAdmin):
-    list_display = ("id", "account_code", "name", "parent", "currency", "bank_account", "is_active", "company")
-    list_filter = ("is_active", "currency", "company")
+    list_display = ("id", "account_code", "name", "parent", "currency", "bank_account", "is_active", "company", "notes")
+    list_filter = ("is_active", "currency", "company", "notes")
     autocomplete_fields = ("company", "parent", "currency", "bank_account")
-    search_fields = ("account_code", "name", "description", "key_words", "examples", "parent__name")
+    search_fields = ("account_code", "name", "description", "key_words", "examples", "parent__name", "notes")
 
 @admin.register(CostCenter)
 class CostCenterAdmin(CompanyScopedAdmin):
-    list_display = ("id", "name", "center_type", "company", "balance_date", "balance")
-    list_filter = ("center_type", "company")
+    list_display = ("id", "name", "center_type", "company", "balance_date", "balance", "notes")
+    list_filter = ("center_type", "company", "notes")
     autocomplete_fields = ("company",)
-    search_fields = ("name", "description")
+    search_fields = ("name", "description", "notes")
 
 @admin.register(AllocationBase)
 class AllocationBaseAdmin(CompanyScopedAdmin):
@@ -77,27 +77,28 @@ class AllocationBaseAdmin(CompanyScopedAdmin):
 
 @admin.register(Transaction)
 class TransactionAdmin(CompanyScopedAdmin):
-    list_display = ("id", "date", "description", "amount", "entity", "currency", "state", "company")
-    list_filter = ("state", "currency", "entity", "company", "date")
+    list_display = ("id", "date", "description", "amount", "entity", "currency", "state", "company", "notes")
+    list_filter = ("state", "currency", "entity", "company", "date", "notes")
     autocomplete_fields = ("company", "entity", "currency")
-    search_fields = ("description", "entity__name")
+    search_fields = ("description", "entity__name", "notes")
 
 @admin.register(JournalEntry)
 class JournalEntryAdmin(CompanyScopedAdmin):
-    list_display = ("id", "transaction", "account", "cost_center", "debit_amount", "credit_amount", "state", "date", "company")
-    list_filter = ("state", "date", "company")
+    list_display = ("id", "transaction", "account", "cost_center", "debit_amount", "credit_amount", "state", "date", "company", "notes")
+    list_filter = ("state", "date", "company", "notes")
     autocomplete_fields = ("company", "transaction", "account", "cost_center")
     search_fields = (
         "transaction__description",
         "account__name",
         "account__account_code",
         "cost_center__name",
+        "notes",
     )
 
 @admin.register(BankTransaction)
 class BankTransactionAdmin(CompanyScopedAdmin):
-    list_display = ("id", "date", "description", "amount", "bank_account", "currency", "status", "tx_hash", "company")
-    list_filter = ("status", "currency", "bank_account__bank", "company", "date")
+    list_display = ("id", "date", "description", "amount", "bank_account", "currency", "status", "tx_hash", "company", "notes")
+    list_filter = ("status", "currency", "bank_account__bank", "company", "date", "notes")
     autocomplete_fields = ("company", "bank_account", "currency")
     search_fields = (
         "description",
@@ -107,12 +108,13 @@ class BankTransactionAdmin(CompanyScopedAdmin):
         "bank_account__account_number",
         "bank_account__entity__name",
         "currency__code",
+        "notes",
     )
 
 @admin.register(Reconciliation)
 class ReconciliationAdmin(CompanyScopedAdmin):
-    list_display = ("id", "status", "reference", "company")
-    list_filter = ("status", "company")
+    list_display = ("id", "status", "reference", "company", "notes")
+    list_filter = ("status", "company", "notes")
     autocomplete_fields = ("company", "journal_entries", "bank_transactions")
     filter_horizontal = ("journal_entries", "bank_transactions")
     search_fields = ("reference", "notes", "status")

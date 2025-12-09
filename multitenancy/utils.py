@@ -1630,6 +1630,66 @@ class Account(TenantAwareBaseModel):
         return [(account, account.calculate_balance(include_pending, beginning_date, end_date)) for account in accounts]
 
 
+def build_notes_metadata(
+    source: str,
+    filename: str = None,
+    function: str = None,
+    user: str = None,
+    user_id: int = None,
+    **kwargs
+) -> str:
+    """
+    Build a formatted notes string with metadata about how a record was created.
+    
+    Args:
+        source: Source of creation (e.g., "ETL", "Import", "API", "Manual")
+        filename: Source filename if applicable (e.g., "2025.01.xlsx")
+        function: Function/method that created the record (e.g., "execute_import_job", "ETLPipelineService._import_data")
+        user: Username of the user who created it
+        user_id: User ID
+        **kwargs: Additional metadata fields (e.g., sheet_name, row_number, log_id, etc.)
+    
+    Returns:
+        Formatted notes string with all metadata
+    """
+    from django.utils import timezone
+    from crum import get_current_user
+    
+    parts = []
+    
+    # Source
+    parts.append(f"Source: {source}")
+    
+    # Timestamp
+    parts.append(f"Created: {timezone.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # Function/method
+    if function:
+        parts.append(f"Function: {function}")
+    
+    # User information
+    if user:
+        parts.append(f"User: {user}")
+    elif user_id:
+        parts.append(f"User ID: {user_id}")
+    else:
+        # Try to get current user
+        current_user = get_current_user()
+        if current_user and current_user.is_authenticated:
+            parts.append(f"User: {current_user.username} (ID: {current_user.id})")
+    
+    # Filename
+    if filename:
+        parts.append(f"File: {filename}")
+    
+    # Additional metadata
+    for key, value in kwargs.items():
+        if value is not None:
+            # Format key nicely (e.g., "sheet_name" -> "Sheet Name")
+            formatted_key = key.replace('_', ' ').title()
+            parts.append(f"{formatted_key}: {value}")
+    
+    return "\n".join(parts)
 
 
 '''

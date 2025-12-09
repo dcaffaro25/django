@@ -41,6 +41,10 @@ class BaseModel(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now_add=True)
     is_deleted = models.BooleanField(default=False)
+    notes = models.TextField(
+        null=True, blank=True,
+        help_text="Metadata and notes about how this record was created (source, filename, function, etc.)"
+    )
 
     class Meta:
         abstract = True

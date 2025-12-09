@@ -800,11 +800,19 @@ class ETLPipelineService:
                     self.extra_fields_by_model[model_name].append(extra_fields)
             
             # Convert to sheets format expected by execute_import_job
+            # Also track which transformation rule was used for each model to get sheet name
             sheets = []
             for model_name, rows in self.transformed_data.items():
+                # Get sheet name from transformation rule if available
+                sheet_name = None
+                rule = self.transformation_rules.get(model_name)
+                if rule:
+                    sheet_name = rule.source_sheet_name
+                
                 sheets.append({
                     'model': model_name,
-                    'rows': rows
+                    'rows': rows,
+                    'sheet_name': sheet_name  # Pass sheet name for metadata
                 })
             
             if not sheets:
@@ -813,11 +821,21 @@ class ETLPipelineService:
             # Use existing import logic
             # Note: execute_import_job has its own transaction.atomic(), which becomes
             # a savepoint within this outer transaction, allowing proper rollback
+            
+            # Build import metadata for notes
+            import_metadata = {
+                'source': 'ETL',
+                'function': 'ETLPipelineService._import_data',
+                'filename': self.file_name,
+                'log_id': self.log.id if self.log else None,
+            }
+            
             result = execute_import_job(
                 company_id=self.company_id,
                 sheets=sheets,
                 commit=True,  # This will commit the inner transaction, but outer transaction wraps everything
-                lookup_cache=self.lookup_cache
+                lookup_cache=self.lookup_cache,
+                import_metadata=import_metadata
             )
             
             # Normalize result format: execute_import_job returns {'imports': [...]}
@@ -2028,6 +2046,40 @@ class ETLPipelineService:
                         bank_je_serializer = JournalEntrySerializer(data=bank_je_data, context={'lookup_cache': self.lookup_cache})
                         if bank_je_serializer.is_valid(raise_exception=True):
                             bank_je = bank_je_serializer.save()
+                            
+                            # Add notes metadata for auto-created journal entry
+                            if hasattr(bank_je, 'notes'):
+                                from multitenancy.utils import build_notes_metadata
+                                from crum import get_current_user
+                                
+                                current_user = get_current_user()
+                                user_name = current_user.username if current_user and current_user.is_authenticated else None
+                                user_id = current_user.id if current_user and current_user.is_authenticated else None
+                                
+                                # Get Excel row metadata from extra_fields
+                                excel_row_id = extra_fields.get('__excel_row_id')
+                                excel_row_number = extra_fields.get('__excel_row_number')
+                                excel_sheet_name = extra_fields.get('__excel_sheet_name')
+                                
+                                notes_metadata = {
+                                    'source': 'ETL',
+                                    'function': 'ETLPipelineService._auto_create_journal_entries',
+                                    'filename': self.file_name,
+                                    'user': user_name,
+                                    'user_id': user_id,
+                                    'log_id': self.log.id if self.log else None,
+                                    'transaction_id': transaction.id,
+                                }
+                                
+                                if excel_row_id:
+                                    notes_metadata['excel_row_id'] = excel_row_id
+                                if excel_row_number:
+                                    notes_metadata['row_number'] = excel_row_number
+                                if excel_sheet_name:
+                                    notes_metadata['sheet_name'] = excel_sheet_name
+                                
+                                bank_je.notes = build_notes_metadata(**notes_metadata)
+                                bank_je.save(update_fields=['notes'])
                             account_id = bank_je.account_id if bank_je.account_id else None
                             account_name = bank_ledger_account.name if bank_ledger_account else "Pending Bank Account"
                             
@@ -2067,6 +2119,40 @@ class ETLPipelineService:
                         opposing_je_serializer = JournalEntrySerializer(data=opposing_je_data, context={'lookup_cache': self.lookup_cache})
                         if opposing_je_serializer.is_valid(raise_exception=True):
                             opposing_je = opposing_je_serializer.save()
+                            
+                            # Add notes metadata for auto-created journal entry
+                            if hasattr(opposing_je, 'notes'):
+                                from multitenancy.utils import build_notes_metadata
+                                from crum import get_current_user
+                                
+                                current_user = get_current_user()
+                                user_name = current_user.username if current_user and current_user.is_authenticated else None
+                                user_id = current_user.id if current_user and current_user.is_authenticated else None
+                                
+                                # Get Excel row metadata from extra_fields
+                                excel_row_id = extra_fields.get('__excel_row_id')
+                                excel_row_number = extra_fields.get('__excel_row_number')
+                                excel_sheet_name = extra_fields.get('__excel_sheet_name')
+                                
+                                notes_metadata = {
+                                    'source': 'ETL',
+                                    'function': 'ETLPipelineService._auto_create_journal_entries',
+                                    'filename': self.file_name,
+                                    'user': user_name,
+                                    'user_id': user_id,
+                                    'log_id': self.log.id if self.log else None,
+                                    'transaction_id': transaction.id,
+                                }
+                                
+                                if excel_row_id:
+                                    notes_metadata['excel_row_id'] = excel_row_id
+                                if excel_row_number:
+                                    notes_metadata['row_number'] = excel_row_number
+                                if excel_sheet_name:
+                                    notes_metadata['sheet_name'] = excel_sheet_name
+                                
+                                opposing_je.notes = build_notes_metadata(**notes_metadata)
+                                opposing_je.save(update_fields=['notes'])
                             
                             # Verify transaction_id is set correctly
                             actual_transaction_id = opposing_je.transaction_id if hasattr(opposing_je, 'transaction_id') else None

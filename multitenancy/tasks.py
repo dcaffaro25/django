@@ -601,7 +601,12 @@ def run_import_job(self, company_id: int, sheets: List[Dict[str, Any]], commit: 
     )
 
 
-def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bool) -> Dict[str, Any]:
+def execute_import_job(
+    company_id: int, 
+    sheets: List[Dict[str, Any]], 
+    commit: bool,
+    import_metadata: Dict[str, Any] = None
+) -> Dict[str, Any]:
     """
     Importer with token->id mapping for FK resolution and a single atomic transaction.
 
@@ -610,9 +615,22 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
       - For each row: substitutions -> filter -> company context -> MPTT path -> *_fk resolution to *_id
       - Save, record token->id
       - On preview (commit=False): rollback entire transaction at the end
+    
+    Args:
+        company_id: Company ID for the import
+        sheets: List of sheet dictionaries with model and rows
+        commit: Whether to commit (True) or preview (False)
+        import_metadata: Optional metadata dict for notes (source, filename, function, etc.)
     """
     run_id = uuid.uuid4().hex[:8]
     logger.info("import_start run_id=%s commit=%s sheet_count=%d", run_id, bool(commit), len(sheets))
+    
+    # Default import metadata
+    if import_metadata is None:
+        import_metadata = {
+            'source': 'Import',
+            'function': 'execute_import_job'
+        }
 
     # enforce sheet processing order using MODEL_APP_MAP key order
     model_order = {name: idx for idx, name in enumerate(MODEL_APP_MAP.keys())}
@@ -628,6 +646,12 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
         for sheet in sheets:
             model_name = sheet.get("model")
             outputs_by_model.setdefault(model_name or "Unknown", [])
+            
+            # Get sheet-specific metadata (e.g., sheet_name from ETL)
+            sheet_metadata = import_metadata.copy() if import_metadata else {}
+            sheet_name = sheet.get("sheet_name")
+            if sheet_name:
+                sheet_metadata['sheet_name'] = sheet_name
 
             app_label = MODEL_APP_MAP.get(model_name)
             if not app_label:
@@ -751,6 +775,52 @@ def execute_import_job(company_id: int, sheets: List[Dict[str, Any]], commit: bo
                         action = "update"
                     else:
                         instance = model(**filtered)
+                    
+                    # 8.5) Add notes metadata if notes field exists and this is a new record
+                    if action == "create" and hasattr(instance, 'notes'):
+                        from multitenancy.utils import build_notes_metadata
+                        from crum import get_current_user
+                        
+                        # Get current user for notes
+                        current_user = get_current_user()
+                        user_name = current_user.username if current_user and current_user.is_authenticated else None
+                        user_id = current_user.id if current_user and current_user.is_authenticated else None
+                        
+                        # Build notes with metadata
+                        notes_metadata = {
+                            'source': import_metadata.get('source', 'Import') if import_metadata else 'Import',
+                            'function': import_metadata.get('function', 'execute_import_job') if import_metadata else 'execute_import_job',
+                            'user': user_name,
+                            'user_id': user_id,
+                        }
+                        
+                        # Add filename if available
+                        if import_metadata and 'filename' in import_metadata:
+                            notes_metadata['filename'] = import_metadata['filename']
+                        
+                        # Add sheet-specific metadata if available (use sheet_metadata which may have sheet_name)
+                        if sheet_metadata:
+                            if 'sheet_name' in sheet_metadata:
+                                notes_metadata['sheet_name'] = sheet_metadata['sheet_name']
+                            if 'log_id' in sheet_metadata:
+                                notes_metadata['log_id'] = sheet_metadata['log_id']
+                        # Also check import_metadata for log_id if not in sheet_metadata
+                        if import_metadata and 'log_id' in import_metadata and 'log_id' not in notes_metadata:
+                            notes_metadata['log_id'] = import_metadata['log_id']
+                        
+                        # Add Excel row metadata from raw data if available (these override sheet-level metadata)
+                        excel_row_id = raw.get('__excel_row_id')
+                        excel_row_number = raw.get('__excel_row_number')
+                        excel_sheet_name = raw.get('__excel_sheet_name')
+                        
+                        if excel_row_id:
+                            notes_metadata['excel_row_id'] = excel_row_id
+                        if excel_row_number:
+                            notes_metadata['row_number'] = excel_row_number
+                        if excel_sheet_name:
+                            notes_metadata['sheet_name'] = excel_sheet_name
+                        
+                        instance.notes = build_notes_metadata(**notes_metadata)
 
                     # 9) validate & save
                     if hasattr(instance, "full_clean"):
