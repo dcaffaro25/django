@@ -7,6 +7,7 @@ from django.contrib.admin.sites import AlreadyRegistered
 from django.contrib.admin import SimpleListFilter
 from django.db import models
 from typing import Iterable
+from core.admin.filters import DateRangeFilter, RecentlyModifiedFilter, EmptyFieldFilter
 
 # ---- Customize these if needed ----
 EXCLUDE_APPS: set[str] = {
@@ -117,11 +118,16 @@ def pick_search_fields(model) -> list[str]:
 
 def pick_list_filters(model) -> list:
     """
+    Enhanced filtering with smart filters for dates, recently modified, and empty fields.
     Booleans, choices, dates, and small FKs become sidebar filters.
     Always includes a custom notes filter if the model has it.
     """
     filters: list = []
     has_notes = False
+    has_date_field = False
+    has_updated_at = False
+    has_created_at = False
+    date_field_name = None
     
     for f in model._meta.get_fields():
         if not getattr(f, "concrete", False):
@@ -131,17 +137,43 @@ def pick_list_filters(model) -> list:
         elif getattr(f, "choices", None):
             filters.append(f.name)
         elif isinstance(f, (models.DateField, models.DateTimeField)):
-            filters.append(f.name)
+            # Check for specific date fields
+            if f.name == 'date':
+                has_date_field = True
+                date_field_name = f.name
+            elif f.name == 'updated_at':
+                has_updated_at = True
+            elif f.name == 'created_at':
+                has_created_at = True
+            
+            # Add standard date filter as fallback
+            if f.name not in ['created_at', 'updated_at']:  # These get special filters
+                filters.append(f.name)
         elif isinstance(f, models.ForeignKey) and is_small_fk(f):
             filters.append(f.name)
         elif f.name == 'notes':
             has_notes = True
     
+    # Add enhanced date range filter if model has a 'date' field
+    if has_date_field and date_field_name:
+        # Create a custom filter class for this specific field
+        filter_class_name = f"{model.__name__}DateRangeFilter"
+        filter_class = type(filter_class_name, (DateRangeFilter,), {
+            'field_name': date_field_name,
+            'title': f'{date_field_name.replace("_", " ").title()} Range',
+            'parameter_name': f'{date_field_name}_range',
+        })
+        filters.append(filter_class)
+    
+    # Add recently modified filter if model has updated_at or created_at
+    if has_updated_at or has_created_at:
+        filters.append(RecentlyModifiedFilter)
+    
     # Add custom notes filter if model has notes field
     if has_notes:
         filters.append(NotesFilter)
     
-    return filters[:6]
+    return filters[:8]  # Increased limit to accommodate new filters
 
 def pick_select_related(model) -> list[str]:
     """Follow FK columns to reduce N+1 on list views."""
