@@ -596,6 +596,13 @@ class BankTransactionSuggestionService:
         total_debit = Decimal('0')
         total_credit = Decimal('0')
         
+        # Get the bank account's GL account for balancing entries
+        bank_account = bank_tx.bank_account
+        bank_gl_account = Account.objects.filter(
+            company_id=self.company_id,
+            bank_account=bank_account,
+        ).first()
+        
         for ref_je in reference_journal_entries:
             # Calculate proportional amounts based on bank transaction amount
             ref_amount = ref_je.debit_amount or ref_je.credit_amount or Decimal('0')
@@ -614,13 +621,23 @@ class BankTransactionSuggestionService:
             # Scale amount proportionally
             scaled_amount = (ref_amount / ref_total) * abs(bank_tx.amount)
             
-            # Determine if this should be debit or credit
-            is_debit = ref_je.debit_amount is not None and ref_je.debit_amount > 0
+            # Get the account and its direction
+            account = ref_je.account
+            if not account:
+                continue
+                
+            account_direction = account.account_direction if hasattr(account, 'account_direction') else 1
             
-            # Adjust for bank transaction direction
-            # If bank transaction is negative (outflow), reverse the direction
-            if bank_tx.amount < 0:
-                is_debit = not is_debit
+            # Use account_direction to determine debit/credit based on bank transaction amount
+            # Logic from calculate_debit_credit():
+            # - account_direction = 1 (debit-normal, like assets):
+            #   - Positive amount → debit
+            #   - Negative amount → credit
+            # - account_direction = -1 (credit-normal, like liabilities/equity):
+            #   - Positive amount → credit
+            #   - Negative amount → debit
+            # Formula: (amount >= 0 and direction == 1) or (amount < 0 and direction == -1) → debit
+            is_debit = (bank_tx.amount >= 0 and account_direction == 1) or (bank_tx.amount < 0 and account_direction == -1)
             
             journal_entry_suggestions.append({
                 'account_id': ref_je.account_id,
@@ -641,12 +658,8 @@ class BankTransactionSuggestionService:
         difference = total_debit - total_credit
         if abs(difference) > Decimal('0.01'):
             # Need balancing entry - use bank account
-            bank_account = bank_tx.bank_account
             # Find the account linked to the bank account
-            balancing_account = Account.objects.filter(
-                company_id=self.company_id,
-                bank_account=bank_account,
-            ).first()
+            balancing_account = bank_gl_account
             
             if balancing_account:
                 # Check if this account is already in the journal entries
@@ -666,6 +679,9 @@ class BankTransactionSuggestionService:
                     )
                 else:
                     # No existing entry for this account, safe to add new entry
+                    # For balancing entries, we simply need to make debits = credits
+                    # If difference > 0: we have more debits, so add credit
+                    # If difference < 0: we have more credits, so add debit
                     if difference > 0:
                         # Need credit to balance
                         journal_entry_suggestions.append({
