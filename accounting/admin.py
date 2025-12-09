@@ -2,6 +2,8 @@
 from django.contrib import admin
 from django.apps import apps
 from django.contrib.admin.views.main import ChangeList
+from django.contrib.admin.utils import model_ngettext
+from django.db import transaction as db_transaction
 
 from .models import (
     Currency, CostCenter, Bank, BankAccount, AllocationBase,
@@ -16,18 +18,9 @@ from .models_financial_statements import (
     FinancialStatementComparison,
 )
 from multitenancy.admin import PlainAdmin, CompanyScopedAdmin
-# ----------------------------
-# Per-page selector (optional)
-# ----------------------------
-from django.contrib import admin
-from django.apps import apps
-from django.contrib.admin.views.main import ChangeList
 
-from .models import (
-    Currency, CostCenter, Bank, BankAccount, AllocationBase,
-    Account, Transaction, JournalEntry, Rule,
-    BankTransaction, Reconciliation, ReconciliationTask, ReconciliationConfig
-)
+# Batch size for bulk operations to avoid memory issues
+BULK_DELETE_BATCH_SIZE = 1000
 
 
 
@@ -75,12 +68,106 @@ class AllocationBaseAdmin(CompanyScopedAdmin):
     autocomplete_fields = ("company", "cost_center", "profit_center")
     search_fields = ("cost_center__name", "profit_center__name")
 
+def delete_reconciliations_for_journal_entries(journal_entry_ids):
+    """
+    Efficiently delete all reconciliations that reference the given journal entries.
+    Uses bulk operations to handle large datasets efficiently.
+    """
+    if not journal_entry_ids:
+        return 0
+    
+    # Find reconciliations that reference these journal entries
+    reconciliations = Reconciliation.objects.filter(
+        journal_entries__id__in=journal_entry_ids
+    ).distinct()
+    
+    reconciliation_ids = list(reconciliations.values_list('id', flat=True))
+    
+    if not reconciliation_ids:
+        return 0
+    
+    # Clear M2M relationships first (more efficient than letting CASCADE handle it)
+    # Delete from the through table
+    Reconciliation.journal_entries.through.objects.filter(
+        reconciliation_id__in=reconciliation_ids
+    ).delete()
+    
+    Reconciliation.bank_transactions.through.objects.filter(
+        reconciliation_id__in=reconciliation_ids
+    ).delete()
+    
+    # Now delete the reconciliation records themselves
+    deleted_count = Reconciliation.objects.filter(id__in=reconciliation_ids).delete()[0]
+    
+    return deleted_count
+
+
 @admin.register(Transaction)
 class TransactionAdmin(CompanyScopedAdmin):
     list_display = ("id", "date", "description", "amount", "entity", "currency", "state", "company", "notes")
     list_filter = ("state", "currency", "entity", "company", "date", "notes")
     autocomplete_fields = ("company", "entity", "currency")
     search_fields = ("description", "entity__name", "notes")
+    
+    @admin.action(description="Delete selected transactions (with journal entries and reconciliations)")
+    def fast_delete_selected(self, request, queryset):
+        """
+        Optimized bulk delete for transactions that:
+        1. Gets all related journal entry IDs first
+        2. Deletes reconciliations that reference those journal entries
+        3. Deletes transactions (which CASCADE deletes journal entries)
+        
+        Handles thousands of records efficiently using batch processing.
+        """
+        transaction_ids = list(queryset.values_list('id', flat=True))
+        total_count = len(transaction_ids)
+        
+        if not total_count:
+            self.message_user(request, "No transactions selected.", level='warning')
+            return
+        
+        # Get all journal entry IDs that will be deleted (CASCADE)
+        # We need to do this BEFORE deleting transactions
+        journal_entry_ids = list(
+            JournalEntry.objects.filter(transaction_id__in=transaction_ids)
+            .values_list('id', flat=True)
+        )
+        
+        deleted_reconciliations = 0
+        deleted_transactions = 0
+        deleted_journal_entries = len(journal_entry_ids)
+        
+        # Use database transaction to ensure atomicity
+        with db_transaction.atomic():
+            # Step 1: Delete reconciliations that reference these journal entries
+            if journal_entry_ids:
+                deleted_reconciliations = delete_reconciliations_for_journal_entries(journal_entry_ids)
+            
+            # Step 2: Delete transactions in batches (CASCADE will delete journal entries)
+            # Process in batches to avoid memory issues with very large datasets
+            for i in range(0, total_count, BULK_DELETE_BATCH_SIZE):
+                batch_ids = transaction_ids[i:i + BULK_DELETE_BATCH_SIZE]
+                batch_queryset = Transaction.objects.filter(id__in=batch_ids)
+                deleted_transactions += batch_queryset.delete()[0]
+        
+        # Build success message
+        message_parts = [
+            f"Successfully deleted {deleted_transactions} {model_ngettext(self.model, deleted_transactions)}"
+        ]
+        
+        if deleted_journal_entries > 0:
+            message_parts.append(f"{deleted_journal_entries} related journal entries")
+        
+        if deleted_reconciliations > 0:
+            message_parts.append(f"{deleted_reconciliations} related reconciliations")
+        
+        self.message_user(
+            request,
+            ". ".join(message_parts) + ".",
+            level='success'
+        )
+    
+    actions = ['fast_delete_selected']
 
 @admin.register(JournalEntry)
 class JournalEntryAdmin(CompanyScopedAdmin):
@@ -94,6 +181,55 @@ class JournalEntryAdmin(CompanyScopedAdmin):
         "cost_center__name",
         "notes",
     )
+    
+    @admin.action(description="Delete selected journal entries (with reconciliations, keep transactions)")
+    def fast_delete_selected(self, request, queryset):
+        """
+        Optimized bulk delete for journal entries that:
+        1. Deletes reconciliations that reference these journal entries
+        2. Deletes journal entries (transactions are kept)
+        
+        Handles thousands of records efficiently using batch processing.
+        """
+        journal_entry_ids = list(queryset.values_list('id', flat=True))
+        total_count = len(journal_entry_ids)
+        
+        if not total_count:
+            self.message_user(request, "No journal entries selected.", level='warning')
+            return
+        
+        deleted_reconciliations = 0
+        deleted_journal_entries = 0
+        
+        # Use database transaction to ensure atomicity
+        with db_transaction.atomic():
+            # Step 1: Delete reconciliations that reference these journal entries
+            deleted_reconciliations = delete_reconciliations_for_journal_entries(journal_entry_ids)
+            
+            # Step 2: Delete journal entries in batches
+            # Process in batches to avoid memory issues with very large datasets
+            for i in range(0, total_count, BULK_DELETE_BATCH_SIZE):
+                batch_ids = journal_entry_ids[i:i + BULK_DELETE_BATCH_SIZE]
+                batch_queryset = JournalEntry.objects.filter(id__in=batch_ids)
+                deleted_journal_entries += batch_queryset.delete()[0]
+        
+        # Build success message
+        message_parts = [
+            f"Successfully deleted {deleted_journal_entries} {model_ngettext(self.model, deleted_journal_entries)}"
+        ]
+        
+        if deleted_reconciliations > 0:
+            message_parts.append(f"{deleted_reconciliations} related reconciliations")
+        
+        message_parts.append("(transactions were preserved)")
+        
+        self.message_user(
+            request,
+            ". ".join(message_parts) + ".",
+            level='success'
+        )
+    
+    actions = ['fast_delete_selected']
 
 @admin.register(BankTransaction)
 class BankTransactionAdmin(CompanyScopedAdmin):
