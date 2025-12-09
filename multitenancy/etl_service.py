@@ -801,6 +801,7 @@ class ETLPipelineService:
             
             # Convert to sheets format expected by execute_import_job
             # Also track which transformation rule was used for each model to get sheet name
+            # IMPORTANT: Set __row_id from __excel_row_id so outputs can be mapped back
             sheets = []
             for model_name, rows in self.transformed_data.items():
                 # Get sheet name from transformation rule if available
@@ -809,9 +810,18 @@ class ETLPipelineService:
                 if rule:
                     sheet_name = rule.source_sheet_name
                 
+                # Ensure __row_id is set from __excel_row_id for mapping outputs back
+                rows_with_row_id = []
+                for row in rows:
+                    row_copy = dict(row)
+                    # Set __row_id from __excel_row_id if not already set
+                    if '__row_id' not in row_copy and '__excel_row_id' in row_copy:
+                        row_copy['__row_id'] = row_copy['__excel_row_id']
+                    rows_with_row_id.append(row_copy)
+                
                 sheets.append({
                     'model': model_name,
-                    'rows': rows,
+                    'rows': rows_with_row_id,
                     'sheet_name': sheet_name  # Pass sheet name for metadata
                 })
             
@@ -902,6 +912,47 @@ class ETLPipelineService:
                 'sample_columns': list(rows_copy[0].keys()) if rows_copy else []
             }
         
+        # Build a map from __row_id to Excel metadata for efficient lookup
+        # The __row_id in output matches the __row_id from input rows (normalized)
+        # We need to normalize both the row_id from rows and from outputs for matching
+        from multitenancy.tasks import _norm_row_key
+        row_id_to_excel_metadata = {}
+        for model_name, rows in self.transformed_data.items():
+            extra_fields_list = self.extra_fields_by_model.get(model_name, [])
+            for idx, row in enumerate(rows):
+                # Try both __row_id and __excel_row_id, normalize for matching
+                row_id = row.get('__row_id') or row.get('__excel_row_id')
+                if row_id and idx < len(extra_fields_list):
+                    extra_fields = extra_fields_list[idx]
+                    # Normalize row_id for consistent matching
+                    normalized_row_id = _norm_row_key(row_id)
+                    row_id_to_excel_metadata[normalized_row_id] = {
+                        '__excel_row_id': extra_fields.get('__excel_row_id'),
+                        '__excel_row_number': extra_fields.get('__excel_row_number'),
+                        '__excel_sheet_name': extra_fields.get('__excel_sheet_name')
+                    }
+        
+        # Build transaction_id -> excel_row_id mapping for JournalEntry grouping (like preview mode)
+        transaction_to_excel_row_map = {}
+        for model_name, outputs in normalized_result.get('results', {}).items():
+            if model_name == 'Transaction':
+                for output in outputs:
+                    if output.get('status') == 'success' and output.get('action') == 'create':
+                        record_data = output.get('data', {})
+                        transaction_id = record_data.get('id')
+                        if transaction_id:
+                            # Look up Excel row metadata using __row_id from output
+                            row_id = output.get('__row_id')
+                            if row_id:
+                                normalized_row_id = _norm_row_key(row_id)
+                                if normalized_row_id in row_id_to_excel_metadata:
+                                    excel_metadata = row_id_to_excel_metadata[normalized_row_id]
+                                    transaction_to_excel_row_map[transaction_id] = {
+                                        'excel_row_id': excel_metadata.get('__excel_row_id'),
+                                        'excel_row_number': excel_metadata.get('__excel_row_number'),
+                                        'excel_sheet_name': excel_metadata.get('__excel_sheet_name', 'Unknown')
+                                    }
+        
         # Build would_create structure from normalized_result
         for model_name, outputs in normalized_result.get('results', {}).items():
             created_records = []
@@ -909,12 +960,49 @@ class ETLPipelineService:
                 if output.get('status') == 'success' and output.get('action') == 'create':
                     record_data = output.get('data', {})
                     if record_data:
-                        # Add Excel row metadata if available
-                        if idx < len(self.extra_fields_by_model.get(model_name, [])):
-                            extra_fields = self.extra_fields_by_model[model_name][idx]
-                            record_data['__excel_row_id'] = extra_fields.get('__excel_row_id')
-                            record_data['__excel_row_number'] = extra_fields.get('__excel_row_number')
-                            record_data['__excel_sheet_name'] = extra_fields.get('__excel_sheet_name')
+                        # Look up Excel row metadata using __row_id from output (normalized)
+                        row_id = output.get('__row_id')
+                        excel_metadata = None
+                        if row_id:
+                            normalized_row_id = _norm_row_key(row_id)
+                            if normalized_row_id in row_id_to_excel_metadata:
+                                excel_metadata = row_id_to_excel_metadata[normalized_row_id]
+                        
+                        # For JournalEntries, try to get Excel row from parent Transaction (like preview mode)
+                        if model_name == 'JournalEntry' and not excel_metadata:
+                            transaction_id = record_data.get('transaction_id')
+                            if transaction_id and transaction_id in transaction_to_excel_row_map:
+                                tx_row_info = transaction_to_excel_row_map[transaction_id]
+                                excel_metadata = {
+                                    '__excel_row_id': tx_row_info['excel_row_id'],
+                                    '__excel_row_number': tx_row_info['excel_row_number'],
+                                    '__excel_sheet_name': tx_row_info['excel_sheet_name']
+                                }
+                        
+                        # Fallback: use index-based lookup if __row_id lookup failed (like preview mode)
+                        if not excel_metadata:
+                            extra_fields_list = self.extra_fields_by_model.get(model_name, [])
+                            if idx < len(extra_fields_list):
+                                extra_fields = extra_fields_list[idx]
+                                excel_metadata = {
+                                    '__excel_row_id': extra_fields.get('__excel_row_id'),
+                                    '__excel_row_number': extra_fields.get('__excel_row_number'),
+                                    '__excel_sheet_name': extra_fields.get('__excel_sheet_name', 'Unknown')
+                                }
+                        
+                        # Apply Excel metadata to record
+                        if excel_metadata:
+                            record_data['__excel_row_id'] = excel_metadata.get('__excel_row_id')
+                            record_data['__excel_row_number'] = excel_metadata.get('__excel_row_number')
+                            record_data['__excel_sheet_name'] = excel_metadata.get('__excel_sheet_name')
+                        else:
+                            # Default fallback (like preview mode)
+                            excel_sheet_name = 'Unknown'
+                            excel_row_number = idx + 1
+                            record_data['__excel_row_id'] = f"{excel_sheet_name}:{excel_row_number}"
+                            record_data['__excel_row_number'] = excel_row_number
+                            record_data['__excel_sheet_name'] = excel_sheet_name
+                        
                         created_records.append(record_data)
             
             if created_records:
@@ -923,7 +1011,7 @@ class ETLPipelineService:
                     'records': created_records
                 }
         
-        # Build would_create_by_row by grouping records by Excel row
+        # Build would_create_by_row by grouping records by Excel row (like preview mode)
         would_create_by_row_dict = {}
         for model_name, model_data in import_result_for_response['would_create'].items():
             records = model_data.get('records', [])
@@ -945,9 +1033,19 @@ class ETLPipelineService:
                 if model_name not in would_create_by_row_dict[excel_row_id]['created_records']:
                     would_create_by_row_dict[excel_row_id]['created_records'][model_name] = []
                 
-                # Remove internal metadata before adding to created_records
-                clean_record = {k: v for k, v in record.items() if not k.startswith('__')}
-                would_create_by_row_dict[excel_row_id]['created_records'][model_name].append(clean_record)
+                # Deduplicate by ID to avoid adding the same record twice (like preview mode)
+                record_id = record.get('id')
+                if record_id:
+                    # Check if this record already exists in the group
+                    existing_ids = {r.get('id') for r in would_create_by_row_dict[excel_row_id]['created_records'][model_name] if r.get('id')}
+                    if record_id not in existing_ids:
+                        # Remove internal metadata before adding to created_records
+                        clean_record = {k: v for k, v in record.items() if not k.startswith('__')}
+                        would_create_by_row_dict[excel_row_id]['created_records'][model_name].append(clean_record)
+                else:
+                    # If no ID, just append (shouldn't happen for saved records)
+                    clean_record = {k: v for k, v in record.items() if not k.startswith('__')}
+                    would_create_by_row_dict[excel_row_id]['created_records'][model_name].append(clean_record)
         
         # Convert to list and sort
         import_result_for_response['would_create_by_row'] = sorted(
