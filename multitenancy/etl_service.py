@@ -2475,10 +2475,6 @@ class ETLPipelineService:
                             logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - Serializer is valid, saving opposing JE")
                             opposing_je = opposing_je_serializer.save()
                             logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - SUCCESS: Created opposing JE ID={opposing_je.id}")
-                        else:
-                            logger.error(f"ETL OPPOSING JE: Transaction {transaction.id} - ERROR: Serializer validation failed: {opposing_je_serializer.errors}")
-                    else:
-                        logger.warning(f"ETL OPPOSING JE: Transaction {transaction.id} - SKIPPED: No opposing_account, opposing JE will not be created")
                             
                             # Add notes metadata for auto-created journal entry
                             if hasattr(opposing_je, 'notes'):
@@ -2529,6 +2525,10 @@ class ETLPipelineService:
                                 'credit_amount': str(opp_credit) if opp_credit else None,
                             })
                             logger.debug(f"ETL: Created opposing JournalEntry {opposing_je.id} for Transaction {transaction.id} (transaction_id={actual_transaction_id})")
+                        else:
+                            logger.error(f"ETL OPPOSING JE: Transaction {transaction.id} - ERROR: Serializer validation failed: {opposing_je_serializer.errors}")
+                    else:
+                        logger.warning(f"ETL OPPOSING JE: Transaction {transaction.id} - SKIPPED: No opposing_account, opposing JE will not be created")
                     
                     # Add to main list
                     journal_entries_created.extend(transaction_jes)
