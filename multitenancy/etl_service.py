@@ -1301,6 +1301,57 @@ class ETLPipelineService:
         
         substitution_rules_cache: Dict[tuple, List[SubstitutionRule]] = {}  # (model, field) -> [rules]
         
+        # DUMP ALL SUBSTITUTION RULES FOR DEBUGGING
+        logger.info("=" * 80)
+        logger.info("ETL SUBSTITUTION RULES DUMP - START")
+        logger.info("=" * 80)
+        all_rules = list(SubstitutionRule.objects.filter(company_id=self.company_id).order_by('model_name', 'field_name', 'id'))
+        logger.info(f"ETL SUBSTITUTION RULES: Total rules for company {self.company_id}: {len(all_rules)}")
+        
+        # Group by (model_name, field_name) for easier reading
+        rules_by_target = {}
+        for rule in all_rules:
+            key = (rule.model_name, rule.field_name)
+            if key not in rules_by_target:
+                rules_by_target[key] = []
+            rules_by_target[key].append(rule)
+        
+        for (model_name, field_name), rules in sorted(rules_by_target.items()):
+            logger.info(f"ETL SUBSTITUTION RULES: {model_name}.{field_name} - {len(rules)} rule(s)")
+            for idx, rule in enumerate(rules, 1):
+                rule_title = getattr(rule, 'title', f'Rule {rule.id}')
+                filter_conditions = getattr(rule, 'filter_conditions', None)
+                logger.info(f"  [{idx}] ID={rule.id}, title='{rule_title}', match_type='{rule.match_type}', "
+                          f"match_value='{rule.match_value}', substitution_value='{rule.substitution_value}', "
+                          f"filter_conditions={filter_conditions}")
+        
+        # Highlight Account.path rules specifically
+        account_path_rules_list = [r for (m, f), rules in rules_by_target.items() 
+                                   for r in rules if m == 'Account' and f == 'path']
+        logger.info(f"ETL SUBSTITUTION RULES: Account.path rules: {len(account_path_rules_list)}")
+        if account_path_rules_list:
+            for idx, rule in enumerate(account_path_rules_list, 1):
+                rule_title = getattr(rule, 'title', f'Rule {rule.id}')
+                logger.info(f"  Account.path Rule [{idx}]: ID={rule.id}, title='{rule_title}', "
+                          f"match='{rule.match_value}' -> '{rule.substitution_value}'")
+        else:
+            logger.warning("ETL SUBSTITUTION RULES: WARNING - No Account.path rules found! "
+                          "Substitutions for account_path will not work.")
+        
+        # Check for common misconfigurations
+        account_path_wrong = [r for (m, f), rules in rules_by_target.items() 
+                             for r in rules if m == 'Account' and f == 'account_path']
+        if account_path_wrong:
+            logger.warning(f"ETL SUBSTITUTION RULES: WARNING - Found {len(account_path_wrong)} rule(s) with "
+                          f"model_name='Account' and field_name='account_path' (should be 'path' instead)")
+            for rule in account_path_wrong:
+                rule_title = getattr(rule, 'title', f'Rule {rule.id}')
+                logger.warning(f"  Misconfigured Rule ID={rule.id}, title='{rule_title}'")
+        
+        logger.info("=" * 80)
+        logger.info("ETL SUBSTITUTION RULES DUMP - END")
+        logger.info("=" * 80)
+        
         # Pre-load rules for Account.path (most common case)
         account_path_rules = list(SubstitutionRule.objects.filter(
             company_id=self.company_id,
@@ -1340,7 +1391,8 @@ class ETLPipelineService:
             row_context = row_context or {}
             logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Row context: {row_context}")
             for idx, rl in enumerate(rules):
-                logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Checking rule {idx + 1}/{len(rules)}: ID={rl.id}, name='{rl.name}', match_type='{rl.match_type}', match_value='{rl.match_value}', substitution_value='{rl.substitution_value}'")
+                rule_title = getattr(rl, 'title', f'Rule {rl.id}')
+                logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Checking rule {idx + 1}/{len(rules)}: ID={rl.id}, title='{rule_title}', match_type='{rl.match_type}', match_value='{rl.match_value}', substitution_value='{rl.substitution_value}'")
                 
                 # Check filter conditions
                 filter_conditions = getattr(rl, "filter_conditions", None)
