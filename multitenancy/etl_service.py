@@ -1160,18 +1160,25 @@ class ETLPipelineService:
         from multitenancy.tasks import _safe_model_dict, _row_observations, _norm_row_key
         from django.apps import apps
         
+        logger.info(f"ETL OPPOSING JE: _import_transactions_with_journal_entries CALLED - {len(transaction_sheets)} Transaction sheet(s), {len(extra_fields_list)} extra_fields entries")
         logger.info(f"ETL: Importing {len(transaction_sheets)} Transaction sheet(s) with auto-created JournalEntries")
         
         # Get auto-create configuration
         auto_config = self.auto_create_journal_entries or {}
+        logger.info(f"ETL OPPOSING JE: auto_create_journal_entries config: {auto_config}")
+        logger.info(f"ETL OPPOSING JE: auto_config.get('enabled'): {auto_config.get('enabled', False)}")
+        
         if not auto_config.get('enabled', False):
             # If not enabled, just use normal import
+            logger.warning(f"ETL OPPOSING JE: auto_create_journal_entries is NOT ENABLED - using normal import instead")
             from multitenancy.tasks import execute_import_job
             return execute_import_job(
                 company_id=self.company_id,
                 sheets=transaction_sheets,
                 commit=False
             )
+        
+        logger.info(f"ETL OPPOSING JE: auto_create_journal_entries is ENABLED - proceeding with custom import logic")
         
         bank_account_field = auto_config.get('bank_account_field', 'bank_account_id')
         opposing_account_field = auto_config.get('opposing_account_field', 'account_path')
@@ -2064,16 +2071,24 @@ class ETLPipelineService:
         from accounting.models import Account, BankAccount, Transaction, JournalEntry
         from accounting.serializers import JournalEntrySerializer
         
+        logger.info(f"ETL OPPOSING JE: _auto_create_journal_entries CALLED")
+        
         # Check if we have any Transaction outputs
         transaction_outputs = import_result.get('results', {}).get('Transaction', [])
+        logger.info(f"ETL OPPOSING JE: Found {len(transaction_outputs)} Transaction outputs")
         if not transaction_outputs:
+            logger.warning(f"ETL OPPOSING JE: No Transaction outputs found, returning early")
             return
         
         # Check if auto-create is enabled (from request parameter)
         auto_config = self.auto_create_journal_entries or {}
+        logger.info(f"ETL OPPOSING JE: auto_create_journal_entries config: {auto_config}")
+        logger.info(f"ETL OPPOSING JE: auto_config.get('enabled'): {auto_config.get('enabled', False)}")
         if not auto_config.get('enabled', False):
+            logger.warning(f"ETL OPPOSING JE: auto_create_journal_entries is NOT ENABLED, returning early")
             return
         
+        logger.info(f"ETL OPPOSING JE: auto_create_journal_entries is ENABLED - proceeding")
         logger.info(f"ETL: Auto-creating JournalEntries for {len(transaction_outputs)} Transactions")
         
         # Get configuration
@@ -2244,6 +2259,7 @@ class ETLPipelineService:
                 
                 # Get extra_fields for this row
                 extra_fields = extra_fields_list[idx] if idx < len(extra_fields_list) else {}
+                logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} (idx={idx}) - Original extra_fields: {extra_fields}")
                 
                 # Apply substitutions to extra_fields before using them (like in _import_transactions_with_journal_entries)
                 substituted_extra_fields = self._apply_substitutions_to_extra_fields(
@@ -2252,6 +2268,7 @@ class ETLPipelineService:
                     substitution_rules_cache=substitution_rules_cache,
                     apply_substitution_fast=apply_substitution_fast
                 )
+                logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} (idx={idx}) - Substituted extra_fields: {substituted_extra_fields}")
                 
                 try:
                     # Track JournalEntries created for this transaction
@@ -2301,7 +2318,14 @@ class ETLPipelineService:
                     opposing_account = None
                     opposing_account_value = substituted_extra_fields.get(opposing_account_field)
                     
+                    logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - Extracting opposing account")
+                    logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - opposing_account_field: '{opposing_account_field}'")
+                    logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - opposing_account_value from substituted_extra_fields: '{opposing_account_value}'")
+                    logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - opposing_account_lookup: '{opposing_account_lookup}'")
+                    logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - path_separator: '{path_separator}'")
+                    
                     if opposing_account_value:
+                        logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - Looking up opposing account with value='{opposing_account_value}', lookup_type='{opposing_account_lookup}'")
                         if opposing_account_lookup == 'path':
                             opposing_account = self._lookup_account(opposing_account_value, 'path', path_separator)
                         elif opposing_account_lookup == 'code':
@@ -2309,12 +2333,22 @@ class ETLPipelineService:
                         elif opposing_account_lookup == 'id':
                             try:
                                 account_id = int(opposing_account_value)
+                                logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - Looking up account by ID: {account_id}")
                                 opposing_account = Account.objects.filter(
                                     company_id=self.company_id,
                                     id=account_id
                                 ).first()
-                            except (ValueError, TypeError):
+                                logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - ID lookup result: {opposing_account.id if opposing_account else None} ({opposing_account.name if opposing_account else 'NOT FOUND'})")
+                            except (ValueError, TypeError) as e:
+                                logger.warning(f"ETL OPPOSING JE: Transaction {transaction_id} - Error converting opposing_account_value to int: {e}")
                                 pass
+                        
+                        if opposing_account:
+                            logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - SUCCESS: Found opposing account - ID: {opposing_account.id}, Name: {opposing_account.name}, Code: {getattr(opposing_account, 'account_code', 'N/A')}")
+                        else:
+                            logger.warning(f"ETL OPPOSING JE: Transaction {transaction_id} - FAILED: Account not found for value='{opposing_account_value}' (lookup_type='{opposing_account_lookup}')")
+                    else:
+                        logger.warning(f"ETL OPPOSING JE: Transaction {transaction_id} - SKIPPED: No opposing_account_value found. Keys in substituted_extra_fields: {list(substituted_extra_fields.keys())}")
                     
                     # Calculate debit/credit
                     if amount >= 0:
@@ -2416,7 +2450,11 @@ class ETLPipelineService:
                             logger.debug(f"ETL: Created bank JournalEntry {bank_je.id} for Transaction {transaction.id} (pending={bank_designation_pending}, transaction_id={actual_transaction_id})")
                     
                     # Create opposing account JournalEntry
+                    logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - Checking if opposing JE should be created")
+                    logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - opposing_account found: {bool(opposing_account)}")
+                    
                     if opposing_account:
+                        logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - Creating opposing JE with account_id={opposing_account.id}, debit={opp_debit}, credit={opp_credit}")
                         opposing_je_data = {
                             'company': self.company_id,
                             'transaction': transaction.id,  # Use transaction instance ID
@@ -2429,11 +2467,18 @@ class ETLPipelineService:
                             'state': 'pending',
                         }
                         
+                        logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - Opposing JE data: {opposing_je_data}")
                         logger.debug(f"ETL: Creating opposing JournalEntry for Transaction {transaction.id} with account {opposing_account.id}")
                         
                         opposing_je_serializer = JournalEntrySerializer(data=opposing_je_data, context={'lookup_cache': self.lookup_cache})
                         if opposing_je_serializer.is_valid(raise_exception=True):
+                            logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - Serializer is valid, saving opposing JE")
                             opposing_je = opposing_je_serializer.save()
+                            logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - SUCCESS: Created opposing JE ID={opposing_je.id}")
+                        else:
+                            logger.error(f"ETL OPPOSING JE: Transaction {transaction.id} - ERROR: Serializer validation failed: {opposing_je_serializer.errors}")
+                    else:
+                        logger.warning(f"ETL OPPOSING JE: Transaction {transaction.id} - SKIPPED: No opposing_account, opposing JE will not be created")
                             
                             # Add notes metadata for auto-created journal entry
                             if hasattr(opposing_je, 'notes'):
