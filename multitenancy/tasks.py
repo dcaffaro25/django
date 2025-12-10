@@ -624,6 +624,10 @@ def execute_import_job(
         import_metadata: Optional metadata dict for notes (source, filename, function, etc.)
         lookup_cache: Optional LookupCache instance for efficient FK resolution (ETL context)
     """
+    # Import at function level to avoid circular imports
+    from multitenancy.utils import build_notes_metadata
+    from crum import get_current_user
+    
     run_id = uuid.uuid4().hex[:8]
     logger.info("import_start run_id=%s commit=%s sheet_count=%d", run_id, bool(commit), len(sheets))
     
@@ -780,9 +784,6 @@ def execute_import_job(
                     
                     # 8.5) Add notes metadata if notes field exists and this is a new record
                     if action == "create" and hasattr(instance, 'notes'):
-                        from multitenancy.utils import build_notes_metadata
-                        from crum import get_current_user
-                        
                         # Get current user for notes
                         current_user = get_current_user()
                         user_name = current_user.username if current_user and current_user.is_authenticated else None
