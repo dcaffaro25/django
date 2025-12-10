@@ -76,13 +76,15 @@ class ETLPipelineService:
         'False': False,
     }
     
-    def __init__(self, company_id: int, file, commit: bool = False, auto_create_journal_entries: Optional[dict] = None, row_limit: Optional[int] = None):
+    def __init__(self, company_id: int, file, commit: bool = False, auto_create_journal_entries: Optional[dict] = None, row_limit: Optional[int] = None, preview_record_limit: Optional[int] = None):
         self.company_id = company_id
         self.file = file
         self.commit = commit
         self.auto_create_journal_entries = auto_create_journal_entries or {}
         # row_limit: None = use default (10), 0 = process all rows, >0 = limit to that number
         self.row_limit = row_limit if row_limit is not None else 10  # Default to 10 for testing
+        # preview_record_limit: None = use default (50), 0 = show all records, >0 = limit to that number
+        self.preview_record_limit = preview_record_limit if preview_record_limit is not None else 50  # Default to 50 for preview
         
         # Initialize lookup cache for efficient FK resolution
         from multitenancy.lookup_cache import LookupCache
@@ -953,7 +955,9 @@ class ETLPipelineService:
                                         'excel_sheet_name': excel_metadata.get('__excel_sheet_name', 'Unknown')
                                     }
         
-        # Build would_create structure from normalized_result
+        # Build would_create and created structures from normalized_result
+        # 'would_create' is for backward compatibility (same as preview)
+        # 'created' is the actual created records (for execute mode)
         for model_name, outputs in normalized_result.get('results', {}).items():
             created_records = []
             for idx, output in enumerate(outputs):
@@ -1006,14 +1010,52 @@ class ETLPipelineService:
                         created_records.append(record_data)
             
             if created_records:
+                # Deduplicate records by ID to avoid showing the same record twice (like preview mode)
+                seen_ids = set()
+                unique_records = []
+                for record in created_records:
+                    record_id = record.get('id')
+                    if record_id:
+                        if record_id not in seen_ids:
+                            seen_ids.add(record_id)
+                            unique_records.append(record)
+                    else:
+                        # If no ID, include it (shouldn't happen for saved records)
+                        unique_records.append(record)
+                
+                # For backward compatibility with preview mode
+                # Preview mode doesn't attach Excel metadata to records in would_create
+                # It only uses metadata for grouping in would_create_by_row
+                would_create_records = []
+                for record in unique_records:
+                    # Create a copy without Excel metadata (like preview mode)
+                    clean_record = {k: v for k, v in record.items() if not k.startswith('__excel_')}
+                    would_create_records.append(clean_record)
+                
+                # Limit records based on preview_record_limit (0 = show all, None/50 = default limit)
+                if self.preview_record_limit == 0:
+                    limited_records = would_create_records
+                else:
+                    limited_records = would_create_records[:self.preview_record_limit]
+                
                 import_result_for_response['would_create'][model_name] = {
-                    'count': len(created_records),
-                    'records': created_records
+                    'count': len(unique_records),
+                    'records': limited_records,  # Limited records for better preview (configurable via preview_record_limit)
+                    'total': len(unique_records)  # Total count even if limited (like preview mode)
+                }
+                
+                # For execute mode - actual created records (with Excel metadata)
+                import_result_for_response['created'] = import_result_for_response.get('created', {})
+                import_result_for_response['created'][model_name] = {
+                    'count': len(unique_records),
+                    'records': unique_records,  # All records with Excel metadata for execute mode
+                    'total': len(unique_records)
                 }
         
         # Build would_create_by_row by grouping records by Excel row (like preview mode)
+        # Use records with Excel metadata from 'created' structure, not cleaned records from 'would_create'
         would_create_by_row_dict = {}
-        for model_name, model_data in import_result_for_response['would_create'].items():
+        for model_name, model_data in import_result_for_response.get('created', {}).items():
             records = model_data.get('records', [])
             for record in records:
                 excel_row_id = record.get('__excel_row_id')
@@ -1039,7 +1081,7 @@ class ETLPipelineService:
                     # Check if this record already exists in the group
                     existing_ids = {r.get('id') for r in would_create_by_row_dict[excel_row_id]['created_records'][model_name] if r.get('id')}
                     if record_id not in existing_ids:
-                        # Remove internal metadata before adding to created_records
+                        # Remove internal metadata before adding to created_records (like preview mode)
                         clean_record = {k: v for k, v in record.items() if not k.startswith('__')}
                         would_create_by_row_dict[excel_row_id]['created_records'][model_name].append(clean_record)
                 else:
@@ -1936,8 +1978,67 @@ class ETLPipelineService:
         # Get extra_fields for Transactions
         extra_fields_list = extra_fields_by_model.get('Transaction', [])
         
+        # Pre-load substitution rules cache for performance
+        from multitenancy.models import SubstitutionRule
+        substitution_rules_cache = {}
+        substitution_rules = SubstitutionRule.objects.filter(company_id=self.company_id)
+        for rule in substitution_rules:
+            key = (rule.model_name, rule.field_name)
+            if key not in substitution_rules_cache:
+                substitution_rules_cache[key] = []
+            substitution_rules_cache[key].append(rule)
+        
+        # Create fast substitution function (with filter_conditions support)
+        from multitenancy.formula_engine import _passes_conditions
+        def apply_substitution_fast(value, model_name, field_name, row_context=None):
+            """Fast substitution using pre-loaded cache with filter_conditions support."""
+            if not value or not model_name or not field_name:
+                return value
+            key = (model_name, field_name)
+            rules = substitution_rules_cache.get(key, [])
+            for rule in rules:
+                try:
+                    # Check filter_conditions if present
+                    if hasattr(rule, 'filter_conditions') and rule.filter_conditions:
+                        if not _passes_conditions(row_context or {}, rule.filter_conditions):
+                            continue
+                    
+                    str_value = str(value)
+                    if rule.match_type == 'exact':
+                        if str_value == rule.match_value:
+                            return rule.substitution_value
+                    elif rule.match_type == 'regex':
+                        import re
+                        return re.sub(rule.match_value, rule.substitution_value, str_value)
+                    elif rule.match_type == 'caseless':
+                        import unicodedata
+                        normalized_value = unicodedata.normalize('NFD', str_value.lower())
+                        normalized_match = unicodedata.normalize('NFD', rule.match_value.lower())
+                        if normalized_value == normalized_match:
+                            return rule.substitution_value
+                except Exception as e:
+                    logger.warning(f"ETL: Error in substitution rule {rule.id}: {e}")
+            return value
+        
         # Track created JournalEntries for result
         journal_entries_created = []
+        
+        # Build transaction_id -> Excel row metadata mapping for JournalEntry grouping
+        transaction_to_excel_row_map = {}
+        for idx, output in enumerate(transaction_outputs):
+            if output.get('status') != 'success' or output.get('action') != 'create':
+                continue
+            
+            transaction_data = output.get('data', {})
+            transaction_id = transaction_data.get('id')
+            
+            if transaction_id and idx < len(extra_fields_list):
+                extra_fields = extra_fields_list[idx]
+                transaction_to_excel_row_map[transaction_id] = {
+                    'excel_row_id': extra_fields.get('__excel_row_id'),
+                    'excel_row_number': extra_fields.get('__excel_row_number'),
+                    'excel_sheet_name': extra_fields.get('__excel_sheet_name', 'Unknown')
+                }
         
         # Collect all transaction IDs first, then bulk fetch them
         # This is more efficient and works better in transaction contexts
@@ -2036,6 +2137,14 @@ class ETLPipelineService:
                 # Get extra_fields for this row
                 extra_fields = extra_fields_list[idx] if idx < len(extra_fields_list) else {}
                 
+                # Apply substitutions to extra_fields before using them (like in _import_transactions_with_journal_entries)
+                substituted_extra_fields = self._apply_substitutions_to_extra_fields(
+                    extra_fields,
+                    auto_config,
+                    substitution_rules_cache=substitution_rules_cache,
+                    apply_substitution_fast=apply_substitution_fast
+                )
+                
                 try:
                     # Track JournalEntries created for this transaction
                     transaction_jes = []
@@ -2063,8 +2172,8 @@ class ETLPipelineService:
                         bank_designation_pending = True
                         logger.debug(f"ETL: Using pending bank account for Transaction {transaction_id}")
                     else:
-                        # Look up specific bank account
-                        bank_account_id_str = extra_fields.get(bank_account_field)
+                        # Look up specific bank account (use substituted extra_fields)
+                        bank_account_id_str = substituted_extra_fields.get(bank_account_field)
                         if bank_account_id_str:
                             try:
                                 bank_account_id = int(bank_account_id_str)
@@ -2080,9 +2189,9 @@ class ETLPipelineService:
                             except (ValueError, TypeError):
                                 pass
                     
-                    # Look up opposing account
+                    # Look up opposing account (use substituted extra_fields with substitutions applied)
                     opposing_account = None
-                    opposing_account_value = extra_fields.get(opposing_account_field)
+                    opposing_account_value = substituted_extra_fields.get(opposing_account_field)
                     
                     if opposing_account_value:
                         if opposing_account_lookup == 'path':
@@ -2109,10 +2218,10 @@ class ETLPipelineService:
                         bank_debit, bank_credit = None, abs_amount
                         opp_debit, opp_credit = abs_amount, None
                     
-                    # Look up cost center (optional)
+                    # Look up cost center (optional, use substituted extra_fields)
                     cost_center_id = None
                     if cost_center_field:
-                        cost_center_value = extra_fields.get(cost_center_field)
+                        cost_center_value = substituted_extra_fields.get(cost_center_field)
                         if cost_center_value:
                             # Could add cost center path lookup here if needed
                             try:
@@ -2298,6 +2407,17 @@ class ETLPipelineService:
                 import_result.setdefault('results', {})['JournalEntry'] = []
             
             for je_data in journal_entries_created:
+                # Get Excel row metadata from the transaction that created this JournalEntry
+                transaction_id = je_data.get('transaction_id')
+                excel_metadata = None
+                if transaction_id and transaction_id in transaction_to_excel_row_map:
+                    tx_row_info = transaction_to_excel_row_map[transaction_id]
+                    excel_metadata = {
+                        '__excel_row_id': tx_row_info['excel_row_id'],
+                        '__excel_row_number': tx_row_info['excel_row_number'],
+                        '__excel_sheet_name': tx_row_info['excel_sheet_name']
+                    }
+                
                 import_result['results']['JournalEntry'].append({
                     '__row_id': None,
                     'status': 'success',
@@ -2313,6 +2433,12 @@ class ETLPipelineService:
                     },
                     'message': f"Auto-created {je_data['type']} JournalEntry",
                 })
+                
+                # Add Excel metadata to the JournalEntry data if available
+                if excel_metadata:
+                    import_result['results']['JournalEntry'][-1]['data']['__excel_row_id'] = excel_metadata.get('__excel_row_id')
+                    import_result['results']['JournalEntry'][-1]['data']['__excel_row_number'] = excel_metadata.get('__excel_row_number')
+                    import_result['results']['JournalEntry'][-1]['data']['__excel_sheet_name'] = excel_metadata.get('__excel_sheet_name')
             
             logger.info(f"ETL: Auto-created {len(journal_entries_created)} JournalEntries")
     
@@ -2777,9 +2903,15 @@ class ETLPipelineService:
                                         # If no ID, include it (shouldn't happen for saved records)
                                         unique_records.append(record)
                                 
+                                # Limit records based on preview_record_limit (0 = show all, None/50 = default limit)
+                                if self.preview_record_limit == 0:
+                                    limited_records = unique_records
+                                else:
+                                    limited_records = unique_records[:self.preview_record_limit]
+                                
                                 preview['would_create'][model_name] = {
                                     'count': len(unique_records),
-                                    'records': unique_records[:50],  # First 50 records for better preview
+                                    'records': limited_records,  # Limited records for better preview (configurable via preview_record_limit)
                                     'total': len(unique_records)
                                 }
                             
@@ -2856,13 +2988,25 @@ class ETLPipelineService:
                                 existing_ids = {je.get('id') for je in existing_jes if je.get('id')}
                                 new_jes = [je for je in all_journal_entries if je.get('id') and je.get('id') not in existing_ids]
                                 if new_jes:
-                                    preview['would_create']['JournalEntry']['records'].extend(new_jes[:max(0, 50 - len(existing_jes))])
+                                    # Limit new records to fit within preview_record_limit
+                                    if self.preview_record_limit == 0:
+                                        limited_new_jes = new_jes
+                                    else:
+                                        remaining_slots = max(0, self.preview_record_limit - len(existing_jes))
+                                        limited_new_jes = new_jes[:remaining_slots]
+                                    preview['would_create']['JournalEntry']['records'].extend(limited_new_jes)
                                     preview['would_create']['JournalEntry']['count'] = existing_count + len(new_jes)
                                     preview['would_create']['JournalEntry']['total'] = existing_count + len(new_jes)
                             else:
+                                # Limit records based on preview_record_limit (0 = show all, None/50 = default limit)
+                                if self.preview_record_limit == 0:
+                                    limited_jes = all_journal_entries
+                                else:
+                                    limited_jes = all_journal_entries[:self.preview_record_limit]
+                                
                                 preview['would_create']['JournalEntry'] = {
                                     'count': len(all_journal_entries),
-                                    'records': all_journal_entries[:50],  # First 50 records
+                                    'records': limited_jes,  # Limited records (configurable via preview_record_limit)
                                     'total': len(all_journal_entries)
                                 }
                         
@@ -3723,10 +3867,16 @@ class ETLPipelineService:
             'integration_rules_preview': import_result.get('integration_rules_preview', [])
         }
         
-        return {
+        result = {
             'rows': rows,
             'transformations': transformations
         }
+        
+        # Add 'created' structure for execute mode (actual created records)
+        if 'created' in import_result:
+            result['created'] = import_result['created']
+        
+        return result
     
     def _build_response(self, start_time: float, success: bool, import_result: dict = None) -> dict:
         """
