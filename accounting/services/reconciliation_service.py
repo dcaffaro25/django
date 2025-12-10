@@ -4044,10 +4044,22 @@ class ReconciliationService:
                 continue
             company_id = company_ids.pop()
 
+            # Build notes metadata for automatic reconciliation
+            from multitenancy.utils import build_notes_metadata
+            
+            reconciliation_notes = build_notes_metadata(
+                source='Reconciliation',
+                function='ReconciliationService._apply_auto_matches_100',
+                reconciliation_type='automatic',
+                auto_match_confidence='100%',
+                bank_ids=', '.join(str(bid) for bid in bank_ids),
+                journal_ids=', '.join(str(jid) for jid in book_ids),
+            )
+
             recon = Reconciliation.objects.create(
                 status=status_value,
                 company_id=company_id,
-                notes="auto_match_100",
+                notes=reconciliation_notes,
             )
             recon.bank_transactions.add(*bank_objs)
             recon.journal_entries.add(*book_objs)

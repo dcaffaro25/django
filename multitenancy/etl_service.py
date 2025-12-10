@@ -1362,6 +1362,29 @@ class ETLPipelineService:
         if account_path_rules:
             logger.info(f"ETL DEBUG: Pre-loaded {len(account_path_rules)} substitution rules for Account.path")
         
+        def normalize_path_separators(path_str: str) -> str:
+            """
+            Normalize path separators to a consistent format.
+            Converts backslashes and various arrow formats to ' > ' (space-greater-space).
+            """
+            if not path_str or not isinstance(path_str, str):
+                return path_str
+            
+            # Replace backslashes with ' > '
+            normalized = path_str.replace('\\', ' > ')
+            
+            # Replace standalone '>' (not part of ' > ') with ' > '
+            # Use regex to match '>' that's not surrounded by spaces
+            normalized = re.sub(r'(?<! )>(?! )', ' > ', normalized)
+            
+            # Clean up multiple spaces (this will also fix any ' >  > ' issues)
+            normalized = ' '.join(normalized.split())
+            
+            # Strip leading/trailing spaces
+            normalized = normalized.strip()
+            
+            return normalized
+        
         def apply_substitution_fast(value: Any, model_name: str, field_name: str, row_context: dict = None) -> Any:
             """
             Fast substitution using pre-loaded rules cache.
@@ -1390,6 +1413,15 @@ class ETLPipelineService:
             # Apply rules in order (first match wins)
             row_context = row_context or {}
             logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Row context: {row_context}")
+            
+            # For account_path fields, normalize path separators before comparison
+            is_account_path_field = (field_name == 'account_path' or field_name.endswith('_path'))
+            if is_account_path_field and isinstance(value, str):
+                value_normalized = normalize_path_separators(value)
+                logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Normalized account_path value: '{value}' -> '{value_normalized}'")
+            else:
+                value_normalized = value
+            
             for idx, rl in enumerate(rules):
                 rule_title = getattr(rl, 'title', f'Rule {rl.id}')
                 logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Checking rule {idx + 1}/{len(rules)}: ID={rl.id}, title='{rule_title}', match_type='{rl.match_type}', match_value='{rl.match_value}', substitution_value='{rl.substitution_value}'")
@@ -1408,9 +1440,19 @@ class ETLPipelineService:
                 mv = rl.match_value
                 sv = rl.substitution_value
                 
+                # For account_path fields, normalize match_value as well
+                if is_account_path_field and isinstance(mv, str):
+                    mv_normalized = normalize_path_separators(mv)
+                    logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Normalized account_path match_value: '{mv}' -> '{mv_normalized}'")
+                else:
+                    mv_normalized = mv
+                
                 if mt == "exact":
-                    logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} exact match: '{value}' == '{mv}'? {value == mv}")
-                    if value == mv:
+                    # Use normalized values for account_path fields, original values otherwise
+                    compare_value = value_normalized if is_account_path_field else value
+                    compare_match = mv_normalized if is_account_path_field else mv
+                    logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} exact match: '{compare_value}' == '{compare_match}'? {compare_value == compare_match}")
+                    if compare_value == compare_match:
                         logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} MATCHED! Returning substitution: '{sv}'")
                         return sv
                 elif mt == "regex":

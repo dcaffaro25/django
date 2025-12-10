@@ -111,3 +111,85 @@ class ETLPreviewHTMLView(View):
                 'traceback': traceback.format_exc()
             }, status=500)
 
+
+class ETLExecuteHTMLView(View):
+    """
+    HTML view for ETL Execute with file upload form.
+    
+    GET: Shows upload form
+    POST: Processes file and commits to database
+    """
+    
+    template_name = 'multitenancy/etl_execute.html'
+    
+    def get(self, request):
+        """Show the file upload form."""
+        companies = Company.objects.filter(is_deleted=False).order_by('name')
+        context = {
+            'companies': companies,
+        }
+        return render(request, self.template_name, context)
+    
+    def post(self, request):
+        """Process the uploaded file and return JSON response."""
+        if 'file' not in request.FILES:
+            return JsonResponse({
+                'error': 'No file provided. Upload an Excel file.'
+            }, status=400)
+        
+        company_id = request.POST.get('company_id')
+        if not company_id:
+            return JsonResponse({
+                'error': 'No company_id provided.'
+            }, status=400)
+        
+        try:
+            company_id = int(company_id)
+        except (ValueError, TypeError):
+            return JsonResponse({
+                'error': f'Invalid company_id: {company_id}'
+            }, status=400)
+        
+        file = request.FILES['file']
+        
+        # Extract auto_create_journal_entries from request (can be JSON string or dict)
+        auto_create_journal_entries = None
+        if 'auto_create_journal_entries' in request.POST:
+            import json
+            auto_create_val = request.POST.get('auto_create_journal_entries')
+            if isinstance(auto_create_val, str):
+                try:
+                    auto_create_journal_entries = json.loads(auto_create_val)
+                except json.JSONDecodeError:
+                    auto_create_journal_entries = {}
+            elif isinstance(auto_create_val, dict):
+                auto_create_journal_entries = auto_create_val
+        
+        # Extract row_limit from request (default: 10, 0 = process all rows)
+        row_limit = 10  # Default for testing
+        if 'row_limit' in request.POST:
+            try:
+                row_limit = int(request.POST.get('row_limit'))
+            except (ValueError, TypeError):
+                row_limit = 10  # Fallback to default
+        
+        try:
+            service = ETLPipelineService(
+                company_id=company_id,
+                file=file,
+                commit=True,  # Execute mode - actually commit to database
+                auto_create_journal_entries=auto_create_journal_entries,
+                row_limit=row_limit
+            )
+            
+            result = service.execute()
+            result = _scrub_json(result)
+            
+            return JsonResponse(result, status=200 if result.get('success') else 400)
+            
+        except Exception as e:
+            import traceback
+            return JsonResponse({
+                'error': str(e),
+                'traceback': traceback.format_exc()
+            }, status=500)

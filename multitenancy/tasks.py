@@ -68,7 +68,7 @@ def trigger_integration_event(company_id: int, event_name: str, payload: dict):
     from multitenancy.models import IntegrationRule
     rules = (
         IntegrationRule.objects
-        .filter(company_id=company_id, is_active=True, triggers__icontains=event_name)
+        .filter(company_id=company_id, is_active=True, trigger_event=event_name)
         .order_by("execution_order")
     )
     for rule in rules:

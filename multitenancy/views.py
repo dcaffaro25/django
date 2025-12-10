@@ -654,7 +654,7 @@ class IntegrationRuleViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         rule = self.get_object()
         payload = request.data.get("payload", {})
         if rule.use_celery:
-            res = trigger_integration_event.delay(rule.company_id, rule.triggers, payload)
+            res = trigger_integration_event.delay(rule.company_id, rule.trigger_event, payload)
             return Response({"task_id": res.id}, status=status.HTTP_202_ACCEPTED)
         else:
             result = rule.run_rule(payload)
