@@ -819,20 +819,72 @@ class ETLPipelineService:
         """
         # Wrap everything in a single atomic transaction
         with transaction.atomic():
-            # Extract __extra_fields__ from rows before import (they're not model fields)
+            # Extract extra_fields and filter invalid model fields before import (same as preview)
+            # This ensures fields like 'account_path' that aren't valid Transaction fields
+            # are still available in extra_fields for opposing account lookup
             self.extra_fields_by_model = {}
+            cleaned_data: Dict[str, List[dict]] = {}
             
             for model_name, rows in self.transformed_data.items():
                 self.extra_fields_by_model[model_name] = []
+                cleaned_data[model_name] = []
+                
+                # Get valid model fields
+                app_label = MODEL_APP_MAP.get(model_name)
+                valid_fields = set()
+                if app_label:
+                    try:
+                        model = apps.get_model(app_label, model_name)
+                        valid_fields = {f.name for f in model._meta.fields}
+                        # Also include _id variants for ForeignKey
+                        for f in model._meta.fields:
+                            if hasattr(f, 'column'):
+                                valid_fields.add(f.column)
+                    except LookupError:
+                        pass
+                
                 for row in rows:
+                    # Extract __extra_fields__ first
                     extra_fields = row.pop('__extra_fields__', {})
+                    
+                    # Preserve Excel row metadata for tracking/grouping
+                    # Note: We extract these but also keep them in row for execute_import_job
+                    excel_row_number = row.pop('__excel_row_number', None)
+                    excel_sheet_name = row.pop('__excel_sheet_name', None)
+                    excel_row_id = row.pop('__excel_row_id', None)
+                    
+                    # Move invalid fields to extra_fields (same logic as preview)
+                    cleaned_row = {}
+                    invalid_fields = {}
+                    for key, value in row.items():
+                        # Check if this is a valid model field
+                        field_name = key.replace('_id', '') if key.endswith('_id') else key
+                        if key in valid_fields or field_name in valid_fields or not valid_fields:
+                            cleaned_row[key] = value
+                        else:
+                            invalid_fields[key] = value
+                    
+                    # Merge invalid fields into extra_fields
+                    extra_fields.update(invalid_fields)
+                    
+                    # Store Excel metadata in extra_fields so it's available for grouping
+                    if excel_row_number is not None:
+                        extra_fields['__excel_row_number'] = excel_row_number
+                    if excel_sheet_name is not None:
+                        extra_fields['__excel_sheet_name'] = excel_sheet_name
+                    if excel_row_id is not None:
+                        extra_fields['__excel_row_id'] = excel_row_id
+                        # Also keep it in cleaned_row for execute_import_job to use
+                        cleaned_row['__excel_row_id'] = excel_row_id
+                    
                     self.extra_fields_by_model[model_name].append(extra_fields)
+                    cleaned_data[model_name].append(cleaned_row)
             
             # Convert to sheets format expected by execute_import_job
             # Also track which transformation rule was used for each model to get sheet name
             # IMPORTANT: Set __row_id from __excel_row_id so outputs can be mapped back
             sheets = []
-            for model_name, rows in self.transformed_data.items():
+            for model_name, rows in cleaned_data.items():
                 # Get sheet name from transformation rule if available
                 sheet_name = None
                 rule = self.transformation_rules.get(model_name)
@@ -2480,7 +2532,7 @@ class ETLPipelineService:
                             if hasattr(opposing_je, 'notes'):
                                 from multitenancy.utils import build_notes_metadata
                                 from crum import get_current_user
-                                
+
                                 current_user = get_current_user()
                                 user_name = current_user.username if current_user and current_user.is_authenticated else None
                                 user_id = current_user.id if current_user and current_user.is_authenticated else None
