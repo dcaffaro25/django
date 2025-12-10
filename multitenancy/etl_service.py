@@ -909,10 +909,6 @@ class ETLPipelineService:
             if not sheets:
                 return {'message': 'No data to import'}
             
-            # Use existing import logic
-            # Note: execute_import_job has its own transaction.atomic(), which becomes
-            # a savepoint within this outer transaction, allowing proper rollback
-            
             # Build import metadata for notes
             import_metadata = {
                 'source': 'ETL',
@@ -921,13 +917,53 @@ class ETLPipelineService:
                 'log_id': self.log.id if self.log else None,
             }
             
-            result = execute_import_job(
-                company_id=self.company_id,
-                sheets=sheets,
-                commit=True,  # This will commit the inner transaction, but outer transaction wraps everything
-                lookup_cache=self.lookup_cache,
-                import_metadata=import_metadata
-            )
+            # Separate Transaction sheets from other sheets when auto_create_journal_entries is enabled
+            # This ensures Transactions and JournalEntries are created together in the same transaction
+            transaction_sheets = []
+            other_sheets = []
+            if self.auto_create_journal_entries and self.auto_create_journal_entries.get('enabled', False):
+                transaction_sheets = [s for s in sheets if s.get('model') == 'Transaction']
+                other_sheets = [s for s in sheets if s.get('model') != 'Transaction']
+            else:
+                other_sheets = sheets
+            
+            # Process Transactions with JournalEntries in the same transaction (if enabled)
+            transaction_import_result = None
+            if transaction_sheets and self.auto_create_journal_entries:
+                logger.info(f"ETL: Processing {len(transaction_sheets)} Transaction sheet(s) with auto-created JournalEntries")
+                transaction_import_result = self._import_transactions_with_journal_entries(
+                    transaction_sheets, 
+                    self.extra_fields_by_model.get('Transaction', [])
+                )
+            
+            # Process other sheets normally
+            other_import_result = None
+            if other_sheets:
+                logger.info(f"ETL: Processing {len(other_sheets)} non-Transaction sheet(s)")
+                other_import_result = execute_import_job(
+                    company_id=self.company_id,
+                    sheets=other_sheets,
+                    commit=True,  # This will commit the inner transaction, but outer transaction wraps everything
+                    lookup_cache=self.lookup_cache,
+                    import_metadata=import_metadata
+                )
+            
+            # Merge results
+            result = {'imports': []}
+            if transaction_import_result:
+                result['imports'].extend(transaction_import_result.get('imports', []))
+            if other_import_result:
+                result['imports'].extend(other_import_result.get('imports', []))
+            
+            # If no separate processing happened, process all sheets normally
+            if not transaction_import_result and not other_import_result:
+                result = execute_import_job(
+                    company_id=self.company_id,
+                    sheets=sheets,
+                    commit=True,  # This will commit the inner transaction, but outer transaction wraps everything
+                    lookup_cache=self.lookup_cache,
+                    import_metadata=import_metadata
+                )
             
             # Normalize result format: execute_import_job returns {'imports': [...]}
             # Convert to {'results': {model_name: [outputs]}} format
@@ -949,9 +985,14 @@ class ETLPipelineService:
                 self.log.total_rows_imported = sum(records_created.values())
                 self.log.save()
             
-            # Auto-create JournalEntries for Transactions (if enabled in request)
-            # This runs inside the same transaction - if it fails, everything rolls back
-            self._auto_create_journal_entries(normalized_result, self.extra_fields_by_model)
+            # Auto-create JournalEntries for Transactions (only if Transactions were NOT processed separately)
+            # If Transactions were processed with _import_transactions_with_journal_entries, JournalEntries are already created
+            if transaction_sheets and self.auto_create_journal_entries and self.auto_create_journal_entries.get('enabled', False):
+                # Transactions were processed with _import_transactions_with_journal_entries, so JournalEntries are already created
+                logger.info(f"ETL: Skipping _auto_create_journal_entries - JournalEntries already created in _import_transactions_with_journal_entries")
+            else:
+                # Transactions were processed normally, so create JournalEntries now
+                self._auto_create_journal_entries(normalized_result, self.extra_fields_by_model)
             
             # Trigger IntegrationRule events for created records (backward compatible)
             # This also runs inside the same transaction - if any trigger fails, everything rolls back
@@ -1914,7 +1955,15 @@ class ETLPipelineService:
         if len(transaction_outputs) > 0:
             logger.info(f"ETL DEBUG: Average time per transaction: {total_time/len(transaction_outputs):.3f}s")
         
-        return result
+        # Build result dict in the format expected by execute_import_job
+        transaction_import_result = {'imports': []}
+        if transaction_outputs:
+            transaction_import_result['imports'].append({
+                'model': 'Transaction',
+                'result': transaction_outputs
+            })
+        
+        return transaction_import_result
         
         bank_account_field = auto_config.get('bank_account_field', 'bank_account_id')
         opposing_account_field = auto_config.get('opposing_account_field', 'account_path')
