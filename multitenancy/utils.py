@@ -1559,77 +1559,7 @@ def match_many_to_many_with_set4(self, request, tenant_id):
     return Response({"suggestions": unique_suggestions})
 
 
-class Account(TenantAwareBaseModel):
-    account_code = models.CharField(max_length=100)
-    name = models.CharField(max_length=100)
-    type = models.CharField(max_length=50)
-    account_direction = models.IntegerField()
-    balance_date = models.DateField()
-    balance = models.DecimalField(max_digits=12, decimal_places=2)
-    currency = models.ForeignKey(Currency, on_delete=models.CASCADE)
-    bank_account = models.ForeignKey(BankAccount, on_delete=models.CASCADE, null=True, blank=True)
-    is_active = models.BooleanField(default=True)
-    
-    class Meta:
-        unique_together = ('company', 'account_code', 'name')
-        
-    def __str__(self):
-        return f'({self.id}) {self.company} - {self.account_code} - {self.name}'
-        
-    def get_depth(self):
-        return len(self.account_code.split('-'))
-    
-    def get_current_balance(self):
-        last_balance_date = self.balance_date
-        validated_balance = self.balance
-
-        transactions = JournalEntry.objects.filter(
-            account=self,
-            transaction__date__gt=last_balance_date,
-            transaction__state='posted',
-            transaction__balance_validated=False  # <-- include only not yet validated transactions
-        ).aggregate(
-            total_debit=Sum('debit_amount'),
-            total_credit=Sum('credit_amount')
-        )
-
-        total_debit = transactions['total_debit'] or Decimal('0.00')
-        total_credit = transactions['total_credit'] or Decimal('0.00')
-
-        effective_amount = (total_debit - total_credit) * self.account_direction
-
-        current_balance = validated_balance + effective_amount
-
-        return current_balance
-    
-    def calculate_balance(self, include_pending=False, beginning_date=None, end_date=None):
-        entries = self.journal_entries.filter(state='posted')
-        if include_pending:
-            entries = entries | self.journal_entries.filter(state='pending')
-
-        # Apply date filters if provided
-        date_filter = Q()
-        if beginning_date:
-            date_filter &= Q(date__gte=beginning_date)
-        if end_date:
-            date_filter &= Q(date__lte=end_date)
-        
-        entries = entries.filter(date_filter)
-
-        return entries.aggregate(balance=Sum('amount'))['balance']
-
-    @staticmethod
-    def get_accounts_summary(company_id, entity_id=None, min_depth=1, include_pending=False, beginning_date=None, end_date=None):
-        Account = apps.get_model('accounting', 'Account') 
-        accounts_query = Account.objects.filter(company_id=company_id, depth__gte=min_depth)
-
-        if entity_id:
-            accounts_query = accounts_query.filter(entity_id=entity_id)
-
-        accounts = accounts_query.annotate(depth=Length('account_code'))
-        return [(account, account.calculate_balance(include_pending, beginning_date, end_date)) for account in accounts]
-
-
+'''
 def build_notes_metadata(
     source: str,
     filename: str = None,
@@ -1690,6 +1620,3 @@ def build_notes_metadata(
             parts.append(f"{formatted_key}: {value}")
     
     return "\n".join(parts)
-
-
-'''
