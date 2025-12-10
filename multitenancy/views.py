@@ -926,13 +926,9 @@ class ETLPipelineExecuteView(APIView):
         permission_classes = [permissions.IsAuthenticated]
     
     def post(self, request, tenant_id=None):
-        # Check if multiple files or single file
-        files = request.FILES.getlist('file') if 'file' in request.FILES else []
-        use_celery = request.data.get('use_celery', 'false').lower() in ('true', '1', 'yes')
-        
-        if not files:
+        if 'file' not in request.FILES:
             return Response(
-                {'error': 'No file(s) provided. Upload one or more Excel files.'},
+                {'error': 'No file provided. Upload an Excel file.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
@@ -948,7 +944,15 @@ class ETLPipelineExecuteView(APIView):
         import json
         import hashlib
         
-        # Extract auto_create_journal_entries from request
+        # Check if multiple files or single file
+        files = request.FILES.getlist('file') if 'file' in request.FILES else []
+        use_celery = request.data.get('use_celery', 'false').lower() in ('true', '1', 'yes')
+        
+        # Single file processing
+        if len(files) == 1:
+            file = files[0]
+        
+        # Extract auto_create_journal_entries from request (can be JSON string or dict)
         auto_create_journal_entries = None
         if 'auto_create_journal_entries' in request.data:
             auto_create_val = request.data.get('auto_create_journal_entries')
@@ -972,112 +976,19 @@ class ETLPipelineExecuteView(APIView):
             except (ValueError, TypeError):
                 row_limit = 10  # Fallback to default
         
-        # Single file processing
-        if len(files) == 1:
-            file = files[0]
-            
-            # Process with Celery or synchronously
-            if use_celery:
-                # Read file data and compute hash
-                file_data = file.read()
-                file_hash = hashlib.sha256(file_data).hexdigest()
-                file.seek(0)
-                
-                # Create ETL log entry
-                from .models import ETLPipelineLog
-                log = ETLPipelineLog.objects.create(
-                    company_id=int(company_id),
-                    file_name=file.name,
-                    file_hash=file_hash,
-                    status='pending',
-                    is_preview=False,
-                )
-                
-                # Queue async task
-                async_res = process_etl_file_task.delay(
-                    company_id=int(company_id),
-                    file_data=file_data,
-                    file_name=file.name,
-                    file_hash=file_hash,
-                    commit=True,
-                    auto_create_journal_entries=auto_create_journal_entries,
-                    row_limit=row_limit,
-                    log_id=log.id
-                )
-                
-                return Response({
-                    "task_id": async_res.id,
-                    "log_id": log.id,
-                    "message": "ETL pipeline scheduled",
-                    "status_url": f"/api/tasks/{async_res.id}/status/"
-                }, status=status.HTTP_202_ACCEPTED)
-            
-            # Synchronous processing
-            service = ETLPipelineService(
-                company_id=int(company_id),
-                file=file,
-                commit=True,  # Execute mode
-                auto_create_journal_entries=auto_create_journal_entries,
-                row_limit=row_limit
-            )
-            
-            result = service.execute()
-            result = _scrub_json(result)
-            
-            http_status = status.HTTP_200_OK if result.get('success') else status.HTTP_400_BAD_REQUEST
-            return Response(result, status=http_status)
+        service = ETLPipelineService(
+            company_id=int(company_id),
+            file=file,
+            commit=True,  # Execute mode
+            auto_create_journal_entries=auto_create_journal_entries,
+            row_limit=row_limit
+        )
         
-        # Multiple files processing
-        else:
-            # Process with Celery or synchronously
-            if use_celery:
-                # Prepare files for batch processing
-                files_data = []
-                for file in files:
-                    file_data = file.read()
-                    file_hash = hashlib.sha256(file_data).hexdigest()
-                    files_data.append({
-                        'data': file_data,
-                        'name': file.name,
-                        'hash': file_hash,
-                    })
-                
-                # Queue async batch task
-                async_res = process_etl_batch_task.delay(
-                    company_id=int(company_id),
-                    files=files_data,
-                    commit=True,
-                    auto_create_journal_entries=auto_create_journal_entries,
-                    row_limit=row_limit
-                )
-                
-                return Response({
-                    "task_id": async_res.id,
-                    "message": f"ETL batch scheduled for {len(files)} files",
-                    "status_url": f"/api/tasks/{async_res.id}/status/"
-                }, status=status.HTTP_202_ACCEPTED)
-            
-            # Synchronous batch processing (process sequentially)
-            batch_results = []
-            for file in files:
-                service = ETLPipelineService(
-                    company_id=int(company_id),
-                    file=file,
-                    commit=True,
-                    auto_create_journal_entries=auto_create_journal_entries,
-                    row_limit=row_limit
-                )
-                result = service.execute()
-                batch_results.append({
-                    'file_name': file.name,
-                    'result': _scrub_json(result),
-                })
-            
-            return Response({
-                'batch_results': batch_results,
-                'total_files': len(files),
-                'completed': len([r for r in batch_results if r['result'].get('success')]),
-            }, status=status.HTTP_200_OK)
+        result = service.execute()
+        result = _scrub_json(result)
+        
+        http_status = status.HTTP_200_OK if result.get('success') else status.HTTP_400_BAD_REQUEST
+        return Response(result, status=http_status)
 
 
 class ETLPipelineAnalyzeView(APIView):
