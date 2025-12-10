@@ -1559,6 +1559,7 @@ def match_many_to_many_with_set4(self, request, tenant_id):
     return Response({"suggestions": unique_suggestions})
 
 
+'''
 def build_notes_metadata(
     source: str,
     filename: str = None,
