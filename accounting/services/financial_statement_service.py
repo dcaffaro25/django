@@ -100,7 +100,52 @@ class FinancialStatementGenerator:
         line_templates = template.line_templates.all().order_by('line_number')
         line_values: Dict[int, Decimal] = {}  # line_number -> calculated value
         
+        log.info(
+            "="*80 + "\n"
+            "STARTING FINANCIAL STATEMENT GENERATION\n"
+            "="*80 + "\n"
+            "Template: %s (ID: %s)\n"
+            "Report Type: %s\n"
+            "Company ID: %s\n"
+            "Period: %s to %s\n"
+            "As of Date: %s\n"
+            "Include Pending: %s\n"
+            "Total Line Templates: %s\n"
+            "="*80,
+            template.name,
+            template.id,
+            template.report_type,
+            self.company_id,
+            start_date,
+            end_date,
+            as_of_date,
+            include_pending,
+            line_templates.count(),
+        )
+        
         for line_template in line_templates:
+            log.info(
+                "\n" + "-"*80 + "\n"
+                "PROCESSING LINE %s: %s\n"
+                "-"*80 + "\n"
+                "Line Type: %s\n"
+                "Calculation Type: %s\n"
+                "Formula: %s\n"
+                "Account ID: %s\n"
+                "Account IDs: %s\n"
+                "Account Code Prefix: %s\n"
+                "Account Path Contains: %s",
+                line_template.line_number,
+                line_template.label,
+                line_template.line_type,
+                line_template.calculation_type,
+                line_template.formula or 'None',
+                line_template.account_id or 'None',
+                line_template.account_ids or 'None',
+                line_template.account_code_prefix or 'None',
+                line_template.account_path_contains or 'None',
+            )
+            
             value = self._calculate_line_value(
                 line_template,
                 start_date,
@@ -111,6 +156,12 @@ class FinancialStatementGenerator:
                 include_pending=include_pending,
             )
             line_values[line_template.line_number] = value
+            
+            log.info(
+                "Line %s calculated value: %s",
+                line_template.line_number,
+                value
+            )
             
             # Create line record
             FinancialStatementLine.objects.create(
@@ -185,6 +236,32 @@ class FinancialStatementGenerator:
         line_templates = template.line_templates.all().order_by('line_number')
         line_values: Dict[int, Decimal] = {}
         lines_data = []
+        
+        log.info(
+            "="*80 + "\n"
+            "STARTING FINANCIAL STATEMENT PREVIEW\n"
+            "="*80 + "\n"
+            "Template: %s (ID: %s)\n"
+            "Report Type: %s\n"
+            "Company ID: %s\n"
+            "Period: %s to %s\n"
+            "As of Date: %s\n"
+            "Include Pending: %s\n"
+            "Currency: %s (ID: %s)\n"
+            "Total Line Templates: %s\n"
+            "="*80,
+            template.name,
+            template.id,
+            template.report_type,
+            self.company_id,
+            start_date,
+            end_date,
+            as_of_date,
+            include_pending,
+            currency.code if currency else 'None',
+            currency.id if currency else 'None',
+            line_templates.count(),
+        )
         
         for line_template in line_templates:
             value = self._calculate_line_value(
@@ -262,18 +339,38 @@ class FinancialStatementGenerator:
     ) -> Decimal:
         """Calculate the value for a single line item."""
         
+        log.debug(
+            "Calculating line value for line %s (%s) - Type: %s, Calc Type: %s",
+            line_template.line_number,
+            line_template.label,
+            line_template.line_type,
+            line_template.calculation_type
+        )
+        
         # Handle different line types
         if line_template.line_type in ('header', 'spacer'):
+            log.debug("Line %s is header/spacer, returning 0.00", line_template.line_number)
             return Decimal('0.00')
         
         # Handle formula-based lines
         if line_template.calculation_type == 'formula' and line_template.formula:
-            return self._evaluate_formula(line_template.formula, line_values)
+            log.info("Line %s uses formula: %s", line_template.line_number, line_template.formula)
+            result = self._evaluate_formula(line_template.formula, line_values)
+            log.info("Line %s formula result: %s", line_template.line_number, result)
+            return result
         
         # Get accounts for this line
+        log.debug("Getting accounts for line %s", line_template.line_number)
         accounts = self._get_accounts_for_line(line_template)
         if not accounts:
+            log.warning("No accounts found for line %s (%s)", line_template.line_number, line_template.label)
             return Decimal('0.00')
+        
+        log.info(
+            "Line %s will use %s account(s) for calculation",
+            line_template.line_number,
+            len(accounts)
+        )
         
         # Calculate based on report type
         if report_type == 'balance_sheet':
@@ -489,35 +586,135 @@ class FinancialStatementGenerator:
         line_template: FinancialStatementLineTemplate,
     ) -> List[Account]:
         """Get accounts that contribute to this line."""
+        log.debug(
+            "Getting accounts for line %s - Account ID: %s, Account IDs: %s, "
+            "Code Prefix: %s, Path Contains: %s",
+            line_template.line_number,
+            line_template.account_id,
+            line_template.account_ids,
+            line_template.account_code_prefix,
+            line_template.account_path_contains,
+        )
+        
         accounts = Account.objects.filter(company_id=self.company_id)
+        initial_count = accounts.count()
         
         # Filter by specific account
         if line_template.account:
+            log.info(
+                "Line %s: Using specific account %s (ID: %s, Code: %s, Name: %s)",
+                line_template.line_number,
+                line_template.account.id,
+                line_template.account.id,
+                line_template.account.account_code,
+                line_template.account.name,
+            )
             # Expand parent account to include all leaf descendants
-            return self._expand_to_leaf_accounts([line_template.account])
+            expanded = self._expand_to_leaf_accounts([line_template.account])
+            log.info(
+                "Line %s: Expanded account %s to %s leaf account(s)",
+                line_template.line_number,
+                line_template.account.id,
+                len(expanded),
+            )
+            return expanded
         
         # Filter by account IDs
         if line_template.account_ids:
+            log.info(
+                "Line %s: Filtering by account IDs: %s",
+                line_template.line_number,
+                line_template.account_ids,
+            )
             accounts = list(accounts.filter(id__in=line_template.account_ids))
+            log.info(
+                "Line %s: Found %s account(s) matching IDs",
+                line_template.line_number,
+                len(accounts),
+            )
         # Filter by code prefix
         elif line_template.account_code_prefix:
+            log.info(
+                "Line %s: Filtering by account code prefix: %s",
+                line_template.line_number,
+                line_template.account_code_prefix,
+            )
             accounts = list(accounts.filter(
                 account_code__startswith=line_template.account_code_prefix
             ))
+            log.info(
+                "Line %s: Found %s account(s) with code prefix %s",
+                line_template.line_number,
+                len(accounts),
+                line_template.account_code_prefix,
+            )
         # Filter by path contains
         elif line_template.account_path_contains:
+            log.info(
+                "Line %s: Filtering by account path contains: %s",
+                line_template.line_number,
+                line_template.account_path_contains,
+            )
             # This requires checking account paths - simplified for now
             matching_accounts = []
             for account in accounts:
-                if line_template.account_path_contains in account.get_path():
+                account_path = account.get_path()
+                if line_template.account_path_contains in account_path:
                     matching_accounts.append(account)
+                    log.debug(
+                        "Line %s: Account %s (ID: %s) matches path filter - Path: %s",
+                        line_template.line_number,
+                        account.name,
+                        account.id,
+                        account_path,
+                    )
             accounts = matching_accounts
+            log.info(
+                "Line %s: Found %s account(s) matching path filter",
+                line_template.line_number,
+                len(accounts),
+            )
         else:
+            log.warning(
+                "Line %s: No account filter specified, using all accounts (count: %s)",
+                line_template.line_number,
+                initial_count,
+            )
             accounts = list(accounts)
+        
+        # Log account details before expansion
+        if accounts:
+            log.info(
+                "Line %s: Accounts before expansion (%s total):",
+                line_template.line_number,
+                len(accounts),
+            )
+            for acc in accounts[:10]:  # Log first 10
+                log.info(
+                    "  - Account ID: %s, Code: %s, Name: %s, Is Leaf: %s, "
+                    "Parent: %s, Direction: %s",
+                    acc.id,
+                    acc.account_code,
+                    acc.name,
+                    acc.is_leaf(),
+                    acc.parent_id if acc.parent else 'None',
+                    acc.account_direction,
+                )
+            if len(accounts) > 10:
+                log.info("  ... and %s more account(s)", len(accounts) - 10)
         
         # Expand all accounts to their leaf descendants
         # This ensures parent accounts are replaced by their leaf children
-        return self._expand_to_leaf_accounts(accounts)
+        expanded_accounts = self._expand_to_leaf_accounts(accounts)
+        
+        log.info(
+            "Line %s: Expanded %s account(s) to %s leaf account(s)",
+            line_template.line_number,
+            len(accounts),
+            len(expanded_accounts),
+        )
+        
+        return expanded_accounts
     
     def _expand_to_leaf_accounts(self, accounts: List[Account]) -> List[Account]:
         """
@@ -537,45 +734,89 @@ class FinancialStatementGenerator:
         """
         leaf_accounts = []
         
-        log.debug(
-            "Expanding %s accounts to leaf accounts",
+        log.info(
+            "Expanding %s account(s) to leaf accounts",
             len(accounts)
         )
         
-        for account in accounts:
+        for idx, account in enumerate(accounts, 1):
+            log.info(
+                "[%s/%s] Processing account: ID=%s, Code=%s, Name=%s, Is Leaf=%s, "
+                "Parent ID=%s, Level=%s, Direction=%s",
+                idx,
+                len(accounts),
+                account.id,
+                account.account_code,
+                account.name,
+                account.is_leaf(),
+                account.parent_id if account.parent else 'None',
+                account.level if hasattr(account, 'level') else 'N/A',
+                account.account_direction,
+            )
+            
             if account.is_leaf():
                 # Leaf account: include directly
                 leaf_accounts.append(account)
-                log.debug(
-                    "Including leaf account %s (id=%s, bank_account_id=%s)",
+                log.info(
+                    "  ✓ Leaf account included: %s (ID: %s, Code: %s, Bank Account ID: %s)",
                     account.name,
                     account.id,
-                    account.bank_account_id
+                    account.account_code,
+                    account.bank_account_id or 'None',
                 )
             else:
                 # Parent account: get all leaf descendants
+                log.info(
+                    "  → Parent account detected, expanding to leaf descendants..."
+                )
                 leaf_descendants = self._get_leaf_descendants(account)
                 leaf_accounts.extend(leaf_descendants)
-                log.debug(
-                    "Expanded parent account %s (id=%s) to %s leaf accounts: %s",
+                log.info(
+                    "  ✓ Expanded parent account %s (ID: %s) to %s leaf account(s)",
                     account.name,
                     account.id,
                     len(leaf_descendants),
-                    [(acc.name, acc.id, acc.bank_account_id) for acc in leaf_descendants]
                 )
+                if leaf_descendants:
+                    log.info("  Leaf descendants:")
+                    for desc in leaf_descendants:
+                        log.info(
+                            "    - %s (ID: %s, Code: %s, Bank Account ID: %s, Direction: %s)",
+                            desc.name,
+                            desc.id,
+                            desc.account_code,
+                            desc.bank_account_id or 'None',
+                            desc.account_direction,
+                        )
+                else:
+                    log.warning(
+                        "  ⚠ Parent account %s (ID: %s) has no leaf descendants!",
+                        account.name,
+                        account.id,
+                    )
         
         # Remove duplicates by ID
         seen_ids = set()
         unique_leaf_accounts = []
+        duplicates = []
         for acc in leaf_accounts:
             if acc.id not in seen_ids:
                 seen_ids.add(acc.id)
                 unique_leaf_accounts.append(acc)
+            else:
+                duplicates.append(acc.id)
         
-        log.debug(
-            "Expanded to %s unique leaf accounts (from %s original accounts)",
+        if duplicates:
+            log.warning(
+                "Found %s duplicate account(s) in expansion (IDs: %s)",
+                len(duplicates),
+                duplicates[:10],  # Show first 10
+            )
+        
+        log.info(
+            "Expansion complete: %s original account(s) → %s unique leaf account(s)",
+            len(accounts),
             len(unique_leaf_accounts),
-            len(accounts)
         )
         
         return unique_leaf_accounts
@@ -598,39 +839,66 @@ class FinancialStatementGenerator:
         
         # Get direct children from same company
         children = account.get_children().filter(company_id=self.company_id)
+        children_list = list(children)
         
         log.debug(
-            "Getting leaf descendants for account %s (id=%s), found %s children",
+            "Getting leaf descendants for account %s (ID: %s, Code: %s), "
+            "found %s direct child(ren)",
             account.name,
             account.id,
-            children.count()
+            account.account_code,
+            len(children_list),
         )
         
-        for child in children:
+        if not children_list:
+            log.warning(
+                "Account %s (ID: %s) has no children for company %s",
+                account.name,
+                account.id,
+                self.company_id,
+            )
+            return leaf_accounts
+        
+        for idx, child in enumerate(children_list, 1):
+            log.debug(
+                "  [%s/%s] Processing child: %s (ID: %s, Code: %s, Is Leaf: %s)",
+                idx,
+                len(children_list),
+                child.name,
+                child.id,
+                child.account_code,
+                child.is_leaf(),
+            )
+            
             if child.is_leaf():
                 # Leaf: add to list
                 leaf_accounts.append(child)
                 log.debug(
-                    "Added leaf account %s (id=%s) to descendants",
+                    "    ✓ Added leaf account %s (ID: %s) to descendants",
                     child.name,
-                    child.id
+                    child.id,
                 )
             else:
                 # Parent: recursively get its leaf descendants
+                log.debug(
+                    "    → Child is also a parent, recursing into %s (ID: %s)...",
+                    child.name,
+                    child.id,
+                )
                 child_leaves = self._get_leaf_descendants(child)
                 leaf_accounts.extend(child_leaves)
                 log.debug(
-                    "Expanded parent account %s (id=%s) to %s leaf descendants",
+                    "    ✓ Expanded parent account %s (ID: %s) to %s leaf descendant(s)",
                     child.name,
                     child.id,
-                    len(child_leaves)
+                    len(child_leaves),
                 )
         
         log.debug(
-            "Account %s (id=%s) has %s total leaf descendants",
+            "Account %s (ID: %s) has %s total leaf descendant(s)",
             account.name,
             account.id,
-            len(leaf_accounts)
+            len(leaf_accounts),
         )
         
         return leaf_accounts
@@ -700,29 +968,92 @@ class FinancialStatementGenerator:
         include_pending: bool = False,
     ) -> Decimal:
         """Calculate balance sheet line (as of specific date)."""
+        log.info(
+            "Calculating balance sheet line for %s account(s) as of %s "
+            "(calculation_type: %s, include_pending: %s)",
+            len(accounts),
+            as_of_date,
+            calculation_type,
+            include_pending,
+        )
+        
         total = Decimal('0.00')
         
-        for account in accounts:
+        for idx, account in enumerate(accounts, 1):
+            log.info(
+                "[%s/%s] Processing account: %s (ID: %s, Code: %s, Direction: %s)",
+                idx,
+                len(accounts),
+                account.name,
+                account.id,
+                account.account_code,
+                account.account_direction,
+            )
+            
             if calculation_type == 'balance':
                 # Balance: Use last closing balance + transactions after closing date
+                log.debug(
+                    "  Using 'balance' calculation type for account %s (ID: %s)",
+                    account.name,
+                    account.id,
+                )
                 balance = self._calculate_account_balance_from_closing(
                     account=account,
                     as_of_date=as_of_date,
                     include_pending=include_pending,
                 )
+                log.info(
+                    "  Account %s (ID: %s) balance from closing: %s",
+                    account.name,
+                    account.id,
+                    balance,
+                )
             else:
                 # Sum or difference: Calculate from journal entries in period
+                log.debug(
+                    "  Using '%s' calculation type for account %s (ID: %s)",
+                    calculation_type,
+                    account.name,
+                    account.id,
+                )
                 balance = self._calculate_account_balance_with_children(
                     account=account,
                     include_pending=include_pending,
                     beginning_date=None,
                     end_date=as_of_date,
                 )
+                log.info(
+                    "  Account %s (ID: %s) balance with children: %s",
+                    account.name,
+                    account.id,
+                    balance,
+                )
                 # Apply account direction for sum
                 if calculation_type == 'sum':
+                    balance_before_direction = balance
                     balance = balance * account.account_direction
+                    log.info(
+                        "  Applied account direction %s: %s × %s = %s",
+                        account.account_direction,
+                        balance_before_direction,
+                        account.account_direction,
+                        balance,
+                    )
             
+            total_before = total
             total += balance
+            log.info(
+                "  Running total: %s + %s = %s",
+                total_before,
+                balance,
+                total,
+            )
+        
+        log.info(
+            "Balance sheet line total: %s (from %s account(s))",
+            total,
+            len(accounts),
+        )
         
         return total
     
@@ -905,26 +1236,67 @@ class FinancialStatementGenerator:
         The closing balance (account.balance) is the validated balance as of account.balance_date.
         We add all transactions after that date up to as_of_date, applying account_direction.
         """
+        log.debug(
+            "Calculating balance from closing for account %s (ID: %s, Code: %s, Is Leaf: %s) "
+            "as of %s (include_pending: %s)",
+            account.name,
+            account.id,
+            account.account_code,
+            account.is_leaf(),
+            as_of_date,
+            include_pending,
+        )
+        
         if account.is_leaf():
             # Get the last closing balance and date
-            closing_balance = account.balance
+            closing_balance = account.balance or Decimal('0.00')
             closing_date = account.balance_date
             
+            log.debug(
+                "  Leaf account %s (ID: %s) - Closing balance: %s, Closing date: %s",
+                account.name,
+                account.id,
+                closing_balance,
+                closing_date or 'None',
+            )
+            
             # If as_of_date is before or equal to closing_date, return closing balance with direction
-            if as_of_date <= closing_date:
-                return closing_balance * account.account_direction
+            if closing_date and as_of_date <= closing_date:
+                result = closing_balance * account.account_direction
+                log.info(
+                    "  Account %s (ID: %s) - As of date %s <= closing date %s, "
+                    "returning closing balance %s × direction %s = %s",
+                    account.name,
+                    account.id,
+                    as_of_date,
+                    closing_date,
+                    closing_balance,
+                    account.account_direction,
+                    result,
+                )
+                return result
             
             # Get transactions after closing date up to as_of_date
             state_filter = Q(state='posted')
             if include_pending:
                 state_filter = Q(state__in=['posted', 'pending'])
             
-            transactions = JournalEntry.objects.filter(
+            entries = JournalEntry.objects.filter(
                 account=account,
-                date__gt=closing_date,
+                date__gt=closing_date if closing_date else date.min,
                 date__lte=as_of_date,
                 transaction__company_id=self.company_id,
-            ).filter(state_filter).aggregate(
+            ).filter(state_filter)
+            
+            entry_count = entries.count()
+            log.debug(
+                "  Found %s journal entry/entries after closing date %s up to %s",
+                entry_count,
+                closing_date or 'beginning',
+                as_of_date,
+            )
+            
+            transactions = entries.aggregate(
                 total_debit=Sum('debit_amount'),
                 total_credit=Sum('credit_amount')
             )
@@ -933,32 +1305,87 @@ class FinancialStatementGenerator:
             total_credit = transactions['total_credit'] or Decimal('0.00')
             
             # Calculate change: (debit - credit) * account_direction
-            change = (total_debit - total_credit) * account.account_direction
+            net_movement = total_debit - total_credit
+            change = net_movement * account.account_direction
             
             # Final balance = closing balance (with direction) + change (with direction)
             # Both are normalized by account_direction
-            return closing_balance * account.account_direction + change
+            closing_with_direction = closing_balance * account.account_direction
+            result = closing_with_direction + change
+            
+            log.info(
+                "  Account %s (ID: %s) - Closing: %s, Debit: %s, Credit: %s, "
+                "Net Movement: %s, Direction: %s, Change: %s, Final: %s",
+                account.name,
+                account.id,
+                closing_balance,
+                total_debit,
+                total_credit,
+                net_movement,
+                account.account_direction,
+                change,
+                result,
+            )
+            
+            return result
         else:
             # Parent account: sum all children
+            log.info(
+                "  Account %s (ID: %s) is a parent account, summing children balances",
+                account.name,
+                account.id,
+            )
             children = account.get_children().filter(company_id=self.company_id)
+            children_list = list(children)
             
-            if not children.exists():
+            if not children_list:
                 log.warning(
-                    "Parent account %s (id=%s) has no children for company %s",
+                    "  ⚠ Parent account %s (ID: %s) has no children for company %s, returning 0.00",
                     account.name,
                     account.id,
-                    self.company_id
+                    self.company_id,
                 )
                 return Decimal('0.00')
             
+            log.info(
+                "  Found %s child(ren) for parent account %s (ID: %s)",
+                len(children_list),
+                account.name,
+                account.id,
+            )
+            
             total = Decimal('0.00')
-            for child in children:
+            for idx, child in enumerate(children_list, 1):
+                log.debug(
+                    "    [%s/%s] Calculating balance from closing for child: %s (ID: %s)",
+                    idx,
+                    len(children_list),
+                    child.name,
+                    child.id,
+                )
                 child_balance = self._calculate_account_balance_from_closing(
                     account=child,
                     as_of_date=as_of_date,
                     include_pending=include_pending,
                 )
+                total_before = total
                 total += child_balance
+                log.info(
+                    "    Child %s (ID: %s) balance: %s | Running total: %s + %s = %s",
+                    child.name,
+                    child.id,
+                    child_balance,
+                    total_before,
+                    child_balance,
+                    total,
+                )
+            
+            log.info(
+                "  Parent account %s (ID: %s) total balance from closing: %s",
+                account.name,
+                account.id,
+                total,
+            )
             
             return total
     
@@ -975,43 +1402,93 @@ class FinancialStatementGenerator:
         This method ensures that when calculating a parent account balance, it properly
         sums all children accounts that belong to the same company.
         """
+        log.debug(
+            "Calculating balance for account %s (ID: %s, Code: %s, Is Leaf: %s) "
+            "from %s to %s (include_pending: %s)",
+            account.name,
+            account.id,
+            account.account_code,
+            account.is_leaf(),
+            beginning_date or 'beginning',
+            end_date or 'end',
+            include_pending,
+        )
+        
         if account.is_leaf():
             # Leaf account: calculate directly from journal entries
-            return account.calculate_balance(
+            log.debug(
+                "  Account %s (ID: %s) is a leaf account, calculating directly from journal entries",
+                account.name,
+                account.id,
+            )
+            balance = account.calculate_balance(
                 include_pending=include_pending,
                 beginning_date=beginning_date,
                 end_date=end_date,
             ) or Decimal('0.00')
+            log.info(
+                "  Leaf account %s (ID: %s) balance: %s",
+                account.name,
+                account.id,
+                balance,
+            )
+            return balance
         else:
             # Parent account: sum all children
             # Ensure we only get children from the same company
             children = account.get_children().filter(company_id=self.company_id)
+            children_list = list(children)
             
-            if not children.exists():
+            log.info(
+                "  Account %s (ID: %s) is a parent account with %s child(ren)",
+                account.name,
+                account.id,
+                len(children_list),
+            )
+            
+            if not children_list:
                 log.warning(
-                    "Parent account %s (id=%s) has no children for company %s",
+                    "  ⚠ Parent account %s (ID: %s) has no children for company %s, returning 0.00",
                     account.name,
                     account.id,
-                    self.company_id
+                    self.company_id,
                 )
                 return Decimal('0.00')
             
             total = Decimal('0.00')
-            for child in children:
+            for idx, child in enumerate(children_list, 1):
+                log.debug(
+                    "    [%s/%s] Calculating balance for child: %s (ID: %s, Code: %s)",
+                    idx,
+                    len(children_list),
+                    child.name,
+                    child.id,
+                    child.account_code,
+                )
                 child_balance = self._calculate_account_balance_with_children(
                     account=child,
                     include_pending=include_pending,
                     beginning_date=beginning_date,
                     end_date=end_date,
                 )
+                total_before = total
                 total += child_balance
+                log.info(
+                    "    Child %s (ID: %s) balance: %s | Running total: %s + %s = %s",
+                    child.name,
+                    child.id,
+                    child_balance,
+                    total_before,
+                    child_balance,
+                    total,
+                )
             
-            log.debug(
-                "Parent account %s (id=%s) balance: %s (from %s children)",
+            log.info(
+                "  Parent account %s (ID: %s) total balance: %s (from %s child(ren))",
                 account.name,
                 account.id,
                 total,
-                children.count()
+                len(children_list),
             )
             
             return total
@@ -1025,11 +1502,38 @@ class FinancialStatementGenerator:
         include_pending: bool = False,
     ) -> Decimal:
         """Calculate income statement line (period activity)."""
+        log.info(
+            "Calculating income statement line for %s account(s) "
+            "from %s to %s (calculation_type: %s, include_pending: %s)",
+            len(accounts),
+            start_date,
+            end_date,
+            calculation_type,
+            include_pending,
+        )
+        
         total = Decimal('0.00')
         
-        for account in accounts:
+        for idx, account in enumerate(accounts, 1):
+            log.info(
+                "[%s/%s] Processing account: %s (ID: %s, Code: %s, Is Leaf: %s, Direction: %s)",
+                idx,
+                len(accounts),
+                account.name,
+                account.id,
+                account.account_code,
+                account.is_leaf(),
+                account.account_direction,
+            )
+            
             if account.is_leaf():
                 # Leaf account: calculate from journal entries
+                log.debug(
+                    "  Account %s (ID: %s) is a leaf account, calculating from journal entries",
+                    account.name,
+                    account.id,
+                )
+                
                 if include_pending:
                     state_filter = Q(state__in=['posted', 'pending'])
                 else:
@@ -1042,8 +1546,17 @@ class FinancialStatementGenerator:
                     transaction__company_id=self.company_id,
                 ).filter(state_filter)
                 
+                entry_count = entries.count()
+                log.debug(
+                    "  Found %s journal entry/entries for account %s (ID: %s) in period",
+                    entry_count,
+                    account.name,
+                    account.id,
+                )
+                
                 if calculation_type == 'difference':
                     # Debit - Credit (no account direction)
+                    log.debug("  Using 'difference' calculation (debit - credit, no direction)")
                     debit_total = entries.aggregate(
                         total=Sum('debit_amount')
                     )['total'] or Decimal('0.00')
@@ -1051,28 +1564,86 @@ class FinancialStatementGenerator:
                         total=Sum('credit_amount')
                     )['total'] or Decimal('0.00')
                     balance = debit_total - credit_total
+                    log.info(
+                        "  Account %s (ID: %s) - Debit: %s, Credit: %s, Difference: %s",
+                        account.name,
+                        account.id,
+                        debit_total,
+                        credit_total,
+                        balance,
+                    )
                 elif calculation_type == 'balance':
                     # Balance: Use last closing balance + transactions after closing date
+                    log.debug("  Using 'balance' calculation (from closing balance)")
                     balance = self._calculate_account_balance_from_closing(
                         account=account,
                         as_of_date=end_date,
                         include_pending=include_pending,
                     )
+                    log.info(
+                        "  Account %s (ID: %s) balance from closing: %s",
+                        account.name,
+                        account.id,
+                        balance,
+                    )
                 else:
                     # Sum: Period movements with account direction (e.g., cash flow)
+                    log.debug(
+                        "  Using 'sum' calculation (debit - credit) × direction %s",
+                        account.account_direction,
+                    )
                     debit_total = entries.aggregate(
                         total=Sum('debit_amount')
                     )['total'] or Decimal('0.00')
                     credit_total = entries.aggregate(
                         total=Sum('credit_amount')
                     )['total'] or Decimal('0.00')
-                    balance = (debit_total - credit_total) * account.account_direction
+                    net_movement = debit_total - credit_total
+                    balance = net_movement * account.account_direction
+                    log.info(
+                        "  Account %s (ID: %s) - Debit: %s, Credit: %s, Net: %s, "
+                        "Direction: %s, Final: %s",
+                        account.name,
+                        account.id,
+                        debit_total,
+                        credit_total,
+                        net_movement,
+                        account.account_direction,
+                        balance,
+                    )
                 
+                total_before = total
                 total += balance
+                log.info(
+                    "  Running total: %s + %s = %s",
+                    total_before,
+                    balance,
+                    total,
+                )
             else:
                 # Parent account: sum children's period activity
+                log.info(
+                    "  Account %s (ID: %s) is a parent account, summing children",
+                    account.name,
+                    account.id,
+                )
                 children = account.get_children().filter(company_id=self.company_id)
-                for child in children:
+                children_list = list(children)
+                log.info(
+                    "  Found %s child(ren) for parent account %s (ID: %s)",
+                    len(children_list),
+                    account.name,
+                    account.id,
+                )
+                
+                for child_idx, child in enumerate(children_list, 1):
+                    log.debug(
+                        "    [%s/%s] Recursively calculating child: %s (ID: %s)",
+                        child_idx,
+                        len(children_list),
+                        child.name,
+                        child.id,
+                    )
                     # Recursively calculate child balance for the period
                     child_balance = self._calculate_income_statement_line(
                         accounts=[child],
@@ -1081,7 +1652,23 @@ class FinancialStatementGenerator:
                         calculation_type=calculation_type,
                         include_pending=include_pending,
                     )
+                    total_before = total
                     total += child_balance
+                    log.info(
+                        "    Child %s (ID: %s) balance: %s | Running total: %s + %s = %s",
+                        child.name,
+                        child.id,
+                        child_balance,
+                        total_before,
+                        child_balance,
+                        total,
+                    )
+        
+        log.info(
+            "Income statement line total: %s (from %s account(s))",
+            total,
+            len(accounts),
+        )
         
         return total
     
@@ -1330,15 +1917,67 @@ class FinancialStatementGenerator:
         if line_numbers:
             line_templates = line_templates.filter(line_number__in=line_numbers)
         
+        log.info(
+            "="*80 + "\n"
+            "STARTING TIME SERIES GENERATION\n"
+            "="*80 + "\n"
+            "Template: %s (ID: %s)\n"
+            "Report Type: %s\n"
+            "Company ID: %s\n"
+            "Period: %s to %s\n"
+            "Dimension: %s\n"
+            "Include Pending: %s\n"
+            "Include Metadata: %s\n"
+            "Line Numbers Filter: %s\n"
+            "Total Periods: %s\n"
+            "Total Line Templates: %s\n"
+            "="*80,
+            template.name,
+            template.id,
+            template.report_type,
+            self.company_id,
+            start_date,
+            end_date,
+            dimension,
+            include_pending,
+            include_metadata,
+            line_numbers or 'All',
+            len(periods),
+            line_templates.count(),
+        )
+        
         series_data = {}
         
         for line_template in line_templates:
+            log.info(
+                "\n" + "-"*80 + "\n"
+                "PROCESSING LINE %s: %s FOR TIME SERIES\n"
+                "-"*80,
+                line_template.line_number,
+                line_template.label,
+            )
+            
             line_series = []
             
             # Get accounts for this line (for metadata)
             accounts = self._get_accounts_for_line(line_template) if include_metadata else []
             
-            for period in periods:
+            log.info(
+                "Line %s: Processing %s period(s)",
+                line_template.line_number,
+                len(periods),
+            )
+            
+            for period_idx, period in enumerate(periods, 1):
+                log.debug(
+                    "  [%s/%s] Calculating line %s for period %s (%s to %s)",
+                    period_idx,
+                    len(periods),
+                    line_template.line_number,
+                    period['key'],
+                    period['start_date'],
+                    period['end_date'],
+                )
                 # Calculate value for this line in this period
                 if include_metadata:
                     value, calculation_memory = self._calculate_line_value_with_metadata(
@@ -1530,7 +2169,31 @@ class FinancialStatementGenerator:
             calculate_period_comparison,
         )
         
+        log.info(
+            "="*80 + "\n"
+            "STARTING COMPARISON GENERATION\n"
+            "="*80 + "\n"
+            "Template: %s (ID: %s)\n"
+            "Report Type: %s\n"
+            "Company ID: %s\n"
+            "Current Period: %s to %s\n"
+            "Comparison Types: %s\n"
+            "Dimension: %s\n"
+            "Include Pending: %s\n"
+            "="*80,
+            template.name,
+            template.id,
+            template.report_type,
+            self.company_id,
+            start_date,
+            end_date,
+            comparison_types,
+            dimension or 'None',
+            include_pending,
+        )
+        
         # Generate current period statement
+        log.info("Generating current period statement...")
         statement = self.generate_statement(
             template=template,
             start_date=start_date,
@@ -1538,6 +2201,8 @@ class FinancialStatementGenerator:
             status='draft',
             include_pending=include_pending,
         )
+        
+        log.info("Current period statement generated (ID: %s)", statement.id)
         
         # Get current line values and calculation metadata
         current_lines = {}
@@ -1566,7 +2231,18 @@ class FinancialStatementGenerator:
         # Generate comparisons
         comparisons = {}
         
-        for comp_type in comparison_types:
+        log.info("Generating %s comparison(s)...", len(comparison_types))
+        
+        for comp_idx, comp_type in enumerate(comparison_types, 1):
+            log.info(
+                "\n" + "-"*80 + "\n"
+                "PROCESSING COMPARISON %s/%s: %s\n"
+                "-"*80,
+                comp_idx,
+                len(comparison_types),
+                comp_type,
+            )
+            
             try:
                 comp_start, comp_end = get_comparison_period(
                     start_date,
@@ -1575,7 +2251,15 @@ class FinancialStatementGenerator:
                     dimension=dimension
                 )
                 
+                log.info(
+                    "Comparison period for %s: %s to %s",
+                    comp_type,
+                    comp_start,
+                    comp_end,
+                )
+                
                 # Generate comparison statement
+                log.info("Generating comparison statement...")
                 comp_statement = self.generate_statement(
                     template=template,
                     start_date=comp_start,
@@ -1583,6 +2267,8 @@ class FinancialStatementGenerator:
                     status='draft',
                     include_pending=include_pending,
                 )
+                
+                log.info("Comparison statement generated (ID: %s)", comp_statement.id)
                 
                 # Get comparison line values and metadata
                 comp_lines = {}
