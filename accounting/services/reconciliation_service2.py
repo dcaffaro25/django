@@ -540,6 +540,9 @@ class ReconciliationPipelineEngine:
     
             # cheap prefilter around the bank date
             local_books = [b for b in available_books if abs((bank.date - b.date).days) <= win]
+            
+            # Collect all candidate matches for this bank
+            candidates: list[dict] = []
     
             for size in range(1, stage.max_group_size_book + 1):
                 for combo in combinations(local_books, size):
@@ -566,6 +569,7 @@ class ReconciliationPipelineEngine:
                     if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                         continue
     
+                    # Calculate description similarity and confidence score
                     sim = self._cosine_similarity(bank.embedding or [], _avg_embedding(combo))
                     scores = compute_match_scores(
                         embed_sim=sim,
@@ -576,22 +580,30 @@ class ReconciliationPipelineEngine:
                         currency_match=1.0,
                         weights=self.stage_weights,
                     )
-                    self._record(
-                        self._make_suggestion(
-                            "one_to_many",
-                            [bank],
-                            list(combo),
-                            scores["global_score"],
-                            stage=stage,
-                            weights=self.stage_weights,
-                            component_scores=scores,
-                            extra={
-                                "book_span_days_measured": book_span,
-                                "avg_date_delta_days_measured": avg_delta,
-                            },
-                        )
+                    
+                    # Add to candidates list instead of recording immediately
+                    sug = self._make_suggestion(
+                        "one_to_many",
+                        [bank],
+                        list(combo),
+                        scores["global_score"],
+                        stage=stage,
+                        weights=self.stage_weights,
+                        component_scores=scores,
+                        extra={
+                            "book_span_days_measured": book_span,
+                            "avg_date_delta_days_measured": avg_delta,
+                        },
                     )
-                    return
+                    candidates.append(sug)
+            
+            # After collecting all candidates, sort by confidence score (descending)
+            # and record the best match (which will have highest description similarity
+            # if date/amount are the same)
+            if candidates:
+                candidates.sort(key=lambda s: float(s["confidence_score"]), reverse=True)
+                best = candidates[0]
+                self._record(best)
     
     
     
