@@ -1306,48 +1306,11 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     else:
         permission_classes = [permissions.IsAuthenticated]
         
-    def get_queryset_base(self):
-        """Base queryset with optimizations for reconciliation status."""
-        from django.db.models import Exists, OuterRef, Case, When, Value, CharField, Prefetch
-        
-        # Annotate reconciliation_status to avoid N+1 queries
-        return (
-            BankTransaction.objects
-            .select_related("bank_account", "bank_account__entity", "currency")
-            .annotate(
-                reconciliation_status=Case(
-                    When(
-                        Exists(
-                            Reconciliation.objects.filter(
-                                bank_transactions=OuterRef('pk'),
-                                status__in=['matched', 'approved']
-                            )
-                        ),
-                        then=Value('matched')
-                    ),
-                    When(
-                        Exists(
-                            Reconciliation.objects.filter(
-                                bank_transactions=OuterRef('pk')
-                            )
-                        ),
-                        then=Value('mixed')
-                    ),
-                    default=Value('pending'),
-                    output_field=CharField()
-                )
-            )
-            .prefetch_related(
-                Prefetch(
-                    'reconciliations',
-                    queryset=Reconciliation.objects.only('id', 'status'),
-                    to_attr='recon_list'
-                )
-            )
-            .order_by("-date", "-id")
-        )
-    
-    queryset = property(lambda self: self.get_queryset_base())
+    queryset = (
+        BankTransaction.objects
+        .select_related("bank_account", "bank_account__entity", "currency")
+        .order_by("-date", "-id")
+    )
     serializer_class = BankTransactionSerializer
 
     filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
@@ -1366,7 +1329,40 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     entity_lookup = "bank_account__entity"  # <-- only if your ScopedQuerysetMixin uses this
 
     def get_queryset(self):
-        qs = self.get_queryset_base()
+        from django.db.models import Exists, OuterRef, Case, When, Value, CharField, Prefetch
+        
+        qs = super().get_queryset()
+        
+        # Annotate reconciliation_status to avoid N+1 queries
+        qs = qs.annotate(
+            reconciliation_status=Case(
+                When(
+                    Exists(
+                        Reconciliation.objects.filter(
+                            bank_transactions=OuterRef('pk'),
+                            status__in=['matched', 'approved']
+                        )
+                    ),
+                    then=Value('matched')
+                ),
+                When(
+                    Exists(
+                        Reconciliation.objects.filter(
+                            bank_transactions=OuterRef('pk')
+                        )
+                    ),
+                    then=Value('mixed')
+                ),
+                default=Value('pending'),
+                output_field=CharField()
+            )
+        ).prefetch_related(
+            Prefetch(
+                'reconciliations',
+                queryset=Reconciliation.objects.only('id', 'status'),
+                to_attr='recon_list'
+            )
+        )
 
         # /entities/<entity_id>/... or ?entity_id=...
         entity_id = self.kwargs.get("entity_id") or self.request.query_params.get("entity_id")
