@@ -52,3 +52,5 @@ python-dateutil>=2.8
 docling==2.61.2
 pypdf==6.2.0
 openai==2.8.0
+google-generativeai>=0.8.0
+google-generativeai>=0.8.0

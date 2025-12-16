@@ -167,6 +167,7 @@ INSTALLED_APPS = [
     'pgvector.django',
     'npl',              # nova app do pipeline
     'feedback',         # app de feedback supervisionado
+    'knowledge_base',   # NotebookLM-like document Q&A with Gemini File Search
 ]
 
 MIDDLEWARE = [

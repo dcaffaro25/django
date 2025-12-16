@@ -32,6 +32,7 @@ urlpatterns = [
     re_path(r'^(?P<tenant_id>[^/]+)/', include('multitenancy.urls')),
     re_path(r'^(?P<tenant_id>[^/]+)/', include('billing.urls')),
     re_path(r'^(?P<tenant_id>[^/]+)/', include('ML.urls')),
+    re_path(r'^(?P<tenant_id>[^/]+)/', include('knowledge_base.urls')),
     #path('api/', include('accounting.urls')),
     path(r'^api/token/?$', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     path(r'^api/token/refresh/?$', TokenRefreshView.as_view(), name='token_refresh'),
@@ -39,6 +40,7 @@ urlpatterns = [
     path("celery/status/<str:task_id>/", task_status, name="celery_status"),
     re_path('', include('npl.urls')),
     re_path('', include('feedback.urls')),
+    re_path(r'^(?P<tenant_id>[^/]+)/', include('knowledge_base.urls')),
 ]
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

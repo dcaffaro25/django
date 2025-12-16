@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Knowledge Base Q&A</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #f5f5f5;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 8px;
+            padding: 30px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            margin-bottom: 30px;
+            color: #333;
+        }
+        .section {
+            margin-bottom: 40px;
+            padding-bottom: 30px;
+            border-bottom: 1px solid #eee;
+        }
+        .section:last-child {
+            border-bottom: none;
+        }
+        .section h2 {
+            margin-bottom: 20px;
+            color: #555;
+            font-size: 1.3em;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 500;
+            color: #333;
+        }
+        input[type="text"], input[type="file"], textarea, select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        textarea {
+            min-height: 100px;
+            resize: vertical;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .btn-secondary {
+            background: #6c757d;
+        }
+        .btn-secondary:hover {
+            background: #545b62;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .status-queued { background: #ffc107; color: #000; }
+        .status-indexing { background: #17a2b8; color: #fff; }
+        .status-ready { background: #28a745; color: #fff; }
+        .status-failed { background: #dc3545; color: #fff; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }
+        th {
+            background: #f8f9fa;
+            font-weight: 600;
+            color: #333;
+        }
+        .answer-box {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 4px;
+            margin-top: 15px;
+        }
+        .citations {
+            margin-top: 20px;
+        }
+        .citation {
+            background: white;
+            padding: 10px;
+            margin-bottom: 10px;
+            border-left: 3px solid #007bff;
+            border-radius: 4px;
+        }
+        .feedback-buttons {
+            margin-top: 20px;
+        }
+        .feedback-buttons button {
+            margin-right: 10px;
+        }
+        .error {
+            color: #dc3545;
+            margin-top: 10px;
+            padding: 10px;
+            background: #f8d7da;
+            border-radius: 4px;
+        }
+        .success {
+            color: #155724;
+            margin-top: 10px;
+            padding: 10px;
+            background: #d4edda;
+            border-radius: 4px;
+        }
+        .loading {
+            color: #007bff;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Knowledge Base Q&A</h1>
+        
+        <!-- Knowledge Base Selection -->
+        <div class="section">
+            <h2>Knowledge Base</h2>
+            <div class="form-group">
+                <label for="kb-select">Select Knowledge Base:</label>
+                <select id="kb-select">
+                    <option value="">Loading...</option>
+                </select>
+                <button onclick="createKB()" style="margin-top: 10px;">Create New KB</button>
+            </div>
+        </div>
+        
+        <!-- Document Upload -->
+        <div class="section">
+            <h2>Upload Documents</h2>
+            <div class="form-group">
+                <label for="file-upload">Upload File:</label>
+                <input type="file" id="file-upload" accept=".pdf,.txt,.doc,.docx">
+                <button onclick="uploadDocument()" style="margin-top: 10px;">Upload</button>
+            </div>
+            <div id="upload-status"></div>
+        </div>
+        
+        <!-- Document List -->
+        <div class="section">
+            <h2>Documents</h2>
+            <button onclick="loadDocuments()">Refresh</button>
+            <div id="documents-list">
+                <p>Select a knowledge base to view documents.</p>
+            </div>
+        </div>
+        
+        <!-- Ask Question -->
+        <div class="section">
+            <h2>Ask a Question</h2>
+            <div class="form-group">
+                <label for="question-input">Question:</label>
+                <textarea id="question-input" placeholder="Enter your question here..."></textarea>
+                <button onclick="askQuestion()" style="margin-top: 10px;">Ask</button>
+            </div>
+            <div id="answer-box"></div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = window.location.pathname.replace(/\/[^/]*$/, '') + '/api';
+        let currentKBId = null;
+
+        // Load knowledge bases on page load
+        window.addEventListener('DOMContentLoaded', () => {
+            loadKnowledgeBases();
+        });
+
+        async function loadKnowledgeBases() {
+            try {
+                const response = await fetch(`${API_BASE}/knowledge-bases/`, {
+                    headers: {
+                        'Authorization': `Token ${getAuthToken()}`,
+                    }
+                });
+                if (!response.ok) throw new Error('Failed to load knowledge bases');
+                const data = await response.json();
+                const select = document.getElementById('kb-select');
+                select.innerHTML = '<option value="">Select a knowledge base...</option>';
+                data.forEach(kb => {
+                    const option = document.createElement('option');
+                    option.value = kb.id;
+                    option.textContent = kb.name;
+                    select.appendChild(option);
+                });
+                select.addEventListener('change', (e) => {
+                    currentKBId = e.target.value;
+                    if (currentKBId) {
+                        loadDocuments();
+                    }
+                });
+            } catch (error) {
+                console.error('Error loading knowledge bases:', error);
+                document.getElementById('kb-select').innerHTML = '<option value="">Error loading</option>';
+            }
+        }
+
+        async function createKB() {
+            const name = prompt('Enter knowledge base name:');
+            if (!name) return;
+            try {
+                const response = await fetch(`${API_BASE}/knowledge-bases/`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Token ${getAuthToken()}`,
+                    },
+                    body: JSON.stringify({ name })
+                });
+                if (!response.ok) throw new Error('Failed to create knowledge base');
+                loadKnowledgeBases();
+                alert('Knowledge base created successfully!');
+            } catch (error) {
+                alert('Error creating knowledge base: ' + error.message);
+            }
+        }
+
+        async function uploadDocument() {
+            if (!currentKBId) {
+                alert('Please select a knowledge base first');
+                return;
+            }
+            const fileInput = document.getElementById('file-upload');
+            const file = fileInput.files[0];
+            if (!file) {
+                alert('Please select a file');
+                return;
+            }
+            const formData = new FormData();
+            formData.append('file', file);
+            const statusDiv = document.getElementById('upload-status');
+            statusDiv.innerHTML = '<div class="loading">Uploading...</div>';
+            try {
+                const response = await fetch(`${API_BASE}/knowledge-bases/${currentKBId}/documents/`, {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Token ${getAuthToken()}`,
+                    },
+                    body: formData
+                });
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.error || 'Upload failed');
+                }
+                const data = await response.json();
+                statusDiv.innerHTML = '<div class="success">Document uploaded successfully! Status: ' + data.status + '</div>';
+                fileInput.value = '';
+                loadDocuments();
+            } catch (error) {
+                statusDiv.innerHTML = '<div class="error">Error: ' + error.message + '</div>';
+            }
+        }
+
+        async function loadDocuments() {
+            if (!currentKBId) return;
+            const listDiv = document.getElementById('documents-list');
+            listDiv.innerHTML = '<p>Loading...</p>';
+            try {
+                const response = await fetch(`${API_BASE}/documents/?knowledge_base=${currentKBId}`, {
+                    headers: {
+                        'Authorization': `Token ${getAuthToken()}`,
+                    }
+                });
+                if (!response.ok) throw new Error('Failed to load documents');
+                const data = await response.json();
+                if (data.length === 0) {
+                    listDiv.innerHTML = '<p>No documents yet. Upload a document to get started.</p>';
+                    return;
+                }
+                let html = '<table><thead><tr><th>Filename</th><th>Status</th><th>Error</th><th>Created</th></tr></thead><tbody>';
+                data.forEach(doc => {
+                    html += `<tr>
+                        <td>${doc.filename}</td>
+                        <td><span class="status-badge status-${doc.status}">${doc.status}</span></td>
+                        <td>${doc.error || '-'}</td>
+                        <td>${new Date(doc.created_at).toLocaleString()}</td>
+                    </tr>`;
+                });
+                html += '</tbody></table>';
+                listDiv.innerHTML = html;
+            } catch (error) {
+                listDiv.innerHTML = '<div class="error">Error loading documents: ' + error.message + '</div>';
+            }
+        }
+
+        async function askQuestion() {
+            if (!currentKBId) {
+                alert('Please select a knowledge base first');
+                return;
+            }
+            const question = document.getElementById('question-input').value.trim();
+            if (!question) {
+                alert('Please enter a question');
+                return;
+            }
+            const answerBox = document.getElementById('answer-box');
+            answerBox.innerHTML = '<div class="loading">Thinking...</div>';
+            try {
+                const response = await fetch(`${API_BASE}/knowledge-bases/${currentKBId}/ask/`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Token ${getAuthToken()}`,
+                    },
+                    body: JSON.stringify({ question })
+                });
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.error || 'Failed to get answer');
+                }
+                const data = await response.json();
+                let html = `<div class="answer-box">
+                    <h3>Answer:</h3>
+                    <p>${data.answer_text}</p>
+                </div>`;
+                if (data.citations && data.citations.length > 0) {
+                    html += '<div class="citations"><h3>Citations:</h3>';
+                    data.citations.forEach(citation => {
+                        html += `<div class="citation">
+                            <strong>${citation.document_name || 'Document'}</strong>
+                            ${citation.excerpt ? '<p>' + citation.excerpt + '</p>' : ''}
+                            ${citation.page ? '<small>Page ' + citation.page + '</small>' : ''}
+                        </div>`;
+                    });
+                    html += '</div>';
+                }
+                html += `<div class="feedback-buttons">
+                    <button onclick="submitFeedback(${data.answer_id}, 'up')">👍 Helpful</button>
+                    <button onclick="submitFeedback(${data.answer_id}, 'down')">👎 Not Helpful</button>
+                </div>`;
+                answerBox.innerHTML = html;
+            } catch (error) {
+                answerBox.innerHTML = '<div class="error">Error: ' + error.message + '</div>';
+            }
+        }
+
+        async function submitFeedback(answerId, rating) {
+            const comment = prompt('Optional comment:');
+            const missingInfo = confirm('Was important information missing?');
+            try {
+                const response = await fetch(`${API_BASE}/answers/${answerId}/feedback/`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Token ${getAuthToken()}`,
+                    },
+                    body: JSON.stringify({
+                        answer: answerId,
+                        rating,
+                        comment: comment || null,
+                        missing_info: missingInfo
+                    })
+                });
+                if (!response.ok) throw new Error('Failed to submit feedback');
+                alert('Thank you for your feedback!');
+            } catch (error) {
+                alert('Error submitting feedback: ' + error.message);
+            }
+        }
+
+        function getAuthToken() {
+            // In a real implementation, get token from localStorage or cookie
+            // For now, return empty string (will work if AUTH_OFF is True)
+            return localStorage.getItem('auth_token') || '';
+        }
+    </script>
+</body>
+</html>
