@@ -47,8 +47,17 @@ class BankTransactionFilter(filters.FilterSet):
         fields = []  # all handled above
 
     def filter_unreconciled(self, qs, name, value: bool):
-        # Keep your related name; add .distinct() to avoid dup rows when joins are present
-        return qs.filter(reconciliations__isnull=True).distinct() if value else qs
+        if value:
+            # Use EXISTS instead of isnull for better performance
+            # A bank transaction is unreconciled if it has no reconciliations with matched/approved status
+            matched_recon = Reconciliation.objects.filter(
+                bank_transactions=OuterRef('pk'),
+                status__in=['matched', 'approved']
+            )
+            return qs.annotate(
+                has_matched_recon=Exists(matched_recon)
+            ).filter(has_matched_recon=False).distinct()
+        return qs
 
 
 class TransactionFilter(filters.FilterSet):

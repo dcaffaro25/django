@@ -193,6 +193,7 @@ class JournalEntryListSerializer(serializers.ModelSerializer):
     company = serializers.PrimaryKeyRelatedField(read_only=True)
     currency = serializers.PrimaryKeyRelatedField(read_only=True)
     entity = serializers.PrimaryKeyRelatedField(read_only=True)
+    # Use regular fields that will read from annotations when available
     balance = serializers.SerializerMethodField()
     transaction_date = serializers.SerializerMethodField()
     transaction_description = serializers.SerializerMethodField()
@@ -209,42 +210,94 @@ class JournalEntryListSerializer(serializers.ModelSerializer):
             'bank_account', 'reconciliation_status',
         ]
 
+    def to_representation(self, instance):
+        """Override to use annotated fields when available."""
+        data = super().to_representation(instance)
+        
+        # Use annotated fields if they exist (from queryset annotations)
+        if hasattr(instance, 'transaction_date'):
+            data['transaction_date'] = instance.transaction_date
+        
+        if hasattr(instance, 'transaction_description'):
+            data['transaction_description'] = instance.transaction_description
+        
+        if hasattr(instance, 'transaction_value'):
+            # Convert Decimal to float if needed
+            value = instance.transaction_value
+            data['transaction_value'] = float(value) if value is not None else None
+        
+        if hasattr(instance, 'bank_account_id'):
+            data['bank_account'] = instance.bank_account_id
+        
+        if hasattr(instance, 'bank_date'):
+            data['bank_date'] = instance.bank_date
+        
+        if hasattr(instance, 'balance'):
+            # Convert Decimal to float if needed
+            balance = instance.balance
+            data['balance'] = float(balance) if balance is not None else None
+        
+        if hasattr(instance, 'reconciliation_status'):
+            data['reconciliation_status'] = instance.reconciliation_status
+        
+        return data
+
     def get_transaction_date(self, obj):
-        """Returns date from related transaction."""
+        """Returns date from related transaction or annotation."""
+        if hasattr(obj, 'transaction_date'):
+            return obj.transaction_date
         return obj.transaction.date if obj.transaction else None
 
     def get_transaction_description(self, obj):
-        """Returns description from related transaction."""
+        """Returns description from related transaction or annotation."""
+        if hasattr(obj, 'transaction_description'):
+            return obj.transaction_description
         return obj.transaction.description if obj.transaction else None
 
     def get_transaction_value(self, obj):
-        """Returns amount from related transaction as float."""
+        """Returns amount from related transaction or annotation."""
+        if hasattr(obj, 'transaction_value'):
+            value = obj.transaction_value
+            return float(value) if value is not None else None
         if obj.transaction and obj.transaction.amount is not None:
             return float(obj.transaction.amount)
         return None
 
     def get_bank_date(self, obj):
         """Returns the journal date only if linked to a bank account."""
+        if hasattr(obj, 'bank_date'):
+            return obj.bank_date
         if obj.account and obj.account.bank_account:
             return obj.date
         return None
 
     def get_bank_account(self, obj):
         """Returns the bank account ID if linked."""
+        if hasattr(obj, 'bank_account_id'):
+            return obj.bank_account_id
         if obj.account and obj.account.bank_account:
             return obj.account.bank_account.id
         return None
 
     def get_balance(self, obj):
         """Returns debit - credit as float."""
+        if hasattr(obj, 'balance'):
+            balance = obj.balance
+            return float(balance) if balance is not None else None
         debit = obj.debit_amount or 0
         credit = obj.credit_amount or 0
         return float(debit - credit)
 
     def get_reconciliation_status(self, obj):
-        """Returns reconciliation status based on linked reconciliations."""
+        """Returns reconciliation status based on linked reconciliations or annotation."""
+        if hasattr(obj, 'reconciliation_status'):
+            return obj.reconciliation_status
         if obj.account and obj.account.bank_account:
-            if obj.reconciliations.filter(status__in=["matched", "approved"]).exists():
+            # Use prefetched reconciliations if available
+            if hasattr(obj, 'recon_list'):
+                if any(rec.status in ["matched", "approved"] for rec in obj.recon_list):
+                    return "matched"
+            elif obj.reconciliations.filter(status__in=["matched", "approved"]).exists():
                 return "matched"
         return "pending"
 
@@ -365,7 +418,8 @@ class RuleSerializer(serializers.ModelSerializer):
 
 
 class BankTransactionSerializer(serializers.ModelSerializer):
-    reconciliation_status = serializers.SerializerMethodField()
+    # Use annotated field if available, otherwise fall back to method
+    reconciliation_status = serializers.CharField(read_only=True, required=False)
     entity = serializers.IntegerField(source='bank_account.entity_id', read_only=True)
     entity_name = serializers.CharField(source='bank_account.entity.name', read_only=True)
 
@@ -379,7 +433,31 @@ class BankTransactionSerializer(serializers.ModelSerializer):
         extra_kwargs = {
             "bank_account": {"queryset": BankAccount.objects.all()},
         }
+    
+    def to_representation(self, instance):
+        """Override to use annotated field if available, otherwise compute it."""
+        data = super().to_representation(instance)
         
+        # If reconciliation_status annotation exists, use it (from queryset annotation)
+        # Otherwise, compute it the old way (for backward compatibility)
+        if hasattr(instance, 'reconciliation_status'):
+            # Annotated field is already in data, no need to override
+            pass
+        else:
+            # Fallback: compute reconciliation_status the old way
+            qs = instance.reconciliations.all()
+            if not qs.exists():
+                data['reconciliation_status'] = 'pending'
+            else:
+                statuses = [rec.status for rec in qs]
+                if all(status in ['matched', 'approved'] for status in statuses):
+                    data['reconciliation_status'] = 'matched'
+                elif all(status not in ['matched', 'approved'] for status in statuses):
+                    data['reconciliation_status'] = 'pending'
+                else:
+                    data['reconciliation_status'] = 'mixed'
+        
+        return data
     
     def create(self, validated_data):
         # In case clients still send 'entity', ignore it
@@ -389,19 +467,6 @@ class BankTransactionSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         validated_data.pop("entity", None)
         return super().update(instance, validated_data)
-    
-    def get_reconciliation_status(self, obj):
-        # Get all reconciliations for this bank transaction.
-        qs = obj.reconciliations.all()
-        if not qs.exists():
-            return 'pending'
-        statuses = [rec.status for rec in qs]
-        if all(status in ['matched', 'approved'] for status in statuses):
-            return 'matched'
-        elif all(status not in ['matched', 'approved'] for status in statuses):
-            return 'pending'
-        else:
-            return 'mixed'
 
 class ReconciliationTaskSerializer(serializers.ModelSerializer):
     class Meta:

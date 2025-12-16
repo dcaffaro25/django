@@ -954,7 +954,12 @@ class Reconciliation(TenantAwareBaseModel):
         # The difference between bank and journal totals.
         return self.total_bank_amount - self.total_journal_amount
     
-    
+    class Meta:
+        # Add index on status field for faster filtering
+        indexes = [
+            models.Index(fields=['status']),
+            models.Index(fields=['company', 'status']),  # Composite index for tenant-scoped queries
+        ]
 
 
 class ReconciliationSuggestion(models.Model):

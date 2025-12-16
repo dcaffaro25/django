@@ -1130,16 +1130,17 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='unmatched')
     def unmatched(self, request, tenant_id=None):
         """
-        Returns transactions that still have unreconciled journal entries.
+        Returns journal entries that are unmatched (not reconciled).
         Optional query parameters:
         - company_id: filter by company
         - date_from / date_to: filter by transaction date
         """
-        # Base queryset: only transactions with journal entries tied to a bank account
+        from django.db.models import Exists, OuterRef, Case, When, Value, CharField, F, Prefetch
         
+        # Base queryset: only journal entries tied to a bank account
         qs = JournalEntry.objects.filter(account__bank_account__isnull=False)
-        qs = qs.select_related('transaction', 'account', 'company').prefetch_related('reconciliations')
-        # Apply optional filters
+        
+        # Apply optional filters first
         company_id = request.query_params.get("tenant_id")
         if company_id:
             qs = qs.filter(company__id=company_id)
@@ -1150,17 +1151,56 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             qs = qs.filter(date__gte=date_from)
         if date_to:
             qs = qs.filter(date__lte=date_to)
-
-        # Exclude any transaction where all bank-side JEs are reconciled (matched or approved)
-        matched_je_ids = (
-            Reconciliation.objects
-            .filter(status__in=['matched', 'approved'])
-            .values_list('journal_entries__id', flat=True)
-        )
         
-        qs_unmatched = qs.exclude(id__in=matched_je_ids).distinct()
+        # Optimize with select_related, annotations, and EXISTS subquery
+        qs = qs.select_related(
+            'transaction', 'account', 'account__bank_account', 'company'
+        ).annotate(
+            # Reconciliation status annotation
+            reconciliation_status=Case(
+                When(
+                    Exists(
+                        Reconciliation.objects.filter(
+                            journal_entries=OuterRef('pk'),
+                            status__in=['matched', 'approved']
+                        )
+                    ),
+                    then=Value('matched')
+                ),
+                default=Value('pending'),
+                output_field=CharField()
+            ),
+            # Transaction fields via F expressions (efficient)
+            transaction_date=F('transaction__date'),
+            transaction_description=F('transaction__description'),
+            transaction_value=F('transaction__amount'),
+            # Bank account fields
+            bank_account_id=F('account__bank_account__id'),
+            bank_date=Case(
+                When(account__bank_account__isnull=False, then=F('date')),
+                default=Value(None),
+                output_field=DateField(null=True)
+            ),
+            # Balance calculation
+            balance=F('debit_amount') - F('credit_amount')
+        ).exclude(
+            # Use EXISTS instead of values_list for better performance
+            Exists(
+                Reconciliation.objects.filter(
+                    journal_entries=OuterRef('pk'),
+                    status__in=['matched', 'approved']
+                )
+            )
+        ).prefetch_related(
+            Prefetch(
+                'reconciliations',
+                queryset=Reconciliation.objects.only('id', 'status'),
+                to_attr='recon_list'
+            )
+        ).distinct()
+        
         serializer_class = self.get_serializer_class()  # use list vs detail serializer
-        serializer = serializer_class(qs_unmatched, many=True)
+        serializer = serializer_class(qs, many=True)
         return Response(serializer.data)
     
     # Get journal entries by transaction
@@ -1266,11 +1306,48 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     else:
         permission_classes = [permissions.IsAuthenticated]
         
-    queryset = (
-        BankTransaction.objects
-        .select_related("bank_account", "bank_account__entity", "currency")  # add "bank_account__bank" if you render it
-        .order_by("-date", "-id")
-    )
+    def get_queryset_base(self):
+        """Base queryset with optimizations for reconciliation status."""
+        from django.db.models import Exists, OuterRef, Case, When, Value, CharField, Prefetch
+        
+        # Annotate reconciliation_status to avoid N+1 queries
+        return (
+            BankTransaction.objects
+            .select_related("bank_account", "bank_account__entity", "currency")
+            .annotate(
+                reconciliation_status=Case(
+                    When(
+                        Exists(
+                            Reconciliation.objects.filter(
+                                bank_transactions=OuterRef('pk'),
+                                status__in=['matched', 'approved']
+                            )
+                        ),
+                        then=Value('matched')
+                    ),
+                    When(
+                        Exists(
+                            Reconciliation.objects.filter(
+                                bank_transactions=OuterRef('pk')
+                            )
+                        ),
+                        then=Value('mixed')
+                    ),
+                    default=Value('pending'),
+                    output_field=CharField()
+                )
+            )
+            .prefetch_related(
+                Prefetch(
+                    'reconciliations',
+                    queryset=Reconciliation.objects.only('id', 'status'),
+                    to_attr='recon_list'
+                )
+            )
+            .order_by("-date", "-id")
+        )
+    
+    queryset = property(lambda self: self.get_queryset_base())
     serializer_class = BankTransactionSerializer
 
     filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
@@ -1289,7 +1366,7 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     entity_lookup = "bank_account__entity"  # <-- only if your ScopedQuerysetMixin uses this
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = self.get_queryset_base()
 
         # /entities/<entity_id>/... or ?entity_id=...
         entity_id = self.kwargs.get("entity_id") or self.request.query_params.get("entity_id")
@@ -1599,7 +1676,7 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     tx_hash = tx_info.get("tx_hash")
 
                     try:
-                        BankTransaction.objects.create(
+                        bank_tx = BankTransaction(
                             company_id=company_id,
                             bank_account=bank_acct_obj,
                             date=parsed_date,
@@ -1609,6 +1686,24 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                             status="pending",
                             tx_hash=tx_hash,
                         )
+                        
+                        # Add notes metadata with filename
+                        if hasattr(bank_tx, 'notes'):
+                            from multitenancy.utils import build_notes_metadata
+                            from crum import get_current_user
+                            
+                            current_user = get_current_user()
+                            user_name = current_user.username if current_user and current_user.is_authenticated else None
+                            
+                            filename = file_summary.get("filename")
+                            bank_tx.notes = build_notes_metadata(
+                                source='OFX Import',
+                                function='BankTransactionViewSet.import_ofx_transactions',
+                                filename=filename,
+                                user=user_name,
+                            )
+                        
+                        bank_tx.save()
                         out["inserted"] += 1
                         tx_info["status"] = "inserted"
                     except Exception as ex:
