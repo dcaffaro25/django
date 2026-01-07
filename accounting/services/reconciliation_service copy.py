@@ -240,56 +240,6 @@ def probe_amount_buckets(buckets: Dict[Decimal, List[object]], base_amt: Decimal
         yield from buckets.get(q2(base + step * k), [])
 
 
-def compute_feasibility_bounds(
-    amounts: List[Decimal],
-    target: Decimal,
-    tol: Decimal,
-    max_group_size: int,
-) -> tuple[List[bool], Optional[int]]:
-    """
-    Compute feasibility bounds for group sizes to avoid enumerating impossible combinations.
-    
-    For each group size g, computes:
-    - min_sum_g: sum of g smallest amounts
-    - max_sum_g: sum of g largest amounts
-    
-    Returns:
-    - feasible: list where feasible[g] is True if size g can reach target within tolerance
-    - g_min: smallest feasible group size, or None if no size is feasible
-    """
-    n = len(amounts)
-    if n == 0:
-        return [], None
-    
-    max_g = min(max_group_size, n)
-    
-    # Sort for min/max prefix sums
-    amounts_asc = sorted(amounts)  # ascending for min_sum
-    amounts_desc = sorted(amounts, reverse=True)  # descending for max_sum
-    
-    min_sum = [Decimal("0")] * (max_g + 1)  # min_sum[g] = sum of g smallest
-    max_sum = [Decimal("0")] * (max_g + 1)  # max_sum[g] = sum of g largest
-    
-    for g in range(1, max_g + 1):
-        min_sum[g] = min_sum[g - 1] + amounts_asc[g - 1]
-        max_sum[g] = max_sum[g - 1] + amounts_desc[g - 1]
-    
-    # Compute feasibility
-    feasible = [False] * (max_g + 1)
-    g_min = None
-    L = target - tol
-    U = target + tol
-    
-    for g in range(1, max_g + 1):
-        # Feasible if [min_sum[g], max_sum[g]] intersects [L, U]
-        if max_sum[g] >= L and min_sum[g] <= U:
-            feasible[g] = True
-            if g_min is None:
-                g_min = g
-    
-    return feasible, g_min
-
-
 def compute_match_scores(
     *,
     embed_sim: float,           # 0–1
@@ -460,31 +410,33 @@ class ReconciliationPipelineEngine:
     
         lower = target - tol
         upper = target + tol
-        candidates: List[tuple[List[int], float]] = []  # (indices, score)
-        
+        result_indices: Optional[List[int]] = None
+    
         def dfs(idx: int, chosen: List[int], current_sum: Decimal):
-            nonlocal candidates
+            nonlocal result_indices
+            if result_indices is not None:
+                return
             if len(chosen) > stage.max_group_size_book:
                 return
-            
+    
             if idx == n:
                 if not chosen:
                     return
                 if not (lower <= q2(current_sum) <= upper):
                     return
-                
+    
                 combo = [local_books[i] for i in chosen]
-                
+    
                 # currency check
                 if any(b.currency_id != bank.currency_id for b in combo):
                     return
-                
+    
                 # intra-side span (books)
                 dates = [b.date for b in combo if b.date]
                 book_span = (max(dates) - min(dates)).days if len(dates) >= 2 else 0
                 if stage.group_span_days and book_span > stage.group_span_days:
                     return
-                
+    
                 # cross-side avg date delta
                 bank_avg = bank.date
                 book_avg = self._weighted_avg_date(combo)
@@ -492,21 +444,8 @@ class ReconciliationPipelineEngine:
                 avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
                 if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                     return
-                
-                # Calculate score for this candidate
-                amount_diff = abs(q2(current_sum) - target)
-                embed_sim = self._cosine_similarity(bank.embedding or [], _avg_embedding(combo))
-                scores = compute_match_scores(
-                    embed_sim=embed_sim,
-                    amount_diff=amount_diff,
-                    amount_tol=stage.amount_tol or CENT,
-                    date_diff=avg_delta,
-                    date_tol=stage.avg_date_delta_days or 1,
-                    currency_match=1.0,
-                    weights=self.stage_weights,
-                )
-                score = scores["global_score"]
-                candidates.append((chosen.copy(), score))
+    
+                result_indices = chosen.copy()
                 return
     
             # branch-and-bound: reachable range
@@ -517,18 +456,16 @@ class ReconciliationPipelineEngine:
     
             # skip
             dfs(idx + 1, chosen, current_sum)
+            if result_indices is not None:
+                return
             # take
             dfs(idx + 1, chosen + [idx], current_sum + amounts[idx])
-        
+    
         dfs(0, [], Decimal("0"))
-        
-        if not candidates:
+    
+        if result_indices is None:
             return None
-        
-        # Return the best candidate by score (highest confidence)
-        candidates.sort(key=lambda x: -x[1])  # Sort by score descending
-        best_indices = candidates[0][0]
-        return [local_books[i] for i in best_indices]
+        return [local_books[i] for i in result_indices]
     
         
     def run(self, banks: list[BankTransactionDTO], books: list[JournalEntryDTO]) -> list[dict]:
@@ -616,24 +553,15 @@ class ReconciliationPipelineEngine:
 
     def _run_exact_1to1(self, banks, books, stage: StageConfig):
         tol = int(stage.avg_date_delta_days or 0)
-        # Deterministic sorting for stable results
-        banks_sorted = sorted(banks, key=lambda b: (b.date or date.min, b.id))
-        books_sorted = sorted(books, key=lambda b: (b.date or date.min, b.id))
-        
-        for bank in banks_sorted:
+        for bank in banks:
             if self._time_exceeded():
                 return
             
-            # Check inside lock for thread safety
-            with self._used_banks_lock:
-                if bank.id in self.used_banks:
+            if bank.id in self.used_banks:
+                continue
+            for book in books:
+                if book.id in self.used_books:
                     continue
-            
-            for book in books_sorted:
-                # Check inside lock for thread safety
-                with self._used_books_lock:
-                    if book.id in self.used_books:
-                        continue
                 if bank.company_id != book.company_id:
                     continue
                 if q2(bank.amount_base) != q2(book.amount_base):
@@ -672,7 +600,7 @@ class ReconciliationPipelineEngine:
           - group_span_days (banks)
           - avg_date_delta_days between bank-group weighted avg date and book.date
 
-        Returns the BEST valid combination of banks by confidence score, or None.
+        Returns the FIRST valid combination of banks, or None.
         """
         n = len(local_banks)
         if n == 0:
@@ -698,10 +626,13 @@ class ReconciliationPipelineEngine:
 
         lower = target - tol
         upper = target + tol
-        candidates: List[tuple[List[int], float]] = []  # (indices, score)
+        result_indices: Optional[List[int]] = None
 
         def dfs(idx: int, chosen: List[int], current_sum: Decimal):
-            nonlocal candidates
+            nonlocal result_indices
+
+            if result_indices is not None:
+                return
 
             if len(chosen) > stage.max_group_size_bank:
                 return
@@ -732,20 +663,7 @@ class ReconciliationPipelineEngine:
                 if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                     return
 
-                # Calculate score for this candidate
-                amount_diff = abs(q2(current_sum) - target)
-                embed_sim = self._cosine_similarity(_avg_embedding(combo), book.embedding or [])
-                scores = compute_match_scores(
-                    embed_sim=embed_sim,
-                    amount_diff=amount_diff,
-                    amount_tol=stage.amount_tol or CENT,
-                    date_diff=avg_delta,
-                    date_tol=stage.avg_date_delta_days or 1,
-                    currency_match=1.0,
-                    weights=self.stage_weights,
-                )
-                score = scores["global_score"]
-                candidates.append((chosen.copy(), score))
+                result_indices = chosen.copy()
                 return
 
             # Branch-and-bound: check reachable range
@@ -756,29 +674,30 @@ class ReconciliationPipelineEngine:
 
             # Option 1: skip this item
             dfs(idx + 1, chosen, current_sum)
+            if result_indices is not None:
+                return
+
             # Option 2: take this item
             dfs(idx + 1, chosen + [idx], current_sum + amounts[idx])
 
         dfs(0, [], Decimal("0"))
 
-        if not candidates:
+        if result_indices is None:
             return None
 
-        # Return the best candidate by score (highest confidence)
-        candidates.sort(key=lambda x: -x[1])  # Sort by score descending
-        best_indices = candidates[0][0]
-        return [local_banks[i] for i in best_indices]
+        return [local_banks[i] for i in result_indices]
 
     def _run_one_to_many(self, banks, books, stage: StageConfig):
         """
         One bank to many books.
 
-        Phase 1: Collect all candidate suggestions from all banks.
-        Phase 2: Run global non-overlapping selection to maximize total match quality.
-        
-        For each bank we generate up to `stage.max_alternatives_per_anchor` best
-        book-combos ranked by global match score. Then we select a non-overlapping
-        set globally to avoid greedy per-anchor selection issues.
+        For each bank we choose up to `stage.max_alternatives_per_anchor` best
+        book-combos ranked by global match score, and return them all as
+        separate suggestions.
+
+        Only the *best* suggestion per bank is marked as used via `_record`;
+        the other alternatives are appended directly to `self.suggestions`
+        without touching `used_banks` / `used_books`.
         """
         available_books = [
             b for b in books
@@ -792,28 +711,13 @@ class ReconciliationPipelineEngine:
             len(banks), len(books), win, stage.amount_tol, stage.allow_mixed_signs, max_k,
         )
 
-        # Phase 1: Collect all candidates from all banks
-        all_candidates: List[dict] = []
-
         def add_candidate(sug: dict, buf: list[dict]) -> None:
-            """Add candidate with deterministic tie-breaking for stable ordering."""
-            def sort_key(s):
-                """Deterministic sort key for suggestions."""
-                return (
-                    -float(s.get("confidence_score", 0.0)),  # Higher is better
-                    s.get("extra", {}).get("avg_date_delta_days_measured", 9999),  # Lower is better
-                    s.get("abs_amount_diff", 999999.0),  # Lower is better
-                    tuple(sorted(s.get("bank_ids", []))),  # Deterministic
-                    tuple(sorted(s.get("journal_entries_ids", []))),  # Deterministic
-                )
-            
-            score_key = sort_key(sug)
+            score = float(sug.get("confidence_score", 0.0))
             if len(buf) < max_k:
                 buf.append(sug)
                 return
-            worst_idx = min(range(len(buf)), key=lambda i: sort_key(buf[i]))
-            worst_key = sort_key(buf[worst_idx])
-            if score_key < worst_key:  # Tuple comparison: better candidate
+            worst_idx = min(range(len(buf)), key=lambda i: float(buf[i].get("confidence_score", 0.0)))
+            if score > float(buf[worst_idx].get("confidence_score", 0.0)):
                 buf[worst_idx] = sug
 
         for bank in banks:
@@ -832,9 +736,6 @@ class ReconciliationPipelineEngine:
             ]
             if not local_books:
                 continue
-            
-            # Deterministic sorting: sort by (amount, id) for stable combination generation
-            local_books.sort(key=lambda b: (b.amount_base or Decimal("0"), b.id))
 
             # sign filtering if mixed_signs is False
             if not stage.allow_mixed_signs and bank_sign != 0:
@@ -906,7 +807,7 @@ class ReconciliationPipelineEngine:
             U = target + tol
             if U < min_possible or L > max_possible:
                 if candidates:
-                    candidates.sort(key=self._deterministic_sort_key)
+                    candidates.sort(key=lambda s: float(s["confidence_score"]), reverse=True)
                     best = candidates[0]
                     self._record(best)
                     for alt in candidates[1:]:
@@ -926,61 +827,6 @@ class ReconciliationPipelineEngine:
 
             max_size = min(stage.max_group_size_book, len(local_books))
 
-            # Feasibility pruning: compute g_min to skip infeasible sizes
-            feasible, g_min = compute_feasibility_bounds(book_amounts, target, tol, max_size)
-            
-            if g_min is None:
-                # No feasible size exists - skip this bank entirely
-                log.debug("OTM bank=%s no feasible group size (g_min=None)", bank.id)
-                if candidates:
-                    all_candidates.extend(candidates)
-                continue
-            
-            # All-in shortcut: if only full group is feasible and it matches exactly
-            if g_min == len(local_books):
-                all_sum = sum(book_amounts)
-                all_diff = abs(q2(all_sum) - target)
-                if all_diff <= tol:
-                    # Check date constraints for full group
-                    book_dates = [b.date for b in local_books if b.date]
-                    book_span = (max(book_dates) - min(book_dates)).days if len(book_dates) >= 2 else 0
-                    if (not stage.group_span_days or book_span <= stage.group_span_days):
-                        bank_avg = bank.date
-                        book_avg = self._weighted_avg_date(local_books)
-                        avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
-                        if (not stage.avg_date_delta_days or avg_delta <= stage.avg_date_delta_days):
-                            # All-in is valid - score and add
-                            sim = self._cosine_similarity(bank.embedding or [], _avg_embedding(local_books))
-                            scores = compute_match_scores(
-                                embed_sim=sim,
-                                amount_diff=all_diff,
-                                amount_tol=stage.amount_tol or CENT,
-                                date_diff=avg_delta,
-                                date_tol=stage.avg_date_delta_days or 1,
-                                currency_match=1.0,
-                                weights=self.stage_weights,
-                            )
-                            sug = self._make_suggestion(
-                                "one_to_many",
-                                [bank],
-                                local_books,
-                                scores["global_score"],
-                                stage=stage,
-                                weights=self.stage_weights,
-                                component_scores=scores,
-                                extra={
-                                    "book_span_days_measured": book_span,
-                                    "avg_date_delta_days_measured": avg_delta,
-                                    "mixed_signs": False,
-                                    "all_in_shortcut": True,
-                                    "g_min": g_min,
-                                },
-                            )
-                            add_candidate(sug, candidates)
-                            if candidates:
-                                all_candidates.extend(candidates)
-                            continue  # Skip enumeration
-
             prefix_max: List[Decimal] = []
             if use_prefix_bounds:
                 amounts_desc = sorted(book_amounts, reverse=True)
@@ -990,13 +836,22 @@ class ReconciliationPipelineEngine:
                     prefix_max.append(acc)
                 if q2(prefix_max[-1]) + tol < target:
                     if candidates:
-                        all_candidates.extend(candidates)
+                        candidates.sort(key=lambda s: float(s["confidence_score"]), reverse=True)
+                        best = candidates[0]
+                        self._record(best)
+                        for alt in candidates[1:]:
+                            self.suggestions.append(alt)
+                            if self._on_suggestion:
+                                try:
+                                    self._on_suggestion(alt)
+                                except Exception as cb_exc:
+                                    log.warning(
+                                        "on_suggestion callback failed (alt many_to_many): %s",
+                                        cb_exc,
+                                    )
                     continue
 
-            # Start enumeration at g_min, not 1
-            for size in range(g_min, max_size + 1):
-                if not feasible[size]:
-                    continue  # Skip infeasible sizes
+            for size in range(1, max_size + 1):
                 if self._time_exceeded():
                     return
 
@@ -1004,10 +859,8 @@ class ReconciliationPipelineEngine:
                     continue
 
                 for combo in combinations(local_books, size):
-                    # Check inside lock for thread safety
-                    with self._used_books_lock:
-                        if any(x.id in self.used_books for x in combo):
-                            continue
+                    if any(x.id in self.used_books for x in combo):
+                        continue
 
                     total = sum((b.amount_base for b in combo), Decimal("0"))
                     diff = abs(q2(total) - target)
@@ -1054,64 +907,18 @@ class ReconciliationPipelineEngine:
                     )
                     add_candidate(sug, candidates)
 
-            # Add all candidates from this bank to global collection
             if candidates:
-                all_candidates.extend(candidates)
-        
-        # Phase 2: Global selection - pick non-overlapping set
-        if all_candidates:
-            selected = self._global_select_non_overlapping(all_candidates)
-            
-            # Record selected suggestions (these mark IDs as used) with rank=1, is_primary=True
-            for rank, sug in enumerate(selected, start=1):
-                # Add alternatives metadata
-                bank_id = sug.get("bank_ids", [None])[0] if sug.get("bank_ids") else None
-                alternatives_group_id = f"bank_{bank_id}_otm" if bank_id else None
-                sug["rank_among_alternatives"] = rank
-                sug["alternatives_group_id"] = alternatives_group_id
-                sug["is_primary"] = (rank == 1)
-                sug["total_alternatives"] = len(selected)  # Will be updated with alternatives count
-                self._record(sug)
-            
-            # Add alternatives that weren't selected (for visibility, but don't mark as used)
-            selected_bank_ids = {bid for s in selected for bid in s.get("bank_ids", [])}
-            alternatives = [s for s in all_candidates if s not in selected]
-            
-            # Group alternatives by bank_id for max_k per anchor
-            alternatives_by_bank: Dict[int, List[dict]] = {}
-            for alt in alternatives:
-                bank_id = alt.get("bank_ids", [None])[0] if alt.get("bank_ids") else None
-                if bank_id and bank_id not in selected_bank_ids:
-                    if bank_id not in alternatives_by_bank:
-                        alternatives_by_bank[bank_id] = []
-                    if len(alternatives_by_bank[bank_id]) < max_k - 1:  # -1 because best was selected
-                        alternatives_by_bank[bank_id].append(alt)
-            
-            # Add alternatives to suggestions with proper ranking
-            for bank_id, alt_list in alternatives_by_bank.items():
-                # Sort alternatives by deterministic key
-                alt_list.sort(key=self._deterministic_sort_key)
-                alternatives_group_id = f"bank_{bank_id}_otm"
-                total_alt_count = len(selected) + len(alt_list)  # Selected + alternatives
-                
-                # Update selected suggestions with correct total_alternatives
-                for sug in selected:
-                    if sug.get("bank_ids", [None])[0] == bank_id:
-                        sug["total_alternatives"] = total_alt_count
-                
-                # Add alternatives with ranks starting from len(selected) + 1
-                for rank_offset, alt in enumerate(alt_list, start=1):
-                    alt["rank_among_alternatives"] = len(selected) + rank_offset
-                    alt["alternatives_group_id"] = alternatives_group_id
-                    alt["is_primary"] = False
-                    alt["total_alternatives"] = total_alt_count
+                candidates.sort(key=lambda s: float(s["confidence_score"]), reverse=True)
+                best = candidates[0]
+                self._record(best)
+                for alt in candidates[1:]:
                     self.suggestions.append(alt)
                     if self._on_suggestion:
                         try:
                             self._on_suggestion(alt)
                         except Exception as cb_exc:
                             log.warning(
-                                "on_suggestion callback failed (alt one_to_many): %s",
+                                "on_suggestion callback failed (alt many_to_many): %s",
                                 cb_exc,
                             )
 
@@ -1138,24 +945,12 @@ class ReconciliationPipelineEngine:
         )
 
         def add_candidate(sug: dict, buf: list[dict]) -> None:
-            """Add candidate with deterministic tie-breaking for stable ordering."""
-            def sort_key(s):
-                """Deterministic sort key for suggestions."""
-                return (
-                    -float(s.get("confidence_score", 0.0)),  # Higher is better
-                    s.get("extra", {}).get("avg_date_delta_days_measured", 9999),  # Lower is better
-                    s.get("abs_amount_diff", 999999.0),  # Lower is better
-                    tuple(sorted(s.get("bank_ids", []))),  # Deterministic
-                    tuple(sorted(s.get("journal_entries_ids", []))),  # Deterministic
-                )
-            
-            score_key = sort_key(sug)
+            score = float(sug.get("confidence_score", 0.0))
             if len(buf) < max_k:
                 buf.append(sug)
                 return
-            worst_idx = min(range(len(buf)), key=lambda i: sort_key(buf[i]))
-            worst_key = sort_key(buf[worst_idx])
-            if score_key < worst_key:  # Tuple comparison: better candidate
+            worst_idx = min(range(len(buf)), key=lambda i: float(buf[i].get("confidence_score", 0.0)))
+            if score > float(buf[worst_idx].get("confidence_score", 0.0)):
                 buf[worst_idx] = sug
 
         for book in books:
@@ -1173,9 +968,6 @@ class ReconciliationPipelineEngine:
             ]
             if not local_banks:
                 continue
-            
-            # Deterministic sorting: sort by (amount, id) for stable combination generation
-            local_banks.sort(key=lambda b: (b.amount_base or Decimal("0"), b.id))
 
             bank_amounts = [(b.amount_base or Decimal("0")) for b in local_banks]
             if not bank_amounts:
@@ -1250,90 +1042,25 @@ class ReconciliationPipelineEngine:
             U = target + tol
             if U < min_possible or L > max_possible:
                 if candidates:
-                    all_candidates.extend(candidates)
-                continue
-                def sort_key(s):
-                    return (
-                        -float(s.get("confidence_score", 0.0)),  # Higher is better
-                        s.get("extra", {}).get("avg_date_delta_days_measured", 9999),  # Lower is better
-                        s.get("abs_amount_diff", 999999.0),  # Lower is better
-                        tuple(sorted(s.get("bank_ids", []))),  # Deterministic
-                        tuple(sorted(s.get("journal_entries_ids", []))),  # Deterministic
-                    )
-                candidates.sort(key=sort_key)
-                best = candidates[0]
-                self._record(best)
-                for alt in candidates[1:]:
-                    self.suggestions.append(alt)
-                    if self._on_suggestion:
-                        try:
-                            self._on_suggestion(alt)
-                        except Exception as cb_exc:
-                            log.warning(
-                                "on_suggestion callback failed (alt many_to_one): %s",
-                                cb_exc,
-                            )
+                    candidates.sort(key=lambda s: float(s["confidence_score"]), reverse=True)
+                    best = candidates[0]
+                    self._record(best)
+                    for alt in candidates[1:]:
+                        self.suggestions.append(alt)
+                        if self._on_suggestion:
+                            try:
+                                self._on_suggestion(alt)
+                            except Exception as cb_exc:
+                                log.warning(
+                                    "on_suggestion callback failed (alt many_to_one): %s",
+                                    cb_exc,
+                                )
                 continue
 
             all_non_negative = all(a >= 0 for a in bank_amounts)
             use_prefix_bounds = all_non_negative and target >= 0
 
             max_size = min(stage.max_group_size_bank, len(local_banks))
-
-            # Feasibility pruning: compute g_min to skip infeasible sizes
-            feasible, g_min = compute_feasibility_bounds(bank_amounts, target, tol, max_size)
-            
-            if g_min is None:
-                # No feasible size exists - skip this book entirely
-                log.debug("MTO book=%s no feasible group size (g_min=None)", book.id)
-                if candidates:
-                    all_candidates.extend(candidates)
-                continue
-            
-            # All-in shortcut: if only full group is feasible and it matches exactly
-            if g_min == len(local_banks):
-                all_sum = sum(bank_amounts)
-                all_diff = abs(q2(all_sum) - target)
-                if all_diff <= tol:
-                    # Check date constraints for full group
-                    bank_dates = [b.date for b in local_banks if b.date]
-                    bank_span = (max(bank_dates) - min(bank_dates)).days if len(bank_dates) >= 2 else 0
-                    if (not stage.group_span_days or bank_span <= stage.group_span_days):
-                        bank_avg = self._weighted_avg_date(local_banks)
-                        book_avg = book.date
-                        avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
-                        if (not stage.avg_date_delta_days or avg_delta <= stage.avg_date_delta_days):
-                            # All-in is valid - score and add
-                            sim = self._cosine_similarity(_avg_embedding(local_banks), book.embedding or [])
-                            scores = compute_match_scores(
-                                embed_sim=sim,
-                                amount_diff=all_diff,
-                                amount_tol=stage.amount_tol or CENT,
-                                date_diff=avg_delta,
-                                date_tol=stage.avg_date_delta_days or 1,
-                                currency_match=1.0,
-                                weights=self.stage_weights,
-                            )
-                            sug = self._make_suggestion(
-                                "many_to_one",
-                                local_banks,
-                                [book],
-                                scores["global_score"],
-                                stage=stage,
-                                weights=self.stage_weights,
-                                component_scores=scores,
-                                extra={
-                                    "bank_span_days_measured": bank_span,
-                                    "avg_date_delta_days_measured": avg_delta,
-                                    "mixed_signs": False,
-                                    "all_in_shortcut": True,
-                                    "g_min": g_min,
-                                },
-                            )
-                            add_candidate(sug, candidates)
-                            if candidates:
-                                all_candidates.extend(candidates)
-                            continue  # Skip enumeration
 
             prefix_max: List[Decimal] = []
             if use_prefix_bounds:
@@ -1344,13 +1071,22 @@ class ReconciliationPipelineEngine:
                     prefix_max.append(acc)
                 if q2(prefix_max[-1]) + tol < target:
                     if candidates:
-                        all_candidates.extend(candidates)
+                        candidates.sort(key=lambda s: float(s["confidence_score"]), reverse=True)
+                        best = candidates[0]
+                        self._record(best)
+                        for alt in candidates[1:]:
+                            self.suggestions.append(alt)
+                            if self._on_suggestion:
+                                try:
+                                    self._on_suggestion(alt)
+                                except Exception as cb_exc:
+                                    log.warning(
+                                        "on_suggestion callback failed (alt many_to_many): %s",
+                                        cb_exc,
+                                    )
                     continue
 
-            # Start enumeration at g_min, not 1
-            for size in range(g_min, max_size + 1):
-                if not feasible[size]:
-                    continue  # Skip infeasible sizes
+            for size in range(1, max_size + 1):
                 if self._time_exceeded():
                     return
 
@@ -1358,10 +1094,8 @@ class ReconciliationPipelineEngine:
                     continue
 
                 for combo in combinations(local_banks, size):
-                    # Check inside lock for thread safety
-                    with self._used_banks_lock:
-                        if any(x.id in self.used_banks for x in combo):
-                            continue
+                    if any(x.id in self.used_banks for x in combo):
+                        continue
 
                     total = sum((b.amount_base for b in combo), Decimal("0"))
                     diff = abs(q2(total) - target)
@@ -1408,64 +1142,18 @@ class ReconciliationPipelineEngine:
                     )
                     add_candidate(sug, candidates)
 
-            # Add all candidates from this book to global collection
             if candidates:
-                all_candidates.extend(candidates)
-        
-        # Phase 2: Global selection - pick non-overlapping set
-        if all_candidates:
-            selected = self._global_select_non_overlapping(all_candidates)
-            
-            # Record selected suggestions (these mark IDs as used) with rank=1, is_primary=True
-            for rank, sug in enumerate(selected, start=1):
-                # Add alternatives metadata
-                book_id = sug.get("journal_entries_ids", [None])[0] if sug.get("journal_entries_ids") else None
-                alternatives_group_id = f"book_{book_id}_mto" if book_id else None
-                sug["rank_among_alternatives"] = rank
-                sug["alternatives_group_id"] = alternatives_group_id
-                sug["is_primary"] = (rank == 1)
-                sug["total_alternatives"] = len(selected)  # Will be updated with alternatives count
-                self._record(sug)
-            
-            # Add alternatives that weren't selected (for visibility, but don't mark as used)
-            selected_book_ids = {jid for s in selected for jid in s.get("journal_entries_ids", [])}
-            alternatives = [s for s in all_candidates if s not in selected]
-            
-            # Group alternatives by book_id for max_k per anchor
-            alternatives_by_book: Dict[int, List[dict]] = {}
-            for alt in alternatives:
-                book_id = alt.get("journal_entries_ids", [None])[0] if alt.get("journal_entries_ids") else None
-                if book_id and book_id not in selected_book_ids:
-                    if book_id not in alternatives_by_book:
-                        alternatives_by_book[book_id] = []
-                    if len(alternatives_by_book[book_id]) < max_k - 1:  # -1 because best was selected
-                        alternatives_by_book[book_id].append(alt)
-            
-            # Add alternatives to suggestions with proper ranking
-            for book_id, alt_list in alternatives_by_book.items():
-                # Sort alternatives by deterministic key
-                alt_list.sort(key=self._deterministic_sort_key)
-                alternatives_group_id = f"book_{book_id}_mto"
-                total_alt_count = len(selected) + len(alt_list)  # Selected + alternatives
-                
-                # Update selected suggestions with correct total_alternatives
-                for sug in selected:
-                    if sug.get("journal_entries_ids", [None])[0] == book_id:
-                        sug["total_alternatives"] = total_alt_count
-                
-                # Add alternatives with ranks starting from len(selected) + 1
-                for rank_offset, alt in enumerate(alt_list, start=1):
-                    alt["rank_among_alternatives"] = len(selected) + rank_offset
-                    alt["alternatives_group_id"] = alternatives_group_id
-                    alt["is_primary"] = False
-                    alt["total_alternatives"] = total_alt_count
+                candidates.sort(key=lambda s: float(s["confidence_score"]), reverse=True)
+                best = candidates[0]
+                self._record(best)
+                for alt in candidates[1:]:
                     self.suggestions.append(alt)
                     if self._on_suggestion:
                         try:
                             self._on_suggestion(alt)
                         except Exception as cb_exc:
                             log.warning(
-                                "on_suggestion callback failed (alt many_to_one): %s",
+                                "on_suggestion callback failed (alt many_to_many): %s",
                                 cb_exc,
                             )
 
@@ -1866,7 +1554,7 @@ class ReconciliationPipelineEngine:
                             add_candidate(sug, candidates)
 
             if candidates:
-                candidates.sort(key=self._deterministic_sort_key)
+                candidates.sort(key=lambda s: float(s["confidence_score"]), reverse=True)
                 best = candidates[0]
                 self._record(best)
                 for alt in candidates[1:]:
@@ -1883,50 +1571,6 @@ class ReconciliationPipelineEngine:
 
 
     # ------------------------ Internal helpers ------------------------
-
-    def _deterministic_sort_key(self, s: dict) -> tuple:
-        """
-        Deterministic sort key for suggestions to ensure stable ordering.
-        Returns a tuple for comparison: smaller tuple = better candidate.
-        """
-        return (
-            -float(s.get("confidence_score", 0.0)),  # Higher is better (negated)
-            s.get("extra", {}).get("avg_date_delta_days_measured", 9999),  # Lower is better
-            s.get("abs_amount_diff", 999999.0),  # Lower is better
-            tuple(sorted(s.get("bank_ids", []))),  # Deterministic
-            tuple(sorted(s.get("journal_entries_ids", []))),  # Deterministic
-        )
-    
-    def _global_select_non_overlapping(self, candidates: List[dict]) -> List[dict]:
-        """
-        Select a non-overlapping set of suggestions from candidates using greedy selection.
-        Sorted by confidence score, picks candidates that don't conflict with already-selected ones.
-        
-        Returns the selected suggestions in order of selection.
-        """
-        if not candidates:
-            return []
-        
-        # Sort by deterministic key (best first)
-        candidates_sorted = sorted(candidates, key=self._deterministic_sort_key)
-        
-        selected: List[dict] = []
-        used_bank_ids: set[int] = set()
-        used_book_ids: set[int] = set()
-        
-        for candidate in candidates_sorted:
-            bank_ids = set(candidate.get("bank_ids", []))
-            book_ids = set(candidate.get("journal_entries_ids", []))
-            
-            # Skip if any ID is already used
-            if bank_ids & used_bank_ids or book_ids & used_book_ids:
-                continue
-            
-            selected.append(candidate)
-            used_bank_ids.update(bank_ids)
-            used_book_ids.update(book_ids)
-        
-        return selected
 
     def _date_span_days(self, items) -> int:
         dates = [it.date for it in items if it.date]
@@ -2078,8 +1722,6 @@ class ReconciliationPipelineEngine:
         Record a suggestion and mark participating IDs as used, but skip exact duplicates.
         A duplicate is any suggestion with the same set of bank_ids and book_ids.
         Thread-safe version for parallel processing.
-        
-        Performs atomic check-and-set: verifies IDs are not already used before marking.
         """
         bank_key = tuple(sorted(suggestion["bank_ids"]))
         book_key = tuple(sorted(suggestion["journal_entries_ids"]))
@@ -2094,23 +1736,6 @@ class ReconciliationPipelineEngine:
                 )
                 return
 
-            # Atomic check: verify no IDs are already used (race condition guard)
-            with self._used_banks_lock:
-                if any(bid in self.used_banks for bid in suggestion["bank_ids"]):
-                    log.debug(
-                        "Skipping suggestion: bank_ids already used: %s",
-                        suggestion["bank_ids"],
-                    )
-                    return
-            
-            with self._used_books_lock:
-                if any(jid in self.used_books for jid in suggestion["journal_entries_ids"]):
-                    log.debug(
-                        "Skipping suggestion: journal_ids already used: %s",
-                        suggestion["journal_entries_ids"],
-                    )
-                    return
-
             self._seen_groups.add(key)
 
             log.debug(
@@ -2123,7 +1748,6 @@ class ReconciliationPipelineEngine:
 
             self.suggestions.append(suggestion)
             
-            # Mark as used atomically
             with self._used_banks_lock:
                 self.used_banks.update(suggestion["bank_ids"])
             with self._used_books_lock:
@@ -2354,7 +1978,7 @@ class ReconciliationPipelineEngine:
         # Sort candidates and record up to max_alternatives_per_anchor
         if not candidates:
             return
-        candidates.sort(key=self._deterministic_sort_key)
+        candidates.sort(key=lambda s: float(s["confidence_score"]), reverse=True)
         best = candidates[0]
         self._record(best)
         for alt in candidates[1:stage.max_alternatives_per_anchor]:
@@ -2424,46 +2048,10 @@ class ReconciliationPipelineEngine:
         # Path 2: Same-sign / bounded search
         # Generate candidate combos up to max_group_size
         max_size = min(stage.max_group_size_book, len(book_items))
-        
-        # Feasibility pruning: compute g_min to skip infeasible sizes
-        book_amounts = [item.amount for item in book_items]
-        tol = stage.amount_tol or Decimal("0")
-        feasible, g_min = compute_feasibility_bounds(book_amounts, target, tol, max_size)
-        
-        if g_min is None:
-            # No feasible size exists - skip this bank entirely
-            log.debug("OTM_FAST bank=%s no feasible group size (g_min=None)", bank.id)
-            if combos:
-                # Still process mixed-sign results if any
-                pass
-            else:
-                return
-        
-        # All-in shortcut: if only full group is feasible and it matches exactly
-        if g_min == len(book_items):
-            all_sum = sum(book_amounts)
-            all_diff = abs(q2(all_sum) - target)
-            if all_diff <= tol:
-                # Check date constraints for full group
-                book_dates = [item.dto.date for item in book_items if item.dto.date]
-                book_span = (max(book_dates) - min(book_dates)).days if len(book_dates) >= 2 else 0
-                if (not stage.group_span_days or book_span <= stage.group_span_days):
-                    bank_avg = bank.date
-                    book_avg = self._weighted_avg_date([item.dto for item in book_items])
-                    avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else stage.candidate_window_days + 1
-                    if (not stage.avg_date_delta_days or avg_delta <= stage.avg_date_delta_days):
-                        # All-in is valid - add to combos
-                        combos.append([item.dto for item in book_items])
-                        log.debug("OTM_FAST bank=%s all-in shortcut: n=%s sum=%s diff=%s", bank.id, len(book_items), all_sum, all_diff)
-                        # Continue to scoring/recording below
-        
         if strategy == "exact" or max_size <= 2:
             # Full enumeration for small groups
-            log.debug("OTM_FAST bank=%s using exact enumeration max_size=%s g_min=%s", bank.id, max_size, g_min)
-            # Start enumeration at g_min, not 1
-            for size in range(g_min if g_min else 1, max_size + 1):
-                if not feasible[size]:
-                    continue  # Skip infeasible sizes
+            log.debug("OTM_FAST bank=%s using exact enumeration max_size=%s", bank.id, max_size)
+            for size in range(1, max_size + 1):
                 if self._time_exceeded():
                     return
                 for combo in combinations(book_items, size):
@@ -2800,46 +2388,10 @@ class ReconciliationPipelineEngine:
         
         # Path 2: Same-sign / bounded search
         max_size = min(stage.max_group_size_bank, len(bank_items))
-        
-        # Feasibility pruning: compute g_min to skip infeasible sizes
-        bank_amounts = [item.amount for item in bank_items]
-        tol = stage.amount_tol or Decimal("0")
-        feasible, g_min = compute_feasibility_bounds(bank_amounts, target, tol, max_size)
-        
-        if g_min is None:
-            # No feasible size exists - skip this book entirely
-            log.debug("MTO_FAST book=%s no feasible group size (g_min=None)", book.id)
-            if combos:
-                # Still process mixed-sign results if any
-                pass
-            else:
-                return
-        
-        # All-in shortcut: if only full group is feasible and it matches exactly
-        if g_min == len(bank_items):
-            all_sum = sum(bank_amounts)
-            all_diff = abs(q2(all_sum) - target)
-            if all_diff <= tol:
-                # Check date constraints for full group
-                bank_dates = [item.dto.date for item in bank_items if item.dto.date]
-                bank_span = (max(bank_dates) - min(bank_dates)).days if len(bank_dates) >= 2 else 0
-                if (not stage.group_span_days or bank_span <= stage.group_span_days):
-                    bank_avg = self._weighted_avg_date([item.dto for item in bank_items])
-                    book_avg = book.date
-                    avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
-                    if (not stage.avg_date_delta_days or avg_delta <= stage.avg_date_delta_days):
-                        # All-in is valid - add to combos
-                        combos.append([item.dto for item in bank_items])
-                        log.debug("MTO_FAST book=%s all-in shortcut: n=%s sum=%s diff=%s", book.id, len(bank_items), all_sum, all_diff)
-                        # Continue to scoring/recording below
-        
         if strategy == "exact" or max_size <= 2:
             # Full enumeration
-            log.debug("MTO_FAST book=%s using exact enumeration max_size=%s g_min=%s", book.id, max_size, g_min)
-            # Start enumeration at g_min, not 1
-            for size in range(g_min if g_min else 1, max_size + 1):
-                if not feasible[size]:
-                    continue  # Skip infeasible sizes
+            log.debug("MTO_FAST book=%s using exact enumeration max_size=%s", book.id, max_size)
+            for size in range(1, max_size + 1):
                 if self._time_exceeded():
                     return
                 for combo in combinations(bank_items, size):
@@ -2995,7 +2547,7 @@ class ReconciliationPipelineEngine:
             ],
         )
         if candidates:
-            candidates.sort(key=self._deterministic_sort_key)
+            candidates.sort(key=lambda s: float(s["confidence_score"]), reverse=True)
             best = candidates[0]
             self._record(best)
             for alt in candidates[1:stage.max_alternatives_per_anchor]:
@@ -4471,8 +4023,7 @@ class ReconciliationService:
                 log.debug("Skipping auto-match suggestion due to overlap in batch: %s", s)
                 continue
 
-            # Check for preexisting matches (idempotency guard)
-            # First check: any bank or book already matched
+            # Check for preexisting matches
             if BankTransaction.objects.filter(
                 id__in=bank_ids, reconciliations__status__in=["matched", "approved"]
             ).exists() or JournalEntry.objects.filter(
@@ -4482,27 +4033,6 @@ class ReconciliationService:
                 details.append({"reason": "already_matched", "suggestion": s})
                 log.debug("Skipping auto-match suggestion because already matched/approved in DB: %s", s)
                 continue
-            
-            # Second check: exact duplicate - same bank_ids + journal_ids combination already exists
-            # This prevents creating duplicate reconciliations on reruns
-            bank_ids_set = set(bank_ids)
-            book_ids_set = set(book_ids)
-            existing_recon = Reconciliation.objects.filter(
-                bank_transactions__id__in=bank_ids
-            ).prefetch_related('bank_transactions', 'journal_entries').first()
-            
-            if existing_recon:
-                # Check if this reconciliation has the exact same bank and journal IDs
-                existing_bank_ids = {bt.id for bt in existing_recon.bank_transactions.all()}
-                existing_book_ids = {je.id for je in existing_recon.journal_entries.all()}
-                if existing_bank_ids == bank_ids_set and existing_book_ids == book_ids_set:
-                    skipped += 1
-                    details.append({"reason": "exact_duplicate", "suggestion": s, "existing_recon_id": existing_recon.id})
-                    log.debug(
-                        "Skipping auto-match suggestion: exact duplicate of reconciliation id=%s (banks=%s, journals=%s)",
-                        existing_recon.id, bank_ids, book_ids
-                    )
-                    continue
 
             bank_objs = list(BankTransaction.objects.filter(id__in=bank_ids))
             book_objs = list(JournalEntry.objects.filter(id__in=book_ids))

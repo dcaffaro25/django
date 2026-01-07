@@ -25,7 +25,8 @@ class TenantMiddleware:
             request.path.startswith('/api/login') or
             request.path.startswith('/api/logout') or
             request.path.startswith('/api/core') or
-            request.path.startswith('/docs')
+            request.path.startswith('/docs') or
+            '/knowledge-base' in request.path
         ):
             return self.get_response(request)
 
@@ -33,6 +34,7 @@ class TenantMiddleware:
         path_parts = request.path_info.strip('/').split('/')
         subdomain = path_parts[0] if path_parts else None
         #print(subdomain)
+        
         # Check if the user is authenticated
         if not request.user.is_authenticated and subdomain != 'testco':
             try:
@@ -43,7 +45,11 @@ class TenantMiddleware:
                     request.user = user
                     request.auth = token
             except AuthenticationFailed:
-                return JsonResponse({'error': 'Authentication required'}, status=401)
+                # Don't return 401 here - let the view handle permissions
+                # Some views (like knowledge-base) allow unauthenticated access
+                # Just log and continue - the view's permission_classes will decide
+                print(f"[TenantMiddleware] Authentication failed for {request.path}, but allowing request to continue")
+                pass
 
         # Handle 'all' tenants for superusers
         if subdomain == 'all':

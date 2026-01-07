@@ -328,9 +328,16 @@ def process_import_template_task(
             f"Company: {company_id} | Commit: {commit}"
         )
         
+        # Build import_metadata with filename for notes
+        import_metadata = {
+            'source': 'Import',
+            'function': 'process_import_template_task',
+            'filename': file_meta.get('filename') if file_meta else None,
+        }
+        
         # Execute import job
         stage_start = time.monotonic()
-        result = execute_import_job(company_id, sheets, commit)
+        result = execute_import_job(company_id, sheets, commit, import_metadata=import_metadata)
         stage_time = time.monotonic() - stage_start
         
         # Collect statistics

@@ -1,0 +1,176 @@
+{% extends "admin/base_site.html" %}
+{% load i18n admin_urls static admin_modify %}
+
+{% block title %}{{ title }} | {{ site_title|default:_('Django site admin') }}{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">{% trans 'Home' %}</a>
+    &rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+    &rsaquo; <a href="{% url 'admin:accounting_account_changelist' %}">{{ opts.verbose_name_plural|capfirst }}</a>
+    &rsaquo; {{ title }}
+</div>
+{% endblock %}
+
+{% block content %}
+<h1>{{ title }}</h1>
+
+<p>You are about to edit <strong>{{ selected_count }}</strong> {{ opts.verbose_name_plural }}.</p>
+
+{% if selected_objects %}
+<h2>Selected {{ opts.verbose_name_plural }} (showing first {{ selected_objects|length }}):</h2>
+<ul>
+    {% for obj in selected_objects %}
+    <li>{{ obj }}</li>
+    {% endfor %}
+    {% if selected_count > selected_objects|length %}
+    <li><em>... and {{ selected_count|add:"-"|add:selected_objects|length }} more</em></li>
+    {% endif %}
+</ul>
+{% endif %}
+
+<form method="post" action="" id="bulk-edit-form">
+    {% csrf_token %}
+    
+    {% if form.non_field_errors %}
+    <ul class="errorlist">
+        {% for error in form.non_field_errors %}
+        <li>{{ error }}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+    
+    <fieldset class="module aligned">
+        <h2>Select field to edit</h2>
+        <div class="form-row">
+            {{ form.field_to_edit.label_tag }}
+            {{ form.field_to_edit }}
+            {% if form.field_to_edit.help_text %}
+            <p class="help">{{ form.field_to_edit.help_text }}</p>
+            {% endif %}
+            {% if form.field_to_edit.errors %}
+            <ul class="errorlist">
+                {% for error in form.field_to_edit.errors %}
+                <li>{{ error }}</li>
+                {% endfor %}
+            </ul>
+            {% endif %}
+        </div>
+    </fieldset>
+    
+    <fieldset class="module aligned" id="field-values">
+        <h2>Enter new value</h2>
+        
+        <div class="form-row field-balance_date" style="display:none;">
+            {{ form.balance_date.label_tag }}
+            {{ form.balance_date }}
+            {% if form.balance_date.help_text %}
+            <p class="help">{{ form.balance_date.help_text }}</p>
+            {% endif %}
+            {% if form.balance_date.errors %}
+            <ul class="errorlist">
+                {% for error in form.balance_date.errors %}
+                <li>{{ error }}</li>
+                {% endfor %}
+            </ul>
+            {% endif %}
+        </div>
+        
+        <div class="form-row field-is_active" style="display:none;">
+            {{ form.is_active.label_tag }}
+            {{ form.is_active }}
+            {% if form.is_active.help_text %}
+            <p class="help">{{ form.is_active.help_text }}</p>
+            {% endif %}
+            {% if form.is_active.errors %}
+            <ul class="errorlist">
+                {% for error in form.is_active.errors %}
+                <li>{{ error }}</li>
+                {% endfor %}
+            </ul>
+            {% endif %}
+        </div>
+        
+        <div class="form-row field-currency" style="display:none;">
+            {{ form.currency.label_tag }}
+            {{ form.currency }}
+            {% if form.currency.help_text %}
+            <p class="help">{{ form.currency.help_text }}</p>
+            {% endif %}
+            {% if form.currency.errors %}
+            <ul class="errorlist">
+                {% for error in form.currency.errors %}
+                <li>{{ error }}</li>
+                {% endfor %}
+            </ul>
+            {% endif %}
+        </div>
+        
+        <div class="form-row field-account_direction" style="display:none;">
+            {{ form.account_direction.label_tag }}
+            {{ form.account_direction }}
+            {% if form.account_direction.help_text %}
+            <p class="help">{{ form.account_direction.help_text }}</p>
+            {% endif %}
+            {% if form.account_direction.errors %}
+            <ul class="errorlist">
+                {% for error in form.account_direction.errors %}
+                <li>{{ error }}</li>
+                {% endfor %}
+            </ul>
+            {% endif %}
+        </div>
+        
+        <div class="form-row field-balance" style="display:none;">
+            {{ form.balance.label_tag }}
+            {{ form.balance }}
+            {% if form.balance.help_text %}
+            <p class="help">{{ form.balance.help_text }}</p>
+            {% endif %}
+            {% if form.balance.errors %}
+            <ul class="errorlist">
+                {% for error in form.balance.errors %}
+                <li>{{ error }}</li>
+                {% endfor %}
+            </ul>
+            {% endif %}
+        </div>
+    </fieldset>
+    
+    <div class="submit-row">
+        <input type="submit" value="Apply" name="apply" class="default" />
+        <a href="{% url 'admin:accounting_account_changelist' %}" class="button">Cancel</a>
+    </div>
+</form>
+
+<script type="text/javascript">
+    (function($) {
+        $(document).ready(function() {
+            var $fieldSelect = $('#id_field_to_edit');
+            var $fieldValues = $('#field-values .form-row');
+            
+            function toggleFields() {
+                var selectedField = $fieldSelect.val();
+                $fieldValues.hide();
+                if (selectedField) {
+                    $('.field-' + selectedField).show();
+                }
+            }
+            
+            $fieldSelect.on('change', toggleFields);
+            toggleFields(); // Initial call
+            
+            // Make required fields actually required when visible
+            $('#bulk-edit-form').on('submit', function() {
+                var selectedField = $fieldSelect.val();
+                if (selectedField) {
+                    var $field = $('.field-' + selectedField);
+                    var $input = $field.find('input, select');
+                    $input.prop('required', true);
+                }
+            });
+        });
+    })(django.jQuery || jQuery);
+</script>
+{% endblock %}
+

@@ -651,9 +651,59 @@ Maps Excel columns to extra payload fields passed to IntegrationRule triggers. T
 {
   "account_path": "Conta",
   "cost_center_path": "Centro de Custo",
-  "reference_number": "Nº Doc"
+  "reference_number": "Nº Doc",
+  "je_bank_date": "Data Pagamento",
+  "je_book_date": "Data Competência"
 }
 ```
+
+**Special Fields for Auto-Create Journal Entries:**
+
+When using `auto_create_journal_entries`, you can specify custom dates for the journal entries:
+
+- **`je_bank_date`**: Date for the bank/cash journal entry leg. If not provided, uses the transaction date.
+- **`je_book_date`**: Date for the opposing (income statement/balance sheet) journal entry leg. If not provided, uses the transaction date.
+
+Both fields accept date values in various formats (Excel dates, pandas Timestamps, ISO strings, YYYY-MM-DD). If a date cannot be parsed, the system will fall back to the transaction date and log a warning.
+
+**⚠️ IMPORTANT: Configuration Rules**
+
+1. **`je_bank_date` and `je_book_date` should ONLY be in `extra_fields_for_trigger`, NOT in `column_mappings`**
+   - They are NOT Transaction model fields
+   - They are only used for journal entry date override
+
+2. **Correct Configuration Example:**
+   ```json
+   {
+     "column_mappings": {
+       "Pago": "amount",
+       "Emissão": "date",           // Transaction date field
+       "Conta Contábil": "account_path"  // Only if account_path is a Transaction field
+     },
+     "extra_fields_for_trigger": {
+       "account_path": "Conta Contábil",
+       "je_bank_date": "Vencimento",      // Bank JE date
+       "je_book_date": "Emissão"          // Book JE date (can use same column as Transaction date)
+     }
+   }
+   ```
+
+3. **Common Mistake - DON'T DO THIS:**
+   ```json
+   {
+     "column_mappings": {
+       "je_bank_date": "Vencimento",  // ❌ WRONG - je_bank_date is not a Transaction field
+       "je_book_date": "Emissão"       // ❌ WRONG - je_book_date is not a Transaction field
+     }
+   }
+   ```
+
+4. **Same Column for Transaction Date and Book Date:**
+   - You can use the same Excel column (e.g., "Emissão") for both Transaction.date and je_book_date
+   - Map it to "date" in `column_mappings` for the Transaction
+   - Map it to "je_book_date" in `extra_fields_for_trigger` for the journal entry
+
+**Note:** Journal entry dates cannot be earlier than the transaction date due to model validation constraints.
 
 **Trigger Payload Structure:**
 ```json
@@ -744,7 +794,9 @@ Controls which IntegrationRule events are fired after import.
   
   "extra_fields_for_trigger": {
     "account_path": "Conta Contábil",
-    "bank_account_id": "ID Conta Banco"
+    "bank_account_id": "ID Conta Banco",
+    "je_bank_date": "Data Pagamento",
+    "je_book_date": "Data Competência"
   },
   
   "trigger_options": {

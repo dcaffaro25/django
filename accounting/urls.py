@@ -26,6 +26,7 @@ from .views_financial_statements import (
     FinancialStatementViewSet,
     FinancialStatementComparisonViewSet,
 )
+from .views_template_preview import template_preview_page, generate_preview
 from .views import (
     EmbeddingBackfillView,
     EmbeddingTaskStatusView,
@@ -82,4 +83,8 @@ urlpatterns = [
     path("embeddings/jobs/", EmbeddingJobsListView.as_view(), name="embedding-jobs-list"),
     path("embeddings/test/", EmbeddingsTestView.as_view(), name="embeddings-test"),
     path("embeddings/search/", EmbeddingsSearchView.as_view(), name="embedding-semantic-search"),
+    
+    # Financial statement template preview
+    re_path(r'^financial-statements/template-preview/?$', template_preview_page, name='template-preview'),
+    re_path(r'^financial-statements/generate-preview/?$', generate_preview, name='generate-preview'),
 ]

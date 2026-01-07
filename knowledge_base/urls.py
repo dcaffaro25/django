@@ -12,5 +12,5 @@ router.register(r'answers/(?P<answer_id>\d+)/feedback', views.AnswerFeedbackView
 
 urlpatterns = [
     path('api/', include(router.urls)),
-    path('', views.KnowledgeBaseIndexView.as_view(), name='knowledge-base-index'),
+    path('knowledge-base/', views.KnowledgeBaseIndexView.as_view(), name='knowledge-base-index'),
 ]

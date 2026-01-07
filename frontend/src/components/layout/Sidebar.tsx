@@ -11,7 +11,8 @@ import {
   Receipt,
   Banknote,
   TrendingUp,
-  Building2
+  Building2,
+  MessageSquare
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -54,6 +55,13 @@ const navigation = [
     items: [
       { label: "Statements", path: "/financial-statements/statements", icon: TrendingUp },
       { label: "Templates", path: "/financial-statements/templates", icon: FileText },
+    ],
+  },
+  {
+    title: "AI & Tools",
+    items: [
+      { label: "AI Chat", path: "/chat", icon: MessageSquare },
+      { label: "AI Template Test", path: "/ai-template-test", icon: FileText },
     ],
   },
   {

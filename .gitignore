@@ -131,3 +131,6 @@ cython_debug/
 
 # LSP config files
 pyrightconfig.json
+
+# Local credentials (contains sensitive API keys)
+local_credentials.ini

@@ -17,6 +17,8 @@ import { JournalEntriesPage } from "@/pages/JournalEntriesPage"
 import { BillingPage } from "@/pages/BillingPage"
 import { HRPage } from "@/pages/HRPage"
 import { SettingsPage } from "@/pages/SettingsPage"
+import { ChatPage } from "@/pages/ChatPage"
+import { AITemplateTestPage } from "@/pages/AITemplateTestPage"
 
 function PrivateRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuth()
@@ -56,6 +58,8 @@ function App() {
                     <Route path="/billing" element={<BillingPage />} />
                     <Route path="/hr" element={<HRPage />} />
                     <Route path="/settings" element={<SettingsPage />} />
+                    <Route path="/chat" element={<ChatPage />} />
+                    <Route path="/ai-template-test" element={<AITemplateTestPage />} />
                   </Routes>
                 </AppShell>
               </PrivateRoute>

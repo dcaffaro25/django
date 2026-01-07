@@ -1,9 +1,17 @@
 # accounting/admin.py
+import logging
 from django.contrib import admin
 from django.apps import apps
 from django.contrib.admin.views.main import ChangeList
 from django.contrib.admin.utils import model_ngettext
 from django.db import transaction as db_transaction
+from django import forms
+from django.shortcuts import render, redirect
+from django.urls import path
+from django.utils.html import format_html
+from django.contrib import messages
+
+logger = logging.getLogger(__name__)
 
 from .models import (
     Currency, CostCenter, Bank, BankAccount, AllocationBase,
@@ -47,12 +55,398 @@ class BankAccountAdmin(CompanyScopedAdmin):
         "currency__code",
     )
 
+# Bulk Edit Form for Account
+class AccountBulkEditForm(forms.Form):
+    """Form for bulk editing Account fields"""
+    field_to_edit = forms.ChoiceField(
+        choices=[
+            ('balance_date', 'Balance Date'),
+            ('is_active', 'Is Active'),
+            ('currency', 'Currency'),
+            ('account_direction', 'Account Direction'),
+            ('balance', 'Balance'),
+        ],
+        label='Field to Edit'
+    )
+    
+    # For balance_date
+    balance_date = forms.DateField(
+        required=False,
+        label='New Balance Date',
+        widget=admin.widgets.AdminDateWidget()
+    )
+    
+    # For is_active
+    is_active = forms.BooleanField(
+        required=False,
+        label='Is Active',
+        help_text='Check to set as active, uncheck to set as inactive'
+    )
+    
+    # For currency
+    currency = forms.ModelChoiceField(
+        queryset=Currency.objects.all(),
+        required=False,
+        label='New Currency'
+    )
+    
+    # For account_direction
+    account_direction = forms.IntegerField(
+        required=False,
+        label='Account Direction',
+        help_text='Integer value for account direction'
+    )
+    
+    # For balance
+    balance = forms.DecimalField(
+        required=False,
+        max_digits=12,
+        decimal_places=2,
+        label='New Balance'
+    )
+
+
 @admin.register(Account)
 class AccountAdmin(CompanyScopedAdmin):
     list_display = ("id", "account_code", "name", "parent", "currency", "bank_account", "is_active", "company", "notes")
     list_filter = ("is_active", "currency", "company", "notes")
     autocomplete_fields = ("company", "parent", "currency", "bank_account")
     search_fields = ("account_code", "name", "description", "key_words", "examples", "parent__name", "notes")
+    
+    # Simple bulk edit actions for common fields
+    @admin.action(description="Bulk edit: Set balance date")
+    def bulk_edit_balance_date(self, request, queryset):
+        """Bulk edit balance_date with an intermediate form"""
+        print("=" * 80)
+        print("DEBUG: bulk_edit_balance_date ACTION CALLED")
+        print(f"DEBUG: Request method: {request.method}")
+        print(f"DEBUG: POST keys: {list(request.POST.keys())}")
+        print(f"DEBUG: GET keys: {list(request.GET.keys())}")
+        print(f"DEBUG: Initial queryset count: {queryset.count()}")
+        logger.info(f"BULK EDIT: bulk_edit_balance_date action called. Method: {request.method}, POST keys: {list(request.POST.keys())}")
+        
+        # Check if this is a form submission from our intermediate form
+        if 'apply' in request.POST:
+            print("DEBUG: 'apply' found in POST - this is a form submission")
+            logger.info(f"BULK EDIT: Form submission detected. POST data: {dict(request.POST)}")
+            
+            # Get selected IDs from POST data (_selected_action) or from session
+            selected_ids = request.POST.getlist('_selected_action')
+            print(f"DEBUG: Selected IDs from POST _selected_action: {selected_ids}")
+            if not selected_ids:
+                # Fallback to session
+                selected_ids = request.session.get('bulk_edit_account_ids', [])
+                print(f"DEBUG: No IDs in POST, using session: {selected_ids}")
+            else:
+                print(f"DEBUG: Using IDs from POST: {len(selected_ids)} IDs")
+            
+            logger.info(f"BULK EDIT: Using {len(selected_ids)} account IDs from POST/session: {selected_ids[:10]}...")
+            selected = self.model.objects.filter(pk__in=selected_ids)
+            print(f"DEBUG: Found {selected.count()} accounts in database with those IDs")
+            logger.info(f"BULK EDIT: Found {selected.count()} accounts in database")
+            
+            # Print current balance_date values before update
+            if selected.exists():
+                sample = selected.first()
+                print(f"DEBUG: Sample account before update - ID: {sample.id}, balance_date: {sample.balance_date}")
+            
+            # Add field_to_edit to POST data if not present (for balance_date action)
+            post_data = request.POST.copy()
+            if 'field_to_edit' not in post_data:
+                post_data['field_to_edit'] = 'balance_date'
+                print(f"DEBUG: Added field_to_edit='balance_date' to POST data")
+            
+            form = AccountBulkEditForm(post_data)
+            print(f"DEBUG: Form created from POST data")
+            print(f"DEBUG: POST data includes field_to_edit: {'field_to_edit' in post_data}")
+            print(f"DEBUG: Form is_valid: {form.is_valid()}")
+            logger.info(f"BULK EDIT: Form is_valid={form.is_valid()}")
+            
+            if not form.is_valid():
+                print(f"DEBUG: Form validation FAILED")
+                print(f"DEBUG: Form errors: {form.errors}")
+                print(f"DEBUG: Form non_field_errors: {form.non_field_errors()}")
+                logger.warning(f"BULK EDIT: Form validation errors: {form.errors}")
+            
+            if form.is_valid():
+                new_date = form.cleaned_data.get('balance_date')
+                print(f"DEBUG: Form is VALID")
+                print(f"DEBUG: New date from form.cleaned_data: {new_date}")
+                print(f"DEBUG: New date type: {type(new_date)}")
+                logger.info(f"BULK EDIT: Form validated. New date value: {new_date} (type: {type(new_date)})")
+                
+                if new_date:
+                    print(f"DEBUG: New date is not None/empty, proceeding with update")
+                    print(f"DEBUG: About to update {selected.count()} accounts")
+                    print(f"DEBUG: Update query: selected.update(balance_date={new_date})")
+                    
+                    logger.info(f"BULK EDIT: Updating {selected.count()} accounts with balance_date={new_date}")
+                    
+                    # Execute the update
+                    updated = selected.update(balance_date=new_date)
+                    print(f"DEBUG: Update returned: {updated} (should be > 0)")
+                    logger.info(f"BULK EDIT: Successfully updated {updated} accounts")
+                    
+                    # Verify the update by querying again
+                    verify_queryset = self.model.objects.filter(pk__in=selected_ids, balance_date=new_date)
+                    verify_count = verify_queryset.count()
+                    print(f"DEBUG: Verification query - accounts with balance_date={new_date}: {verify_count}")
+                    logger.info(f"BULK EDIT: Verification - {verify_count} accounts now have balance_date={new_date}")
+                    
+                    # Print a sample after update
+                    if verify_queryset.exists():
+                        sample_after = verify_queryset.first()
+                        print(f"DEBUG: Sample account after update - ID: {sample_after.id}, balance_date: {sample_after.balance_date}")
+                    else:
+                        print(f"DEBUG: WARNING - No accounts found with the new balance_date!")
+                    
+                    if updated > 0:
+                        self.message_user(
+                            request,
+                            f"Successfully updated balance_date for {updated} {model_ngettext(self.model, updated)}.",
+                            level=messages.SUCCESS
+                        )
+                        print(f"DEBUG: Success message sent, redirecting...")
+                        return redirect('admin:accounting_account_changelist')
+                    else:
+                        print(f"DEBUG: WARNING - Update returned 0, no records were updated!")
+                        self.message_user(
+                            request,
+                            f"Warning: Update query returned 0. No records were updated. Check logs for details.",
+                            level=messages.WARNING
+                        )
+                else:
+                    print(f"DEBUG: New date is None/empty, not updating")
+                    logger.warning("BULK EDIT: Form valid but balance_date is None/empty")
+                    self.message_user(
+                        request,
+                        "Please provide a balance date.",
+                        level=messages.ERROR
+                    )
+            else:
+                print(f"DEBUG: Form is INVALID, showing form again with errors")
+        else:
+            print("DEBUG: 'apply' NOT in POST - this is initial form display")
+            logger.info("BULK EDIT: Initial form display (not a submission)")
+            # Store selected IDs in session for form submission
+            selected_ids = list(queryset.values_list('pk', flat=True))
+            print(f"DEBUG: Storing {len(selected_ids)} account IDs in session")
+            print(f"DEBUG: First 10 IDs: {selected_ids[:10]}")
+            logger.info(f"BULK EDIT: Storing {len(selected_ids)} account IDs in session: {selected_ids[:10]}...")
+            request.session['bulk_edit_account_ids'] = selected_ids
+            request.session.modified = True
+            form = AccountBulkEditForm(initial={'field_to_edit': 'balance_date'})
+            print(f"DEBUG: Form created with initial data")
+        
+        # Get selected objects info - use queryset for initial, or retrieve from IDs for submission
+        if 'apply' in request.POST:
+            selected_ids = request.POST.getlist('_selected_action') or request.session.get('bulk_edit_account_ids', [])
+            print(f"DEBUG: Getting objects for form display - using IDs: {len(selected_ids)}")
+            selected_queryset = self.model.objects.filter(pk__in=selected_ids)
+            selected_count = selected_queryset.count()
+            selected_objects = list(selected_queryset[:20])
+            all_selected_ids = selected_ids
+        else:
+            selected_count = queryset.count()
+            selected_objects = list(queryset[:20])
+            all_selected_ids = list(queryset.values_list('pk', flat=True))
+            print(f"DEBUG: Initial display - {selected_count} accounts, {len(all_selected_ids)} IDs")
+        
+        print(f"DEBUG: Rendering template with {selected_count} selected accounts, {len(all_selected_ids)} total IDs")
+        print(f"DEBUG: Form fields in template: balance_date field will be shown")
+        logger.info(f"BULK EDIT: Rendering form with {selected_count} selected accounts (all IDs: {len(all_selected_ids)})")
+        context = {
+            **self.admin_site.each_context(request),
+            'form': form,
+            'model': self.model,
+            'selected_count': selected_count,
+            'selected_objects': selected_objects,
+            'all_selected_ids': all_selected_ids,  # All IDs for form submission
+            'field_name': 'balance_date',
+            'title': 'Bulk Edit: Balance Date',
+            'opts': self.model._meta,
+            'has_view_permission': self.has_view_permission(request),
+            'has_change_permission': self.has_change_permission(request),
+            'action_checkbox_name': admin.helpers.ACTION_CHECKBOX_NAME,
+        }
+        
+        print("DEBUG: About to render template")
+        print("=" * 80)
+        return render(request, 'admin/accounting/account/bulk_edit.html', context)
+    
+    @admin.action(description="Bulk edit: Toggle is_active")
+    def bulk_edit_is_active(self, request, queryset):
+        """Bulk toggle is_active status"""
+        selected_ids = list(queryset.values_list('pk', flat=True))
+        request.session['bulk_edit_account_ids'] = selected_ids
+        
+        if 'apply' in request.POST:
+            stored_ids = request.session.pop('bulk_edit_account_ids', [])
+            selected = self.model.objects.filter(pk__in=stored_ids)
+            
+            form = AccountBulkEditForm(request.POST)
+            if form.is_valid():
+                is_active = form.cleaned_data.get('is_active')
+                if is_active is not None:
+                    updated = selected.update(is_active=is_active)
+                    action = "activated" if is_active else "deactivated"
+                    self.message_user(
+                        request,
+                        f"Successfully {action} {updated} {model_ngettext(self.model, updated)}.",
+                        level=messages.SUCCESS
+                    )
+                    return redirect('admin:accounting_account_changelist')
+        else:
+            form = AccountBulkEditForm(initial={'field_to_edit': 'is_active', 'is_active': True})
+        
+        selected_count = queryset.count()
+        context = {
+            **self.admin_site.each_context(request),
+            'form': form,
+            'model': self.model,
+            'selected_count': selected_count,
+            'selected_objects': list(queryset[:20]),
+            'field_name': 'is_active',
+            'title': 'Bulk Edit: Is Active',
+            'opts': self.model._meta,
+            'has_view_permission': self.has_view_permission(request),
+            'has_change_permission': self.has_change_permission(request),
+            'action_checkbox_name': admin.helpers.ACTION_CHECKBOX_NAME,
+        }
+        return render(request, 'admin/accounting/account/bulk_edit.html', context)
+    
+    @admin.action(description="Bulk edit: Set currency")
+    def bulk_edit_currency(self, request, queryset):
+        """Bulk edit currency"""
+        selected_ids = list(queryset.values_list('pk', flat=True))
+        request.session['bulk_edit_account_ids'] = selected_ids
+        
+        if 'apply' in request.POST:
+            stored_ids = request.session.pop('bulk_edit_account_ids', [])
+            selected = self.model.objects.filter(pk__in=stored_ids)
+            
+            form = AccountBulkEditForm(request.POST)
+            if form.is_valid():
+                new_currency = form.cleaned_data.get('currency')
+                if new_currency:
+                    updated = selected.update(currency=new_currency)
+                    self.message_user(
+                        request,
+                        f"Successfully updated currency for {updated} {model_ngettext(self.model, updated)}.",
+                        level=messages.SUCCESS
+                    )
+                    return redirect('admin:accounting_account_changelist')
+        else:
+            form = AccountBulkEditForm(initial={'field_to_edit': 'currency'})
+        
+        selected_count = queryset.count()
+        context = {
+            **self.admin_site.each_context(request),
+            'form': form,
+            'model': self.model,
+            'selected_count': selected_count,
+            'selected_objects': list(queryset[:20]),
+            'field_name': 'currency',
+            'title': 'Bulk Edit: Currency',
+            'opts': self.model._meta,
+            'has_view_permission': self.has_view_permission(request),
+            'has_change_permission': self.has_change_permission(request),
+            'action_checkbox_name': admin.helpers.ACTION_CHECKBOX_NAME,
+        }
+        return render(request, 'admin/accounting/account/bulk_edit.html', context)
+    
+    @admin.action(description="Bulk edit: Generic field editor")
+    def bulk_edit_generic(self, request, queryset):
+        """Generic bulk edit for any Account field"""
+        logger.info(f"BULK EDIT GENERIC: Action called. Method: {request.method}, POST keys: {list(request.POST.keys())}")
+        
+        selected_ids = list(queryset.values_list('pk', flat=True))
+        logger.info(f"BULK EDIT GENERIC: Storing {len(selected_ids)} account IDs in session")
+        request.session['bulk_edit_account_ids'] = selected_ids
+        request.session.modified = True
+        
+        if 'apply' in request.POST:
+            logger.info(f"BULK EDIT GENERIC: Form submission detected. POST data: {dict(request.POST)}")
+            stored_ids = request.session.pop('bulk_edit_account_ids', [])
+            logger.info(f"BULK EDIT GENERIC: Retrieved {len(stored_ids)} account IDs from session")
+            selected = self.model.objects.filter(pk__in=stored_ids)
+            logger.info(f"BULK EDIT GENERIC: Found {selected.count()} accounts in database")
+            
+            form = AccountBulkEditForm(request.POST)
+            logger.info(f"BULK EDIT GENERIC: Form is_valid={form.is_valid()}")
+            if not form.is_valid():
+                logger.warning(f"BULK EDIT GENERIC: Form validation errors: {form.errors}")
+            
+            if form.is_valid():
+                field_to_edit = form.cleaned_data['field_to_edit']
+                logger.info(f"BULK EDIT GENERIC: Field to edit: {field_to_edit}")
+                updated_count = 0
+                
+                with db_transaction.atomic():
+                    if field_to_edit == 'balance_date' and form.cleaned_data.get('balance_date'):
+                        new_date = form.cleaned_data['balance_date']
+                        logger.info(f"BULK EDIT GENERIC: Updating balance_date to {new_date}")
+                        updated_count = selected.update(balance_date=new_date)
+                        logger.info(f"BULK EDIT GENERIC: Updated {updated_count} accounts")
+                    elif field_to_edit == 'is_active' and form.cleaned_data.get('is_active') is not None:
+                        new_value = form.cleaned_data['is_active']
+                        logger.info(f"BULK EDIT GENERIC: Updating is_active to {new_value}")
+                        updated_count = selected.update(is_active=new_value)
+                        logger.info(f"BULK EDIT GENERIC: Updated {updated_count} accounts")
+                    elif field_to_edit == 'currency' and form.cleaned_data.get('currency'):
+                        new_currency = form.cleaned_data['currency']
+                        logger.info(f"BULK EDIT GENERIC: Updating currency to {new_currency}")
+                        updated_count = selected.update(currency=new_currency)
+                        logger.info(f"BULK EDIT GENERIC: Updated {updated_count} accounts")
+                    elif field_to_edit == 'account_direction' and form.cleaned_data.get('account_direction') is not None:
+                        new_value = form.cleaned_data['account_direction']
+                        logger.info(f"BULK EDIT GENERIC: Updating account_direction to {new_value}")
+                        updated_count = selected.update(account_direction=new_value)
+                        logger.info(f"BULK EDIT GENERIC: Updated {updated_count} accounts")
+                    elif field_to_edit == 'balance' and form.cleaned_data.get('balance') is not None:
+                        new_balance = form.cleaned_data['balance']
+                        logger.info(f"BULK EDIT GENERIC: Updating balance to {new_balance}")
+                        updated_count = selected.update(balance=new_balance)
+                        logger.info(f"BULK EDIT GENERIC: Updated {updated_count} accounts")
+                    else:
+                        logger.warning(f"BULK EDIT GENERIC: No valid field/value combination matched")
+                
+                if updated_count > 0:
+                    self.message_user(
+                        request,
+                        f"Successfully updated {field_to_edit} for {updated_count} {model_ngettext(self.model, updated_count)}.",
+                        level=messages.SUCCESS
+                    )
+                else:
+                    logger.warning(f"BULK EDIT GENERIC: No accounts were updated")
+                    self.message_user(
+                        request,
+                        "No fields were updated. Please ensure you selected a field and provided a value.",
+                        level=messages.WARNING
+                    )
+                return redirect('admin:accounting_account_changelist')
+        else:
+            logger.info("BULK EDIT GENERIC: Initial form display (not a submission)")
+            form = AccountBulkEditForm()
+        
+        selected_count = queryset.count()
+        logger.info(f"BULK EDIT GENERIC: Rendering form with {selected_count} selected accounts")
+        context = {
+            **self.admin_site.each_context(request),
+            'form': form,
+            'model': self.model,
+            'selected_count': selected_count,
+            'selected_objects': list(queryset[:20]),
+            'field_name': 'generic',
+            'title': 'Bulk Edit: Multiple Fields',
+            'opts': self.model._meta,
+            'has_view_permission': self.has_view_permission(request),
+            'has_change_permission': self.has_change_permission(request),
+            'action_checkbox_name': admin.helpers.ACTION_CHECKBOX_NAME,
+        }
+        return render(request, 'admin/accounting/account/bulk_edit_generic.html', context)
+    
+    actions = ['bulk_edit_balance_date', 'bulk_edit_is_active', 'bulk_edit_currency', 'bulk_edit_generic']
 
 @admin.register(CostCenter)
 class CostCenterAdmin(CompanyScopedAdmin):

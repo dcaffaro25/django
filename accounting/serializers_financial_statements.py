@@ -229,3 +229,63 @@ class ComparisonRequestSerializer(serializers.Serializer):
     )
     include_pending = serializers.BooleanField(required=False, default=False)
 
+
+class TemplateSuggestionRequestSerializer(serializers.Serializer):
+    """
+    Serializer for AI-powered template suggestion requests.
+    
+    Used by POST /api/financial-statements/suggest_templates/
+    """
+    
+    user_preferences = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text=(
+            "Free-text preferences for template customization. "
+            "Examples: 'I want revenue broken down to 3 levels', "
+            "'Simplify the template for external investors', "
+            "'Group small accounts into Other buckets'"
+        )
+    )
+    apply_changes = serializers.BooleanField(
+        required=False,
+        default=True,
+        help_text="If true, apply changes to database. If false, simulate and return what would be done."
+    )
+    ai_provider = serializers.ChoiceField(
+        choices=['openai', 'anthropic'],
+        required=False,
+        default='openai',
+        help_text="AI provider to use for generating suggestions."
+    )
+    ai_model = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        help_text="Specific AI model to use. Defaults vary by provider."
+    )
+
+
+class TemplateSuggestionResponseSerializer(serializers.Serializer):
+    """Serializer for template suggestion response."""
+    
+    status = serializers.CharField()
+    applied_changes = serializers.BooleanField()
+    templates_created = serializers.IntegerField(required=False, default=0)
+    templates_updated = serializers.IntegerField(required=False, default=0)
+    lines_created = serializers.IntegerField(required=False, default=0)
+    lines_updated = serializers.IntegerField(required=False, default=0)
+    validation_errors = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list
+    )
+    validation_warnings = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list
+    )
+    error = serializers.CharField(required=False, allow_null=True)
+    error_type = serializers.CharField(required=False, allow_null=True)
+    ai_raw_response = serializers.JSONField(required=False, allow_null=True)

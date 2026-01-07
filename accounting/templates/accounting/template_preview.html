@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Financial Statement Template Preview</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #34495e;
+        }
+        select, input[type="date"], input[type="checkbox"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        select {
+            max-width: 400px;
+        }
+        input[type="date"] {
+            max-width: 200px;
+        }
+        button {
+            background-color: #3498db;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-top: 10px;
+        }
+        button:hover {
+            background-color: #2980b9;
+        }
+        button:disabled {
+            background-color: #95a5a6;
+            cursor: not-allowed;
+        }
+        .preview-container {
+            margin-top: 30px;
+            display: none;
+        }
+        .preview-container.active {
+            display: block;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        th {
+            background-color: #3498db;
+            color: white;
+            padding: 12px;
+            text-align: left;
+        }
+        td {
+            padding: 10px;
+            border-bottom: 1px solid #ddd;
+        }
+        tr:hover {
+            background-color: #f5f5f5;
+        }
+        .amount {
+            text-align: right;
+            font-family: 'Courier New', monospace;
+        }
+        .negative {
+            color: #e74c3c;
+        }
+        .bold {
+            font-weight: bold;
+        }
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: #7f8c8d;
+        }
+        .error {
+            background-color: #fee;
+            color: #c33;
+            padding: 15px;
+            border-radius: 4px;
+            margin-top: 20px;
+        }
+        .debug-section {
+            margin-top: 30px;
+            padding: 20px;
+            background-color: #f9f9f9;
+            border-radius: 4px;
+        }
+        .debug-section h3 {
+            margin-top: 0;
+            color: #34495e;
+        }
+        .debug-info {
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+            background: white;
+            padding: 15px;
+            border-radius: 4px;
+            overflow-x: auto;
+        }
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .checkbox-group input[type="checkbox"] {
+            width: auto;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Financial Statement Template Preview</h1>
+        
+        <form id="previewForm">
+            <div class="form-group">
+                <label for="template_id">Select Template:</label>
+                <select id="template_id" name="template_id" required>
+                    <option value="">-- Select a template --</option>
+                    {% for template in templates %}
+                    <option value="{{ template.id }}">
+                        {{ template.name }} ({{ template.get_report_type_display }})
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
+            
+            <div class="form-group">
+                <label for="start_date">Start Date:</label>
+                <input type="date" id="start_date" name="start_date" required>
+            </div>
+            
+            <div class="form-group">
+                <label for="end_date">End Date:</label>
+                <input type="date" id="end_date" name="end_date" required>
+            </div>
+            
+            <div class="form-group">
+                <label for="as_of_date">As of Date (for Balance Sheet):</label>
+                <input type="date" id="as_of_date" name="as_of_date">
+            </div>
+            
+            <div class="form-group checkbox-group">
+                <input type="checkbox" id="include_pending" name="include_pending">
+                <label for="include_pending" style="font-weight: normal;">Include Pending Entries</label>
+            </div>
+            
+            <div class="form-group checkbox-group">
+                <input type="checkbox" id="debug_accounts" name="debug_accounts">
+                <label for="debug_accounts" style="font-weight: normal;">Show Debug Information</label>
+            </div>
+            
+            <button type="submit">Generate Preview</button>
+        </form>
+        
+        <div id="loading" class="loading" style="display: none;">
+            Generating preview...
+        </div>
+        
+        <div id="error" class="error" style="display: none;"></div>
+        
+        <div id="preview" class="preview-container">
+            <h2>Preview Results</h2>
+            <div id="previewTable"></div>
+            <div id="debugSection" class="debug-section" style="display: none;">
+                <h3>Debug Information</h3>
+                <div id="debugInfo" class="debug-info"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Set default dates (current year)
+        const today = new Date();
+        const yearStart = new Date(today.getFullYear(), 0, 1);
+        document.getElementById('start_date').value = yearStart.toISOString().split('T')[0];
+        document.getElementById('end_date').value = today.toISOString().split('T')[0];
+        document.getElementById('as_of_date').value = today.toISOString().split('T')[0];
+        
+        document.getElementById('previewForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const formData = new FormData(this);
+            const loading = document.getElementById('loading');
+            const error = document.getElementById('error');
+            const preview = document.getElementById('preview');
+            const previewTable = document.getElementById('previewTable');
+            const debugSection = document.getElementById('debugSection');
+            const debugInfo = document.getElementById('debugInfo');
+            
+            // Show loading, hide others
+            loading.style.display = 'block';
+            error.style.display = 'none';
+            preview.classList.remove('active');
+            debugSection.style.display = 'none';
+            
+            try {
+                const response = await fetch('{% url "generate-preview" %}', {
+                    method: 'POST',
+                    body: formData,
+                    headers: {
+                        'X-CSRFToken': getCookie('csrftoken')
+                    }
+                });
+                
+                const data = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(data.error || 'Failed to generate preview');
+                }
+                
+                // Display preview
+                let html = '<table><thead><tr><th>Line</th><th>Label</th><th>Balance</th></tr></thead><tbody>';
+                
+                if (data.lines && data.lines.length > 0) {
+                    data.lines.forEach(line => {
+                        const indent = '&nbsp;'.repeat(4 * (line.indent_level || 0));
+                        const label = line.is_bold ? `<strong>${line.label}</strong>` : line.label;
+                        const balance = parseFloat(line.balance || 0);
+                        const balanceClass = balance < 0 ? 'negative' : '';
+                        const balanceFormatted = balance.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                        const rowClass = line.is_bold ? 'bold' : '';
+                        
+                        html += `<tr class="${rowClass}">`;
+                        html += `<td>${line.line_number}</td>`;
+                        html += `<td>${indent}${label}</td>`;
+                        html += `<td class="amount ${balanceClass}">${balanceFormatted}</td>`;
+                        html += `</tr>`;
+                    });
+                } else {
+                    html += '<tr><td colspan="3">No lines found</td></tr>';
+                }
+                
+                html += '</tbody></table>';
+                previewTable.innerHTML = html;
+                preview.classList.add('active');
+                
+                // Show debug info if available
+                if (data.debug_info) {
+                    debugInfo.textContent = JSON.stringify(data.debug_info, null, 2);
+                    debugSection.style.display = 'block';
+                }
+                
+            } catch (err) {
+                error.textContent = 'Error: ' + err.message;
+                error.style.display = 'block';
+            } finally {
+                loading.style.display = 'none';
+            }
+        });
+        
+        function getCookie(name) {
+            let cookieValue = null;
+            if (document.cookie && document.cookie !== '') {
+                const cookies = document.cookie.split(';');
+                for (let i = 0; i < cookies.length; i++) {
+                    const cookie = cookies[i].trim();
+                    if (cookie.substring(0, name.length + 1) === (name + '=')) {
+                        cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+                        break;
+                    }
+                }
+            }
+            return cookieValue;
+        }
+    </script>
+</body>
+</html>
+

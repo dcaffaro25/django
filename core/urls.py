@@ -18,6 +18,7 @@ from .task_views import (
 )
 
 from .chat.views import ChatAskView, ChatDiagView, ChatAskView_NoContext
+from .chat.flexible_chat import FlexibleChatView
 
 router = DefaultRouter()
 router.trailing_slash = r'/?'
@@ -52,6 +53,7 @@ urlpatterns = [
     path("api/chat/ask/", ChatAskView.as_view()),
     path("api/chat/ask_nocontext/", ChatAskView.as_view()),
     path("api/chat/diag/", ChatDiagView.as_view()),
+    path("api/chat/flexible/", FlexibleChatView.as_view(), name="flexible-chat"),
     
     # Tutorial endpoint
     path("api/tutorial/", TutorialView.as_view(), name="tutorial"),

@@ -40,7 +40,6 @@ urlpatterns = [
     path("celery/status/<str:task_id>/", task_status, name="celery_status"),
     re_path('', include('npl.urls')),
     re_path('', include('feedback.urls')),
-    re_path(r'^(?P<tenant_id>[^/]+)/', include('knowledge_base.urls')),
 ]
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

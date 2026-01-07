@@ -25,8 +25,11 @@ from .serializers_financial_statements import (
     GenerateStatementRequestSerializer,
     TimeSeriesRequestSerializer,
     ComparisonRequestSerializer,
+    TemplateSuggestionRequestSerializer,
+    TemplateSuggestionResponseSerializer,
 )
 from .services.financial_statement_service import FinancialStatementGenerator
+from .services.template_suggestion_service import TemplateSuggestionService
 from .models import Currency, Account
 
 
@@ -93,6 +96,95 @@ class FinancialStatementTemplateViewSet(ScopedQuerysetMixin, viewsets.ModelViewS
         
         serializer = self.get_serializer(new_template)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+    
+    @action(detail=False, methods=['post'])
+    def suggest_templates(self, request, tenant_id=None):
+        """
+        Use AI to suggest/generate Income Statement, Balance Sheet, and Cash Flow templates.
+        
+        This endpoint:
+        1. Reads the company's chart of accounts
+        2. Reads existing financial statement templates
+        3. Sends context to an external AI (OpenAI/Anthropic)
+        4. Receives structured JSON with template suggestions
+        5. Validates and applies the suggestions to the database
+        
+        POST /api/<tenant>/api/financial-statement-templates/suggest_templates/
+        {
+            "user_preferences": "I want revenue broken down to 3 levels, OPEX to 1 level",
+            "apply_changes": true,
+            "ai_provider": "openai",
+            "ai_model": "gpt-4o"
+        }
+        
+        Response:
+        {
+            "status": "success",
+            "applied_changes": true,
+            "templates_created": 3,
+            "templates_updated": 0,
+            "lines_created": 75,
+            "lines_updated": 0,
+            "validation_warnings": [],
+            "ai_raw_response": { ... }
+        }
+        """
+        # Validate request
+        serializer = TemplateSuggestionRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        
+        # Get company from tenant
+        company = getattr(request, 'tenant', None)
+        if not company or company == 'all':
+            return Response(
+                {'error': 'Company/tenant not found in request'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        company_id = company.id if hasattr(company, 'id') else company
+        
+        try:
+            # Initialize service
+            service = TemplateSuggestionService(
+                company_id=company_id,
+                user_preferences=data.get('user_preferences', ''),
+                ai_provider=data.get('ai_provider', 'openai'),
+                ai_model=data.get('ai_model'),
+            )
+            
+            # Generate suggestions
+            result = service.generate_suggestions(
+                apply_changes=data.get('apply_changes', True),
+            )
+            
+            # Determine response status code
+            if result.get('status') == 'success':
+                http_status = status.HTTP_200_OK
+            elif result.get('status') == 'partial':
+                http_status = status.HTTP_207_MULTI_STATUS
+            else:
+                http_status = status.HTTP_400_BAD_REQUEST
+            
+            # Serialize and return response
+            response_serializer = TemplateSuggestionResponseSerializer(data=result)
+            if response_serializer.is_valid():
+                return Response(response_serializer.data, status=http_status)
+            else:
+                return Response(result, status=http_status)
+        
+        except ValueError as e:
+            return Response(
+                {'error': str(e), 'status': 'error'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            import logging
+            log = logging.getLogger(__name__)
+            log.exception("Error in suggest_templates: %s", e)
+            return Response(
+                {'error': str(e), 'status': 'error', 'error_type': 'internal_error'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 
 class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):

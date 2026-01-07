@@ -136,6 +136,45 @@ def get_service_url(service: str) -> Optional[str]:
     return None
 
 
+def get_ai_config() -> Dict[str, Any]:
+    """
+    Get AI service configuration from local config.
+    
+    Returns:
+        Dictionary with AI configuration:
+        - openai_api_key: OpenAI API key
+        - anthropic_api_key: Anthropic API key (optional)
+        - default_provider: Default AI provider ("openai" or "anthropic")
+        - default_model: Default model to use (optional)
+    """
+    config = get_local_config()
+    if not config:
+        return {}
+    
+    if not config.has_section("ai_services"):
+        return {}
+    
+    result = {}
+    
+    if config.has_option("ai_services", "openai_api_key"):
+        key = config.get("ai_services", "openai_api_key")
+        if key and not key.startswith("sk-your-"):  # Skip placeholder
+            result["openai_api_key"] = key
+    
+    if config.has_option("ai_services", "anthropic_api_key"):
+        key = config.get("ai_services", "anthropic_api_key")
+        if key and not key.startswith("sk-ant-your-"):  # Skip placeholder
+            result["anthropic_api_key"] = key
+    
+    if config.has_option("ai_services", "default_provider"):
+        result["default_provider"] = config.get("ai_services", "default_provider")
+    
+    if config.has_option("ai_services", "default_model"):
+        result["default_model"] = config.get("ai_services", "default_model")
+    
+    return result
+
+
 def is_local_mode() -> bool:
     """Check if running in local development mode."""
     return get_environment_mode() in ("local", "homolog", "homologation", "development", "dev")
@@ -195,6 +234,17 @@ def apply_local_settings(settings_module: dict) -> dict:
     if llm_url:
         settings_module["LLM_BASE_URL"] = llm_url
     
+    # Apply AI service configuration
+    ai_config = get_ai_config()
+    if ai_config.get("openai_api_key"):
+        settings_module["OPEN_AI_API_KEY"] = ai_config["openai_api_key"]
+    if ai_config.get("anthropic_api_key"):
+        settings_module["ANTHROPIC_API_KEY"] = ai_config["anthropic_api_key"]
+    if ai_config.get("default_provider"):
+        settings_module["TEMPLATE_AI_PROVIDER"] = ai_config["default_provider"]
+    if ai_config.get("default_model"):
+        settings_module["TEMPLATE_AI_MODEL"] = ai_config["default_model"]
+    
     # Mark that we're in local mode
     settings_module["LOCAL_MODE"] = True
     settings_module["ENVIRONMENT_MODE"] = mode
@@ -209,6 +259,7 @@ __all__ = [
     "get_database_config",
     "get_redis_url",
     "get_service_url",
+    "get_ai_config",
     "is_local_mode",
     "is_homolog_mode",
     "apply_local_settings",

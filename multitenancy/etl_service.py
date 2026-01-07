@@ -22,7 +22,7 @@ import hashlib
 import logging
 import re
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from datetime import time as time_type
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 from django.apps import apps
 from django.db import transaction
+from django.db import models as dj_models
 from django.utils import timezone
 
 from .models import ImportTransformationRule, ETLPipelineLog, SubstitutionRule
@@ -76,7 +77,7 @@ class ETLPipelineService:
         'False': False,
     }
     
-    def __init__(self, company_id: int, file, commit: bool = False, auto_create_journal_entries: Optional[dict] = None, row_limit: Optional[int] = None, preview_record_limit: Optional[int] = None):
+    def __init__(self, company_id: int, file, commit: bool = False, auto_create_journal_entries: Optional[dict] = None, row_limit: Optional[int] = None, preview_record_limit: Optional[int] = None, debug_account_substitution: bool = False):
         self.company_id = company_id
         self.file = file
         self.commit = commit
@@ -85,6 +86,8 @@ class ETLPipelineService:
         self.row_limit = row_limit if row_limit is not None else 10  # Default to 10 for testing
         # preview_record_limit: None = use default (50), 0 = show all records, >0 = limit to that number
         self.preview_record_limit = preview_record_limit if preview_record_limit is not None else 50  # Default to 50 for preview
+        # debug_account_substitution: Enable debug logging for account substitution (default: False)
+        self.debug_account_substitution = debug_account_substitution
         
         # Initialize lookup cache for efficient FK resolution
         from multitenancy.lookup_cache import LookupCache
@@ -251,13 +254,30 @@ class ETLPipelineService:
         
         logger.info(f"ETL: Transforming sheet '{sheet_name}' using rule '{rule.name}'")
         
+        # Debug: Print transformation rule specs
+        logger.info("=" * 80)
+        logger.info(f"ETL TRANSFORMATION RULE DEBUG: Rule '{rule.name}' for sheet '{sheet_name}'")
+        logger.info("=" * 80)
+        logger.info(f"ETL TRANSFORMATION RULE DEBUG: target_model = {rule.target_model}")
+        logger.info(f"ETL TRANSFORMATION RULE DEBUG: skip_rows = {rule.skip_rows}")
+        logger.info(f"ETL TRANSFORMATION RULE DEBUG: header_row = {rule.header_row}")
+        logger.info(f"ETL TRANSFORMATION RULE DEBUG: column_mappings = {rule.column_mappings}")
+        logger.info(f"ETL TRANSFORMATION RULE DEBUG: extra_fields_for_trigger = {rule.extra_fields_for_trigger}")
+        logger.info(f"ETL TRANSFORMATION RULE DEBUG: column_concatenations = {rule.column_concatenations}")
+        logger.info(f"ETL TRANSFORMATION RULE DEBUG: computed_columns = {rule.computed_columns}")
+        logger.info(f"ETL TRANSFORMATION RULE DEBUG: default_values = {rule.default_values}")
+        logger.info(f"ETL TRANSFORMATION RULE DEBUG: row_filter = {rule.row_filter}")
+        logger.info("=" * 80)
+        
         try:
             # Apply skip_rows
             if rule.skip_rows > 0:
+                logger.debug(f"ETL DEBUG: Applying skip_rows={rule.skip_rows}")
                 df = df.iloc[rule.skip_rows:].reset_index(drop=True)
             
             # Handle header_row
             if rule.header_row > 0:
+                logger.debug(f"ETL DEBUG: Applying header_row={rule.header_row}")
                 df.columns = df.iloc[rule.header_row - 1]
                 df = df.iloc[rule.header_row:].reset_index(drop=True)
             
@@ -286,15 +306,44 @@ class ETLPipelineService:
                     limited_to=self.row_limit
                 )
             
+            # Debug: Show raw data from template (limited to requested rows)
+            logger.info("=" * 80)
+            logger.info(f"ETL RAW DATA DEBUG: Raw Excel data from sheet '{sheet_name}' (showing first {len(df)} rows)")
+            logger.info("=" * 80)
+            logger.info(f"ETL RAW DATA DEBUG: Available columns: {list(df.columns)}")
+            for idx, (row_idx, row) in enumerate(df.iterrows()):
+                if idx >= 10:  # Limit to first 10 rows for debug output
+                    logger.info(f"ETL RAW DATA DEBUG: ... (showing first 10 rows only)")
+                    break
+                row_dict = row.to_dict()
+                # Convert NaN to None for cleaner output
+                clean_row = {k: (None if pd.isna(v) else v) for k, v in row_dict.items()}
+                logger.info(f"ETL RAW DATA DEBUG: Row {row_idx + 1}: {clean_row}")
+            logger.info("=" * 80)
+            
             # Build case-insensitive column lookup
             available_columns = {str(col).lower().strip(): str(col) for col in df.columns}
             available_columns_list = list(df.columns)
             
             # Validate required columns from column_mappings
+            # Note: Fields that are only in extra_fields_for_trigger (not actual model fields) 
+            # should NOT be validated as required columns. They are passed to triggers but not saved to the model.
+            extra_fields_target_keys = set((rule.extra_fields_for_trigger or {}).keys())
             missing_columns = []
             column_map = {}  # normalized_target -> actual_source
             
             for source_col, target_field in (rule.column_mappings or {}).items():
+                # Skip validation and mapping if the target_field is only used for extra_fields_for_trigger
+                # (i.e., if target_field is a key in extra_fields_for_trigger, meaning it's not a model field)
+                # These fields should ONLY be in extra_fields_for_trigger, not column_mappings
+                if target_field in extra_fields_target_keys:
+                    # This target field is only for extra_fields, not a model field
+                    # It should be extracted via extra_fields_for_trigger, not column_mappings
+                    # Skip it here to avoid conflicts
+                    logger.warning(f"ETL: Field '{target_field}' in column_mappings is also in extra_fields_for_trigger. "
+                                 f"Remove it from column_mappings - it will be extracted via extra_fields_for_trigger.")
+                    continue
+                
                 source_lower = str(source_col).lower().strip()
                 if source_lower not in available_columns:
                     missing_columns.append(source_col)
@@ -362,24 +411,48 @@ class ETLPipelineService:
                     transformed = {}
                     
                     # 1. Apply column mappings
+                    logger.debug(f"ETL TRANSFORM DEBUG: Row {row_number} - Applying column mappings from {len(column_map)} mapped columns")
                     for target_field, source_col in column_map.items():
                         value = row_dict.get(source_col)
+                        logger.debug(f"ETL TRANSFORM DEBUG: Row {row_number} - Mapping '{source_col}' -> '{target_field}': raw_value={value} (type: {type(value).__name__})")
                         # Clean NaN values
                         if pd.isna(value):
                             value = None
+                            logger.debug(f"ETL TRANSFORM DEBUG: Row {row_number} - '{source_col}' was NaN, set to None")
                         # Convert pandas Timestamp/datetime to date for date fields
                         if target_field == 'date' and value is not None:
+                            logger.info(f"ETL DATE DEBUG: Row {row_number} - Processing Transaction date field from column '{source_col}': raw_value={value} (type: {type(value).__name__})")
                             if hasattr(value, 'date'):
                                 # pandas Timestamp or datetime
+                                original_value = value
                                 value = value.date()
+                                logger.info(f"ETL DATE DEBUG: Row {row_number} - Extracted date from {type(original_value).__name__}: {value}")
                             elif isinstance(value, str) and 'T' in value:
                                 # ISO datetime string
                                 from datetime import datetime as dt
                                 try:
                                     value = dt.fromisoformat(value.replace('Z', '+00:00')).date()
-                                except (ValueError, TypeError):
-                                    pass
+                                    logger.info(f"ETL DATE DEBUG: Row {row_number} - Parsed ISO datetime string to date: {value}")
+                                except (ValueError, TypeError) as e:
+                                    logger.warning(f"ETL DATE DEBUG: Row {row_number} - Failed to parse ISO datetime string '{value}': {e}")
+                            elif isinstance(value, str):
+                                # Try parsing as date string
+                                parsed_date = self._parse_date_value(value)
+                                if parsed_date:
+                                    value = parsed_date
+                                    logger.info(f"ETL DATE DEBUG: Row {row_number} - Parsed date string '{value}' to date: {parsed_date}")
+                                else:
+                                    logger.warning(f"ETL DATE DEBUG: Row {row_number} - Failed to parse date string '{value}'")
+                            elif isinstance(value, (int, float)):
+                                # Try parsing as Excel serial number
+                                parsed_date = self._parse_date_value(value)
+                                if parsed_date:
+                                    value = parsed_date
+                                    logger.info(f"ETL DATE DEBUG: Row {row_number} - Parsed Excel serial number {value} to date: {parsed_date}")
+                                else:
+                                    logger.warning(f"ETL DATE DEBUG: Row {row_number} - Failed to parse Excel serial number '{value}'")
                         transformed[target_field] = value
+                        logger.debug(f"ETL TRANSFORM DEBUG: Row {row_number} - Set '{target_field}' = {value} (final type: {type(value).__name__})")
                     
                     # 2. Apply column concatenations
                     for target_field, concat_config in (rule.column_concatenations or {}).items():
@@ -435,21 +508,83 @@ class ETLPipelineService:
                     
                     # 5. Extract extra_fields_for_trigger (not saved to model, passed to triggers)
                     extra_fields = {}
-                    for target_field, source_col in (rule.extra_fields_for_trigger or {}).items():
+                    logger.debug(f"ETL TRANSFORM DEBUG: Row {row_number} - Extracting extra_fields_for_trigger")
+                    
+                    # Check if extra_fields_for_trigger format is backwards (common mistake)
+                    # Format should be: {"target_field": "Source Column"}
+                    # But user might have: {"Source Column": "target_field"}
+                    extra_fields_config = rule.extra_fields_for_trigger or {}
+                    if extra_fields_config:
+                        # Check if keys look like Excel column names (common in available columns)
+                        # and values look like field names (je_bank_date, je_book_date, account_path, etc.)
+                        first_key = list(extra_fields_config.keys())[0]
+                        first_value = list(extra_fields_config.values())[0]
+                        key_in_columns = str(first_key).lower().strip() in available_columns
+                        value_is_field_name = first_value in ('je_bank_date', 'je_book_date', 'account_path', 'cost_center_path')
+                        
+                        if key_in_columns and value_is_field_name:
+                            # Configuration is backwards! Swap it
+                            logger.warning(f"ETL TRANSFORM DEBUG: Row {row_number} - ⚠️ WARNING: extra_fields_for_trigger appears to be backwards!")
+                            logger.warning(f"ETL TRANSFORM DEBUG: Row {row_number} - Current: {extra_fields_config}")
+                            logger.warning(f"ETL TRANSFORM DEBUG: Row {row_number} - Should be: {dict((v, k) for k, v in extra_fields_config.items())}")
+                            logger.warning(f"ETL TRANSFORM DEBUG: Row {row_number} - Format should be: {{\"target_field\": \"Source Column\"}}, not {{\"Source Column\": \"target_field\"}}")
+                            # Auto-fix by swapping
+                            extra_fields_config = {v: k for k, v in extra_fields_config.items()}
+                            logger.warning(f"ETL TRANSFORM DEBUG: Row {row_number} - Auto-corrected to: {extra_fields_config}")
+                    
+                    for target_field, source_col in extra_fields_config.items():
                         source_lower = str(source_col).lower().strip()
                         actual_col = available_columns.get(source_lower, source_col)
                         value = row_dict.get(actual_col)
+                        logger.debug(f"ETL TRANSFORM DEBUG: Row {row_number} - extra_field '{target_field}' from column '{source_col}' (actual: '{actual_col}'): raw_value={value} (type: {type(value).__name__})")
                         if pd.isna(value):
                             value = None
+                            logger.debug(f"ETL TRANSFORM DEBUG: Row {row_number} - '{source_col}' was NaN, set to None")
+                        elif value is None:
+                            logger.warning(f"ETL TRANSFORM DEBUG: Row {row_number} - ⚠️ Column '{source_col}' not found in row data for extra_field '{target_field}'")
+                        
+                        # Special handling for date fields in extra_fields
+                        if target_field in ('je_bank_date', 'je_book_date') and value is not None:
+                            logger.info(f"ETL DATE DEBUG: Row {row_number} - Processing {target_field} from column '{source_col}': raw_value={value} (type: {type(value).__name__})")
+                            parsed_date = self._parse_date_value(value)
+                            if parsed_date:
+                                value = parsed_date
+                                logger.info(f"ETL DATE DEBUG: Row {row_number} - ✓ Successfully parsed {target_field}={parsed_date}")
+                            else:
+                                logger.warning(f"ETL DATE DEBUG: Row {row_number} - ✗ Failed to parse {target_field}='{value}', will be passed as-is")
+                        
                         extra_fields[target_field] = value
+                        logger.debug(f"ETL TRANSFORM DEBUG: Row {row_number} - Set extra_field '{target_field}' = {value} (final type: {type(value).__name__})")
+                    
+                    if extra_fields:
+                        logger.info(f"ETL TRANSFORM DEBUG: Row {row_number} - Final extra_fields: {extra_fields}")
                     
                     # Store extra_fields in a special key (will be removed before import)
                     if extra_fields:
                         transformed['__extra_fields__'] = extra_fields
                     
+                    # Debug: Show final transformed row (limited output)
+                    logger.debug(f"ETL TRANSFORM DEBUG: Row {row_number} - Final transformed data (excluding metadata):")
+                    transformed_debug = {k: v for k, v in transformed.items() if not k.startswith('__')}
+                    for key, val in transformed_debug.items():
+                        logger.debug(f"ETL TRANSFORM DEBUG: Row {row_number} -   {key} = {val} (type: {type(val).__name__})")
+                    
                     # Additional post-transformation filter: Skip rows with null amount for Transaction model
                     if rule.target_model == 'Transaction':
                         amount = transformed.get('amount')
+                        date_value = transformed.get('date')
+                        logger.info(f"ETL DATE DEBUG: Row {row_number} - Transaction date after transformation: {date_value} (type: {type(date_value).__name__ if date_value is not None else 'None'})")
+                        
+                        # Warn if date is missing
+                        if date_value is None:
+                            logger.error(f"ETL DATE DEBUG: Row {row_number} - ⚠️ ERROR: Transaction date is NULL!")
+                            logger.error(f"ETL DATE DEBUG: Row {row_number} - Available columns in Excel: {list(available_columns.keys())}")
+                            logger.error(f"ETL DATE DEBUG: Row {row_number} - column_mappings: {rule.column_mappings}")
+                            logger.error(f"ETL DATE DEBUG: Row {row_number} - Raw row data has 'Emissão': {row_dict.get('Emissão')}")
+                            logger.error(f"ETL DATE DEBUG: Row {row_number} - Raw row data has 'Vencimento': {row_dict.get('Vencimento')}")
+                            logger.error(f"ETL DATE DEBUG: Row {row_number} - Raw row data has 'Competência': {row_dict.get('Competência')}")
+                            logger.error(f"ETL DATE DEBUG: Row {row_number} - 💡 SOLUTION: Add 'Emissão': 'date' to column_mappings")
+                        
                         # Check if amount is null or empty after transformation
                         # Note: We allow 0 as a valid amount, only filter null/empty
                         is_null_amount = (
@@ -517,8 +652,84 @@ class ETLPipelineService:
     
     def _apply_substitutions(self):
         """Apply SubstitutionRules to transformed data."""
+        from multitenancy.formula_engine import _passes_conditions
+        
         for model_name, rows in self.transformed_data.items():
-            # Get all substitution rules for this model
+            # Get model class to identify FK fields
+            app_label = MODEL_APP_MAP.get(model_name)
+            model = None
+            fk_field_mapping = {}
+            
+            if app_label:
+                try:
+                    model = apps.get_model(app_label, model_name)
+                    # Build FK field mapping: {field_name: related_model_name}
+                    for field in model._meta.fields:
+                        if isinstance(field, dj_models.ForeignKey):
+                            related_model = getattr(field, 'related_model', None)
+                            if related_model:
+                                fk_field_mapping[field.name] = related_model.__name__
+                except LookupError:
+                    pass
+            
+            # Phase 1: Apply FK-related substitutions (e.g., Entity.id for entity_id)
+            if fk_field_mapping:
+                logger.info(f"ETL SUBSTITUTION: Found {len(fk_field_mapping)} FK fields in {model_name}: {list(fk_field_mapping.keys())}")
+                
+                for row_idx, row in enumerate(rows):
+                    for field_name, related_model_name in fk_field_mapping.items():
+                        if field_name not in row or row[field_name] is None:
+                            continue
+                        
+                        original_value = row[field_name]
+                        logger.debug(f"ETL SUBSTITUTION: Row {row_idx + 1} - Before FK substitution - {field_name}: '{original_value}' (type: {type(original_value).__name__})")
+                        
+                        # Look for substitution rules: model_name=related_model_name, field_name="id"
+                        fk_rules = SubstitutionRule.objects.filter(
+                            company_id=self.company_id,
+                            model_name__iexact=related_model_name,
+                            field_name__iexact="id"
+                        )
+                        
+                        if not fk_rules.exists():
+                            logger.debug(f"ETL SUBSTITUTION: No FK substitution rules found for {field_name} -> {related_model_name}.id")
+                            continue
+                        
+                        logger.debug(f"ETL SUBSTITUTION: Found {fk_rules.count()} FK substitution rules for {field_name} -> {related_model_name}.id")
+                        
+                        for rule in fk_rules:
+                            # Check filter_conditions
+                            filter_conditions = getattr(rule, 'filter_conditions', None)
+                            if filter_conditions and not _passes_conditions(row, filter_conditions):
+                                logger.debug(f"ETL SUBSTITUTION: FK rule {rule.id} ({rule.title or rule.id}) failed filter_conditions for {field_name}")
+                                continue
+                            
+                            try:
+                                new_value = self._apply_substitution_rule(rule, original_value, row)
+                                if new_value != original_value:
+                                    # Convert to int for _id fields
+                                    if field_name.endswith('_id'):
+                                        try:
+                                            new_value = int(new_value)
+                                            logger.debug(f"ETL SUBSTITUTION: Converted {field_name} substitution value to integer: {new_value}")
+                                        except (ValueError, TypeError):
+                                            # Keep as string if conversion fails
+                                            logger.debug(f"ETL SUBSTITUTION: Could not convert {field_name} value '{new_value}' to int, keeping as string")
+                                    
+                                    row[field_name] = new_value
+                                    logger.info(f"ETL SUBSTITUTION: FK substitution applied - Row {row_idx + 1} - {field_name}: '{original_value}' -> '{new_value}' (rule: {rule.title or rule.id}, target: {related_model_name}.id)")
+                                    break  # First matching rule wins
+                            except Exception as e:
+                                logger.error(f"ETL SUBSTITUTION: Error applying FK substitution rule '{rule}' to {field_name}: {str(e)}", exc_info=True)
+                                self._add_warning(
+                                    warning_type='substitution_error',
+                                    message=f"Error applying FK substitution rule '{rule}' to {field_name}: {str(e)}",
+                                    model=model_name,
+                                    field=field_name,
+                                    value=str(original_value)[:100]
+                                )
+            
+            # Phase 2: Apply normal model-level substitutions
             rules = SubstitutionRule.objects.filter(
                 company_id=self.company_id,
                 model_name__iexact=model_name
@@ -527,7 +738,7 @@ class ETLPipelineService:
             if not rules.exists():
                 continue
             
-            logger.info(f"ETL: Applying {rules.count()} substitution rules to {len(rows)} rows of {model_name}")
+            logger.info(f"ETL: Applying {rules.count()} model-level substitution rules to {len(rows)} rows of {model_name}")
             
             for rule in rules:
                 field_name = rule.field_name
@@ -540,10 +751,16 @@ class ETLPipelineService:
                     if original_value is None:
                         continue
                     
+                    # Check filter_conditions
+                    filter_conditions = getattr(rule, 'filter_conditions', None)
+                    if filter_conditions and not _passes_conditions(row, filter_conditions):
+                        continue
+                    
                     try:
-                        new_value = self._apply_substitution_rule(rule, original_value)
+                        new_value = self._apply_substitution_rule(rule, original_value, row)
                         if new_value != original_value:
                             row[field_name] = new_value
+                            logger.debug(f"ETL: Substitution applied - {field_name}: '{original_value}' -> '{new_value}' (rule: {rule.title or rule.id})")
                     except Exception as e:
                         self._add_warning(
                             warning_type='substitution_error',
@@ -553,7 +770,7 @@ class ETLPipelineService:
                             value=str(original_value)[:100]
                         )
     
-    def _apply_substitution_rule(self, rule: SubstitutionRule, value: Any) -> Any:
+    def _apply_substitution_rule(self, rule: SubstitutionRule, value: Any, row: dict = None) -> Any:
         """Apply a single substitution rule to a value."""
         str_value = str(value)
         
@@ -561,12 +778,17 @@ class ETLPipelineService:
             if str_value == rule.match_value:
                 return rule.substitution_value
         elif rule.match_type == 'regex':
-            return re.sub(rule.match_value, rule.substitution_value, str_value)
+            try:
+                if re.search(rule.match_value, str_value):
+                    return re.sub(rule.match_value, rule.substitution_value, str_value)
+            except re.error as e:
+                logger.warning(f"ETL: Invalid regex pattern in substitution rule {rule.id}: {rule.match_value} - {str(e)}")
+                return value
         elif rule.match_type == 'caseless':
             # Case and accent insensitive
             import unicodedata
             def normalize(s):
-                return unicodedata.normalize('NFD', s.lower()).encode('ascii', 'ignore').decode('utf-8')
+                return unicodedata.normalize('NFD', str(s).lower()).encode('ascii', 'ignore').decode('utf-8')
             if normalize(str_value) == normalize(rule.match_value):
                 return rule.substitution_value
         
@@ -626,11 +848,13 @@ class ETLPipelineService:
         # Apply substitutions for each field with detailed profiling
         # Use fast substitution function that uses pre-loaded rules cache
         field_timings = {}
-        logger.info(f"ETL OPPOSING JE: _apply_substitutions_to_extra_fields - Processing {len(field_mappings)} field mappings")
+        if self.debug_account_substitution:
+            logger.info(f"ETL OPPOSING JE: _apply_substitutions_to_extra_fields - Processing {len(field_mappings)} field mappings")
         for field_name, (target_model, target_field) in field_mappings.items():
             if field_name in substituted and substituted[field_name] is not None:
                 value = substituted[field_name]
-                logger.info(f"ETL OPPOSING JE: _apply_substitutions_to_extra_fields - Processing field '{field_name}' -> {target_model}.{target_field}, original value: '{value}'")
+                if self.debug_account_substitution:
+                    logger.info(f"ETL OPPOSING JE: _apply_substitutions_to_extra_fields - Processing field '{field_name}' -> {target_model}.{target_field}, original value: '{value}'")
                 
                 # Apply substitutions using fast cached function
                 field_subst_start = time.time()
@@ -643,19 +867,23 @@ class ETLPipelineService:
                     if field_subst_time > 0.01:
                         logger.info(f"ETL DEBUG: Substitution for {field_name} ({target_model}.{target_field}) took {field_subst_time:.3f}s")
                     if new_value != value:
-                        logger.info(f"ETL OPPOSING JE: _apply_substitutions_to_extra_fields - SUBSTITUTION APPLIED to '{field_name}': '{value}' -> '{new_value}'")
+                        if self.debug_account_substitution:
+                            logger.info(f"ETL OPPOSING JE: _apply_substitutions_to_extra_fields - SUBSTITUTION APPLIED to '{field_name}': '{value}' -> '{new_value}'")
                         logger.debug(f"ETL: Applied substitution to {field_name}: {value} -> {new_value}")
                         substituted[field_name] = new_value
                     else:
-                        logger.info(f"ETL OPPOSING JE: _apply_substitutions_to_extra_fields - No substitution applied to '{field_name}', value unchanged: '{value}'")
+                        if self.debug_account_substitution:
+                            logger.info(f"ETL OPPOSING JE: _apply_substitutions_to_extra_fields - No substitution applied to '{field_name}', value unchanged: '{value}'")
                 except Exception as e:
                     field_subst_time = time.time() - field_subst_start
                     field_timings[field_name] = field_subst_time
-                    logger.error(f"ETL OPPOSING JE: _apply_substitutions_to_extra_fields - EXCEPTION applying substitution to '{field_name}': {e}", exc_info=True)
+                    if self.debug_account_substitution:
+                        logger.error(f"ETL OPPOSING JE: _apply_substitutions_to_extra_fields - EXCEPTION applying substitution to '{field_name}': {e}", exc_info=True)
                     logger.warning(f"ETL: Error applying substitutions to {field_name}: {e}")
                     # Continue with original value
             else:
-                logger.debug(f"ETL OPPOSING JE: _apply_substitutions_to_extra_fields - Field '{field_name}' not in substituted or is None")
+                if self.debug_account_substitution:
+                    logger.debug(f"ETL OPPOSING JE: _apply_substitutions_to_extra_fields - Field '{field_name}' not in substituted or is None")
         
         # Log summary of field timings
         if field_timings:
@@ -696,44 +924,56 @@ class ETLPipelineService:
         Returns:
             Account instance or None
         """
-        logger.info(f"ETL OPPOSING JE: _lookup_account called - value='{value}', lookup_type='{lookup_type}', path_separator='{path_separator}'")
+        if self.debug_account_substitution:
+            logger.info(f"ETL OPPOSING JE: _lookup_account called - value='{value}', lookup_type='{lookup_type}', path_separator='{path_separator}'")
         
         if not value:
-            logger.warning(f"ETL OPPOSING JE: _lookup_account - value is None/empty, returning None")
+            if self.debug_account_substitution:
+                logger.warning(f"ETL OPPOSING JE: _lookup_account - value is None/empty, returning None")
             return None
         
         lookup_start = time.time()
         try:
             result = None
             if lookup_type == 'id':
-                logger.info(f"ETL OPPOSING JE: _lookup_account - Looking up by ID: {value}")
+                if self.debug_account_substitution:
+                    logger.info(f"ETL OPPOSING JE: _lookup_account - Looking up by ID: {value}")
                 result = self.lookup_cache.get_account_by_id(int(value))
-                logger.info(f"ETL OPPOSING JE: _lookup_account - ID lookup result: {result.id if result else None} ({result.name if result else 'NOT FOUND'})")
+                if self.debug_account_substitution:
+                    logger.info(f"ETL OPPOSING JE: _lookup_account - ID lookup result: {result.id if result else None} ({result.name if result else 'NOT FOUND'})")
             
             elif lookup_type == 'code':
-                logger.info(f"ETL OPPOSING JE: _lookup_account - Looking up by code: {value}")
+                if self.debug_account_substitution:
+                    logger.info(f"ETL OPPOSING JE: _lookup_account - Looking up by code: {value}")
                 result = self.lookup_cache.get_account_by_code(str(value))
-                logger.info(f"ETL OPPOSING JE: _lookup_account - Code lookup result: {result.id if result else None} ({result.name if result else 'NOT FOUND'})")
+                if self.debug_account_substitution:
+                    logger.info(f"ETL OPPOSING JE: _lookup_account - Code lookup result: {result.id if result else None} ({result.name if result else 'NOT FOUND'})")
             
             elif lookup_type == 'name':
-                logger.info(f"ETL OPPOSING JE: _lookup_account - Looking up by name: {value}")
+                if self.debug_account_substitution:
+                    logger.info(f"ETL OPPOSING JE: _lookup_account - Looking up by name: {value}")
                 result = self.lookup_cache.get_account_by_name(str(value))
-                logger.info(f"ETL OPPOSING JE: _lookup_account - Name lookup result: {result.id if result else None} ({result.name if result else 'NOT FOUND'})")
+                if self.debug_account_substitution:
+                    logger.info(f"ETL OPPOSING JE: _lookup_account - Name lookup result: {result.id if result else None} ({result.name if result else 'NOT FOUND'})")
             
             elif lookup_type == 'path':
                 # Use lookup cache for path resolution
-                logger.info(f"ETL OPPOSING JE: _lookup_account - Looking up by path: '{value}' with separator: '{path_separator}'")
+                if self.debug_account_substitution:
+                    logger.info(f"ETL OPPOSING JE: _lookup_account - Looking up by path: '{value}' with separator: '{path_separator}'")
                 result = self.lookup_cache.get_account_by_path(str(value), path_separator)
                 if result:
-                    logger.info(f"ETL OPPOSING JE: _lookup_account - Path lookup SUCCESS: ID={result.id}, Name={result.name}, Code={getattr(result, 'account_code', 'N/A')}")
+                    if self.debug_account_substitution:
+                        logger.info(f"ETL OPPOSING JE: _lookup_account - Path lookup SUCCESS: ID={result.id}, Name={result.name}, Code={getattr(result, 'account_code', 'N/A')}")
                 else:
-                    logger.warning(f"ETL OPPOSING JE: _lookup_account - Path lookup FAILED: No account found for path '{value}' with separator '{path_separator}'")
-                    # Try to get more info about why it failed
-                    path_parts = [p.strip() for p in str(value).split(path_separator) if p.strip()]
-                    logger.info(f"ETL OPPOSING JE: _lookup_account - Path parts: {path_parts}")
+                    if self.debug_account_substitution:
+                        logger.warning(f"ETL OPPOSING JE: _lookup_account - Path lookup FAILED: No account found for path '{value}' with separator '{path_separator}'")
+                        # Try to get more info about why it failed
+                        path_parts = [p.strip() for p in str(value).split(path_separator) if p.strip()]
+                        logger.info(f"ETL OPPOSING JE: _lookup_account - Path parts: {path_parts}")
             
             else:
-                logger.warning(f"ETL OPPOSING JE: _lookup_account - Unknown lookup type: {lookup_type}")
+                if self.debug_account_substitution:
+                    logger.warning(f"ETL OPPOSING JE: _lookup_account - Unknown lookup type: {lookup_type}")
                 logger.warning(f"Unknown account lookup type: {lookup_type}")
                 return None
             
@@ -747,6 +987,108 @@ class ETLPipelineService:
             logger.error(f"ETL OPPOSING JE: _lookup_account - EXCEPTION: {e}", exc_info=True)
             logger.error(f"Error looking up account: {e}")
             return None
+    
+    def _parse_date_value(self, value: Any) -> Optional[date]:
+        """
+        Parse various date formats to Python date object.
+        
+        Supports:
+        - date objects (returns as-is)
+        - datetime objects (extracts date)
+        - pandas Timestamp objects (extracts date)
+        - Excel serial numbers (float/int representing days since 1900-01-01)
+        - ISO format strings (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
+        - YYYY-MM-DD format strings
+        
+        Args:
+            value: Date value in various formats
+            
+        Returns:
+            date object or None if parsing fails
+        """
+        logger.debug(f"ETL DATE DEBUG: _parse_date_value called with value={value} (type: {type(value).__name__})")
+        
+        if isinstance(value, date):
+            # Check date first, but exclude datetime and Timestamp which are subclasses
+            if not isinstance(value, datetime):
+                logger.debug(f"ETL DATE DEBUG: Value is already a date object: {value}")
+                return value
+        # Handle pandas Timestamp objects FIRST (before datetime check)
+        # pd.Timestamp is a subclass of datetime, so we need to check it first
+        # to avoid comparison issues when isinstance checks trigger internal comparisons
+        try:
+            if isinstance(value, pd.Timestamp):
+                # pandas Timestamp - convert to Python date
+                # Use to_pydatetime().date() to avoid comparison issues
+                parsed = value.to_pydatetime().date()
+                logger.debug(f"ETL DATE DEBUG: Extracted date from pandas Timestamp: {parsed}")
+                return parsed
+            elif hasattr(value, 'to_pydatetime'):
+                # Other pandas-like timestamp objects
+                parsed = value.to_pydatetime().date()
+                logger.debug(f"ETL DATE DEBUG: Extracted date from pandas-like object: {parsed}")
+                return parsed
+            elif hasattr(value, 'date') and callable(getattr(value, 'date', None)):
+                # Objects with .date() method (like pandas Timestamp)
+                try:
+                    # For Timestamp objects, use to_pydatetime().date() to avoid comparison issues
+                    if hasattr(value, 'to_pydatetime'):
+                        parsed = value.to_pydatetime().date()
+                    else:
+                        parsed = value.date()
+                    if isinstance(parsed, date):
+                        logger.debug(f"ETL DATE DEBUG: Extracted date using .date() method: {parsed}")
+                        return parsed
+                except (AttributeError, ValueError, TypeError) as e:
+                    logger.debug(f"ETL DATE DEBUG: Failed to extract date from object with .date() method: {e}")
+                    pass
+        except (AttributeError, ValueError, TypeError) as e:
+            logger.debug(f"ETL DATE DEBUG: Failed to parse as pandas Timestamp: {e}")
+            pass
+        # Handle datetime objects (check after Timestamp since Timestamp is a subclass)
+        if isinstance(value, datetime):
+            parsed = value.date()
+            logger.debug(f"ETL DATE DEBUG: Extracted date from datetime: {parsed}")
+            return parsed
+        # Handle Excel serial numbers (days since 1900-01-01)
+        # Excel dates are typically floats like 44927.0 for 2023-01-01
+        if isinstance(value, (int, float)):
+            try:
+                # Excel epoch is 1899-12-30 (not 1900-01-01 due to Excel's 1900 leap year bug)
+                excel_epoch = date(1899, 12, 30)
+                days = int(value)
+                parsed = excel_epoch + timedelta(days=days)
+                # Validate it's a reasonable date (between 1900 and 2100)
+                if parsed.year >= 1900 and parsed.year <= 2100:
+                    logger.debug(f"ETL DATE DEBUG: Parsed Excel serial number {value} to date: {parsed}")
+                    return parsed
+                else:
+                    logger.debug(f"ETL DATE DEBUG: Excel serial number {value} resulted in out-of-range date: {parsed}")
+            except (ValueError, OverflowError, TypeError) as e:
+                logger.debug(f"ETL DATE DEBUG: Failed to parse numeric value {value} as Excel date: {e}")
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                logger.debug(f"ETL DATE DEBUG: Empty string after strip, returning None")
+                return None
+            logger.debug(f"ETL DATE DEBUG: Attempting to parse string '{value}' as date...")
+            # Try ISO format first (handles both date-only and datetime strings)
+            try:
+                if 'T' in value:
+                    logger.debug(f"ETL DATE DEBUG: String contains 'T', parsing as ISO datetime format")
+                    parsed = datetime.fromisoformat(value.replace('Z', '+00:00')).date()
+                    logger.debug(f"ETL DATE DEBUG: Successfully parsed ISO datetime to date: {parsed}")
+                    return parsed
+                else:
+                    logger.debug(f"ETL DATE DEBUG: Parsing as YYYY-MM-DD format")
+                    parsed = datetime.strptime(value, '%Y-%m-%d').date()
+                    logger.debug(f"ETL DATE DEBUG: Successfully parsed YYYY-MM-DD to date: {parsed}")
+                    return parsed
+            except (ValueError, TypeError) as e:
+                logger.warning(f"ETL DATE DEBUG: Failed to parse date value '{value}' (error: {e}), expected YYYY-MM-DD format")
+                return None
+        logger.debug(f"ETL DATE DEBUG: Value type {type(value).__name__} not supported, returning None")
+        return None
     
     def _validate_data(self):
         """Validate transformed data before import."""
@@ -1253,17 +1595,20 @@ class ETLPipelineService:
         from multitenancy.tasks import _safe_model_dict, _row_observations, _norm_row_key
         from django.apps import apps
         
-        logger.info(f"ETL OPPOSING JE: _import_transactions_with_journal_entries CALLED - {len(transaction_sheets)} Transaction sheet(s), {len(extra_fields_list)} extra_fields entries")
+        if self.debug_account_substitution:
+            logger.info(f"ETL OPPOSING JE: _import_transactions_with_journal_entries CALLED - {len(transaction_sheets)} Transaction sheet(s), {len(extra_fields_list)} extra_fields entries")
         logger.info(f"ETL: Importing {len(transaction_sheets)} Transaction sheet(s) with auto-created JournalEntries")
         
         # Get auto-create configuration
         auto_config = self.auto_create_journal_entries or {}
-        logger.info(f"ETL OPPOSING JE: auto_create_journal_entries config: {auto_config}")
-        logger.info(f"ETL OPPOSING JE: auto_config.get('enabled'): {auto_config.get('enabled', False)}")
+        if self.debug_account_substitution:
+            logger.info(f"ETL OPPOSING JE: auto_create_journal_entries config: {auto_config}")
+            logger.info(f"ETL OPPOSING JE: auto_config.get('enabled'): {auto_config.get('enabled', False)}")
         
         if not auto_config.get('enabled', False):
             # If not enabled, just use normal import
-            logger.warning(f"ETL OPPOSING JE: auto_create_journal_entries is NOT ENABLED - using normal import instead")
+            if self.debug_account_substitution:
+                logger.warning(f"ETL OPPOSING JE: auto_create_journal_entries is NOT ENABLED - using normal import instead")
             from multitenancy.tasks import execute_import_job
             return execute_import_job(
                 company_id=self.company_id,
@@ -1271,7 +1616,8 @@ class ETLPipelineService:
                 commit=False
             )
         
-        logger.info(f"ETL OPPOSING JE: auto_create_journal_entries is ENABLED - proceeding with custom import logic")
+        if self.debug_account_substitution:
+            logger.info(f"ETL OPPOSING JE: auto_create_journal_entries is ENABLED - proceeding with custom import logic")
         
         bank_account_field = auto_config.get('bank_account_field', 'bank_account_id')
         opposing_account_field = auto_config.get('opposing_account_field', 'account_path')
@@ -1301,56 +1647,57 @@ class ETLPipelineService:
         
         substitution_rules_cache: Dict[tuple, List[SubstitutionRule]] = {}  # (model, field) -> [rules]
         
-        # DUMP ALL SUBSTITUTION RULES FOR DEBUGGING
-        logger.info("=" * 80)
-        logger.info("ETL SUBSTITUTION RULES DUMP - START")
-        logger.info("=" * 80)
-        all_rules = list(SubstitutionRule.objects.filter(company_id=self.company_id).order_by('model_name', 'field_name', 'id'))
-        logger.info(f"ETL SUBSTITUTION RULES: Total rules for company {self.company_id}: {len(all_rules)}")
-        
-        # Group by (model_name, field_name) for easier reading
-        rules_by_target = {}
-        for rule in all_rules:
-            key = (rule.model_name, rule.field_name)
-            if key not in rules_by_target:
-                rules_by_target[key] = []
-            rules_by_target[key].append(rule)
-        
-        for (model_name, field_name), rules in sorted(rules_by_target.items()):
-            logger.info(f"ETL SUBSTITUTION RULES: {model_name}.{field_name} - {len(rules)} rule(s)")
-            for idx, rule in enumerate(rules, 1):
-                rule_title = getattr(rule, 'title', f'Rule {rule.id}')
-                filter_conditions = getattr(rule, 'filter_conditions', None)
-                logger.info(f"  [{idx}] ID={rule.id}, title='{rule_title}', match_type='{rule.match_type}', "
-                          f"match_value='{rule.match_value}', substitution_value='{rule.substitution_value}', "
-                          f"filter_conditions={filter_conditions}")
-        
-        # Highlight Account.path rules specifically
-        account_path_rules_list = [r for (m, f), rules in rules_by_target.items() 
-                                   for r in rules if m == 'Account' and f == 'path']
-        logger.info(f"ETL SUBSTITUTION RULES: Account.path rules: {len(account_path_rules_list)}")
-        if account_path_rules_list:
-            for idx, rule in enumerate(account_path_rules_list, 1):
-                rule_title = getattr(rule, 'title', f'Rule {rule.id}')
-                logger.info(f"  Account.path Rule [{idx}]: ID={rule.id}, title='{rule_title}', "
-                          f"match='{rule.match_value}' -> '{rule.substitution_value}'")
-        else:
-            logger.warning("ETL SUBSTITUTION RULES: WARNING - No Account.path rules found! "
-                          "Substitutions for account_path will not work.")
-        
-        # Check for common misconfigurations
-        account_path_wrong = [r for (m, f), rules in rules_by_target.items() 
-                             for r in rules if m == 'Account' and f == 'account_path']
-        if account_path_wrong:
-            logger.warning(f"ETL SUBSTITUTION RULES: WARNING - Found {len(account_path_wrong)} rule(s) with "
-                          f"model_name='Account' and field_name='account_path' (should be 'path' instead)")
-            for rule in account_path_wrong:
-                rule_title = getattr(rule, 'title', f'Rule {rule.id}')
-                logger.warning(f"  Misconfigured Rule ID={rule.id}, title='{rule_title}'")
-        
-        logger.info("=" * 80)
-        logger.info("ETL SUBSTITUTION RULES DUMP - END")
-        logger.info("=" * 80)
+        # DUMP ALL SUBSTITUTION RULES FOR DEBUGGING (only if flag enabled)
+        if self.debug_account_substitution:
+            logger.info("=" * 80)
+            logger.info("ETL SUBSTITUTION RULES DUMP - START")
+            logger.info("=" * 80)
+            all_rules = list(SubstitutionRule.objects.filter(company_id=self.company_id).order_by('model_name', 'field_name', 'id'))
+            logger.info(f"ETL SUBSTITUTION RULES: Total rules for company {self.company_id}: {len(all_rules)}")
+            
+            # Group by (model_name, field_name) for easier reading
+            rules_by_target = {}
+            for rule in all_rules:
+                key = (rule.model_name, rule.field_name)
+                if key not in rules_by_target:
+                    rules_by_target[key] = []
+                rules_by_target[key].append(rule)
+            
+            for (model_name, field_name), rules in sorted(rules_by_target.items()):
+                logger.info(f"ETL SUBSTITUTION RULES: {model_name}.{field_name} - {len(rules)} rule(s)")
+                for idx, rule in enumerate(rules, 1):
+                    rule_title = getattr(rule, 'title', f'Rule {rule.id}')
+                    filter_conditions = getattr(rule, 'filter_conditions', None)
+                    logger.info(f"  [{idx}] ID={rule.id}, title='{rule_title}', match_type='{rule.match_type}', "
+                              f"match_value='{rule.match_value}', substitution_value='{rule.substitution_value}', "
+                              f"filter_conditions={filter_conditions}")
+            
+            # Highlight Account.path rules specifically
+            account_path_rules_list = [r for (m, f), rules in rules_by_target.items() 
+                                       for r in rules if m == 'Account' and f == 'path']
+            logger.info(f"ETL SUBSTITUTION RULES: Account.path rules: {len(account_path_rules_list)}")
+            if account_path_rules_list:
+                for idx, rule in enumerate(account_path_rules_list, 1):
+                    rule_title = getattr(rule, 'title', f'Rule {rule.id}')
+                    logger.info(f"  Account.path Rule [{idx}]: ID={rule.id}, title='{rule_title}', "
+                              f"match='{rule.match_value}' -> '{rule.substitution_value}'")
+            else:
+                logger.warning("ETL SUBSTITUTION RULES: WARNING - No Account.path rules found! "
+                              "Substitutions for account_path will not work.")
+            
+            # Check for common misconfigurations
+            account_path_wrong = [r for (m, f), rules in rules_by_target.items() 
+                                 for r in rules if m == 'Account' and f == 'account_path']
+            if account_path_wrong:
+                logger.warning(f"ETL SUBSTITUTION RULES: WARNING - Found {len(account_path_wrong)} rule(s) with "
+                              f"model_name='Account' and field_name='account_path' (should be 'path' instead)")
+                for rule in account_path_wrong:
+                    rule_title = getattr(rule, 'title', f'Rule {rule.id}')
+                    logger.warning(f"  Misconfigured Rule ID={rule.id}, title='{rule_title}'")
+            
+            logger.info("=" * 80)
+            logger.info("ETL SUBSTITUTION RULES DUMP - END")
+            logger.info("=" * 80)
         
         # Pre-load rules for Account.path (most common case)
         account_path_rules = list(SubstitutionRule.objects.filter(
@@ -1359,7 +1706,7 @@ class ETLPipelineService:
             field_name='path'
         ))
         substitution_rules_cache[('Account', 'path')] = account_path_rules
-        if account_path_rules:
+        if self.debug_account_substitution and account_path_rules:
             logger.info(f"ETL DEBUG: Pre-loaded {len(account_path_rules)} substitution rules for Account.path")
         
         def normalize_path_separators(path_str: str) -> str:
@@ -1396,44 +1743,53 @@ class ETLPipelineService:
             cache_key = (model_name, field_name)
             rules = substitution_rules_cache.get(cache_key)
             
-            logger.info(f"ETL OPPOSING JE: apply_substitution_fast - value='{value}', model='{model_name}', field='{field_name}'")
-            logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Found {len(rules) if rules else 0} rules in cache for {cache_key}")
+            if self.debug_account_substitution:
+                logger.info(f"ETL OPPOSING JE: apply_substitution_fast - value='{value}', model='{model_name}', field='{field_name}'")
+                logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Found {len(rules) if rules else 0} rules in cache for {cache_key}")
             
             # If not cached, load it (shouldn't happen often)
             if rules is None:
-                logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rules not cached, loading from DB")
+                if self.debug_account_substitution:
+                    logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rules not cached, loading from DB")
                 rules = list(SubstitutionRule.objects.filter(
                     company_id=self.company_id,
                     model_name=model_name,
                     field_name=field_name
                 ))
                 substitution_rules_cache[cache_key] = rules
-                logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Loaded {len(rules)} rules from DB")
+                if self.debug_account_substitution:
+                    logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Loaded {len(rules)} rules from DB")
             
             # Apply rules in order (first match wins)
             row_context = row_context or {}
-            logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Row context: {row_context}")
+            if self.debug_account_substitution:
+                logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Row context: {row_context}")
             
             # For account_path fields, normalize path separators before comparison
             is_account_path_field = (field_name == 'account_path' or field_name.endswith('_path'))
             if is_account_path_field and isinstance(value, str):
                 value_normalized = normalize_path_separators(value)
-                logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Normalized account_path value: '{value}' -> '{value_normalized}'")
+                if self.debug_account_substitution:
+                    logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Normalized account_path value: '{value}' -> '{value_normalized}'")
             else:
                 value_normalized = value
             
             for idx, rl in enumerate(rules):
                 rule_title = getattr(rl, 'title', f'Rule {rl.id}')
-                logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Checking rule {idx + 1}/{len(rules)}: ID={rl.id}, title='{rule_title}', match_type='{rl.match_type}', match_value='{rl.match_value}', substitution_value='{rl.substitution_value}'")
+                if self.debug_account_substitution:
+                    logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Checking rule {idx + 1}/{len(rules)}: ID={rl.id}, title='{rule_title}', match_type='{rl.match_type}', match_value='{rl.match_value}', substitution_value='{rl.substitution_value}'")
                 
                 # Check filter conditions
                 filter_conditions = getattr(rl, "filter_conditions", None)
-                logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} filter_conditions: {filter_conditions}")
+                if self.debug_account_substitution:
+                    logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} filter_conditions: {filter_conditions}")
                 if not _passes_conditions(row_context, filter_conditions):
-                    logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} FAILED filter conditions, skipping")
+                    if self.debug_account_substitution:
+                        logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} FAILED filter conditions, skipping")
                     continue
                 
-                logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} PASSED filter conditions, checking match")
+                if self.debug_account_substitution:
+                    logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} PASSED filter conditions, checking match")
                 
                 # Check match type
                 mt = (rl.match_type or "exact").lower()
@@ -1443,7 +1799,8 @@ class ETLPipelineService:
                 # For account_path fields, normalize match_value as well
                 if is_account_path_field and isinstance(mv, str):
                     mv_normalized = normalize_path_separators(mv)
-                    logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Normalized account_path match_value: '{mv}' -> '{mv_normalized}'")
+                    if self.debug_account_substitution:
+                        logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Normalized account_path match_value: '{mv}' -> '{mv_normalized}'")
                 else:
                     mv_normalized = mv
                 
@@ -1451,31 +1808,40 @@ class ETLPipelineService:
                     # Use normalized values for account_path fields, original values otherwise
                     compare_value = value_normalized if is_account_path_field else value
                     compare_match = mv_normalized if is_account_path_field else mv
-                    logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} exact match: '{compare_value}' == '{compare_match}'? {compare_value == compare_match}")
+                    if self.debug_account_substitution:
+                        logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} exact match: '{compare_value}' == '{compare_match}'? {compare_value == compare_match}")
                     if compare_value == compare_match:
-                        logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} MATCHED! Returning substitution: '{sv}'")
+                        if self.debug_account_substitution:
+                            logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} MATCHED! Returning substitution: '{sv}'")
                         return sv
                 elif mt == "regex":
                     try:
-                        logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} regex match: pattern='{mv}' against '{value}'")
+                        if self.debug_account_substitution:
+                            logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} regex match: pattern='{mv}' against '{value}'")
                         if regex_module.search(str(mv), str(value or "")):
                             result = regex_module.sub(str(mv), str(sv), str(value or ""))
-                            logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} MATCHED! Returning substitution: '{result}'")
+                            if self.debug_account_substitution:
+                                logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} MATCHED! Returning substitution: '{result}'")
                             return result
                         else:
-                            logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} regex did not match")
+                            if self.debug_account_substitution:
+                                logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} regex did not match")
                     except regex_module.error as regex_err:
-                        logger.warning(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} regex error: {regex_err}")
+                        if self.debug_account_substitution:
+                            logger.warning(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} regex error: {regex_err}")
                         continue
                 elif mt == "caseless":
                     normalized_value = _normalize(value)
                     normalized_match = _normalize(mv)
-                    logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} caseless match: '{normalized_value}' == '{normalized_match}'? {normalized_value == normalized_match}")
+                    if self.debug_account_substitution:
+                        logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} caseless match: '{normalized_value}' == '{normalized_match}'? {normalized_value == normalized_match}")
                     if normalized_value == normalized_match:
-                        logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} MATCHED! Returning substitution: '{sv}'")
+                        if self.debug_account_substitution:
+                            logger.info(f"ETL OPPOSING JE: apply_substitution_fast - Rule {idx + 1} MATCHED! Returning substitution: '{sv}'")
                         return sv
             
-            logger.info(f"ETL OPPOSING JE: apply_substitution_fast - No rules matched, returning original value: '{value}'")
+            if self.debug_account_substitution:
+                logger.info(f"ETL OPPOSING JE: apply_substitution_fast - No rules matched, returning original value: '{value}'")
             return value
         
         model = apps.get_model('accounting', 'Transaction')
@@ -1488,6 +1854,11 @@ class ETLPipelineService:
             raw_rows: List[Dict[str, Any]] = sheet.get("rows") or []
             logger.info(f"ETL DEBUG: Sheet {sheet_idx + 1}: Processing {len(raw_rows)} raw rows")
             
+            # Log entity_id values before substitutions
+            for idx, row in enumerate(raw_rows):
+                if isinstance(row, dict) and 'entity_id' in row:
+                    logger.info(f"ETL DEBUG: Row {idx + 1} BEFORE substitutions - entity_id: '{row.get('entity_id')}' (type: {type(row.get('entity_id')).__name__})")
+            
             # Apply substitutions
             subst_start = time.time()
             rows, audit = apply_substitutions(
@@ -1498,6 +1869,11 @@ class ETLPipelineService:
             )
             subst_time = time.time() - subst_start
             logger.info(f"ETL DEBUG: Substitutions took {subst_time:.3f}s for {len(rows)} rows ({subst_time/len(rows)*1000:.2f}ms per row)")
+            
+            # Log entity_id values after substitutions
+            for idx, row in enumerate(rows):
+                if isinstance(row, dict) and 'entity_id' in row:
+                    logger.info(f"ETL DEBUG: Row {idx + 1} AFTER substitutions - entity_id: '{row.get('entity_id')}' (type: {type(row.get('entity_id')).__name__})")
             audit_by_rowid: Dict[Any, List[dict]] = {}
             for ch in (audit or []):
                 key_norm = _norm_row_key(ch.get("__row_id"))
@@ -1513,6 +1889,10 @@ class ETLPipelineService:
                 raw = dict(row or {})
                 rid_raw = raw.pop("__row_id", None)
                 rid = _norm_row_key(rid_raw)
+                
+                # Log entity_id in raw row
+                if 'entity_id' in raw:
+                    logger.debug(f"ETL DEBUG: Row {row_idx + 1} raw dict - entity_id: '{raw.get('entity_id')}' (type: {type(raw.get('entity_id')).__name__})")
                 
                 try:
                     filter_start = time.time()
@@ -1535,6 +1915,10 @@ class ETLPipelineService:
                     fk_time = time.time() - fk_start
                     if fk_time > 0.01:
                         logger.debug(f"ETL DEBUG: Row {row_idx + 1} FK resolution took {fk_time:.3f}s")
+                    
+                    # Log entity_id in filtered dict before save
+                    if 'entity_id' in filtered:
+                        logger.info(f"ETL DEBUG: Row {row_idx + 1} BEFORE save - entity_id: '{filtered.get('entity_id')}' (type: {type(filtered.get('entity_id')).__name__})")
                     
                     # Coercions
                     filtered = _coerce_boolean_fields(model, filtered)
@@ -1619,9 +2003,10 @@ class ETLPipelineService:
                     
                     # Apply substitutions to extra_fields before using them
                     # For each field, check if there are substitutions for the target model
-                    logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Starting extra_fields substitution")
-                    logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Original extra_fields: {extra_fields}")
-                    logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Auto config: enabled={auto_config.get('enabled')}, opposing_account_field={auto_config.get('opposing_account_field')}, opposing_account_lookup={auto_config.get('opposing_account_lookup')}")
+                    if self.debug_account_substitution:
+                        logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Starting extra_fields substitution")
+                        logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Original extra_fields: {extra_fields}")
+                        logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Auto config: enabled={auto_config.get('enabled')}, opposing_account_field={auto_config.get('opposing_account_field')}, opposing_account_lookup={auto_config.get('opposing_account_lookup')}")
                     
                     subst_extra_start = time.time()
                     substituted_extra_fields = self._apply_substitutions_to_extra_fields(
@@ -1631,7 +2016,8 @@ class ETLPipelineService:
                         apply_substitution_fast=apply_substitution_fast
                     )
                     subst_extra_time = time.time() - subst_extra_start
-                    logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Substituted extra_fields: {substituted_extra_fields}")
+                    if self.debug_account_substitution:
+                        logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Substituted extra_fields: {substituted_extra_fields}")
                     logger.info(f"ETL DEBUG: Row {row_idx + 1} extra field substitutions took {subst_extra_time:.3f}s")
                     if subst_extra_time > 0.5:
                         logger.warning(f"ETL DEBUG: Row {row_idx + 1} extra field substitutions is VERY SLOW: {subst_extra_time:.3f}s")
@@ -1675,41 +2061,48 @@ class ETLPipelineService:
                         opposing_account = None
                         account_path_value = substituted_extra_fields.get('account_path')
                         
-                        logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Extracting account_path from substituted_extra_fields")
-                        logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - account_path_value (raw): {account_path_value}")
-                        logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - opposing_account_field from config: {opposing_account_field}")
-                        logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - opposing_account_lookup from config: {opposing_account_lookup}")
+                        if self.debug_account_substitution:
+                            logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Extracting account_path from substituted_extra_fields")
+                            logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - account_path_value (raw): {account_path_value}")
+                            logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - opposing_account_field from config: {opposing_account_field}")
+                            logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - opposing_account_lookup from config: {opposing_account_lookup}")
                         
                         # Also check if the field name in extra_fields matches the configured field name
                         if not account_path_value and opposing_account_field != 'account_path':
                             account_path_value = substituted_extra_fields.get(opposing_account_field)
-                            logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Also checked {opposing_account_field}: {account_path_value}")
+                            if self.debug_account_substitution:
+                                logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Also checked {opposing_account_field}: {account_path_value}")
                         
                         # Detect path separator (could be \ or > )
                         detected_separator = path_separator
                         if account_path_value:
-                            logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Detecting path separator for: {account_path_value}")
+                            if self.debug_account_substitution:
+                                logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Detecting path separator for: {account_path_value}")
                             if '\\' in account_path_value:
                                 detected_separator = '\\'
                             elif ' > ' in account_path_value:
                                 detected_separator = ' > '
                             elif '>' in account_path_value:
                                 detected_separator = '>'
-                            logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Detected separator: '{detected_separator}' (config default: '{path_separator}')")
+                            if self.debug_account_substitution:
+                                logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Detected separator: '{detected_separator}' (config default: '{path_separator}')")
                         
                         if account_path_value:
                             # Look up account by path for opposing JournalEntry
-                            logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Looking up account with path='{account_path_value}', lookup_type='{opposing_account_lookup}', separator='{detected_separator}'")
+                            if self.debug_account_substitution:
+                                logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Looking up account with path='{account_path_value}', lookup_type='{opposing_account_lookup}', separator='{detected_separator}'")
                             lookup_start = time.time()
                             opposing_account = self._lookup_account(account_path_value, opposing_account_lookup, detected_separator)
                             lookup_time = time.time() - lookup_start
                             if lookup_time > 0.01:
                                 logger.debug(f"ETL DEBUG: Row {row_idx + 1} account path lookup took {lookup_time:.3f}s")
                             if opposing_account:
-                                logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - SUCCESS: Found opposing account - ID: {opposing_account.id}, Name: {opposing_account.name}, Code: {getattr(opposing_account, 'account_code', 'N/A')}")
+                                if self.debug_account_substitution:
+                                    logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - SUCCESS: Found opposing account - ID: {opposing_account.id}, Name: {opposing_account.name}, Code: {getattr(opposing_account, 'account_code', 'N/A')}")
                                 logger.debug(f"ETL: Found opposing account using account_path: {account_path_value} -> {opposing_account.id} ({opposing_account.name})")
                             else:
-                                logger.warning(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - FAILED: Account not found for path: '{account_path_value}' (separator: '{detected_separator}', lookup_type: '{opposing_account_lookup}')")
+                                if self.debug_account_substitution:
+                                    logger.warning(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - FAILED: Account not found for path: '{account_path_value}' (separator: '{detected_separator}', lookup_type: '{opposing_account_lookup}')")
                                 logger.warning(f"ETL: Account not found for path: {account_path_value} (separator: {detected_separator})")
                                 self._add_warning(
                                     warning_type='account_not_found',
@@ -1719,7 +2112,8 @@ class ETLPipelineService:
                                     account_path=account_path_value
                                 )
                         else:
-                            logger.warning(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - SKIPPED: No account_path_value found in substituted_extra_fields. Keys available: {list(substituted_extra_fields.keys())}")
+                            if self.debug_account_substitution:
+                                logger.warning(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - SKIPPED: No account_path_value found in substituted_extra_fields. Keys available: {list(substituted_extra_fields.keys())}")
                         
                         # Calculate debit/credit based on transaction amount and account direction
                         # For bank account (pending): treat as asset (direction = 1)
@@ -1751,6 +2145,91 @@ class ETLPipelineService:
                                 except (ValueError, TypeError):
                                     pass
                         
+                        # Extract custom dates from extra_fields (if provided)
+                        logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - Transaction date: {instance.date}")
+                        logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - Checking for custom dates in extra_fields...")
+                        logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - Available keys in substituted_extra_fields: {list(substituted_extra_fields.keys())}")
+                        
+                        je_bank_date = None
+                        je_book_date = None
+                        
+                        je_bank_date_raw = substituted_extra_fields.get('je_bank_date')
+                        logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - je_bank_date raw value: {je_bank_date_raw} (type: {type(je_bank_date_raw).__name__ if je_bank_date_raw is not None else 'None'})")
+                        
+                        if je_bank_date_raw:
+                            logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - Parsing je_bank_date from '{je_bank_date_raw}'...")
+                            je_bank_date = self._parse_date_value(je_bank_date_raw)
+                            if je_bank_date:
+                                # Ensure it's a Python date object, not a Timestamp or datetime
+                                # Check that it's a date but not a datetime (Timestamp is a subclass of datetime)
+                                if not isinstance(je_bank_date, date) or isinstance(je_bank_date, datetime):
+                                    logger.warning(f"ETL DATE DEBUG: Transaction {instance.id} - je_bank_date is not a pure date object (type: {type(je_bank_date).__name__}), converting...")
+                                    je_bank_date = self._parse_date_value(je_bank_date)  # Re-parse to ensure it's a date
+                                    # Ensure conversion succeeded
+                                    if je_bank_date and isinstance(je_bank_date, datetime):
+                                        je_bank_date = je_bank_date.date() if hasattr(je_bank_date, 'date') else None
+                                logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - ✓ Successfully parsed je_bank_date={je_bank_date} (type: {type(je_bank_date).__name__})")
+                                logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - je_bank_date vs transaction.date: {je_bank_date} vs {instance.date}")
+                                if je_bank_date < instance.date:
+                                    self._add_warning(
+                                        warning_type='journal_entry_date_earlier_than_transaction',
+                                        message=f"Bank Journal Entry date {je_bank_date} cannot be earlier than Transaction date {instance.date} for Transaction {instance.id}. Using transaction date.",
+                                        model='JournalEntry',
+                                        transaction_id=instance.id,
+                                        provided_date=str(je_bank_date),
+                                        transaction_date=str(instance.date)
+                                    )
+                                    je_bank_date = None  # Fallback to transaction date
+                                    logger.warning(f"ETL DATE DEBUG: Transaction {instance.id} - ✗ je_bank_date is earlier than transaction.date, falling back to transaction.date")
+                                else:
+                                    logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - ✓ je_bank_date is valid (>= transaction.date)")
+                            else:
+                                logger.warning(f"ETL DATE DEBUG: Transaction {instance.id} - ✗ Failed to parse je_bank_date='{je_bank_date_raw}', will use transaction.date")
+                        else:
+                            logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - No je_bank_date provided in extra_fields - will use transaction.date={instance.date}")
+                        
+                        je_book_date_raw = substituted_extra_fields.get('je_book_date')
+                        logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - je_book_date raw value: {je_book_date_raw} (type: {type(je_book_date_raw).__name__ if je_book_date_raw is not None else 'None'})")
+                        
+                        if je_book_date_raw:
+                            logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - Parsing je_book_date from '{je_book_date_raw}'...")
+                            je_book_date = self._parse_date_value(je_book_date_raw)
+                            if je_book_date:
+                                # Ensure it's a Python date object, not a Timestamp or datetime
+                                # Check that it's a date but not a datetime (Timestamp is a subclass of datetime)
+                                if not isinstance(je_book_date, date) or isinstance(je_book_date, datetime):
+                                    logger.warning(f"ETL DATE DEBUG: Transaction {instance.id} - je_book_date is not a pure date object (type: {type(je_book_date).__name__}), converting...")
+                                    je_book_date = self._parse_date_value(je_book_date)  # Re-parse to ensure it's a date
+                                    # Ensure conversion succeeded
+                                    if je_book_date and isinstance(je_book_date, datetime):
+                                        je_book_date = je_book_date.date() if hasattr(je_book_date, 'date') else None
+                                logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - ✓ Successfully parsed je_book_date={je_book_date} (type: {type(je_book_date).__name__})")
+                                logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - je_book_date vs transaction.date: {je_book_date} vs {instance.date}")
+                                if je_book_date < instance.date:
+                                    self._add_warning(
+                                        warning_type='journal_entry_date_earlier_than_transaction',
+                                        message=f"Book Journal Entry date {je_book_date} cannot be earlier than Transaction date {instance.date} for Transaction {instance.id}. Using transaction date.",
+                                        model='JournalEntry',
+                                        transaction_id=instance.id,
+                                        provided_date=str(je_book_date),
+                                        transaction_date=str(instance.date)
+                                    )
+                                    je_book_date = None  # Fallback to transaction date
+                                    logger.warning(f"ETL DATE DEBUG: Transaction {instance.id} - ✗ je_book_date is earlier than transaction.date, falling back to transaction.date")
+                                else:
+                                    logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - ✓ je_book_date is valid (>= transaction.date)")
+                            else:
+                                logger.warning(f"ETL DATE DEBUG: Transaction {instance.id} - ✗ Failed to parse je_book_date='{je_book_date_raw}', will use transaction.date")
+                        else:
+                            logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - No je_book_date provided in extra_fields - will use transaction.date={instance.date}")
+                        
+                        # Summary of date decisions
+                        final_bank_date = je_bank_date if je_bank_date else instance.date
+                        final_book_date = je_book_date if je_book_date else instance.date
+                        logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - FINAL DATE DECISION:")
+                        logger.info(f"ETL DATE DEBUG: Transaction {instance.id} -   Bank JE will use: {final_bank_date} {'(CUSTOM: je_bank_date)' if je_bank_date else '(DEFAULT: transaction.date)'}")
+                        logger.info(f"ETL DATE DEBUG: Transaction {instance.id} -   Book JE will use: {final_book_date} {'(CUSTOM: je_book_date)' if je_book_date else '(DEFAULT: transaction.date)'}")
+                        
                         # Create bank account JournalEntry
                         # Always create bank JournalEntry if pending bank account is enabled
                         if use_pending_bank:
@@ -1763,7 +2242,7 @@ class ETLPipelineService:
                                 bank_je = JournalEntry(
                                     company_id=self.company_id,
                                     transaction_id=instance.id,
-                                    date=instance.date,
+                                    date=final_bank_date,
                                     description=instance.description or '',
                                     debit_amount=bank_debit,
                                     credit_amount=bank_credit,
@@ -1821,13 +2300,15 @@ class ETLPipelineService:
                         
                         # Create opposing account JournalEntry
                         # Always try to create if account_path was provided
-                        logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Checking if opposing JE should be created")
-                        logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - account_path_value present: {bool(account_path_value)}, opposing_account found: {bool(opposing_account)}")
+                        if self.debug_account_substitution:
+                            logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Checking if opposing JE should be created")
+                            logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - account_path_value present: {bool(account_path_value)}, opposing_account found: {bool(opposing_account)}")
                         
                         if account_path_value:
                             if not opposing_account:
                                 # Account lookup failed, but we still want to show the error in output
-                                logger.error(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - ERROR: Account lookup failed, cannot create opposing JE")
+                                if self.debug_account_substitution:
+                                    logger.error(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - ERROR: Account lookup failed, cannot create opposing JE")
                                 journal_entry_outputs.append({
                                     '__row_id': f"auto_je_opp_{instance.id}",
                                     'status': 'error',
@@ -1842,7 +2323,8 @@ class ETLPipelineService:
                                 })
                             else:
                                 # Account found, create opposing JournalEntry
-                                logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Creating opposing JE with account_id={opposing_account.id}, debit={opp_debit}, credit={opp_credit}")
+                                if self.debug_account_substitution:
+                                    logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Creating opposing JE with account_id={opposing_account.id}, debit={opp_debit}, credit={opp_credit}")
                                 try:
                                     # Create JournalEntry instance directly (skip serializer for performance)
                                     opp_je_create_start = time.time()
@@ -1850,7 +2332,7 @@ class ETLPipelineService:
                                         company_id=self.company_id,
                                         transaction_id=instance.id,
                                         account_id=opposing_account.id,
-                                        date=instance.date,
+                                        date=final_book_date,
                                         description=instance.description or '',
                                         debit_amount=opp_debit,
                                         credit_amount=opp_credit,
@@ -1881,7 +2363,8 @@ class ETLPipelineService:
                                         'debit_amount': opp_debit,
                                         'credit_amount': opp_credit,
                                     })
-                                    logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - SUCCESS: Opposing JE prepared for bulk_create. Total JEs in queue: {len(journal_entries_to_create)}")
+                                    if self.debug_account_substitution:
+                                        logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - SUCCESS: Opposing JE prepared for bulk_create. Total JEs in queue: {len(journal_entries_to_create)}")
                                     logger.debug(f"ETL: Prepared opposing JournalEntry for Transaction {instance.id} with account {opposing_account.id} ({opposing_account.name})")
                                 except Exception as je_error:
                                     # Include failed JournalEntry in output with error
@@ -1949,26 +2432,31 @@ class ETLPipelineService:
         # Bulk create all JournalEntries at once (major performance optimization)
         if journal_entries_to_create:
             bulk_start = time.time()
-            logger.info(f"ETL OPPOSING JE: Bulk creating {len(journal_entries_to_create)} JournalEntries")
+            if self.debug_account_substitution:
+                logger.info(f"ETL OPPOSING JE: Bulk creating {len(journal_entries_to_create)} JournalEntries")
             # Count how many are bank vs opposing
             bank_count = sum(1 for m in journal_entry_metadata if m.get('type') == 'bank')
             opposing_count = sum(1 for m in journal_entry_metadata if m.get('type') == 'opposing')
-            logger.info(f"ETL OPPOSING JE: Breakdown - Bank JEs: {bank_count}, Opposing JEs: {opposing_count}")
+            if self.debug_account_substitution:
+                logger.info(f"ETL OPPOSING JE: Breakdown - Bank JEs: {bank_count}, Opposing JEs: {opposing_count}")
             
             # Log details about opposing entries
-            for metadata in journal_entry_metadata:
-                if metadata.get('type') == 'opposing':
-                    logger.info(f"ETL OPPOSING JE: About to create opposing JE for Transaction {metadata.get('transaction_id')} with account_id={metadata.get('account_id')}, path={metadata.get('account_path')}")
+            if self.debug_account_substitution:
+                for metadata in journal_entry_metadata:
+                    if metadata.get('type') == 'opposing':
+                        logger.info(f"ETL OPPOSING JE: About to create opposing JE for Transaction {metadata.get('transaction_id')} with account_id={metadata.get('account_id')}, path={metadata.get('account_path')}")
             
             try:
                 created_jes = JournalEntry.objects.bulk_create(journal_entries_to_create, batch_size=500)
                 bulk_time = time.time() - bulk_start
-                logger.info(f"ETL OPPOSING JE: SUCCESS - Bulk created {len(created_jes)} JournalEntries in {bulk_time:.3f}s ({len(created_jes)/bulk_time:.1f} entries/sec)")
+                if self.debug_account_substitution:
+                    logger.info(f"ETL OPPOSING JE: SUCCESS - Bulk created {len(created_jes)} JournalEntries in {bulk_time:.3f}s ({len(created_jes)/bulk_time:.1f} entries/sec)")
                 logger.info(f"ETL: Successfully bulk created {len(created_jes)} JournalEntries in {bulk_time:.3f}s ({len(created_jes)/bulk_time:.1f} entries/sec)")
                 
                 # Verify opposing entries were created
                 created_opposing = sum(1 for m in journal_entry_metadata if m.get('type') == 'opposing')
-                logger.info(f"ETL OPPOSING JE: Created {created_opposing} opposing JournalEntries out of {opposing_count} expected")
+                if self.debug_account_substitution:
+                    logger.info(f"ETL OPPOSING JE: Created {created_opposing} opposing JournalEntries out of {opposing_count} expected")
                 
                 # Map created JournalEntries to their metadata for output
                 opposing_created_count = 0
@@ -1987,7 +2475,8 @@ class ETLPipelineService:
                         output_data['account_id'] = metadata['account_id']
                         output_data['account_code'] = metadata.get('account_code')
                         opposing_created_count += 1
-                        logger.info(f"ETL OPPOSING JE: Created opposing JE ID={je.id} for Transaction {metadata['transaction_id']} with account_id={metadata['account_id']}, path={metadata['account_path']}")
+                        if self.debug_account_substitution:
+                            logger.info(f"ETL OPPOSING JE: Created opposing JE ID={je.id} for Transaction {metadata['transaction_id']} with account_id={metadata['account_id']}, path={metadata['account_path']}")
                     elif metadata['type'] == 'bank':
                         output_data['account_id'] = None
                         bank_created_count += 1
@@ -2002,7 +2491,8 @@ class ETLPipelineService:
                         'external_id': None,
                     })
                 
-                logger.info(f"ETL OPPOSING JE: Final count - Bank JEs created: {bank_created_count}, Opposing JEs created: {opposing_created_count}")
+                if self.debug_account_substitution:
+                    logger.info(f"ETL OPPOSING JE: Final count - Bank JEs created: {bank_created_count}, Opposing JEs created: {opposing_created_count}")
             except Exception as bulk_error:
                 logger.error(f"ETL OPPOSING JE: ERROR - Bulk create failed: {bulk_error}", exc_info=True)
                 logger.error(f"ETL: Error bulk creating JournalEntries: {bulk_error}", exc_info=True)
@@ -2266,24 +2756,30 @@ class ETLPipelineService:
         from accounting.models import Account, BankAccount, Transaction, JournalEntry
         from accounting.serializers import JournalEntrySerializer
         
-        logger.info(f"ETL OPPOSING JE: _auto_create_journal_entries CALLED")
+        if self.debug_account_substitution:
+            logger.info(f"ETL OPPOSING JE: _auto_create_journal_entries CALLED")
         
         # Check if we have any Transaction outputs
         transaction_outputs = import_result.get('results', {}).get('Transaction', [])
-        logger.info(f"ETL OPPOSING JE: Found {len(transaction_outputs)} Transaction outputs")
+        if self.debug_account_substitution:
+            logger.info(f"ETL OPPOSING JE: Found {len(transaction_outputs)} Transaction outputs")
         if not transaction_outputs:
-            logger.warning(f"ETL OPPOSING JE: No Transaction outputs found, returning early")
+            if self.debug_account_substitution:
+                logger.warning(f"ETL OPPOSING JE: No Transaction outputs found, returning early")
             return
         
         # Check if auto-create is enabled (from request parameter)
         auto_config = self.auto_create_journal_entries or {}
-        logger.info(f"ETL OPPOSING JE: auto_create_journal_entries config: {auto_config}")
-        logger.info(f"ETL OPPOSING JE: auto_config.get('enabled'): {auto_config.get('enabled', False)}")
+        if self.debug_account_substitution:
+            logger.info(f"ETL OPPOSING JE: auto_create_journal_entries config: {auto_config}")
+            logger.info(f"ETL OPPOSING JE: auto_config.get('enabled'): {auto_config.get('enabled', False)}")
         if not auto_config.get('enabled', False):
-            logger.warning(f"ETL OPPOSING JE: auto_create_journal_entries is NOT ENABLED, returning early")
+            if self.debug_account_substitution:
+                logger.warning(f"ETL OPPOSING JE: auto_create_journal_entries is NOT ENABLED, returning early")
             return
         
-        logger.info(f"ETL OPPOSING JE: auto_create_journal_entries is ENABLED - proceeding")
+        if self.debug_account_substitution:
+            logger.info(f"ETL OPPOSING JE: auto_create_journal_entries is ENABLED - proceeding")
         logger.info(f"ETL: Auto-creating JournalEntries for {len(transaction_outputs)} Transactions")
         
         # Get configuration
@@ -2465,6 +2961,56 @@ class ETLPipelineService:
                 )
                 logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} (idx={idx}) - Substituted extra_fields: {substituted_extra_fields}")
                 
+                # Extract custom dates from extra_fields (if provided)
+                logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - Transaction date: {transaction.date}")
+                logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - Checking for custom dates in extra_fields...")
+                
+                je_bank_date = None
+                je_book_date = None
+                
+                je_bank_date_raw = substituted_extra_fields.get('je_bank_date')
+                logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - je_bank_date raw value: {je_bank_date_raw} (type: {type(je_bank_date_raw).__name__})")
+                
+                if je_bank_date_raw:
+                    logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - Parsing je_bank_date from '{je_bank_date_raw}'...")
+                    je_bank_date = self._parse_date_value(je_bank_date_raw)
+                    if je_bank_date:
+                        logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - ✓ Successfully parsed je_bank_date={je_bank_date} (type: {type(je_bank_date).__name__})")
+                        logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - je_bank_date vs transaction.date: {je_bank_date} vs {transaction.date}")
+                        if je_bank_date < transaction.date:
+                            logger.warning(f"ETL DATE DEBUG: Transaction {transaction_id} - ⚠ WARNING: je_bank_date ({je_bank_date}) is earlier than transaction.date ({transaction.date}) - this will cause validation error!")
+                        else:
+                            logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - ✓ je_bank_date is valid (>= transaction.date)")
+                    else:
+                        logger.warning(f"ETL DATE DEBUG: Transaction {transaction_id} - ✗ Failed to parse je_bank_date='{je_bank_date_raw}' - will fallback to transaction.date={transaction.date}")
+                else:
+                    logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - No je_bank_date provided in extra_fields - will use transaction.date={transaction.date}")
+                
+                je_book_date_raw = substituted_extra_fields.get('je_book_date')
+                logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - je_book_date raw value: {je_book_date_raw} (type: {type(je_book_date_raw).__name__})")
+                
+                if je_book_date_raw:
+                    logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - Parsing je_book_date from '{je_book_date_raw}'...")
+                    je_book_date = self._parse_date_value(je_book_date_raw)
+                    if je_book_date:
+                        logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - ✓ Successfully parsed je_book_date={je_book_date} (type: {type(je_book_date).__name__})")
+                        logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - je_book_date vs transaction.date: {je_book_date} vs {transaction.date}")
+                        if je_book_date < transaction.date:
+                            logger.warning(f"ETL DATE DEBUG: Transaction {transaction_id} - ⚠ WARNING: je_book_date ({je_book_date}) is earlier than transaction.date ({transaction.date}) - this will cause validation error!")
+                        else:
+                            logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - ✓ je_book_date is valid (>= transaction.date)")
+                    else:
+                        logger.warning(f"ETL DATE DEBUG: Transaction {transaction_id} - ✗ Failed to parse je_book_date='{je_book_date_raw}' - will fallback to transaction.date={transaction.date}")
+                else:
+                    logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - No je_book_date provided in extra_fields - will use transaction.date={transaction.date}")
+                
+                # Summary of date decisions
+                final_bank_date = je_bank_date if je_bank_date else transaction.date
+                final_book_date = je_book_date if je_book_date else transaction.date
+                logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - FINAL DATE DECISION:")
+                logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} -   Bank JE will use: {final_bank_date} {'(CUSTOM)' if je_bank_date else '(TRANSACTION DATE)'}")
+                logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} -   Book JE will use: {final_book_date} {'(CUSTOM)' if je_book_date else '(TRANSACTION DATE)'}")
+                
                 try:
                     # Track JournalEntries created for this transaction
                     transaction_jes = []
@@ -2513,14 +3059,16 @@ class ETLPipelineService:
                     opposing_account = None
                     opposing_account_value = substituted_extra_fields.get(opposing_account_field)
                     
-                    logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - Extracting opposing account")
-                    logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - opposing_account_field: '{opposing_account_field}'")
-                    logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - opposing_account_value from substituted_extra_fields: '{opposing_account_value}'")
-                    logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - opposing_account_lookup: '{opposing_account_lookup}'")
-                    logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - path_separator: '{path_separator}'")
+                    if self.debug_account_substitution:
+                        logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - Extracting opposing account")
+                        logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - opposing_account_field: '{opposing_account_field}'")
+                        logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - opposing_account_value from substituted_extra_fields: '{opposing_account_value}'")
+                        logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - opposing_account_lookup: '{opposing_account_lookup}'")
+                        logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - path_separator: '{path_separator}'")
                     
                     if opposing_account_value:
-                        logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - Looking up opposing account with value='{opposing_account_value}', lookup_type='{opposing_account_lookup}'")
+                        if self.debug_account_substitution:
+                            logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - Looking up opposing account with value='{opposing_account_value}', lookup_type='{opposing_account_lookup}'")
                         if opposing_account_lookup == 'path':
                             opposing_account = self._lookup_account(opposing_account_value, 'path', path_separator)
                         elif opposing_account_lookup == 'code':
@@ -2528,22 +3076,28 @@ class ETLPipelineService:
                         elif opposing_account_lookup == 'id':
                             try:
                                 account_id = int(opposing_account_value)
-                                logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - Looking up account by ID: {account_id}")
+                                if self.debug_account_substitution:
+                                    logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - Looking up account by ID: {account_id}")
                                 opposing_account = Account.objects.filter(
                                     company_id=self.company_id,
                                     id=account_id
                                 ).first()
-                                logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - ID lookup result: {opposing_account.id if opposing_account else None} ({opposing_account.name if opposing_account else 'NOT FOUND'})")
+                                if self.debug_account_substitution:
+                                    logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - ID lookup result: {opposing_account.id if opposing_account else None} ({opposing_account.name if opposing_account else 'NOT FOUND'})")
                             except (ValueError, TypeError) as e:
-                                logger.warning(f"ETL OPPOSING JE: Transaction {transaction_id} - Error converting opposing_account_value to int: {e}")
+                                if self.debug_account_substitution:
+                                    logger.warning(f"ETL OPPOSING JE: Transaction {transaction_id} - Error converting opposing_account_value to int: {e}")
                                 pass
                         
                         if opposing_account:
-                            logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - SUCCESS: Found opposing account - ID: {opposing_account.id}, Name: {opposing_account.name}, Code: {getattr(opposing_account, 'account_code', 'N/A')}")
+                            if self.debug_account_substitution:
+                                logger.info(f"ETL OPPOSING JE: Transaction {transaction_id} - SUCCESS: Found opposing account - ID: {opposing_account.id}, Name: {opposing_account.name}, Code: {getattr(opposing_account, 'account_code', 'N/A')}")
                         else:
-                            logger.warning(f"ETL OPPOSING JE: Transaction {transaction_id} - FAILED: Account not found for value='{opposing_account_value}' (lookup_type='{opposing_account_lookup}')")
+                            if self.debug_account_substitution:
+                                logger.warning(f"ETL OPPOSING JE: Transaction {transaction_id} - FAILED: Account not found for value='{opposing_account_value}' (lookup_type='{opposing_account_lookup}')")
                     else:
-                        logger.warning(f"ETL OPPOSING JE: Transaction {transaction_id} - SKIPPED: No opposing_account_value found. Keys in substituted_extra_fields: {list(substituted_extra_fields.keys())}")
+                        if self.debug_account_substitution:
+                            logger.warning(f"ETL OPPOSING JE: Transaction {transaction_id} - SKIPPED: No opposing_account_value found. Keys in substituted_extra_fields: {list(substituted_extra_fields.keys())}")
                     
                     # Calculate debit/credit
                     if amount >= 0:
@@ -2569,10 +3123,13 @@ class ETLPipelineService:
                     # Create bank account JournalEntry
                     # Create if we have a bank account OR if using pending bank account
                     if bank_ledger_account or use_pending_bank:
+                        bank_je_final_date = je_bank_date if je_bank_date else transaction.date
+                        logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - Creating Bank JE with date: {bank_je_final_date} {'(CUSTOM: je_bank_date)' if je_bank_date else '(DEFAULT: transaction.date)'}")
+                        
                         bank_je_data = {
                             'company': self.company_id,
                             'transaction': transaction.id,  # Use transaction instance ID
-                            'date': transaction.date,
+                            'date': bank_je_final_date,
                             'description': transaction.description or '',
                             'debit_amount': bank_debit,
                             'credit_amount': bank_credit,
@@ -2581,7 +3138,7 @@ class ETLPipelineService:
                             'bank_designation_pending': bank_designation_pending,
                         }
                         
-                        logger.debug(f"ETL: Creating bank JournalEntry for Transaction {transaction.id} (pending={bank_designation_pending})")
+                        logger.debug(f"ETL: Creating bank JournalEntry for Transaction {transaction.id} (pending={bank_designation_pending}, date={bank_je_final_date})")
                         
                         # Only set account if not using pending bank account
                         if bank_ledger_account and not bank_designation_pending:
@@ -2590,6 +3147,11 @@ class ETLPipelineService:
                         bank_je_serializer = JournalEntrySerializer(data=bank_je_data, context={'lookup_cache': self.lookup_cache})
                         if bank_je_serializer.is_valid(raise_exception=True):
                             bank_je = bank_je_serializer.save()
+                            
+                            # Confirm the date that was actually saved
+                            logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - ✓ Bank JE created successfully!")
+                            logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - Bank JE ID: {bank_je.id}, Saved date: {bank_je.date}")
+                            logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - Bank JE date verification: requested={bank_je_final_date}, saved={bank_je.date}, match={bank_je.date == bank_je_final_date}")
                             
                             # Add notes metadata for auto-created journal entry
                             if hasattr(bank_je, 'notes'):
@@ -2645,16 +3207,21 @@ class ETLPipelineService:
                             logger.debug(f"ETL: Created bank JournalEntry {bank_je.id} for Transaction {transaction.id} (pending={bank_designation_pending}, transaction_id={actual_transaction_id})")
                     
                     # Create opposing account JournalEntry
-                    logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - Checking if opposing JE should be created")
-                    logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - opposing_account found: {bool(opposing_account)}")
+                    if self.debug_account_substitution:
+                        logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - Checking if opposing JE should be created")
+                        logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - opposing_account found: {bool(opposing_account)}")
                     
                     if opposing_account:
-                        logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - Creating opposing JE with account_id={opposing_account.id}, debit={opp_debit}, credit={opp_credit}")
+                        opposing_je_final_date = je_book_date if je_book_date else transaction.date
+                        logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - Creating Book/Opposing JE with date: {opposing_je_final_date} {'(CUSTOM: je_book_date)' if je_book_date else '(DEFAULT: transaction.date)'}")
+                        if self.debug_account_substitution:
+                            logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - Creating opposing JE with account_id={opposing_account.id}, debit={opp_debit}, credit={opp_credit}, date={opposing_je_final_date}")
+                        
                         opposing_je_data = {
                             'company': self.company_id,
                             'transaction': transaction.id,  # Use transaction instance ID
                             'account': opposing_account.id,
-                            'date': transaction.date,
+                            'date': opposing_je_final_date,
                             'description': transaction.description or '',
                             'debit_amount': opp_debit,
                             'credit_amount': opp_credit,
@@ -2662,14 +3229,22 @@ class ETLPipelineService:
                             'state': 'pending',
                         }
                         
-                        logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - Opposing JE data: {opposing_je_data}")
-                        logger.debug(f"ETL: Creating opposing JournalEntry for Transaction {transaction.id} with account {opposing_account.id}")
+                        if self.debug_account_substitution:
+                            logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - Opposing JE data: {opposing_je_data}")
+                        logger.debug(f"ETL: Creating opposing JournalEntry for Transaction {transaction.id} with account {opposing_account.id}, date={opposing_je_final_date}")
                         
                         opposing_je_serializer = JournalEntrySerializer(data=opposing_je_data, context={'lookup_cache': self.lookup_cache})
                         if opposing_je_serializer.is_valid(raise_exception=True):
-                            logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - Serializer is valid, saving opposing JE")
+                            if self.debug_account_substitution:
+                                logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - Serializer is valid, saving opposing JE")
                             opposing_je = opposing_je_serializer.save()
-                            logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - SUCCESS: Created opposing JE ID={opposing_je.id}")
+                            
+                            # Confirm the date that was actually saved
+                            logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - ✓ Book/Opposing JE created successfully!")
+                            logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - Book JE ID: {opposing_je.id}, Saved date: {opposing_je.date}")
+                            logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - Book JE date verification: requested={opposing_je_final_date}, saved={opposing_je.date}, match={opposing_je.date == opposing_je_final_date}")
+                            if self.debug_account_substitution:
+                                logger.info(f"ETL OPPOSING JE: Transaction {transaction.id} - SUCCESS: Created opposing JE ID={opposing_je.id}")
                             
                             # Add notes metadata for auto-created journal entry
                             if hasattr(opposing_je, 'notes'):
@@ -4300,4 +4875,5 @@ class ETLPipelineService:
             }
         
         return response
+
 

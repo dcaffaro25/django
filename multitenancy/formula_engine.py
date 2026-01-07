@@ -646,6 +646,111 @@ def apply_substitutions(
     prof_start = time.perf_counter()
     rule_time = defaultdict(float)
     rule_hits = defaultdict(int)
+    
+    # NEW: FK substitution logic (before normal substitutions)
+    if model_name:
+        from django.db import models as dj_models
+        from multitenancy.tasks import MODEL_APP_MAP
+        
+        app_label = MODEL_APP_MAP.get(model_name)
+        if app_label:
+            try:
+                model = apps.get_model(app_label, model_name)
+                # Build FK field mapping: {field_name: related_model_name}
+                fk_field_mapping = {}
+                for field in model._meta.fields:
+                    if isinstance(field, dj_models.ForeignKey):
+                        related_model = getattr(field, 'related_model', None)
+                        if related_model:
+                            fk_field_mapping[field.name] = related_model.__name__
+                
+                if fk_field_mapping:
+                    logger.debug(f"ETL SUBSTITUTION: Found {len(fk_field_mapping)} FK fields in {model_name}: {list(fk_field_mapping.keys())}")
+                    
+                    # Apply FK substitutions to each row
+                    for rec in rows:
+                        if isinstance(rec, dict):
+                            for field_name, related_model_name in fk_field_mapping.items():
+                                if field_name not in rec or rec[field_name] is None:
+                                    continue
+                                
+                                original_value = rec[field_name]
+                                
+                                # Log before FK substitution
+                                logger.debug(f"ETL SUBSTITUTION: Before FK substitution - {field_name}: '{original_value}' (type: {type(original_value).__name__})")
+                                
+                                # Look for substitution rules: model_name=related_model_name, field_name="id"
+                                fk_rules = SubstitutionRule.objects.filter(
+                                    company_id=company_id,
+                                    model_name__iexact=related_model_name,
+                                    field_name__iexact="id"
+                                )
+                                
+                                if fk_rules.exists():
+                                    logger.debug(f"ETL SUBSTITUTION: Found {fk_rules.count()} FK substitution rules for {field_name} -> {related_model_name}.id")
+                                    
+                                    for rule in fk_rules:
+                                        # Check filter_conditions
+                                        filter_conditions = getattr(rule, 'filter_conditions', None)
+                                        if filter_conditions and not _passes_conditions(rec, filter_conditions):
+                                            logger.debug(f"ETL SUBSTITUTION: FK rule {rule.id} ({rule.title or rule.id}) failed filter_conditions for {field_name}")
+                                            continue
+                                        
+                                        # Apply substitution using _should_apply_rule logic
+                                        mt = (rule.match_type or "exact").lower()
+                                        mv = rule.match_value
+                                        sv = rule.substitution_value
+                                        str_value = str(original_value)
+                                        
+                                        matched = False
+                                        new_value = original_value
+                                        
+                                        if mt == "exact":
+                                            if str_value == mv:
+                                                matched = True
+                                                new_value = sv
+                                        elif mt == "regex":
+                                            try:
+                                                if re.search(str(mv), str_value):
+                                                    matched = True
+                                                    new_value = re.sub(str(mv), str(sv), str_value)
+                                            except re.error:
+                                                logger.warning(f"ETL SUBSTITUTION: Invalid regex pattern in FK substitution rule {rule.id}: {rule.match_value}")
+                                        elif mt == "caseless":
+                                            if _normalize(str_value) == _normalize(mv):
+                                                matched = True
+                                                new_value = sv
+                                        
+                                        if matched and new_value != original_value:
+                                            # Convert to int for _id fields
+                                            if field_name.endswith('_id'):
+                                                try:
+                                                    new_value = int(new_value)
+                                                    logger.debug(f"ETL SUBSTITUTION: Converted {field_name} substitution value to integer: {new_value}")
+                                                except (ValueError, TypeError):
+                                                    logger.debug(f"ETL SUBSTITUTION: Could not convert {field_name} value '{new_value}' to int, keeping as string")
+                                            
+                                            rec[field_name] = new_value
+                                            logger.info(f"ETL SUBSTITUTION: FK substitution applied - {field_name}: '{original_value}' -> '{new_value}' (rule: {rule.title or rule.id}, target: {related_model_name}.id)")
+                                            
+                                            if return_audit:
+                                                rid = rec.get("__row_id")
+                                                audit.append({
+                                                    "__row_id": rid,
+                                                    "field": field_name,
+                                                    "old": original_value,
+                                                    "new": new_value,
+                                                    "rule_id": rule.id,
+                                                    "rule_name": rule.title or f"Rule#{rule.id}",
+                                                })
+                                            break  # First matching rule wins
+                                else:
+                                    logger.debug(f"ETL SUBSTITUTION: No FK substitution rules found for {field_name} -> {related_model_name}.id")
+            except LookupError as e:
+                logger.debug(f"ETL SUBSTITUTION: Could not load model {model_name} from app {app_label}: {e}")
+            except Exception as e:
+                logger.warning(f"ETL SUBSTITUTION: Error in FK substitution logic: {e}", exc_info=True)
+    
     def _should_apply_rule(row_dict: Dict[str, Any], rl: SubstitutionRule, field: str, value: Any) -> Tuple[bool, Any]:
         """Avalia condições, tipo de correspondência e retorna (True, novo_valor) se aplicar."""
         # verifica condições

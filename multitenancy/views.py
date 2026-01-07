@@ -712,6 +712,13 @@ class BulkImportAPIView(APIView):
         
         file_meta = {"sha256": file_sha256, "size": size, "filename": getattr(up, "name", None)}
         
+        # Build import_metadata with filename for notes
+        import_metadata = {
+            'source': 'Import',
+            'function': 'BulkImportAPIView.post',
+            'filename': file_meta.get('filename'),
+        }
+        
         if use_celery:
             from .etl_tasks import process_import_template_task
             async_res = process_import_template_task.delay(
@@ -727,7 +734,7 @@ class BulkImportAPIView(APIView):
             }, status=status.HTTP_202_ACCEPTED)
 
         # Synchronous
-        result = execute_import_job(company_id, sheets, commit)#, file_meta=file_meta)
+        result = execute_import_job(company_id, sheets, commit, import_metadata=import_metadata)
 
         # Final safety: scrub any NaN/±Inf that may have been produced downstream
         result = _scrub_json(result)
