@@ -532,8 +532,8 @@ class ReconciliationPipelineEngine:
     
         
     def run(self, banks: list[BankTransactionDTO], books: list[JournalEntryDTO]) -> list[dict]:
-        log.debug(
-            "PipelineEngine.run: company_id=%s stages=%d banks=%d books=%d "
+        log.info(
+            "=== PipelineEngine.run START === company_id=%s stages=%d banks=%d books=%d "
             "max_suggestions=%d max_runtime=%s fast=%s",
             self.company_id,
             len(self.config.stages),
@@ -545,14 +545,22 @@ class ReconciliationPipelineEngine:
         )
 
         for idx, stage in enumerate(self.config.stages):
+            log.info(
+                ">>> Processing stage %d/%d: type=%s enabled=%s",
+                idx + 1, len(self.config.stages), stage.type, stage.enabled,
+            )
+            
             if not stage.enabled:
-                log.debug("Stage %d (%s) skipped: enabled=False", idx, stage.type)
+                log.info("Stage %d (%s) skipped: enabled=False", idx, stage.type)
                 continue
             
             if self._time_exceeded():
-                log.debug(
-                    "Time limit reached before stage %d (%s); stopping pipeline.",
+                log.warning(
+                    "Time limit reached before stage %d (%s); stopping pipeline. "
+                    "Elapsed: %.2fs / %.2fs",
                     idx, stage.type,
+                    monotonic() - self._start_ts,
+                    self.max_runtime_seconds or 0,
                 )
                 break
             
@@ -569,59 +577,106 @@ class ReconciliationPipelineEngine:
                 fast_name = f"{base_name}_fast"
                 handler = getattr(self, fast_name, None)
                 if handler:
-                    log.debug(
+                    log.info(
                         "Using FAST handler %s for stage %d (%s)",
                         fast_name, idx, stage.type,
                     )
             if handler is None:
                 handler = getattr(self, base_name, None)
-            
+                log.debug(
+                    "Using standard handler %s for stage %d (%s)",
+                    base_name, idx, stage.type,
+                )
 
             win = stage.candidate_window_days
 
-            log.debug(
-                "Stage %d (%s): weights=%s amount_tol=%s group_span_days=%d "
+            log.info(
+                "Stage %d (%s) parameters: weights=%s amount_tol=%s group_span_days=%d "
                 "avg_date_delta_days=%d candidate_window_days=%d "
-                "max_grp_bank=%d max_grp_book=%d banks=%d books=%d allow_mixed_signs=%s",
+                "max_grp_bank=%d max_grp_book=%d banks=%d books=%d allow_mixed_signs=%s "
+                "max_alternatives=%d",
                 idx, stage.type, self.stage_weights, stage.amount_tol,
                 stage.group_span_days, stage.avg_date_delta_days, win,
                 stage.max_group_size_bank, stage.max_group_size_book,
                 len(banks), len(books), stage.allow_mixed_signs,
+                stage.max_alternatives_per_anchor,
             )
+            
+            suggestions_before = len(self.suggestions)
+            used_banks_before = len(self.used_banks)
+            used_books_before = len(self.used_books)
     
             if handler:
+                log.info("Executing stage handler for %s", stage.type)
+                stage_start = monotonic()
                 handler(banks, books, stage)
+                stage_duration = monotonic() - stage_start
+                
+                suggestions_after = len(self.suggestions)
+                used_banks_after = len(self.used_banks)
+                used_books_after = len(self.used_books)
+                
+                log.info(
+                    "Stage %d (%s) completed in %.3fs: new_suggestions=%d (+%d) "
+                    "used_banks=%d (+%d) used_books=%d (+%d) total_suggestions=%d",
+                    idx, stage.type, stage_duration,
+                    suggestions_after, suggestions_after - suggestions_before,
+                    used_banks_after, used_banks_after - used_banks_before,
+                    used_books_after, used_books_after - used_books_before,
+                    suggestions_after,
+                )
                 
                 if self._time_exceeded():
-                    log.debug(
-                        "Time limit reached after stage %d (%s); stopping pipeline.",
+                    log.warning(
+                        "Time limit reached after stage %d (%s); stopping pipeline. "
+                        "Elapsed: %.2fs / %.2fs",
                         idx, stage.type,
+                        monotonic() - self._start_ts,
+                        self.max_runtime_seconds or 0,
                     )
                     break
                 
                 if len(self.suggestions) >= self.config.max_suggestions:
-                    log.debug(
+                    log.warning(
                         "Reached max_suggestions=%d at stage %d (%s); stopping.",
                         self.config.max_suggestions, idx, stage.type,
                     )
                     break
+            else:
+                log.warning(
+                    "No handler found for stage type '%s' (checked: %s, %s_fast)",
+                    stage.type, base_name, base_name,
+                )
                 
-        log.debug(
-            "PipelineEngine.run finished: suggestions=%d used_banks=%d used_books=%d",
-            len(self.suggestions), len(self.used_banks), len(self.used_books),
+        total_duration = monotonic() - self._start_ts
+        log.info(
+            "=== PipelineEngine.run FINISHED === duration=%.3fs suggestions=%d "
+            "used_banks=%d used_books=%d remaining_banks=%d remaining_books=%d",
+            total_duration,
+            len(self.suggestions),
+            len(self.used_banks),
+            len(self.used_books),
+            len(banks) - len(self.used_banks),
+            len(books) - len(self.used_books),
         )
         return self.suggestions[: self.config.max_suggestions]
 
     # ------------------------ Stage handlers ------------------------
 
     def _run_exact_1to1(self, banks, books, stage: StageConfig):
+        log.info("_run_exact_1to1: starting with banks=%d books=%d", len(banks), len(books))
         tol = int(stage.avg_date_delta_days or 0)
         # Deterministic sorting for stable results
         banks_sorted = sorted(banks, key=lambda b: (b.date or date.min, b.id))
         books_sorted = sorted(books, key=lambda b: (b.date or date.min, b.id))
         
+        matches_attempted = 0
+        matches_tested = 0
+        matches_found = 0
+        
         for bank in banks_sorted:
             if self._time_exceeded():
+                log.debug("_run_exact_1to1: time exceeded, stopping")
                 return
             
             # Check inside lock for thread safety
@@ -629,20 +684,72 @@ class ReconciliationPipelineEngine:
                 if bank.id in self.used_banks:
                     continue
             
+            matches_attempted += 1
+            log.debug(
+                "exact_1to1: testing bank_id=%d amount=%s date=%s currency_id=%d company_id=%d",
+                bank.id, bank.amount_base, bank.date, bank.currency_id, bank.company_id,
+            )
+            
             for book in books_sorted:
                 # Check inside lock for thread safety
                 with self._used_books_lock:
                     if book.id in self.used_books:
                         continue
+                
+                matches_tested += 1
+                log.debug(
+                    "exact_1to1: testing pair bank_id=%d vs book_id=%d "
+                    "(bank_amount=%s book_amount=%s bank_date=%s book_date=%s)",
+                    bank.id, book.id,
+                    bank.amount_base, book.amount_base,
+                    bank.date, book.date,
+                )
+                
                 if bank.company_id != book.company_id:
+                    log.debug(
+                        "exact_1to1: REJECTED bank_id=%d book_id=%d - company mismatch "
+                        "(bank_company=%d book_company=%d)",
+                        bank.id, book.id, bank.company_id, book.company_id,
+                    )
                     continue
                 if q2(bank.amount_base) != q2(book.amount_base):
+                    log.debug(
+                        "exact_1to1: REJECTED bank_id=%d book_id=%d - amount mismatch "
+                        "(bank_amount=%s book_amount=%s)",
+                        bank.id, book.id, bank.amount_base, book.amount_base,
+                    )
                     continue
                 if bank.currency_id != book.currency_id:
+                    log.debug(
+                        "exact_1to1: REJECTED bank_id=%d book_id=%d - currency mismatch "
+                        "(bank_currency=%d book_currency=%d)",
+                        bank.id, book.id, bank.currency_id, book.currency_id,
+                    )
                     continue
                 # Cross-side constraint: |bank.date - book.date| <= avg_date_delta_days
-                if bank.date and book.date and abs((bank.date - book.date).days) > tol:
-                    continue
+                if bank.date and book.date:
+                    date_diff = abs((bank.date - book.date).days)
+                    if date_diff > tol:
+                        log.debug(
+                            "exact_1to1: REJECTED bank_id=%d book_id=%d - date delta too large "
+                            "(delta=%d tol=%d)",
+                            bank.id, book.id, date_diff, tol,
+                        )
+                        continue
+                    log.debug(
+                        "exact_1to1: date check PASSED bank_id=%d book_id=%d (delta=%d tol=%d)",
+                        bank.id, book.id, date_diff, tol,
+                    )
+                
+                log.info(
+                    "exact_1to1: MATCH FOUND bank_id=%d book_id=%d "
+                    "(amount=%s currency=%d date_diff=%d)",
+                    bank.id, book.id,
+                    bank.amount_base,
+                    bank.currency_id,
+                    abs((bank.date - book.date).days) if (bank.date and book.date) else 0,
+                )
+                matches_found += 1
                 self._record(
                     self._make_suggestion(
                         "exact_1to1",
@@ -654,6 +761,11 @@ class ReconciliationPipelineEngine:
                     )
                 )
                 break
+        
+        log.info(
+            "_run_exact_1to1: completed - matches_attempted=%d matches_tested=%d matches_found=%d",
+            matches_attempted, matches_tested, matches_found,
+        )
 
     
     def _find_mixed_many_to_one_group(
@@ -780,6 +892,12 @@ class ReconciliationPipelineEngine:
         book-combos ranked by global match score. Then we select a non-overlapping
         set globally to avoid greedy per-anchor selection issues.
         """
+        log.info(
+            "_run_one_to_many: START - total_banks=%d total_books=%d "
+            "used_banks=%d used_books=%d",
+            len(banks), len(books), len(self.used_banks), len(self.used_books),
+        )
+        
         available_books = [
             b for b in books
             if b.id not in self.used_books and b.company_id == self.company_id
@@ -787,9 +905,11 @@ class ReconciliationPipelineEngine:
         win = stage.candidate_window_days
         max_k = max(int(stage.max_alternatives_per_anchor or 1), 1)
 
-        log.debug(
-            "_run_one_to_many: banks=%d books=%d win=%d amount_tol=%s allow_mixed=%s max_k=%d",
-            len(banks), len(books), win, stage.amount_tol, stage.allow_mixed_signs, max_k,
+        log.info(
+            "_run_one_to_many: filtered available_books=%d (from %d total) "
+            "win=%d amount_tol=%s allow_mixed=%s max_k=%d",
+            len(available_books), len(books), win, stage.amount_tol, 
+            stage.allow_mixed_signs, max_k,
         )
 
         # Phase 1: Collect all candidates from all banks
@@ -816,21 +936,38 @@ class ReconciliationPipelineEngine:
             if score_key < worst_key:  # Tuple comparison: better candidate
                 buf[worst_idx] = sug
 
+        banks_processed = 0
+        banks_with_candidates = 0
+        total_candidates_generated = 0
+        
         for bank in banks:
             if self._time_exceeded():
+                log.warning("_run_one_to_many: time exceeded, stopping bank processing")
                 return
             if bank.id in self.used_banks:
+                log.debug("_run_one_to_many: bank_id=%d already used, skipping", bank.id)
                 continue
 
+            banks_processed += 1
             bank_amt = bank.amount_base or Decimal("0")
             bank_sign = _sign(bank_amt)
+
+            log.debug(
+                "_run_one_to_many: processing bank_id=%d amount=%s sign=%d date=%s currency_id=%d",
+                bank.id, bank_amt, bank_sign, bank.date, bank.currency_id,
+            )
 
             # date window
             local_books = [
                 b for b in available_books
                 if b.date and bank.date and abs((bank.date - b.date).days) <= win
             ]
+            log.debug(
+                "_run_one_to_many: bank_id=%d date_window filter: %d books in window (win=%d days)",
+                bank.id, len(local_books), win,
+            )
             if not local_books:
+                log.debug("_run_one_to_many: bank_id=%d no books in date window, skipping", bank.id)
                 continue
             
             # Deterministic sorting: sort by (amount, id) for stable combination generation
@@ -838,11 +975,18 @@ class ReconciliationPipelineEngine:
 
             # sign filtering if mixed_signs is False
             if not stage.allow_mixed_signs and bank_sign != 0:
+                before_sign_filter = len(local_books)
                 if bank_sign > 0:
                     local_books = [b for b in local_books if (b.amount_base or Decimal("0")) >= 0]
                 else:
                     local_books = [b for b in local_books if (b.amount_base or Decimal("0")) <= 0]
+                log.debug(
+                    "_run_one_to_many: bank_id=%d sign filter: %d -> %d books (allow_mixed=%s bank_sign=%d)",
+                    bank.id, before_sign_filter, len(local_books), 
+                    stage.allow_mixed_signs, bank_sign,
+                )
                 if not local_books:
+                    log.debug("_run_one_to_many: bank_id=%d no books after sign filter, skipping", bank.id)
                     continue
 
             book_amounts = [(b.amount_base or Decimal("0")) for b in local_books]
@@ -927,14 +1071,40 @@ class ReconciliationPipelineEngine:
             max_size = min(stage.max_group_size_book, len(local_books))
 
             # Feasibility pruning: compute g_min to skip infeasible sizes
+            log.debug(
+                "_run_one_to_many: bank_id=%d computing feasibility bounds "
+                "(target=%s tol=%s max_size=%d num_books=%d)",
+                bank.id, target, tol, max_size, len(book_amounts),
+            )
             feasible, g_min = compute_feasibility_bounds(book_amounts, target, tol, max_size)
+            
+            log.debug(
+                "_run_one_to_many: bank_id=%d feasibility result: g_min=%s feasible_sizes=%s",
+                bank.id, g_min, [i for i, f in enumerate(feasible) if f] if feasible else [],
+            )
             
             if g_min is None:
                 # No feasible size exists - skip this bank entirely
-                log.debug("OTM bank=%s no feasible group size (g_min=None)", bank.id)
+                log.debug(
+                    "_run_one_to_many: bank_id=%d no feasible group size (g_min=None) "
+                    "target=%s tol=%s book_amounts_range=[%s, %s]",
+                    bank.id, target, tol,
+                    min(book_amounts) if book_amounts else None,
+                    max(book_amounts) if book_amounts else None,
+                )
                 if candidates:
+                    log.debug(
+                        "_run_one_to_many: bank_id=%d adding %d candidates from mixed-sign path before skip",
+                        bank.id, len(candidates),
+                    )
                     all_candidates.extend(candidates)
                 continue
+            
+            banks_with_candidates += 1
+            log.debug(
+                "_run_one_to_many: bank_id=%d starting enumeration from g_min=%d to max_size=%d",
+                bank.id, g_min, max_size,
+            )
             
             # All-in shortcut: if only full group is feasible and it matches exactly
             if g_min == len(local_books):
@@ -994,37 +1164,90 @@ class ReconciliationPipelineEngine:
                     continue
 
             # Start enumeration at g_min, not 1
+            combos_tested = 0
             for size in range(g_min, max_size + 1):
                 if not feasible[size]:
+                    log.debug(
+                        "_run_one_to_many: bank_id=%d skipping size=%d (not feasible)",
+                        bank.id, size,
+                    )
                     continue  # Skip infeasible sizes
                 if self._time_exceeded():
                     return
 
                 if use_prefix_bounds and q2(prefix_max[size - 1]) + tol < target:
+                    log.debug(
+                        "_run_one_to_many: bank_id=%d size=%d prefix bound check failed "
+                        "(prefix_max=%s + tol=%s < target=%s)",
+                        bank.id, size, prefix_max[size - 1], tol, target,
+                    )
                     continue
 
+                combos_at_size = 0
                 for combo in combinations(local_books, size):
+                    combos_tested += 1
+                    combos_at_size += 1
+                    
                     # Check inside lock for thread safety
                     with self._used_books_lock:
-                        if any(x.id in self.used_books for x in combo):
+                        used_book_ids = [x.id for x in combo if x.id in self.used_books]
+                        if used_book_ids:
+                            log.debug(
+                                "_run_one_to_many: bank_id=%d combo size=%d rejected - "
+                                "books already used: %s",
+                                bank.id, size, used_book_ids,
+                            )
                             continue
 
                     total = sum((b.amount_base for b in combo), Decimal("0"))
                     diff = abs(q2(total) - target)
+                    
+                    log.debug(
+                        "_run_one_to_many: bank_id=%d testing combo size=%d "
+                        "(book_ids=%s total=%s diff=%s target=%s)",
+                        bank.id, size,
+                        [b.id for b in combo], total, diff, target,
+                    )
+                    
                     if diff > stage.amount_tol:
+                        log.debug(
+                            "_run_one_to_many: bank_id=%d combo REJECTED - amount diff too large "
+                            "(diff=%s > tol=%s)",
+                            bank.id, diff, stage.amount_tol,
+                        )
                         continue
+                        
                     if any(b.currency_id != bank.currency_id for b in combo):
+                        invalid_currencies = {
+                            b.id: b.currency_id for b in combo 
+                            if b.currency_id != bank.currency_id
+                        }
+                        log.debug(
+                            "_run_one_to_many: bank_id=%d combo REJECTED - currency mismatch "
+                            "(bank_currency=%d invalid_book_currencies=%s)",
+                            bank.id, bank.currency_id, invalid_currencies,
+                        )
                         continue
 
                     book_dates = [b.date for b in combo if b.date]
                     book_span = (max(book_dates) - min(book_dates)).days if len(book_dates) >= 2 else 0
                     if stage.group_span_days and book_span > stage.group_span_days:
+                        log.debug(
+                            "_run_one_to_many: bank_id=%d combo REJECTED - book span too large "
+                            "(span=%d > max=%d)",
+                            bank.id, book_span, stage.group_span_days,
+                        )
                         continue
 
                     bank_avg = bank.date
                     book_avg = self._weighted_avg_date(combo)
                     avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
                     if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
+                        log.debug(
+                            "_run_one_to_many: bank_id=%d combo REJECTED - avg date delta too large "
+                            "(delta=%d > max=%d)",
+                            bank.id, avg_delta, stage.avg_date_delta_days,
+                        )
                         continue
 
                     # Use the already-calculated diff as amount_diff
@@ -1038,6 +1261,14 @@ class ReconciliationPipelineEngine:
                         currency_match=1.0,
                         weights=self.stage_weights,
                     )
+                    
+                    log.info(
+                        "_run_one_to_many: bank_id=%d VALID COMBO FOUND size=%d "
+                        "(book_ids=%s score=%.4f amount_diff=%s date_delta=%d embed_sim=%.4f)",
+                        bank.id, size, [b.id for b in combo],
+                        scores["global_score"], diff, avg_delta, sim,
+                    )
+                    
                     sug = self._make_suggestion(
                         "one_to_many",
                         [bank],
@@ -1053,24 +1284,62 @@ class ReconciliationPipelineEngine:
                         },
                     )
                     add_candidate(sug, candidates)
+                    total_candidates_generated += 1
+                
+                log.debug(
+                    "_run_one_to_many: bank_id=%d size=%d completed: tested=%d combos candidates=%d",
+                    bank.id, size, combos_at_size, len(candidates),
+                )
+            
+            log.debug(
+                "_run_one_to_many: bank_id=%d enumeration complete: tested=%d combos candidates=%d",
+                bank.id, combos_tested, len(candidates),
+            )
 
             # Add all candidates from this bank to global collection
             if candidates:
+                log.debug(
+                    "_run_one_to_many: bank_id=%d adding %d candidates to global pool",
+                    bank.id, len(candidates),
+                )
                 all_candidates.extend(candidates)
+        
+        log.info(
+            "_run_one_to_many: Phase 1 complete - banks_processed=%d banks_with_candidates=%d "
+            "total_candidates=%d",
+            banks_processed, banks_with_candidates, len(all_candidates),
+        )
         
         # Phase 2: Global selection - pick non-overlapping set
         if all_candidates:
+            log.info(
+                "_run_one_to_many: Phase 2 starting - selecting non-overlapping set from %d candidates",
+                len(all_candidates),
+            )
             selected = self._global_select_non_overlapping(all_candidates)
+            
+            log.info(
+                "_run_one_to_many: Phase 2 complete - selected %d non-overlapping suggestions",
+                len(selected),
+            )
             
             # Record selected suggestions (these mark IDs as used) with rank=1, is_primary=True
             for rank, sug in enumerate(selected, start=1):
                 # Add alternatives metadata
                 bank_id = sug.get("bank_ids", [None])[0] if sug.get("bank_ids") else None
+                book_ids = sug.get("journal_entries_ids", [])
                 alternatives_group_id = f"bank_{bank_id}_otm" if bank_id else None
                 sug["rank_among_alternatives"] = rank
                 sug["alternatives_group_id"] = alternatives_group_id
                 sug["is_primary"] = (rank == 1)
                 sug["total_alternatives"] = len(selected)  # Will be updated with alternatives count
+                
+                log.info(
+                    "_run_one_to_many: recording selected suggestion rank=%d/%d "
+                    "bank_id=%d book_ids=%s score=%.4f is_primary=%s",
+                    rank, len(selected), bank_id, book_ids,
+                    sug.get("confidence_score", 0.0), sug["is_primary"],
+                )
                 self._record(sug)
             
             # Add alternatives that weren't selected (for visibility, but don't mark as used)
@@ -1481,50 +1750,112 @@ class ReconciliationPipelineEngine:
           4) Opcionalmente adicionar alternativas por bank, até
              stage.max_alternatives_per_anchor (sem marcar used_*).
         """
+        log.info(
+            "_run_fuzzy_1to1: START - banks=%d books=%d used_banks=%d used_books=%d",
+            len(banks), len(books), len(self.used_banks), len(self.used_books),
+        )
+        
         win = stage.candidate_window_days
         bin_size = max(1, min(win or 1, 7))
 
         max_k = max(int(stage.max_alternatives_per_anchor or 1), 1)
+        
+        log.info(
+            "_run_fuzzy_1to1: parameters win=%d bin_size=%d max_k=%d amount_tol=%s",
+            win, bin_size, max_k, stage.amount_tol,
+        )
 
         # Indexar books por bins de data para lookup mais rápido
+        available_books = [b for b in books if b.id not in self.used_books]
+        log.debug(
+            "_run_fuzzy_1to1: available books for binning: %d (from %d total)",
+            len(available_books), len(books),
+        )
+        
         book_bins = build_date_bins(
-            [b for b in books if b.id not in self.used_books],
+            available_books,
             get_date=lambda e: e.date,
             bin_size_days=bin_size,
         )
+        
+        log.debug(
+            "_run_fuzzy_1to1: built %d date bins for candidate lookup",
+            len(book_bins),
+        )
 
         candidates: list[dict] = []
+        pairs_tested = 0
+        pairs_valid = 0
 
+        banks_processed = 0
         for bank in banks:
             if self._time_exceeded():
+                log.warning("_run_fuzzy_1to1: time exceeded, stopping")
                 return
             if bank.id in self.used_banks:
+                log.debug("_run_fuzzy_1to1: bank_id=%d already used, skipping", bank.id)
                 continue
+
+            banks_processed += 1
+            log.debug(
+                "_run_fuzzy_1to1: processing bank_id=%d amount=%s date=%s currency_id=%d",
+                bank.id, bank.amount_base, bank.date, bank.currency_id,
+            )
 
             # Books "perto" em data
             candidates_in_window = list(
                 iter_date_bin_candidates(bank.date, book_bins, bin_size, win)
             )
+            log.debug(
+                "_run_fuzzy_1to1: bank_id=%d found %d books in date window (win=%d days)",
+                bank.id, len(candidates_in_window), win,
+            )
             if not candidates_in_window:
+                log.debug("_run_fuzzy_1to1: bank_id=%d no books in date window, skipping", bank.id)
                 continue
 
             # Bucket por amount em torno deste bank
             buckets = build_amount_buckets(
                 candidates_in_window, get_amount=lambda e: e.amount_base
             )
+            log.debug(
+                "_run_fuzzy_1to1: bank_id=%d built %d amount buckets",
+                bank.id, len(buckets),
+            )
 
             for book in probe_amount_buckets(
                 buckets, bank.amount_base, stage.amount_tol
             ):
+                pairs_tested += 1
                 if book.id in self.used_books:
+                    log.debug(
+                        "_run_fuzzy_1to1: skipping pair bank_id=%d book_id=%d (book already used)",
+                        bank.id, book.id,
+                    )
                     continue
+
+                log.debug(
+                    "_run_fuzzy_1to1: testing pair bank_id=%d book_id=%d "
+                    "(bank_amount=%s book_amount=%s)",
+                    bank.id, book.id, bank.amount_base, book.amount_base,
+                )
 
                 # Guards básicos
                 if bank.currency_id != book.currency_id:
+                    log.debug(
+                        "_run_fuzzy_1to1: REJECTED bank_id=%d book_id=%d - currency mismatch "
+                        "(bank_currency=%d book_currency=%d)",
+                        bank.id, book.id, bank.currency_id, book.currency_id,
+                    )
                     continue
 
                 a_diff = abs(q2(bank.amount_base) - q2(book.amount_base))
                 if a_diff > stage.amount_tol:
+                    log.debug(
+                        "_run_fuzzy_1to1: REJECTED bank_id=%d book_id=%d - amount diff too large "
+                        "(diff=%s > tol=%s)",
+                        bank.id, book.id, a_diff, stage.amount_tol,
+                    )
                     continue
 
                 # Δ de datas
@@ -1534,10 +1865,20 @@ class ReconciliationPipelineEngine:
                     avg_delta = (stage.avg_date_delta_days or win or 0) + 1
 
                 if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
+                    log.debug(
+                        "_run_fuzzy_1to1: REJECTED bank_id=%d book_id=%d - date delta too large "
+                        "(delta=%d > max=%d)",
+                        bank.id, book.id, avg_delta, stage.avg_date_delta_days,
+                    )
                     continue
 
                 embed_sim = self._cosine_similarity(
                     bank.embedding or [], book.embedding or []
+                )
+                log.debug(
+                    "_run_fuzzy_1to1: pair bank_id=%d book_id=%d passed all checks "
+                    "(amount_diff=%s date_delta=%d embed_sim=%.4f)",
+                    bank.id, book.id, a_diff, avg_delta, embed_sim,
                 )
 
                 weights = {
@@ -1565,6 +1906,13 @@ class ReconciliationPipelineEngine:
                     weights=weights,
                 )
 
+                pairs_valid += 1
+                log.info(
+                    "_run_fuzzy_1to1: VALID CANDIDATE bank_id=%d book_id=%d "
+                    "(score=%.4f amount_diff=%s date_delta=%d embed_sim=%.4f)",
+                    bank.id, book.id, scores["global_score"], a_diff, avg_delta, embed_sim,
+                )
+                
                 candidates.append(
                     {
                         "bank": bank,
@@ -1577,10 +1925,22 @@ class ReconciliationPipelineEngine:
                     }
                 )
 
+        log.info(
+            "_run_fuzzy_1to1: candidate generation complete - banks_processed=%d "
+            "pairs_tested=%d pairs_valid=%d total_candidates=%d",
+            banks_processed, pairs_tested, pairs_valid, len(candidates),
+        )
+        
         if not candidates:
+            log.info("_run_fuzzy_1to1: no valid candidates found, returning")
             return
 
         # GLOBAL SELECTION: melhores pares não sobrepostos
+        log.info(
+            "_run_fuzzy_1to1: Phase 2 - global selection starting with %d candidates",
+            len(candidates),
+        )
+        
         candidates.sort(
             key=lambda c: (
                 c["scores"]["global_score"],
@@ -1593,8 +1953,10 @@ class ReconciliationPipelineEngine:
         local_used_banks: set[int] = set()
         local_used_books: set[int] = set()
         primary_pairs: set[tuple[int, int]] = set()  # (bank_id, book_id) primário
+        primary_selected = 0
+        skipped_overlap = 0
 
-        for c in candidates:
+        for idx, c in enumerate(candidates):
             bank = c["bank"]
             book = c["book"]
 
@@ -1604,10 +1966,23 @@ class ReconciliationPipelineEngine:
                 or bank.id in local_used_banks
                 or book.id in local_used_books
             ):
+                skipped_overlap += 1
+                log.debug(
+                    "_run_fuzzy_1to1: skipping candidate %d/%d bank_id=%d book_id=%d "
+                    "(already used in global selection)",
+                    idx + 1, len(candidates), bank.id, book.id,
+                )
                 continue
 
             scores = c["scores"]
             weights = c["weights"]
+
+            log.info(
+                "_run_fuzzy_1to1: selecting primary pair %d bank_id=%d book_id=%d "
+                "(score=%.4f rank=%d/%d)",
+                primary_selected + 1, bank.id, book.id, scores["global_score"],
+                idx + 1, len(candidates),
+            )
 
             suggestion = self._make_suggestion(
                 "fuzzy_1to1",
@@ -1626,13 +2001,23 @@ class ReconciliationPipelineEngine:
             )
 
             self._record(suggestion)
+            primary_selected += 1
 
             local_used_banks.add(bank.id)
             local_used_books.add(book.id)
             primary_pairs.add((bank.id, book.id))
 
             if len(self.suggestions) >= self.config.max_suggestions:
+                log.warning(
+                    "_run_fuzzy_1to1: reached max_suggestions=%d, stopping selection",
+                    self.config.max_suggestions,
+                )
                 break
+        
+        log.info(
+            "_run_fuzzy_1to1: Phase 2 complete - primary_selected=%d skipped_overlap=%d",
+            primary_selected, skipped_overlap,
+        )
 
         # Se max_k == 1, comportamento antigo: só um par por bank
         if max_k <= 1:
@@ -1905,7 +2290,13 @@ class ReconciliationPipelineEngine:
         Returns the selected suggestions in order of selection.
         """
         if not candidates:
+            log.debug("_global_select_non_overlapping: no candidates provided")
             return []
+        
+        log.debug(
+            "_global_select_non_overlapping: starting with %d candidates",
+            len(candidates),
+        )
         
         # Sort by deterministic key (best first)
         candidates_sorted = sorted(candidates, key=self._deterministic_sort_key)
@@ -1913,18 +2304,43 @@ class ReconciliationPipelineEngine:
         selected: List[dict] = []
         used_bank_ids: set[int] = set()
         used_book_ids: set[int] = set()
+        skipped_overlap = 0
         
-        for candidate in candidates_sorted:
+        for idx, candidate in enumerate(candidates_sorted):
             bank_ids = set(candidate.get("bank_ids", []))
             book_ids = set(candidate.get("journal_entries_ids", []))
+            score = candidate.get("confidence_score", 0.0)
             
             # Skip if any ID is already used
-            if bank_ids & used_bank_ids or book_ids & used_book_ids:
+            overlapping_banks = bank_ids & used_bank_ids
+            overlapping_books = book_ids & used_book_ids
+            if overlapping_banks or overlapping_books:
+                skipped_overlap += 1
+                log.debug(
+                    "_global_select_non_overlapping: skipping candidate %d/%d "
+                    "(score=%.4f bank_ids=%s book_ids=%s overlaps: banks=%s books=%s)",
+                    idx + 1, len(candidates_sorted), score,
+                    list(bank_ids), list(book_ids),
+                    list(overlapping_banks), list(overlapping_books),
+                )
                 continue
             
             selected.append(candidate)
             used_bank_ids.update(bank_ids)
             used_book_ids.update(book_ids)
+            
+            log.debug(
+                "_global_select_non_overlapping: selected candidate %d/%d "
+                "(score=%.4f bank_ids=%s book_ids=%s) total_selected=%d",
+                idx + 1, len(candidates_sorted), score,
+                list(bank_ids), list(book_ids), len(selected),
+            )
+        
+        log.info(
+            "_global_select_non_overlapping: completed - selected=%d skipped_overlap=%d "
+            "from total=%d candidates",
+            len(selected), skipped_overlap, len(candidates),
+        )
         
         return selected
 
@@ -2081,60 +2497,82 @@ class ReconciliationPipelineEngine:
         
         Performs atomic check-and-set: verifies IDs are not already used before marking.
         """
-        bank_key = tuple(sorted(suggestion["bank_ids"]))
-        book_key = tuple(sorted(suggestion["journal_entries_ids"]))
+        bank_ids = suggestion["bank_ids"]
+        book_ids = suggestion["journal_entries_ids"]
+        bank_key = tuple(sorted(bank_ids))
+        book_key = tuple(sorted(book_ids))
         key = (bank_key, book_key)
+        match_type = suggestion.get("match_type", "unknown")
+        score = suggestion.get("confidence_score", 0.0)
+
+        log.debug(
+            "_record: attempting to record suggestion type=%s bank_ids=%s book_ids=%s score=%.4f",
+            match_type, bank_ids, book_ids, score,
+        )
 
         with self._lock:
             if key in self._seen_groups:
-                log.debug(
-                    "Skipping duplicate suggestion: banks=%s books=%s",
-                    bank_key,
-                    book_key,
+                log.info(
+                    "_record: SKIPPING duplicate suggestion type=%s banks=%s books=%s "
+                    "(already seen in this run)",
+                    match_type, bank_key, book_key,
                 )
                 return
 
             # Atomic check: verify no IDs are already used (race condition guard)
             with self._used_banks_lock:
-                if any(bid in self.used_banks for bid in suggestion["bank_ids"]):
-                    log.debug(
-                        "Skipping suggestion: bank_ids already used: %s",
-                        suggestion["bank_ids"],
+                used_bank_ids = [bid for bid in bank_ids if bid in self.used_banks]
+                if used_bank_ids:
+                    log.info(
+                        "_record: SKIPPING suggestion type=%s banks=%s books=%s "
+                        "- bank_ids already used: %s",
+                        match_type, bank_ids, book_ids, used_bank_ids,
                     )
                     return
             
             with self._used_books_lock:
-                if any(jid in self.used_books for jid in suggestion["journal_entries_ids"]):
-                    log.debug(
-                        "Skipping suggestion: journal_ids already used: %s",
-                        suggestion["journal_entries_ids"],
+                used_book_ids = [jid for jid in book_ids if jid in self.used_books]
+                if used_book_ids:
+                    log.info(
+                        "_record: SKIPPING suggestion type=%s banks=%s books=%s "
+                        "- book_ids already used: %s",
+                        match_type, bank_ids, book_ids, used_book_ids,
                     )
                     return
 
             self._seen_groups.add(key)
 
-            log.debug(
-                "Recording suggestion: type=%s, bank_ids=%s, journal_ids=%s, confidence=%.4f",
-                suggestion["match_type"],
-                suggestion["bank_ids"],
-                suggestion["journal_entries_ids"],
-                suggestion["confidence_score"],
+            log.info(
+                "_record: RECORDING suggestion type=%s bank_ids=%s book_ids=%s "
+                "confidence=%.4f total_suggestions=%d",
+                match_type, bank_ids, book_ids, score, len(self.suggestions) + 1,
             )
 
             self.suggestions.append(suggestion)
             
             # Mark as used atomically
             with self._used_banks_lock:
-                self.used_banks.update(suggestion["bank_ids"])
+                before_banks = len(self.used_banks)
+                self.used_banks.update(bank_ids)
+                log.debug(
+                    "_record: marked %d banks as used (total used now: %d)",
+                    len(bank_ids), len(self.used_banks),
+                )
             with self._used_books_lock:
-                self.used_books.update(suggestion["journal_entries_ids"])
+                before_books = len(self.used_books)
+                self.used_books.update(book_ids)
+                log.debug(
+                    "_record: marked %d books as used (total used now: %d)",
+                    len(book_ids), len(self.used_books),
+                )
 
         # Dispara callback (para persistência incremental, etc.)
         if self._on_suggestion:
             try:
                 self._on_suggestion(suggestion)
+                log.debug("_record: on_suggestion callback executed successfully")
             except Exception as cb_exc:
-                log.warning("on_suggestion callback failed: %s", cb_exc)
+                log.warning("_record: on_suggestion callback failed: %s", cb_exc, exc_info=True)
 
     # ----------------------------------------------------------------------
     # Adaptive strategy selection and candidate preparation
@@ -4124,6 +4562,13 @@ class ReconciliationService:
         # Build candidate QuerySets
         bank_ids = data.get("bank_ids", [])
         book_ids = data.get("book_ids", [])
+        
+        log.info(
+            "match_many_to_many: building candidate sets company_id=%s "
+            "bank_ids_provided=%d book_ids_provided=%d",
+            company_id, len(bank_ids) if bank_ids else 0, len(book_ids) if book_ids else 0,
+        )
+        
         bank_qs = (
             BankTransaction.objects
             .exclude(reconciliations__status__in=["matched", "approved"])
@@ -4131,23 +4576,25 @@ class ReconciliationService:
             .only("id", "company_id", "date", "amount", "currency_id", "description", "description_embedding")
         )
         bank_count_initial = bank_qs.count()
-        log.debug(
-            "Initial unmatched bank transactions count (company_id=%s): %d",
+        log.info(
+            "match_many_to_many: initial unmatched bank transactions (company_id=%s): %d",
             company_id, bank_count_initial,
         )
         
         if bank_ids:
             bank_qs = bank_qs.filter(id__in=bank_ids)
             filtered_count = bank_qs.count()
-            log.debug(
-                "Filtered bank transactions by provided IDs (%d ids) for company_id=%s: %d records remain",
+            log.info(
+                "match_many_to_many: filtered bank transactions by provided IDs (%d ids) "
+                "for company_id=%s: %d records remain",
                 len(bank_ids),
                 company_id,
                 filtered_count,
             )
         else:
-            log.debug(
-                "No bank_ids provided; using all unmatched bank transactions for company_id=%s (%d records)",
+            log.info(
+                "match_many_to_many: no bank_ids provided; using all unmatched bank transactions "
+                "for company_id=%s (%d records)",
                 company_id,
                 bank_count_initial,
             )
@@ -4201,15 +4648,25 @@ class ReconciliationService:
         # ------------------------------------------------------------------
         # Convert querysets to DTOs, EXCLUINDO amount == 0
         # ------------------------------------------------------------------
+        log.info("match_many_to_many: converting bank transactions to DTOs...")
         candidate_bank: List[BankTransactionDTO] = []
         skipped_zero_bank = 0
+        skipped_no_embedding = 0
 
         for tx in bank_qs:
             amt = tx.amount or Decimal("0")
             # usamos q2 para garantir consistência com o resto do engine
             if q2(amt) == Decimal("0.00"):
                 skipped_zero_bank += 1
+                log.debug(
+                    "match_many_to_many: skipping bank tx_id=%d (zero amount: %s)",
+                    tx.id, amt,
+                )
                 continue
+
+            embedding = _as_vec_list(getattr(tx, "description_embedding", None))
+            if not embedding:
+                skipped_no_embedding += 1
 
             candidate_bank.append(
                 BankTransactionDTO(
@@ -4219,23 +4676,27 @@ class ReconciliationService:
                     amount=amt,
                     currency_id=tx.currency_id,
                     description=tx.description,
-                    embedding=_as_vec_list(getattr(tx, "description_embedding", None)),
+                    embedding=embedding,
                 )
             )
 
-        log.debug(
-            "Created %d BankTransactionDTOs (skipped %d with zero amount)",
-            len(candidate_bank),
-            skipped_zero_bank,
+        log.info(
+            "match_many_to_many: created %d BankTransactionDTOs "
+            "(skipped %d with zero amount, %d without embedding)",
+            len(candidate_bank), skipped_zero_bank, skipped_no_embedding,
         )
-        for dto in candidate_bank[:10]:
-            log.debug(
-                "BankDTO: id=%s, amount=%s, date=%s, currency_id=%s, company_id=%s",
+        for dto in candidate_bank[:5]:
+            log.info(
+                "match_many_to_many: BankDTO sample: id=%s amount=%s date=%s "
+                "currency_id=%s company_id=%s has_embedding=%s",
                 dto.id, dto.amount, dto.date, dto.currency_id, dto.company_id,
+                bool(dto.embedding),
             )
         
+        log.info("match_many_to_many: converting journal entries to DTOs...")
         candidate_book: List[JournalEntryDTO] = []
         skipped_zero_book = 0
+        skipped_no_embedding = 0
 
         for je in book_qs:
             tr = getattr(je, "transaction", None)
@@ -4248,12 +4709,23 @@ class ReconciliationService:
             if eff_amt is None:
                 # sem valor efetivo → não tentamos conciliar agora
                 skipped_zero_book += 1
+                log.debug(
+                    "match_many_to_many: skipping journal entry_id=%d (no effective amount)",
+                    je.id,
+                )
                 continue
             if q2(eff_amt) == Decimal("0.00"):
                 # valor efetivo 0 → fora desta etapa de conciliação
                 skipped_zero_book += 1
+                log.debug(
+                    "match_many_to_many: skipping journal entry_id=%d (zero effective amount: %s)",
+                    je.id, eff_amt,
+                )
                 continue
         
+            if not tr_vec:
+                skipped_no_embedding += 1
+
             candidate_book.append(
                 JournalEntryDTO(
                     id=je.id,
@@ -4267,24 +4739,32 @@ class ReconciliationService:
                 )
             )
         
-        log.debug(
-            "Created %d JournalEntryDTOs (skipped %d with zero effective_amount)",
-            len(candidate_book),
-            skipped_zero_book,
+        log.info(
+            "match_many_to_many: created %d JournalEntryDTOs "
+            "(skipped %d with zero/no effective_amount, %d without embedding)",
+            len(candidate_book), skipped_zero_book, skipped_no_embedding,
         )
-        for dto in candidate_book[:10]:
-            log.debug(
-                "BookDTO: id=%s, tx_id=%s, amount=%s, date=%s, currency_id=%s, company_id=%s",
+        for dto in candidate_book[:5]:
+            log.info(
+                "match_many_to_many: BookDTO sample: id=%s tx_id=%s amount=%s date=%s "
+                "currency_id=%s company_id=%s has_embedding=%s",
                 dto.id, dto.transaction_id, dto.effective_amount,
-                dto.date, dto.currency_id, dto.company_id,
+                dto.date, dto.currency_id, dto.company_id, bool(dto.embedding),
             )
         
         use_fast = bool(data.get("fast", False))
         
+        log.info(
+            "match_many_to_many: starting matching engine "
+            "config_id=%s pipeline_id=%s fast=%s banks=%d books=%d",
+            config_id, pipeline_id, use_fast, len(candidate_bank), len(candidate_book),
+        )
+        
         # Run the appropriate matching engine and capture soft limit
         soft_time_limit = None
+        matching_start = monotonic()
         if pipeline_id:
-            log.debug(
+            log.info(
                 "match_many_to_many: using pipeline_id=%s fast=%s",
                 pipeline_id, use_fast,
             )
@@ -4298,7 +4778,7 @@ class ReconciliationService:
             )
             soft_time_limit = getattr(pipe_obj, "soft_time_limit_seconds", None)
         else:
-            log.debug(
+            log.info(
                 "match_many_to_many: using config_id=%s fast=%s",
                 config_id, use_fast,
             )
@@ -4312,6 +4792,12 @@ class ReconciliationService:
                 fast=use_fast,
             )
             soft_time_limit = getattr(cfg_obj, "soft_time_limit_seconds", None)
+        
+        matching_duration = monotonic() - matching_start
+        log.info(
+            "match_many_to_many: matching engine completed in %.3fs - suggestions=%d",
+            matching_duration, len(suggestions),
+        )
 
         # Auto-apply matches with confidence 1.0
         auto_info = {"enabled": bool(auto_match_100), "applied": 0, "skipped": 0, "details": []}

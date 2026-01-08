@@ -70,6 +70,30 @@ class FinancialStatementLineTemplate(models.Model):
         ('spacer', 'Spacer'),
     ]
     
+    # NEW: Calculation method enum (replaces calculation_type)
+    CALCULATION_METHOD_CHOICES = [
+        # Stock measures (point-in-time)
+        ('ending_balance', 'Ending Balance'),           # Balance as of end_date (Balance Sheet)
+        ('opening_balance', 'Opening Balance'),         # Balance as of start_date - 1 day
+        # Flow measures (period activity)
+        ('net_movement', 'Net Movement'),               # Σ(debit - credit) in period (Income Statement)
+        ('debit_total', 'Debit Total'),                 # Σ debit in period
+        ('credit_total', 'Credit Total'),               # Σ credit in period
+        # Delta measures (change between points)
+        ('change_in_balance', 'Change in Balance'),     # ending - opening (Cash Flow)
+        # Aggregation
+        ('rollup_children', 'Rollup Children'),         # Sum of child template lines (no GL query)
+        ('formula', 'Formula'),                         # Reference other lines
+        ('manual_input', 'Manual Input / Constant'),    # User-provided value
+    ]
+    
+    # NEW: Sign policy enum
+    SIGN_POLICY_CHOICES = [
+        ('natural', 'Natural'),       # Use account.account_direction as-is
+        ('invert', 'Invert'),         # Multiply by -1 (for liabilities shown positive)
+        ('absolute', 'Absolute'),     # abs(value)
+    ]
+    
     template = models.ForeignKey(
         FinancialStatementTemplate,
         related_name='line_templates',
@@ -112,7 +136,13 @@ class FinancialStatementLineTemplate(models.Model):
         help_text="List of account IDs to include in this line"
     )
     
-    # Calculation
+    # NEW: Selector control - whether to include MPTT descendants
+    include_descendants = models.BooleanField(
+        default=True,
+        help_text="If True, include all MPTT descendants of selected account(s)"
+    )
+    
+    # DEPRECATED: Old calculation type (kept for backward compatibility during migration)
     calculation_type = models.CharField(
         max_length=20,
         choices=[
@@ -122,7 +152,24 @@ class FinancialStatementLineTemplate(models.Model):
             ('formula', 'Formula'),
         ],
         default='balance',
+        help_text="DEPRECATED: Use calculation_method instead"
+    )
+    
+    # NEW: Calculation method (replaces calculation_type)
+    calculation_method = models.CharField(
+        max_length=30,
+        choices=CALCULATION_METHOD_CHOICES,
+        null=True,
+        blank=True,
         help_text="How to calculate the line value"
+    )
+    
+    # NEW: Sign policy for presentation
+    sign_policy = models.CharField(
+        max_length=20,
+        choices=SIGN_POLICY_CHOICES,
+        default='natural',
+        help_text="How to present the sign of the calculated value"
     )
     
     # Formula for calculated lines (e.g., "line_1 + line_2 - line_3")
@@ -133,10 +180,37 @@ class FinancialStatementLineTemplate(models.Model):
         help_text="Formula referencing other line numbers (e.g., 'L1 + L2 - L3')"
     )
     
+    # NEW: Manual value for manual_input calculation method
+    manual_value = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Value for manual_input calculation method"
+    )
+    
     # Formatting
     indent_level = models.IntegerField(default=0, validators=[MinValueValidator(0)])
     is_bold = models.BooleanField(default=False)
     show_negative_in_parentheses = models.BooleanField(default=False)
+    
+    # NEW: Scale and decimal formatting
+    SCALE_CHOICES = [
+        ('none', 'None'),
+        ('K', 'Thousands'),
+        ('M', 'Millions'),
+        ('B', 'Billions'),
+    ]
+    scale = models.CharField(
+        max_length=10,
+        choices=SCALE_CHOICES,
+        default='none',
+        help_text="Scale factor for display"
+    )
+    decimal_places = models.PositiveSmallIntegerField(
+        default=2,
+        help_text="Number of decimal places for display"
+    )
     
     # Parent line for grouping
     parent_line = models.ForeignKey(
@@ -154,6 +228,24 @@ class FinancialStatementLineTemplate(models.Model):
     
     def __str__(self):
         return f"{self.template.name} - Line {self.line_number}: {self.label}"
+    
+    def get_effective_calculation_method(self):
+        """
+        Get the effective calculation method, falling back to legacy calculation_type mapping.
+        
+        Returns the calculation_method if set, otherwise maps calculation_type to new method.
+        """
+        if self.calculation_method:
+            return self.calculation_method
+        
+        # Legacy mapping from calculation_type
+        mapping = {
+            'sum': 'net_movement',
+            'difference': 'net_movement',
+            'balance': 'ending_balance',
+            'formula': 'formula',
+        }
+        return mapping.get(self.calculation_type, 'ending_balance')
 
 
 class FinancialStatement(TenantAwareBaseModel):

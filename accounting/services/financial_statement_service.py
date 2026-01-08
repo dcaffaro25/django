@@ -3,14 +3,32 @@ Financial Statement Generation Service
 
 Generates financial statements (Balance Sheet, P&L, Cash Flow, etc.)
 from accounting data.
+
+Calculation Methods:
+- ending_balance: Balance as of end_date (inclusive) - for Balance Sheet
+- opening_balance: Balance as of start_date - 1 day - for Cash Flow opening
+- net_movement: Sum of (debit - credit) in [start_date, end_date] - for Income Statement
+- change_in_balance: ending_balance - opening_balance - for Cash Flow delta
+- debit_total: Sum of debits in period
+- credit_total: Sum of credits in period
+- rollup_children: Sum of child template lines (no GL query)
+- formula: Reference other lines with L-tokens
+- manual_input: User-provided constant value
+
+Date Boundaries:
+- All date ranges are INCLUSIVE on both ends
+- opening_balance uses date < start_date (exclusive of start_date)
+- ending_balance uses date <= end_date (inclusive)
+- net_movement uses date >= start_date AND date <= end_date
 """
 
 import logging
+from datetime import date, timedelta
 from decimal import Decimal
-from datetime import date
 from typing import Dict, List, Optional, Set, Any, Union, Tuple
-from django.db.models import Q, Sum, F, Min, Max
+
 from django.db import transaction
+from django.db.models import Q, Sum, F, Min, Max
 
 from accounting.models import Account, JournalEntry, Currency
 from accounting.models_financial_statements import (
@@ -19,8 +37,17 @@ from accounting.models_financial_statements import (
     FinancialStatement,
     FinancialStatementLine,
 )
+from accounting.services.formula_evaluator import (
+    SafeFormulaEvaluator,
+    FormulaError,
+    InvalidFormulaError,
+    UndefinedLineError,
+)
 
 log = logging.getLogger(__name__)
+
+# Singleton formula evaluator
+_formula_evaluator = SafeFormulaEvaluator()
 
 
 class FinancialStatementGenerator:
@@ -337,76 +364,374 @@ class FinancialStatementGenerator:
         line_values: Dict[int, Decimal],
         include_pending: bool = False,
     ) -> Decimal:
-        """Calculate the value for a single line item."""
+        """
+        Calculate the value for a single line item.
         
+        Uses calculation_method if set, otherwise falls back to legacy calculation_type.
+        
+        Parameters
+        ----------
+        line_template : FinancialStatementLineTemplate
+            The line template defining the calculation
+        start_date : date
+            Start of the reporting period (inclusive)
+        end_date : date
+            End of the reporting period (inclusive)
+        as_of_date : date
+            Point-in-time date for balance calculations
+        report_type : str
+            Type of report (balance_sheet, income_statement, cash_flow, etc.)
+        line_values : Dict[int, Decimal]
+            Previously calculated line values (for formula references)
+        include_pending : bool
+            Whether to include pending journal entries
+            
+        Returns
+        -------
+        Decimal
+            Calculated value for the line, with sign_policy applied
+        """
         log.debug(
-            "Calculating line value for line %s (%s) - Type: %s, Calc Type: %s",
+            "Calculating line value for line %s (%s) - Type: %s, Method: %s, Legacy Calc Type: %s",
             line_template.line_number,
             line_template.label,
             line_template.line_type,
+            line_template.calculation_method or 'None',
             line_template.calculation_type
         )
         
-        # Handle different line types
+        # Handle different line types (headers/spacers always return 0)
         if line_template.line_type in ('header', 'spacer'):
             log.debug("Line %s is header/spacer, returning 0.00", line_template.line_number)
             return Decimal('0.00')
         
-        # Handle formula-based lines
-        if line_template.calculation_type == 'formula' and line_template.formula:
-            log.info("Line %s uses formula: %s", line_template.line_number, line_template.formula)
-            result = self._evaluate_formula(line_template.formula, line_values)
-            log.info("Line %s formula result: %s", line_template.line_number, result)
-            return result
+        # Get effective calculation method (new field or legacy mapping)
+        calc_method = line_template.get_effective_calculation_method()
+        log.debug("Line %s effective calculation method: %s", line_template.line_number, calc_method)
         
-        # Get accounts for this line
-        log.debug("Getting accounts for line %s", line_template.line_number)
+        # Dispatch to appropriate calculation method
+        value = self._dispatch_calculation(
+            calc_method=calc_method,
+            line_template=line_template,
+            start_date=start_date,
+            end_date=end_date,
+            as_of_date=as_of_date,
+            report_type=report_type,
+            line_values=line_values,
+            include_pending=include_pending,
+        )
+        
+        # Apply sign policy
+        value = self._apply_sign_policy(value, line_template.sign_policy)
+        
+        log.info("Line %s final value: %s", line_template.line_number, value)
+        return value
+    
+    def _dispatch_calculation(
+        self,
+        calc_method: str,
+        line_template: FinancialStatementLineTemplate,
+        start_date: date,
+        end_date: date,
+        as_of_date: date,
+        report_type: str,
+        line_values: Dict[int, Decimal],
+        include_pending: bool,
+    ) -> Decimal:
+        """
+        Dispatch to the appropriate calculation method based on calc_method.
+        
+        This is the core dispatcher that routes to specific calculation implementations.
+        """
+        # Formula-based calculation (no accounts needed)
+        if calc_method == 'formula':
+            if line_template.formula:
+                log.info("Line %s uses formula: %s", line_template.line_number, line_template.formula)
+                try:
+                    result = _formula_evaluator.evaluate(line_template.formula, line_values)
+                    log.info("Line %s formula result: %s", line_template.line_number, result)
+                    return result
+                except FormulaError as e:
+                    log.warning("Formula evaluation failed for line %s: %s", line_template.line_number, e)
+                    return Decimal('0.00')
+            else:
+                log.warning("Line %s has formula method but no formula defined", line_template.line_number)
+                return Decimal('0.00')
+        
+        # Rollup children (sum child template lines, no GL query)
+        if calc_method == 'rollup_children':
+            return self._calc_rollup_children(line_template, line_values)
+        
+        # Manual input (user-provided constant)
+        if calc_method == 'manual_input':
+            return line_template.manual_value or Decimal('0.00')
+        
+        # All other methods require accounts
         accounts = self._get_accounts_for_line(line_template)
         if not accounts:
             log.warning("No accounts found for line %s (%s)", line_template.line_number, line_template.label)
             return Decimal('0.00')
         
         log.info(
-            "Line %s will use %s account(s) for calculation",
+            "Line %s will use %s account(s) for %s calculation",
             line_template.line_number,
-            len(accounts)
+            len(accounts),
+            calc_method
         )
         
-        # Calculate based on report type
-        if report_type == 'balance_sheet':
-            # Balance sheet: use balance as of date
-            return self._calculate_balance_sheet_line(
-                accounts,
-                as_of_date,
-                line_template.calculation_type,
+        # Stock measures (point-in-time)
+        if calc_method == 'ending_balance':
+            return self._calc_ending_balance(accounts, as_of_date, include_pending)
+        
+        if calc_method == 'opening_balance':
+            # Opening balance is balance as of day before start_date
+            opening_date = start_date - timedelta(days=1)
+            return self._calc_ending_balance(accounts, opening_date, include_pending)
+        
+        # Flow measures (period activity)
+        if calc_method == 'net_movement':
+            return self._calc_net_movement(accounts, start_date, end_date, include_pending)
+        
+        if calc_method == 'debit_total':
+            return self._calc_debit_total(accounts, start_date, end_date, include_pending)
+        
+        if calc_method == 'credit_total':
+            return self._calc_credit_total(accounts, start_date, end_date, include_pending)
+        
+        # Delta measures
+        if calc_method == 'change_in_balance':
+            opening_date = start_date - timedelta(days=1)
+            opening = self._calc_ending_balance(accounts, opening_date, include_pending)
+            ending = self._calc_ending_balance(accounts, as_of_date, include_pending)
+            return ending - opening
+        
+        # Fallback: use legacy report_type-based calculation
+        log.warning(
+            "Unknown calculation method '%s' for line %s, falling back to legacy logic",
+            calc_method, line_template.line_number
+        )
+        return self._calculate_legacy(
+            accounts, start_date, end_date, as_of_date, 
+            report_type, line_template.calculation_type, include_pending
+        )
+    
+    def _apply_sign_policy(self, value: Decimal, sign_policy: str) -> Decimal:
+        """
+        Apply sign policy to a calculated value.
+        
+        Parameters
+        ----------
+        value : Decimal
+            The calculated value
+        sign_policy : str
+            'natural' - return as-is
+            'invert' - multiply by -1
+            'absolute' - return absolute value
+        """
+        if sign_policy == 'invert':
+            return -value
+        elif sign_policy == 'absolute':
+            return abs(value)
+        else:  # 'natural' or default
+            return value
+    
+    def _calc_rollup_children(
+        self,
+        line_template: FinancialStatementLineTemplate,
+        line_values: Dict[int, Decimal],
+    ) -> Decimal:
+        """
+        Calculate rollup of child template lines.
+        
+        Sums the values of all child lines (template hierarchy, not account hierarchy).
+        This allows for hierarchical statement structures where totals are computed
+        from their component lines without querying the GL.
+        """
+        child_templates = line_template.child_lines.all()
+        total = Decimal('0.00')
+        
+        for child in child_templates:
+            child_value = line_values.get(child.line_number, Decimal('0.00'))
+            total += child_value
+            log.debug(
+                "Rollup: Line %s adding child L%s = %s (running total: %s)",
+                line_template.line_number, child.line_number, child_value, total
+            )
+        
+        log.info(
+            "Line %s rollup_children total: %s (from %s children)",
+            line_template.line_number, total, child_templates.count()
+        )
+        return total
+    
+    def _calc_ending_balance(
+        self,
+        accounts: List[Account],
+        as_of_date: date,
+        include_pending: bool,
+    ) -> Decimal:
+        """
+        Calculate ending balance as of a specific date (inclusive).
+        
+        This is a STOCK measure - point-in-time balance.
+        Used for Balance Sheet items.
+        
+        Returns sum of all account balances considering:
+        - Account's opening balance (if balance_date <= as_of_date)
+        - All journal entries up to and including as_of_date
+        - Account direction for sign normalization
+        """
+        total = Decimal('0.00')
+        
+        for account in accounts:
+            balance = self._calculate_cumulative_ending_balance(
+                account=account,
+                as_of_date=as_of_date,
                 include_pending=include_pending,
+            )
+            total += balance
+        
+        return total
+    
+    def _calc_net_movement(
+        self,
+        accounts: List[Account],
+        start_date: date,
+        end_date: date,
+        include_pending: bool,
+    ) -> Decimal:
+        """
+        Calculate net movement (debit - credit) within a period.
+        
+        This is a FLOW measure - activity within a period.
+        Used for Income Statement items.
+        
+        Date range is inclusive: [start_date, end_date]
+        """
+        state_filter = Q(state='posted')
+        if include_pending:
+            state_filter = Q(state__in=['posted', 'pending'])
+        
+        total = Decimal('0.00')
+        
+        for account in accounts:
+            entries = JournalEntry.objects.filter(
+                account=account,
+                date__gte=start_date,
+                date__lte=end_date,
+                transaction__company_id=self.company_id,
+            ).filter(state_filter)
+            
+            result = entries.aggregate(
+                total_debit=Sum('debit_amount'),
+                total_credit=Sum('credit_amount')
+            )
+            
+            debit = result['total_debit'] or Decimal('0.00')
+            credit = result['total_credit'] or Decimal('0.00')
+            
+            # Apply account direction for proper sign
+            net = (debit - credit) * account.account_direction
+            total += net
+            
+            log.debug(
+                "Net movement for account %s: debit=%s, credit=%s, direction=%s, net=%s",
+                account.id, debit, credit, account.account_direction, net
+            )
+        
+        return total
+    
+    def _calc_debit_total(
+        self,
+        accounts: List[Account],
+        start_date: date,
+        end_date: date,
+        include_pending: bool,
+    ) -> Decimal:
+        """
+        Calculate total debits within a period.
+        
+        Date range is inclusive: [start_date, end_date]
+        """
+        state_filter = Q(state='posted')
+        if include_pending:
+            state_filter = Q(state__in=['posted', 'pending'])
+        
+        total = Decimal('0.00')
+        
+        for account in accounts:
+            result = JournalEntry.objects.filter(
+                account=account,
+                date__gte=start_date,
+                date__lte=end_date,
+                transaction__company_id=self.company_id,
+            ).filter(state_filter).aggregate(total=Sum('debit_amount'))
+            
+            total += result['total'] or Decimal('0.00')
+        
+        return total
+    
+    def _calc_credit_total(
+        self,
+        accounts: List[Account],
+        start_date: date,
+        end_date: date,
+        include_pending: bool,
+    ) -> Decimal:
+        """
+        Calculate total credits within a period.
+        
+        Date range is inclusive: [start_date, end_date]
+        """
+        state_filter = Q(state='posted')
+        if include_pending:
+            state_filter = Q(state__in=['posted', 'pending'])
+        
+        total = Decimal('0.00')
+        
+        for account in accounts:
+            result = JournalEntry.objects.filter(
+                account=account,
+                date__gte=start_date,
+                date__lte=end_date,
+                transaction__company_id=self.company_id,
+            ).filter(state_filter).aggregate(total=Sum('credit_amount'))
+            
+            total += result['total'] or Decimal('0.00')
+        
+        return total
+    
+    def _calculate_legacy(
+        self,
+        accounts: List[Account],
+        start_date: date,
+        end_date: date,
+        as_of_date: date,
+        report_type: str,
+        calculation_type: str,
+        include_pending: bool,
+    ) -> Decimal:
+        """
+        Legacy calculation method for backward compatibility.
+        
+        This is called when calculation_method is not recognized or not set.
+        Routes to the original report_type-based calculation logic.
+        """
+        if report_type == 'balance_sheet':
+            return self._calculate_balance_sheet_line(
+                accounts, as_of_date, calculation_type, include_pending
             )
         elif report_type == 'income_statement':
-            # Income statement: use period activity
             return self._calculate_income_statement_line(
-                accounts,
-                start_date,
-                end_date,
-                line_template.calculation_type,
-                include_pending=include_pending,
+                accounts, start_date, end_date, calculation_type, include_pending
             )
         elif report_type == 'cash_flow':
-            # Cash flow: specific logic
             return self._calculate_cash_flow_line(
-                accounts,
-                start_date,
-                end_date,
-                line_template.calculation_type,
-                include_pending=include_pending,
+                accounts, start_date, end_date, calculation_type, include_pending
             )
         else:
-            # Default: period activity
             return self._calculate_period_balance(
-                accounts,
-                start_date,
-                end_date,
-                line_template.calculation_type,
-                include_pending=include_pending,
+                accounts, start_date, end_date, calculation_type, include_pending
             )
     
     def _calculate_line_value_with_metadata(
@@ -585,15 +910,24 @@ class FinancialStatementGenerator:
         self,
         line_template: FinancialStatementLineTemplate,
     ) -> List[Account]:
-        """Get accounts that contribute to this line."""
+        """
+        Get accounts that contribute to this line.
+        
+        Respects the include_descendants field:
+        - If True (default): expands parent accounts to include all leaf descendants
+        - If False: returns only the explicitly specified accounts
+        """
+        include_descendants = getattr(line_template, 'include_descendants', True)
+        
         log.debug(
             "Getting accounts for line %s - Account ID: %s, Account IDs: %s, "
-            "Code Prefix: %s, Path Contains: %s",
+            "Code Prefix: %s, Path Contains: %s, Include Descendants: %s",
             line_template.line_number,
             line_template.account_id,
             line_template.account_ids,
             line_template.account_code_prefix,
             line_template.account_path_contains,
+            include_descendants,
         )
         
         accounts = Account.objects.filter(company_id=self.company_id)
@@ -609,15 +943,24 @@ class FinancialStatementGenerator:
                 line_template.account.account_code,
                 line_template.account.name,
             )
-            # Expand parent account to include all leaf descendants
-            expanded = self._expand_to_leaf_accounts([line_template.account])
-            log.info(
-                "Line %s: Expanded account %s to %s leaf account(s)",
-                line_template.line_number,
-                line_template.account.id,
-                len(expanded),
-            )
-            return expanded
+            
+            if include_descendants:
+                # Expand parent account to include all leaf descendants
+                expanded = self._expand_to_leaf_accounts([line_template.account])
+                log.info(
+                    "Line %s: Expanded account %s to %s leaf account(s)",
+                    line_template.line_number,
+                    line_template.account.id,
+                    len(expanded),
+                )
+                return expanded
+            else:
+                # Return only the specified account (no descendant expansion)
+                log.info(
+                    "Line %s: Using only specified account (include_descendants=False)",
+                    line_template.line_number,
+                )
+                return [line_template.account]
         
         # Filter by account IDs
         if line_template.account_ids:
@@ -703,16 +1046,25 @@ class FinancialStatementGenerator:
             if len(accounts) > 10:
                 log.info("  ... and %s more account(s)", len(accounts) - 10)
         
-        # Expand all accounts to their leaf descendants
-        # This ensures parent accounts are replaced by their leaf children
-        expanded_accounts = self._expand_to_leaf_accounts(accounts)
-        
-        log.info(
-            "Line %s: Expanded %s account(s) to %s leaf account(s)",
-            line_template.line_number,
-            len(accounts),
-            len(expanded_accounts),
-        )
+        # Expand accounts to leaf descendants if include_descendants is True
+        if include_descendants:
+            # This ensures parent accounts are replaced by their leaf children
+            expanded_accounts = self._expand_to_leaf_accounts(accounts)
+            
+            log.info(
+                "Line %s: Expanded %s account(s) to %s leaf account(s)",
+                line_template.line_number,
+                len(accounts),
+                len(expanded_accounts),
+            )
+        else:
+            # Don't expand - use accounts as specified
+            expanded_accounts = accounts
+            log.info(
+                "Line %s: Using %s account(s) without expansion (include_descendants=False)",
+                line_template.line_number,
+                len(accounts),
+            )
         
         return expanded_accounts
     
@@ -1788,17 +2140,26 @@ class FinancialStatementGenerator:
         formula: str,
         line_values: Dict[int, Decimal],
     ) -> Decimal:
-        """Evaluate a formula referencing other line numbers."""
-        # Simple formula evaluator: "L1 + L2 - L3"
-        # Replace L{number} with actual values
-        result = formula
-        for line_num, value in line_values.items():
-            result = result.replace(f'L{line_num}', str(value))
+        """
+        Evaluate a formula referencing other line numbers.
         
-        # Evaluate (simple - in production, use a proper expression evaluator)
+        Uses the safe formula evaluator (no eval()).
+        
+        Parameters
+        ----------
+        formula : str
+            Formula string with L-tokens (e.g., "L1 + L2 - L3")
+        line_values : Dict[int, Decimal]
+            Dictionary mapping line numbers to their calculated values
+            
+        Returns
+        -------
+        Decimal
+            Result of the formula evaluation
+        """
         try:
-            return Decimal(str(eval(result)))
-        except Exception as e:
+            return _formula_evaluator.evaluate(formula, line_values)
+        except FormulaError as e:
             log.warning("Formula evaluation failed: %s - %s", formula, e)
             return Decimal('0.00')
     
@@ -1948,6 +2309,13 @@ class FinancialStatementGenerator:
         
         series_data = {}
         
+        # Pre-compute period line values for formula support
+        # Each period needs its own set of line values computed sequentially
+        period_line_values: Dict[str, Dict[int, Decimal]] = {}
+        for period in periods:
+            period_line_values[period['key']] = {}
+        
+        # Process all lines for all periods, computing sequentially per period
         for line_template in line_templates:
             log.info(
                 "\n" + "-"*80 + "\n"
@@ -1969,15 +2337,21 @@ class FinancialStatementGenerator:
             )
             
             for period_idx, period in enumerate(periods, 1):
+                period_key = period['key']
                 log.debug(
                     "  [%s/%s] Calculating line %s for period %s (%s to %s)",
                     period_idx,
                     len(periods),
                     line_template.line_number,
-                    period['key'],
+                    period_key,
                     period['start_date'],
                     period['end_date'],
                 )
+                
+                # Get the accumulated line values for this period
+                # (previous lines in this period have already been computed)
+                current_period_line_values = period_line_values[period_key]
+                
                 # Calculate value for this line in this period
                 if include_metadata:
                     value, calculation_memory = self._calculate_line_value_with_metadata(
@@ -1986,12 +2360,12 @@ class FinancialStatementGenerator:
                         period['end_date'],
                         period['end_date'],  # as_of_date
                         template.report_type,
-                        {},  # line_values not used for time series
+                        current_period_line_values,  # Pass accumulated values for this period
                         include_pending=include_pending,
                     )
                     
                     line_series.append({
-                        'period_key': period['key'],
+                        'period_key': period_key,
                         'period_label': period['label'],
                         'start_date': period['start_date'],
                         'end_date': period['end_date'],
@@ -2005,17 +2379,20 @@ class FinancialStatementGenerator:
                         period['end_date'],
                         period['end_date'],  # as_of_date
                         template.report_type,
-                        {},  # line_values not used for time series
+                        current_period_line_values,  # Pass accumulated values for this period
                         include_pending=include_pending,
                     )
                     
                     line_series.append({
-                        'period_key': period['key'],
+                        'period_key': period_key,
                         'period_label': period['label'],
                         'start_date': period['start_date'],
                         'end_date': period['end_date'],
                         'value': float(value),
                     })
+                
+                # Store the computed value for this period so subsequent lines can reference it
+                period_line_values[period_key][line_template.line_number] = value
             
             line_data = {
                 'line_number': line_template.line_number,
@@ -2029,11 +2406,14 @@ class FinancialStatementGenerator:
             # Add line metadata if requested
             if include_metadata:
                 line_data['metadata'] = {
-                    'calculation_type': line_template.calculation_type,
+                    'calculation_method': line_template.get_effective_calculation_method(),
+                    'calculation_type': line_template.calculation_type,  # Deprecated
+                    'sign_policy': line_template.sign_policy,
                     'account_id': line_template.account_id,
                     'account_ids': line_template.account_ids,
                     'account_code_prefix': line_template.account_code_prefix,
                     'account_path_contains': line_template.account_path_contains,
+                    'include_descendants': line_template.include_descendants,
                     'formula': line_template.formula,
                     'resolved_accounts': [
                         {
@@ -2079,6 +2459,85 @@ class FinancialStatementGenerator:
         else:
             result['is_preview'] = True
         return result
+    
+    def _calculate_statement_data(
+        self,
+        template: FinancialStatementTemplate,
+        start_date: date,
+        end_date: date,
+        as_of_date: Optional[date] = None,
+        include_pending: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Calculate statement data WITHOUT persisting to database.
+        
+        This is the core calculation logic that can be used for both
+        preview and generation. Returns a dictionary with all computed values.
+        
+        Parameters
+        ----------
+        template : FinancialStatementTemplate
+            Template defining the statement structure
+        start_date : date
+            Start of reporting period
+        end_date : date
+            End of reporting period
+        as_of_date : Optional[date]
+            For balance sheet: specific date. If None, defaults to end_date
+        include_pending : bool
+            Whether to include pending journal entries
+            
+        Returns
+        -------
+        Dict[str, Any]
+            Statement data with 'lines', 'line_values', and metadata
+        """
+        if as_of_date is None:
+            as_of_date = end_date
+        
+        line_templates = template.line_templates.all().order_by('line_number')
+        line_values: Dict[int, Decimal] = {}
+        lines_data = []
+        
+        log.debug(
+            "Calculating statement data (no persist): template=%s, period=%s to %s, as_of=%s",
+            template.id, start_date, end_date, as_of_date
+        )
+        
+        for line_template in line_templates:
+            value = self._calculate_line_value(
+                line_template,
+                start_date,
+                end_date,
+                as_of_date,
+                template.report_type,
+                line_values,
+                include_pending=include_pending,
+            )
+            line_values[line_template.line_number] = value
+            
+            lines_data.append({
+                'line_number': line_template.line_number,
+                'label': line_template.label,
+                'line_type': line_template.line_type,
+                'balance': value,
+                'indent_level': line_template.indent_level,
+                'is_bold': line_template.is_bold,
+                'account_ids': self._get_account_ids_for_line(line_template),
+                'calculation_method': line_template.get_effective_calculation_method(),
+                'formula': line_template.formula if line_template.get_effective_calculation_method() == 'formula' else None,
+            })
+        
+        return {
+            'template_id': template.id,
+            'template_name': template.name,
+            'report_type': template.report_type,
+            'start_date': start_date,
+            'end_date': end_date,
+            'as_of_date': as_of_date,
+            'lines': lines_data,
+            'line_values': line_values,  # Raw values for formula references
+        }
     
     def generate_with_comparisons(
         self,
@@ -2405,10 +2864,172 @@ class FinancialStatementGenerator:
         dimension: Optional[str] = None,
         include_pending: bool = False,
     ) -> Dict[str, Any]:
-        """Preview comparisons without saving statements."""
-        result = self.generate_with_comparisons(
-            template, start_date, end_date, comparison_types, dimension, include_pending
+        """
+        Preview comparisons WITHOUT saving any statements to the database.
+        
+        Unlike generate_with_comparisons, this method:
+        - Does NOT create FinancialStatement records
+        - Does NOT create FinancialStatementLine records
+        - Uses _calculate_statement_data for computation
+        
+        Parameters
+        ----------
+        template : FinancialStatementTemplate
+            Template to use
+        start_date : date
+            Start of current period
+        end_date : date
+            End of current period
+        comparison_types : List[str]
+            List of comparison types
+        dimension : Optional[str]
+            Time dimension to break down current period
+        include_pending : bool
+            Include pending journal entries
+            
+        Returns
+        -------
+        Dict[str, Any]
+            Comparison data (no DB records created)
+        """
+        from accounting.utils_time_dimensions import (
+            get_comparison_period,
+            calculate_period_comparison,
+            generate_periods,
         )
-        result['is_preview'] = True
-        return result
+        
+        log.info(
+            "Preview comparison (no persist): template=%s, period=%s to %s, types=%s",
+            template.id, start_date, end_date, comparison_types
+        )
+        
+        # If dimension is provided, break down current period by dimension
+        if dimension:
+            periods = generate_periods(start_date, end_date, dimension)
+            result = {
+                'template_id': template.id,
+                'template_name': template.name,
+                'report_type': template.report_type,
+                'dimension': dimension,
+                'start_date': start_date,
+                'end_date': end_date,
+                'is_preview': True,
+                'periods': []
+            }
+            
+            for period in periods:
+                period_data = self._preview_comparison_for_period(
+                    template, period['start_date'], period['end_date'],
+                    comparison_types, include_pending, dimension=dimension
+                )
+                period_data['period_key'] = period['key']
+                period_data['period_label'] = period['label']
+                result['periods'].append(period_data)
+            
+            return result
+        else:
+            # Single period comparison
+            result = self._preview_comparison_for_period(
+                template, start_date, end_date, comparison_types, include_pending, dimension=None
+            )
+            result['is_preview'] = True
+            return result
+    
+    def _preview_comparison_for_period(
+        self,
+        template: FinancialStatementTemplate,
+        start_date: date,
+        end_date: date,
+        comparison_types: List[str],
+        include_pending: bool,
+        dimension: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Preview comparison for a single period WITHOUT persisting.
+        
+        Uses _calculate_statement_data instead of generate_statement.
+        """
+        from accounting.utils_time_dimensions import (
+            get_comparison_period,
+            calculate_period_comparison,
+        )
+        
+        # Calculate current period data (no DB save)
+        current_data = self._calculate_statement_data(
+            template=template,
+            start_date=start_date,
+            end_date=end_date,
+            as_of_date=end_date,
+            include_pending=include_pending,
+        )
+        
+        # Build current line values dict
+        current_lines = {
+            line['line_number']: line['balance']
+            for line in current_data['lines']
+        }
+        
+        # Generate comparisons
+        comparisons = {}
+        
+        for comp_type in comparison_types:
+            try:
+                comp_start, comp_end = get_comparison_period(
+                    start_date, end_date, comp_type, dimension=dimension
+                )
+                
+                # Calculate comparison period data (no DB save)
+                comp_data = self._calculate_statement_data(
+                    template=template,
+                    start_date=comp_start,
+                    end_date=comp_end,
+                    as_of_date=comp_end,
+                    include_pending=include_pending,
+                )
+                
+                comp_lines = {
+                    line['line_number']: line['balance']
+                    for line in comp_data['lines']
+                }
+                
+                # Calculate comparison metrics
+                line_comparisons = {}
+                for line_num, current_val in current_lines.items():
+                    comp_val = comp_lines.get(line_num, Decimal('0.00'))
+                    
+                    comparison_result = calculate_period_comparison(
+                        current_val, comp_val, comp_type
+                    )
+                    line_comparisons[line_num] = comparison_result
+                
+                comparisons[comp_type] = {
+                    'start_date': comp_start,
+                    'end_date': comp_end,
+                    'lines': line_comparisons,
+                }
+                
+            except Exception as e:
+                log.warning("Failed to generate preview comparison %s: %s", comp_type, e)
+                comparisons[comp_type] = {'error': str(e)}
+        
+        # Build statement data for response
+        statement_lines = []
+        for line in current_data['lines']:
+            statement_lines.append({
+                'line_number': line['line_number'],
+                'label': line['label'],
+                'balance': float(line['balance']),
+                'indent_level': line['indent_level'],
+                'is_bold': line['is_bold'],
+            })
+        
+        return {
+            'statement': {
+                'name': template.name,
+                'start_date': start_date,
+                'end_date': end_date,
+                'lines': statement_lines,
+            },
+            'comparisons': comparisons,
+        }
 

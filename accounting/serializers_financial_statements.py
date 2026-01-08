@@ -15,6 +15,9 @@ from .models_financial_statements import (
 class FinancialStatementLineTemplateSerializer(serializers.ModelSerializer):
     """Serializer for financial statement line templates."""
     
+    # Computed field for effective calculation method
+    effective_calculation_method = serializers.SerializerMethodField()
+    
     class Meta:
         model = FinancialStatementLineTemplate
         fields = [
@@ -26,14 +29,25 @@ class FinancialStatementLineTemplateSerializer(serializers.ModelSerializer):
             'account_code_prefix',
             'account_path_contains',
             'account_ids',
-            'calculation_type',
+            'include_descendants',  # NEW
+            'calculation_type',  # DEPRECATED - keep for backward compat
+            'calculation_method',  # NEW
+            'effective_calculation_method',  # Computed: returns calculation_method or legacy mapping
+            'sign_policy',  # NEW
             'formula',
+            'manual_value',  # NEW
             'indent_level',
             'is_bold',
             'show_negative_in_parentheses',
+            'scale',  # NEW
+            'decimal_places',  # NEW
             'parent_line',
         ]
-        read_only_fields = ['id']
+        read_only_fields = ['id', 'effective_calculation_method']
+    
+    def get_effective_calculation_method(self, obj):
+        """Return the effective calculation method (new or legacy mapping)."""
+        return obj.get_effective_calculation_method()
 
 
 class FinancialStatementTemplateSerializer(serializers.ModelSerializer):
@@ -168,6 +182,11 @@ class GenerateStatementRequestSerializer(serializers.Serializer):
     )
     notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     include_pending = serializers.BooleanField(required=False, default=False)
+    persist = serializers.BooleanField(
+        required=False,
+        default=True,
+        help_text="If True, save statement to database. If False, return preview only."
+    )
 
 
 class TimeSeriesRequestSerializer(serializers.Serializer):

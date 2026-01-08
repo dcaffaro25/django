@@ -254,7 +254,8 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             "as_of_date": "2025-12-31",  // optional
             "currency_id": 1,  // optional
             "status": "draft",  // optional
-            "notes": "..."  // optional
+            "notes": "...",  // optional
+            "persist": true  // optional, defaults to true. Set to false for preview mode.
         }
         """
         serializer = GenerateStatementRequestSerializer(data=request.data)
@@ -276,8 +277,46 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             company_id=company_id,
         )
         
-        # Generate statement
         generator = FinancialStatementGenerator(company_id=company_id)
+        
+        # Check if persist=False (preview mode)
+        persist = data.get('persist', True)
+        
+        if not persist:
+            # Preview mode: use preview_statement (no DB save)
+            preview_data = generator.preview_statement(
+                template=template,
+                start_date=data['start_date'],
+                end_date=data['end_date'],
+                as_of_date=data.get('as_of_date'),
+                currency_id=data.get('currency_id'),
+                include_pending=data.get('include_pending', False),
+            )
+            
+            # Get currency for formatting
+            currency = self._get_company_currency(company_id)
+            
+            format_param = request.query_params.get('format', 'json')
+            if format_param == 'markdown':
+                return Response(
+                    self._format_preview_as_markdown(preview_data, currency),
+                    content_type='text/markdown',
+                    status=status.HTTP_200_OK
+                )
+            elif format_param == 'html':
+                return Response(
+                    self._format_preview_as_html(preview_data, currency),
+                    content_type='text/html',
+                    status=status.HTTP_200_OK
+                )
+            else:
+                preview_data['formatted'] = {
+                    'markdown': self._format_preview_as_markdown(preview_data, currency),
+                    'html': self._format_preview_as_html(preview_data, currency),
+                }
+                return Response(preview_data, status=status.HTTP_200_OK)
+        
+        # Normal mode: persist to database
         statement = generator.generate_statement(
             template=template,
             start_date=data['start_date'],
