@@ -779,6 +779,7 @@ def execute_import_job(
                         instance = model(**filtered)
                     
                     # 8.5) Add notes metadata if notes field exists and this is a new record
+                    logger.info(f"IMPORT NOTES DEBUG: model={model_name}, action={action}, hasattr(instance, 'notes')={hasattr(instance, 'notes')}, import_metadata={import_metadata}")
                     if action == "create" and hasattr(instance, 'notes'):
                         # Import here to avoid circular import issues
                         try:
@@ -837,11 +838,16 @@ def execute_import_job(
                             notes_metadata['sheet_name'] = excel_sheet_name
                         
                         instance.notes = build_notes_metadata(**notes_metadata)
+                        logger.info(f"IMPORT NOTES DEBUG: Set notes to: {instance.notes[:100] if instance.notes else 'None'}...")
+                    else:
+                        logger.warning(f"IMPORT NOTES DEBUG: NOT setting notes - action={action}, hasattr notes={hasattr(instance, 'notes')}")
 
                     # 9) validate & save
                     if hasattr(instance, "full_clean"):
                         instance.full_clean()
                     instance.save()  # assign PK now (even in preview; will rollback later)
+                    # Verify notes were saved
+                    logger.info(f"IMPORT NOTES DEBUG: After save, instance.notes = {instance.notes[:100] if instance.notes else 'None'}...")
 
                     # 10) register token->id (AFTER save to ensure an id exists)
                     if rid:

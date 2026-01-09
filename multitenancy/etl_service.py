@@ -1942,6 +1942,7 @@ class ETLPipelineService:
                         instance = model(**filtered)
                     
                     # Add notes metadata if notes field exists and this is a new record
+                    logger.info(f"ETL NOTES DEBUG: action={action}, hasattr(instance, 'notes')={hasattr(instance, 'notes')}, import_metadata={import_metadata}")
                     if action == "create" and hasattr(instance, 'notes'):
                         # Import here to avoid circular import issues
                         try:
@@ -1998,6 +1999,9 @@ class ETLPipelineService:
                             notes_metadata['sheet_name'] = sheet.get('sheet_name')
                         
                         instance.notes = build_notes_metadata(**notes_metadata)
+                        logger.info(f"ETL NOTES DEBUG: Set notes to: {instance.notes[:100] if instance.notes else 'None'}...")
+                    else:
+                        logger.warning(f"ETL NOTES DEBUG: NOT setting notes - action={action}, hasattr notes={hasattr(instance, 'notes')}")
                     
                     # Validate & save
                     save_start = time.time()
@@ -2024,6 +2028,8 @@ class ETLPipelineService:
                     instance.save()  # Transaction is now saved in the transaction context (save() quantizes amounts)
                     db_save_time = time.time() - db_save_start
                     logger.info(f"ETL DEBUG: Row {row_idx + 1} Transaction instance.save() took {db_save_time:.3f}s")
+                    # Verify notes were saved
+                    logger.info(f"ETL NOTES DEBUG: After save, instance.notes = {instance.notes[:100] if instance.notes else 'None'}...")
                     if db_save_time > 0.5:
                         logger.warning(f"ETL DEBUG: Row {row_idx + 1} Transaction save is VERY SLOW: {db_save_time:.3f}s")
                     save_time = time.time() - save_start
