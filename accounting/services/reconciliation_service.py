@@ -299,9 +299,12 @@ def compute_match_scores(
     date_tol: int,              # tolerance (>= 0)
     currency_match: float,      # 0 or 1
     weights: Dict[str, float],  # embedding/amount/date/currency weights
+    worst_metrics: Optional[Dict[str, float]] = None,  # Optional worst-case metrics for outlier detection
 ) -> Dict[str, float]:
     """
     Return per-dimension scores (0–1) and a weighted global score.
+    
+    If worst_metrics is provided, applies penalties for outlier entries within groups.
     """
     # defensive guards for zero tolerances
     amt_norm = float(amount_diff / (amount_tol or CENT))
@@ -313,6 +316,26 @@ def compute_match_scores(
     desc_score = max(0.0, min(1.0, float(embed_sim)))  # ensure 0–1
     curr_score = max(0.0, min(1.0, float(currency_match)))
 
+    # Apply outlier penalties if worst_metrics provided
+    outlier_penalty = 0.0
+    if worst_metrics:
+        # Penalty for large max_date_delta_ratio (outlier date)
+        if worst_metrics.get("max_date_delta_ratio", 1.0) > 2.0:
+            ratio_penalty = min(0.15, (worst_metrics["max_date_delta_ratio"] - 2.0) * 0.05)
+            outlier_penalty += ratio_penalty
+        
+        # Penalty for very low min_embedding_sim (poor description match)
+        min_sim = worst_metrics.get("min_embedding_sim", 1.0)
+        if min_sim < 0.5:
+            sim_penalty = (0.5 - min_sim) * 0.2  # Up to 0.1 penalty
+            outlier_penalty += sim_penalty
+        
+        # Penalty for very large max_date_delta (absolute outlier)
+        max_delta = worst_metrics.get("max_date_delta", 0)
+        if max_delta > (date_tol or 1) * 2:
+            delta_penalty = min(0.1, (max_delta - (date_tol or 1) * 2) / 100.0)
+            outlier_penalty += delta_penalty
+
     w_emb = float(weights.get("embedding", 0.0))
     w_amt = float(weights.get("amount", 0.0))
     w_date = float(weights.get("date", 0.0))
@@ -322,9 +345,13 @@ def compute_match_scores(
         w_emb * desc_score +
         w_amt * amt_score +
         w_date * date_score +
-        w_curr * curr_score,
+        w_curr * curr_score -
+        outlier_penalty,  # Subtract penalty from global score
         4,
     )
+    
+    # Ensure global_score doesn't go below 0
+    global_score = max(0.0, global_score)
 
     return {
         "description_score": desc_score,
@@ -332,6 +359,7 @@ def compute_match_scores(
         "date_score": date_score,
         "currency_score": curr_score,
         "global_score": global_score,
+        "outlier_penalty": outlier_penalty,
     }
 
 def compute_weighted_confidence(
@@ -342,6 +370,7 @@ def compute_weighted_confidence(
     date_tol: int,
     currency_match: float,
     weights: Dict[str, float],
+    worst_metrics: Optional[Dict[str, float]] = None,
 ) -> float:
     scores = compute_match_scores(
         embed_sim=embed_sim,
@@ -351,6 +380,7 @@ def compute_weighted_confidence(
         date_tol=date_tol,
         currency_match=currency_match,
         weights=weights,
+        worst_metrics=worst_metrics,
     )
     return scores["global_score"]
 
@@ -364,6 +394,123 @@ def _avg_embedding(items):
         for i, x in enumerate(v):
             sums[i] += x
     return [s / len(vecs) for s in sums]
+
+
+def _compute_worst_match_metrics(
+    bank_item: Union[BankTransactionDTO, List[BankTransactionDTO]],
+    book_items: List[JournalEntryDTO],
+) -> Dict[str, float]:
+    """
+    Compute worst-case match metrics within a group to detect outliers.
+    
+    Returns:
+        - max_date_delta: Maximum date difference of any single book entry from bank date
+        - min_embedding_sim: Minimum embedding similarity of any single book entry
+        - max_date_delta_ratio: Ratio of max_date_delta to group average date delta
+    """
+    from math import sqrt
+    
+    if isinstance(bank_item, list):
+        bank_date = None
+        bank_embedding = None
+        if bank_item:
+            # For many-to-one: use weighted average of bank dates
+            dates = [b.date for b in bank_item if b.date]
+            amounts = [abs(b.amount_base or Decimal("0")) for b in bank_item]
+            if dates and amounts:
+                total_abs = sum(amounts, Decimal("0"))
+                if total_abs:
+                    num = sum((Decimal(d.toordinal()) * w for d, w in zip(dates, amounts)), Decimal("0"))
+                    ord_ = int((num / total_abs).to_integral_value(ROUND_HALF_UP))
+                    bank_date = _date.fromordinal(ord_)
+            # Average embedding for bank group
+            bank_embedding = _avg_embedding(bank_item)
+    else:
+        bank_date = bank_item.date
+        bank_embedding = bank_item.embedding or []
+    
+    if not bank_date or not book_items:
+        return {
+            "max_date_delta": 9999,
+            "min_embedding_sim": 0.0,
+            "max_date_delta_ratio": 1.0,
+        }
+    
+    max_date_delta = 0
+    min_embedding_sim = 1.0
+    date_deltas = []
+    
+    for book in book_items:
+        if book.date:
+            delta = abs((bank_date - book.date).days)
+            date_deltas.append(delta)
+            max_date_delta = max(max_date_delta, delta)
+        
+        if bank_embedding and book.embedding:
+            # Compute cosine similarity
+            dot = sum(a * b for a, b in zip(bank_embedding, book.embedding))
+            norm_bank = sqrt(sum(a * a for a in bank_embedding))
+            norm_book = sqrt(sum(b * b for b in book.embedding))
+            if norm_bank and norm_book:
+                sim = dot / (norm_bank * norm_book)
+                min_embedding_sim = min(min_embedding_sim, sim)
+    
+    # Compute average date delta for ratio calculation
+    avg_date_delta = sum(date_deltas) / len(date_deltas) if date_deltas else max_date_delta
+    max_date_delta_ratio = max_date_delta / avg_date_delta if avg_date_delta > 0 else 1.0
+    
+    return {
+        "max_date_delta": float(max_date_delta),
+        "min_embedding_sim": float(min_embedding_sim),
+        "max_date_delta_ratio": float(max_date_delta_ratio),
+    }
+
+
+def _check_intra_group_coherence(
+    bank_item: Union[BankTransactionDTO, List[BankTransactionDTO]],
+    book_items: List[JournalEntryDTO],
+    stage: StageConfig,
+    worst_metrics: Optional[Dict[str, float]] = None,
+) -> tuple[bool, Optional[str]]:
+    """
+    Check if all entries in a group are coherent (no obvious outliers).
+    
+    Returns:
+        (is_coherent, rejection_reason)
+    """
+    if len(book_items) <= 1:
+        return (True, None)  # Single entry groups are always coherent
+    
+    # Compute worst metrics if not provided
+    if worst_metrics is None:
+        worst_metrics = _compute_worst_match_metrics(bank_item, book_items)
+    
+    # Check 1: Maximum date delta should not exceed group_span_days significantly
+    # If group_span_days is set, enforce it strictly
+    if stage.group_span_days and stage.group_span_days > 0:
+        book_dates = [b.date for b in book_items if b.date]
+        if len(book_dates) >= 2:
+            book_span = (max(book_dates) - min(book_dates)).days
+            if book_span > stage.group_span_days:
+                return (False, f"book_span_days={book_span} > group_span_days={stage.group_span_days}")
+    
+    # Check 2: Worst date delta should not be too much worse than average
+    # If max_date_delta is more than 3x the average, it's an outlier
+    if worst_metrics["max_date_delta_ratio"] > 3.0:
+        return (False, f"max_date_delta_ratio={worst_metrics['max_date_delta_ratio']:.2f} > 3.0 (outlier detected)")
+    
+    # Check 3: Minimum embedding similarity should be reasonable
+    # If any entry has very low similarity (< 0.3), it's likely a mismatch
+    if worst_metrics["min_embedding_sim"] < 0.3:
+        return (False, f"min_embedding_sim={worst_metrics['min_embedding_sim']:.3f} < 0.3 (poor match)")
+    
+    # Check 4: For one-to-many, check if any single book entry is too far from bank date
+    if not isinstance(bank_item, list) and stage.avg_date_delta_days and stage.avg_date_delta_days > 0:
+        if worst_metrics["max_date_delta"] > stage.avg_date_delta_days * 2:
+            return (False, f"max_date_delta={worst_metrics['max_date_delta']} > 2x avg_date_delta_days={stage.avg_date_delta_days}")
+    
+    return (True, None)
+
 
 # ----------------------------------------------------------------------
 # Reconciliation pipeline engine
@@ -493,6 +640,14 @@ class ReconciliationPipelineEngine:
                 if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                     return
                 
+                # Check intra-group coherence before scoring
+                worst_metrics = _compute_worst_match_metrics(bank, combo)
+                is_coherent, reject_reason = _check_intra_group_coherence(
+                    bank, combo, stage, worst_metrics
+                )
+                if not is_coherent:
+                    return  # Skip this candidate
+                
                 # Calculate score for this candidate
                 amount_diff = abs(q2(current_sum) - target)
                 embed_sim = self._cosine_similarity(bank.embedding or [], _avg_embedding(combo))
@@ -504,6 +659,7 @@ class ReconciliationPipelineEngine:
                     date_tol=stage.avg_date_delta_days or 1,
                     currency_match=1.0,
                     weights=self.stage_weights,
+                    worst_metrics=worst_metrics,
                 )
                 score = scores["global_score"]
                 candidates.append((chosen.copy(), score))
@@ -844,6 +1000,14 @@ class ReconciliationPipelineEngine:
                 if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                     return
 
+                # Check intra-group coherence before scoring
+                worst_metrics = _compute_worst_match_metrics(combo, [book])
+                is_coherent, reject_reason = _check_intra_group_coherence(
+                    combo, [book], stage, worst_metrics
+                )
+                if not is_coherent:
+                    return  # Skip this candidate
+
                 # Calculate score for this candidate
                 amount_diff = abs(q2(current_sum) - target)
                 embed_sim = self._cosine_similarity(_avg_embedding(combo), book.embedding or [])
@@ -855,6 +1019,7 @@ class ReconciliationPipelineEngine:
                     date_tol=stage.avg_date_delta_days or 1,
                     currency_match=1.0,
                     weights=self.stage_weights,
+                    worst_metrics=worst_metrics,
                 )
                 score = scores["global_score"]
                 candidates.append((chosen.copy(), score))
@@ -1003,27 +1168,42 @@ class ReconciliationPipelineEngine:
             if mixed_signs and stage.allow_mixed_signs:
                 combo = self._find_mixed_one_to_many_group(bank, local_books, stage)
                 if combo:
-                    book_dates = [b.date for b in combo if b.date]
-                    book_span = (max(book_dates) - min(book_dates)).days if len(book_dates) >= 2 else 0
-                    bank_avg = bank.date
-                    book_avg = self._weighted_avg_date(combo)
-                    avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
-
-                    # Calculate actual amount difference
-                    bank_total = bank.amount_base or Decimal("0")
-                    book_total = sum((b.amount_base for b in combo), Decimal("0"))
-                    amount_diff = abs(q2(bank_total) - q2(book_total))
-
-                    sim = self._cosine_similarity(bank.embedding or [], _avg_embedding(combo))
-                    scores = compute_match_scores(
-                        embed_sim=sim,
-                        amount_diff=amount_diff,
-                        amount_tol=stage.amount_tol or CENT,
-                        date_diff=avg_delta,
-                        date_tol=stage.avg_date_delta_days or 1,
-                        currency_match=1.0,
-                        weights=self.stage_weights,
+                    # Check intra-group coherence before scoring
+                    worst_metrics = _compute_worst_match_metrics(bank, list(combo))
+                    is_coherent, reject_reason = _check_intra_group_coherence(
+                        bank, list(combo), stage, worst_metrics
                     )
+                    if not is_coherent:
+                        log.debug(
+                            "_run_one_to_many: bank_id=%d mixed-sign combo REJECTED - coherence check failed: %s "
+                            "(book_ids=%s)",
+                            bank.id, reject_reason, [b.id for b in combo],
+                        )
+                        combo = None  # Reject this combo
+                    
+                    if combo:  # Only proceed if coherence check passed
+                        book_dates = [b.date for b in combo if b.date]
+                        book_span = (max(book_dates) - min(book_dates)).days if len(book_dates) >= 2 else 0
+                        bank_avg = bank.date
+                        book_avg = self._weighted_avg_date(combo)
+                        avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
+
+                        # Calculate actual amount difference
+                        bank_total = bank.amount_base or Decimal("0")
+                        book_total = sum((b.amount_base for b in combo), Decimal("0"))
+                        amount_diff = abs(q2(bank_total) - q2(book_total))
+
+                        sim = self._cosine_similarity(bank.embedding or [], _avg_embedding(combo))
+                        scores = compute_match_scores(
+                            embed_sim=sim,
+                            amount_diff=amount_diff,
+                            amount_tol=stage.amount_tol or CENT,
+                            date_diff=avg_delta,
+                            date_tol=stage.avg_date_delta_days or 1,
+                            currency_match=1.0,
+                            weights=self.stage_weights,
+                            worst_metrics=worst_metrics,
+                        )
                     sug = self._make_suggestion(
                         "one_to_many",
                         [bank],
@@ -1119,6 +1299,18 @@ class ReconciliationPipelineEngine:
                         book_avg = self._weighted_avg_date(local_books)
                         avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
                         if (not stage.avg_date_delta_days or avg_delta <= stage.avg_date_delta_days):
+                            # Check intra-group coherence before accepting
+                            worst_metrics = _compute_worst_match_metrics(bank, local_books)
+                            is_coherent, reject_reason = _check_intra_group_coherence(
+                                bank, local_books, stage, worst_metrics
+                            )
+                            if not is_coherent:
+                                log.debug(
+                                    "_run_one_to_many: bank_id=%d all-in combo REJECTED - coherence check failed: %s",
+                                    bank.id, reject_reason,
+                                )
+                                continue
+                            
                             # All-in is valid - score and add
                             sim = self._cosine_similarity(bank.embedding or [], _avg_embedding(local_books))
                             scores = compute_match_scores(
@@ -1129,6 +1321,7 @@ class ReconciliationPipelineEngine:
                                 date_tol=stage.avg_date_delta_days or 1,
                                 currency_match=1.0,
                                 weights=self.stage_weights,
+                                worst_metrics=worst_metrics,
                             )
                             sug = self._make_suggestion(
                                 "one_to_many",
@@ -1250,6 +1443,19 @@ class ReconciliationPipelineEngine:
                         )
                         continue
 
+                    # Check intra-group coherence before scoring
+                    worst_metrics = _compute_worst_match_metrics(bank, list(combo))
+                    is_coherent, reject_reason = _check_intra_group_coherence(
+                        bank, list(combo), stage, worst_metrics
+                    )
+                    if not is_coherent:
+                        log.debug(
+                            "_run_one_to_many: bank_id=%d combo REJECTED - coherence check failed: %s "
+                            "(book_ids=%s)",
+                            bank.id, reject_reason, [b.id for b in combo],
+                        )
+                        continue
+
                     # Use the already-calculated diff as amount_diff
                     sim = self._cosine_similarity(bank.embedding or [], _avg_embedding(combo))
                     scores = compute_match_scores(
@@ -1260,6 +1466,7 @@ class ReconciliationPipelineEngine:
                         date_tol=stage.avg_date_delta_days or 1,
                         currency_match=1.0,
                         weights=self.stage_weights,
+                        worst_metrics=worst_metrics,
                     )
                     
                     log.info(
@@ -1472,27 +1679,42 @@ class ReconciliationPipelineEngine:
             if mixed_signs and stage.allow_mixed_signs:
                 combo = self._find_mixed_many_to_one_group(book, local_banks, stage)
                 if combo:
-                    bank_dates = [b.date for b in combo if b.date]
-                    bank_span = (max(bank_dates) - min(bank_dates)).days if len(bank_dates) >= 2 else 0
-                    bank_avg = self._weighted_avg_date(combo)
-                    book_avg = book.date
-                    avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
-
-                    # Calculate actual amount difference
-                    bank_total = sum((b.amount_base for b in combo), Decimal("0"))
-                    book_total = book.amount_base or Decimal("0")
-                    amount_diff = abs(q2(bank_total) - q2(book_total))
-
-                    sim = self._cosine_similarity(_avg_embedding(combo), book.embedding or [])
-                    scores = compute_match_scores(
-                        embed_sim=sim,
-                        amount_diff=amount_diff,
-                        amount_tol=stage.amount_tol or CENT,
-                        date_diff=avg_delta,
-                        date_tol=stage.avg_date_delta_days or 1,
-                        currency_match=1.0,
-                        weights=self.stage_weights,
+                    # Check intra-group coherence before scoring
+                    worst_metrics = _compute_worst_match_metrics(list(combo), [book])
+                    is_coherent, reject_reason = _check_intra_group_coherence(
+                        list(combo), [book], stage, worst_metrics
                     )
+                    if not is_coherent:
+                        log.debug(
+                            "_run_many_to_one: book_id=%d mixed-sign combo REJECTED - coherence check failed: %s "
+                            "(bank_ids=%s)",
+                            book.id, reject_reason, [b.id for b in combo],
+                        )
+                        combo = None  # Reject this combo
+                    
+                    if combo:  # Only proceed if coherence check passed
+                        bank_dates = [b.date for b in combo if b.date]
+                        bank_span = (max(bank_dates) - min(bank_dates)).days if len(bank_dates) >= 2 else 0
+                        bank_avg = self._weighted_avg_date(combo)
+                        book_avg = book.date
+                        avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
+
+                        # Calculate actual amount difference
+                        bank_total = sum((b.amount_base for b in combo), Decimal("0"))
+                        book_total = book.amount_base or Decimal("0")
+                        amount_diff = abs(q2(bank_total) - q2(book_total))
+
+                        sim = self._cosine_similarity(_avg_embedding(combo), book.embedding or [])
+                        scores = compute_match_scores(
+                            embed_sim=sim,
+                            amount_diff=amount_diff,
+                            amount_tol=stage.amount_tol or CENT,
+                            date_diff=avg_delta,
+                            date_tol=stage.avg_date_delta_days or 1,
+                            currency_match=1.0,
+                            weights=self.stage_weights,
+                            worst_metrics=worst_metrics,
+                        )
                     sug = self._make_suggestion(
                         "many_to_one",
                         list(combo),
@@ -1572,6 +1794,18 @@ class ReconciliationPipelineEngine:
                         book_avg = book.date
                         avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
                         if (not stage.avg_date_delta_days or avg_delta <= stage.avg_date_delta_days):
+                            # Check intra-group coherence before accepting
+                            worst_metrics = _compute_worst_match_metrics(local_banks, [book])
+                            is_coherent, reject_reason = _check_intra_group_coherence(
+                                local_banks, [book], stage, worst_metrics
+                            )
+                            if not is_coherent:
+                                log.debug(
+                                    "_run_many_to_one: book_id=%d all-in combo REJECTED - coherence check failed: %s",
+                                    book.id, reject_reason,
+                                )
+                                continue
+                            
                             # All-in is valid - score and add
                             sim = self._cosine_similarity(_avg_embedding(local_banks), book.embedding or [])
                             scores = compute_match_scores(
@@ -1582,6 +1816,7 @@ class ReconciliationPipelineEngine:
                                 date_tol=stage.avg_date_delta_days or 1,
                                 currency_match=1.0,
                                 weights=self.stage_weights,
+                                worst_metrics=worst_metrics,
                             )
                             sug = self._make_suggestion(
                                 "many_to_one",
@@ -1650,6 +1885,19 @@ class ReconciliationPipelineEngine:
                     if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                         continue
 
+                    # Check intra-group coherence before scoring
+                    worst_metrics = _compute_worst_match_metrics(list(combo), [book])
+                    is_coherent, reject_reason = _check_intra_group_coherence(
+                        list(combo), [book], stage, worst_metrics
+                    )
+                    if not is_coherent:
+                        log.debug(
+                            "_run_many_to_one: book_id=%d combo REJECTED - coherence check failed: %s "
+                            "(bank_ids=%s)",
+                            book.id, reject_reason, [b.id for b in combo],
+                        )
+                        continue
+
                     # Use the already-calculated diff as amount_diff
                     sim = self._cosine_similarity(_avg_embedding(combo), book.embedding or [])
                     scores = compute_match_scores(
@@ -1660,6 +1908,7 @@ class ReconciliationPipelineEngine:
                         date_tol=stage.avg_date_delta_days or 1,
                         currency_match=1.0,
                         weights=self.stage_weights,
+                        worst_metrics=worst_metrics,
                     )
                     sug = self._make_suggestion(
                         "many_to_one",
