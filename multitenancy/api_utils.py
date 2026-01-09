@@ -69,9 +69,33 @@ def generic_bulk_update(viewset, request_data):
 
 @transaction.atomic
 def generic_bulk_delete(viewset, ids):
+    """
+    Optimized bulk delete that processes deletions in batches to handle large datasets efficiently.
+    
+    For models with many-to-many relationships (like Reconciliation), this function
+    will handle them efficiently. For models with CASCADE relationships, Django's
+    ORM will handle the cascading deletes automatically.
+    
+    Batch size: 1000 records per batch to balance performance and memory usage.
+    """
     model = viewset.get_queryset().model
-    model.objects.filter(id__in=ids).delete()
-    return Response({'status': 'bulk delete successful'}, status=status.HTTP_204_NO_CONTENT)
+    BULK_DELETE_BATCH_SIZE = 1000
+    
+    if not ids:
+        return Response({'status': 'bulk delete successful', 'deleted_count': 0}, status=status.HTTP_204_NO_CONTENT)
+    
+    total_deleted = 0
+    
+    # Process deletions in batches to avoid memory issues and long-running queries
+    for i in range(0, len(ids), BULK_DELETE_BATCH_SIZE):
+        batch_ids = ids[i:i + BULK_DELETE_BATCH_SIZE]
+        deleted_count = model.objects.filter(id__in=batch_ids).delete()[0]
+        total_deleted += deleted_count
+    
+    return Response({
+        'status': 'bulk delete successful',
+        'deleted_count': total_deleted
+    }, status=status.HTTP_204_NO_CONTENT)
 
 # Function for CSV response
 def create_csv_response(data, delimiter=','):

@@ -612,6 +612,12 @@ class FinancialStatementGenerator:
         if include_pending:
             state_filter = Q(state__in=['posted', 'pending'])
         
+        log.info(
+            "Calculating net_movement: %s account(s), period [%s, %s], "
+            "include_pending=%s, company_id=%s",
+            len(accounts), start_date, end_date, include_pending, self.company_id
+        )
+        
         total = Decimal('0.00')
         
         for account in accounts:
@@ -621,6 +627,8 @@ class FinancialStatementGenerator:
                 date__lte=end_date,
                 transaction__company_id=self.company_id,
             ).filter(state_filter)
+            
+            entry_count = entries.count()
             
             result = entries.aggregate(
                 total_debit=Sum('debit_amount'),
@@ -634,11 +642,47 @@ class FinancialStatementGenerator:
             net = (debit - credit) * account.account_direction
             total += net
             
-            log.debug(
-                "Net movement for account %s: debit=%s, credit=%s, direction=%s, net=%s",
-                account.id, debit, credit, account.account_direction, net
+            log.info(
+                "Account %s (ID: %s, Code: %s): %s entries found, "
+                "debit=%s, credit=%s, direction=%s, net=%s",
+                account.name,
+                account.id,
+                account.account_code,
+                entry_count,
+                debit,
+                credit,
+                account.account_direction,
+                net
             )
+            
+            # If no entries found, log potential reasons
+            if entry_count == 0:
+                # Check if entries exist for this account at all
+                all_entries_count = JournalEntry.objects.filter(
+                    account=account,
+                    transaction__company_id=self.company_id,
+                ).count()
+                
+                # Check entries in date range regardless of state
+                entries_any_state = JournalEntry.objects.filter(
+                    account=account,
+                    date__gte=start_date,
+                    date__lte=end_date,
+                    transaction__company_id=self.company_id,
+                ).count()
+                
+                log.warning(
+                    "Account %s (ID: %s): No entries found in period [%s, %s]. "
+                    "Total entries for account: %s, Entries in date range (any state): %s",
+                    account.name,
+                    account.id,
+                    start_date,
+                    end_date,
+                    all_entries_count,
+                    entries_any_state,
+                )
         
+        log.info("Net movement total: %s", total)
         return total
     
     def _calc_debit_total(
@@ -935,24 +979,67 @@ class FinancialStatementGenerator:
         
         # Filter by specific account
         if line_template.account:
+            # Warn if other selectors are also set (they will be ignored)
+            if line_template.account_path_contains or line_template.account_code_prefix or line_template.account_ids:
+                log.warning(
+                    "Line %s: Both 'account' and other selectors are set. "
+                    "Using only the specific account (ID: %s). Other selectors will be ignored.",
+                    line_template.line_number,
+                    line_template.account.id,
+                )
+            
             log.info(
-                "Line %s: Using specific account %s (ID: %s, Code: %s, Name: %s)",
+                "Line %s: Using specific account %s (ID: %s, Code: %s, Name: %s, Is Leaf: %s)",
                 line_template.line_number,
                 line_template.account.id,
                 line_template.account.id,
                 line_template.account.account_code,
                 line_template.account.name,
+                line_template.account.is_leaf(),
             )
             
             if include_descendants:
                 # Expand parent account to include all leaf descendants
                 expanded = self._expand_to_leaf_accounts([line_template.account])
                 log.info(
-                    "Line %s: Expanded account %s to %s leaf account(s)",
+                    "Line %s: Expanded account %s to %s leaf account(s): %s",
                     line_template.line_number,
                     line_template.account.id,
                     len(expanded),
+                    [f"{acc.account_code or 'None'} ({acc.name})" for acc in expanded[:5]]
                 )
+                
+                # Check if parent account itself has entries
+                # If so, include it in the calculation (common pattern where entries are posted to parent)
+                parent_has_entries = JournalEntry.objects.filter(
+                    account=line_template.account,
+                    transaction__company_id=self.company_id,
+                ).exists()
+                
+                if parent_has_entries:
+                    log.warning(
+                        "Line %s: Parent account %s has journal entries. "
+                        "Including parent account in calculation along with %s leaf accounts.",
+                        line_template.line_number,
+                        line_template.account.id,
+                        len(expanded),
+                    )
+                    # Include parent account in the list
+                    expanded.append(line_template.account)
+                elif len(expanded) == 0:
+                    log.warning(
+                        "Line %s: Account %s expanded to 0 leaf accounts. "
+                        "This account may have no children, or all children are inactive.",
+                        line_template.line_number,
+                        line_template.account.id,
+                    )
+                    # If no leaf accounts and parent has no entries, return empty list
+                    # Otherwise return parent account itself
+                    if not parent_has_entries:
+                        return []
+                    else:
+                        return [line_template.account]
+                
                 return expanded
             else:
                 # Return only the specified account (no descendant expansion)
@@ -3032,4 +3119,179 @@ class FinancialStatementGenerator:
             },
             'comparisons': comparisons,
         }
+    
+    def diagnose_line_calculation(
+        self,
+        line_template: FinancialStatementLineTemplate,
+        start_date: date,
+        end_date: date,
+        as_of_date: Optional[date] = None,
+    ) -> Dict[str, Any]:
+        """
+        Diagnostic method to debug why a line is returning zero.
+        
+        Returns detailed information about:
+        - Account selection
+        - Journal entries found
+        - Calculation results
+        - Potential issues
+        """
+        if as_of_date is None:
+            as_of_date = end_date
+        
+        diagnosis = {
+            'line_template': {
+                'id': line_template.id,
+                'line_number': line_template.line_number,
+                'label': line_template.label,
+                'calculation_method': line_template.get_effective_calculation_method(),
+                'account_id': line_template.account_id,
+                'account_ids': line_template.account_ids,
+                'account_code_prefix': line_template.account_code_prefix,
+                'account_path_contains': line_template.account_path_contains,
+                'include_descendants': getattr(line_template, 'include_descendants', True),
+            },
+            'date_range': {
+                'start_date': str(start_date),
+                'end_date': str(end_date),
+                'as_of_date': str(as_of_date),
+            },
+            'company_id': self.company_id,
+            'accounts_selected': [],
+            'journal_entries': [],
+            'calculation_result': None,
+            'issues': [],
+        }
+        
+        # Get accounts
+        accounts = self._get_accounts_for_line(line_template)
+        diagnosis['accounts_selected'] = [
+            {
+                'id': acc.id,
+                'code': acc.account_code,
+                'name': acc.name,
+                'is_leaf': acc.is_leaf(),
+                'account_direction': acc.account_direction,
+                'parent_id': acc.parent_id,
+            }
+            for acc in accounts
+        ]
+        
+        if not accounts:
+            diagnosis['issues'].append('No accounts found for this line')
+            return diagnosis
+        
+        # Check journal entries for each account
+        for account in accounts:
+            # All entries for this account
+            all_entries = JournalEntry.objects.filter(
+                account=account,
+                transaction__company_id=self.company_id,
+            )
+            
+            # Entries in date range (any state)
+            entries_in_range = JournalEntry.objects.filter(
+                account=account,
+                date__gte=start_date,
+                date__lte=end_date,
+                transaction__company_id=self.company_id,
+            )
+            
+            # Posted entries in date range
+            posted_entries = entries_in_range.filter(state='posted')
+            
+            # Pending entries in date range
+            pending_entries = entries_in_range.filter(state='pending')
+            
+            account_info = {
+                'account_id': account.id,
+                'account_code': account.account_code,
+                'account_name': account.name,
+                'total_entries_all_time': all_entries.count(),
+                'entries_in_date_range': entries_in_range.count(),
+                'posted_entries_in_range': posted_entries.count(),
+                'pending_entries_in_range': pending_entries.count(),
+                'sample_entries': [],
+            }
+            
+            # Get sample entries
+            sample = entries_in_range[:5]
+            for entry in sample:
+                account_info['sample_entries'].append({
+                    'id': entry.id,
+                    'date': str(entry.date),
+                    'state': entry.state,
+                    'debit_amount': float(entry.debit_amount) if entry.debit_amount else 0,
+                    'credit_amount': float(entry.credit_amount) if entry.credit_amount else 0,
+                    'transaction_id': entry.transaction_id,
+                })
+            
+            diagnosis['journal_entries'].append(account_info)
+            
+            # Check for issues
+            if all_entries.count() == 0:
+                diagnosis['issues'].append(
+                    f"Account {account.account_code} ({account.name}) has no journal entries at all"
+                )
+            elif entries_in_range.count() == 0:
+                # Check if entries exist outside date range
+                earliest = all_entries.order_by('date').first()
+                latest = all_entries.order_by('-date').first()
+                if earliest and latest:
+                    diagnosis['issues'].append(
+                        f"Account {account.account_code} has entries but none in range [%s, %s]. "
+                        "Entries exist from %s to %s" % (
+                            start_date, end_date, earliest.date, latest.date
+                        )
+                    )
+            elif posted_entries.count() == 0 and pending_entries.count() > 0:
+                diagnosis['issues'].append(
+                    f"Account {account.account_code} has {pending_entries.count()} pending entries "
+                    "but no posted entries. Set include_pending=True to include them."
+                )
+        
+        # Calculate the actual value
+        calc_method = line_template.get_effective_calculation_method()
+        if calc_method == 'net_movement':
+            diagnosis['calculation_result'] = float(self._calc_net_movement(
+                accounts, start_date, end_date, include_pending=False
+            ))
+        elif calc_method == 'ending_balance':
+            diagnosis['calculation_result'] = float(self._calc_ending_balance(
+                accounts, as_of_date, include_pending=False
+            ))
+        elif calc_method == 'opening_balance':
+            opening_date = start_date - timedelta(days=1)
+            diagnosis['calculation_result'] = float(self._calc_ending_balance(
+                accounts, opening_date, include_pending=False
+            ))
+        else:
+            diagnosis['calculation_result'] = 'Not calculated (method: %s)' % calc_method
+        
+        # Check if parent account has entries (common issue)
+        if line_template.account and not line_template.account.is_leaf():
+            parent_entries_all = JournalEntry.objects.filter(
+                account=line_template.account,
+                transaction__company_id=self.company_id,
+            )
+            parent_entries_range = parent_entries_all.filter(
+                date__gte=start_date,
+                date__lte=end_date,
+            )
+            
+            if parent_entries_all.count() > 0:
+                diagnosis['parent_account_entries'] = {
+                    'account_id': line_template.account.id,
+                    'account_name': line_template.account.name,
+                    'total_entries': parent_entries_all.count(),
+                    'entries_in_range': parent_entries_range.count(),
+                }
+                diagnosis['issues'].append(
+                    f"⚠️  PARENT ACCOUNT '{line_template.account.name}' (ID: {line_template.account.id}) "
+                    f"has {parent_entries_all.count()} entries ({parent_entries_range.count()} in date range). "
+                    "Entries may be linked to parent account instead of leaf accounts! "
+                    "Journal entries should be linked to leaf accounts, not parent accounts."
+                )
+        
+        return diagnosis
 

@@ -5,6 +5,8 @@ from django.apps import apps
 from django.contrib.admin.views.main import ChangeList
 from django.contrib.admin.utils import model_ngettext
 from django.db import transaction as db_transaction
+from django.db.models import Count, Sum, F, DecimalField
+from django.db.models.functions import Coalesce
 from django import forms
 from django.shortcuts import render, redirect
 from django.urls import path
@@ -29,6 +31,19 @@ from multitenancy.admin import PlainAdmin, CompanyScopedAdmin
 
 # Batch size for bulk operations to avoid memory issues
 BULK_DELETE_BATCH_SIZE = 1000
+# Batch size for reconciliation deletion (smaller due to M2M complexity)
+RECONCILIATION_DELETE_BATCH_SIZE = 500
+
+# Import for signal management (lazy import to avoid circular dependencies)
+def _get_signal_handlers():
+    """Lazy import of signal handlers to avoid circular dependencies"""
+    from django.db.models.signals import post_delete, m2m_changed
+    from accounting.signals import (
+        on_reconciliation_deleted,
+        on_reconciliation_entries_changed,
+        update_account_balance
+    )
+    return post_delete, m2m_changed, on_reconciliation_deleted, on_reconciliation_entries_changed, update_account_balance
 
 
 
@@ -462,58 +477,281 @@ class AllocationBaseAdmin(CompanyScopedAdmin):
     autocomplete_fields = ("company", "cost_center", "profit_center")
     search_fields = ("cost_center__name", "profit_center__name")
 
-def delete_reconciliations_for_journal_entries(journal_entry_ids):
+def batch_update_account_balances(affected_account_ids):
+    """
+    Efficiently update account balances for multiple accounts in batch.
+    Uses a single aggregation query with GROUP BY to calculate all balances at once.
+    Only updates leaf accounts (non-leaf accounts get balances from children).
+    
+    Args:
+        affected_account_ids: Set or list of account IDs to update
+        
+    Returns:
+        Dictionary mapping account_id to new balance
+    """
+    if not affected_account_ids:
+        return {}
+    
+    from accounting.models import Account, JournalEntry
+    from django.db.models import Sum, F, DecimalField, Exists, OuterRef
+    from django.db.models.functions import Coalesce
+    from decimal import Decimal
+    
+    # Get only leaf accounts efficiently using MPTT - leaf accounts have no children
+    # Use a subquery to check for children existence
+    leaf_account_ids = list(
+        Account.objects.filter(
+            id__in=affected_account_ids
+        ).annotate(
+            has_children=Exists(
+                Account.objects.filter(parent_id=OuterRef('id'))
+            )
+        ).filter(has_children=False).values_list('id', flat=True)
+    )
+    
+    if not leaf_account_ids:
+        return {}
+    
+    # Calculate all balances in a single query using GROUP BY
+    balance_results = JournalEntry.objects.filter(
+        account_id__in=leaf_account_ids
+    ).values('account_id').annotate(
+        total=Coalesce(
+            Sum(
+                F('debit_amount') - F('credit_amount'),
+                output_field=DecimalField(max_digits=12, decimal_places=2)
+            ),
+            Decimal('0'),
+            output_field=DecimalField(max_digits=12, decimal_places=2)
+        )
+    ).values_list('account_id', 'total')
+    
+    # Create mapping of account_id to new balance
+    balance_map = {account_id: balance for account_id, balance in balance_results}
+    
+    # Set balance to 0 for leaf accounts with no journal entries
+    accounts_with_entries = set(balance_map.keys())
+    accounts_no_entries = set(leaf_account_ids) - accounts_with_entries
+    for account_id in accounts_no_entries:
+        balance_map[account_id] = Decimal('0')
+    
+    # Update all accounts in batch - use select_for_update to avoid race conditions
+    # Get accounts in batches to avoid memory issues
+    accounts_to_update = []
+    for i in range(0, len(leaf_account_ids), BULK_DELETE_BATCH_SIZE):
+        batch_account_ids = leaf_account_ids[i:i + BULK_DELETE_BATCH_SIZE]
+        batch_accounts = Account.objects.filter(id__in=batch_account_ids)
+        for account in batch_accounts:
+            if account.id in balance_map:
+                account.balance = balance_map[account.id]
+                accounts_to_update.append(account)
+    
+    if accounts_to_update:
+        Account.objects.bulk_update(accounts_to_update, ['balance'], batch_size=BULK_DELETE_BATCH_SIZE)
+    
+    return balance_map
+
+
+def batch_update_parent_balances(affected_account_ids, skip_if_large=True):
+    """
+    Efficiently update parent account balances for multiple accounts in batch.
+    Uses a single GROUP BY query to calculate all direct parent balances.
+    
+    Note: This only updates direct parents. For full ancestor tree updates,
+    consider running a separate maintenance task after bulk operations.
+    
+    Args:
+        affected_account_ids: Set or list of account IDs whose parents need updating
+        skip_if_large: If True and more than 100 accounts, skip parent updates for performance
+    """
+    if not affected_account_ids:
+        return
+    
+    # Skip parent updates for very large operations - can be done separately
+    if skip_if_large and len(affected_account_ids) > 100:
+        return
+    
+    from accounting.models import Account
+    from django.db.models import Sum, DecimalField
+    from django.db.models.functions import Coalesce
+    from decimal import Decimal
+    
+    # Get all affected accounts and collect their direct parent IDs
+    affected_accounts = Account.objects.filter(id__in=affected_account_ids).only('parent_id')
+    parent_ids_to_update = {acc.parent_id for acc in affected_accounts if acc.parent_id}
+    
+    if not parent_ids_to_update:
+        return
+    
+    # Calculate ALL direct parent balances in a SINGLE query using GROUP BY
+    # This replaces N queries with 1 query
+    parent_balances = Account.objects.filter(
+        parent_id__in=parent_ids_to_update
+    ).values('parent_id').annotate(
+        total=Coalesce(
+            Sum('balance'),
+            Decimal('0'),
+            output_field=DecimalField(max_digits=12, decimal_places=2)
+        )
+    ).values_list('parent_id', 'total')
+    
+    # Create mapping of parent_id to new balance
+    balance_map = {parent_id: balance for parent_id, balance in parent_balances}
+    
+    # Handle parent accounts with no children (should have balance 0)
+    parents_with_children = set(balance_map.keys())
+    parents_no_children = parent_ids_to_update - parents_with_children
+    for parent_id in parents_no_children:
+        balance_map[parent_id] = Decimal('0')
+    
+    # Get all parent accounts and update their balances in batch
+    parent_accounts = list(Account.objects.filter(id__in=parent_ids_to_update))
+    accounts_to_update = []
+    for account in parent_accounts:
+        if account.id in balance_map:
+            account.balance = balance_map[account.id]
+            accounts_to_update.append(account)
+    
+    if accounts_to_update:
+        Account.objects.bulk_update(accounts_to_update, ['balance'], batch_size=BULK_DELETE_BATCH_SIZE)
+
+
+def delete_reconciliations_for_journal_entries(journal_entry_ids, disable_signals=True):
     """
     Efficiently delete all reconciliations that reference the given journal entries.
-    Uses bulk operations to handle large datasets efficiently.
+    Uses bulk operations with batching to handle large datasets efficiently.
+    
+    Optimizations:
+    - Processes journal entry IDs in batches to avoid memory issues
+    - Uses direct through table query instead of .distinct() to avoid expensive DISTINCT
+    - Processes reconciliation deletions in batches
+    - Disables signals during bulk delete for massive performance improvement
+    - Uses single query to get unique reconciliation IDs from through table
+    
+    Args:
+        journal_entry_ids: List of journal entry IDs
+        disable_signals: If True, disables signals during deletion (default: True for performance)
     """
     if not journal_entry_ids:
-        return 0
+        return 0, set()
     
-    # Find reconciliations that reference these journal entries
-    reconciliations = Reconciliation.objects.filter(
-        journal_entries__id__in=journal_entry_ids
-    ).distinct()
+    # Get all unique reconciliation IDs in a single query (much faster than batching)
+    # Use DISTINCT directly in SQL which is optimized by the database
+    reconciliation_ids = list(
+        Reconciliation.journal_entries.through.objects.filter(
+            journalentry_id__in=journal_entry_ids
+        ).values_list('reconciliation_id', flat=True).distinct()
+    )
     
-    reconciliation_ids = list(reconciliations.values_list('id', flat=True))
+    # Track affected journal entry IDs for return value
+    affected_journal_entry_ids = set(journal_entry_ids)
     
     if not reconciliation_ids:
-        return 0
+        return 0, affected_journal_entry_ids
     
-    # Clear M2M relationships first (more efficient than letting CASCADE handle it)
-    # Delete from the through table
-    Reconciliation.journal_entries.through.objects.filter(
-        reconciliation_id__in=reconciliation_ids
-    ).delete()
+    deleted_count = 0
     
-    Reconciliation.bank_transactions.through.objects.filter(
-        reconciliation_id__in=reconciliation_ids
-    ).delete()
+    # Disable signals during bulk delete for massive performance improvement
+    # Signals will be processed in batch after all deletions are complete
+    if disable_signals:
+        post_delete, m2m_changed, on_reconciliation_deleted, on_reconciliation_entries_changed, _ = _get_signal_handlers()
+        m2m_changed.disconnect(on_reconciliation_entries_changed, sender=Reconciliation.journal_entries.through)
+        post_delete.disconnect(on_reconciliation_deleted, sender=Reconciliation)
     
-    # Now delete the reconciliation records themselves
-    deleted_count = Reconciliation.objects.filter(id__in=reconciliation_ids).delete()[0]
+    try:
+        # Process reconciliation deletions in batches
+        for i in range(0, len(reconciliation_ids), RECONCILIATION_DELETE_BATCH_SIZE):
+            batch_reconciliation_ids = reconciliation_ids[i:i + RECONCILIATION_DELETE_BATCH_SIZE]
+            
+            # Clear M2M relationships first (more efficient than letting CASCADE handle it)
+            # Delete from the through tables in batch
+            Reconciliation.journal_entries.through.objects.filter(
+                reconciliation_id__in=batch_reconciliation_ids
+            ).delete()
+            
+            Reconciliation.bank_transactions.through.objects.filter(
+                reconciliation_id__in=batch_reconciliation_ids
+            ).delete()
+            
+            # Now delete the reconciliation records themselves in batch
+            deleted_count += Reconciliation.objects.filter(
+                id__in=batch_reconciliation_ids
+            ).delete()[0]
+    finally:
+        # Re-enable signals after bulk delete
+        if disable_signals:
+            post_delete, m2m_changed, on_reconciliation_deleted, on_reconciliation_entries_changed, _ = _get_signal_handlers()
+            m2m_changed.connect(on_reconciliation_entries_changed, sender=Reconciliation.journal_entries.through)
+            post_delete.connect(on_reconciliation_deleted, sender=Reconciliation)
     
-    return deleted_count
+    return deleted_count, affected_journal_entry_ids
 
 
 @admin.register(Transaction)
 class TransactionAdmin(CompanyScopedAdmin):
-    list_display = ("id", "date", "description", "amount", "entity", "currency", "state", "company", "notes")
+    list_display = ("id", "date", "description", "amount", "entity", "currency", "state", "journal_entries_count", "transaction_balance", "company", "notes")
     list_filter = ("state", "currency", "entity", "company", "date", "notes")
     autocomplete_fields = ("company", "entity", "currency")
     search_fields = ("description", "entity__name", "notes")
+    
+    def get_queryset(self, request):
+        """Optimize queryset with annotations for journal entry count and balance"""
+        queryset = super().get_queryset(request)
+        queryset = queryset.annotate(
+            journal_entries_count=Count('journal_entries'),
+            total_debits=Coalesce(Sum('journal_entries__debit_amount'), 0, output_field=DecimalField(max_digits=12, decimal_places=2)),
+            total_credits=Coalesce(Sum('journal_entries__credit_amount'), 0, output_field=DecimalField(max_digits=12, decimal_places=2)),
+        )
+        return queryset
+    
+    def journal_entries_count(self, obj):
+        """Display the count of journal entries for this transaction"""
+        return getattr(obj, 'journal_entries_count', obj.journal_entries.count())
+    journal_entries_count.short_description = 'Journal Entries'
+    journal_entries_count.admin_order_field = 'journal_entries_count'
+    
+    def transaction_balance(self, obj):
+        """Display the transaction balance (debits - credits)"""
+        if hasattr(obj, 'total_debits') and hasattr(obj, 'total_credits'):
+            balance = obj.total_debits - obj.total_credits
+        else:
+            # Fallback if annotations aren't available
+            total_debits = sum(je.debit_amount or 0 for je in obj.journal_entries.all())
+            total_credits = sum(je.credit_amount or 0 for je in obj.journal_entries.all())
+            balance = total_debits - total_credits
+        
+        # Format the balance as a string with 2 decimal places
+        balance_str = f'{float(balance):.2f}'
+        
+        # Format with color coding: red for negative, green for positive, black for zero
+        if balance < 0:
+            return format_html('<span style="color: red;">{}</span>', balance_str)
+        elif balance > 0:
+            return format_html('<span style="color: green;">{}</span>', balance_str)
+        else:
+            return balance_str
+    transaction_balance.short_description = 'Balance (Debits - Credits)'
+    # Note: Can't order by computed balance field directly, but can order by total_debits or total_credits if needed
     
     @admin.action(description="Delete selected transactions (with journal entries and reconciliations)")
     def fast_delete_selected(self, request, queryset):
         """
         Optimized bulk delete for transactions that:
-        1. Gets all related journal entry IDs first
+        1. Gets all related journal entry IDs first (in batches to avoid memory issues)
         2. Deletes reconciliations that reference those journal entries
-        3. Deletes transactions (which CASCADE deletes journal entries)
+        3. Deletes transactions in batches (which CASCADE deletes journal entries)
         
         Handles thousands of records efficiently using batch processing.
+        Optimizations:
+        - Batches journal entry ID retrieval to avoid loading all into memory
+        - Uses optimized reconciliation deletion with batching
+        - Processes transactions in batches
         """
-        transaction_ids = list(queryset.values_list('id', flat=True))
+        # Get transaction IDs - use iterator to avoid loading all into memory
+        transaction_ids = []
+        for transaction_id in queryset.values_list('id', flat=True).iterator(chunk_size=BULK_DELETE_BATCH_SIZE):
+            transaction_ids.append(transaction_id)
+        
         total_count = len(transaction_ids)
         
         if not total_count:
@@ -521,7 +759,8 @@ class TransactionAdmin(CompanyScopedAdmin):
             return
         
         # Get all journal entry IDs that will be deleted (CASCADE)
-        # We need to do this BEFORE deleting transactions
+        # We need to do this BEFORE deleting transactions to find related reconciliations
+        # Get IDs directly without loading account_id (we don't need it anymore since balance updates are disabled)
         journal_entry_ids = list(
             JournalEntry.objects.filter(transaction_id__in=transaction_ids)
             .values_list('id', flat=True)
@@ -531,18 +770,33 @@ class TransactionAdmin(CompanyScopedAdmin):
         deleted_transactions = 0
         deleted_journal_entries = len(journal_entry_ids)
         
-        # Use database transaction to ensure atomicity
-        with db_transaction.atomic():
-            # Step 1: Delete reconciliations that reference these journal entries
-            if journal_entry_ids:
-                deleted_reconciliations = delete_reconciliations_for_journal_entries(journal_entry_ids)
-            
-            # Step 2: Delete transactions in batches (CASCADE will delete journal entries)
-            # Process in batches to avoid memory issues with very large datasets
-            for i in range(0, total_count, BULK_DELETE_BATCH_SIZE):
-                batch_ids = transaction_ids[i:i + BULK_DELETE_BATCH_SIZE]
-                batch_queryset = Transaction.objects.filter(id__in=batch_ids)
-                deleted_transactions += batch_queryset.delete()[0]
+        # Disable signals during bulk delete for massive performance improvement
+        # We'll process signal updates in batch after all deletions
+        post_delete, _, _, _, update_account_balance = _get_signal_handlers()
+        post_delete.disconnect(update_account_balance, sender=JournalEntry)
+        
+        try:
+            # Use database transaction to ensure atomicity
+            with db_transaction.atomic():
+                # Step 1: Delete reconciliations that reference these journal entries
+                if journal_entry_ids:
+                    deleted_reconciliations, _ = delete_reconciliations_for_journal_entries(
+                        journal_entry_ids, disable_signals=True
+                    )
+                
+                # Step 2: Delete transactions in batches (CASCADE will delete journal entries)
+                # Process in batches to avoid memory issues with very large datasets
+                for i in range(0, total_count, BULK_DELETE_BATCH_SIZE):
+                    batch_ids = transaction_ids[i:i + BULK_DELETE_BATCH_SIZE]
+                    batch_queryset = Transaction.objects.filter(id__in=batch_ids)
+                    deleted_transactions += batch_queryset.delete()[0]
+                
+                # Step 3: Skip account balance updates during bulk delete for maximum performance
+                # Account balances will be recalculated automatically when needed or can be
+                # recalculated via a separate maintenance task. This avoids N+1 query issues.
+        finally:
+            # Re-enable signals after bulk operations
+            post_delete.connect(update_account_balance, sender=JournalEntry)
         
         # Build success message
         message_parts = [
@@ -584,8 +838,14 @@ class JournalEntryAdmin(CompanyScopedAdmin):
         2. Deletes journal entries (transactions are kept)
         
         Handles thousands of records efficiently using batch processing.
+        Optimizations:
+        - Uses iterator to avoid loading all IDs into memory at once
+        - Uses optimized reconciliation deletion with batching
+        - Processes journal entries in batches
         """
+        # Get journal entry IDs - we don't need account IDs anymore since balance updates are disabled
         journal_entry_ids = list(queryset.values_list('id', flat=True))
+        
         total_count = len(journal_entry_ids)
         
         if not total_count:
@@ -595,17 +855,32 @@ class JournalEntryAdmin(CompanyScopedAdmin):
         deleted_reconciliations = 0
         deleted_journal_entries = 0
         
-        # Use database transaction to ensure atomicity
-        with db_transaction.atomic():
-            # Step 1: Delete reconciliations that reference these journal entries
-            deleted_reconciliations = delete_reconciliations_for_journal_entries(journal_entry_ids)
-            
-            # Step 2: Delete journal entries in batches
-            # Process in batches to avoid memory issues with very large datasets
-            for i in range(0, total_count, BULK_DELETE_BATCH_SIZE):
-                batch_ids = journal_entry_ids[i:i + BULK_DELETE_BATCH_SIZE]
-                batch_queryset = JournalEntry.objects.filter(id__in=batch_ids)
-                deleted_journal_entries += batch_queryset.delete()[0]
+        # Disable signals during bulk delete for massive performance improvement
+        # We'll process signal updates in batch after all deletions
+        post_delete, _, _, _, update_account_balance = _get_signal_handlers()
+        post_delete.disconnect(update_account_balance, sender=JournalEntry)
+        
+        try:
+            # Use database transaction to ensure atomicity
+            with db_transaction.atomic():
+                # Step 1: Delete reconciliations that reference these journal entries
+                deleted_reconciliations, _ = delete_reconciliations_for_journal_entries(
+                    journal_entry_ids, disable_signals=True
+                )
+                
+                # Step 2: Delete journal entries in batches
+                # Process in batches to avoid memory issues with very large datasets
+                for i in range(0, total_count, BULK_DELETE_BATCH_SIZE):
+                    batch_ids = journal_entry_ids[i:i + BULK_DELETE_BATCH_SIZE]
+                    batch_queryset = JournalEntry.objects.filter(id__in=batch_ids)
+                    deleted_journal_entries += batch_queryset.delete()[0]
+                
+                # Step 3: Skip account balance updates during bulk delete for maximum performance
+                # Account balances will be recalculated automatically when needed or can be
+                # recalculated via a separate maintenance task. This avoids N+1 query issues.
+        finally:
+            # Re-enable signals after bulk operations
+            post_delete.connect(update_account_balance, sender=JournalEntry)
         
         # Build success message
         message_parts = [

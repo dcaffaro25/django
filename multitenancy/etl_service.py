@@ -1275,7 +1275,8 @@ class ETLPipelineService:
                 logger.info(f"ETL: Processing {len(transaction_sheets)} Transaction sheet(s) with auto-created JournalEntries")
                 transaction_import_result = self._import_transactions_with_journal_entries(
                     transaction_sheets, 
-                    self.extra_fields_by_model.get('Transaction', [])
+                    self.extra_fields_by_model.get('Transaction', []),
+                    import_metadata=import_metadata
                 )
             
             # Process other sheets normally
@@ -1578,7 +1579,7 @@ class ETLPipelineService:
         
         return import_result_for_response
     
-    def _import_transactions_with_journal_entries(self, transaction_sheets: List[dict], extra_fields_list: List[dict]) -> dict:
+    def _import_transactions_with_journal_entries(self, transaction_sheets: List[dict], extra_fields_list: List[dict], import_metadata: dict = None) -> dict:
         """
         Import Transactions and create JournalEntries immediately after each Transaction,
         all within the same transaction context. This ensures Transactions are accessible
@@ -1613,7 +1614,9 @@ class ETLPipelineService:
             return execute_import_job(
                 company_id=self.company_id,
                 sheets=transaction_sheets,
-                commit=False
+                commit=True,
+                lookup_cache=self.lookup_cache,
+                import_metadata=import_metadata
             )
         
         if self.debug_account_substitution:
@@ -1937,6 +1940,64 @@ class ETLPipelineService:
                         action = "update"
                     else:
                         instance = model(**filtered)
+                    
+                    # Add notes metadata if notes field exists and this is a new record
+                    if action == "create" and hasattr(instance, 'notes'):
+                        # Import here to avoid circular import issues
+                        try:
+                            from multitenancy.utils import build_notes_metadata
+                            from crum import get_current_user
+                        except ImportError:
+                            # Fallback: if import fails, create a simple notes string
+                            from crum import get_current_user
+                            def build_notes_metadata(source, function=None, filename=None, user=None, user_id=None, **kwargs):
+                                parts = [f"Source: {source}"]
+                                if function:
+                                    parts.append(f"Function: {function}")
+                                if filename:
+                                    parts.append(f"File: {filename}")
+                                if user:
+                                    parts.append(f"User: {user}")
+                                return " | ".join(parts)
+                        
+                        # Get current user for notes
+                        current_user = get_current_user()
+                        user_name = current_user.username if current_user and current_user.is_authenticated else None
+                        user_id = current_user.id if current_user and current_user.is_authenticated else None
+                        
+                        # Get Excel row metadata from extra_fields
+                        extra_fields = extra_fields_list[row_idx] if row_idx < len(extra_fields_list) else {}
+                        excel_row_id = extra_fields.get('__excel_row_id')
+                        excel_row_number = extra_fields.get('__excel_row_number')
+                        excel_sheet_name = extra_fields.get('__excel_sheet_name')
+                        
+                        # Build notes with metadata
+                        notes_metadata = {
+                            'source': import_metadata.get('source', 'ETL') if import_metadata else 'ETL',
+                            'function': import_metadata.get('function', 'ETLPipelineService._import_transactions_with_journal_entries') if import_metadata else 'ETLPipelineService._import_transactions_with_journal_entries',
+                            'user': user_name,
+                            'user_id': user_id,
+                        }
+                        
+                        # Add filename if available
+                        if import_metadata and 'filename' in import_metadata:
+                            notes_metadata['filename'] = import_metadata['filename']
+                        
+                        # Add log_id if available
+                        if import_metadata and 'log_id' in import_metadata:
+                            notes_metadata['log_id'] = import_metadata['log_id']
+                        
+                        # Add Excel row metadata if available
+                        if excel_row_id:
+                            notes_metadata['excel_row_id'] = excel_row_id
+                        if excel_row_number:
+                            notes_metadata['row_number'] = excel_row_number
+                        if excel_sheet_name:
+                            notes_metadata['sheet_name'] = excel_sheet_name
+                        elif sheet.get('sheet_name'):
+                            notes_metadata['sheet_name'] = sheet.get('sheet_name')
+                        
+                        instance.notes = build_notes_metadata(**notes_metadata)
                     
                     # Validate & save
                     save_start = time.time()
