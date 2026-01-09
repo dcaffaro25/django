@@ -3308,15 +3308,17 @@ class ReconciliationPipelineEngine:
             log.debug("[FAST] OTM_FAST bank=%s beam combos=%s", bank.id, len(combos_from_beam))
 
             # If beam search failed to find anything, fall back to branch-and-bound subset search
+            # Use multi version to find multiple alternatives (in case some fail coherence checks)
             if not combos:
                 amounts = [item.amount_q2 for item in book_items]
-                bb_indices = branch_and_bound_subset(
+                bb_results = branch_and_bound_subset_multi(
                     amounts=amounts,
                     target=target,
                     tolerance=stage.amount_tol,
                     max_size=stage.max_group_size_book,
+                    max_results=10,  # Find up to 10 alternatives
                 )
-                if bb_indices:
+                for bb_indices in bb_results:
                     bb_combo = [book_items[i].dto for i in bb_indices]
                     total_bb = sum((b.amount_base for b in bb_combo), Decimal("0"))
                     diff_bb = abs(q2(total_bb) - target)
@@ -3328,6 +3330,8 @@ class ReconciliationPipelineEngine:
                         [(d.id, d.amount_base, d.date) for d in bb_combo],
                     )
                     combos.append(bb_combo)
+                if bb_results:
+                    log.debug("[FAST] OTM_FAST bank=%s branch_and_bound found %d alternatives", bank.id, len(bb_results))
         
         log.debug(
             "[FAST] OTM_FAST bank=%s combos_ready=%s detail=%s",
@@ -4157,11 +4161,13 @@ import itertools
 
 
 def branch_and_bound_subset(amounts: List[Decimal], target: Decimal, tolerance: Decimal = Decimal("0.00"),
-                            max_size: Optional[int] = None) -> Optional[List[int]]:
+                            max_size: Optional[int] = None, max_results: int = 1) -> Optional[List[int]]:
     """
-    Find a subset of `amounts` whose sum is within +/- `tolerance` of `target` using a
-    depth‑first branch‑and‑bound search.  The function returns a list of indices
-    into the original `amounts` list or None if no valid combination is found.
+    Find subsets of `amounts` whose sum is within +/- `tolerance` of `target` using a
+    depth‑first branch‑and‑bound search.
+    
+    When max_results=1 (default), returns the first valid subset found.
+    When max_results>1, returns the first valid subset but the multi variant should be used.
 
     Parameters
     ----------
@@ -4176,6 +4182,8 @@ def branch_and_bound_subset(amounts: List[Decimal], target: Decimal, tolerance: 
         Maximum number of elements allowed in the subset.  If None, no limit is
         enforced.  This can be used to limit the depth of the search to keep
         combinatorial explosion in check.
+    max_results: int
+        For compatibility - use branch_and_bound_subset_multi for multiple results.
 
     Returns
     -------
@@ -4183,25 +4191,52 @@ def branch_and_bound_subset(amounts: List[Decimal], target: Decimal, tolerance: 
         A list of indices of amounts that sum to within tolerance of the target,
         or None if no such subset exists.
     """
+    results = branch_and_bound_subset_multi(amounts, target, tolerance, max_size, max_results=1)
+    return results[0] if results else None
+
+
+def branch_and_bound_subset_multi(amounts: List[Decimal], target: Decimal, tolerance: Decimal = Decimal("0.00"),
+                                   max_size: Optional[int] = None, max_results: int = 10) -> List[List[int]]:
+    """
+    Find MULTIPLE subsets of `amounts` whose sum is within +/- `tolerance` of `target`.
+    Returns up to max_results different valid combinations.
+    
+    This is useful when some combinations may be rejected by other constraints (e.g., date span)
+    and we want to try alternative combinations.
+
+    Parameters
+    ----------
+    amounts: List[Decimal]
+        A list of Decimal amounts.  Negative values are allowed.
+    target: Decimal
+        The target sum that the selected subset should approximate.
+    tolerance: Decimal
+        The allowed absolute difference between the subset sum and the target.
+    max_size: Optional[int]
+        Maximum number of elements allowed in the subset.
+    max_results: int
+        Maximum number of valid subsets to return (default 10).
+
+    Returns
+    -------
+    List[List[int]]
+        A list of valid subsets (each subset is a list of indices), or empty list if none found.
+    """
     n = len(amounts)
     if n == 0:
-        return None
+        return []
 
     # Normalize inputs
     amounts = [Decimal(x) for x in amounts]
     target = Decimal(target)
     tol = Decimal(tolerance) if tolerance is not None else Decimal("0")
 
-    # Sort indices by absolute value descending to improve pruning.  We need to
-    # track original indices to reconstruct the subset later.
+    # Sort indices by absolute value descending to improve pruning.
     indexed = list(enumerate(amounts))
     indexed.sort(key=lambda x: abs(x[1]), reverse=True)
     sorted_indices, sorted_amounts = zip(*indexed)
 
-    # Precompute remaining min/max sums from each position.  For each i,
-    # rem_min[i] is the sum of all negative numbers from i onward, and
-    # rem_max[i] is the sum of all positive numbers from i onward.  These
-    # bounds allow us to prune branches that cannot reach the target ± tol.
+    # Precompute remaining min/max sums from each position.
     rem_min = [Decimal("0")] * (n + 1)
     rem_max = [Decimal("0")] * (n + 1)
     for i in range(n - 1, -1, -1):
@@ -4213,11 +4248,12 @@ def branch_and_bound_subset(amounts: List[Decimal], target: Decimal, tolerance: 
             rem_min[i] = rem_min[i + 1] + amt
             rem_max[i] = rem_max[i + 1]
 
-    result: Optional[List[int]] = None
+    results: List[List[int]] = []
+    seen_sets: set = set()  # Track unique combinations to avoid duplicates
 
     def dfs(idx: int, chosen: List[int], current_sum: Decimal):
-        nonlocal result
-        if result is not None:
+        nonlocal results
+        if len(results) >= max_results:
             return
         # If we exceeded the optional group size, stop exploring
         if max_size is not None and len(chosen) > max_size:
@@ -4225,29 +4261,29 @@ def branch_and_bound_subset(amounts: List[Decimal], target: Decimal, tolerance: 
         # If we've considered all items, check if the sum is within tolerance
         if idx == n:
             if chosen and (target - tol) <= current_sum <= (target + tol):
-                result = chosen.copy()
+                # Check if this combination is unique (sorted to avoid order-dependent duplicates)
+                combo_key = tuple(sorted(chosen))
+                if combo_key not in seen_sets:
+                    seen_sets.add(combo_key)
+                    results.append(chosen.copy())
             return
         # Calculate bounds on the sum reachable with remaining items
-        # The best we can do is current_sum + rem_min[idx] (if all remaining are negative)
-        # or current_sum + rem_max[idx] (if all remaining are positive)
         min_possible = current_sum + rem_min[idx]
         max_possible = current_sum + rem_max[idx]
-        # If the interval [min_possible, max_possible] does not intersect [target - tol, target + tol]
-        # then prune this branch
+        # If the interval doesn't intersect [target - tol, target + tol], prune
         if max_possible < (target - tol) or min_possible > (target + tol):
             return
         # Branch 1: skip current item
         dfs(idx + 1, chosen, current_sum)
-        if result is not None:
+        if len(results) >= max_results:
             return
         # Branch 2: include current item
         dfs(idx + 1, chosen + [idx], current_sum + sorted_amounts[idx])
 
     dfs(0, [], Decimal("0"))
-    if result is None:
-        return None
-    # Translate sorted indices back to original indices
-    return [sorted_indices[i] for i in result]
+    
+    # Translate sorted indices back to original indices for all results
+    return [[sorted_indices[i] for i in result] for result in results]
 
 
 def beam_search_subsets(amounts: List[Decimal], target: Decimal, tolerance: Decimal = Decimal("0.00"),
