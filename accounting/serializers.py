@@ -187,6 +187,7 @@ class JournalEntrySerializer(serializers.ModelSerializer):
             "debit_amount", "credit_amount",
             "state", "date",
             "bank_designation_pending", "has_designated_bank",
+            "notes",
         ]
 
 class JournalEntryListSerializer(serializers.ModelSerializer):
@@ -207,7 +208,7 @@ class JournalEntryListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'company', 'entity', 'currency', 'description', 'bank_date', 'balance',
             'transaction_date', 'transaction_description', 'transaction_value',
-            'bank_account', 'reconciliation_status',
+            'bank_account', 'reconciliation_status', 'notes',
         ]
 
     def to_representation(self, instance):
@@ -317,7 +318,7 @@ class TransactionListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'company', 'entity', 'currency', 'date', 'bank_date', 'description', 'amount', 'state',
             'journal_entries_count', 'balance', 'journal_entries_summary',
-            'journal_entries_bank_accounts', 'reconciliation_status'
+            'journal_entries_bank_accounts', 'reconciliation_status', 'notes'
         ]
 
     def get_journal_entries_count(self, obj):
@@ -428,7 +429,7 @@ class BankTransactionSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'company', 'bank_account', 'entity', 'entity_name', 'currency', 'date', 
             'description', 'amount', 'status', #'transaction_type',
-            'is_deleted', 'updated_at', 'updated_by', 'reconciliation_status'
+            'is_deleted', 'updated_at', 'updated_by', 'reconciliation_status', 'notes'
         ]
         extra_kwargs = {
             "bank_account": {"queryset": BankAccount.objects.all()},
