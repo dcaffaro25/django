@@ -240,14 +240,14 @@ def compare_two_engines_task(self, db_id: int, data: Dict[str, Any], tenant_id: 
         created_at=now,
     )
 
-    # dispatch both (optionally dedicated queues configured in Celery)
+    # dispatch both to the same recon queue
     legacy_async = match_many_to_many_task.apply_async(
         args=(legacy_row.id, legacy_data, tenant_id, auto_match_100, False),
-        queue="recon_legacy",
+        queue="recon",
     )
     fast_async = match_many_to_many_task.apply_async(
         args=(fast_row.id, fast_data, tenant_id, auto_match_100, True),
-        queue="recon_fast",
+        queue="recon",
     )
     
     legacy_row.task_id = legacy_async.id
@@ -348,6 +348,13 @@ def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=Fa
     Wrapper that calls ReconciliationService.match_many_to_many with streaming on_suggestion callback.
     Persists suggestions in batches and updates the ReconciliationTask object incrementally.
     """
+    engine_tag = "[FAST]" if fast else "[REGULAR]"
+    logger.info(
+        "%s match_many_to_many_task START: db_id=%s fast=%s tenant_id=%s bank_ids=%s book_ids=%s",
+        engine_tag, db_id, fast, tenant_id,
+        (data or {}).get("bank_ids", [])[:5],  # first 5 for brevity
+        (data or {}).get("book_ids", [])[:5],
+    )
     task_obj = ReconciliationTask.objects.get(id=db_id)
     
     # local copy so we don't mutate the caller's dict
@@ -377,6 +384,10 @@ def match_many_to_many_task(self, db_id, data, tenant_id=None, auto_match_100=Fa
     
     request_data["fast"] = fast
     
+    logger.info(
+        "%s match_many_to_many_task: request_data[fast]=%s strategy=%s about to call engine",
+        engine_tag, request_data.get("fast"), strategy,
+    )
     
     flush_interval = DEFAULT_SUGGESTION_FLUSH_INTERVAL
     buffer: List[ReconciliationSuggestion] = []
