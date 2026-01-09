@@ -3005,6 +3005,19 @@ class ReconciliationPipelineEngine:
             if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                 continue
             
+            # Check intra-group coherence before scoring
+            worst_metrics = _compute_worst_match_metrics(bank, combo)
+            is_coherent, reject_reason = _check_intra_group_coherence(
+                bank, combo, stage, worst_metrics
+            )
+            if not is_coherent:
+                log.debug(
+                    "_evaluate_and_record_candidates: bank_id=%d combo REJECTED - coherence check failed: %s "
+                    "(book_ids=%s)",
+                    bank.id, reject_reason, [b.id for b in combo],
+                )
+                continue
+            
             # Calculate actual amount difference
             bank_total = bank.amount_base or Decimal("0")
             book_total = sum((b.amount_base for b in combo), Decimal("0"))
@@ -3020,6 +3033,7 @@ class ReconciliationPipelineEngine:
                 date_tol=stage.avg_date_delta_days or 1,
                 currency_match=1.0,
                 weights=self.stage_weights,
+                worst_metrics=worst_metrics,
             )
             suggestion = self._make_suggestion(
                 match_type,
@@ -3632,6 +3646,19 @@ class ReconciliationPipelineEngine:
             if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                 continue
             
+            # Check intra-group coherence before scoring
+            worst_metrics = _compute_worst_match_metrics(combo, [book])
+            is_coherent, reject_reason = _check_intra_group_coherence(
+                combo, [book], stage, worst_metrics
+            )
+            if not is_coherent:
+                log.debug(
+                    "MTO_FAST book_id=%d combo REJECTED - coherence check failed: %s "
+                    "(bank_ids=%s)",
+                    book.id, reject_reason, [b.id for b in combo],
+                )
+                continue
+            
             # Calculate actual amount difference
             bank_total = sum((b.amount_base for b in combo), Decimal("0"))
             book_total = book.amount_base or Decimal("0")
@@ -3646,6 +3673,7 @@ class ReconciliationPipelineEngine:
                 date_tol=stage.avg_date_delta_days or 1,
                 currency_match=1.0,
                 weights=self.stage_weights,
+                worst_metrics=worst_metrics,
             )
             suggestion = self._make_suggestion(
                 "many_to_one",
@@ -3975,6 +4003,33 @@ class ReconciliationPipelineEngine:
                     if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                         continue
                     
+                    # Check intra-group coherence before scoring
+                    # For many-to-many, check coherence of both bank and book groups
+                    worst_metrics_bank = _compute_worst_match_metrics(bank_combo, book_combo)
+                    worst_metrics_book = _compute_worst_match_metrics(book_combo, bank_combo)
+                    # Use the worst of both sides
+                    worst_metrics = {
+                        "max_date_delta": max(worst_metrics_bank["max_date_delta"], worst_metrics_book["max_date_delta"]),
+                        "min_embedding_sim": min(worst_metrics_bank["min_embedding_sim"], worst_metrics_book["min_embedding_sim"]),
+                        "max_date_delta_ratio": max(worst_metrics_bank["max_date_delta_ratio"], worst_metrics_book["max_date_delta_ratio"]),
+                    }
+                    
+                    # Check coherence for both groups
+                    is_coherent_bank, reject_reason_bank = _check_intra_group_coherence(
+                        bank_combo, book_combo, stage, worst_metrics_bank
+                    )
+                    is_coherent_book, reject_reason_book = _check_intra_group_coherence(
+                        book_combo, bank_combo, stage, worst_metrics_book
+                    )
+                    if not is_coherent_bank or not is_coherent_book:
+                        log.debug(
+                            "MTM_FAST anchor_bank=%d combo REJECTED - coherence check failed: bank=%s book=%s "
+                            "(bank_ids=%s book_ids=%s)",
+                            anchor_bank.id, reject_reason_bank, reject_reason_book,
+                            [b.id for b in bank_combo], [e.id for e in book_combo],
+                        )
+                        continue
+                    
                     # Calculate actual amount difference
                     bank_total = sum((b.amount_base for b in bank_combo), Decimal("0"))
                     book_total = sum((e.amount_base for e in book_combo), Decimal("0"))
@@ -3991,6 +4046,7 @@ class ReconciliationPipelineEngine:
                         date_tol=stage.avg_date_delta_days or 1,
                         currency_match=1.0,
                         weights=self.stage_weights,
+                        worst_metrics=worst_metrics,
                     )
                     suggestion = self._make_suggestion(
                         "many_to_many",
