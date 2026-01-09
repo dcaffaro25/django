@@ -4701,6 +4701,10 @@ def run_single_config(cfg: object,
     except Exception:
         max_runtime = None
 
+    log.info(
+        "[%s] run_single_config: creating PipelineConfig with fast=%s cfg_id=%s stage_type=%s",
+        "FAST" if fast else "REGULAR", fast, getattr(cfg, "id", None), stage_type,
+    )
     pipe_cfg = PipelineConfig(
         stages=[stage],
         auto_apply_score=float(getattr(cfg, "min_confidence", 1.0)),
