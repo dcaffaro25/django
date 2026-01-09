@@ -63,7 +63,7 @@ from .serializers import (
 from .serializers import ResolvedReconciliationConfigSerializer
 
 # accounting/views_embeddings.py
-from accounting.tasks import match_many_to_many_task, compare_two_engines_task
+from accounting.tasks import match_many_to_many_task
 import os
 import time
 import requests
@@ -3133,28 +3133,16 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         )
 
         # -------------------------
-        #  NEW: Dual-engine toggle
+        #  Single engine dispatch (fast flag from request)
         # -------------------------
-        from django.conf import settings
-    
-        use_dual_engine = getattr(settings, "RECONCILIATION_DUAL_ENGINE", True)
-    
-        if use_dual_engine:
-            # Launch the orchestrator instead of the legacy task
-            async_result = compare_two_engines_task.delay(
-                task_obj.id,
-                data,
-                tenant_id,
-                auto_match_100,
-            )
-        else:
-            # Default: legacy engine
-            async_result = match_many_to_many_task.delay(
-                task_obj.id,
-                data,
-                tenant_id,
-                auto_match_100,
-            )
+        use_fast = data.get("fast", False)
+        async_result = match_many_to_many_task.delay(
+            task_obj.id,
+            data,
+            tenant_id,
+            auto_match_100,
+            use_fast,  # pass fast flag to task
+        )
     
         task_obj.task_id = async_result.id
         task_obj.save(update_fields=["task_id", "updated_at"])
