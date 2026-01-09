@@ -2327,6 +2327,10 @@ class ETLPipelineService:
                                 # if bank_validate_time > 0.1:
                                 #     logger.info(f"ETL DEBUG: Row {row_idx + 1} bank JE validation took {bank_validate_time:.3f}s")
                                 journal_entries_to_create.append(bank_je)
+                                # Store Excel row metadata for notes
+                                excel_row_id = extra_fields.get('__excel_row_id')
+                                excel_row_number = extra_fields.get('__excel_row_number')
+                                excel_sheet_name = extra_fields.get('__excel_sheet_name')
                                 journal_entry_metadata.append({
                                     'type': 'bank',
                                     'transaction_id': instance.id,
@@ -2334,6 +2338,9 @@ class ETLPipelineService:
                                     'account_path': "Pending Bank Account",
                                     'debit_amount': bank_debit,
                                     'credit_amount': bank_credit,
+                                    'excel_row_id': excel_row_id,
+                                    'excel_row_number': excel_row_number,
+                                    'excel_sheet_name': excel_sheet_name,
                                 })
                                 bank_je_time = time.time() - bank_je_create_start
                                 if bank_je_time > 0.05:
@@ -2420,6 +2427,10 @@ class ETLPipelineService:
                                     opp_je_time = time.time() - opp_je_create_start
                                     if opp_je_time > 0.05:
                                         logger.debug(f"ETL DEBUG: Row {row_idx + 1} opposing JE creation took {opp_je_time:.3f}s")
+                                    # Store Excel row metadata for notes
+                                    excel_row_id = extra_fields.get('__excel_row_id')
+                                    excel_row_number = extra_fields.get('__excel_row_number')
+                                    excel_sheet_name = extra_fields.get('__excel_sheet_name')
                                     journal_entry_metadata.append({
                                         'type': 'opposing',
                                         'transaction_id': instance.id,
@@ -2429,6 +2440,9 @@ class ETLPipelineService:
                                         'account_code': opposing_account.account_code if hasattr(opposing_account, 'account_code') else None,
                                         'debit_amount': opp_debit,
                                         'credit_amount': opp_credit,
+                                        'excel_row_id': excel_row_id,
+                                        'excel_row_number': excel_row_number,
+                                        'excel_sheet_name': excel_sheet_name,
                                     })
                                     if self.debug_account_substitution:
                                         logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - SUCCESS: Opposing JE prepared for bulk_create. Total JEs in queue: {len(journal_entries_to_create)}")
@@ -2519,6 +2533,49 @@ class ETLPipelineService:
                 if self.debug_account_substitution:
                     logger.info(f"ETL OPPOSING JE: SUCCESS - Bulk created {len(created_jes)} JournalEntries in {bulk_time:.3f}s ({len(created_jes)/bulk_time:.1f} entries/sec)")
                 logger.info(f"ETL: Successfully bulk created {len(created_jes)} JournalEntries in {bulk_time:.3f}s ({len(created_jes)/bulk_time:.1f} entries/sec)")
+                
+                # Add notes to all created Journal Entries
+                notes_start = time.time()
+                if created_jes and hasattr(created_jes[0], 'notes'):
+                    from multitenancy.utils import build_notes_metadata
+                    from crum import get_current_user
+                    
+                    current_user = get_current_user()
+                    user_name = current_user.username if current_user and current_user.is_authenticated else None
+                    user_id = current_user.id if current_user and current_user.is_authenticated else None
+                    
+                    # Build notes for each Journal Entry
+                    for je, metadata in zip(created_jes, journal_entry_metadata):
+                        notes_metadata = {
+                            'source': import_metadata.get('source', 'ETL') if import_metadata else 'ETL',
+                            'function': import_metadata.get('function', 'ETLPipelineService._import_transactions_with_journal_entries') if import_metadata else 'ETLPipelineService._import_transactions_with_journal_entries',
+                            'user': user_name,
+                            'user_id': user_id,
+                        }
+                        
+                        # Add filename if available
+                        if import_metadata and 'filename' in import_metadata:
+                            notes_metadata['filename'] = import_metadata['filename']
+                        
+                        # Add log_id if available
+                        if import_metadata and 'log_id' in import_metadata:
+                            notes_metadata['log_id'] = import_metadata['log_id']
+                        
+                        # Add Excel row metadata if available
+                        if metadata.get('excel_row_id'):
+                            notes_metadata['excel_row_id'] = metadata['excel_row_id']
+                        if metadata.get('excel_row_number'):
+                            notes_metadata['row_number'] = metadata['excel_row_number']
+                        if metadata.get('excel_sheet_name'):
+                            notes_metadata['sheet_name'] = metadata['excel_sheet_name']
+                        
+                        je.notes = build_notes_metadata(**notes_metadata)
+                        logger.info(f"ETL NOTES DEBUG: Set notes on JournalEntry {je.id}: {je.notes[:100] if je.notes else 'None'}...")
+                    
+                    # Bulk update notes efficiently
+                    JournalEntry.objects.bulk_update(created_jes, ['notes'], batch_size=500)
+                    notes_time = time.time() - notes_start
+                    logger.info(f"ETL: Added notes to {len(created_jes)} JournalEntries in {notes_time:.3f}s")
                 
                 # Verify opposing entries were created
                 created_opposing = sum(1 for m in journal_entry_metadata if m.get('type') == 'opposing')
