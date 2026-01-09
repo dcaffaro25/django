@@ -121,8 +121,11 @@ class StageConfig:
         """
         Cheap pre-filter window used to limit search breadth.
         We use the looser (max) of group_span_days and avg_date_delta_days.
+        If both are 0/disabled, use a sensible default of 30 days.
         """
-        return max(int(self.group_span_days or 0), int(self.avg_date_delta_days or 0), 0)
+        computed = max(int(self.group_span_days or 0), int(self.avg_date_delta_days or 0))
+        # Default to 30 days if no explicit constraint is set
+        return computed if computed > 0 else 30
 
 
 
@@ -471,9 +474,20 @@ def _check_intra_group_coherence(
     book_items: List[JournalEntryDTO],
     stage: StageConfig,
     worst_metrics: Optional[Dict[str, float]] = None,
+    strict: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """
     Check if all entries in a group are coherent (no obvious outliers).
+    
+    This check is intentionally very lenient in non-strict mode - we rely more on 
+    scoring penalties for outliers, and only reject truly extreme cases.
+    
+    Args:
+        bank_item: Single bank transaction or list of bank transactions
+        book_items: List of journal entries to check coherence for
+        stage: Stage configuration with date tolerances
+        worst_metrics: Pre-computed worst-case metrics (optional)
+        strict: If False (default), only reject extreme outliers. If True, use tighter thresholds.
     
     Returns:
         (is_coherent, rejection_reason)
@@ -485,8 +499,8 @@ def _check_intra_group_coherence(
     if worst_metrics is None:
         worst_metrics = _compute_worst_match_metrics(bank_item, book_items)
     
-    # Check 1: Maximum date delta should not exceed group_span_days significantly
-    # If group_span_days is set, enforce it strictly
+    # Check 1: Maximum date delta should not exceed group_span_days
+    # If group_span_days is set, enforce it (this is already a user-configured constraint)
     if stage.group_span_days and stage.group_span_days > 0:
         book_dates = [b.date for b in book_items if b.date]
         if len(book_dates) >= 2:
@@ -494,20 +508,22 @@ def _check_intra_group_coherence(
             if book_span > stage.group_span_days:
                 return (False, f"book_span_days={book_span} > group_span_days={stage.group_span_days}")
     
-    # Check 2: Worst date delta should not be too much worse than average
-    # If max_date_delta is more than 3x the average, it's an outlier
-    if worst_metrics["max_date_delta_ratio"] > 3.0:
-        return (False, f"max_date_delta_ratio={worst_metrics['max_date_delta_ratio']:.2f} > 3.0 (outlier detected)")
+    # Check 2: Extreme date outliers only
+    # In strict mode: 5x threshold, in lenient mode: 20x threshold (almost never rejects)
+    ratio_threshold = 5.0 if strict else 20.0
+    if worst_metrics["max_date_delta_ratio"] > ratio_threshold:
+        return (False, f"max_date_delta_ratio={worst_metrics['max_date_delta_ratio']:.2f} > {ratio_threshold} (extreme outlier)")
     
-    # Check 3: Minimum embedding similarity should be reasonable
-    # If any entry has very low similarity (< 0.3), it's likely a mismatch
-    if worst_metrics["min_embedding_sim"] < 0.3:
-        return (False, f"min_embedding_sim={worst_metrics['min_embedding_sim']:.3f} < 0.3 (poor match)")
+    # NOTE: We intentionally do NOT reject based on embedding similarity here.
+    # Many valid matches have low embedding similarity due to generic bank descriptions.
+    # The scoring function already applies penalties for low similarity.
     
-    # Check 4: For one-to-many, check if any single book entry is too far from bank date
+    # Check 3: Extreme date distance only (strict: 3x, lenient: 10x threshold)
+    # Only reject if a single entry is extremely far from the bank date
+    date_multiplier = 3.0 if strict else 10.0
     if not isinstance(bank_item, list) and stage.avg_date_delta_days and stage.avg_date_delta_days > 0:
-        if worst_metrics["max_date_delta"] > stage.avg_date_delta_days * 2:
-            return (False, f"max_date_delta={worst_metrics['max_date_delta']} > 2x avg_date_delta_days={stage.avg_date_delta_days}")
+        if worst_metrics["max_date_delta"] > stage.avg_date_delta_days * date_multiplier:
+            return (False, f"max_date_delta={worst_metrics['max_date_delta']} > {date_multiplier}x avg_date_delta_days={stage.avg_date_delta_days}")
     
     return (True, None)
 
@@ -734,13 +750,13 @@ class ReconciliationPipelineEngine:
                 handler = getattr(self, fast_name, None)
                 if handler:
                     log.info(
-                        "Using FAST handler %s for stage %d (%s)",
+                        "========== [FAST ENGINE] Using handler %s for stage %d (%s) ==========",
                         fast_name, idx, stage.type,
                     )
             if handler is None:
                 handler = getattr(self, base_name, None)
-                log.debug(
-                    "Using standard handler %s for stage %d (%s)",
+                log.info(
+                    "========== [REGULAR ENGINE] Using handler %s for stage %d (%s) ==========",
                     base_name, idx, stage.type,
                 )
 
@@ -1058,7 +1074,7 @@ class ReconciliationPipelineEngine:
         set globally to avoid greedy per-anchor selection issues.
         """
         log.info(
-            "_run_one_to_many: START - total_banks=%d total_books=%d "
+            "[REGULAR] _run_one_to_many: START - total_banks=%d total_books=%d "
             "used_banks=%d used_books=%d",
             len(banks), len(books), len(self.used_banks), len(self.used_books),
         )
@@ -1071,7 +1087,7 @@ class ReconciliationPipelineEngine:
         max_k = max(int(stage.max_alternatives_per_anchor or 1), 1)
 
         log.info(
-            "_run_one_to_many: filtered available_books=%d (from %d total) "
+            "[REGULAR] _run_one_to_many: filtered available_books=%d (from %d total) "
             "win=%d amount_tol=%s allow_mixed=%s max_k=%d",
             len(available_books), len(books), win, stage.amount_tol, 
             stage.allow_mixed_signs, max_k,
@@ -1107,10 +1123,10 @@ class ReconciliationPipelineEngine:
         
         for bank in banks:
             if self._time_exceeded():
-                log.warning("_run_one_to_many: time exceeded, stopping bank processing")
+                log.warning("[REGULAR] _run_one_to_many: time exceeded, stopping bank processing")
                 return
             if bank.id in self.used_banks:
-                log.debug("_run_one_to_many: bank_id=%d already used, skipping", bank.id)
+                log.debug("[REGULAR] _run_one_to_many: bank_id=%d already used, skipping", bank.id)
                 continue
 
             banks_processed += 1
@@ -1118,7 +1134,7 @@ class ReconciliationPipelineEngine:
             bank_sign = _sign(bank_amt)
 
             log.debug(
-                "_run_one_to_many: processing bank_id=%d amount=%s sign=%d date=%s currency_id=%d",
+                "[REGULAR] _run_one_to_many: processing bank_id=%d amount=%s sign=%d date=%s currency_id=%d",
                 bank.id, bank_amt, bank_sign, bank.date, bank.currency_id,
             )
 
@@ -1128,11 +1144,11 @@ class ReconciliationPipelineEngine:
                 if b.date and bank.date and abs((bank.date - b.date).days) <= win
             ]
             log.debug(
-                "_run_one_to_many: bank_id=%d date_window filter: %d books in window (win=%d days)",
+                "[REGULAR] _run_one_to_many: bank_id=%d date_window filter: %d books in window (win=%d days)",
                 bank.id, len(local_books), win,
             )
             if not local_books:
-                log.debug("_run_one_to_many: bank_id=%d no books in date window, skipping", bank.id)
+                log.debug("[REGULAR] _run_one_to_many: bank_id=%d no books in date window, skipping", bank.id)
                 continue
             
             # Deterministic sorting: sort by (amount, id) for stable combination generation
@@ -1146,12 +1162,12 @@ class ReconciliationPipelineEngine:
                 else:
                     local_books = [b for b in local_books if (b.amount_base or Decimal("0")) <= 0]
                 log.debug(
-                    "_run_one_to_many: bank_id=%d sign filter: %d -> %d books (allow_mixed=%s bank_sign=%d)",
+                    "[REGULAR] _run_one_to_many: bank_id=%d sign filter: %d -> %d books (allow_mixed=%s bank_sign=%d)",
                     bank.id, before_sign_filter, len(local_books), 
                     stage.allow_mixed_signs, bank_sign,
                 )
                 if not local_books:
-                    log.debug("_run_one_to_many: bank_id=%d no books after sign filter, skipping", bank.id)
+                    log.debug("[REGULAR] _run_one_to_many: bank_id=%d no books after sign filter, skipping", bank.id)
                     continue
 
             book_amounts = [(b.amount_base or Decimal("0")) for b in local_books]
@@ -1175,7 +1191,7 @@ class ReconciliationPipelineEngine:
                     )
                     if not is_coherent:
                         log.debug(
-                            "_run_one_to_many: bank_id=%d mixed-sign combo REJECTED - coherence check failed: %s "
+                            "[REGULAR] _run_one_to_many: bank_id=%d mixed-sign combo REJECTED - coherence check failed: %s "
                             "(book_ids=%s)",
                             bank.id, reject_reason, [b.id for b in combo],
                         )
@@ -1252,21 +1268,21 @@ class ReconciliationPipelineEngine:
 
             # Feasibility pruning: compute g_min to skip infeasible sizes
             log.debug(
-                "_run_one_to_many: bank_id=%d computing feasibility bounds "
+                "[REGULAR] _run_one_to_many: bank_id=%d computing feasibility bounds "
                 "(target=%s tol=%s max_size=%d num_books=%d)",
                 bank.id, target, tol, max_size, len(book_amounts),
             )
             feasible, g_min = compute_feasibility_bounds(book_amounts, target, tol, max_size)
             
             log.debug(
-                "_run_one_to_many: bank_id=%d feasibility result: g_min=%s feasible_sizes=%s",
+                "[REGULAR] _run_one_to_many: bank_id=%d feasibility result: g_min=%s feasible_sizes=%s",
                 bank.id, g_min, [i for i, f in enumerate(feasible) if f] if feasible else [],
             )
             
             if g_min is None:
                 # No feasible size exists - skip this bank entirely
                 log.debug(
-                    "_run_one_to_many: bank_id=%d no feasible group size (g_min=None) "
+                    "[REGULAR] _run_one_to_many: bank_id=%d no feasible group size (g_min=None) "
                     "target=%s tol=%s book_amounts_range=[%s, %s]",
                     bank.id, target, tol,
                     min(book_amounts) if book_amounts else None,
@@ -1274,7 +1290,7 @@ class ReconciliationPipelineEngine:
                 )
                 if candidates:
                     log.debug(
-                        "_run_one_to_many: bank_id=%d adding %d candidates from mixed-sign path before skip",
+                        "[REGULAR] _run_one_to_many: bank_id=%d adding %d candidates from mixed-sign path before skip",
                         bank.id, len(candidates),
                     )
                     all_candidates.extend(candidates)
@@ -1282,7 +1298,7 @@ class ReconciliationPipelineEngine:
             
             banks_with_candidates += 1
             log.debug(
-                "_run_one_to_many: bank_id=%d starting enumeration from g_min=%d to max_size=%d",
+                "[REGULAR] _run_one_to_many: bank_id=%d starting enumeration from g_min=%d to max_size=%d",
                 bank.id, g_min, max_size,
             )
             
@@ -1306,7 +1322,7 @@ class ReconciliationPipelineEngine:
                             )
                             if not is_coherent:
                                 log.debug(
-                                    "_run_one_to_many: bank_id=%d all-in combo REJECTED - coherence check failed: %s",
+                                    "[REGULAR] _run_one_to_many: bank_id=%d all-in combo REJECTED - coherence check failed: %s",
                                     bank.id, reject_reason,
                                 )
                                 continue
@@ -1361,7 +1377,7 @@ class ReconciliationPipelineEngine:
             for size in range(g_min, max_size + 1):
                 if not feasible[size]:
                     log.debug(
-                        "_run_one_to_many: bank_id=%d skipping size=%d (not feasible)",
+                        "[REGULAR] _run_one_to_many: bank_id=%d skipping size=%d (not feasible)",
                         bank.id, size,
                     )
                     continue  # Skip infeasible sizes
@@ -1370,7 +1386,7 @@ class ReconciliationPipelineEngine:
 
                 if use_prefix_bounds and q2(prefix_max[size - 1]) + tol < target:
                     log.debug(
-                        "_run_one_to_many: bank_id=%d size=%d prefix bound check failed "
+                        "[REGULAR] _run_one_to_many: bank_id=%d size=%d prefix bound check failed "
                         "(prefix_max=%s + tol=%s < target=%s)",
                         bank.id, size, prefix_max[size - 1], tol, target,
                     )
@@ -1386,7 +1402,7 @@ class ReconciliationPipelineEngine:
                         used_book_ids = [x.id for x in combo if x.id in self.used_books]
                         if used_book_ids:
                             log.debug(
-                                "_run_one_to_many: bank_id=%d combo size=%d rejected - "
+                                "[REGULAR] _run_one_to_many: bank_id=%d combo size=%d rejected - "
                                 "books already used: %s",
                                 bank.id, size, used_book_ids,
                             )
@@ -1396,7 +1412,7 @@ class ReconciliationPipelineEngine:
                     diff = abs(q2(total) - target)
                     
                     log.debug(
-                        "_run_one_to_many: bank_id=%d testing combo size=%d "
+                        "[REGULAR] _run_one_to_many: bank_id=%d testing combo size=%d "
                         "(book_ids=%s total=%s diff=%s target=%s)",
                         bank.id, size,
                         [b.id for b in combo], total, diff, target,
@@ -1404,7 +1420,7 @@ class ReconciliationPipelineEngine:
                     
                     if diff > stage.amount_tol:
                         log.debug(
-                            "_run_one_to_many: bank_id=%d combo REJECTED - amount diff too large "
+                            "[REGULAR] _run_one_to_many: bank_id=%d combo REJECTED - amount diff too large "
                             "(diff=%s > tol=%s)",
                             bank.id, diff, stage.amount_tol,
                         )
@@ -1416,7 +1432,7 @@ class ReconciliationPipelineEngine:
                             if b.currency_id != bank.currency_id
                         }
                         log.debug(
-                            "_run_one_to_many: bank_id=%d combo REJECTED - currency mismatch "
+                            "[REGULAR] _run_one_to_many: bank_id=%d combo REJECTED - currency mismatch "
                             "(bank_currency=%d invalid_book_currencies=%s)",
                             bank.id, bank.currency_id, invalid_currencies,
                         )
@@ -1426,7 +1442,7 @@ class ReconciliationPipelineEngine:
                     book_span = (max(book_dates) - min(book_dates)).days if len(book_dates) >= 2 else 0
                     if stage.group_span_days and book_span > stage.group_span_days:
                         log.debug(
-                            "_run_one_to_many: bank_id=%d combo REJECTED - book span too large "
+                            "[REGULAR] _run_one_to_many: bank_id=%d combo REJECTED - book span too large "
                             "(span=%d > max=%d)",
                             bank.id, book_span, stage.group_span_days,
                         )
@@ -1437,7 +1453,7 @@ class ReconciliationPipelineEngine:
                     avg_delta = abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else win + 1
                     if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
                         log.debug(
-                            "_run_one_to_many: bank_id=%d combo REJECTED - avg date delta too large "
+                            "[REGULAR] _run_one_to_many: bank_id=%d combo REJECTED - avg date delta too large "
                             "(delta=%d > max=%d)",
                             bank.id, avg_delta, stage.avg_date_delta_days,
                         )
@@ -1450,7 +1466,7 @@ class ReconciliationPipelineEngine:
                     )
                     if not is_coherent:
                         log.debug(
-                            "_run_one_to_many: bank_id=%d combo REJECTED - coherence check failed: %s "
+                            "[REGULAR] _run_one_to_many: bank_id=%d combo REJECTED - coherence check failed: %s "
                             "(book_ids=%s)",
                             bank.id, reject_reason, [b.id for b in combo],
                         )
@@ -1470,7 +1486,7 @@ class ReconciliationPipelineEngine:
                     )
                     
                     log.info(
-                        "_run_one_to_many: bank_id=%d VALID COMBO FOUND size=%d "
+                        "[REGULAR] _run_one_to_many: bank_id=%d VALID COMBO FOUND size=%d "
                         "(book_ids=%s score=%.4f amount_diff=%s date_delta=%d embed_sim=%.4f)",
                         bank.id, size, [b.id for b in combo],
                         scores["global_score"], diff, avg_delta, sim,
@@ -1494,25 +1510,25 @@ class ReconciliationPipelineEngine:
                     total_candidates_generated += 1
                 
                 log.debug(
-                    "_run_one_to_many: bank_id=%d size=%d completed: tested=%d combos candidates=%d",
+                    "[REGULAR] _run_one_to_many: bank_id=%d size=%d completed: tested=%d combos candidates=%d",
                     bank.id, size, combos_at_size, len(candidates),
                 )
             
             log.debug(
-                "_run_one_to_many: bank_id=%d enumeration complete: tested=%d combos candidates=%d",
+                "[REGULAR] _run_one_to_many: bank_id=%d enumeration complete: tested=%d combos candidates=%d",
                 bank.id, combos_tested, len(candidates),
             )
 
             # Add all candidates from this bank to global collection
             if candidates:
                 log.debug(
-                    "_run_one_to_many: bank_id=%d adding %d candidates to global pool",
+                    "[REGULAR] _run_one_to_many: bank_id=%d adding %d candidates to global pool",
                     bank.id, len(candidates),
                 )
                 all_candidates.extend(candidates)
         
         log.info(
-            "_run_one_to_many: Phase 1 complete - banks_processed=%d banks_with_candidates=%d "
+            "[REGULAR] _run_one_to_many: Phase 1 complete - banks_processed=%d banks_with_candidates=%d "
             "total_candidates=%d",
             banks_processed, banks_with_candidates, len(all_candidates),
         )
@@ -1520,13 +1536,13 @@ class ReconciliationPipelineEngine:
         # Phase 2: Global selection - pick non-overlapping set
         if all_candidates:
             log.info(
-                "_run_one_to_many: Phase 2 starting - selecting non-overlapping set from %d candidates",
+                "[REGULAR] _run_one_to_many: Phase 2 starting - selecting non-overlapping set from %d candidates",
                 len(all_candidates),
             )
             selected = self._global_select_non_overlapping(all_candidates)
             
             log.info(
-                "_run_one_to_many: Phase 2 complete - selected %d non-overlapping suggestions",
+                "[REGULAR] _run_one_to_many: Phase 2 complete - selected %d non-overlapping suggestions",
                 len(selected),
             )
             
@@ -1542,7 +1558,7 @@ class ReconciliationPipelineEngine:
                 sug["total_alternatives"] = len(selected)  # Will be updated with alternatives count
                 
                 log.info(
-                    "_run_one_to_many: recording selected suggestion rank=%d/%d "
+                    "[REGULAR] _run_one_to_many: recording selected suggestion rank=%d/%d "
                     "bank_id=%d book_ids=%s score=%.4f is_primary=%s",
                     rank, len(selected), bank_id, book_ids,
                     sug.get("confidence_score", 0.0), sug["is_primary"],
@@ -1609,7 +1625,7 @@ class ReconciliationPipelineEngine:
         max_k = max(int(stage.max_alternatives_per_anchor or 1), 1)
 
         log.debug(
-            "_run_many_to_one: banks=%d books=%d win=%d amount_tol=%s allow_mixed=%s max_k=%d",
+            "[REGULAR] _run_many_to_one: banks=%d books=%d win=%d amount_tol=%s allow_mixed=%s max_k=%d",
             len(banks), len(books), win, stage.amount_tol, stage.allow_mixed_signs, max_k,
         )
 
@@ -1686,7 +1702,7 @@ class ReconciliationPipelineEngine:
                     )
                     if not is_coherent:
                         log.debug(
-                            "_run_many_to_one: book_id=%d mixed-sign combo REJECTED - coherence check failed: %s "
+                            "[REGULAR] _run_many_to_one: book_id=%d mixed-sign combo REJECTED - coherence check failed: %s "
                             "(bank_ids=%s)",
                             book.id, reject_reason, [b.id for b in combo],
                         )
@@ -1801,7 +1817,7 @@ class ReconciliationPipelineEngine:
                             )
                             if not is_coherent:
                                 log.debug(
-                                    "_run_many_to_one: book_id=%d all-in combo REJECTED - coherence check failed: %s",
+                                    "[REGULAR] _run_many_to_one: book_id=%d all-in combo REJECTED - coherence check failed: %s",
                                     book.id, reject_reason,
                                 )
                                 continue
@@ -1892,7 +1908,7 @@ class ReconciliationPipelineEngine:
                     )
                     if not is_coherent:
                         log.debug(
-                            "_run_many_to_one: book_id=%d combo REJECTED - coherence check failed: %s "
+                            "[REGULAR] _run_many_to_one: book_id=%d combo REJECTED - coherence check failed: %s "
                             "(bank_ids=%s)",
                             book.id, reject_reason, [b.id for b in combo],
                         )
@@ -2350,7 +2366,7 @@ class ReconciliationPipelineEngine:
         max_k = max(int(stage.max_alternatives_per_anchor or 1), 1)
 
         log.debug(
-            "_run_many_to_many: banks=%d books=%d win=%d amount_tol=%s allow_mixed=%s max_k=%d",
+            "[REGULAR] _run_many_to_many: banks=%d books=%d win=%d amount_tol=%s allow_mixed=%s max_k=%d",
             len(sorted_banks), len(sorted_books), win, stage.amount_tol, stage.allow_mixed_signs, max_k,
         )
 
@@ -2858,10 +2874,13 @@ class ReconciliationPipelineEngine:
         }
         
         # Decide candidate cap: larger sets require pruning
-        if n_books > 40 or n_banks > 40:
-            result["max_cands"] = 64  # keep only 64 local candidates
+        # Be generous with candidates - better to have more and filter later
+        if n_books > 100 or n_banks > 100:
+            result["max_cands"] = 128  # keep more local candidates for very large sets
+        elif n_books > 40 or n_banks > 40:
+            result["max_cands"] = 96
         elif n_books > 20 or n_banks > 20:
-            result["max_cands"] = 32
+            result["max_cands"] = 64
         
         # Set a beam width for heuristic search
         # Larger data sets use a moderate beam; smaller sets use exact search
@@ -2920,7 +2939,7 @@ class ReconciliationPipelineEngine:
         
         if USE_DATE_GROUPING and bank.date:
             log.debug(
-                "OTM_FAST bank=%s using date_grouping (amount=%s < threshold=%s) candidates=%s",
+                "[FAST] OTM_FAST bank=%s using date_grouping (amount=%s < threshold=%s) candidates=%s",
                 bank.id,
                 abs_bank_amt,
                 SMALL_AMOUNT_THRESHOLD,
@@ -2950,7 +2969,7 @@ class ReconciliationPipelineEngine:
                 # Early exit if we have enough candidates from same/close dates
                 if len(result) >= max_local:
                     log.debug(
-                        "OTM_FAST bank=%s date_grouping: same_day=%s total_selected=%s from_date_diff=%s",
+                        "[FAST] OTM_FAST bank=%s date_grouping: same_day=%s total_selected=%s from_date_diff=%s",
                         bank.id,
                         same_day_count,
                         len(result),
@@ -2993,6 +3012,10 @@ class ReconciliationPipelineEngine:
         extra_info: additional data to include in the suggestion's 'extra' field
         """
         candidates: List[dict] = []
+        rejected_by_date = 0
+        rejected_by_coherence = 0
+        total_combos = len(combos)
+        
         for combo in combos:
             # Compute measured spans and weighted avg date delta
             book_dates = [b.date for b in combo if b.date]
@@ -3003,16 +3026,18 @@ class ReconciliationPipelineEngine:
             
             # Skip if out of date range
             if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
+                rejected_by_date += 1
                 continue
             
-            # Check intra-group coherence before scoring
+            # Check intra-group coherence before scoring (lenient mode)
             worst_metrics = _compute_worst_match_metrics(bank, combo)
             is_coherent, reject_reason = _check_intra_group_coherence(
-                bank, combo, stage, worst_metrics
+                bank, combo, stage, worst_metrics, strict=False
             )
             if not is_coherent:
+                rejected_by_coherence += 1
                 log.debug(
-                    "_evaluate_and_record_candidates: bank_id=%d combo REJECTED - coherence check failed: %s "
+                    "[FAST] _evaluate_and_record_candidates: bank_id=%d combo REJECTED - coherence check failed: %s "
                     "(book_ids=%s)",
                     bank.id, reject_reason, [b.id for b in combo],
                 )
@@ -3052,8 +3077,20 @@ class ReconciliationPipelineEngine:
             )
             candidates.append(suggestion)
         
+        # Log summary of filtering
+        if total_combos > 0:
+            log.debug(
+                "[FAST] _evaluate_and_record_candidates: bank_id=%d processed=%d accepted=%d rejected_date=%d rejected_coherence=%d",
+                bank.id, total_combos, len(candidates), rejected_by_date, rejected_by_coherence
+            )
+        
         # Sort candidates and record up to max_alternatives_per_anchor
         if not candidates:
+            if total_combos > 0:
+                log.info(
+                    "[FAST] _evaluate_and_record_candidates: bank_id=%d ALL %d combos rejected (date=%d coherence=%d)",
+                    bank.id, total_combos, rejected_by_date, rejected_by_coherence
+                )
             return
         candidates.sort(key=self._deterministic_sort_key)
         best = candidates[0]
@@ -3088,15 +3125,22 @@ class ReconciliationPipelineEngine:
         
         # Pre-select candidate books for this bank
         local_books = self._prepare_candidates(bank, books, stage, max_local=max_local)
-        if bank.embedding and len(local_books) > stage.max_group_size_book * 4:
-            top_k = min(len(local_books), (max_local or len(local_books)), 32)
+        # Only apply embedding preselection if we have many candidates AND good embeddings
+        # Be more generous - use 64 instead of 32 and only filter when we have way too many
+        if bank.embedding and len(local_books) > stage.max_group_size_book * 8:
+            before_count = len(local_books)
+            top_k = min(before_count, (max_local or before_count), 64)
             local_books = preselect_candidates_by_embedding(bank, local_books, top_k=top_k)
+            log.debug(
+                "[FAST] OTM_FAST bank=%s embedding preselect: before=%s after=%s top_k=%s",
+                bank.id, before_count, len(local_books), top_k
+            )
         if not local_books:
-            log.debug("OTM_FAST bank=%s no candidates survived prefilter", bank.id)
+            log.debug("[FAST] OTM_FAST bank=%s no candidates survived prefilter", bank.id)
             return
         book_items = _build_fast_items(local_books)
         log.debug(
-            "OTM_FAST bank=%s amount=%s candidates=%s max_group=%s",
+            "[FAST] OTM_FAST bank=%s amount=%s candidates=%s max_group=%s",
             bank.id,
             bank.amount_base,
             len(book_items),
@@ -3110,17 +3154,17 @@ class ReconciliationPipelineEngine:
         book_signs = [item.sign for item in book_items]
         has_mixed_books = (1 in book_signs and -1 in book_signs)
         if has_mixed_books and not stage.allow_mixed_signs:
-            log.debug("OTM_FAST bank=%s mixed_signs_blocked", bank.id)
+            log.debug("[FAST] OTM_FAST bank=%s mixed_signs_blocked", bank.id)
         
         # Path 1: Mixed-sign via DFS if allowed
         if has_mixed_books and stage.allow_mixed_signs:
-            log.debug("OTM_FAST bank=%s entering mixed-sign DFS path", bank.id)
+            log.debug("[FAST] OTM_FAST bank=%s entering mixed-sign DFS path", bank.id)
             subset = self._find_mixed_one_to_many_group(bank, [item.dto for item in book_items], stage)
             if subset:
                 combos.append(list(subset))
-                log.debug("OTM_FAST bank=%s mixed DFS produced group size=%s", bank.id, len(subset))
+                log.debug("[FAST] OTM_FAST bank=%s mixed DFS produced group size=%s", bank.id, len(subset))
             else:
-                log.debug("OTM_FAST bank=%s mixed DFS produced no group", bank.id)
+                log.debug("[FAST] OTM_FAST bank=%s mixed DFS produced no group", bank.id)
         
         # Path 2: Same-sign / bounded search
         # Generate candidate combos up to max_group_size
@@ -3133,7 +3177,7 @@ class ReconciliationPipelineEngine:
         
         if g_min is None:
             # No feasible size exists - skip this bank entirely
-            log.debug("OTM_FAST bank=%s no feasible group size (g_min=None)", bank.id)
+            log.debug("[FAST] OTM_FAST bank=%s no feasible group size (g_min=None)", bank.id)
             if combos:
                 # Still process mixed-sign results if any
                 pass
@@ -3155,12 +3199,12 @@ class ReconciliationPipelineEngine:
                     if (not stage.avg_date_delta_days or avg_delta <= stage.avg_date_delta_days):
                         # All-in is valid - add to combos
                         combos.append([item.dto for item in book_items])
-                        log.debug("OTM_FAST bank=%s all-in shortcut: n=%s sum=%s diff=%s", bank.id, len(book_items), all_sum, all_diff)
+                        log.debug("[FAST] OTM_FAST bank=%s all-in shortcut: n=%s sum=%s diff=%s", bank.id, len(book_items), all_sum, all_diff)
                         # Continue to scoring/recording below
         
         if strategy == "exact" or max_size <= 2:
             # Full enumeration for small groups
-            log.debug("OTM_FAST bank=%s using exact enumeration max_size=%s g_min=%s", bank.id, max_size, g_min)
+            log.debug("[FAST] OTM_FAST bank=%s using exact enumeration max_size=%s g_min=%s", bank.id, max_size, g_min)
             # Start enumeration at g_min, not 1
             for size in range(g_min if g_min else 1, max_size + 1):
                 if not feasible[size]:
@@ -3174,7 +3218,7 @@ class ReconciliationPipelineEngine:
                         continue
                     combo_dtos = [c.dto for c in combo]
                     log.debug(
-                        "OTM_FAST bank=%s exact_combo size=%s total=%s diff=%s members=%s",
+                        "[FAST] OTM_FAST bank=%s exact_combo size=%s total=%s diff=%s members=%s",
                         bank.id,
                         size,
                         total,
@@ -3186,7 +3230,7 @@ class ReconciliationPipelineEngine:
             # Beam search for larger groups
             # Start with 1-book combos, then expand
             log.debug(
-                "OTM_FAST bank=%s using beam_search max_size=%s beam_width=%s",
+                "[FAST] OTM_FAST bank=%s using beam_search max_size=%s beam_width=%s",
                 bank.id,
                 max_size,
                 beam_width,
@@ -3197,7 +3241,7 @@ class ReconciliationPipelineEngine:
                 if diff <= stage.amount_tol:
                     beam.append((item.amount, (idx,)))
                     log.debug(
-                        "OTM_FAST bank=%s beam_seed idx=%s amount=%s diff=%s book_id=%s",
+                        "[FAST] OTM_FAST bank=%s beam_seed idx=%s amount=%s diff=%s book_id=%s",
                         bank.id,
                         idx,
                         item.amount,
@@ -3215,13 +3259,13 @@ class ReconciliationPipelineEngine:
                 combos.extend(combos_from_hits)
                 for combo_dtos in combos_from_hits:
                     log.debug(
-                        "OTM_FAST bank=%s beam_hit total=%s members=%s",
+                        "[FAST] OTM_FAST bank=%s beam_hit total=%s members=%s",
                         bank.id,
                         sum((dto.amount_base for dto in combo_dtos), Decimal("0")),
                         [(d.id, d.amount_base, d.date) for d in combo_dtos],
                     )
             if max_size <= 1:
-                log.debug("OTM_FAST bank=%s max_size<=1 skipping beam expansion", bank.id)
+                log.debug("[FAST] OTM_FAST bank=%s max_size<=1 skipping beam expansion", bank.id)
             else:
                 # Expand beam
                 for depth in range(2, max_size + 1):
@@ -3238,7 +3282,7 @@ class ReconciliationPipelineEngine:
                                 next_idxs = idxs + (idx,)
                                 next_beam.append((new_total, next_idxs))
                                 log.debug(
-                                    "OTM_FAST bank=%s beam_extend depth=%s total=%s diff=%s members=%s",
+                                    "[FAST] OTM_FAST bank=%s beam_extend depth=%s total=%s diff=%s members=%s",
                                     bank.id,
                                     depth,
                                     new_total,
@@ -3255,13 +3299,13 @@ class ReconciliationPipelineEngine:
             ]
             for combo_dtos in combos_from_beam:
                 log.debug(
-                    "OTM_FAST bank=%s beam_combo total=%s members=%s",
+                    "[FAST] OTM_FAST bank=%s beam_combo total=%s members=%s",
                     bank.id,
                     sum((dto.amount_base for dto in combo_dtos), Decimal("0")),
                     [(d.id, d.amount_base, d.date) for d in combo_dtos],
                 )
             combos.extend(combos_from_beam)
-            log.debug("OTM_FAST bank=%s beam combos=%s", bank.id, len(combos_from_beam))
+            log.debug("[FAST] OTM_FAST bank=%s beam combos=%s", bank.id, len(combos_from_beam))
 
             # If beam search failed to find anything, fall back to branch-and-bound subset search
             if not combos:
@@ -3277,7 +3321,7 @@ class ReconciliationPipelineEngine:
                     total_bb = sum((b.amount_base for b in bb_combo), Decimal("0"))
                     diff_bb = abs(q2(total_bb) - target)
                     log.debug(
-                        "OTM_FAST bank=%s branch_and_bound hit total=%s diff=%s members=%s",
+                        "[FAST] OTM_FAST bank=%s branch_and_bound hit total=%s diff=%s members=%s",
                         bank.id,
                         total_bb,
                         diff_bb,
@@ -3286,7 +3330,7 @@ class ReconciliationPipelineEngine:
                     combos.append(bb_combo)
         
         log.debug(
-            "OTM_FAST bank=%s combos_ready=%s detail=%s",
+            "[FAST] OTM_FAST bank=%s combos_ready=%s detail=%s",
             bank.id,
             len(combos),
             [
@@ -3321,7 +3365,7 @@ class ReconciliationPipelineEngine:
         beam_width = strategy_cfg.get("beam_width")
         strategy   = strategy_cfg.get("strategy")
         log.debug(
-            "OTM_FAST stage=%s strategy=%s max_local=%s beam_width=%s tol=%s mixed=%s threads=%s",
+            "[FAST] OTM_FAST stage=%s strategy=%s max_local=%s beam_width=%s tol=%s mixed=%s threads=%s",
             stage.type,
             strategy,
             max_local,
@@ -3339,7 +3383,7 @@ class ReconciliationPipelineEngine:
                     available_banks.append(bank)
         
         if not available_banks:
-            log.debug("OTM_FAST no available banks to process")
+            log.debug("[FAST] OTM_FAST no available banks to process")
             return
         
         # Process banks in parallel
@@ -3362,9 +3406,9 @@ class ReconciliationPipelineEngine:
                 try:
                     future.result()
                 except Exception as exc:
-                    log.error("OTM_FAST bank=%s processing failed: %s", bank_id, exc, exc_info=True)
+                    log.error("[FAST] OTM_FAST bank=%s processing failed: %s", bank_id, exc, exc_info=True)
                 if self._time_exceeded():
-                    log.debug("OTM_FAST time limit reached, cancelling remaining tasks")
+                    log.debug("[FAST] OTM_FAST time limit reached, cancelling remaining tasks")
                     break
     
     def _process_one_book_mto_fast(
@@ -3397,7 +3441,7 @@ class ReconciliationPipelineEngine:
             and abs((b.date - book.date).days) <= win
         ]
         if not local_banks:
-            log.debug("MTO_FAST book=%s no banks in window", book.id)
+            log.debug("[FAST] MTO_FAST book=%s no banks in window", book.id)
             return
         
         # Filter by sign if mixed signs not allowed
@@ -3409,7 +3453,7 @@ class ReconciliationPipelineEngine:
             else:
                 local_banks = [b for b in local_banks if _sign(b.amount_base) <= 0]
             log.debug(
-                "MTO_FAST book=%s filtered_by_sign before=%s after=%s book_sign=%s",
+                "[FAST] MTO_FAST book=%s filtered_by_sign before=%s after=%s book_sign=%s",
                 book.id,
                 before,
                 len(local_banks),
@@ -3461,7 +3505,7 @@ class ReconciliationPipelineEngine:
                 
                 local_banks = result[:max_local]
                 log.debug(
-                    "MTO_FAST book=%s date_grouped trimmed_candidates to=%s max_local=%s (small_amount=%s)",
+                    "[FAST] MTO_FAST book=%s date_grouped trimmed_candidates to=%s max_local=%s (small_amount=%s)",
                     book.id,
                     len(local_banks),
                     max_local,
@@ -3474,7 +3518,7 @@ class ReconciliationPipelineEngine:
                     return (amt_diff, date_diff)
                 local_banks = sorted(local_banks, key=sort_key)[:max_local]
                 log.debug(
-                    "MTO_FAST book=%s trimmed_candidates to=%s max_local=%s",
+                    "[FAST] MTO_FAST book=%s trimmed_candidates to=%s max_local=%s",
                     book.id,
                     len(local_banks),
                     max_local,
@@ -3489,15 +3533,15 @@ class ReconciliationPipelineEngine:
         
         # Path 1: Mixed-sign via DFS
         if has_mixed_banks and not stage.allow_mixed_signs:
-            log.debug("MTO_FAST book=%s mixed_signs_blocked", book.id)
+            log.debug("[FAST] MTO_FAST book=%s mixed_signs_blocked", book.id)
         if has_mixed_banks and stage.allow_mixed_signs:
-            log.debug("MTO_FAST book=%s entering mixed-sign DFS path", book.id)
+            log.debug("[FAST] MTO_FAST book=%s entering mixed-sign DFS path", book.id)
             subset = self._find_mixed_many_to_one_group(book, [item.dto for item in bank_items], stage)
             if subset:
                 combos.append(list(subset))
-                log.debug("MTO_FAST book=%s mixed DFS produced group size=%s", book.id, len(subset))
+                log.debug("[FAST] MTO_FAST book=%s mixed DFS produced group size=%s", book.id, len(subset))
             else:
-                log.debug("MTO_FAST book=%s mixed DFS produced no group", book.id)
+                log.debug("[FAST] MTO_FAST book=%s mixed DFS produced no group", book.id)
         
         # Path 2: Same-sign / bounded search
         max_size = min(stage.max_group_size_bank, len(bank_items))
@@ -3509,7 +3553,7 @@ class ReconciliationPipelineEngine:
         
         if g_min is None:
             # No feasible size exists - skip this book entirely
-            log.debug("MTO_FAST book=%s no feasible group size (g_min=None)", book.id)
+            log.debug("[FAST] MTO_FAST book=%s no feasible group size (g_min=None)", book.id)
             if combos:
                 # Still process mixed-sign results if any
                 pass
@@ -3531,12 +3575,12 @@ class ReconciliationPipelineEngine:
                     if (not stage.avg_date_delta_days or avg_delta <= stage.avg_date_delta_days):
                         # All-in is valid - add to combos
                         combos.append([item.dto for item in bank_items])
-                        log.debug("MTO_FAST book=%s all-in shortcut: n=%s sum=%s diff=%s", book.id, len(bank_items), all_sum, all_diff)
+                        log.debug("[FAST] MTO_FAST book=%s all-in shortcut: n=%s sum=%s diff=%s", book.id, len(bank_items), all_sum, all_diff)
                         # Continue to scoring/recording below
         
         if strategy == "exact" or max_size <= 2:
             # Full enumeration
-            log.debug("MTO_FAST book=%s using exact enumeration max_size=%s g_min=%s", book.id, max_size, g_min)
+            log.debug("[FAST] MTO_FAST book=%s using exact enumeration max_size=%s g_min=%s", book.id, max_size, g_min)
             # Start enumeration at g_min, not 1
             for size in range(g_min if g_min else 1, max_size + 1):
                 if not feasible[size]:
@@ -3550,7 +3594,7 @@ class ReconciliationPipelineEngine:
                         continue
                     combo_dtos = [c.dto for c in combo]
                     log.debug(
-                        "MTO_FAST book=%s exact_combo size=%s total=%s diff=%s members=%s",
+                        "[FAST] MTO_FAST book=%s exact_combo size=%s total=%s diff=%s members=%s",
                         book.id,
                         size,
                         total,
@@ -3561,7 +3605,7 @@ class ReconciliationPipelineEngine:
         else:
             # Beam search
             log.debug(
-                "MTO_FAST book=%s using beam_search max_size=%s beam_width=%s",
+                "[FAST] MTO_FAST book=%s using beam_search max_size=%s beam_width=%s",
                 book.id,
                 max_size,
                 beam_width,
@@ -3572,7 +3616,7 @@ class ReconciliationPipelineEngine:
                 if diff <= stage.amount_tol:
                     beam.append((item.amount, (idx,)))
                     log.debug(
-                        "MTO_FAST book=%s beam_seed idx=%s amount=%s diff=%s bank_id=%s",
+                        "[FAST] MTO_FAST book=%s beam_seed idx=%s amount=%s diff=%s bank_id=%s",
                         book.id,
                         idx,
                         item.amount,
@@ -3589,13 +3633,13 @@ class ReconciliationPipelineEngine:
                 combos.extend(combos_from_hits)
                 for combo_dtos in combos_from_hits:
                     log.debug(
-                        "MTO_FAST book=%s beam_hit total=%s members=%s",
+                        "[FAST] MTO_FAST book=%s beam_hit total=%s members=%s",
                         book.id,
                         sum((dto.amount_base for dto in combo_dtos), Decimal("0")),
                         [(d.id, d.amount_base, d.date) for d in combo_dtos],
                     )
             if max_size <= 1:
-                log.debug("MTO_FAST book=%s max_size<=1 skipping beam expansion", book.id)
+                log.debug("[FAST] MTO_FAST book=%s max_size<=1 skipping beam expansion", book.id)
             else:
                 for depth in range(2, max_size + 1):
                     if self._time_exceeded():
@@ -3611,7 +3655,7 @@ class ReconciliationPipelineEngine:
                                 next_idxs = idxs + (idx,)
                                 next_beam.append((new_total, next_idxs))
                                 log.debug(
-                                    "MTO_FAST book=%s beam_extend depth=%s total=%s diff=%s members=%s",
+                                    "[FAST] MTO_FAST book=%s beam_extend depth=%s total=%s diff=%s members=%s",
                                     book.id,
                                     depth,
                                     new_total,
@@ -3627,16 +3671,20 @@ class ReconciliationPipelineEngine:
             ]
             for combo_dtos in combos_from_beam:
                 log.debug(
-                    "MTO_FAST book=%s beam_combo total=%s members=%s",
+                    "[FAST] MTO_FAST book=%s beam_combo total=%s members=%s",
                     book.id,
                     sum((dto.amount_base for dto in combo_dtos), Decimal("0")),
                     [(d.id, d.amount_base, d.date) for d in combo_dtos],
                 )
             combos.extend(combos_from_beam)
-            log.debug("MTO_FAST book=%s beam combos=%s", book.id, len(beam))
+            log.debug("[FAST] MTO_FAST book=%s beam combos=%s", book.id, len(beam))
         
         # Evaluate suggestions
         candidates: List[dict] = []
+        rejected_by_date = 0
+        rejected_by_coherence = 0
+        total_combos = len(combos)
+        
         for combo in combos:
             bank_dates = [b.date for b in combo if b.date]
             bank_span = (max(bank_dates) - min(bank_dates)).days if len(bank_dates) >= 2 else 0
@@ -3644,16 +3692,18 @@ class ReconciliationPipelineEngine:
             book_avg_date = book.date
             avg_delta = abs((bank_avg_date - book_avg_date).days) if bank_avg_date and book_avg_date else stage.candidate_window_days + 1
             if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
+                rejected_by_date += 1
                 continue
             
-            # Check intra-group coherence before scoring
+            # Check intra-group coherence before scoring (lenient mode)
             worst_metrics = _compute_worst_match_metrics(combo, [book])
             is_coherent, reject_reason = _check_intra_group_coherence(
-                combo, [book], stage, worst_metrics
+                combo, [book], stage, worst_metrics, strict=False
             )
             if not is_coherent:
+                rejected_by_coherence += 1
                 log.debug(
-                    "MTO_FAST book_id=%d combo REJECTED - coherence check failed: %s "
+                    "[FAST] MTO_FAST book_id=%d combo REJECTED - coherence check failed: %s "
                     "(bank_ids=%s)",
                     book.id, reject_reason, [b.id for b in combo],
                 )
@@ -3692,9 +3742,16 @@ class ReconciliationPipelineEngine:
             )
             candidates.append(suggestion)
         
+        # Log summary of filtering
+        if total_combos > 0:
+            log.debug(
+                "[FAST] MTO_FAST book=%s processed=%d accepted=%d rejected_date=%d rejected_coherence=%d",
+                book.id, total_combos, len(candidates), rejected_by_date, rejected_by_coherence
+            )
+        
         # Sort and record top suggestions
         log.debug(
-            "MTO_FAST book=%s combos_ready=%s candidates_ready=%s detail=%s",
+            "[FAST] MTO_FAST book=%s combos_ready=%s candidates_ready=%s detail=%s",
             book.id,
             len(combos),
             len(candidates),
@@ -3709,6 +3766,11 @@ class ReconciliationPipelineEngine:
                 for combo in combos[:5]
             ],
         )
+        if not candidates and total_combos > 0:
+            log.info(
+                "[FAST] MTO_FAST book=%s ALL %d combos rejected (date=%d coherence=%d)",
+                book.id, total_combos, rejected_by_date, rejected_by_coherence
+            )
         if candidates:
             candidates.sort(key=self._deterministic_sort_key)
             best = candidates[0]
@@ -3735,7 +3797,7 @@ class ReconciliationPipelineEngine:
         beam_width = strategy_cfg.get("beam_width")
         strategy   = strategy_cfg.get("strategy")
         log.debug(
-            "MTO_FAST stage=%s strategy=%s max_local=%s beam_width=%s tol=%s mixed=%s threads=%s",
+            "[FAST] MTO_FAST stage=%s strategy=%s max_local=%s beam_width=%s tol=%s mixed=%s threads=%s",
             stage.type,
             strategy,
             max_local,
@@ -3753,7 +3815,7 @@ class ReconciliationPipelineEngine:
                     available_books.append(book)
         
         if not available_books:
-            log.debug("MTO_FAST no available books to process")
+            log.debug("[FAST] MTO_FAST no available books to process")
             return
         
         # Process books in parallel
@@ -3776,9 +3838,9 @@ class ReconciliationPipelineEngine:
                 try:
                     future.result()
                 except Exception as exc:
-                    log.error("MTO_FAST book=%s processing failed: %s", book_id, exc, exc_info=True)
+                    log.error("[FAST] MTO_FAST book=%s processing failed: %s", book_id, exc, exc_info=True)
                 if self._time_exceeded():
-                    log.debug("MTO_FAST time limit reached, cancelling remaining tasks")
+                    log.debug("[FAST] MTO_FAST time limit reached, cancelling remaining tasks")
                     break
     
     def _run_many_to_many_fast(self, banks, books, stage: StageConfig):
@@ -3794,7 +3856,7 @@ class ReconciliationPipelineEngine:
         beam_width = strategy_cfg.get("beam_width")
         strategy   = strategy_cfg.get("strategy")
         log.debug(
-            "MTM_FAST stage=%s strategy=%s max_local_banks=%s max_local_books=%s beam_width=%s tol=%s",
+            "[FAST] MTM_FAST stage=%s strategy=%s max_local_banks=%s max_local_books=%s beam_width=%s tol=%s",
             stage.type,
             strategy,
             max_local_banks,
@@ -3823,7 +3885,7 @@ class ReconciliationPipelineEngine:
             local_banks = [b for b in banks_sorted if start <= b.date <= end]
             local_books = [e for e in books_sorted if start <= e.date <= end]
             log.debug(
-                "MTM_FAST anchor_bank=%s window_days=%s banks=%s books=%s",
+                "[FAST] MTM_FAST anchor_bank=%s window_days=%s banks=%s books=%s",
                 anchor_bank.id,
                 win,
                 len(local_banks),
@@ -3841,7 +3903,7 @@ class ReconciliationPipelineEngine:
                     local_banks = [b for b in local_banks if _sign(b.amount_base) <= 0]
                     local_books = [e for e in local_books if _sign(e.amount_base) <= 0]
                 log.debug(
-                    "MTM_FAST anchor_bank=%s sign_filter applied banks:%s->%s books:%s->%s",
+                    "[FAST] MTM_FAST anchor_bank=%s sign_filter applied banks:%s->%s books:%s->%s",
                     anchor_bank.id,
                     before_banks,
                     len(local_banks),
@@ -3861,7 +3923,7 @@ class ReconciliationPipelineEngine:
                     key=sort_key
                 )[:max_local_banks - 1]
                 log.debug(
-                    "MTM_FAST anchor_bank=%s trimmed banks to=%s",
+                    "[FAST] MTM_FAST anchor_bank=%s trimmed banks to=%s",
                     anchor_bank.id,
                     len(local_banks),
                 )
@@ -3873,7 +3935,7 @@ class ReconciliationPipelineEngine:
                     return (amt_diff, date_diff)
                 local_books = sorted(local_books, key=sort_key)[:max_local_books]
                 log.debug(
-                    "MTM_FAST anchor_bank=%s trimmed books to=%s",
+                    "[FAST] MTM_FAST anchor_bank=%s trimmed books to=%s",
                     anchor_bank.id,
                     len(local_books),
                 )
@@ -3890,7 +3952,7 @@ class ReconciliationPipelineEngine:
                             continue
                         bank_groups.append(combo)
                 log.debug(
-                    "MTM_FAST anchor_bank=%s exact bank_groups=%s",
+                    "[FAST] MTM_FAST anchor_bank=%s exact bank_groups=%s",
                     anchor_bank.id,
                     len(bank_groups),
                 )
@@ -3898,7 +3960,7 @@ class ReconciliationPipelineEngine:
                 # Beam search on bank side
                 bank_beam = [[anchor_bank]]
                 log.debug(
-                    "MTM_FAST anchor_bank=%s beam bank search max_size=%s beam=%s",
+                    "[FAST] MTM_FAST anchor_bank=%s beam bank search max_size=%s beam=%s",
                     anchor_bank.id,
                     max_bank_size,
                     beam_width,
@@ -3920,7 +3982,7 @@ class ReconciliationPipelineEngine:
                     bank_beam = next_beam[:beam_width]
                 bank_groups.extend(bank_beam)
                 log.debug(
-                    "MTM_FAST anchor_bank=%s beam bank_groups=%s",
+                    "[FAST] MTM_FAST anchor_bank=%s beam bank_groups=%s",
                     anchor_bank.id,
                     len(bank_beam),
                 )
@@ -3948,7 +4010,7 @@ class ReconciliationPipelineEngine:
                                 continue
                             book_groups.append(book_combo)
                     log.debug(
-                        "MTM_FAST anchor_bank=%s bank_combo=%s exact book_groups=%s",
+                        "[FAST] MTM_FAST anchor_bank=%s bank_combo=%s exact book_groups=%s",
                         anchor_bank.id,
                         [b.id for b in bank_combo],
                         len(book_groups),
@@ -3957,7 +4019,7 @@ class ReconciliationPipelineEngine:
                     # Beam search on book side
                     book_beam = []
                     log.debug(
-                        "MTM_FAST anchor_bank=%s bank_combo=%s beam book search max_size=%s beam=%s",
+                        "[FAST] MTM_FAST anchor_bank=%s bank_combo=%s beam book search max_size=%s beam=%s",
                         anchor_bank.id,
                         [b.id for b in bank_combo],
                         max_book_size,
@@ -3985,7 +4047,7 @@ class ReconciliationPipelineEngine:
                         book_beam = next_beam[:beam_width]
                     book_groups.extend(book_beam)
                     log.debug(
-                        "MTM_FAST anchor_bank=%s bank_combo=%s beam book_groups=%s",
+                        "[FAST] MTM_FAST anchor_bank=%s bank_combo=%s beam book_groups=%s",
                         anchor_bank.id,
                         [b.id for b in bank_combo],
                         len(book_beam),
@@ -4014,16 +4076,16 @@ class ReconciliationPipelineEngine:
                         "max_date_delta_ratio": max(worst_metrics_bank["max_date_delta_ratio"], worst_metrics_book["max_date_delta_ratio"]),
                     }
                     
-                    # Check coherence for both groups
+                    # Check coherence for both groups (lenient mode)
                     is_coherent_bank, reject_reason_bank = _check_intra_group_coherence(
-                        bank_combo, book_combo, stage, worst_metrics_bank
+                        bank_combo, book_combo, stage, worst_metrics_bank, strict=False
                     )
                     is_coherent_book, reject_reason_book = _check_intra_group_coherence(
-                        book_combo, bank_combo, stage, worst_metrics_book
+                        book_combo, bank_combo, stage, worst_metrics_book, strict=False
                     )
                     if not is_coherent_bank or not is_coherent_book:
                         log.debug(
-                            "MTM_FAST anchor_bank=%d combo REJECTED - coherence check failed: bank=%s book=%s "
+                            "[FAST] MTM_FAST anchor_bank=%d combo REJECTED - coherence check failed: bank=%s book=%s "
                             "(bank_ids=%s book_ids=%s)",
                             anchor_bank.id, reject_reason_bank, reject_reason_book,
                             [b.id for b in bank_combo], [e.id for e in book_combo],
@@ -4066,7 +4128,7 @@ class ReconciliationPipelineEngine:
                     )
                     self._record(suggestion)
                     log.debug(
-                        "MTM_FAST anchor_bank=%s recorded bank_combo=%s book_combo=%s score=%s",
+                        "[FAST] MTM_FAST anchor_bank=%s recorded bank_combo=%s book_combo=%s score=%s",
                         anchor_bank.id,
                         [b.id for b in bank_combo],
                         [e.id for e in book_combo],
