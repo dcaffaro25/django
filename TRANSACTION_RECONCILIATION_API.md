@@ -14,7 +14,7 @@ This document describes the API endpoints and features for the Transaction Recon
 6. [Classification History Endpoint](#classification-history-endpoint)
 7. [Existing Transaction Actions](#existing-transaction-actions)
 8. [Usage Examples](#usage-examples)
-9. [Entity Reconciliation Summary Endpoint](#entity-reconciliation-summary-endpoint)
+9. [Company Reconciliation Summary Endpoint](#company-reconciliation-summary-endpoint)
 
 ---
 
@@ -545,14 +545,14 @@ Error responses include a message:
 
 ---
 
-## Entity Reconciliation Summary Endpoint
+## Company Reconciliation Summary Endpoint
 
-Returns transaction reconciliation summary statistics **grouped by entity/client**. This is useful for dashboards that need to show reconciliation status across all clients.
+Returns transaction reconciliation summary statistics **grouped by company (client/tenant)**. This is useful for dashboards that need to show reconciliation status across all clients.
 
 ### Endpoint
 
 ```
-GET /api/entities/reconciliation-summary/
+GET /api/companies/reconciliation-summary/
 ```
 
 ### Query Parameters
@@ -586,10 +586,11 @@ GET /api/entities/reconciliation-summary/
       "na": 220
     }
   },
-  "by_entity": [
+  "by_company": [
     {
-      "entity_id": 1,
-      "entity_name": "Client ABC Ltda",
+      "company_id": 1,
+      "company_name": "Client ABC Ltda",
+      "subdomain": "clientabc",
       "total_count": 150,
       "balanced_count": 140,
       "unbalanced_count": 10,
@@ -609,8 +610,9 @@ GET /api/entities/reconciliation-summary/
       }
     },
     {
-      "entity_id": 2,
-      "entity_name": "Client XYZ S.A.",
+      "company_id": 2,
+      "company_name": "Client XYZ S.A.",
+      "subdomain": "clientxyz",
       "total_count": 100,
       ...
     }
@@ -621,11 +623,11 @@ GET /api/entities/reconciliation-summary/
 ### Response Fields
 
 #### `totals` Object
-Aggregated statistics across all entities:
+Aggregated statistics across all companies:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `total_count` | integer | Total transactions across all entities |
+| `total_count` | integer | Total transactions across all companies |
 | `balanced_count` | integer | Balanced transactions |
 | `unbalanced_count` | integer | Unbalanced transactions |
 | `ready_to_post_count` | integer | Ready to post (balanced + no pending bank recon) |
@@ -634,14 +636,15 @@ Aggregated statistics across all entities:
 | `by_state` | object | Count breakdown by state |
 | `by_bank_recon_status` | object | Count breakdown by bank recon status |
 
-#### `by_entity` Array
-List of entity summaries, sorted by `total_count` descending. Each entity includes:
+#### `by_company` Array
+List of company summaries, sorted by `total_count` descending. Each company includes:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `entity_id` | integer | Entity primary key |
-| `entity_name` | string | Entity name |
-| `total_count` | integer | Transactions for this entity |
+| `company_id` | integer | Company primary key |
+| `company_name` | string | Company name |
+| `subdomain` | string | Company subdomain (tenant identifier) |
+| `total_count` | integer | Transactions for this company |
 | `balanced_count` | integer | Balanced transactions |
 | `unbalanced_count` | integer | Unbalanced transactions |
 | `ready_to_post_count` | integer | Ready to post |
@@ -652,28 +655,28 @@ List of entity summaries, sorted by `total_count` descending. Each entity includ
 
 ### Example Requests
 
-**Get summary for all entities:**
+**Get summary for all companies:**
 ```
-GET /api/entities/reconciliation-summary/
+GET /api/companies/reconciliation-summary/
 ```
 
 **Get summary for this month:**
 ```
-GET /api/entities/reconciliation-summary/?date_from=2026-01-01&date_to=2026-01-31
+GET /api/companies/reconciliation-summary/?date_from=2026-01-01&date_to=2026-01-31
 ```
 
 **Get summary for pending transactions only:**
 ```
-GET /api/entities/reconciliation-summary/?state__in=pending
+GET /api/companies/reconciliation-summary/?state__in=pending
 ```
 
 ### Retool Usage Example
 
 ```javascript
-// REST Query for entity summary dashboard
+// REST Query for company summary dashboard
 {
   "method": "GET",
-  "url": "/{{ tenant }}/api/entities/reconciliation-summary/",
+  "url": "/api/companies/reconciliation-summary/",
   "params": {
     "date_from": "{{ dateRangePicker.startDate }}",
     "date_to": "{{ dateRangePicker.endDate }}"
@@ -681,12 +684,12 @@ GET /api/entities/reconciliation-summary/?state__in=pending
 }
 
 // Table data source
-{{ entitySummary.data.by_entity }}
+{{ companySummary.data.by_company }}
 
 // Global stats display
-"Total: {{ entitySummary.data.totals.total_count }} | " +
-"Unbalanced: {{ entitySummary.data.totals.unbalanced_count }} | " +
-"Ready: {{ entitySummary.data.totals.ready_to_post_count }}"
+"Total: {{ companySummary.data.totals.total_count }} | " +
+"Unbalanced: {{ companySummary.data.totals.unbalanced_count }} | " +
+"Ready: {{ companySummary.data.totals.ready_to_post_count }}"
 ```
 
 ---
