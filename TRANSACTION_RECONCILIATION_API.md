@@ -562,6 +562,7 @@ GET /api/companies/reconciliation-summary/
 | `date_from` | date | Filter transactions from this date |
 | `date_to` | date | Filter transactions until this date |
 | `state__in` | string | Comma-separated states: `pending,posted,canceled` |
+| `include_empty` | boolean | If `true`, include companies with no transactions (default: `false`) |
 
 ### Response
 
@@ -668,6 +669,11 @@ GET /api/companies/reconciliation-summary/?date_from=2026-01-01&date_to=2026-01-
 **Get summary for pending transactions only:**
 ```
 GET /api/companies/reconciliation-summary/?state__in=pending
+```
+
+**Get summary including companies with no transactions:**
+```
+GET /api/companies/reconciliation-summary/?include_empty=true
 ```
 
 ### Retool Usage Example

@@ -282,6 +282,7 @@ class CompanyViewSet(viewsets.ModelViewSet):
         - date_from: Filter transactions from this date
         - date_to: Filter transactions until this date
         - state__in: Comma-separated transaction states (pending,posted,canceled)
+        - include_empty: If 'true', include companies with no transactions (default: false)
         
         Response:
         {
@@ -307,6 +308,7 @@ class CompanyViewSet(viewsets.ModelViewSet):
         date_from = request.query_params.get('date_from')
         date_to = request.query_params.get('date_to')
         state_in = request.query_params.get('state__in')
+        include_empty = request.query_params.get('include_empty', 'false').lower() in ('true', '1', 'yes')
         
         # Base transaction queryset
         tx_qs = Transaction.objects.all()
@@ -365,8 +367,25 @@ class CompanyViewSet(viewsets.ModelViewSet):
             company_tx = tx_annotated.filter(company_id=company.id)
             
             total_count = company_tx.count()
+            
+            # Handle companies with no transactions
             if total_count == 0:
-                continue  # Skip companies with no transactions in the filter range
+                if include_empty:
+                    # Add company with zero counts
+                    results.append({
+                        'company_id': company.id,
+                        'company_name': company.name,
+                        'subdomain': company.subdomain,
+                        'total_count': 0,
+                        'balanced_count': 0,
+                        'unbalanced_count': 0,
+                        'ready_to_post_count': 0,
+                        'pending_bank_recon_count': 0,
+                        'total_amount': 0.0,
+                        'by_state': {},
+                        'by_bank_recon_status': {'matched': 0, 'pending': 0, 'mixed': 0, 'na': 0}
+                    })
+                continue
             
             balanced_count = company_tx.filter(is_balanced=True).count()
             unbalanced_count = company_tx.filter(is_balanced=False).count()
