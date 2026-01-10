@@ -312,13 +312,22 @@ class TransactionListSerializer(serializers.ModelSerializer):
     reconciliation_status = serializers.SerializerMethodField()
     entity = serializers.PrimaryKeyRelatedField(read_only=True)
     bank_date = serializers.SerializerMethodField()
+    # New fields for transaction reconciliation page
+    bank_recon_status = serializers.SerializerMethodField()
+    bank_linked_je_count = serializers.SerializerMethodField()
+    bank_reconciled_je_count = serializers.SerializerMethodField()
+    is_balanced = serializers.BooleanField(read_only=True)
+    total_debit = serializers.SerializerMethodField()
+    total_credit = serializers.SerializerMethodField()
     
     class Meta:
         model = Transaction
         fields = [
             'id', 'company', 'entity', 'currency', 'date', 'bank_date', 'description', 'amount', 'state',
             'journal_entries_count', 'balance', 'journal_entries_summary',
-            'journal_entries_bank_accounts', 'reconciliation_status', 'notes'
+            'journal_entries_bank_accounts', 'reconciliation_status', 'notes',
+            'is_balanced', 'bank_recon_status', 'bank_linked_je_count', 'bank_reconciled_je_count',
+            'total_debit', 'total_credit'
         ]
 
     def get_journal_entries_count(self, obj):
@@ -392,6 +401,50 @@ class TransactionListSerializer(serializers.ModelSerializer):
             return 'pending'
         else:
             return 'mixed'
+    
+    def get_bank_recon_status(self, obj):
+        """
+        Returns the bank reconciliation status:
+        - 'matched': All bank-linked JEs have reconciliations with status 'matched' or 'approved'
+        - 'pending': Has bank-linked JEs with no reconciliation
+        - 'mixed': Some matched, some pending
+        - 'na': No bank-linked JEs
+        """
+        relevant_entries = [je for je in obj.journal_entries.all() if je.account and je.account.bank_account]
+        if not relevant_entries:
+            return 'na'
+        
+        def is_reconciled(je):
+            return any(rec.status in ['matched', 'approved'] for rec in je.reconciliations.all())
+        
+        statuses = [is_reconciled(je) for je in relevant_entries]
+        if all(statuses):
+            return 'matched'
+        elif not any(statuses):
+            return 'pending'
+        else:
+            return 'mixed'
+    
+    def get_bank_linked_je_count(self, obj):
+        """Returns the count of journal entries linked to bank accounts."""
+        return sum(1 for je in obj.journal_entries.all() if je.account and je.account.bank_account)
+    
+    def get_bank_reconciled_je_count(self, obj):
+        """Returns the count of journal entries that are reconciled (matched/approved)."""
+        count = 0
+        for je in obj.journal_entries.all():
+            if je.account and je.account.bank_account:
+                if any(rec.status in ['matched', 'approved'] for rec in je.reconciliations.all()):
+                    count += 1
+        return count
+    
+    def get_total_debit(self, obj):
+        """Returns total debit amount across all journal entries."""
+        return float(sum((je.debit_amount or 0) for je in obj.journal_entries.all()))
+    
+    def get_total_credit(self, obj):
+        """Returns total credit amount across all journal entries."""
+        return float(sum((je.credit_amount or 0) for je in obj.journal_entries.all()))
     
 class TransactionSerializer(serializers.ModelSerializer):
     

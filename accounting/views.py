@@ -1040,6 +1040,141 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     
     # ==================== END BALANCE VALIDATION WORKFLOW ====================
     
+    # ==================== SUMMARY STATS FOR TRANSACTION RECONCILIATION PAGE ====================
+    
+    @action(detail=False, methods=['get'], url_path='summary-stats')
+    def summary_stats(self, request, tenant_id=None):
+        """
+        Returns aggregated summary statistics for transactions based on the applied filters.
+        
+        Query parameters: same as list filters (date_from, date_to, entity, state__in, etc.)
+        
+        Response:
+        {
+            "total_count": 150,
+            "unbalanced_count": 12,
+            "balanced_count": 138,
+            "ready_to_post_count": 45,
+            "pending_bank_recon_count": 23,
+            "total_debit": 125000.00,
+            "total_credit": 118500.00,
+            "by_state": {"pending": 100, "posted": 45, "canceled": 5},
+            "by_bank_recon_status": {"matched": 50, "pending": 30, "mixed": 10, "na": 60}
+        }
+        """
+        from django.db.models import Sum, Count, Case, When, Value, IntegerField, DecimalField
+        from django.db.models.functions import Coalesce
+        
+        # Apply filters using the filterset
+        qs = self.filter_queryset(self.get_queryset())
+        
+        # Basic counts
+        total_count = qs.count()
+        
+        # Balance status counts
+        balanced_count = qs.filter(is_balanced=True).count()
+        unbalanced_count = qs.filter(is_balanced=False).count()
+        
+        # Group by state
+        state_counts = qs.values('state').annotate(count=Count('id'))
+        by_state = {item['state']: item['count'] for item in state_counts}
+        
+        # Calculate total debit and credit across all journal entries
+        from accounting.models import JournalEntry
+        je_aggregates = JournalEntry.objects.filter(
+            transaction__in=qs
+        ).aggregate(
+            total_debit=Coalesce(Sum('debit_amount'), Value(0), output_field=DecimalField()),
+            total_credit=Coalesce(Sum('credit_amount'), Value(0), output_field=DecimalField())
+        )
+        
+        # Bank reconciliation status counts
+        # We need to compute this in Python since it requires complex JE inspection
+        # For performance, we'll sample or limit if too many records
+        
+        # Use annotations to efficiently compute bank recon status
+        from django.db.models import Exists, OuterRef
+        
+        # Subquery: JEs linked to bank accounts for this transaction
+        bank_linked_jes = JournalEntry.objects.filter(
+            transaction_id=OuterRef('id'),
+            account__bank_account__isnull=False
+        )
+        
+        # Subquery: JEs with OK reconciliation
+        from accounting.models import Reconciliation
+        ok_recon = Reconciliation.objects.filter(
+            journal_entries__id=OuterRef('id'),
+            status__in=['matched', 'approved']
+        )
+        
+        # JEs that are bank-linked and NOT reconciled
+        nonreconciled_bank_jes = bank_linked_jes.annotate(
+            has_ok=Exists(ok_recon)
+        ).filter(has_ok=False)
+        
+        # JEs that are bank-linked and ARE reconciled
+        reconciled_bank_jes = bank_linked_jes.annotate(
+            has_ok=Exists(ok_recon)
+        ).filter(has_ok=True)
+        
+        qs_annotated = qs.annotate(
+            has_bank_jes=Exists(bank_linked_jes),
+            has_nonreconciled_bank_jes=Exists(nonreconciled_bank_jes),
+            has_reconciled_bank_jes=Exists(reconciled_bank_jes)
+        )
+        
+        # Count by bank recon status
+        na_count = qs_annotated.filter(has_bank_jes=False).count()
+        matched_count = qs_annotated.filter(
+            has_bank_jes=True, 
+            has_nonreconciled_bank_jes=False
+        ).count()
+        pending_count = qs_annotated.filter(
+            has_bank_jes=True, 
+            has_reconciled_bank_jes=False
+        ).count()
+        mixed_count = qs_annotated.filter(
+            has_bank_jes=True, 
+            has_reconciled_bank_jes=True, 
+            has_nonreconciled_bank_jes=True
+        ).count()
+        
+        by_bank_recon_status = {
+            'matched': matched_count,
+            'pending': pending_count,
+            'mixed': mixed_count,
+            'na': na_count
+        }
+        
+        # Ready to post: balanced AND (all bank JEs reconciled OR no bank JEs)
+        ready_to_post_count = qs_annotated.filter(
+            is_balanced=True,
+            state='pending'
+        ).filter(
+            Q(has_bank_jes=False) | Q(has_nonreconciled_bank_jes=False)
+        ).count()
+        
+        # Pending bank recon: has unreconciled bank JEs
+        pending_bank_recon_count = qs_annotated.filter(
+            has_bank_jes=True,
+            has_nonreconciled_bank_jes=True
+        ).count()
+        
+        return Response({
+            'total_count': total_count,
+            'balanced_count': balanced_count,
+            'unbalanced_count': unbalanced_count,
+            'ready_to_post_count': ready_to_post_count,
+            'pending_bank_recon_count': pending_bank_recon_count,
+            'total_debit': float(je_aggregates['total_debit'] or 0),
+            'total_credit': float(je_aggregates['total_credit'] or 0),
+            'by_state': by_state,
+            'by_bank_recon_status': by_bank_recon_status
+        })
+    
+    # ==================== END SUMMARY STATS ====================
+    
     # Automatically create a balancing journal entry
     @action(detail=True, methods=['post'])
     def create_balancing_entry(self, request, pk=None):
@@ -1229,6 +1364,332 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         journal_entries = self.queryset.filter(filters)
         serializer = self.get_serializer(journal_entries, many=True)
         return Response(serializer.data)
+
+    # ==================== ACCOUNT SUGGESTION & CLASSIFICATION ====================
+    
+    @action(detail=False, methods=['post'], url_path='suggest-account')
+    def suggest_account(self, request, tenant_id=None):
+        """
+        Suggests accounts for a journal entry based on historical classification patterns.
+        
+        POST body:
+        {
+            "transaction_description": "Pagamento fornecedor XYZ",
+            "amount": 1500.00,
+            "entity_id": 5,           // optional
+            "je_description": "...",   // optional
+            "limit": 5                 // optional, default 5
+        }
+        
+        Response:
+        {
+            "suggestions": [
+                {
+                    "account_id": 123,
+                    "account_code": "2.1.01",
+                    "account_name": "Fornecedores",
+                    "account_path": "Passivo > Circulante > Fornecedores",
+                    "confidence": 0.92,
+                    "reason": "description_match",
+                    "historical_count": 47,
+                    "last_used": "2026-01-05"
+                },
+                ...
+            ]
+        }
+        """
+        from django.db.models import Count, Max
+        from django.db.models.functions import Lower
+        from collections import Counter
+        import re
+        
+        transaction_description = request.data.get('transaction_description', '')
+        je_description = request.data.get('je_description', '')
+        amount = request.data.get('amount')
+        entity_id = request.data.get('entity_id')
+        limit = int(request.data.get('limit', 5))
+        
+        # Get company from tenant context
+        company_id = getattr(request, 'company_id', None)
+        if not company_id and hasattr(request, 'user') and hasattr(request.user, 'company_id'):
+            company_id = request.user.company_id
+        
+        # Normalize description for matching
+        def normalize_text(text):
+            if not text:
+                return ''
+            # Convert to lowercase, remove extra spaces, remove common prefixes
+            text = text.lower().strip()
+            # Remove numbers (often transaction-specific)
+            text = re.sub(r'\d+', '', text)
+            # Remove special characters except spaces
+            text = re.sub(r'[^\w\s]', ' ', text)
+            # Remove extra whitespace
+            text = re.sub(r'\s+', ' ', text).strip()
+            return text
+        
+        normalized_desc = normalize_text(transaction_description)
+        normalized_je_desc = normalize_text(je_description)
+        
+        # Words to match against
+        search_words = set(normalized_desc.split() + normalized_je_desc.split())
+        # Remove very short words
+        search_words = {w for w in search_words if len(w) > 2}
+        
+        suggestions = []
+        suggestion_scores = Counter()
+        suggestion_data = {}
+        
+        # Base queryset: historical JEs with assigned accounts
+        base_qs = JournalEntry.objects.filter(
+            account__isnull=False
+        ).select_related('account', 'transaction')
+        
+        if company_id:
+            base_qs = base_qs.filter(company_id=company_id)
+        
+        # Strategy 1: Description word matching
+        if search_words:
+            for word in search_words:
+                matching_jes = base_qs.filter(
+                    Q(transaction__description__icontains=word) |
+                    Q(description__icontains=word)
+                ).values(
+                    'account_id',
+                    'account__account_code',
+                    'account__name'
+                ).annotate(
+                    count=Count('id'),
+                    last_used=Max('transaction__date')
+                ).order_by('-count')[:20]
+                
+                for item in matching_jes:
+                    account_id = item['account_id']
+                    if account_id not in suggestion_data:
+                        suggestion_data[account_id] = {
+                            'account_id': account_id,
+                            'account_code': item['account__account_code'],
+                            'account_name': item['account__name'],
+                            'historical_count': 0,
+                            'last_used': None,
+                            'match_reasons': set()
+                        }
+                    suggestion_data[account_id]['historical_count'] += item['count']
+                    if item['last_used']:
+                        if not suggestion_data[account_id]['last_used'] or item['last_used'] > suggestion_data[account_id]['last_used']:
+                            suggestion_data[account_id]['last_used'] = item['last_used']
+                    suggestion_data[account_id]['match_reasons'].add('description_match')
+                    suggestion_scores[account_id] += item['count'] * 2  # Weight for description match
+        
+        # Strategy 2: Entity pattern matching
+        if entity_id:
+            entity_jes = base_qs.filter(
+                transaction__entity_id=entity_id
+            ).values(
+                'account_id',
+                'account__account_code',
+                'account__name'
+            ).annotate(
+                count=Count('id'),
+                last_used=Max('transaction__date')
+            ).order_by('-count')[:20]
+            
+            for item in entity_jes:
+                account_id = item['account_id']
+                if account_id not in suggestion_data:
+                    suggestion_data[account_id] = {
+                        'account_id': account_id,
+                        'account_code': item['account__account_code'],
+                        'account_name': item['account__name'],
+                        'historical_count': 0,
+                        'last_used': None,
+                        'match_reasons': set()
+                    }
+                suggestion_data[account_id]['historical_count'] += item['count']
+                if item['last_used']:
+                    if not suggestion_data[account_id]['last_used'] or item['last_used'] > suggestion_data[account_id]['last_used']:
+                        suggestion_data[account_id]['last_used'] = item['last_used']
+                suggestion_data[account_id]['match_reasons'].add('entity_pattern')
+                suggestion_scores[account_id] += item['count']  # Weight for entity match
+        
+        # Strategy 3: Amount range matching (for similar transaction amounts)
+        if amount is not None:
+            from decimal import Decimal
+            amount_dec = Decimal(str(amount))
+            # Match amounts within 10% range
+            amount_min = amount_dec * Decimal('0.9')
+            amount_max = amount_dec * Decimal('1.1')
+            
+            amount_jes = base_qs.filter(
+                transaction__amount__gte=amount_min,
+                transaction__amount__lte=amount_max
+            ).values(
+                'account_id',
+                'account__account_code',
+                'account__name'
+            ).annotate(
+                count=Count('id'),
+                last_used=Max('transaction__date')
+            ).order_by('-count')[:15]
+            
+            for item in amount_jes:
+                account_id = item['account_id']
+                if account_id not in suggestion_data:
+                    suggestion_data[account_id] = {
+                        'account_id': account_id,
+                        'account_code': item['account__account_code'],
+                        'account_name': item['account__name'],
+                        'historical_count': 0,
+                        'last_used': None,
+                        'match_reasons': set()
+                    }
+                suggestion_data[account_id]['historical_count'] += item['count']
+                if item['last_used']:
+                    if not suggestion_data[account_id]['last_used'] or item['last_used'] > suggestion_data[account_id]['last_used']:
+                        suggestion_data[account_id]['last_used'] = item['last_used']
+                suggestion_data[account_id]['match_reasons'].add('amount_pattern')
+                suggestion_scores[account_id] += item['count'] // 2  # Lower weight for amount match
+        
+        # Calculate confidence and sort
+        max_score = max(suggestion_scores.values()) if suggestion_scores else 1
+        
+        for account_id, score in suggestion_scores.most_common(limit):
+            data = suggestion_data[account_id]
+            confidence = min(0.99, score / max_score)  # Normalize to 0-1
+            
+            # Get account path
+            try:
+                account = Account.objects.get(id=account_id)
+                account_path = account.get_path()
+            except Account.DoesNotExist:
+                account_path = data['account_name']
+            
+            suggestions.append({
+                'account_id': account_id,
+                'account_code': data['account_code'],
+                'account_name': data['account_name'],
+                'account_path': account_path,
+                'confidence': round(confidence, 2),
+                'reason': ', '.join(sorted(data['match_reasons'])),
+                'historical_count': data['historical_count'],
+                'last_used': str(data['last_used']) if data['last_used'] else None
+            })
+        
+        return Response({'suggestions': suggestions})
+    
+    @action(detail=False, methods=['get'], url_path='classification-history')
+    def classification_history(self, request, tenant_id=None):
+        """
+        Returns recent classification patterns for journal entries.
+        
+        Query params:
+        - account_id: Filter by specific account (optional)
+        - entity_id: Filter by specific entity (optional)
+        - limit: Max results (default 20)
+        
+        Response:
+        {
+            "recent_classifications": [
+                {
+                    "account_id": 123,
+                    "account_code": "2.1.01",
+                    "account_name": "Fornecedores",
+                    "description_pattern": "Pagamento*",
+                    "count": 15,
+                    "last_used": "2026-01-05"
+                }
+            ],
+            "recent_accounts": [
+                {
+                    "account_id": 123,
+                    "account_code": "2.1.01",
+                    "account_name": "Fornecedores",
+                    "usage_count": 47
+                }
+            ]
+        }
+        """
+        from django.db.models import Count, Max
+        
+        account_id = request.query_params.get('account_id')
+        entity_id = request.query_params.get('entity_id')
+        limit = int(request.query_params.get('limit', 20))
+        
+        # Get company from tenant context
+        company_id = getattr(request, 'company_id', None)
+        if not company_id and hasattr(request, 'user') and hasattr(request.user, 'company_id'):
+            company_id = request.user.company_id
+        
+        # Base queryset
+        base_qs = JournalEntry.objects.filter(
+            account__isnull=False
+        ).select_related('account', 'transaction')
+        
+        if company_id:
+            base_qs = base_qs.filter(company_id=company_id)
+        if account_id:
+            base_qs = base_qs.filter(account_id=account_id)
+        if entity_id:
+            base_qs = base_qs.filter(transaction__entity_id=entity_id)
+        
+        # Recent classifications grouped by account and description pattern
+        recent_classifications = base_qs.values(
+            'account_id',
+            'account__account_code',
+            'account__name',
+            'transaction__description'
+        ).annotate(
+            count=Count('id'),
+            last_used=Max('transaction__date')
+        ).order_by('-last_used', '-count')[:limit]
+        
+        classifications_list = []
+        seen_patterns = set()
+        
+        for item in recent_classifications:
+            # Create a simplified pattern from description
+            desc = item['transaction__description'] or ''
+            # Truncate and add wildcard
+            pattern = desc[:30] + '*' if len(desc) > 30 else desc
+            
+            pattern_key = (item['account_id'], pattern)
+            if pattern_key in seen_patterns:
+                continue
+            seen_patterns.add(pattern_key)
+            
+            classifications_list.append({
+                'account_id': item['account_id'],
+                'account_code': item['account__account_code'],
+                'account_name': item['account__name'],
+                'description_pattern': pattern,
+                'count': item['count'],
+                'last_used': str(item['last_used']) if item['last_used'] else None
+            })
+        
+        # Most used accounts (regardless of pattern)
+        recent_accounts = base_qs.values(
+            'account_id',
+            'account__account_code',
+            'account__name'
+        ).annotate(
+            usage_count=Count('id'),
+            last_used=Max('transaction__date')
+        ).order_by('-usage_count')[:10]
+        
+        accounts_list = [{
+            'account_id': item['account_id'],
+            'account_code': item['account__account_code'],
+            'account_name': item['account__name'],
+            'usage_count': item['usage_count'],
+            'last_used': str(item['last_used']) if item['last_used'] else None
+        } for item in recent_accounts]
+        
+        return Response({
+            'recent_classifications': classifications_list[:limit],
+            'recent_accounts': accounts_list
+        })
+    
+    # ==================== END ACCOUNT SUGGESTION & CLASSIFICATION ====================
 
     
 # Rule ViewSet

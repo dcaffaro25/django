@@ -69,12 +69,17 @@ class TransactionFilter(filters.FilterSet):
 
     # If Transaction has a real FK `entity`, using 'entity_id' here still works in Django
     entity      = filters.NumberFilter(field_name="entity_id")
+    entity__in  = NumberInFilter(field_name="entity_id", lookup_expr="in")
     currency    = filters.NumberFilter(field_name="currency_id")
 
     description = filters.CharFilter(field_name="description", lookup_expr="icontains")
     
     # Booleans / flags
     unreconciled = filters.BooleanFilter(method="filter_unreconciled")
+    is_balanced = filters.BooleanFilter(field_name="is_balanced")
+    
+    # Bank reconciliation status filter: matched, pending, mixed, na
+    bank_recon_status = filters.CharFilter(method="filter_bank_recon_status")
     
     # ⚠ Only keep this if Transaction actually has this field
     balance_validated = filters.BooleanFilter(field_name="balance_validated")
@@ -151,6 +156,33 @@ class TransactionFilter(filters.FilterSet):
         elif v == "mixed":
             # Has relevant JEs and both reconciled and unreconciled among them
             return qs.filter(has_rel=True, has_any_reconciled=True, has_nonreconciled=True).distinct()
+        return qs
+
+    def filter_bank_recon_status(self, qs, name, value: str):
+        """
+        Filter by bank reconciliation status:
+        - 'matched': All bank-linked JEs are reconciled
+        - 'pending': Has bank-linked JEs with no reconciliation
+        - 'mixed': Some matched, some pending
+        - 'na': No bank-linked JEs
+        
+        Usage: ?bank_recon_status=matched|pending|mixed|na
+        """
+        qs = self._annotate_recon_flags(qs)
+        v = (value or "").lower()
+        
+        if v == "matched":
+            # Has relevant JEs and ALL are reconciled
+            return qs.filter(has_rel=True, has_nonreconciled=False).distinct()
+        elif v == "pending":
+            # Has relevant JEs but NONE are reconciled
+            return qs.filter(has_rel=True, has_any_reconciled=False).distinct()
+        elif v == "mixed":
+            # Has relevant JEs and SOME are reconciled, SOME are not
+            return qs.filter(has_rel=True, has_any_reconciled=True, has_nonreconciled=True).distinct()
+        elif v == "na":
+            # No relevant JEs (no bank-linked accounts)
+            return qs.filter(has_rel=False).distinct()
         return qs
 
 class JournalEntryFilter(filters.FilterSet):
