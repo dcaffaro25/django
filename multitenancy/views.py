@@ -290,7 +290,7 @@ class CompanyViewSet(viewsets.ModelViewSet):
             "by_company": [
                 {
                     "company_id": 1,
-                    "company_name": "Client ABC",
+                    "name": "Client ABC",
                     "subdomain": "clientabc",
                     "total_count": 50,
                     "balanced_count": 45,
@@ -374,7 +374,7 @@ class CompanyViewSet(viewsets.ModelViewSet):
                     # Add company with zero counts
                     results.append({
                         'company_id': company.id,
-                        'company_name': company.name,
+                        'name': company.name,
                         'subdomain': company.subdomain,
                         'total_count': 0,
                         'balanced_count': 0,
@@ -431,7 +431,7 @@ class CompanyViewSet(viewsets.ModelViewSet):
             
             company_data = {
                 'company_id': company.id,
-                'company_name': company.name,
+                'name': company.name,
                 'subdomain': company.subdomain,
                 'total_count': total_count,
                 'balanced_count': balanced_count,

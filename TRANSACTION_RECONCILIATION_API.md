@@ -590,7 +590,7 @@ GET /api/companies/reconciliation-summary/
   "by_company": [
     {
       "company_id": 1,
-      "company_name": "Client ABC Ltda",
+      "name": "Client ABC Ltda",
       "subdomain": "clientabc",
       "total_count": 150,
       "balanced_count": 140,
@@ -643,7 +643,7 @@ List of company summaries, sorted by `total_count` descending. Each company incl
 | Field | Type | Description |
 |-------|------|-------------|
 | `company_id` | integer | Company primary key |
-| `company_name` | string | Company name |
+| `name` | string | Company name |
 | `subdomain` | string | Company subdomain (tenant identifier) |
 | `total_count` | integer | Transactions for this company |
 | `balanced_count` | integer | Balanced transactions |
