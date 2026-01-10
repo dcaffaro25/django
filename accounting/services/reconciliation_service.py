@@ -3316,7 +3316,8 @@ class ReconciliationPipelineEngine:
                     target=target,
                     tolerance=stage.amount_tol,
                     max_size=stage.max_group_size_book,
-                    max_results=10,  # Find up to 10 alternatives
+                    max_results=3,  # Find up to 3 alternatives
+                    time_exceeded_fn=self._time_exceeded,  # Respect soft time limit
                 )
                 for bb_indices in bb_results:
                     bb_combo = [book_items[i].dto for i in bb_indices]
@@ -4196,7 +4197,8 @@ def branch_and_bound_subset(amounts: List[Decimal], target: Decimal, tolerance: 
 
 
 def branch_and_bound_subset_multi(amounts: List[Decimal], target: Decimal, tolerance: Decimal = Decimal("0.00"),
-                                   max_size: Optional[int] = None, max_results: int = 10) -> List[List[int]]:
+                                   max_size: Optional[int] = None, max_results: int = 3,
+                                   time_exceeded_fn: Optional[Callable[[], bool]] = None) -> List[List[int]]:
     """
     Find MULTIPLE subsets of `amounts` whose sum is within +/- `tolerance` of `target`.
     Returns up to max_results different valid combinations.
@@ -4215,7 +4217,10 @@ def branch_and_bound_subset_multi(amounts: List[Decimal], target: Decimal, toler
     max_size: Optional[int]
         Maximum number of elements allowed in the subset.
     max_results: int
-        Maximum number of valid subsets to return (default 10).
+        Maximum number of valid subsets to return (default 3).
+    time_exceeded_fn: Optional[Callable[[], bool]]
+        Optional callback function that returns True if time limit is exceeded.
+        When provided, the search will abort early and return whatever was found.
 
     Returns
     -------
@@ -4250,11 +4255,22 @@ def branch_and_bound_subset_multi(amounts: List[Decimal], target: Decimal, toler
 
     results: List[List[int]] = []
     seen_sets: set = set()  # Track unique combinations to avoid duplicates
+    time_exceeded = False
+    check_counter = 0
 
     def dfs(idx: int, chosen: List[int], current_sum: Decimal):
-        nonlocal results
+        nonlocal results, time_exceeded, check_counter
         if len(results) >= max_results:
             return
+        if time_exceeded:
+            return
+        # Check time limit periodically (every 1000 recursions to avoid overhead)
+        if time_exceeded_fn is not None:
+            check_counter += 1
+            if check_counter % 1000 == 0 and time_exceeded_fn():
+                time_exceeded = True
+                logger.debug("branch_and_bound_subset_multi: time limit exceeded, returning %d results found", len(results))
+                return
         # If we exceeded the optional group size, stop exploring
         if max_size is not None and len(chosen) > max_size:
             return
@@ -4275,7 +4291,7 @@ def branch_and_bound_subset_multi(amounts: List[Decimal], target: Decimal, toler
             return
         # Branch 1: skip current item
         dfs(idx + 1, chosen, current_sum)
-        if len(results) >= max_results:
+        if len(results) >= max_results or time_exceeded:
             return
         # Branch 2: include current item
         dfs(idx + 1, chosen + [idx], current_sum + sorted_amounts[idx])
