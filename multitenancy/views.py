@@ -386,6 +386,183 @@ class EntityViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
 
         return Response(results, status=status.HTTP_200_OK)
 
+    @action(detail=False, methods=['get'], url_path='reconciliation-summary')
+    def reconciliation_summary(self, request, tenant_id=None):
+        """
+        Returns transaction reconciliation summary statistics grouped by entity/client.
+        
+        Query parameters (optional):
+        - date_from: Filter transactions from this date
+        - date_to: Filter transactions until this date
+        - state__in: Comma-separated transaction states (pending,posted,canceled)
+        
+        Response:
+        {
+            "totals": { ... global summary ... },
+            "by_entity": [
+                {
+                    "entity_id": 1,
+                    "entity_name": "Client ABC",
+                    "total_count": 50,
+                    "balanced_count": 45,
+                    ...
+                },
+                ...
+            ]
+        }
+        """
+        from django.db.models import Count, Sum, Q, Exists, OuterRef, Value, DecimalField
+        from django.db.models.functions import Coalesce
+        from accounting.models import Transaction, JournalEntry, Reconciliation
+        
+        # Get filter parameters
+        date_from = request.query_params.get('date_from')
+        date_to = request.query_params.get('date_to')
+        state_in = request.query_params.get('state__in')
+        
+        # Base transaction queryset
+        tx_qs = Transaction.objects.all()
+        
+        if date_from:
+            tx_qs = tx_qs.filter(date__gte=date_from)
+        if date_to:
+            tx_qs = tx_qs.filter(date__lte=date_to)
+        if state_in:
+            states = [s.strip() for s in state_in.split(',')]
+            tx_qs = tx_qs.filter(state__in=states)
+        
+        # Subqueries for bank reconciliation status
+        bank_linked_jes = JournalEntry.objects.filter(
+            transaction_id=OuterRef('id'),
+            account__bank_account__isnull=False
+        )
+        
+        ok_recon = Reconciliation.objects.filter(
+            journal_entries__id=OuterRef('id'),
+            status__in=['matched', 'approved']
+        )
+        
+        nonreconciled_bank_jes = bank_linked_jes.annotate(
+            has_ok=Exists(ok_recon)
+        ).filter(has_ok=False)
+        
+        reconciled_bank_jes = bank_linked_jes.annotate(
+            has_ok=Exists(ok_recon)
+        ).filter(has_ok=True)
+        
+        # Annotate transactions with bank recon flags
+        tx_annotated = tx_qs.annotate(
+            has_bank_jes=Exists(bank_linked_jes),
+            has_nonreconciled_bank_jes=Exists(nonreconciled_bank_jes),
+            has_reconciled_bank_jes=Exists(reconciled_bank_jes)
+        )
+        
+        # Get all entities with their transaction stats
+        entities = self.get_queryset()
+        results = []
+        
+        # Global totals
+        global_totals = {
+            'total_count': 0,
+            'balanced_count': 0,
+            'unbalanced_count': 0,
+            'ready_to_post_count': 0,
+            'pending_bank_recon_count': 0,
+            'total_amount': 0,
+            'by_state': {},
+            'by_bank_recon_status': {'matched': 0, 'pending': 0, 'mixed': 0, 'na': 0}
+        }
+        
+        for entity in entities:
+            entity_tx = tx_annotated.filter(entity_id=entity.id)
+            
+            total_count = entity_tx.count()
+            if total_count == 0:
+                continue  # Skip entities with no transactions in the filter range
+            
+            balanced_count = entity_tx.filter(is_balanced=True).count()
+            unbalanced_count = entity_tx.filter(is_balanced=False).count()
+            
+            # Bank recon status counts
+            na_count = entity_tx.filter(has_bank_jes=False).count()
+            matched_count = entity_tx.filter(
+                has_bank_jes=True, 
+                has_nonreconciled_bank_jes=False
+            ).count()
+            pending_recon_count = entity_tx.filter(
+                has_bank_jes=True, 
+                has_reconciled_bank_jes=False
+            ).count()
+            mixed_count = entity_tx.filter(
+                has_bank_jes=True, 
+                has_reconciled_bank_jes=True, 
+                has_nonreconciled_bank_jes=True
+            ).count()
+            
+            # Ready to post: balanced + pending state + (no bank JEs OR all reconciled)
+            ready_to_post_count = entity_tx.filter(
+                is_balanced=True,
+                state='pending'
+            ).filter(
+                Q(has_bank_jes=False) | Q(has_nonreconciled_bank_jes=False)
+            ).count()
+            
+            # Pending bank recon
+            pending_bank_recon_count = entity_tx.filter(
+                has_bank_jes=True,
+                has_nonreconciled_bank_jes=True
+            ).count()
+            
+            # State breakdown
+            state_counts = entity_tx.values('state').annotate(count=Count('id'))
+            by_state = {item['state']: item['count'] for item in state_counts}
+            
+            # Total amount
+            total_amount = entity_tx.aggregate(
+                total=Coalesce(Sum('amount'), Value(0), output_field=DecimalField())
+            )['total']
+            
+            entity_data = {
+                'entity_id': entity.id,
+                'entity_name': entity.name,
+                'total_count': total_count,
+                'balanced_count': balanced_count,
+                'unbalanced_count': unbalanced_count,
+                'ready_to_post_count': ready_to_post_count,
+                'pending_bank_recon_count': pending_bank_recon_count,
+                'total_amount': float(total_amount or 0),
+                'by_state': by_state,
+                'by_bank_recon_status': {
+                    'matched': matched_count,
+                    'pending': pending_recon_count,
+                    'mixed': mixed_count,
+                    'na': na_count
+                }
+            }
+            results.append(entity_data)
+            
+            # Accumulate global totals
+            global_totals['total_count'] += total_count
+            global_totals['balanced_count'] += balanced_count
+            global_totals['unbalanced_count'] += unbalanced_count
+            global_totals['ready_to_post_count'] += ready_to_post_count
+            global_totals['pending_bank_recon_count'] += pending_bank_recon_count
+            global_totals['total_amount'] += float(total_amount or 0)
+            global_totals['by_bank_recon_status']['matched'] += matched_count
+            global_totals['by_bank_recon_status']['pending'] += pending_recon_count
+            global_totals['by_bank_recon_status']['mixed'] += mixed_count
+            global_totals['by_bank_recon_status']['na'] += na_count
+            for state, count in by_state.items():
+                global_totals['by_state'][state] = global_totals['by_state'].get(state, 0) + count
+        
+        # Sort by total_count descending
+        results.sort(key=lambda x: x['total_count'], reverse=True)
+        
+        return Response({
+            'totals': global_totals,
+            'by_entity': results
+        }, status=status.HTTP_200_OK)
+
 class EntityDynamicTransposedView(APIView):
     """
     Retrieve Entity data dynamically transposed by Accounts or Cost Centers.

@@ -14,6 +14,7 @@ This document describes the API endpoints and features for the Transaction Recon
 6. [Classification History Endpoint](#classification-history-endpoint)
 7. [Existing Transaction Actions](#existing-transaction-actions)
 8. [Usage Examples](#usage-examples)
+9. [Entity Reconciliation Summary Endpoint](#entity-reconciliation-summary-endpoint)
 
 ---
 
@@ -540,6 +541,152 @@ Error responses include a message:
 {
   "error": "Account ID is required"
 }
+```
+
+---
+
+## Entity Reconciliation Summary Endpoint
+
+Returns transaction reconciliation summary statistics **grouped by entity/client**. This is useful for dashboards that need to show reconciliation status across all clients.
+
+### Endpoint
+
+```
+GET /api/entities/reconciliation-summary/
+```
+
+### Query Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `date_from` | date | Filter transactions from this date |
+| `date_to` | date | Filter transactions until this date |
+| `state__in` | string | Comma-separated states: `pending,posted,canceled` |
+
+### Response
+
+```json
+{
+  "totals": {
+    "total_count": 500,
+    "balanced_count": 450,
+    "unbalanced_count": 50,
+    "ready_to_post_count": 200,
+    "pending_bank_recon_count": 80,
+    "total_amount": 1500000.00,
+    "by_state": {
+      "pending": 300,
+      "posted": 180,
+      "canceled": 20
+    },
+    "by_bank_recon_status": {
+      "matched": 150,
+      "pending": 100,
+      "mixed": 30,
+      "na": 220
+    }
+  },
+  "by_entity": [
+    {
+      "entity_id": 1,
+      "entity_name": "Client ABC Ltda",
+      "total_count": 150,
+      "balanced_count": 140,
+      "unbalanced_count": 10,
+      "ready_to_post_count": 80,
+      "pending_bank_recon_count": 25,
+      "total_amount": 500000.00,
+      "by_state": {
+        "pending": 100,
+        "posted": 45,
+        "canceled": 5
+      },
+      "by_bank_recon_status": {
+        "matched": 50,
+        "pending": 30,
+        "mixed": 10,
+        "na": 60
+      }
+    },
+    {
+      "entity_id": 2,
+      "entity_name": "Client XYZ S.A.",
+      "total_count": 100,
+      ...
+    }
+  ]
+}
+```
+
+### Response Fields
+
+#### `totals` Object
+Aggregated statistics across all entities:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `total_count` | integer | Total transactions across all entities |
+| `balanced_count` | integer | Balanced transactions |
+| `unbalanced_count` | integer | Unbalanced transactions |
+| `ready_to_post_count` | integer | Ready to post (balanced + no pending bank recon) |
+| `pending_bank_recon_count` | integer | Has unreconciled bank JEs |
+| `total_amount` | decimal | Sum of all transaction amounts |
+| `by_state` | object | Count breakdown by state |
+| `by_bank_recon_status` | object | Count breakdown by bank recon status |
+
+#### `by_entity` Array
+List of entity summaries, sorted by `total_count` descending. Each entity includes:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `entity_id` | integer | Entity primary key |
+| `entity_name` | string | Entity name |
+| `total_count` | integer | Transactions for this entity |
+| `balanced_count` | integer | Balanced transactions |
+| `unbalanced_count` | integer | Unbalanced transactions |
+| `ready_to_post_count` | integer | Ready to post |
+| `pending_bank_recon_count` | integer | Pending bank reconciliation |
+| `total_amount` | decimal | Sum of transaction amounts |
+| `by_state` | object | State breakdown |
+| `by_bank_recon_status` | object | Bank recon status breakdown |
+
+### Example Requests
+
+**Get summary for all entities:**
+```
+GET /api/entities/reconciliation-summary/
+```
+
+**Get summary for this month:**
+```
+GET /api/entities/reconciliation-summary/?date_from=2026-01-01&date_to=2026-01-31
+```
+
+**Get summary for pending transactions only:**
+```
+GET /api/entities/reconciliation-summary/?state__in=pending
+```
+
+### Retool Usage Example
+
+```javascript
+// REST Query for entity summary dashboard
+{
+  "method": "GET",
+  "url": "/{{ tenant }}/api/entities/reconciliation-summary/",
+  "params": {
+    "date_from": "{{ dateRangePicker.startDate }}",
+    "date_to": "{{ dateRangePicker.endDate }}"
+  }
+}
+
+// Table data source
+{{ entitySummary.data.by_entity }}
+
+// Global stats display
+"Total: {{ entitySummary.data.totals.total_count }} | " +
+"Unbalanced: {{ entitySummary.data.totals.unbalanced_count }} | " +
+"Ready: {{ entitySummary.data.totals.ready_to_post_count }}"
 ```
 
 ---
