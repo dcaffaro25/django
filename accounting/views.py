@@ -460,7 +460,36 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             # descriptions (here we use the detailed multiline summaries)
             bank_description = get_bank_transaction_summary(banks)
             book_description = get_journal_entries_summary(books)
-    
+            
+            # Check if all records belong to the same company
+            company_ids = set()
+            for bank_tx in banks:
+                if bank_tx.company_id is not None:
+                    company_ids.add(bank_tx.company_id)
+            for je in books:
+                if hasattr(je, 'transaction') and je.transaction and je.transaction.company_id is not None:
+                    company_ids.add(je.transaction.company_id)
+            same_company = len(company_ids) == 1
+            
+            # Check if all records belong to the same entity
+            entity_ids = set()
+            for bank_tx in banks:
+                try:
+                    entity_id = bank_tx.entity_id
+                    if entity_id is not None:
+                        entity_ids.add(entity_id)
+                except (AttributeError, TypeError):
+                    if hasattr(bank_tx, 'bank_account') and bank_tx.bank_account:
+                        entity_id = getattr(bank_tx.bank_account, 'entity_id', None)
+                        if entity_id is not None:
+                            entity_ids.add(entity_id)
+            for je in books:
+                if hasattr(je, 'transaction') and je.transaction:
+                    entity_id = getattr(je.transaction, 'entity_id', None)
+                    if entity_id is not None:
+                        entity_ids.add(entity_id)
+            same_entity = len(entity_ids) == 1
+            
             results.append({
                 "reconciliation_id": rec.id,
                 "bank_ids": bank_ids,
@@ -478,6 +507,8 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 "max_date": max_date.isoformat() if max_date else None,
                 "reference": rec.reference,
                 "notes": rec.notes,
+                "same_company": same_company,
+                "same_entity": same_entity,
             })
     
         if page is not None:
