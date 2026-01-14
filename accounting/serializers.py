@@ -573,9 +573,64 @@ class ReconciliationTaskSerializer(serializers.ModelSerializer):
         ]
 
 class ReconciliationSerializer(serializers.ModelSerializer):
+    same_company = serializers.SerializerMethodField()
+    same_entity = serializers.SerializerMethodField()
+    
     class Meta:
         model = Reconciliation
         fields = '__all__'
+    
+    def get_same_company(self, obj):
+        """
+        Check if all bank transactions and journal entries belong to the same company.
+        Returns True if there's exactly one unique company ID across all records, False otherwise.
+        """
+        company_ids = set()
+        
+        # Collect company IDs from bank transactions
+        for bank_tx in obj.bank_transactions.all():
+            if bank_tx.company_id is not None:
+                company_ids.add(bank_tx.company_id)
+        
+        # Collect company IDs from journal entries (via transaction)
+        for je in obj.journal_entries.all():
+            if hasattr(je, 'transaction') and je.transaction and je.transaction.company_id is not None:
+                company_ids.add(je.transaction.company_id)
+        
+        # Return True if there's exactly one unique company ID, False otherwise
+        # If no records or all have None, return False (treat as mismatch)
+        return len(company_ids) == 1
+    
+    def get_same_entity(self, obj):
+        """
+        Check if all bank transactions and journal entries belong to the same entity.
+        Returns True if there's exactly one unique entity ID across all records, False otherwise.
+        """
+        entity_ids = set()
+        
+        # Collect entity IDs from bank transactions (via entity_id property)
+        for bank_tx in obj.bank_transactions.all():
+            try:
+                entity_id = bank_tx.entity_id
+                if entity_id is not None:
+                    entity_ids.add(entity_id)
+            except (AttributeError, TypeError):
+                # Fallback: try accessing via bank_account if property fails
+                if hasattr(bank_tx, 'bank_account') and bank_tx.bank_account:
+                    entity_id = getattr(bank_tx.bank_account, 'entity_id', None)
+                    if entity_id is not None:
+                        entity_ids.add(entity_id)
+        
+        # Collect entity IDs from journal entries (via transaction.entity_id)
+        for je in obj.journal_entries.all():
+            if hasattr(je, 'transaction') and je.transaction:
+                entity_id = getattr(je.transaction, 'entity_id', None)
+                if entity_id is not None:
+                    entity_ids.add(entity_id)
+        
+        # Return True if there's exactly one unique entity ID, False otherwise
+        # If no records or all have None, return False (treat as mismatch)
+        return len(entity_ids) == 1
 
 class ReconciliationConfigSerializer(serializers.ModelSerializer):
     company_name = serializers.CharField(source="company.name", read_only=True)
