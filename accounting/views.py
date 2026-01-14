@@ -296,15 +296,24 @@ class AccountSummaryView(APIView):
         permission_classes = [permissions.IsAuthenticated]
     
     def get(self, request, *args, **kwargs):
-        company_id = request.query_params.get('company_id')
+        # Get tenant from request (set by middleware) - never trust query params
+        tenant = getattr(request, 'tenant', None)
+        if not tenant or tenant == 'all':
+            if request.user.is_superuser and tenant == 'all':
+                # Superuser can access all, but need company_id for this endpoint
+                company_id = request.query_params.get('company_id')
+                if not company_id:
+                    return Response({"error": "Company ID is required when accessing all tenants"}, status=status.HTTP_400_BAD_REQUEST)
+            else:
+                return Response({"error": "Tenant not found in request"}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            company_id = tenant.id
+        
         entity_id = request.query_params.get('entity_id')
         min_depth = int(request.query_params.get('min_depth', 1))
         include_pending = request.query_params.get('include_pending', 'false').lower() == 'true'
         beginning_date = request.query_params.get('beginning_date')
         end_date = request.query_params.get('end_date')
-
-        if not company_id:
-            return Response({"error": "Company ID is required"}, status=status.HTTP_400_BAD_REQUEST)
 
         accounts_with_balances = Account.get_accounts_summary(
             company_id, entity_id, min_depth, include_pending, beginning_date, end_date
@@ -835,17 +844,13 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         """
         Returns transactions that still have unreconciled journal entries.
         Optional query parameters:
-        - company_id: filter by company
         - date_from / date_to: filter by transaction date
         """
+        # Use get_queryset() to ensure tenant filtering is applied via ScopedQuerysetMixin
         # Base queryset: only transactions with journal entries tied to a bank account
-        qs = Transaction.objects.filter(journal_entries__account__bank_account__isnull=False)
+        qs = self.get_queryset().filter(journal_entries__account__bank_account__isnull=False)
 
-        # Apply optional filters
-        company_id = request.query_params.get("tenant_id")
-        if company_id:
-            qs = qs.filter(company__id=company_id)
-
+        # Apply optional date filters
         date_from = request.query_params.get("date_from")
         date_to = request.query_params.get("date_to")
         if date_from:
@@ -854,10 +859,19 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             qs = qs.filter(date__lte=date_to)
 
         # Exclude any transaction where all bank-side JEs are reconciled (matched or approved)
-        matched_recon_tx_ids = Reconciliation.objects.filter(
-            status__in=['matched', 'approved'],
-            journal_entries__account__bank_account__isnull=False
-        ).values_list('journal_entries__transaction_id', flat=True)
+        # Ensure reconciliations are also filtered by tenant
+        tenant = getattr(request, 'tenant', None)
+        if tenant and tenant != 'all':
+            matched_recon_tx_ids = Reconciliation.objects.filter(
+                company=tenant,
+                status__in=['matched', 'approved'],
+                journal_entries__account__bank_account__isnull=False
+            ).values_list('journal_entries__transaction_id', flat=True)
+        else:
+            matched_recon_tx_ids = Reconciliation.objects.filter(
+                status__in=['matched', 'approved'],
+                journal_entries__account__bank_account__isnull=False
+            ).values_list('journal_entries__transaction_id', flat=True)
 
         qs_unmatched = qs.exclude(id__in=matched_recon_tx_ids).distinct()
 
@@ -1267,19 +1281,15 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         """
         Returns journal entries that are unmatched (not reconciled).
         Optional query parameters:
-        - company_id: filter by company
         - date_from / date_to: filter by transaction date
         """
         from django.db.models import Exists, OuterRef, Case, When, Value, CharField, F, Prefetch
         
+        # Use get_queryset() to ensure tenant filtering is applied via ScopedQuerysetMixin
         # Base queryset: only journal entries tied to a bank account
-        qs = JournalEntry.objects.filter(account__bank_account__isnull=False)
+        qs = self.get_queryset().filter(account__bank_account__isnull=False)
         
-        # Apply optional filters first
-        company_id = request.query_params.get("tenant_id")
-        if company_id:
-            qs = qs.filter(company__id=company_id)
-
+        # Apply optional date filters
         date_from = request.query_params.get("date_from")
         date_to = request.query_params.get("date_to")
         if date_from:
@@ -1318,21 +1328,45 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             ),
             # Balance calculation
             balance=F('debit_amount') - F('credit_amount')
-        ).exclude(
-            # Use EXISTS instead of values_list for better performance
-            Exists(
-                Reconciliation.objects.filter(
-                    journal_entries=OuterRef('pk'),
-                    status__in=['matched', 'approved']
+        )
+        
+        # Ensure reconciliations are filtered by tenant
+        tenant = getattr(request, 'tenant', None)
+        if tenant and tenant != 'all':
+            qs = qs.exclude(
+                # Use EXISTS instead of values_list for better performance
+                Exists(
+                    Reconciliation.objects.filter(
+                        company=tenant,
+                        journal_entries=OuterRef('pk'),
+                        status__in=['matched', 'approved']
+                    )
+                )
+            ).prefetch_related(
+                Prefetch(
+                    'reconciliations',
+                    queryset=Reconciliation.objects.filter(company=tenant).only('id', 'status'),
+                    to_attr='recon_list'
                 )
             )
-        ).prefetch_related(
-            Prefetch(
-                'reconciliations',
-                queryset=Reconciliation.objects.only('id', 'status'),
-                to_attr='recon_list'
+        else:
+            qs = qs.exclude(
+                # Use EXISTS instead of values_list for better performance
+                Exists(
+                    Reconciliation.objects.filter(
+                        journal_entries=OuterRef('pk'),
+                        status__in=['matched', 'approved']
+                    )
+                )
+            ).prefetch_related(
+                Prefetch(
+                    'reconciliations',
+                    queryset=Reconciliation.objects.only('id', 'status'),
+                    to_attr='recon_list'
+                )
             )
-        ).distinct()
+        
+        qs = qs.distinct()
         
         serializer_class = self.get_serializer_class()  # use list vs detail serializer
         serializer = serializer_class(qs, many=True)
@@ -1792,7 +1826,15 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     def get_queryset(self):
         from django.db.models import Exists, OuterRef, Case, When, Value, CharField, Prefetch
         
+        # Get tenant-filtered queryset from mixin (filters by company=request.tenant)
         qs = super().get_queryset()
+        
+        # Ensure tenant is set and validate it's a Company instance
+        tenant = getattr(self.request, 'tenant', None)
+        if not tenant or tenant == 'all':
+            # If no tenant, mixin should have already filtered to empty, but be explicit
+            if not self.request.user.is_superuser:
+                return qs.none()
         
         # Annotate reconciliation_status to avoid N+1 queries
         qs = qs.annotate(
@@ -1826,13 +1868,16 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         )
 
         # /entities/<entity_id>/... or ?entity_id=...
+        # Only filter by entity_id if it belongs to the current tenant
         entity_id = self.kwargs.get("entity_id") or self.request.query_params.get("entity_id")
         if entity_id:
-            qs = qs.filter(bank_account__entity_id=entity_id)
+            # Ensure entity belongs to current tenant (already filtered by company, but double-check)
+            qs = qs.filter(bank_account__entity_id=entity_id, bank_account__entity__company=tenant)
 
         bank_account_id = self.request.query_params.get("bank_account")
         if bank_account_id:
-            qs = qs.filter(bank_account_id=bank_account_id)
+            # Ensure bank_account belongs to current tenant
+            qs = qs.filter(bank_account_id=bank_account_id, bank_account__company=tenant)
 
         # accept ?status=... or ?status=PENDING,STARTED
         status_param = self.request.query_params.get("status")
@@ -3471,14 +3516,21 @@ class UnreconciledDashboardView(APIView):
         
     def get(self, request, tenant_id=None):
         try:
+            # Get tenant from request (set by middleware) - never trust query params or URL kwargs
+            tenant = getattr(request, 'tenant', None)
+            if not tenant or tenant == 'all':
+                if request.user.is_superuser and tenant == 'all':
+                    # Superuser can access all tenants, but need to specify which one
+                    return Response({"error": "Tenant must be specified for this endpoint"}, status=status.HTTP_400_BAD_REQUEST)
+                else:
+                    return Response({"error": "Tenant not found in request"}, status=status.HTTP_400_BAD_REQUEST)
+            
             # --- BANK TRANSACTIONS ---
             # Exclude reconciled records and those with missing dates.
-            bank_qs = BankTransaction.objects.exclude(
+            # Filter by company (tenant) to ensure tenant isolation
+            bank_qs = BankTransaction.objects.filter(company=tenant).exclude(
                 reconciliations__status__in=['matched', 'approved']
             ).filter(date__isnull=False).exclude(date='')
-            
-            if tenant_id:
-                bank_qs = bank_qs.filter(company__subdomain=tenant_id)
             
             bank_overall = bank_qs.aggregate(
                 count=Count('id'),
@@ -3491,12 +3543,10 @@ class UnreconciledDashboardView(APIView):
             ).order_by('day')
             
             # --- JOURNAL ENTRIES ---
-            journal_qs = JournalEntry.objects.exclude(
+            # Filter by company (tenant) to ensure tenant isolation
+            journal_qs = JournalEntry.objects.filter(company=tenant).exclude(
                 reconciliations__status__in=['matched', 'approved']
             ).filter(transaction__date__isnull=False).exclude(transaction__date='')
-            
-            if tenant_id:
-                journal_qs = journal_qs.filter(transaction__company__subdomain=tenant_id)
             
             journal_overall = journal_qs.aggregate(
                 count=Count('id'),
@@ -3537,11 +3587,24 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     serializer_class = ReconciliationTaskSerializer
     
     def get_queryset(self):
-        qs = ReconciliationTask.objects.all().order_by("-created_at")
-        # Accept tenant from router path or ?tenant_id=...
-        tenant_id = self.kwargs.get("tenant_id") or self.request.query_params.get("tenant_id")
-        if tenant_id:
-            qs = qs.filter(tenant_id=tenant_id)
+        # Call super().get_queryset() to apply ScopedQuerysetMixin filtering
+        # However, ReconciliationTask uses tenant_id (CharField) not company FK,
+        # so we need to handle it specially
+        qs = super().get_queryset().order_by("-created_at")
+        
+        # Get tenant from request (set by middleware) - never trust query params or URL kwargs
+        tenant = getattr(self.request, 'tenant', None)
+        if tenant and tenant != 'all':
+            # ReconciliationTask uses tenant_id (subdomain string), not company FK
+            # Filter by the tenant's subdomain
+            qs = qs.filter(tenant_id=tenant.subdomain)
+        elif tenant == 'all' and self.request.user.is_superuser:
+            # Superuser can see all tasks
+            pass
+        else:
+            # No tenant or not superuser - return empty
+            return qs.none()
+        
         return qs
     
     @action(detail=False, methods=["post"])
@@ -3775,23 +3838,24 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     def queued(self, request, tenant_id=None):
         """
         Returns both:
-        1. DB-persisted tasks (filterable by tenant_id, status)
+        1. DB-persisted tasks (filterable by status)
         2. Live Celery queue info (active/reserved/scheduled)
         Filters:
-          - ?tenant_id=foo
           - ?last_n=100   (last 100 tasks)
           - ?hours_ago=6  (tasks from the last 6 hours)
         """
         
-        tenant_filter = request.query_params.get("tenant_id")
+        # Get tenant from request (set by middleware) - never trust query params
+        tenant = getattr(request, 'tenant', None)
         status_filter = request.query_params.get("status")
         last_n = request.query_params.get("last_n")
         hours_ago = request.query_params.get("hours_ago")
         
         # ---- DB tasks ----
-        qs = ReconciliationTask.objects.all().order_by("-created_at")
-        if tenant_filter:
-            qs = qs.filter(tenant_id=tenant_filter)
+        # Use get_queryset() to ensure tenant filtering is applied
+        qs = self.get_queryset()
+        if status_filter:
+            qs = qs.filter(status=status_filter)
         if status_filter:
             qs = qs.filter(status=status_filter)
         
@@ -3841,18 +3905,16 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         """
         Lightweight endpoint to return counts of tasks by status.
         Filters:
-          - ?tenant_id=foo
           - ?last_n=100   (last 100 tasks)
           - ?hours_ago=6  (tasks from the last 6 hours)
         """
-        tenant_filter = tenant_id or request.query_params.get("tenant_id")
+        # Get tenant from request (set by middleware) - never trust query params or URL kwargs
+        tenant = getattr(request, 'tenant', None)
         last_n = request.query_params.get("last_n")
         hours_ago = request.query_params.get("hours_ago")
     
-        qs = ReconciliationTask.objects.all()
-    
-        if tenant_filter:
-            qs = qs.filter(tenant_id=tenant_filter)
+        # Use get_queryset() to ensure tenant filtering is applied
+        qs = self.get_queryset()
     
         if hours_ago:
             try:
@@ -3897,17 +3959,27 @@ class ReconciliationConfigViewSet2(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        company_id = self.request.query_params.get("company_id")
-
+        # Get tenant from request (set by middleware) - never trust query params
+        tenant = getattr(self.request, 'tenant', None)
+        
+        # Call super().get_queryset() to apply ScopedQuerysetMixin filtering first
         qs = super().get_queryset()
 
-        return qs.filter(
-            models.Q(scope="global") |
-            models.Q(scope="company", company_id=company_id) |
-            models.Q(scope="user", user=user)
-        )
+        # ReconciliationConfig has scope-based filtering (global, company, user, company_user)
+        # Apply scope filtering on top of tenant filtering
+        filters = Q(scope="global")
+        
+        if tenant and tenant != 'all':
+            # Add company-scoped configs for current tenant
+            filters |= Q(scope="company", company=tenant)
+            filters |= Q(scope="company_user", company=tenant, user=user)
+        
+        # Add user-scoped configs for current user
+        filters |= Q(scope="user", user=user)
 
-class ReconciliationConfigViewSet(viewsets.ModelViewSet):
+        return qs.filter(filters)
+
+class ReconciliationConfigViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     if settings.AUTH_OFF:
         permission_classes = []
     else:
@@ -3921,19 +3993,26 @@ class ReconciliationConfigViewSet(viewsets.ModelViewSet):
         """
         Return all configs available to the current user:
         - Global
-        - Company
+        - Company (current tenant)
         - User
-        - Company+User
+        - Company+User (current tenant + current user)
         """
         user = request.user
-        company_id = request.query_params.get("company_id")
+        # Get tenant from request (set by middleware) - never trust query params
+        tenant = getattr(request, 'tenant', None)
 
-        qs = ReconciliationConfig.objects.filter(
-            Q(scope="global")
-            | Q(scope="company", company_id=company_id)
-            | Q(scope="user", user=user)
-            | Q(scope="company_user", company_id=company_id, user=user)
-        )
+        # Use get_queryset() to ensure tenant filtering is applied
+        filters = Q(scope="global")
+        
+        if tenant and tenant != 'all':
+            # Add company-scoped configs for current tenant
+            filters |= Q(scope="company", company=tenant)
+            filters |= Q(scope="company_user", company=tenant, user=user)
+        
+        # Add user-scoped configs for current user
+        filters |= Q(scope="user", user=user)
+        
+        qs = self.get_queryset().filter(filters)
 
         serializer = ResolvedReconciliationConfigSerializer(qs, many=True)
         return Response(serializer.data)
