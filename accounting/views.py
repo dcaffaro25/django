@@ -3618,19 +3618,21 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     serializer_class = ReconciliationTaskSerializer
     
     def get_queryset(self):
-        # Call super().get_queryset() to apply ScopedQuerysetMixin filtering
-        # However, ReconciliationTask uses tenant_id (CharField) not company FK,
-        # so we need to handle it specially
-        qs = super().get_queryset().order_by("-created_at")
+        # ReconciliationTask uses tenant_id (CharField) not company FK,
+        # so we need to bypass ScopedQuerysetMixin and handle tenant filtering directly
+        # Call ModelViewSet.get_queryset() directly instead of mixin's
+        qs = viewsets.ModelViewSet.get_queryset(self).order_by("-created_at")
         
         # Get tenant from request (set by middleware) - never trust query params or URL kwargs
         tenant = getattr(self.request, 'tenant', None)
+        user = self.request.user
+        
         if tenant and tenant != 'all':
             # ReconciliationTask uses tenant_id (subdomain string), not company FK
             # Filter by the tenant's subdomain
             qs = qs.filter(tenant_id=tenant.subdomain)
-        elif tenant == 'all' and self.request.user.is_superuser:
-            # Superuser can see all tasks
+        elif tenant == 'all' and user.is_superuser:
+            # Superuser can see all tasks when accessing all tenants
             pass
         else:
             # No tenant or not superuser - return empty
