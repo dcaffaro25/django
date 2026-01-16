@@ -378,11 +378,14 @@ class ReconciliationFinancialMetricsService:
         Verify account assignment based on historical transactions.
         
         Checks if the account assigned to this journal entry matches
-        patterns from historical transactions (same company, entity, description patterns, etc.).
+        patterns from historical transactions (same company, entity, exact description).
+        
+        The query excludes the current journal entry to avoid self-matching.
+        Only exact description matches are considered (no date or amount checks).
         
         Returns:
         - confidence_score: How confident we are in the assignment (0-1)
-        - historical_matches: Count of historical transactions with same account
+        - historical_matches: Count of historical transactions with same account and description
         - suggested_account_id: Most common account from history (if different)
         - match_reasons: List of reasons for confidence
         """
@@ -401,14 +404,15 @@ class ReconciliationFinancialMetricsService:
             return result
         
         # Build base query for historical transactions
-        # Same company, same entity, similar description
+        # Same company, same entity, has an account assigned
+        # Excludes the current journal entry (id != journal_entry.id) to avoid self-matching
         base_qs = JournalEntry.objects.filter(
             transaction__company=tx.company,
             transaction__entity=tx.entity,
             account__isnull=False,
         ).exclude(id=journal_entry.id)
         
-        # Strategy 1: Exact description match
+        # Exact description match only
         if tx.description:
             exact_desc_matches = base_qs.filter(
                 transaction__description__iexact=tx.description
@@ -421,51 +425,10 @@ class ReconciliationFinancialMetricsService:
                 top_match = exact_desc_matches[0]
                 if top_match['account_id'] == journal_entry.account_id:
                     result['historical_matches'] += top_match['count']
-                    result['confidence_score'] += Decimal('0.5')
+                    result['confidence_score'] = Decimal('1.0')  # Full confidence for exact description match
                     result['match_reasons'].append('exact_description_match')
                 else:
                     result['suggested_account_id'] = top_match['account_id']
-        
-        # Strategy 2: Amount range match
-        if tx.amount:
-            amount_min = tx.amount * Decimal('0.9')
-            amount_max = tx.amount * Decimal('1.1')
-            
-            amount_matches = base_qs.filter(
-                transaction__amount__gte=amount_min,
-                transaction__amount__lte=amount_max
-            ).values('account_id').annotate(
-                count=Count('id')
-            ).order_by('-count')[:5]
-            
-            for match in amount_matches:
-                if match['account_id'] == journal_entry.account_id:
-                    result['historical_matches'] += match['count']
-                    result['confidence_score'] += Decimal('0.3')
-                    result['match_reasons'].append('amount_range_match')
-                    break
-        
-        # Strategy 3: Date proximity + entity match
-        if tx.date:
-            date_start = tx.date - timedelta(days=30)
-            date_end = tx.date + timedelta(days=30)
-            
-            date_matches = base_qs.filter(
-                transaction__date__gte=date_start,
-                transaction__date__lte=date_end
-            ).values('account_id').annotate(
-                count=Count('id')
-            ).order_by('-count')[:5]
-            
-            for match in date_matches:
-                if match['account_id'] == journal_entry.account_id:
-                    result['historical_matches'] += match['count'] // 2  # Lower weight
-                    result['confidence_score'] += Decimal('0.2')
-                    result['match_reasons'].append('date_proximity_match')
-                    break
-        
-        # Cap confidence at 1.0
-        result['confidence_score'] = min(result['confidence_score'], Decimal('1.0'))
         
         return result
     
