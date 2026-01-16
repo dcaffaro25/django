@@ -161,25 +161,20 @@ class BalanceRecalculationService:
                             )
                             
                             # Create single record with all three balance types
+                            # Note: opening and ending balances are not stored, only movements (debits/credits)
                             AccountBalanceHistory.objects.create(
                                 company_id=self.company_id,
                                 account=account,
                                 year=year,
                                 month=month,
                                 currency=currency,
-                                # Posted balances
-                                posted_opening_balance=posted_data['opening_balance'],
-                                posted_ending_balance=posted_data['ending_balance'],
+                                # Posted movements
                                 posted_total_debit=posted_data['total_debit'],
                                 posted_total_credit=posted_data['total_credit'],
-                                # Bank-reconciled balances
-                                bank_reconciled_opening_balance=bank_reconciled_data['opening_balance'],
-                                bank_reconciled_ending_balance=bank_reconciled_data['ending_balance'],
+                                # Bank-reconciled movements
                                 bank_reconciled_total_debit=bank_reconciled_data['total_debit'],
                                 bank_reconciled_total_credit=bank_reconciled_data['total_credit'],
-                                # All transactions balances
-                                all_opening_balance=all_data['opening_balance'],
-                                all_ending_balance=all_data['ending_balance'],
+                                # All transactions movements
                                 all_total_debit=all_data['total_debit'],
                                 all_total_credit=all_data['total_credit'],
                                 calculated_by=calculated_by,

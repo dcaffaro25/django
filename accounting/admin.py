@@ -1070,9 +1070,8 @@ class AccountBalanceHistoryAdmin(CompanyScopedAdmin):
         'account',
         'year',
         'month',
-        'posted_ending_balance',
-        'bank_reconciled_ending_balance',
-        'all_ending_balance',
+        'posted_total_debit',
+        'posted_total_credit',
         'currency',
         'calculated_at',
         'is_validated',
@@ -1100,24 +1099,18 @@ class AccountBalanceHistoryAdmin(CompanyScopedAdmin):
         }),
         ('Posted Transactions', {
             'fields': (
-                'posted_opening_balance',
-                'posted_ending_balance',
                 'posted_total_debit',
                 'posted_total_credit'
             )
         }),
         ('Bank-Reconciled Transactions', {
             'fields': (
-                'bank_reconciled_opening_balance',
-                'bank_reconciled_ending_balance',
                 'bank_reconciled_total_debit',
                 'bank_reconciled_total_credit'
             )
         }),
         ('All Transactions', {
             'fields': (
-                'all_opening_balance',
-                'all_ending_balance',
                 'all_total_debit',
                 'all_total_credit'
             )

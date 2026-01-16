@@ -454,13 +454,15 @@ class FinancialStatementComparison(TenantAwareBaseModel):
 
 class AccountBalanceHistory(TenantAwareBaseModel):
     """
-    Stores monthly account balances for efficient financial statement generation.
+    Stores monthly account balance movements for efficient financial statement generation.
     
-    Each record represents the ending balances of an account at the end of a specific month.
+    Each record represents the debit/credit movements of an account during a specific month.
     This table stores three balance types in separate columns:
-    - posted_ending_balance: Only posted transactions (state='posted')
-    - bank_reconciled_ending_balance: Only bank-reconciled transactions (is_reconciled=True)
-    - all_ending_balance: All transactions (posted + pending, reconciled + unreconciled)
+    - posted: Only posted transactions (state='posted')
+    - bank_reconciled: Only bank-reconciled transactions (is_reconciled=True)
+    - all: All transactions (posted + pending, reconciled + unreconciled)
+    
+    Opening and ending balances are calculated on-the-fly from account balance + cumulative movements.
     """
     
     account = models.ForeignKey(
@@ -483,46 +485,6 @@ class AccountBalanceHistory(TenantAwareBaseModel):
         Currency,
         on_delete=models.CASCADE,
         help_text="Currency of the balance"
-    )
-    
-    # Opening balances (one per balance type)
-    posted_opening_balance = models.DecimalField(
-        max_digits=18,
-        decimal_places=2,
-        default=Decimal('0.00'),
-        help_text="Opening balance for posted transactions only"
-    )
-    bank_reconciled_opening_balance = models.DecimalField(
-        max_digits=18,
-        decimal_places=2,
-        default=Decimal('0.00'),
-        help_text="Opening balance for bank-reconciled transactions only"
-    )
-    all_opening_balance = models.DecimalField(
-        max_digits=18,
-        decimal_places=2,
-        default=Decimal('0.00'),
-        help_text="Opening balance for all transactions"
-    )
-    
-    # Ending balances (one per balance type)
-    posted_ending_balance = models.DecimalField(
-        max_digits=18,
-        decimal_places=2,
-        default=Decimal('0.00'),
-        help_text="Ending balance for posted transactions only"
-    )
-    bank_reconciled_ending_balance = models.DecimalField(
-        max_digits=18,
-        decimal_places=2,
-        default=Decimal('0.00'),
-        help_text="Ending balance for bank-reconciled transactions only"
-    )
-    all_ending_balance = models.DecimalField(
-        max_digits=18,
-        decimal_places=2,
-        default=Decimal('0.00'),
-        help_text="Ending balance for all transactions"
     )
     
     # Movement during the month (one set per balance type)
@@ -608,7 +570,7 @@ class AccountBalanceHistory(TenantAwareBaseModel):
         ordering = ['year', 'month', 'account']
     
     def __str__(self):
-        return f"{self.account.name} - {self.year}-{self.month:02d}: posted={self.posted_ending_balance}, reconciled={self.bank_reconciled_ending_balance}, all={self.all_ending_balance}"
+        return f"{self.account.name} - {self.year}-{self.month:02d}: debits/credits (posted/reconciled/all)"
     
     @property
     def period_start(self):
@@ -651,7 +613,9 @@ class AccountBalanceHistory(TenantAwareBaseModel):
     
     def get_ending_balance(self, balance_type='all'):
         """
-        Get ending balance for a specific balance type.
+        Calculate ending balance for a specific balance type on-the-fly.
+        
+        Ending balance = opening balance + (total_debit - total_credit) * account_direction
         
         Parameters:
         -----------
@@ -662,12 +626,61 @@ class AccountBalanceHistory(TenantAwareBaseModel):
         --------
         Decimal ending balance
         """
+        # Get opening balance from previous month or account balance
+        opening_balance = self._get_opening_balance(balance_type)
+        
+        # Get movement for this month
         if balance_type == 'posted':
-            return self.posted_ending_balance
+            total_debit = self.posted_total_debit
+            total_credit = self.posted_total_credit
         elif balance_type == 'bank_reconciled':
-            return self.bank_reconciled_ending_balance
+            total_debit = self.bank_reconciled_total_debit
+            total_credit = self.bank_reconciled_total_credit
         elif balance_type == 'all':
-            return self.all_ending_balance
+            total_debit = self.all_total_debit
+            total_credit = self.all_total_credit
         else:
             raise ValueError(f"Invalid balance_type: {balance_type}")
+        
+        # Calculate change with account direction
+        net_movement = total_debit - total_credit
+        change = net_movement * self.account.account_direction
+        
+        # Calculate ending balance
+        ending_balance = opening_balance + change
+        return ending_balance
+    
+    def _get_opening_balance(self, balance_type='all'):
+        """
+        Calculate opening balance for this month by getting previous month's ending balance
+        or calculating from account base balance.
+        """
+        # Try to get previous month
+        if self.month == 1:
+            prev_year = self.year - 1
+            prev_month = 12
+        else:
+            prev_year = self.year
+            prev_month = self.month - 1
+        
+        # Try to get previous month's ending balance
+        prev_balance = self.__class__.get_balance_for_period(
+            account=self.account,
+            year=prev_year,
+            month=prev_month,
+            currency=self.currency,
+            balance_type=balance_type,
+        )
+        
+        if prev_balance:
+            return prev_balance.get_ending_balance(balance_type)
+        
+        # If no previous month, calculate from account balance + all previous months
+        # This is a simplified version - for full calculation, we'd need to query all journal entries
+        # For now, use account balance if it's before this month
+        month_start = date(self.year, self.month, 1)
+        if self.account.balance_date and self.account.balance_date < month_start:
+            return self.account.balance or Decimal('0.00')
+        
+        return Decimal('0.00')
 

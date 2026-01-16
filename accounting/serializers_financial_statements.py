@@ -344,19 +344,13 @@ class AccountBalanceHistorySerializer(serializers.ModelSerializer):
             'year',
             'month',
             'currency',
-            # Posted balances
-            'posted_opening_balance',
-            'posted_ending_balance',
+            # Posted movements
             'posted_total_debit',
             'posted_total_credit',
-            # Bank-reconciled balances
-            'bank_reconciled_opening_balance',
-            'bank_reconciled_ending_balance',
+            # Bank-reconciled movements
             'bank_reconciled_total_debit',
             'bank_reconciled_total_credit',
-            # All transactions balances
-            'all_opening_balance',
-            'all_ending_balance',
+            # All transactions movements
             'all_total_debit',
             'all_total_credit',
             'calculated_at',
