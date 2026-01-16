@@ -694,6 +694,7 @@ class TransactionAdmin(CompanyScopedAdmin):
         "id", "date", "description", "amount", "entity", "currency", "state",
         "journal_entries_count", "transaction_balance",
         "avg_payment_day_delta", "total_amount_discrepancy", "avg_amount_discrepancy",
+        "avg_bank_payment_date_delta", "min_bank_payment_date_delta", "max_bank_payment_date_delta",
         "exact_match_count", "perfect_match_count", "reconciliation_rate",
         "metrics_last_calculated_at",
         "company", "notes"
@@ -830,7 +831,7 @@ class JournalEntryAdmin(CompanyScopedAdmin):
     list_display = (
         "id", "transaction", "account", "cost_center",
         "debit_amount", "credit_amount", "state", "date",
-        "payment_day_delta", "journal_entry_date_delta", "amount_discrepancy",
+        "payment_day_delta", "journal_entry_date_delta", "bank_payment_date_delta", "amount_discrepancy",
         "is_exact_match", "is_date_match", "is_perfect_match",
         "account_confidence_score", "account_historical_matches",
         "metrics_last_calculated_at",

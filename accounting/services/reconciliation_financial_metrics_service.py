@@ -63,6 +63,7 @@ class ReconciliationFinancialMetricsService:
         metrics = {
             'payment_day_delta': None,
             'journal_entry_date_delta': None,
+            'bank_payment_date_delta': None,  # Only for cash accounts when bank_reconciled
             'amount_discrepancy': None,  # Financial difference in value (2 decimal places)
             'is_exact_match': False,
             'is_date_match': False,
@@ -138,6 +139,18 @@ class ReconciliationFinancialMetricsService:
             if journal_entry.date:
                 je_date_delta = (avg_bank_date - journal_entry.date).days
                 metrics['journal_entry_date_delta'] = je_date_delta
+            
+            # Bank payment date delta: only for journal entries hitting cash accounts (bank accounts) that are bank_reconciled
+            # Compare journal entry date (est payment date) to bank transaction date
+            # Only calculate if: 1) journal entry has a date, 2) journal entry is bank_reconciled, 3) journal entry hits a cash account
+            if journal_entry.date and journal_entry.is_reconciled:
+                # Check if this journal entry hits a cash account (account has bank_account relationship)
+                # Reload account to ensure we have bank_account_id
+                if journal_entry.account_id:
+                    account = journal_entry.account
+                    if account and account.bank_account_id:
+                        bank_payment_delta = (avg_bank_date - journal_entry.date).days
+                        metrics['bank_payment_date_delta'] = bank_payment_delta
         
         # Amount discrepancy (only for reconciled entries)
         # Store only the financial difference in value (2 decimal places), not percentage
@@ -167,6 +180,7 @@ class ReconciliationFinancialMetricsService:
         field_mapping = {
             'payment_day_delta': 'payment_day_delta',
             'journal_entry_date_delta': 'journal_entry_date_delta',
+            'bank_payment_date_delta': 'bank_payment_date_delta',  # Only for cash accounts when bank_reconciled
             'amount_discrepancy': 'amount_discrepancy',  # Financial difference in value (2 decimal places)
             'is_exact_match': 'is_exact_match',
             'is_date_match': 'is_date_match',
@@ -205,6 +219,9 @@ class ReconciliationFinancialMetricsService:
             'avg_payment_day_delta': 'avg_payment_day_delta',
             'min_payment_day_delta': 'min_payment_day_delta',
             'max_payment_day_delta': 'max_payment_day_delta',
+            'avg_bank_payment_date_delta': 'avg_bank_payment_date_delta',
+            'min_bank_payment_date_delta': 'min_bank_payment_date_delta',
+            'max_bank_payment_date_delta': 'max_bank_payment_date_delta',
             'total_amount_discrepancy': 'total_amount_discrepancy',
             'avg_amount_discrepancy': 'avg_amount_discrepancy',
             'exact_match_count': 'exact_match_count',
@@ -237,6 +254,9 @@ class ReconciliationFinancialMetricsService:
         - avg_payment_day_delta: Average payment delay across reconciled JEs only
         - min_payment_day_delta: Minimum payment delay (from reconciled JEs only)
         - max_payment_day_delta: Maximum payment delay (from reconciled JEs only)
+        - avg_bank_payment_date_delta: Average bank payment date delta (JE est date vs bank date) for JEs hitting cash accounts
+        - min_bank_payment_date_delta: Minimum bank payment date delta for JEs hitting cash accounts
+        - max_bank_payment_date_delta: Maximum bank payment date delta for JEs hitting cash accounts
         - total_amount_discrepancy: Sum of discrepancies from reconciled JEs only
         - avg_amount_discrepancy: Average discrepancy (from reconciled JEs only)
         - exact_match_count: Number of reconciled JEs with exact amount matches
@@ -249,6 +269,9 @@ class ReconciliationFinancialMetricsService:
             'avg_payment_day_delta': None,
             'min_payment_day_delta': None,
             'max_payment_day_delta': None,
+            'avg_bank_payment_date_delta': None,
+            'min_bank_payment_date_delta': None,
+            'max_bank_payment_date_delta': None,
             'total_amount_discrepancy': Decimal('0'),
             'avg_amount_discrepancy': None,
             'exact_match_count': 0,
@@ -273,6 +296,7 @@ class ReconciliationFinancialMetricsService:
         # Collect metrics from journal entries
         # Payment metrics: only from reconciled journal entries
         payment_deltas = []
+        bank_payment_date_deltas = []  # Only from journal entries hitting cash accounts
         amount_discrepancies = []
         exact_matches = 0
         perfect_matches = 0
@@ -289,6 +313,11 @@ class ReconciliationFinancialMetricsService:
                 # Collect payment deltas (only for reconciled entries)
                 if je_metrics.get('payment_day_delta') is not None:
                     payment_deltas.append(je_metrics['payment_day_delta'])
+                
+                # Collect bank payment date deltas (only for journal entries hitting cash accounts)
+                # This is the delta between JE est payment date and bank transaction date
+                if je_metrics.get('bank_payment_date_delta') is not None:
+                    bank_payment_date_deltas.append(je_metrics['bank_payment_date_delta'])
                 
                 # Collect amount discrepancies (only for reconciled entries)
                 if je_metrics.get('amount_discrepancy') is not None:
@@ -314,6 +343,12 @@ class ReconciliationFinancialMetricsService:
             metrics['avg_payment_day_delta'] = Decimal(str(sum(payment_deltas) / len(payment_deltas)))
             metrics['min_payment_day_delta'] = min(payment_deltas)
             metrics['max_payment_day_delta'] = max(payment_deltas)
+        
+        # Aggregate bank payment date deltas (only from journal entries hitting cash accounts)
+        if bank_payment_date_deltas:
+            metrics['avg_bank_payment_date_delta'] = Decimal(str(sum(bank_payment_date_deltas) / len(bank_payment_date_deltas)))
+            metrics['min_bank_payment_date_delta'] = min(bank_payment_date_deltas)
+            metrics['max_bank_payment_date_delta'] = max(bank_payment_date_deltas)
         
         # Aggregate amount discrepancies (only from reconciled entries)
         if amount_discrepancies:
@@ -482,7 +517,7 @@ class ReconciliationFinancialMetricsService:
             transaction__date__lte=end_date,
             state='pending',  # Only process unposted journal entries
         ).select_related(
-            'transaction', 'account'
+            'transaction', 'account', 'account__bank_account'
         ).prefetch_related(
             'reconciliations__bank_transactions',
         )

@@ -343,6 +343,19 @@ class Transaction(TenantAwareBaseModel):
         default=0,
         help_text="Number of journal entries with perfect matches (system calculated, read-only)"
     )
+    # Bank payment date metrics (aggregated only from journal entries hitting cash accounts)
+    avg_bank_payment_date_delta = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True,
+        help_text="Average bank payment date delta (JE est payment date vs bank date) for journal entries hitting cash accounts (system calculated, read-only)"
+    )
+    min_bank_payment_date_delta = models.IntegerField(
+        null=True, blank=True,
+        help_text="Minimum bank payment date delta for journal entries hitting cash accounts (system calculated, read-only)"
+    )
+    max_bank_payment_date_delta = models.IntegerField(
+        null=True, blank=True,
+        help_text="Maximum bank payment date delta for journal entries hitting cash accounts (system calculated, read-only)"
+    )
     reconciliation_rate = models.DecimalField(
         max_digits=5, decimal_places=2, default=Decimal('0.00'),
         help_text="Percentage of journal entries that are reconciled (system calculated, read-only)"
@@ -501,6 +514,10 @@ class JournalEntry(TenantAwareBaseModel):
     journal_entry_date_delta = models.IntegerField(
         null=True, blank=True,
         help_text="Days between journal entry date and bank date (system calculated, read-only)"
+    )
+    bank_payment_date_delta = models.IntegerField(
+        null=True, blank=True,
+        help_text="Days between journal entry date (est payment date) and bank transaction date, only for bank-reconciled entries hitting cash accounts (system calculated, read-only)"
     )
     amount_discrepancy = models.DecimalField(
         max_digits=12, decimal_places=2, null=True, blank=True,
