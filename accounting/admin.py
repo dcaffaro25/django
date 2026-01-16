@@ -1066,7 +1066,8 @@ class FinancialStatementComparisonAdmin(CompanyScopedAdmin):
 
 @admin.register(AccountBalanceHistory)
 class AccountBalanceHistoryAdmin(CompanyScopedAdmin):
-    list_display = [
+    # Default list_display with all fields
+    _full_list_display = [
         'account',
         'year',
         'month',
@@ -1076,6 +1077,16 @@ class AccountBalanceHistoryAdmin(CompanyScopedAdmin):
         'calculated_at',
         'is_validated',
     ]
+    
+    # Minimal list_display for when migration hasn't been applied
+    _minimal_list_display = [
+        'account',
+        'year',
+        'month',
+        'currency',
+    ]
+    
+    list_display = _full_list_display
     list_filter = [
         'year',
         'month',
@@ -1122,6 +1133,93 @@ class AccountBalanceHistoryAdmin(CompanyScopedAdmin):
             'fields': ('is_validated', 'validated_at', 'validated_by')
         }),
     )
+    
+    def _check_columns_exist(self):
+        """Check if the migration columns exist in the database."""
+        from django.db import connection
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'accounting_accountbalancehistory' 
+                    AND column_name = 'posted_total_debit'
+                """)
+                return cursor.fetchone() is not None
+        except Exception:
+            return False
+    
+    def get_list_display(self, request):
+        """
+        Dynamically return list_display based on whether migration columns exist.
+        This is called before the queryset is evaluated.
+        """
+        if not self._check_columns_exist():
+            return self._minimal_list_display
+        return self._full_list_display
+    
+    def get_list_filter(self, request):
+        """
+        Dynamically return list_filter based on whether migration columns exist.
+        """
+        if not self._check_columns_exist():
+            return ['year', 'month', 'currency']
+        return [
+            'year',
+            'month',
+            'currency',
+            'is_validated',
+            'calculated_at',
+        ]
+    
+    def get_date_hierarchy(self, request):
+        """
+        Dynamically return date_hierarchy based on whether migration columns exist.
+        """
+        if not self._check_columns_exist():
+            return None
+        return 'calculated_at'
+    
+    def changelist_view(self, request, extra_context=None):
+        """
+        Override changelist to handle missing columns gracefully.
+        get_list_display, get_list_filter, and get_date_hierarchy are already
+        set up to return appropriate values based on column existence.
+        """
+        # Try to render the changelist, but catch database errors
+        try:
+            return super().changelist_view(request, extra_context)
+        except Exception as e:
+            # If it's a column-related database error, show a helpful message
+            from django.db.utils import ProgrammingError
+            error_str = str(e)
+            is_column_error = (
+                isinstance(e, ProgrammingError) or 
+                'does not exist' in error_str or 
+                'column' in error_str.lower()
+            )
+            
+            if is_column_error:
+                # Return a simple error response
+                from django.http import HttpResponse
+                error_html = f"""
+                <html>
+                <head><title>Migration Required</title></head>
+                <body style="font-family: sans-serif; padding: 20px;">
+                    <h1 style="color: #d32f2f;">Migration Required</h1>
+                    <p>The AccountBalanceHistory migration hasn't been applied yet.</p>
+                    <p><strong>Please run the following command to create the required columns:</strong></p>
+                    <pre style="background: #f5f5f5; padding: 10px; border-radius: 4px;">python manage.py migrate accounting</pre>
+                    <p>After running the migration, refresh this page.</p>
+                    <hr>
+                    <p style="color: #666; font-size: 0.9em;">Database error: {error_str[:300]}</p>
+                </body>
+                </html>
+                """
+                return HttpResponse(error_html, content_type='text/html', status=500)
+            
+            # Re-raise if it's a different error
+            raise
 
 # (Optional) auto-register anything missed
 for model in apps.get_app_config("accounting").get_models():

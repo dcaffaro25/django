@@ -125,14 +125,39 @@ class BalanceRecalculationService:
                     
                     for year, month in months_to_process:
                         # Delete existing record for this account/month/currency
-                        deleted_count = AccountBalanceHistory.objects.filter(
-                            company_id=self.company_id,
-                            account=account,
-                            year=year,
-                            month=month,
-                            currency=currency
-                        ).delete()[0]
-                        records_deleted += deleted_count
+                        # Try normal delete first, fall back to raw SQL if columns don't exist
+                        try:
+                            queryset = AccountBalanceHistory.objects.filter(
+                                company_id=self.company_id,
+                                account=account,
+                                year=year,
+                                month=month,
+                                currency=currency
+                            )
+                            deleted_count = queryset.delete()[0]
+                            records_deleted += deleted_count
+                        except Exception as e:
+                            # If delete fails due to missing columns (migration not applied),
+                            # try raw SQL delete using only the primary key and foreign keys
+                            if 'does not exist' in str(e) or 'column' in str(e).lower():
+                                from django.db import connection
+                                with connection.cursor() as cursor:
+                                    cursor.execute(
+                                        """
+                                        DELETE FROM accounting_accountbalancehistory
+                                        WHERE company_id = %s
+                                          AND account_id = %s
+                                          AND year = %s
+                                          AND month = %s
+                                          AND currency_id = %s
+                                        """,
+                                        [self.company_id, account.id, year, month, currency.id]
+                                    )
+                                    deleted_count = cursor.rowcount
+                                    records_deleted += deleted_count
+                            else:
+                                # Re-raise if it's a different error
+                                raise
                         
                         try:
                             # Calculate all three balance types
