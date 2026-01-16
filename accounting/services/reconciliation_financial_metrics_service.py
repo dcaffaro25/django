@@ -63,8 +63,7 @@ class ReconciliationFinancialMetricsService:
         metrics = {
             'payment_day_delta': None,
             'journal_entry_date_delta': None,
-            'amount_discrepancy': None,
-            'amount_discrepancy_percentage': None,
+            'amount_discrepancy': None,  # Financial difference in value (2 decimal places)
             'is_exact_match': False,
             'is_date_match': False,
             'is_perfect_match': False,
@@ -141,14 +140,9 @@ class ReconciliationFinancialMetricsService:
                 metrics['journal_entry_date_delta'] = je_date_delta
         
         # Amount discrepancy (only for reconciled entries)
+        # Store only the financial difference in value (2 decimal places), not percentage
         amount_discrepancy = total_bank_amount - je_amount
         metrics['amount_discrepancy'] = amount_discrepancy
-        
-        if je_amount != 0:
-            percentage = (amount_discrepancy / abs(je_amount)) * Decimal('100')
-            # Cap percentage at 999999.99% to fit within max_digits=10, decimal_places=2
-            max_percentage = Decimal('999999.99')
-            metrics['amount_discrepancy_percentage'] = min(percentage, max_percentage) if percentage > 0 else max(percentage, -max_percentage)
         
         # Accuracy flags (only meaningful when reconciled)
         metrics['is_exact_match'] = abs(amount_discrepancy) <= self.AMOUNT_TOLERANCE
@@ -169,11 +163,11 @@ class ReconciliationFinancialMetricsService:
         update_fields = []
         
         # Map metrics dict keys to model field names
+        # Note: amount_discrepancy_percentage is not stored - only the value difference (amount_discrepancy)
         field_mapping = {
             'payment_day_delta': 'payment_day_delta',
             'journal_entry_date_delta': 'journal_entry_date_delta',
-            'amount_discrepancy': 'amount_discrepancy',
-            'amount_discrepancy_percentage': 'amount_discrepancy_percentage',
+            'amount_discrepancy': 'amount_discrepancy',  # Financial difference in value (2 decimal places)
             'is_exact_match': 'is_exact_match',
             'is_date_match': 'is_date_match',
             'is_perfect_match': 'is_perfect_match',
