@@ -53,7 +53,7 @@ class ReconciliationFinancialMetricsService:
         Returns a dictionary of calculated metrics:
         - payment_day_delta: Days between transaction date and bank date (if reconciled)
         - journal_entry_date_delta: Days between JE date and bank date
-        - amount_discrepancy: Difference between JE amount and bank amount
+        - amount_discrepancy: Difference between JE effective amount (considering account direction) and bank amount
         - is_exact_match: Whether amounts match exactly (within tolerance)
         - is_date_match: Whether dates match (within tolerance)
         - is_perfect_match: Both amount and date match
@@ -99,7 +99,10 @@ class ReconciliationFinancialMetricsService:
         
         # For multiple bank transactions, use weighted average date and sum amounts
         total_bank_amount = sum(bt.amount for bt in bank_transactions)
-        je_amount = journal_entry.get_amount()
+        # Use effective amount (considering account direction and debits/credits)
+        # For accounts with direction=1 (debits increase, like cash), debits are positive
+        # For accounts with direction=-1 (credits increase), credits are positive
+        je_amount = journal_entry.get_effective_amount()
         
         if je_amount is None or total_bank_amount is None:
             return metrics
