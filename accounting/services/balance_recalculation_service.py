@@ -87,16 +87,25 @@ class BalanceRecalculationService:
             accounts_qs = accounts_qs.filter(id__in=account_ids)
         
         # Get currencies to process
-        currencies_qs = Currency.objects.all()
+        # If currency_id is provided, use only that currency
+        # Otherwise, we'll process each account's currency individually
         if currency_id:
-            currencies_qs = currencies_qs.filter(id=currency_id)
+            currencies_qs = Currency.objects.filter(id=currency_id)
+            currencies = list(currencies_qs)
+        else:
+            # No specific currency filter - we'll process each account's currency
+            currencies = None  # Will be determined per account
         
         accounts = list(accounts_qs)
-        currencies = list(currencies_qs)
+        
+        if currencies:
+            currency_count = len(currencies)
+        else:
+            currency_count = "account-specific"
         
         log.info(
-            "Starting balance recalculation: company_id=%s, period=%s to %s, accounts=%d, currencies=%d",
-            self.company_id, period_start, period_end, len(accounts), len(currencies)
+            "Starting balance recalculation: company_id=%s, period=%s to %s, accounts=%d, currencies=%s",
+            self.company_id, period_start, period_end, len(accounts), currency_count
         )
         
         # Generate list of months to process
@@ -113,15 +122,28 @@ class BalanceRecalculationService:
         records_created = 0
         records_deleted = 0
         errors = []
+        currencies_processed_set = set()
         
         # Process each account, currency, month combination
         # Each record stores all three balance types
+        # Note: We only calculate balances for the account's currency, filtering JournalEntry by transaction currency
         with transaction.atomic():
             for account in accounts:
-                for currency in currencies:
-                    # Only process if account currency matches (or if no currency filter)
-                    if currency_id and account.currency_id != currency_id:
+                # Determine which currency(ies) to process for this account
+                if currency_id:
+                    # Specific currency filter provided - only process if account matches
+                    if account.currency_id != currency_id:
                         continue
+                    account_currencies = [Currency.objects.get(id=currency_id)]
+                else:
+                    # No currency filter - only process the account's own currency
+                    if not account.currency_id:
+                        log.warning(f"Account {account.id} has no currency set, skipping")
+                        continue
+                    account_currencies = [account.currency]
+                
+                for currency in account_currencies:
+                    currencies_processed_set.add(currency.id)
                     
                     for year, month in months_to_process:
                         try:
@@ -195,7 +217,7 @@ class BalanceRecalculationService:
                 'period_start': str(period_start),
                 'period_end': str(period_end),
                 'accounts_processed': len(accounts),
-                'currencies_processed': len(currencies),
+                'currencies_processed': len(currencies_processed_set),
                 'months_processed': len(months_to_process),
                 'records_created': records_created,
                 'records_deleted': records_deleted,
@@ -248,10 +270,11 @@ class BalanceRecalculationService:
             balance_type=balance_type,
         )
         
-        # Get journal entries for this month
+        # Get journal entries for this month, filtered by currency
         entries = JournalEntry.objects.filter(
             account=account,
             transaction__company_id=self.company_id,
+            transaction__currency=currency,
         )
         
         # Apply balance_type filter
@@ -336,10 +359,11 @@ class BalanceRecalculationService:
                 pass
         
         # Calculate from beginning of time (or from account.balance_date if set)
-        # Get all journal entries up to (but not including) this month
+        # Get all journal entries up to (but not including) this month, filtered by currency
         entries = JournalEntry.objects.filter(
             account=account,
             transaction__company_id=self.company_id,
+            transaction__currency=currency,
         )
         
         # Apply balance_type filter
