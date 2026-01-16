@@ -124,41 +124,6 @@ class BalanceRecalculationService:
                         continue
                     
                     for year, month in months_to_process:
-                        # Delete existing record for this account/month/currency
-                        # Try normal delete first, fall back to raw SQL if columns don't exist
-                        try:
-                            queryset = AccountBalanceHistory.objects.filter(
-                                company_id=self.company_id,
-                                account=account,
-                                year=year,
-                                month=month,
-                                currency=currency
-                            )
-                            deleted_count = queryset.delete()[0]
-                            records_deleted += deleted_count
-                        except Exception as e:
-                            # If delete fails due to missing columns (migration not applied),
-                            # try raw SQL delete using only the primary key and foreign keys
-                            if 'does not exist' in str(e) or 'column' in str(e).lower():
-                                from django.db import connection
-                                with connection.cursor() as cursor:
-                                    cursor.execute(
-                                        """
-                                        DELETE FROM accounting_accountbalancehistory
-                                        WHERE company_id = %s
-                                          AND account_id = %s
-                                          AND year = %s
-                                          AND month = %s
-                                          AND currency_id = %s
-                                        """,
-                                        [self.company_id, account.id, year, month, currency.id]
-                                    )
-                                    deleted_count = cursor.rowcount
-                                    records_deleted += deleted_count
-                            else:
-                                # Re-raise if it's a different error
-                                raise
-                        
                         try:
                             # Calculate all three balance types
                             posted_data = self._calculate_month_balance(
@@ -185,26 +150,33 @@ class BalanceRecalculationService:
                                 balance_type='all',
                             )
                             
-                            # Create single record with all three balance types
+                            # Use update_or_create to handle race conditions and avoid IntegrityError
+                            # This atomically updates existing records or creates new ones
                             # Note: opening and ending balances are not stored, only movements (debits/credits)
-                            AccountBalanceHistory.objects.create(
+                            balance_history, created = AccountBalanceHistory.objects.update_or_create(
                                 company_id=self.company_id,
                                 account=account,
                                 year=year,
                                 month=month,
                                 currency=currency,
-                                # Posted movements
-                                posted_total_debit=posted_data['total_debit'],
-                                posted_total_credit=posted_data['total_credit'],
-                                # Bank-reconciled movements
-                                bank_reconciled_total_debit=bank_reconciled_data['total_debit'],
-                                bank_reconciled_total_credit=bank_reconciled_data['total_credit'],
-                                # All transactions movements
-                                all_total_debit=all_data['total_debit'],
-                                all_total_credit=all_data['total_credit'],
-                                calculated_by=calculated_by,
+                                defaults={
+                                    # Posted movements
+                                    'posted_total_debit': posted_data['total_debit'],
+                                    'posted_total_credit': posted_data['total_credit'],
+                                    # Bank-reconciled movements
+                                    'bank_reconciled_total_debit': bank_reconciled_data['total_debit'],
+                                    'bank_reconciled_total_credit': bank_reconciled_data['total_credit'],
+                                    # All transactions movements
+                                    'all_total_debit': all_data['total_debit'],
+                                    'all_total_credit': all_data['total_credit'],
+                                    'calculated_by': calculated_by,
+                                }
                             )
-                            records_created += 1
+                            
+                            if created:
+                                records_created += 1
+                            else:
+                                records_deleted += 1  # Count updates as deletions for statistics
                             
                         except Exception as e:
                             error_msg = (
