@@ -28,6 +28,11 @@ from .views_financial_statements import (
     BalanceHistoryRecalculateView,
     BalanceHistoryViewSet,
 )
+from .views_reconciliation_metrics import (
+    ReconciliationMetricsRecalculateView,
+    ReconciliationMetricsTransactionView,
+    ReconciliationMetricsJournalEntryView,
+)
 from .views_template_preview import template_preview_page, generate_preview
 from .views import (
     EmbeddingBackfillView,
@@ -93,4 +98,9 @@ urlpatterns = [
     
     # Balance history recalculation
     re_path(r'^balance-history/recalculate/?$', BalanceHistoryRecalculateView.as_view(), name='balance-history-recalculate'),
+    
+    # Reconciliation metrics
+    re_path(r'^reconciliation-metrics/recalculate/?$', ReconciliationMetricsRecalculateView.as_view(), name='reconciliation-metrics-recalculate'),
+    re_path(r'^reconciliation-metrics/transaction/(?P<transaction_id>\d+)/?$', ReconciliationMetricsTransactionView.as_view(), name='reconciliation-metrics-transaction'),
+    re_path(r'^reconciliation-metrics/journal-entry/(?P<journal_entry_id>\d+)/?$', ReconciliationMetricsJournalEntryView.as_view(), name='reconciliation-metrics-journal-entry'),
 ]

@@ -314,6 +314,48 @@ class Transaction(TenantAwareBaseModel):
     is_reconciled  = models.BooleanField(default=False)
     is_posted = models.BooleanField(default=False)
     
+    # Reconciliation financial metrics (read-only, system calculated, aggregated from journal entries)
+    avg_payment_day_delta = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True,
+        help_text="Average payment delay across all journal entries (system calculated, read-only)"
+    )
+    min_payment_day_delta = models.IntegerField(
+        null=True, blank=True,
+        help_text="Minimum payment delay across all journal entries (system calculated, read-only)"
+    )
+    max_payment_day_delta = models.IntegerField(
+        null=True, blank=True,
+        help_text="Maximum payment delay across all journal entries (system calculated, read-only)"
+    )
+    total_amount_discrepancy = models.DecimalField(
+        max_digits=12, decimal_places=2, default=Decimal('0.00'),
+        help_text="Sum of all journal entry discrepancies (system calculated, read-only)"
+    )
+    avg_amount_discrepancy = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True,
+        help_text="Average discrepancy per journal entry (system calculated, read-only)"
+    )
+    exact_match_count = models.IntegerField(
+        default=0,
+        help_text="Number of journal entries with exact amount matches (system calculated, read-only)"
+    )
+    perfect_match_count = models.IntegerField(
+        default=0,
+        help_text="Number of journal entries with perfect matches (system calculated, read-only)"
+    )
+    reconciliation_rate = models.DecimalField(
+        max_digits=5, decimal_places=2, default=Decimal('0.00'),
+        help_text="Percentage of journal entries that are reconciled (system calculated, read-only)"
+    )
+    days_outstanding = models.IntegerField(
+        null=True, blank=True,
+        help_text="Days from transaction date to first reconciliation (system calculated, read-only)"
+    )
+    metrics_last_calculated_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="When metrics were last calculated (system updated, read-only)"
+    )
+    
     class Meta:
         indexes = [
             HnswIndex(
@@ -450,6 +492,48 @@ class JournalEntry(TenantAwareBaseModel):
     
     is_cash = models.BooleanField(default=False)
     is_reconciled = models.BooleanField(default=False)
+    
+    # Reconciliation financial metrics (read-only, system calculated)
+    payment_day_delta = models.IntegerField(
+        null=True, blank=True,
+        help_text="Days between transaction date and bank date (system calculated, read-only)"
+    )
+    journal_entry_date_delta = models.IntegerField(
+        null=True, blank=True,
+        help_text="Days between journal entry date and bank date (system calculated, read-only)"
+    )
+    amount_discrepancy = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True,
+        help_text="Difference between JE amount and bank amount (system calculated, read-only)"
+    )
+    amount_discrepancy_percentage = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True,
+        help_text="Percentage difference between JE amount and bank amount (system calculated, read-only)"
+    )
+    is_exact_match = models.BooleanField(
+        default=False,
+        help_text="Whether amounts match exactly within tolerance (system calculated, read-only)"
+    )
+    is_date_match = models.BooleanField(
+        default=False,
+        help_text="Whether dates match within tolerance (system calculated, read-only)"
+    )
+    is_perfect_match = models.BooleanField(
+        default=False,
+        help_text="Both amount and date match within tolerance (system calculated, read-only)"
+    )
+    account_confidence_score = models.DecimalField(
+        max_digits=3, decimal_places=2, null=True, blank=True,
+        help_text="Confidence score for account assignment based on historical patterns (0-1, system calculated, read-only)"
+    )
+    account_historical_matches = models.IntegerField(
+        default=0,
+        help_text="Number of historical transactions with same account assignment (system calculated, read-only)"
+    )
+    metrics_last_calculated_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="When metrics were last calculated (system updated, read-only)"
+    )
     
     class Meta:
         indexes = [
