@@ -690,7 +690,14 @@ def delete_reconciliations_for_journal_entries(journal_entry_ids, disable_signal
 
 @admin.register(Transaction)
 class TransactionAdmin(CompanyScopedAdmin):
-    list_display = ("id", "date", "description", "amount", "entity", "currency", "state", "journal_entries_count", "transaction_balance", "company", "notes")
+    list_display = (
+        "id", "date", "description", "amount", "entity", "currency", "state",
+        "journal_entries_count", "transaction_balance",
+        "avg_payment_day_delta", "total_amount_discrepancy", "avg_amount_discrepancy",
+        "exact_match_count", "perfect_match_count", "reconciliation_rate",
+        "metrics_last_calculated_at",
+        "company", "notes"
+    )
     list_filter = ("state", "currency", "entity", "company", "date", "notes")
     autocomplete_fields = ("company", "entity", "currency")
     search_fields = ("description", "entity__name", "notes")
@@ -820,7 +827,15 @@ class TransactionAdmin(CompanyScopedAdmin):
 
 @admin.register(JournalEntry)
 class JournalEntryAdmin(CompanyScopedAdmin):
-    list_display = ("id", "transaction", "account", "cost_center", "debit_amount", "credit_amount", "state", "date", "company", "notes")
+    list_display = (
+        "id", "transaction", "account", "cost_center",
+        "debit_amount", "credit_amount", "state", "date",
+        "payment_day_delta", "journal_entry_date_delta", "amount_discrepancy",
+        "is_exact_match", "is_date_match", "is_perfect_match",
+        "account_confidence_score", "account_historical_matches",
+        "metrics_last_calculated_at",
+        "company", "notes"
+    )
     list_filter = ("state", "date", "company", "notes")
     autocomplete_fields = ("company", "transaction", "account", "cost_center")
     search_fields = (

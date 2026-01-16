@@ -15,16 +15,19 @@ from typing import Optional, List
 from accounting.services.reconciliation_financial_metrics_service import (
     ReconciliationFinancialMetricsService,
 )
+from accounting.tasks import recalculate_reconciliation_metrics_task
 
 
 class ReconciliationMetricsRecalculateView(APIView):
     """
-    Endpoint to recalculate reconciliation financial metrics.
+    Endpoint to queue reconciliation financial metrics recalculation as a Celery task.
     
     POST /api/reconciliation-metrics/recalculate/
     
     Note: Only processes unposted (pending) transactions and journal entries.
     Posted transactions and journal entries are excluded from recalculation.
+    
+    Returns a task_id that can be used to check the status of the recalculation.
     
     Request body:
     {
@@ -34,6 +37,14 @@ class ReconciliationMetricsRecalculateView(APIView):
         "entity_id": 2,                // Optional
         "account_id": 10,              // Optional (filters journal entries)
         "transaction_ids": [100, 101]  // Optional (specific transactions, must be unposted)
+    }
+    
+    Response:
+    {
+        "success": true,
+        "task_id": "abc-123-def",
+        "status": "PENDING",
+        "message": "Recalculation task queued successfully"
     }
     """
     
@@ -102,24 +113,39 @@ class ReconciliationMetricsRecalculateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Run recalculation
-        service = ReconciliationFinancialMetricsService()
+        # Trigger Celery task for async recalculation
         try:
-            result = service.recalculate_metrics(
-                start_date=start_date,
-                end_date=end_date,
+            task = recalculate_reconciliation_metrics_task.delay(
+                start_date=start_date.isoformat(),
+                end_date=end_date.isoformat() if end_date else None,
                 company_id=company_id,
                 entity_id=entity_id,
                 account_id=account_id,
                 transaction_ids=transaction_ids,
             )
             
-            return Response(result, status=status.HTTP_200_OK)
+            return Response(
+                {
+                    "success": True,
+                    "task_id": task.id,
+                    "status": task.status,
+                    "message": "Recalculation task queued successfully",
+                    "filters": {
+                        "start_date": str(start_date),
+                        "end_date": str(end_date) if end_date else None,
+                        "company_id": company_id,
+                        "entity_id": entity_id,
+                        "account_id": account_id,
+                        "transaction_ids": transaction_ids,
+                    }
+                },
+                status=status.HTTP_202_ACCEPTED
+            )
         
         except Exception as e:
             return Response(
                 {
-                    "error": "Recalculation failed",
+                    "error": "Failed to queue recalculation task",
                     "message": str(e)
                 },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR

@@ -44,6 +44,7 @@ from .services.embedding_client import EmbeddingClient
 from multitenancy.utils import resolve_tenant
 
 from accounting.utils import update_journal_entries_and_transaction_flags
+from accounting.services.reconciliation_financial_metrics_service import ReconciliationFinancialMetricsService
 
 logger = logging.getLogger("recon")
 log = logger 
@@ -673,4 +674,70 @@ def generate_missing_embeddings(self, per_model_limit: Optional[int] = None, cli
         "total_requested": total,
         "total_done": done,
     }
+    return result
+
+
+@shared_task(bind=True, name='accounting.recalculate_reconciliation_metrics')
+def recalculate_reconciliation_metrics_task(
+    self,
+    start_date: str,
+    end_date: Optional[str] = None,
+    company_id: Optional[int] = None,
+    entity_id: Optional[int] = None,
+    account_id: Optional[int] = None,
+    transaction_ids: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    """
+    Celery task to recalculate reconciliation financial metrics for unposted transactions and journal entries.
+    
+    This task processes only transactions and journal entries with state='pending' (unposted).
+    
+    Parameters:
+    -----------
+    start_date: str
+        Start date in YYYY-MM-DD format (required)
+    end_date: Optional[str]
+        End date in YYYY-MM-DD format (optional, defaults to today)
+    company_id: Optional[int]
+        Optional company filter
+    entity_id: Optional[int]
+        Optional entity filter
+    account_id: Optional[int]
+        Optional account filter (for journal entries)
+    transaction_ids: Optional[List[int]]
+        Optional list of specific transaction IDs (must be unposted)
+        
+    Returns:
+    --------
+    Dict[str, Any]
+        Statistics about the recalculation including:
+        - success: bool
+        - stats: dict with transactions_processed, journal_entries_processed, metrics_calculated, errors
+        - filters: dict with the filters used
+    """
+    from datetime import date
+    from django.utils.dateparse import parse_date
+    
+    # Parse dates
+    start_date_obj = parse_date(start_date)
+    if not start_date_obj:
+        raise ValueError(f"Invalid start_date format: {start_date}. Use YYYY-MM-DD")
+    
+    end_date_obj = None
+    if end_date:
+        end_date_obj = parse_date(end_date)
+        if not end_date_obj:
+            raise ValueError(f"Invalid end_date format: {end_date}. Use YYYY-MM-DD")
+    
+    # Run recalculation
+    service = ReconciliationFinancialMetricsService()
+    result = service.recalculate_metrics(
+        start_date=start_date_obj,
+        end_date=end_date_obj,
+        company_id=company_id,
+        entity_id=entity_id,
+        account_id=account_id,
+        transaction_ids=transaction_ids,
+    )
+    
     return result
