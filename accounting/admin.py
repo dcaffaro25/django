@@ -1070,10 +1070,10 @@ class AccountBalanceHistoryAdmin(CompanyScopedAdmin):
         'account',
         'year',
         'month',
-        'opening_balance',
-        'ending_balance',
+        'posted_ending_balance',
+        'bank_reconciled_ending_balance',
+        'all_ending_balance',
         'currency',
-        'balance_type',
         'calculated_at',
         'is_validated',
     ]
@@ -1081,7 +1081,6 @@ class AccountBalanceHistoryAdmin(CompanyScopedAdmin):
         'year',
         'month',
         'currency',
-        'balance_type',
         'is_validated',
         'calculated_at',
     ]
@@ -1099,11 +1098,32 @@ class AccountBalanceHistoryAdmin(CompanyScopedAdmin):
         ('Account & Period', {
             'fields': ('account', 'year', 'month', 'currency')
         }),
-        ('Balances', {
-            'fields': ('opening_balance', 'ending_balance', 'total_debit', 'total_credit')
+        ('Posted Transactions', {
+            'fields': (
+                'posted_opening_balance',
+                'posted_ending_balance',
+                'posted_total_debit',
+                'posted_total_credit'
+            )
+        }),
+        ('Bank-Reconciled Transactions', {
+            'fields': (
+                'bank_reconciled_opening_balance',
+                'bank_reconciled_ending_balance',
+                'bank_reconciled_total_debit',
+                'bank_reconciled_total_credit'
+            )
+        }),
+        ('All Transactions', {
+            'fields': (
+                'all_opening_balance',
+                'all_ending_balance',
+                'all_total_debit',
+                'all_total_credit'
+            )
         }),
         ('Metadata', {
-            'fields': ('balance_type', 'calculated_at', 'calculated_by')
+            'fields': ('calculated_at', 'calculated_by')
         }),
         ('Validation', {
             'fields': ('is_validated', 'validated_at', 'validated_by')

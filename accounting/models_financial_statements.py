@@ -456,13 +456,11 @@ class AccountBalanceHistory(TenantAwareBaseModel):
     """
     Stores monthly account balances for efficient financial statement generation.
     
-    Each record represents the ending balance of an account at the end of a specific month.
-    This table is populated by a recalculation process and used by financial statements.
-    
-    Three balance types are stored per account/month:
-    - 'posted': Only posted transactions (state='posted')
-    - 'bank_reconciled': Only bank-reconciled transactions (is_reconciled=True)
-    - 'all': All transactions (posted + pending, reconciled + unreconciled)
+    Each record represents the ending balances of an account at the end of a specific month.
+    This table stores three balance types in separate columns:
+    - posted_ending_balance: Only posted transactions (state='posted')
+    - bank_reconciled_ending_balance: Only bank-reconciled transactions (is_reconciled=True)
+    - all_ending_balance: All transactions (posted + pending, reconciled + unreconciled)
     """
     
     account = models.ForeignKey(
@@ -480,34 +478,6 @@ class AccountBalanceHistory(TenantAwareBaseModel):
         help_text="Month (1-12)"
     )
     
-    # Balance information
-    opening_balance = models.DecimalField(
-        max_digits=18,
-        decimal_places=2,
-        default=Decimal('0.00'),
-        help_text="Balance at the start of the month"
-    )
-    ending_balance = models.DecimalField(
-        max_digits=18,
-        decimal_places=2,
-        default=Decimal('0.00'),
-        help_text="Balance at the end of the month"
-    )
-    
-    # Movement during the month
-    total_debit = models.DecimalField(
-        max_digits=18,
-        decimal_places=2,
-        default=Decimal('0.00'),
-        help_text="Total debits during the month"
-    )
-    total_credit = models.DecimalField(
-        max_digits=18,
-        decimal_places=2,
-        default=Decimal('0.00'),
-        help_text="Total credits during the month"
-    )
-    
     # Metadata
     currency = models.ForeignKey(
         Currency,
@@ -515,17 +485,84 @@ class AccountBalanceHistory(TenantAwareBaseModel):
         help_text="Currency of the balance"
     )
     
-    # Balance type: posted, bank_reconciled, or all transactions
-    BALANCE_TYPE_CHOICES = [
-        ('posted', 'Posted Transactions Only'),
-        ('bank_reconciled', 'Bank-Reconciled Only'),
-        ('all', 'All Transactions'),
-    ]
+    # Opening balances (one per balance type)
+    posted_opening_balance = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Opening balance for posted transactions only"
+    )
+    bank_reconciled_opening_balance = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Opening balance for bank-reconciled transactions only"
+    )
+    all_opening_balance = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Opening balance for all transactions"
+    )
     
-    balance_type = models.CharField(
-        max_length=20,
-        choices=BALANCE_TYPE_CHOICES,
-        help_text="Type of balance: posted (state='posted'), bank_reconciled (is_reconciled=True), or all (everything)"
+    # Ending balances (one per balance type)
+    posted_ending_balance = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Ending balance for posted transactions only"
+    )
+    bank_reconciled_ending_balance = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Ending balance for bank-reconciled transactions only"
+    )
+    all_ending_balance = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Ending balance for all transactions"
+    )
+    
+    # Movement during the month (one set per balance type)
+    posted_total_debit = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Total debits for posted transactions during the month"
+    )
+    posted_total_credit = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Total credits for posted transactions during the month"
+    )
+    
+    bank_reconciled_total_debit = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Total debits for bank-reconciled transactions during the month"
+    )
+    bank_reconciled_total_credit = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Total credits for bank-reconciled transactions during the month"
+    )
+    
+    all_total_debit = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Total debits for all transactions during the month"
+    )
+    all_total_credit = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Total credits for all transactions during the month"
     )
     
     # Calculation metadata
@@ -561,17 +598,17 @@ class AccountBalanceHistory(TenantAwareBaseModel):
     )
     
     class Meta:
-        unique_together = ('company', 'account', 'year', 'month', 'currency', 'balance_type')
+        unique_together = ('company', 'account', 'year', 'month', 'currency')
         indexes = [
-            models.Index(fields=['company', 'account', 'year', 'month', 'balance_type']),
+            models.Index(fields=['company', 'account', 'year', 'month']),
             models.Index(fields=['company', 'year', 'month']),
             models.Index(fields=['account', 'year', 'month']),
             models.Index(fields=['calculated_at']),
         ]
-        ordering = ['year', 'month', 'account', 'balance_type']
+        ordering = ['year', 'month', 'account']
     
     def __str__(self):
-        return f"{self.account.name} - {self.year}-{self.month:02d} ({self.get_balance_type_display()}): {self.ending_balance}"
+        return f"{self.account.name} - {self.year}-{self.month:02d}: posted={self.posted_ending_balance}, reconciled={self.bank_reconciled_ending_balance}, all={self.all_ending_balance}"
     
     @property
     def period_start(self):
@@ -588,16 +625,49 @@ class AccountBalanceHistory(TenantAwareBaseModel):
     
     @classmethod
     def get_balance_for_period(cls, account, year, month, currency, balance_type='all'):
-        """Get balance for a specific period"""
+        """
+        Get balance for a specific period.
+        
+        Parameters:
+        -----------
+        balance_type : str
+            One of: 'posted', 'bank_reconciled', 'all'
+        
+        Returns:
+        --------
+        AccountBalanceHistory instance or None
+        """
         try:
-            return cls.objects.get(
+            history = cls.objects.get(
                 account=account,
                 year=year,
                 month=month,
                 currency=currency,
-                balance_type=balance_type,
                 company=account.company
             )
+            return history
         except cls.DoesNotExist:
             return None
+    
+    def get_ending_balance(self, balance_type='all'):
+        """
+        Get ending balance for a specific balance type.
+        
+        Parameters:
+        -----------
+        balance_type : str
+            One of: 'posted', 'bank_reconciled', 'all'
+        
+        Returns:
+        --------
+        Decimal ending balance
+        """
+        if balance_type == 'posted':
+            return self.posted_ending_balance
+        elif balance_type == 'bank_reconciled':
+            return self.bank_reconciled_ending_balance
+        elif balance_type == 'all':
+            return self.all_ending_balance
+        else:
+            raise ValueError(f"Invalid balance_type: {balance_type}")
 

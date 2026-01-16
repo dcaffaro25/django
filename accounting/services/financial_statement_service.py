@@ -176,14 +176,13 @@ class FinancialStatementGenerator:
                     continue
                 
                 for year, month in months_to_check:
-                    # Check if at least one balance_type exists (we'll use 'all' as indicator)
+                    # Check if history exists (one record per account/month/currency)
                     exists = AccountBalanceHistory.objects.filter(
                         company_id=self.company_id,
                         account=account,
                         year=year,
                         month=month,
-                        currency=currency,
-                        balance_type='all'
+                        currency=currency
                     ).exists()
                     
                     if not exists:
@@ -1742,10 +1741,9 @@ class FinancialStatementGenerator:
                 year=year,
                 month=month,
                 currency=currency,
-                balance_type=balance_type,
                 company_id=self.company_id
             )
-            return history.ending_balance
+            return history.get_ending_balance(balance_type)
         except AccountBalanceHistory.DoesNotExist:
             return None
     
@@ -2811,12 +2809,16 @@ class FinancialStatementGenerator:
         end_date: date,
         as_of_date: Optional[date] = None,
         include_pending: bool = False,
+        currency_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Calculate statement data WITHOUT persisting to database.
         
         This is the core calculation logic that can be used for both
         preview and generation. Returns a dictionary with all computed values.
+        
+        Note: This method ensures balance history is persisted even though
+        the statement itself is not saved. This ensures future queries are faster.
         
         Parameters
         ----------
@@ -2830,6 +2832,8 @@ class FinancialStatementGenerator:
             For balance sheet: specific date. If None, defaults to end_date
         include_pending : bool
             Whether to include pending journal entries
+        currency_id : Optional[int]
+            Currency ID for balance history calculation
             
         Returns
         -------
@@ -2838,6 +2842,17 @@ class FinancialStatementGenerator:
         """
         if as_of_date is None:
             as_of_date = end_date
+        
+        # Ensure balance history exists for the period (auto-recalculate if missing)
+        # This persists the calculated balances even for previews/comparisons
+        self._ensure_balance_history_for_period(
+            start_date=start_date,
+            end_date=end_date,
+            currency_id=currency_id,
+            account_ids=None,
+            template=template,
+            generated_by=None,  # No user for internal calculations
+        )
         
         line_templates = template.line_templates.all().order_by('line_number')
         line_values: Dict[int, Decimal] = {}
@@ -3298,6 +3313,10 @@ class FinancialStatementGenerator:
             calculate_period_comparison,
         )
         
+        # Get currency from template or use default
+        # For balance history, we'll calculate for all currencies used by accounts
+        currency_id = None  # None means all currencies
+        
         # Calculate current period data (no DB save)
         current_data = self._calculate_statement_data(
             template=template,
@@ -3305,6 +3324,7 @@ class FinancialStatementGenerator:
             end_date=end_date,
             as_of_date=end_date,
             include_pending=include_pending,
+            currency_id=currency_id,
         )
         
         # Build current line values dict
@@ -3329,6 +3349,7 @@ class FinancialStatementGenerator:
                     end_date=comp_end,
                     as_of_date=comp_end,
                     include_pending=include_pending,
+                    currency_id=currency_id,
                 )
                 
                 comp_lines = {

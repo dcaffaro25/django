@@ -25,11 +25,22 @@ class Migration(migrations.Migration):
                 ('notes', models.TextField(blank=True, help_text='Metadata and notes about how this record was created (source, filename, function, etc.)', null=True)),
                 ('year', models.IntegerField(help_text='Year (e.g., 2024)')),
                 ('month', models.IntegerField(help_text='Month (1-12)')),
-                ('opening_balance', models.DecimalField(decimal_places=2, default=Decimal('0.00'), help_text='Balance at the start of the month', max_digits=18)),
-                ('ending_balance', models.DecimalField(decimal_places=2, default=Decimal('0.00'), help_text='Balance at the end of the month', max_digits=18)),
-                ('total_debit', models.DecimalField(decimal_places=2, default=Decimal('0.00'), help_text='Total debits during the month', max_digits=18)),
-                ('total_credit', models.DecimalField(decimal_places=2, default=Decimal('0.00'), help_text='Total credits during the month', max_digits=18)),
-                ('balance_type', models.CharField(choices=[('posted', 'Posted Transactions Only'), ('bank_reconciled', 'Bank-Reconciled Only'), ('all', 'All Transactions')], help_text="Type of balance: posted (state='posted'), bank_reconciled (is_reconciled=True), or all (everything)", max_length=20)),
+                # Posted balances
+                ('posted_opening_balance', models.DecimalField(decimal_places=2, default=Decimal('0.00'), help_text='Opening balance for posted transactions only', max_digits=18)),
+                ('posted_ending_balance', models.DecimalField(decimal_places=2, default=Decimal('0.00'), help_text='Ending balance for posted transactions only', max_digits=18)),
+                ('posted_total_debit', models.DecimalField(decimal_places=2, default=Decimal('0.00'), help_text='Total debits for posted transactions during the month', max_digits=18)),
+                ('posted_total_credit', models.DecimalField(decimal_places=2, default=Decimal('0.00'), help_text='Total credits for posted transactions during the month', max_digits=18)),
+                # Bank-reconciled balances
+                ('bank_reconciled_opening_balance', models.DecimalField(decimal_places=2, default=Decimal('0.00'), help_text='Opening balance for bank-reconciled transactions only', max_digits=18)),
+                ('bank_reconciled_ending_balance', models.DecimalField(decimal_places=2, default=Decimal('0.00'), help_text='Ending balance for bank-reconciled transactions only', max_digits=18)),
+                ('bank_reconciled_total_debit', models.DecimalField(decimal_places=2, default=Decimal('0.00'), help_text='Total debits for bank-reconciled transactions during the month', max_digits=18)),
+                ('bank_reconciled_total_credit', models.DecimalField(decimal_places=2, default=Decimal('0.00'), help_text='Total credits for bank-reconciled transactions during the month', max_digits=18)),
+                # All transactions balances
+                ('all_opening_balance', models.DecimalField(decimal_places=2, default=Decimal('0.00'), help_text='Opening balance for all transactions', max_digits=18)),
+                ('all_ending_balance', models.DecimalField(decimal_places=2, default=Decimal('0.00'), help_text='Ending balance for all transactions', max_digits=18)),
+                ('all_total_debit', models.DecimalField(decimal_places=2, default=Decimal('0.00'), help_text='Total debits for all transactions during the month', max_digits=18)),
+                ('all_total_credit', models.DecimalField(decimal_places=2, default=Decimal('0.00'), help_text='Total credits for all transactions during the month', max_digits=18)),
+                # Metadata
                 ('calculated_at', models.DateTimeField(auto_now=True, help_text='When this balance was last calculated')),
                 ('is_validated', models.BooleanField(default=False, help_text='Whether this balance has been manually validated')),
                 ('validated_at', models.DateTimeField(blank=True, help_text='When this balance was validated', null=True)),
@@ -42,9 +53,14 @@ class Migration(migrations.Migration):
                 ('validated_by', models.ForeignKey(blank=True, help_text='User who validated this balance', null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='validated_balance_history', to=settings.AUTH_USER_MODEL)),
             ],
             options={
-                'ordering': ['year', 'month', 'account', 'balance_type'],
-                'indexes': [models.Index(fields=['company', 'account', 'year', 'month', 'balance_type'], name='accounting__company_7bdf24_idx'), models.Index(fields=['company', 'year', 'month'], name='accounting__company_1554ca_idx'), models.Index(fields=['account', 'year', 'month'], name='accounting__account_881348_idx'), models.Index(fields=['calculated_at'], name='accounting__calcula_2a6e17_idx')],
-                'unique_together': {('company', 'account', 'year', 'month', 'currency', 'balance_type')},
+                'ordering': ['year', 'month', 'account'],
+                'indexes': [
+                    models.Index(fields=['company', 'account', 'year', 'month'], name='accounting__company_7bdf24_idx'),
+                    models.Index(fields=['company', 'year', 'month'], name='accounting__company_1554ca_idx'),
+                    models.Index(fields=['account', 'year', 'month'], name='accounting__account_881348_idx'),
+                    models.Index(fields=['calculated_at'], name='accounting__calcula_2a6e17_idx')
+                ],
+                'unique_together': {('company', 'account', 'year', 'month', 'currency')},
             },
         ),
     ]

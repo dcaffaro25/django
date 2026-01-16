@@ -2025,15 +2025,10 @@ class BalanceHistoryViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
         if month:
             qs = qs.filter(month=month)
         
-        # Filter by balance_type
-        balance_type = self.request.query_params.get('balance_type')
-        if balance_type:
-            qs = qs.filter(balance_type=balance_type)
-        
         # Filter by currency
         currency_id = self.request.query_params.get('currency_id')
         if currency_id:
             qs = qs.filter(currency_id=currency_id)
         
-        return qs.order_by('year', 'month', 'account', 'balance_type')
+        return qs.order_by('year', 'month', 'account')
 

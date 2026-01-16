@@ -114,7 +114,8 @@ class BalanceRecalculationService:
         records_deleted = 0
         errors = []
         
-        # Process each account, currency, month, and balance_type combination
+        # Process each account, currency, month combination
+        # Each record stores all three balance types
         with transaction.atomic():
             for account in accounts:
                 for currency in currencies:
@@ -123,7 +124,7 @@ class BalanceRecalculationService:
                         continue
                     
                     for year, month in months_to_process:
-                        # Delete existing records for this account/month/currency
+                        # Delete existing record for this account/month/currency
                         deleted_count = AccountBalanceHistory.objects.filter(
                             company_id=self.company_id,
                             account=account,
@@ -133,41 +134,65 @@ class BalanceRecalculationService:
                         ).delete()[0]
                         records_deleted += deleted_count
                         
-                        # Calculate all three balance types
-                        for balance_type in ['posted', 'bank_reconciled', 'all']:
-                            try:
-                                balance_data = self._calculate_month_balance(
-                                    account=account,
-                                    year=year,
-                                    month=month,
-                                    currency=currency,
-                                    balance_type=balance_type,
-                                )
-                                
-                                # Create new record
-                                AccountBalanceHistory.objects.create(
-                                    company_id=self.company_id,
-                                    account=account,
-                                    year=year,
-                                    month=month,
-                                    currency=currency,
-                                    balance_type=balance_type,
-                                    opening_balance=balance_data['opening_balance'],
-                                    ending_balance=balance_data['ending_balance'],
-                                    total_debit=balance_data['total_debit'],
-                                    total_credit=balance_data['total_credit'],
-                                    calculated_by=calculated_by,
-                                )
-                                records_created += 1
-                                
-                            except Exception as e:
-                                error_msg = (
-                                    f"Error calculating balance for account={account.id}, "
-                                    f"year={year}, month={month}, currency={currency.id}, "
-                                    f"balance_type={balance_type}: {str(e)}"
-                                )
-                                log.error(error_msg, exc_info=True)
-                                errors.append(error_msg)
+                        try:
+                            # Calculate all three balance types
+                            posted_data = self._calculate_month_balance(
+                                account=account,
+                                year=year,
+                                month=month,
+                                currency=currency,
+                                balance_type='posted',
+                            )
+                            
+                            bank_reconciled_data = self._calculate_month_balance(
+                                account=account,
+                                year=year,
+                                month=month,
+                                currency=currency,
+                                balance_type='bank_reconciled',
+                            )
+                            
+                            all_data = self._calculate_month_balance(
+                                account=account,
+                                year=year,
+                                month=month,
+                                currency=currency,
+                                balance_type='all',
+                            )
+                            
+                            # Create single record with all three balance types
+                            AccountBalanceHistory.objects.create(
+                                company_id=self.company_id,
+                                account=account,
+                                year=year,
+                                month=month,
+                                currency=currency,
+                                # Posted balances
+                                posted_opening_balance=posted_data['opening_balance'],
+                                posted_ending_balance=posted_data['ending_balance'],
+                                posted_total_debit=posted_data['total_debit'],
+                                posted_total_credit=posted_data['total_credit'],
+                                # Bank-reconciled balances
+                                bank_reconciled_opening_balance=bank_reconciled_data['opening_balance'],
+                                bank_reconciled_ending_balance=bank_reconciled_data['ending_balance'],
+                                bank_reconciled_total_debit=bank_reconciled_data['total_debit'],
+                                bank_reconciled_total_credit=bank_reconciled_data['total_credit'],
+                                # All transactions balances
+                                all_opening_balance=all_data['opening_balance'],
+                                all_ending_balance=all_data['ending_balance'],
+                                all_total_debit=all_data['total_debit'],
+                                all_total_credit=all_data['total_credit'],
+                                calculated_by=calculated_by,
+                            )
+                            records_created += 1
+                            
+                        except Exception as e:
+                            error_msg = (
+                                f"Error calculating balance for account={account.id}, "
+                                f"year={year}, month={month}, currency={currency.id}: {str(e)}"
+                            )
+                            log.error(error_msg, exc_info=True)
+                            errors.append(error_msg)
         
         duration = (timezone.now() - start_time).total_seconds()
         
@@ -307,7 +332,7 @@ class BalanceRecalculationService:
         )
         
         if prev_balance:
-            return prev_balance.ending_balance
+            return prev_balance.get_ending_balance(balance_type)
         
         # If no previous month in history, check if we can use account.balance
         if account.balance_date:

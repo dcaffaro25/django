@@ -333,7 +333,6 @@ class AccountBalanceHistorySerializer(serializers.ModelSerializer):
     
     account_name = serializers.CharField(source='account.name', read_only=True)
     account_code = serializers.CharField(source='account.account_code', read_only=True)
-    balance_type_display = serializers.CharField(source='get_balance_type_display', read_only=True)
     
     class Meta:
         model = AccountBalanceHistory
@@ -344,13 +343,22 @@ class AccountBalanceHistorySerializer(serializers.ModelSerializer):
             'account_code',
             'year',
             'month',
-            'opening_balance',
-            'ending_balance',
-            'total_debit',
-            'total_credit',
             'currency',
-            'balance_type',
-            'balance_type_display',
+            # Posted balances
+            'posted_opening_balance',
+            'posted_ending_balance',
+            'posted_total_debit',
+            'posted_total_credit',
+            # Bank-reconciled balances
+            'bank_reconciled_opening_balance',
+            'bank_reconciled_ending_balance',
+            'bank_reconciled_total_debit',
+            'bank_reconciled_total_credit',
+            # All transactions balances
+            'all_opening_balance',
+            'all_ending_balance',
+            'all_total_debit',
+            'all_total_credit',
             'calculated_at',
             'calculated_by',
             'is_validated',
