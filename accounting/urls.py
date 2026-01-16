@@ -25,6 +25,8 @@ from .views_financial_statements import (
     FinancialStatementTemplateViewSet,
     FinancialStatementViewSet,
     FinancialStatementComparisonViewSet,
+    BalanceHistoryRecalculateView,
+    BalanceHistoryViewSet,
 )
 from .views_template_preview import template_preview_page, generate_preview
 from .views import (
@@ -59,6 +61,7 @@ router.register(r"reconciliation-pipelines", ReconciliationPipelineViewSet, base
 router.register(r'financial-statement-templates', FinancialStatementTemplateViewSet, basename="financial-statement-templates")
 router.register(r'financial-statements', FinancialStatementViewSet, basename="financial-statements")
 router.register(r'financial-statement-comparisons', FinancialStatementComparisonViewSet, basename="financial-statement-comparisons")
+router.register(r'balance-history', BalanceHistoryViewSet, basename="balance-history")
 
 urlpatterns = [
     # IMPORTANT: no extra 'api/' here because the project urls already mount this file at /<tenant>/api/
@@ -87,4 +90,7 @@ urlpatterns = [
     # Financial statement template preview
     re_path(r'^financial-statements/template-preview/?$', template_preview_page, name='template-preview'),
     re_path(r'^financial-statements/generate-preview/?$', generate_preview, name='generate-preview'),
+    
+    # Balance history recalculation
+    re_path(r'^balance-history/recalculate/?$', BalanceHistoryRecalculateView.as_view(), name='balance-history-recalculate'),
 ]

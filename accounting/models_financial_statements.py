@@ -8,6 +8,7 @@ including Balance Sheet, Income Statement (P&L), Cash Flow Statement, and others
 from django.db import models
 from django.core.validators import MinValueValidator
 from decimal import Decimal
+from datetime import date, timedelta
 from multitenancy.models import TenantAwareBaseModel
 from .models import Account, Currency
 
@@ -449,4 +450,154 @@ class FinancialStatementComparison(TenantAwareBaseModel):
     
     def __str__(self):
         return f"{self.name}: {self.base_statement} vs {self.comparison_statement}"
+
+
+class AccountBalanceHistory(TenantAwareBaseModel):
+    """
+    Stores monthly account balances for efficient financial statement generation.
+    
+    Each record represents the ending balance of an account at the end of a specific month.
+    This table is populated by a recalculation process and used by financial statements.
+    
+    Three balance types are stored per account/month:
+    - 'posted': Only posted transactions (state='posted')
+    - 'bank_reconciled': Only bank-reconciled transactions (is_reconciled=True)
+    - 'all': All transactions (posted + pending, reconciled + unreconciled)
+    """
+    
+    account = models.ForeignKey(
+        Account,
+        on_delete=models.CASCADE,
+        related_name='balance_history',
+        help_text="The account this balance belongs to"
+    )
+    
+    # Time dimension: Month
+    year = models.IntegerField(
+        help_text="Year (e.g., 2024)"
+    )
+    month = models.IntegerField(
+        help_text="Month (1-12)"
+    )
+    
+    # Balance information
+    opening_balance = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Balance at the start of the month"
+    )
+    ending_balance = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Balance at the end of the month"
+    )
+    
+    # Movement during the month
+    total_debit = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Total debits during the month"
+    )
+    total_credit = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        default=Decimal('0.00'),
+        help_text="Total credits during the month"
+    )
+    
+    # Metadata
+    currency = models.ForeignKey(
+        Currency,
+        on_delete=models.CASCADE,
+        help_text="Currency of the balance"
+    )
+    
+    # Balance type: posted, bank_reconciled, or all transactions
+    BALANCE_TYPE_CHOICES = [
+        ('posted', 'Posted Transactions Only'),
+        ('bank_reconciled', 'Bank-Reconciled Only'),
+        ('all', 'All Transactions'),
+    ]
+    
+    balance_type = models.CharField(
+        max_length=20,
+        choices=BALANCE_TYPE_CHOICES,
+        help_text="Type of balance: posted (state='posted'), bank_reconciled (is_reconciled=True), or all (everything)"
+    )
+    
+    # Calculation metadata
+    calculated_at = models.DateTimeField(
+        auto_now=True,
+        help_text="When this balance was last calculated"
+    )
+    calculated_by = models.ForeignKey(
+        'multitenancy.CustomUser',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        help_text="User who triggered the calculation"
+    )
+    
+    # Validation
+    is_validated = models.BooleanField(
+        default=False,
+        help_text="Whether this balance has been manually validated"
+    )
+    validated_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When this balance was validated"
+    )
+    validated_by = models.ForeignKey(
+        'multitenancy.CustomUser',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='validated_balance_history',
+        help_text="User who validated this balance"
+    )
+    
+    class Meta:
+        unique_together = ('company', 'account', 'year', 'month', 'currency', 'balance_type')
+        indexes = [
+            models.Index(fields=['company', 'account', 'year', 'month', 'balance_type']),
+            models.Index(fields=['company', 'year', 'month']),
+            models.Index(fields=['account', 'year', 'month']),
+            models.Index(fields=['calculated_at']),
+        ]
+        ordering = ['year', 'month', 'account', 'balance_type']
+    
+    def __str__(self):
+        return f"{self.account.name} - {self.year}-{self.month:02d} ({self.get_balance_type_display()}): {self.ending_balance}"
+    
+    @property
+    def period_start(self):
+        """Return the first day of the month"""
+        return date(self.year, self.month, 1)
+    
+    @property
+    def period_end(self):
+        """Return the last day of the month"""
+        if self.month == 12:
+            return date(self.year, 12, 31)
+        else:
+            return date(self.year, self.month + 1, 1) - timedelta(days=1)
+    
+    @classmethod
+    def get_balance_for_period(cls, account, year, month, currency, balance_type='all'):
+        """Get balance for a specific period"""
+        try:
+            return cls.objects.get(
+                account=account,
+                year=year,
+                month=month,
+                currency=currency,
+                balance_type=balance_type,
+                company=account.company
+            )
+        except cls.DoesNotExist:
+            return None
 

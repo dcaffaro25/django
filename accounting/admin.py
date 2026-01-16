@@ -26,6 +26,7 @@ from .models_financial_statements import (
     FinancialStatement,
     FinancialStatementLine,
     FinancialStatementComparison,
+    AccountBalanceHistory,
 )
 from multitenancy.admin import PlainAdmin, CompanyScopedAdmin
 
@@ -1059,6 +1060,53 @@ class FinancialStatementComparisonAdmin(CompanyScopedAdmin):
         ("Metadados", {
             "fields": ("created_at",),
             "classes": ("collapse",)
+        }),
+    )
+
+
+@admin.register(AccountBalanceHistory)
+class AccountBalanceHistoryAdmin(CompanyScopedAdmin):
+    list_display = [
+        'account',
+        'year',
+        'month',
+        'opening_balance',
+        'ending_balance',
+        'currency',
+        'balance_type',
+        'calculated_at',
+        'is_validated',
+    ]
+    list_filter = [
+        'year',
+        'month',
+        'currency',
+        'balance_type',
+        'is_validated',
+        'calculated_at',
+    ]
+    search_fields = [
+        'account__name',
+        'account__account_code',
+    ]
+    readonly_fields = [
+        'calculated_at',
+        'calculated_by',
+    ]
+    date_hierarchy = 'calculated_at'
+    
+    fieldsets = (
+        ('Account & Period', {
+            'fields': ('account', 'year', 'month', 'currency')
+        }),
+        ('Balances', {
+            'fields': ('opening_balance', 'ending_balance', 'total_debit', 'total_credit')
+        }),
+        ('Metadata', {
+            'fields': ('balance_type', 'calculated_at', 'calculated_by')
+        }),
+        ('Validation', {
+            'fields': ('is_validated', 'validated_at', 'validated_by')
         }),
     )
 

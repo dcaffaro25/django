@@ -9,6 +9,7 @@ from .models_financial_statements import (
     FinancialStatement,
     FinancialStatementLine,
     FinancialStatementComparison,
+    AccountBalanceHistory,
 )
 
 
@@ -308,3 +309,59 @@ class TemplateSuggestionResponseSerializer(serializers.Serializer):
     error = serializers.CharField(required=False, allow_null=True)
     error_type = serializers.CharField(required=False, allow_null=True)
     ai_raw_response = serializers.JSONField(required=False, allow_null=True)
+
+
+class BalanceHistoryRecalculateSerializer(serializers.Serializer):
+    """
+    Serializer for balance history recalculation requests.
+    
+    Used by POST /api/accounting/balance-history/recalculate/
+    """
+    
+    start_date = serializers.DateField(required=True)
+    end_date = serializers.DateField(required=False, allow_null=True)
+    account_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        allow_null=True
+    )
+    currency_id = serializers.IntegerField(required=False, allow_null=True)
+
+
+class AccountBalanceHistorySerializer(serializers.ModelSerializer):
+    """Serializer for AccountBalanceHistory model."""
+    
+    account_name = serializers.CharField(source='account.name', read_only=True)
+    account_code = serializers.CharField(source='account.account_code', read_only=True)
+    balance_type_display = serializers.CharField(source='get_balance_type_display', read_only=True)
+    
+    class Meta:
+        model = AccountBalanceHistory
+        fields = [
+            'id',
+            'account',
+            'account_name',
+            'account_code',
+            'year',
+            'month',
+            'opening_balance',
+            'ending_balance',
+            'total_debit',
+            'total_credit',
+            'currency',
+            'balance_type',
+            'balance_type_display',
+            'calculated_at',
+            'calculated_by',
+            'is_validated',
+            'validated_at',
+            'validated_by',
+            'period_start',
+            'period_end',
+        ]
+        read_only_fields = [
+            'id',
+            'calculated_at',
+            'period_start',
+            'period_end',
+        ]

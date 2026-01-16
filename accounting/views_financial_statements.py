@@ -6,6 +6,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.views import APIView
 from django.db.models import Q
 from django.utils import timezone
 from datetime import date, timedelta
@@ -17,6 +18,7 @@ from .models_financial_statements import (
     FinancialStatementTemplate,
     FinancialStatement,
     FinancialStatementComparison,
+    AccountBalanceHistory,
 )
 from .serializers_financial_statements import (
     FinancialStatementTemplateSerializer,
@@ -27,9 +29,12 @@ from .serializers_financial_statements import (
     ComparisonRequestSerializer,
     TemplateSuggestionRequestSerializer,
     TemplateSuggestionResponseSerializer,
+    BalanceHistoryRecalculateSerializer,
+    AccountBalanceHistorySerializer,
 )
 from .services.financial_statement_service import FinancialStatementGenerator
 from .services.template_suggestion_service import TemplateSuggestionService
+from .services.balance_recalculation_service import BalanceRecalculationService
 from .models import Currency, Account
 
 
@@ -1944,4 +1949,91 @@ class FinancialStatementComparisonViewSet(ScopedQuerysetMixin, viewsets.ModelVie
             'base_statement': FinancialStatementSerializer(comparison.base_statement).data,
             'comparison_statement': FinancialStatementSerializer(comparison.comparison_statement).data,
         })
+
+
+class BalanceHistoryRecalculateView(APIView):
+    """
+    Endpoint to trigger recalculation of account balances for a period.
+    
+    POST /api/accounting/balance-history/recalculate/
+    
+    Always calculates all three balance types (posted, bank_reconciled, all)
+    and always overwrites existing records.
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request):
+        serializer = BalanceHistoryRecalculateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        # Get company from request (multitenancy)
+        tenant = resolve_tenant(request)
+        if not tenant or tenant == 'all':
+            return Response(
+                {'error': 'Company/tenant must be specified'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get company_id from tenant
+        from multitenancy.models import Company
+        try:
+            company = Company.objects.get(subdomain=tenant)
+            company_id = company.id
+        except Company.DoesNotExist:
+            return Response(
+                {'error': 'Company not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        service = BalanceRecalculationService(company_id=company_id)
+        
+        result = service.recalculate_balances(
+            start_date=serializer.validated_data['start_date'],
+            end_date=serializer.validated_data.get('end_date'),
+            account_ids=serializer.validated_data.get('account_ids'),
+            currency_id=serializer.validated_data.get('currency_id'),
+            calculated_by=request.user,
+        )
+        
+        return Response(result, status=status.HTTP_200_OK)
+
+
+class BalanceHistoryViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet for viewing account balance history.
+    
+    GET /api/accounting/balance-history/
+    """
+    
+    queryset = AccountBalanceHistory.objects.all()
+    serializer_class = AccountBalanceHistorySerializer
+    
+    def get_queryset(self):
+        qs = super().get_queryset()
+        
+        # Filter by account
+        account_id = self.request.query_params.get('account_id')
+        if account_id:
+            qs = qs.filter(account_id=account_id)
+        
+        # Filter by year/month
+        year = self.request.query_params.get('year')
+        if year:
+            qs = qs.filter(year=year)
+        
+        month = self.request.query_params.get('month')
+        if month:
+            qs = qs.filter(month=month)
+        
+        # Filter by balance_type
+        balance_type = self.request.query_params.get('balance_type')
+        if balance_type:
+            qs = qs.filter(balance_type=balance_type)
+        
+        # Filter by currency
+        currency_id = self.request.query_params.get('currency_id')
+        if currency_id:
+            qs = qs.filter(currency_id=currency_id)
+        
+        return qs.order_by('year', 'month', 'account', 'balance_type')
 

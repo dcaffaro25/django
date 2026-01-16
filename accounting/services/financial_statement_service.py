@@ -36,7 +36,9 @@ from accounting.models_financial_statements import (
     FinancialStatementLineTemplate,
     FinancialStatement,
     FinancialStatementLine,
+    AccountBalanceHistory,
 )
+from accounting.services.balance_recalculation_service import BalanceRecalculationService
 from accounting.services.formula_evaluator import (
     SafeFormulaEvaluator,
     FormulaError,
@@ -55,6 +57,175 @@ class FinancialStatementGenerator:
     
     def __init__(self, company_id: int):
         self.company_id = company_id
+    
+    def _ensure_balance_history_for_period(
+        self,
+        start_date: date,
+        end_date: date,
+        currency_id: Optional[int] = None,
+        account_ids: Optional[List[int]] = None,
+        template: Optional[FinancialStatementTemplate] = None,
+        generated_by=None,
+    ) -> bool:
+        """
+        Check if balance history exists for the period and automatically
+        recalculate missing periods if needed.
+        
+        Parameters:
+        -----------
+        start_date : date
+            Start of the period
+        end_date : date
+            End of the period
+        currency_id : Optional[int]
+            Currency to check (if None, checks all currencies)
+        account_ids : Optional[List[int]]
+            Specific accounts to check (if None, checks all accounts used in statements)
+        generated_by : User
+            User triggering the recalculation
+        
+        Returns:
+        --------
+        bool
+            True if history was recalculated, False if already exists
+        """
+        from calendar import monthrange
+        
+        # Generate list of months to check
+        months_to_check = []
+        current = date(start_date.year, start_date.month, 1)
+        end_month = date(end_date.year, end_date.month, 1)
+        
+        while current <= end_month:
+            months_to_check.append((current.year, current.month))
+            # Move to next month
+            if current.month == 12:
+                current = date(current.year + 1, 1, 1)
+            else:
+                current = date(current.year, current.month + 1, 1)
+        
+        # Check if history exists for all months
+        # We need to check for at least one balance_type ('all' is sufficient)
+        # If any month is missing, we'll recalculate the entire period
+        
+        # Get accounts to check
+        if account_ids:
+            accounts_qs = Account.objects.filter(
+                company_id=self.company_id,
+                id__in=account_ids,
+                is_active=True
+            )
+        elif template:
+            # Get accounts from template (more efficient)
+            line_templates = template.line_templates.all()
+            account_ids_from_template = set()
+            
+            for line_template in line_templates:
+                if line_template.account_id:
+                    account_ids_from_template.add(line_template.account_id)
+                elif line_template.account_ids:
+                    account_ids_from_template.update(line_template.account_ids)
+                elif line_template.account_code_prefix:
+                    # Get accounts with matching prefix
+                    prefix_accounts = Account.objects.filter(
+                        company_id=self.company_id,
+                        account_code__startswith=line_template.account_code_prefix,
+                        is_active=True
+                    ).values_list('id', flat=True)
+                    account_ids_from_template.update(prefix_accounts)
+            
+            if account_ids_from_template:
+                accounts_qs = Account.objects.filter(
+                    company_id=self.company_id,
+                    id__in=account_ids_from_template,
+                    is_active=True
+                )
+            else:
+                # Fallback to all accounts if template has no account references
+                accounts_qs = Account.objects.filter(
+                    company_id=self.company_id,
+                    is_active=True
+                )
+        else:
+            # Check all active accounts
+            accounts_qs = Account.objects.filter(
+                company_id=self.company_id,
+                is_active=True
+            )
+        
+        accounts = list(accounts_qs)
+        if not accounts:
+            return False
+        
+        # Get currencies to check
+        if currency_id:
+            currencies = [Currency.objects.get(id=currency_id)]
+        else:
+            # Check all currencies used by accounts
+            currencies = list(Currency.objects.filter(
+                account__company_id=self.company_id,
+                account__is_active=True
+            ).distinct())
+        
+        # Check if history exists for all account/month/currency combinations
+        missing_periods = []
+        for account in accounts:
+            for currency in currencies:
+                # Only check if account currency matches (or if no currency filter)
+                if currency_id and account.currency_id != currency_id:
+                    continue
+                
+                for year, month in months_to_check:
+                    # Check if at least one balance_type exists (we'll use 'all' as indicator)
+                    exists = AccountBalanceHistory.objects.filter(
+                        company_id=self.company_id,
+                        account=account,
+                        year=year,
+                        month=month,
+                        currency=currency,
+                        balance_type='all'
+                    ).exists()
+                    
+                    if not exists:
+                        missing_periods.append((account.id, currency.id, year, month))
+        
+        # If no missing periods, return False (no recalculation needed)
+        if not missing_periods:
+            log.debug(
+                "Balance history exists for period %s to %s, no recalculation needed",
+                start_date, end_date
+            )
+            return False
+        
+        # Recalculate missing periods
+        log.info(
+            "Balance history missing for %d account/month/currency combinations. "
+            "Auto-triggering recalculation for period %s to %s",
+            len(missing_periods), start_date, end_date
+        )
+        
+        # Determine which accounts and currencies need recalculation
+        accounts_to_recalc = list(set(acc_id for acc_id, _, _, _ in missing_periods))
+        currencies_to_recalc = list(set(curr_id for _, curr_id, _, _ in missing_periods))
+        
+        # Use BalanceRecalculationService to recalculate
+        recalculation_service = BalanceRecalculationService(company_id=self.company_id)
+        
+        result = recalculation_service.recalculate_balances(
+            start_date=start_date,
+            end_date=end_date,
+            account_ids=accounts_to_recalc if len(accounts_to_recalc) < len(accounts) else None,
+            currency_id=currency_id,
+            calculated_by=generated_by,
+        )
+        
+        log.info(
+            "Auto-recalculation completed: created %d records, duration %.2fs",
+            result['statistics']['records_created'],
+            result['statistics']['duration_seconds']
+        )
+        
+        return True
     
     def generate_statement(
         self,
@@ -107,6 +278,16 @@ class FinancialStatementGenerator:
                 raise ValueError("No currency specified and no default currency found")
         else:
             currency = Currency.objects.get(id=currency_id)
+        
+        # Ensure balance history exists for the period (auto-recalculate if missing)
+        self._ensure_balance_history_for_period(
+            start_date=start_date,
+            end_date=end_date,
+            currency_id=currency_id,
+            account_ids=None,
+            template=template,  # Pass template to optimize account checking
+            generated_by=generated_by,
+        )
         
         # Create statement record
         statement = FinancialStatement.objects.create(
@@ -258,6 +439,16 @@ class FinancialStatementGenerator:
                 raise ValueError("No currency specified and no default currency found")
         else:
             currency = Currency.objects.get(id=currency_id)
+        
+        # Ensure balance history exists for the period (auto-recalculate if missing)
+        self._ensure_balance_history_for_period(
+            start_date=start_date,
+            end_date=end_date,
+            currency_id=currency_id,
+            account_ids=None,
+            template=template,  # Pass template to optimize account checking
+            generated_by=None,  # Preview doesn't have a user
+        )
         
         # Generate lines without saving
         line_templates = template.line_templates.all().order_by('line_number')
@@ -1518,18 +1709,84 @@ class FinancialStatementGenerator:
         )
         return balance
     
+    def _get_balance_from_history(
+        self,
+        account: Account,
+        as_of_date: date,
+        balance_type: str = 'all',
+        currency: Optional[Currency] = None,
+    ) -> Optional[Decimal]:
+        """
+        Get balance from AccountBalanceHistory if available.
+        
+        Parameters:
+        -----------
+        balance_type : str
+            One of: 'posted', 'bank_reconciled', 'all'
+            Determines which balance type to retrieve from history
+        
+        Returns:
+        --------
+        Ending balance from the history table for the month containing as_of_date.
+        Returns None if history doesn't exist for that period.
+        """
+        if currency is None:
+            currency = account.currency
+        
+        year = as_of_date.year
+        month = as_of_date.month
+        
+        try:
+            history = AccountBalanceHistory.objects.get(
+                account=account,
+                year=year,
+                month=month,
+                currency=currency,
+                balance_type=balance_type,
+                company_id=self.company_id
+            )
+            return history.ending_balance
+        except AccountBalanceHistory.DoesNotExist:
+            return None
+    
     def _calculate_cumulative_ending_balance_with_metadata(
         self,
         account: Account,
         as_of_date: date,
         include_pending: bool = False,
+        balance_type: str = 'all',
     ) -> Tuple[Decimal, Dict[str, Any]]:
         """
         Calculate cumulative ending balance with detailed metadata for debugging.
         
+        Parameters:
+        -----------
+        balance_type : str
+            One of: 'posted', 'bank_reconciled', 'all'
+            Determines which balance type to use from history or calculate on-the-fly
+        
         Returns:
             Tuple of (ending_balance, metadata_dict)
         """
+        # Try to get from history first (only for leaf accounts)
+        if account.is_leaf():
+            balance_from_history = self._get_balance_from_history(
+                account=account,
+                as_of_date=as_of_date,
+                balance_type=balance_type,
+            )
+            
+            if balance_from_history is not None:
+                # Use pre-calculated balance
+                metadata = {
+                    'source': 'balance_history',
+                    'from_history': True,
+                    'balance_type': balance_type,
+                    'as_of_date': str(as_of_date),
+                    'is_parent': False,
+                }
+                return balance_from_history, metadata
+        
         if not account.is_leaf():
             # Parent account: sum all children's ending balances
             children = account.get_children().filter(company_id=self.company_id)
