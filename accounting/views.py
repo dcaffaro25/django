@@ -295,7 +295,7 @@ class AccountSummaryView(APIView):
     else:
         permission_classes = [permissions.IsAuthenticated]
     
-    def get(self, request, *args, **kwargs):
+    def get(self, request, tenant_id=None, *args, **kwargs):
         # Get tenant from request (set by middleware) - never trust query params
         tenant = getattr(request, 'tenant', None)
         if not tenant or tenant == 'all':

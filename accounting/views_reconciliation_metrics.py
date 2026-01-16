@@ -36,7 +36,7 @@ class ReconciliationMetricsRecalculateView(APIView):
     
     permission_classes = [IsAuthenticated]
     
-    def post(self, request):
+    def post(self, request, tenant_id=None):
         """Recalculate metrics for transactions and journal entries."""
         # Parse start_date (required)
         start_date_str = request.data.get('start_date')
@@ -132,7 +132,7 @@ class ReconciliationMetricsTransactionView(APIView):
     
     permission_classes = [IsAuthenticated]
     
-    def get(self, request, transaction_id: int):
+    def get(self, request, transaction_id: int, tenant_id=None):
         """Get metrics for a specific transaction."""
         from accounting.models import Transaction
         
@@ -162,7 +162,7 @@ class ReconciliationMetricsJournalEntryView(APIView):
     
     permission_classes = [IsAuthenticated]
     
-    def get(self, request, journal_entry_id: int):
+    def get(self, request, journal_entry_id: int, tenant_id=None):
         """Get metrics for a specific journal entry."""
         from accounting.models import JournalEntry
         

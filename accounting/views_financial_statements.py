@@ -1962,7 +1962,7 @@ class BalanceHistoryRecalculateView(APIView):
     """
     permission_classes = [IsAuthenticated]
     
-    def post(self, request):
+    def post(self, request, tenant_id=None):
         serializer = BalanceHistoryRecalculateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         

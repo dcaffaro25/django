@@ -97,10 +97,10 @@ urlpatterns = [
     re_path(r'^financial-statements/generate-preview/?$', generate_preview, name='generate-preview'),
     
     # Balance history recalculation
-    re_path(r'^balance-history/recalculate/?$', BalanceHistoryRecalculateView.as_view(), name='balance-history-recalculate'),
+    re_path(r'^api/balance-history/recalculate/?$', BalanceHistoryRecalculateView.as_view(), name='balance-history-recalculate'),
     
     # Reconciliation metrics
-    re_path(r'^reconciliation-metrics/recalculate/?$', ReconciliationMetricsRecalculateView.as_view(), name='reconciliation-metrics-recalculate'),
-    re_path(r'^reconciliation-metrics/transaction/(?P<transaction_id>\d+)/?$', ReconciliationMetricsTransactionView.as_view(), name='reconciliation-metrics-transaction'),
-    re_path(r'^reconciliation-metrics/journal-entry/(?P<journal_entry_id>\d+)/?$', ReconciliationMetricsJournalEntryView.as_view(), name='reconciliation-metrics-journal-entry'),
+    re_path(r'^api/reconciliation-metrics/recalculate/?$', ReconciliationMetricsRecalculateView.as_view(), name='reconciliation-metrics-recalculate'),
+    re_path(r'^api/reconciliation-metrics/transaction/(?P<transaction_id>\d+)/?$', ReconciliationMetricsTransactionView.as_view(), name='reconciliation-metrics-transaction'),
+    re_path(r'^api/reconciliation-metrics/journal-entry/(?P<journal_entry_id>\d+)/?$', ReconciliationMetricsJournalEntryView.as_view(), name='reconciliation-metrics-journal-entry'),
 ]
