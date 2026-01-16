@@ -145,7 +145,10 @@ class ReconciliationFinancialMetricsService:
         metrics['amount_discrepancy'] = amount_discrepancy
         
         if je_amount != 0:
-            metrics['amount_discrepancy_percentage'] = (amount_discrepancy / abs(je_amount)) * Decimal('100')
+            percentage = (amount_discrepancy / abs(je_amount)) * Decimal('100')
+            # Cap percentage at 999999.99% to fit within max_digits=10, decimal_places=2
+            max_percentage = Decimal('999999.99')
+            metrics['amount_discrepancy_percentage'] = min(percentage, max_percentage) if percentage > 0 else max(percentage, -max_percentage)
         
         # Accuracy flags (only meaningful when reconciled)
         metrics['is_exact_match'] = abs(amount_discrepancy) <= self.AMOUNT_TOLERANCE
@@ -444,7 +447,10 @@ class ReconciliationFinancialMetricsService:
         transaction_ids: Optional[List[int]] = None,
     ) -> Dict[str, Any]:
         """
-        Recalculate metrics for transactions and journal entries matching the filters.
+        Recalculate metrics for unposted (pending) transactions and journal entries matching the filters.
+        
+        Only processes transactions and journal entries with state='pending'.
+        Posted transactions and journal entries are excluded from recalculation.
         
         Parameters:
         - start_date: Required start date for filtering
@@ -452,17 +458,18 @@ class ReconciliationFinancialMetricsService:
         - company_id: Optional company filter
         - entity_id: Optional entity filter
         - account_id: Optional account filter (for journal entries)
-        - transaction_ids: Optional list of specific transaction IDs
+        - transaction_ids: Optional list of specific transaction IDs (must be unposted)
         
         Returns statistics about the recalculation.
         """
         if end_date is None:
             end_date = date.today()
         
-        # Build transaction query
+        # Build transaction query - only unposted transactions
         tx_query = Transaction.objects.filter(
             date__gte=start_date,
             date__lte=end_date,
+            state='pending',  # Only process unposted transactions
         ).select_related('company', 'entity', 'currency').prefetch_related(
             'journal_entries__account',
             'journal_entries__reconciliations__bank_transactions',
@@ -475,10 +482,11 @@ class ReconciliationFinancialMetricsService:
         if transaction_ids:
             tx_query = tx_query.filter(id__in=transaction_ids)
         
-        # Build journal entry query
+        # Build journal entry query - only unposted journal entries
         je_query = JournalEntry.objects.filter(
             transaction__date__gte=start_date,
             transaction__date__lte=end_date,
+            state='pending',  # Only process unposted journal entries
         ).select_related(
             'transaction', 'account'
         ).prefetch_related(

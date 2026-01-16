@@ -507,7 +507,7 @@ class JournalEntry(TenantAwareBaseModel):
         help_text="Difference between JE amount and bank amount (system calculated, read-only)"
     )
     amount_discrepancy_percentage = models.DecimalField(
-        max_digits=5, decimal_places=2, null=True, blank=True,
+        max_digits=10, decimal_places=2, null=True, blank=True,
         help_text="Percentage difference between JE amount and bank amount (system calculated, read-only)"
     )
     is_exact_match = models.BooleanField(

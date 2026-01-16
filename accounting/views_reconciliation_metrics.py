@@ -23,6 +23,9 @@ class ReconciliationMetricsRecalculateView(APIView):
     
     POST /api/reconciliation-metrics/recalculate/
     
+    Note: Only processes unposted (pending) transactions and journal entries.
+    Posted transactions and journal entries are excluded from recalculation.
+    
     Request body:
     {
         "start_date": "2025-01-01",  // Required
@@ -30,7 +33,7 @@ class ReconciliationMetricsRecalculateView(APIView):
         "company_id": 1,               // Optional
         "entity_id": 2,                // Optional
         "account_id": 10,              // Optional (filters journal entries)
-        "transaction_ids": [100, 101]  // Optional (specific transactions)
+        "transaction_ids": [100, 101]  // Optional (specific transactions, must be unposted)
     }
     """
     
