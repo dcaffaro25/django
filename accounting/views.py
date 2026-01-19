@@ -4208,6 +4208,39 @@ class ReconciliationConfigViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = ReconciliationConfig.objects.all()
     serializer_class = ReconciliationConfigSerializer
 
+    def get_queryset(self):
+        """
+        Return all configs available to the current user:
+        - Global
+        - Company (current tenant)
+        - User
+        - Company+User (current tenant + current user)
+        """
+        user = getattr(self.request, 'user', None)
+        # Get tenant from request (set by middleware) - never trust query params
+        tenant = getattr(self.request, 'tenant', None)
+
+        # Build filters for all relevant scopes
+        filters = Q(scope="global")
+        
+        if tenant and tenant != 'all':
+            # Add company-scoped configs for current tenant
+            filters |= Q(scope="company", company=tenant)
+            # Add company+user scoped configs if user is available
+            if user and not user.is_anonymous:
+                filters |= Q(scope="company_user", company=tenant, user=user)
+        
+        # Add user-scoped configs for current user (if authenticated)
+        if user and not user.is_anonymous:
+            filters |= Q(scope="user", user=user)
+        
+        # Get base queryset and apply scope filters
+        # Note: We bypass ScopedQuerysetMixin's filtering since ReconciliationConfig
+        # has its own scope-based filtering system
+        qs = ReconciliationConfig.objects.all().filter(filters)
+        
+        return qs
+
     @action(detail=False, methods=["get"])
     def resolved(self, request, *args, **kwargs):
         """
@@ -4216,23 +4249,11 @@ class ReconciliationConfigViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         - Company (current tenant)
         - User
         - Company+User (current tenant + current user)
+        
+        Uses ResolvedReconciliationConfigSerializer which may include additional metadata.
         """
-        user = request.user
-        # Get tenant from request (set by middleware) - never trust query params
-        tenant = getattr(request, 'tenant', None)
-
-        # Use get_queryset() to ensure tenant filtering is applied
-        filters = Q(scope="global")
-        
-        if tenant and tenant != 'all':
-            # Add company-scoped configs for current tenant
-            filters |= Q(scope="company", company=tenant)
-            filters |= Q(scope="company_user", company=tenant, user=user)
-        
-        # Add user-scoped configs for current user
-        filters |= Q(scope="user", user=user)
-        
-        qs = self.get_queryset().filter(filters)
+        # get_queryset() now already returns all relevant scopes
+        qs = self.get_queryset()
 
         serializer = ResolvedReconciliationConfigSerializer(qs, many=True)
         return Response(serializer.data)
