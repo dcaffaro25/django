@@ -298,7 +298,7 @@ class Account(TenantAwareBaseModel, MPTTModel):
 class Transaction(TenantAwareBaseModel):
     date = models.DateField()
     entity = models.ForeignKey('multitenancy.Entity', related_name='transactions', on_delete=models.CASCADE)
-    description = models.CharField(max_length=255)
+    description = models.CharField(max_length=1000)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     currency = models.ForeignKey(Currency, on_delete=models.CASCADE)
     state = models.CharField(max_length=50, default='pending')  # e.g., 'pending', 'posted'
@@ -485,7 +485,7 @@ class Transaction(TenantAwareBaseModel):
 
 class JournalEntry(TenantAwareBaseModel):
     transaction = models.ForeignKey(Transaction, related_name='journal_entries', on_delete=models.CASCADE)
-    description = models.CharField(max_length=255, null=True, blank=True)
+    description = models.CharField(max_length=1000, null=True, blank=True)
     account = models.ForeignKey(Account, on_delete=models.CASCADE, null=True, blank=True)
     cost_center = models.ForeignKey(CostCenter, on_delete=models.CASCADE, null=True, blank=True)
     debit_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
