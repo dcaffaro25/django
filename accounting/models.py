@@ -108,7 +108,7 @@ class BankAccount(TenantAwareBaseModel):
         return f'({self.id}) {self.company} - {self.entity} - {self.bank.name} - {self.account_number}'
     
     class Meta:
-        unique_together = ('name', 'bank', 'account_number', 'branch_id')
+        unique_together = ('company', 'name', 'bank', 'account_number', 'branch_id')
     
     def get_current_balance(self):
         last_balance_date = self.balance_date
