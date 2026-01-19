@@ -1897,6 +1897,121 @@ class BankAccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
     
+    @action(methods=['post'], detail=False)
+    def ensure_pending_bulk(self, request, *args, **kwargs):
+        """
+        Ensure pending bank structs exist for multiple companies.
+        
+        POST /api/bank_accounts/ensure_pending_bulk/
+        Body: {
+            "company_ids": [1, 2, 3],  // Optional: specific company IDs
+            "all": true,                // Optional: ensure for all companies (requires superuser)
+            "currency_id": <optional>   // Optional currency ID
+        }
+        
+        Returns results for each company processed.
+        """
+        from multitenancy.models import Company
+        from accounting.serializers import AccountSerializer
+        
+        # Check if user is superuser for bulk operations
+        if not request.user.is_superuser:
+            return Response(
+                {"error": "Superuser access required for bulk operations"}, 
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        company_ids = request.data.get('company_ids', [])
+        all_companies = request.data.get('all', False)
+        currency_id = request.data.get('currency_id')
+        
+        if currency_id:
+            try:
+                currency_id = int(currency_id)
+            except (ValueError, TypeError):
+                return Response(
+                    {"error": "currency_id must be a valid integer"}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        # Determine which companies to process
+        if all_companies:
+            companies = Company.objects.all()
+        elif company_ids:
+            try:
+                company_ids = [int(cid) for cid in company_ids]
+            except (ValueError, TypeError):
+                return Response(
+                    {"error": "company_ids must be a list of integers"}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            companies = Company.objects.filter(id__in=company_ids)
+        else:
+            return Response(
+                {"error": "Either 'company_ids' or 'all' must be provided"}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        results = {
+            "success": [],
+            "errors": [],
+            "skipped": []
+        }
+        
+        for company in companies:
+            try:
+                # Check if pending bank account already exists
+                existing = BankAccount.objects.filter(
+                    company_id=company.id,
+                    name='Pending BankAccount',
+                    account_number='PENDING',
+                    branch_id='PENDING',
+                ).first()
+                
+                if existing:
+                    results["skipped"].append({
+                        "company_id": company.id,
+                        "company_name": company.name,
+                        "bank_account_id": existing.id,
+                        "message": "Pending bank account already exists"
+                    })
+                    continue
+                
+                # Ensure pending bank structs
+                pending_ba, pending_gl = ensure_pending_bank_structs(
+                    company_id=company.id,
+                    currency_id=currency_id
+                )
+                
+                results["success"].append({
+                    "company_id": company.id,
+                    "company_name": company.name,
+                    "bank_account": BankAccountSerializer(pending_ba).data,
+                    "gl_account": AccountSerializer(pending_gl).data,
+                    "message": "Pending bank structs created successfully"
+                })
+                
+            except Exception as e:
+                logging.getLogger(__name__).error(
+                    f"Error ensuring pending bank structs for company {company.id}: {e}", 
+                    exc_info=True
+                )
+                results["errors"].append({
+                    "company_id": company.id,
+                    "company_name": company.name,
+                    "error": str(e)
+                })
+        
+        return Response({
+            "summary": {
+                "total": companies.count(),
+                "success": len(results["success"]),
+                "skipped": len(results["skipped"]),
+                "errors": len(results["errors"])
+            },
+            "results": results
+        }, status=status.HTTP_200_OK)
+    
 # BankTransaction ViewSet
 class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     if settings.AUTH_OFF:

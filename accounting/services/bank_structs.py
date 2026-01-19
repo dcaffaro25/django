@@ -98,22 +98,77 @@ def ensure_pending_bank_structs(company_id, *, currency_id=None):
             transaction.savepoint_commit(sid)
         except IntegrityError:
             # Race condition: another process created it between check and create
-            # Rollback the savepoint to restore transaction state, then fetch the existing record
+            # Rollback the savepoint to restore transaction state
             transaction.savepoint_rollback(sid)
-            try:
-                pending_ba = BankAccount.objects.get(
+            
+            # After rollback, we need to retry getting the record
+            # Due to transaction isolation, we might not see it immediately, so retry with a small delay
+            import time
+            max_retries = 3
+            retry_delay = 0.1  # 100ms
+            
+            for attempt in range(max_retries):
+                # Try to get the existing record (use filter().first() to avoid DoesNotExist)
+                pending_ba = BankAccount.objects.filter(
                     company_id=company_id,
                     name=PENDING_BANKACCOUNT_NAME,
                     account_number=PENDING_BANKACCOUNT_NUMBER,
                     branch_id=PENDING_BRANCH_ID,
                     bank=bank,
-                )
-            except BankAccount.DoesNotExist:
-                # This shouldn't happen after IntegrityError, but handle it just in case
-                raise RuntimeError(
-                    f"Pending BankAccount was expected to exist after IntegrityError but was not found "
-                    f"for company {company_id}"
-                )
+                ).first()
+                
+                if pending_ba:
+                    break
+                
+                # If not found and this isn't the last attempt, wait a bit for transaction to commit
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+            
+            if not pending_ba:
+                # Record still doesn't exist after retries
+                # This shouldn't happen, but if it does, the record might have been created
+                # in another transaction that hasn't committed yet
+                # Try one final get_or_create without savepoint (let it handle the IntegrityError)
+                try:
+                    pending_ba, _ = BankAccount.objects.get_or_create(
+                        company_id=company_id,
+                        name=PENDING_BANKACCOUNT_NAME,
+                        account_number=PENDING_BANKACCOUNT_NUMBER,
+                        branch_id=PENDING_BRANCH_ID,
+                        bank=bank,
+                        defaults=dict(
+                            currency_id=currency_id,
+                            balance=Decimal("0.00"),
+                            balance_date=now().date(),
+                            account_type="pending",
+                            entity=entity,
+                        ),
+                    )
+                except IntegrityError:
+                    # Final attempt - the record definitely exists, use get() with select_for_update
+                    # This will wait for any pending transaction to commit
+                    from django.db import transaction as db_transaction
+                    try:
+                        with db_transaction.atomic():
+                            pending_ba = BankAccount.objects.select_for_update(nowait=False).get(
+                                company_id=company_id,
+                                name=PENDING_BANKACCOUNT_NAME,
+                                account_number=PENDING_BANKACCOUNT_NUMBER,
+                                branch_id=PENDING_BRANCH_ID,
+                                bank=bank,
+                            )
+                    except BankAccount.DoesNotExist:
+                        # Even after all retries and select_for_update, record not found
+                        # This is very unusual - the IntegrityError said it exists
+                        # The record might be in a transaction that will rollback
+                        # Raise a clear error message
+                        raise RuntimeError(
+                            f"Pending BankAccount for company {company_id} triggered IntegrityError "
+                            f"(indicating it exists) but could not be retrieved after multiple attempts. "
+                            f"This may be due to transaction isolation. Please try the ensure_pending "
+                            f"endpoint again, or check the database directly."
+                        )
 
     # Make sure currency is set even if record existed
     if not pending_ba.currency_id and currency_id:
