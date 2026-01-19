@@ -52,24 +52,14 @@ def ensure_pending_bank_structs(company_id, *, currency_id=None):
         defaults={}
     )
 
+    # Use a savepoint to isolate IntegrityError and prevent transaction breakage
+    # This allows us to rollback just the failed get_or_create attempt without
+    # breaking the entire transaction
     try:
-        pending_ba, _ = BankAccount.objects.get_or_create(
-            company_id=company_id,
-            name=PENDING_BANKACCOUNT_NAME,
-            account_number=PENDING_BANKACCOUNT_NUMBER,
-            branch_id=PENDING_BRANCH_ID,
-            bank=bank,
-            defaults=dict(
-                currency_id=currency_id,
-                balance=Decimal("0.00"),
-                balance_date=now().date(),
-                account_type="pending",
-                entity = entity,
-                #entity_id=entity_id,  # set to None if you allow; else choose a default entity for the company
-            ),
-        )
-    except IntegrityError:
-        # Race condition: another process created it between check and create
+        sid = transaction.savepoint()
+    except Exception:
+        # Transaction is already in a failed state, can't create savepoint
+        # Try to get the existing record directly
         pending_ba = BankAccount.objects.get(
             company_id=company_id,
             name=PENDING_BANKACCOUNT_NAME,
@@ -77,6 +67,36 @@ def ensure_pending_bank_structs(company_id, *, currency_id=None):
             branch_id=PENDING_BRANCH_ID,
             bank=bank,
         )
+    else:
+        try:
+            pending_ba, _ = BankAccount.objects.get_or_create(
+                company_id=company_id,
+                name=PENDING_BANKACCOUNT_NAME,
+                account_number=PENDING_BANKACCOUNT_NUMBER,
+                branch_id=PENDING_BRANCH_ID,
+                bank=bank,
+                defaults=dict(
+                    currency_id=currency_id,
+                    balance=Decimal("0.00"),
+                    balance_date=now().date(),
+                    account_type="pending",
+                    entity = entity,
+                    #entity_id=entity_id,  # set to None if you allow; else choose a default entity for the company
+                ),
+            )
+            # Successfully created, release the savepoint
+            transaction.savepoint_commit(sid)
+        except IntegrityError:
+            # Race condition: another process created it between check and create
+            # Rollback the savepoint to restore transaction state, then fetch the existing record
+            transaction.savepoint_rollback(sid)
+            pending_ba = BankAccount.objects.get(
+                company_id=company_id,
+                name=PENDING_BANKACCOUNT_NAME,
+                account_number=PENDING_BANKACCOUNT_NUMBER,
+                branch_id=PENDING_BRANCH_ID,
+                bank=bank,
+            )
 
     # Make sure currency is set even if record existed
     if not pending_ba.currency_id and currency_id:
