@@ -2,7 +2,7 @@
 from decimal import Decimal
 from django.apps import apps
 from django.utils.timezone import now
-from django.db import transaction
+from django.db import transaction, IntegrityError
 
 PENDING_ENTITY_NAME = "PENDING"
 PENDING_BANK_NAME = "PENDING"
@@ -52,21 +52,31 @@ def ensure_pending_bank_structs(company_id, *, currency_id=None):
         defaults={}
     )
 
-    pending_ba, _ = BankAccount.objects.get_or_create(
-        company_id=company_id,
-        name=PENDING_BANKACCOUNT_NAME,
-        account_number=PENDING_BANKACCOUNT_NUMBER,
-        branch_id=PENDING_BRANCH_ID,
-        bank=bank,
-        defaults=dict(
-            currency_id=currency_id,
-            balance=Decimal("0.00"),
-            balance_date=now().date(),
-            account_type="pending",
-            entity = entity,
-            #entity_id=entity_id,  # set to None if you allow; else choose a default entity for the company
-        ),
-    )
+    try:
+        pending_ba, _ = BankAccount.objects.get_or_create(
+            company_id=company_id,
+            name=PENDING_BANKACCOUNT_NAME,
+            account_number=PENDING_BANKACCOUNT_NUMBER,
+            branch_id=PENDING_BRANCH_ID,
+            bank=bank,
+            defaults=dict(
+                currency_id=currency_id,
+                balance=Decimal("0.00"),
+                balance_date=now().date(),
+                account_type="pending",
+                entity = entity,
+                #entity_id=entity_id,  # set to None if you allow; else choose a default entity for the company
+            ),
+        )
+    except IntegrityError:
+        # Race condition: another process created it between check and create
+        pending_ba = BankAccount.objects.get(
+            company_id=company_id,
+            name=PENDING_BANKACCOUNT_NAME,
+            account_number=PENDING_BANKACCOUNT_NUMBER,
+            branch_id=PENDING_BRANCH_ID,
+            bank=bank,
+        )
 
     # Make sure currency is set even if record existed
     if not pending_ba.currency_id and currency_id:

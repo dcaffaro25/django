@@ -2906,6 +2906,10 @@ class ETLPipelineService:
             logger.info(f"ETL OPPOSING JE: auto_create_journal_entries is ENABLED - proceeding")
         logger.info(f"ETL: Auto-creating JournalEntries for {len(transaction_outputs)} Transactions")
         
+        # Cache pending bank accounts by currency_id (prevents duplicate key violations)
+        # ensure_pending_bank_structs is expensive, so we call it once per currency
+        pending_bank_cache: Dict[int, tuple] = {}  # currency_id -> (pending_ba, pending_gl)
+        
         # Get configuration
         bank_account_field = auto_config.get('bank_account_field', 'bank_account_id')
         opposing_account_field = auto_config.get('opposing_account_field', 'account_path')
@@ -3152,12 +3156,17 @@ class ETLPipelineService:
                     bank_designation_pending = False
                     
                     if use_pending_bank:
-                        # Use pending bank account feature
-                        from accounting.services.bank_structs import ensure_pending_bank_structs
-                        pending_ba, pending_gl = ensure_pending_bank_structs(
-                            company_id=self.company_id,
-                            currency_id=transaction.currency_id
-                        )
+                        # Use cached pending bank account (prevents duplicate key violations)
+                        currency_id = transaction.currency_id
+                        if currency_id not in pending_bank_cache:
+                            from accounting.services.bank_structs import ensure_pending_bank_structs
+                            pending_ba, pending_gl = ensure_pending_bank_structs(
+                                company_id=self.company_id,
+                                currency_id=currency_id
+                            )
+                            pending_bank_cache[currency_id] = (pending_ba, pending_gl)
+                        else:
+                            pending_ba, pending_gl = pending_bank_cache[currency_id]
                         bank_ledger_account = pending_gl
                         bank_designation_pending = True
                         logger.debug(f"ETL: Using pending bank account for Transaction {transaction_id}")
