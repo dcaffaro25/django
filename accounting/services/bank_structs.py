@@ -59,14 +59,24 @@ def ensure_pending_bank_structs(company_id, *, currency_id=None):
         sid = transaction.savepoint()
     except Exception:
         # Transaction is already in a failed state, can't create savepoint
-        # Try to get the existing record directly
-        pending_ba = BankAccount.objects.get(
-            company_id=company_id,
-            name=PENDING_BANKACCOUNT_NAME,
-            account_number=PENDING_BANKACCOUNT_NUMBER,
-            branch_id=PENDING_BRANCH_ID,
-            bank=bank,
-        )
+        # Try to get the existing record directly, or create it if it doesn't exist
+        try:
+            pending_ba = BankAccount.objects.get(
+                company_id=company_id,
+                name=PENDING_BANKACCOUNT_NAME,
+                account_number=PENDING_BANKACCOUNT_NUMBER,
+                branch_id=PENDING_BRANCH_ID,
+                bank=bank,
+            )
+        except BankAccount.DoesNotExist:
+            # Record doesn't exist and transaction is broken - can't create it here
+            # This is a critical error - the function should fail gracefully
+            # The caller should handle this or use the endpoint to create it manually
+            raise RuntimeError(
+                f"Pending BankAccount does not exist for company {company_id} and cannot be created "
+                f"because the transaction is in a failed state. Please use the ensure_pending endpoint "
+                f"to create it manually."
+            )
     else:
         try:
             pending_ba, _ = BankAccount.objects.get_or_create(
@@ -90,13 +100,20 @@ def ensure_pending_bank_structs(company_id, *, currency_id=None):
             # Race condition: another process created it between check and create
             # Rollback the savepoint to restore transaction state, then fetch the existing record
             transaction.savepoint_rollback(sid)
-            pending_ba = BankAccount.objects.get(
-                company_id=company_id,
-                name=PENDING_BANKACCOUNT_NAME,
-                account_number=PENDING_BANKACCOUNT_NUMBER,
-                branch_id=PENDING_BRANCH_ID,
-                bank=bank,
-            )
+            try:
+                pending_ba = BankAccount.objects.get(
+                    company_id=company_id,
+                    name=PENDING_BANKACCOUNT_NAME,
+                    account_number=PENDING_BANKACCOUNT_NUMBER,
+                    branch_id=PENDING_BRANCH_ID,
+                    bank=bank,
+                )
+            except BankAccount.DoesNotExist:
+                # This shouldn't happen after IntegrityError, but handle it just in case
+                raise RuntimeError(
+                    f"Pending BankAccount was expected to exist after IntegrityError but was not found "
+                    f"for company {company_id}"
+                )
 
     # Make sure currency is set even if record existed
     if not pending_ba.currency_id and currency_id:

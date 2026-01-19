@@ -1825,6 +1825,78 @@ class BankAccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         ids = request.data  # Assuming request.data is a list of IDs
         return generic_bulk_delete(self, ids)
     
+    @action(methods=['post'], detail=False)
+    def ensure_pending(self, request, *args, **kwargs):
+        """
+        Ensure pending bank structs exist for the company.
+        
+        POST /api/bank_accounts/ensure_pending/
+        Body: {"currency_id": <optional>}
+        
+        Creates or returns:
+        - PENDING Bank
+        - Pending BankAccount
+        - Bank Clearing (Pending) GL Account
+        
+        Returns the bank account and GL account details.
+        """
+        from accounting.serializers import AccountSerializer
+        
+        # Get company_id from tenant (set by middleware)
+        tenant = getattr(request, 'tenant', None)
+        if not tenant or tenant == 'all':
+            if request.user.is_superuser and tenant == 'all':
+                # Superuser can access all, but need company_id for this endpoint
+                company_id = request.data.get('company_id') or request.query_params.get('company_id')
+                if not company_id:
+                    return Response(
+                        {"error": "company_id is required when accessing all tenants"}, 
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                try:
+                    company_id = int(company_id)
+                except (ValueError, TypeError):
+                    return Response(
+                        {"error": "company_id must be a valid integer"}, 
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            else:
+                return Response(
+                    {"error": "Tenant not found in request"}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        else:
+            company_id = tenant.id
+        
+        currency_id = request.data.get('currency_id')
+        if currency_id:
+            try:
+                currency_id = int(currency_id)
+            except (ValueError, TypeError):
+                return Response(
+                    {"error": "currency_id must be a valid integer"}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
+        try:
+            pending_ba, pending_gl = ensure_pending_bank_structs(
+                company_id=company_id,
+                currency_id=currency_id
+            )
+            
+            return Response({
+                "success": True,
+                "bank_account": BankAccountSerializer(pending_ba).data,
+                "gl_account": AccountSerializer(pending_gl).data,
+                "message": "Pending bank structs ensured successfully"
+            }, status=status.HTTP_200_OK)
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Error ensuring pending bank structs: {e}", exc_info=True)
+            return Response(
+                {"error": str(e)}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
 # BankTransaction ViewSet
 class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     if settings.AUTH_OFF:
