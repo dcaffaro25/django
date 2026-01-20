@@ -37,6 +37,8 @@ from .services.financial_statement_service import FinancialStatementGenerator
 from .services.template_suggestion_service import TemplateSuggestionService
 from .services.balance_recalculation_service import BalanceRecalculationService
 from .services.income_statement_service import IncomeStatementService
+from .services.balance_sheet_service import BalanceSheetService
+from .services.cash_flow_service import CashFlowService
 from .models import Currency, Account
 
 log = logging.getLogger(__name__)
@@ -1845,7 +1847,10 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             "end_date": "2025-12-31",
             "currency_id": 1,  // optional
             "balance_type": "posted",  // optional: "posted", "bank_reconciled", or "all"
-            "include_zero_balances": false  // optional: include accounts with zero balance
+            "include_zero_balances": false,  // optional: include accounts with zero balance
+            "revenue_depth": -1,  // optional: max depth for revenues (-1 = all, 0 = parent only, 1 = parent+1 level)
+            "cost_depth": -1,  // optional: max depth for costs
+            "expense_depth": -1  // optional: max depth for expenses
         }
         """
         # Get company from tenant (set by middleware)
@@ -1896,6 +1901,22 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         balance_type = request.data.get('balance_type', 'posted')
         include_zero_balances = request.data.get('include_zero_balances', False)
         
+        # Get depth parameters (-1 means show all levels)
+        revenue_depth = request.data.get('revenue_depth', -1)
+        cost_depth = request.data.get('cost_depth', -1)
+        expense_depth = request.data.get('expense_depth', -1)
+        
+        # Validate depth parameters
+        try:
+            revenue_depth = int(revenue_depth) if revenue_depth is not None else -1
+            cost_depth = int(cost_depth) if cost_depth is not None else -1
+            expense_depth = int(expense_depth) if expense_depth is not None else -1
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Depth parameters must be integers'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
         if balance_type not in ['posted', 'bank_reconciled', 'all']:
             return Response(
                 {'error': 'balance_type must be one of: posted, bank_reconciled, all'},
@@ -1914,6 +1935,9 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 currency_id=currency_id,
                 balance_type=balance_type,
                 include_zero_balances=include_zero_balances,
+                revenue_depth=revenue_depth,
+                cost_depth=cost_depth,
+                expense_depth=expense_depth,
             )
             
             return Response(income_statement, status=status.HTTP_200_OK)
@@ -1927,6 +1951,238 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             log.exception("Error generating detailed income statement")
             return Response(
                 {'error': f'Error generating income statement: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['post'])
+    def detailed_balance_sheet(self, request, tenant_id=None):
+        """
+        Generate detailed hierarchical balance sheet from parent accounts.
+        
+        POST /api/financial-statements/detailed_balance_sheet/
+        {
+            "asset_parent_ids": [1, 2],
+            "liability_parent_ids": [3, 4],
+            "equity_parent_ids": [5, 6],
+            "as_of_date": "2025-12-31",
+            "currency_id": 1,  // optional
+            "balance_type": "posted",  // optional: "posted", "bank_reconciled", or "all"
+            "include_zero_balances": false,  // optional
+            "asset_depth": -1,  // optional: max depth for assets (-1 = all)
+            "liability_depth": -1,  // optional: max depth for liabilities
+            "equity_depth": -1  // optional: max depth for equity
+        }
+        """
+        # Get company from tenant (set by middleware)
+        company = getattr(request, 'tenant', None)
+        if not company or company == 'all':
+            return Response(
+                {'error': 'Company/tenant not found in request'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        company_id = company.id if hasattr(company, 'id') else company
+        
+        # Validate required fields
+        asset_parent_ids = request.data.get('asset_parent_ids', [])
+        liability_parent_ids = request.data.get('liability_parent_ids', [])
+        equity_parent_ids = request.data.get('equity_parent_ids', [])
+        as_of_date_str = request.data.get('as_of_date')
+        
+        if not asset_parent_ids and not liability_parent_ids and not equity_parent_ids:
+            return Response(
+                {'error': 'At least one parent account ID list is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not as_of_date_str:
+            return Response(
+                {'error': 'as_of_date is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            as_of_date = date.fromisoformat(as_of_date_str)
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get optional parameters
+        currency_id = request.data.get('currency_id')
+        balance_type = request.data.get('balance_type', 'posted')
+        include_zero_balances = request.data.get('include_zero_balances', False)
+        
+        # Get depth parameters (-1 means show all levels)
+        asset_depth = request.data.get('asset_depth', -1)
+        liability_depth = request.data.get('liability_depth', -1)
+        equity_depth = request.data.get('equity_depth', -1)
+        
+        # Validate depth parameters
+        try:
+            asset_depth = int(asset_depth) if asset_depth is not None else -1
+            liability_depth = int(liability_depth) if liability_depth is not None else -1
+            equity_depth = int(equity_depth) if equity_depth is not None else -1
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Depth parameters must be integers'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if balance_type not in ['posted', 'bank_reconciled', 'all']:
+            return Response(
+                {'error': 'balance_type must be one of: posted, bank_reconciled, all'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            # Generate balance sheet
+            service = BalanceSheetService(company_id=company_id)
+            balance_sheet = service.generate_balance_sheet(
+                asset_parent_ids=asset_parent_ids,
+                liability_parent_ids=liability_parent_ids,
+                equity_parent_ids=equity_parent_ids,
+                as_of_date=as_of_date,
+                currency_id=currency_id,
+                balance_type=balance_type,
+                include_zero_balances=include_zero_balances,
+                asset_depth=asset_depth,
+                liability_depth=liability_depth,
+                equity_depth=equity_depth,
+            )
+            
+            return Response(balance_sheet, status=status.HTTP_200_OK)
+            
+        except ValueError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            log.exception("Error generating detailed balance sheet")
+            return Response(
+                {'error': f'Error generating balance sheet: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @action(detail=False, methods=['post'])
+    def detailed_cash_flow(self, request, tenant_id=None):
+        """
+        Generate detailed hierarchical cash flow statement from parent accounts.
+        
+        POST /api/financial-statements/detailed_cash_flow/
+        {
+            "operating_parent_ids": [1, 2],
+            "investing_parent_ids": [3, 4],
+            "financing_parent_ids": [5, 6],
+            "start_date": "2025-01-01",
+            "end_date": "2025-12-31",
+            "currency_id": 1,  // optional
+            "balance_type": "posted",  // optional: "posted", "bank_reconciled", or "all"
+            "include_zero_balances": false,  // optional
+            "operating_depth": -1,  // optional: max depth for operating (-1 = all)
+            "investing_depth": -1,  // optional: max depth for investing
+            "financing_depth": -1  // optional: max depth for financing
+        }
+        """
+        # Get company from tenant (set by middleware)
+        company = getattr(request, 'tenant', None)
+        if not company or company == 'all':
+            return Response(
+                {'error': 'Company/tenant not found in request'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        company_id = company.id if hasattr(company, 'id') else company
+        
+        # Validate required fields
+        operating_parent_ids = request.data.get('operating_parent_ids', [])
+        investing_parent_ids = request.data.get('investing_parent_ids', [])
+        financing_parent_ids = request.data.get('financing_parent_ids', [])
+        start_date_str = request.data.get('start_date')
+        end_date_str = request.data.get('end_date')
+        
+        if not operating_parent_ids and not investing_parent_ids and not financing_parent_ids:
+            return Response(
+                {'error': 'At least one parent account ID list is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not start_date_str or not end_date_str:
+            return Response(
+                {'error': 'start_date and end_date are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            start_date = date.fromisoformat(start_date_str)
+            end_date = date.fromisoformat(end_date_str)
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if start_date > end_date:
+            return Response(
+                {'error': 'start_date must be before or equal to end_date'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get optional parameters
+        currency_id = request.data.get('currency_id')
+        balance_type = request.data.get('balance_type', 'posted')
+        include_zero_balances = request.data.get('include_zero_balances', False)
+        
+        # Get depth parameters (-1 means show all levels)
+        operating_depth = request.data.get('operating_depth', -1)
+        investing_depth = request.data.get('investing_depth', -1)
+        financing_depth = request.data.get('financing_depth', -1)
+        
+        # Validate depth parameters
+        try:
+            operating_depth = int(operating_depth) if operating_depth is not None else -1
+            investing_depth = int(investing_depth) if investing_depth is not None else -1
+            financing_depth = int(financing_depth) if financing_depth is not None else -1
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Depth parameters must be integers'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if balance_type not in ['posted', 'bank_reconciled', 'all']:
+            return Response(
+                {'error': 'balance_type must be one of: posted, bank_reconciled, all'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            # Generate cash flow
+            service = CashFlowService(company_id=company_id)
+            cash_flow = service.generate_cash_flow(
+                operating_parent_ids=operating_parent_ids,
+                investing_parent_ids=investing_parent_ids,
+                financing_parent_ids=financing_parent_ids,
+                start_date=start_date,
+                end_date=end_date,
+                currency_id=currency_id,
+                balance_type=balance_type,
+                include_zero_balances=include_zero_balances,
+                operating_depth=operating_depth,
+                investing_depth=investing_depth,
+                financing_depth=financing_depth,
+            )
+            
+            return Response(cash_flow, status=status.HTTP_200_OK)
+            
+        except ValueError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            log.exception("Error generating detailed cash flow")
+            return Response(
+                {'error': f'Error generating cash flow: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
     

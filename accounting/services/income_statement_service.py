@@ -129,6 +129,9 @@ class IncomeStatementService:
         currency_id: Optional[int] = None,
         balance_type: str = 'posted',
         include_zero_balances: bool = False,
+        revenue_depth: int = -1,
+        cost_depth: int = -1,
+        expense_depth: int = -1,
     ) -> Dict[str, Any]:
         """
         Generate a detailed hierarchical income statement.
@@ -151,6 +154,12 @@ class IncomeStatementService:
             One of: 'posted', 'bank_reconciled', 'all'
         include_zero_balances : bool
             Include accounts with zero balances
+        revenue_depth : int
+            Maximum depth to show for revenues (-1 = all levels, 0 = parent only, 1 = parent + 1 level, etc.)
+        cost_depth : int
+            Maximum depth to show for costs (-1 = all levels)
+        expense_depth : int
+            Maximum depth to show for expenses (-1 = all levels)
         
         Returns:
         --------
@@ -181,7 +190,7 @@ class IncomeStatementService:
         cost_accounts = self._get_all_descendants(cost_parent_ids)
         expense_accounts = self._get_all_descendants(expense_parent_ids)
         
-        # Build hierarchical structure for each section
+        # Build hierarchical structure for each section with depth limits
         revenues = self._build_account_hierarchy(
             revenue_accounts,
             start_date,
@@ -189,6 +198,7 @@ class IncomeStatementService:
             currency,
             balance_type,
             include_zero_balances,
+            max_depth=revenue_depth,
         )
         
         costs = self._build_account_hierarchy(
@@ -198,6 +208,7 @@ class IncomeStatementService:
             currency,
             balance_type,
             include_zero_balances,
+            max_depth=cost_depth,
         )
         
         expenses = self._build_account_hierarchy(
@@ -207,6 +218,7 @@ class IncomeStatementService:
             currency,
             balance_type,
             include_zero_balances,
+            max_depth=expense_depth,
         )
         
         # Calculate totals
@@ -279,10 +291,16 @@ class IncomeStatementService:
         currency: Currency,
         balance_type: str,
         include_zero_balances: bool,
+        max_depth: int = -1,
     ) -> List[Dict[str, Any]]:
         """
         Build hierarchical structure of accounts with balances.
         Only includes accounts with non-zero balances (unless include_zero_balances=True).
+        
+        Parameters:
+        -----------
+        max_depth : int
+            Maximum depth to show (-1 = all levels, 0 = parent only, 1 = parent + 1 level, etc.)
         """
         if not accounts:
             return []
@@ -363,6 +381,8 @@ class IncomeStatementService:
                 account_balances,
                 accounts,
                 0,  # depth level
+                max_depth=max_depth,
+                root_level=getattr(root, 'level', 0),
             )
             if node:
                 hierarchy.append(node)
@@ -376,29 +396,46 @@ class IncomeStatementService:
         account_balances: Dict[int, Decimal],
         all_accounts: List[Account],
         depth: int,
+        max_depth: int = -1,
+        root_level: int = 0,
     ) -> Optional[Dict[str, Any]]:
         """
         Build a single account node with its children.
+        
+        Parameters:
+        -----------
+        depth : int
+            Current depth relative to the root of this section
+        max_depth : int
+            Maximum depth to show (-1 = all levels)
+        root_level : int
+            Level of the root account in the overall tree (for calculating relative depth)
         """
         balance = account_balances.get(account.id, Decimal('0.00'))
         
-        # Find children that are in the filtered account_map
-        children = [
-            acc for acc in all_accounts
-            if acc.parent_id == account.id and acc.id in account_map
-        ]
+        # Check if we should include children based on max_depth
+        include_children = (max_depth == -1) or (depth < max_depth)
         
         children_nodes = []
-        for child in children:
-            child_node = self._build_account_node(
-                child,
-                account_map,
-                account_balances,
-                all_accounts,
-                depth + 1,
-            )
-            if child_node:
-                children_nodes.append(child_node)
+        if include_children:
+            # Find children that are in the filtered account_map
+            children = [
+                acc for acc in all_accounts
+                if acc.parent_id == account.id and acc.id in account_map
+            ]
+            
+            for child in children:
+                child_node = self._build_account_node(
+                    child,
+                    account_map,
+                    account_balances,
+                    all_accounts,
+                    depth + 1,
+                    max_depth=max_depth,
+                    root_level=root_level,
+                )
+                if child_node:
+                    children_nodes.append(child_node)
         
         # Only return node if it has balance or has children with balance
         if balance == Decimal('0.00') and not children_nodes:
