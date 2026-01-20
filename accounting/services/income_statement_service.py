@@ -191,34 +191,41 @@ class IncomeStatementService:
         expense_accounts = self._get_all_descendants(expense_parent_ids)
         
         # Build hierarchical structure for each section with depth limits
-        revenues = self._build_account_hierarchy(
+        # Add level 0 consolidation wrapper
+        revenues = self._build_account_hierarchy_with_consolidation(
             revenue_accounts,
+            revenue_parent_ids,
             start_date,
             end_date,
             currency,
             balance_type,
             include_zero_balances,
             max_depth=revenue_depth,
+            section_name="Revenue",
         )
         
-        costs = self._build_account_hierarchy(
+        costs = self._build_account_hierarchy_with_consolidation(
             cost_accounts,
+            cost_parent_ids,
             start_date,
             end_date,
             currency,
             balance_type,
             include_zero_balances,
             max_depth=cost_depth,
+            section_name="Cost of Goods Sold",
         )
         
-        expenses = self._build_account_hierarchy(
+        expenses = self._build_account_hierarchy_with_consolidation(
             expense_accounts,
+            expense_parent_ids,
             start_date,
             end_date,
             currency,
             balance_type,
             include_zero_balances,
             max_depth=expense_depth,
+            section_name="Expenses",
         )
         
         # Calculate totals
@@ -388,6 +395,121 @@ class IncomeStatementService:
                 hierarchy.append(node)
         
         return hierarchy
+    
+    def _build_account_hierarchy_with_consolidation(
+        self,
+        accounts: List[Account],
+        parent_ids: List[int],
+        start_date: date,
+        end_date: date,
+        currency: Currency,
+        balance_type: str,
+        include_zero_balances: bool,
+        max_depth: int = -1,
+        section_name: str = "",
+    ) -> List[Dict[str, Any]]:
+        """
+        Build hierarchical structure with level 0 consolidation of parent accounts.
+        
+        Level 0 = Consolidation of all parent accounts
+        Level 1 = Individual parent accounts
+        Level 2+ = Children of parent accounts
+        """
+        if not accounts or not parent_ids:
+            return []
+        
+        # Build the base hierarchy (parent accounts at depth 0 relative to their roots)
+        base_hierarchy = self._build_account_hierarchy(
+            accounts,
+            start_date,
+            end_date,
+            currency,
+            balance_type,
+            include_zero_balances,
+            max_depth=-1,  # Build full hierarchy first, then apply depth limit
+        )
+        
+        # If max_depth is 0, return only consolidation
+        if max_depth == 0:
+            total_balance = self._calculate_total(base_hierarchy)
+            return [{
+                'id': None,
+                'account_code': '',
+                'name': section_name or 'Total',
+                'path': section_name or 'Total',
+                'balance': float(total_balance),
+                'depth': 0,
+                'is_leaf': False,
+                'children': None,  # Children hidden at depth 0
+            }]
+        
+        # Calculate total balance for consolidation
+        total_balance = self._calculate_total(base_hierarchy)
+        
+        # Adjust depth for children: if max_depth=1, show only parents (no children)
+        # if max_depth=2, show parents + 1 level of children, etc.
+        # Since we're adding a level 0 consolidation, we need to reduce depth by 1 for children
+        adjusted_max_depth = max_depth - 1 if max_depth > 0 else -1
+        
+        # Wrap each root account node and apply depth limit
+        parent_nodes = []
+        for root_node in base_hierarchy:
+            if adjusted_max_depth >= 0:
+                # Limit depth of children
+                limited_node = self._limit_node_depth(root_node, adjusted_max_depth, current_depth=0)
+                if limited_node:
+                    parent_nodes.append(limited_node)
+            else:
+                # Show all levels
+                parent_nodes.append(root_node)
+        
+        # Create consolidation node at level 0
+        consolidation = {
+            'id': None,
+            'account_code': '',
+            'name': section_name or 'Total',
+            'path': section_name or 'Total',
+            'balance': float(total_balance),
+            'depth': 0,
+            'is_leaf': False,
+            'children': parent_nodes if parent_nodes else None,
+        }
+        
+        return [consolidation]
+    
+    def _limit_node_depth(
+        self,
+        node: Dict[str, Any],
+        max_depth: int,
+        current_depth: int = 0,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Recursively limit the depth of a node and its children.
+        
+        max_depth: Maximum depth allowed (0 = node only, no children)
+        current_depth: Current depth of the node
+        """
+        # If current depth >= max_depth, remove children
+        if current_depth >= max_depth:
+            return {
+                **node,
+                'children': None,
+            }
+        
+        # If node has children, limit their depth
+        if node.get('children'):
+            limited_children = []
+            for child in node['children']:
+                limited_child = self._limit_node_depth(child, max_depth, current_depth + 1)
+                if limited_child:
+                    limited_children.append(limited_child)
+            
+            return {
+                **node,
+                'children': limited_children if limited_children else None,
+            }
+        
+        return node
     
     def _build_account_node(
         self,

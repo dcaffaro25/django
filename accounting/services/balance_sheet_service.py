@@ -220,31 +220,38 @@ class BalanceSheetService(IncomeStatementService):
         equity_accounts = self._get_all_descendants(equity_parent_ids)
         
         # Build hierarchical structure for each section with ending balances
-        assets = self._build_account_hierarchy_balance_sheet(
+        # Add level 0 consolidation wrapper
+        assets = self._build_account_hierarchy_balance_sheet_with_consolidation(
             asset_accounts,
+            asset_parent_ids,
             as_of_date,
             currency,
             balance_type,
             include_zero_balances,
             max_depth=asset_depth,
+            section_name="Assets",
         )
         
-        liabilities = self._build_account_hierarchy_balance_sheet(
+        liabilities = self._build_account_hierarchy_balance_sheet_with_consolidation(
             liability_accounts,
+            liability_parent_ids,
             as_of_date,
             currency,
             balance_type,
             include_zero_balances,
             max_depth=liability_depth,
+            section_name="Liabilities",
         )
         
-        equity = self._build_account_hierarchy_balance_sheet(
+        equity = self._build_account_hierarchy_balance_sheet_with_consolidation(
             equity_accounts,
+            equity_parent_ids,
             as_of_date,
             currency,
             balance_type,
             include_zero_balances,
             max_depth=equity_depth,
+            section_name="Equity",
         )
         
         # Calculate totals
@@ -365,4 +372,79 @@ class BalanceSheetService(IncomeStatementService):
                 hierarchy.append(node)
         
         return hierarchy
+    
+    def _build_account_hierarchy_balance_sheet_with_consolidation(
+        self,
+        accounts: List[Account],
+        parent_ids: List[int],
+        as_of_date: date,
+        currency: Currency,
+        balance_type: str,
+        include_zero_balances: bool,
+        max_depth: int = -1,
+        section_name: str = "",
+    ) -> List[Dict[str, Any]]:
+        """
+        Build hierarchical structure with level 0 consolidation of parent accounts.
+        
+        Level 0 = Consolidation of all parent accounts
+        Level 1 = Individual parent accounts
+        Level 2+ = Children of parent accounts
+        """
+        if not accounts or not parent_ids:
+            return []
+        
+        # Build the base hierarchy
+        base_hierarchy = self._build_account_hierarchy_balance_sheet(
+            accounts,
+            as_of_date,
+            currency,
+            balance_type,
+            include_zero_balances,
+            max_depth=-1,  # Build full hierarchy first
+        )
+        
+        # If max_depth is 0, return only consolidation
+        if max_depth == 0:
+            total_balance = self._calculate_total(base_hierarchy)
+            return [{
+                'id': None,
+                'account_code': '',
+                'name': section_name or 'Total',
+                'path': section_name or 'Total',
+                'balance': float(total_balance),
+                'depth': 0,
+                'is_leaf': False,
+                'children': None,
+            }]
+        
+        # Calculate total balance for consolidation
+        total_balance = self._calculate_total(base_hierarchy)
+        
+        # Adjust depth for children
+        adjusted_max_depth = max_depth - 1 if max_depth > 0 else -1
+        
+        # Wrap each root account node and apply depth limit
+        parent_nodes = []
+        for root_node in base_hierarchy:
+            if adjusted_max_depth >= 0:
+                limited_node = self._limit_node_depth(root_node, adjusted_max_depth, current_depth=0)
+                if limited_node:
+                    parent_nodes.append(limited_node)
+            else:
+                parent_nodes.append(root_node)
+        
+        # Create consolidation node at level 0
+        consolidation = {
+            'id': None,
+            'account_code': '',
+            'name': section_name or 'Total',
+            'path': section_name or 'Total',
+            'balance': float(total_balance),
+            'depth': 0,
+            'is_leaf': False,
+            'children': parent_nodes if parent_nodes else None,
+        }
+        
+        return [consolidation]
 
