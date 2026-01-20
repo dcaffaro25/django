@@ -11,6 +11,7 @@ from django.db.models import Q
 from django.utils import timezone
 from datetime import date, timedelta
 from decimal import Decimal
+import logging
 
 from multitenancy.mixins import ScopedQuerysetMixin
 from multitenancy.utils import resolve_tenant
@@ -35,7 +36,10 @@ from .serializers_financial_statements import (
 from .services.financial_statement_service import FinancialStatementGenerator
 from .services.template_suggestion_service import TemplateSuggestionService
 from .services.balance_recalculation_service import BalanceRecalculationService
+from .services.income_statement_service import IncomeStatementService
 from .models import Currency, Account
+
+log = logging.getLogger(__name__)
 
 
 class FinancialStatementTemplateViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
@@ -1826,6 +1830,105 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         
         serializer = self.get_serializer(statement)
         return Response(serializer.data)
+    
+    @action(detail=False, methods=['post'])
+    def detailed_income_statement(self, request, tenant_id=None):
+        """
+        Generate detailed hierarchical income statement from parent accounts.
+        
+        POST /api/financial-statements/detailed_income_statement/
+        {
+            "revenue_parent_ids": [1, 2],
+            "cost_parent_ids": [3, 4],
+            "expense_parent_ids": [5, 6],
+            "start_date": "2025-01-01",
+            "end_date": "2025-12-31",
+            "currency_id": 1,  // optional
+            "balance_type": "posted",  // optional: "posted", "bank_reconciled", or "all"
+            "include_zero_balances": false  // optional: include accounts with zero balance
+        }
+        """
+        # Get company from tenant (set by middleware)
+        company = getattr(request, 'tenant', None)
+        if not company or company == 'all':
+            return Response(
+                {'error': 'Company/tenant not found in request'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        company_id = company.id if hasattr(company, 'id') else company
+        
+        # Validate required fields
+        revenue_parent_ids = request.data.get('revenue_parent_ids', [])
+        cost_parent_ids = request.data.get('cost_parent_ids', [])
+        expense_parent_ids = request.data.get('expense_parent_ids', [])
+        start_date_str = request.data.get('start_date')
+        end_date_str = request.data.get('end_date')
+        
+        if not revenue_parent_ids and not cost_parent_ids and not expense_parent_ids:
+            return Response(
+                {'error': 'At least one parent account ID list is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not start_date_str or not end_date_str:
+            return Response(
+                {'error': 'start_date and end_date are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            start_date = date.fromisoformat(start_date_str)
+            end_date = date.fromisoformat(end_date_str)
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if start_date > end_date:
+            return Response(
+                {'error': 'start_date must be before or equal to end_date'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get optional parameters
+        currency_id = request.data.get('currency_id')
+        balance_type = request.data.get('balance_type', 'posted')
+        include_zero_balances = request.data.get('include_zero_balances', False)
+        
+        if balance_type not in ['posted', 'bank_reconciled', 'all']:
+            return Response(
+                {'error': 'balance_type must be one of: posted, bank_reconciled, all'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            # Generate income statement
+            service = IncomeStatementService(company_id=company_id)
+            income_statement = service.generate_income_statement(
+                revenue_parent_ids=revenue_parent_ids,
+                cost_parent_ids=cost_parent_ids,
+                expense_parent_ids=expense_parent_ids,
+                start_date=start_date,
+                end_date=end_date,
+                currency_id=currency_id,
+                balance_type=balance_type,
+                include_zero_balances=include_zero_balances,
+            )
+            
+            return Response(income_statement, status=status.HTTP_200_OK)
+            
+        except ValueError as e:
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            log.exception("Error generating detailed income statement")
+            return Response(
+                {'error': f'Error generating income statement: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
     
     @action(detail=False, methods=['post'])
     def preview(self, request, tenant_id=None):
