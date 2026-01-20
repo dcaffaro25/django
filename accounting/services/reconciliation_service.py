@@ -460,12 +460,18 @@ def _compute_worst_match_metrics(
     
     # Compute average date delta for ratio calculation
     avg_date_delta = sum(date_deltas) / len(date_deltas) if date_deltas else max_date_delta
-    max_date_delta_ratio = max_date_delta / avg_date_delta if avg_date_delta > 0 else 1.0
+    # Avoid division by very small numbers that artificially inflate the ratio
+    # If avg is < 0.5 days, treat it as all entries being on the same date
+    if avg_date_delta < 0.5:
+        max_date_delta_ratio = 1.0 if max_date_delta < 1.0 else float(max_date_delta)
+    else:
+        max_date_delta_ratio = max_date_delta / avg_date_delta
     
     return {
         "max_date_delta": float(max_date_delta),
         "min_embedding_sim": float(min_embedding_sim),
         "max_date_delta_ratio": float(max_date_delta_ratio),
+        "avg_date_delta": float(avg_date_delta),
     }
 
 
@@ -509,10 +515,16 @@ def _check_intra_group_coherence(
                 return (False, f"book_span_days={book_span} > group_span_days={stage.group_span_days}")
     
     # Check 2: Extreme date outliers only
-    # In strict mode: 5x threshold, in lenient mode: 20x threshold (almost never rejects)
-    ratio_threshold = 5.0 if strict else 20.0
-    if worst_metrics["max_date_delta_ratio"] > ratio_threshold:
-        return (False, f"max_date_delta_ratio={worst_metrics['max_date_delta_ratio']:.2f} > {ratio_threshold} (extreme outlier)")
+    # Skip ratio check if average delta is very small (< 0.5 days), as ratio becomes meaningless
+    # when most entries are on the same date. The absolute date distance check (Check 3) will catch real outliers.
+    avg_date_delta_implied = worst_metrics.get("avg_date_delta")
+    # If avg_date_delta is not available (backward compat) or >= 0.5, do ratio check
+    # If avg_date_delta < 0.5, skip ratio check (entries are too clustered to meaningfully use ratio)
+    if avg_date_delta_implied is None or avg_date_delta_implied >= 0.5:
+        # In strict mode: 5x threshold, in lenient mode: 20x threshold (almost never rejects)
+        ratio_threshold = 5.0 if strict else 20.0
+        if worst_metrics["max_date_delta_ratio"] > ratio_threshold:
+            return (False, f"max_date_delta_ratio={worst_metrics['max_date_delta_ratio']:.2f} > {ratio_threshold} (extreme outlier)")
     
     # NOTE: We intentionally do NOT reject based on embedding similarity here.
     # Many valid matches have low embedding similarity due to generic bank descriptions.
