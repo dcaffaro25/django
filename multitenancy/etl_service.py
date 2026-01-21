@@ -39,6 +39,85 @@ from .tasks import execute_import_job, MODEL_APP_MAP
 logger = logging.getLogger(__name__)
 
 
+def _parse_notes_metadata_newline(notes: str) -> dict:
+    """
+    Parse notes metadata that uses newline-separated format from build_notes_metadata.
+    Format: "Key: value\nKey2: value2"
+    """
+    meta = {}
+    if not notes:
+        return meta
+    for line in notes.split("\n"):
+        if ":" in line:
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                k = parts[0].strip().lower()
+                v = parts[1].strip()
+                # Normalize key names (e.g., "file" -> "filename", "row number" -> "row_number")
+                if k == "file":
+                    meta["filename"] = v
+                elif k == "row number":
+                    meta["row_number"] = v
+                elif k == "sheet name":
+                    meta["sheet_name"] = v
+                elif k == "log id":
+                    meta["log_id"] = v
+                else:
+                    meta[k] = v
+    return meta
+
+
+def _find_existing_transaction_by_metadata(
+    company_id: int,
+    filename: str,
+    row_number: str,
+    log_id: Optional[str] = None,
+    sheet_name: Optional[str] = None
+) -> Optional[Any]:
+    """
+    Find an existing Transaction by matching notes metadata.
+    
+    Args:
+        company_id: Company ID to filter by
+        filename: Filename from import metadata
+        row_number: Excel row number
+        log_id: Optional log ID for disambiguation
+        sheet_name: Optional sheet name for disambiguation
+        
+    Returns:
+        Transaction instance if found, None otherwise
+    """
+    from accounting.models import Transaction
+    
+    if not filename or not row_number:
+        return None
+    
+    # Search for transactions with this filename in notes
+    candidates = Transaction.objects.filter(
+        company_id=company_id,
+        notes__icontains=filename
+    )
+    
+    matching_tx = None
+    for tx in candidates:
+        meta = _parse_notes_metadata_newline(tx.notes or "")
+        fname = meta.get("filename") or meta.get("file", "").strip()
+        if fname != filename:
+            continue
+        if log_id and meta.get("log_id") != str(log_id):
+            continue
+        if sheet_name and meta.get("sheet_name") != sheet_name:
+            continue
+        if str(meta.get("row_number") or meta.get("row", "")) == str(row_number):
+            if matching_tx:
+                # Multiple matches - ambiguous
+                logger.warning(f"Multiple transactions found for filename={filename}, row={row_number}")
+                return None
+            matching_tx = tx
+    
+    return matching_tx
+
+
 class ETLPipelineError(Exception):
     """Base exception for ETL pipeline errors."""
     def __init__(self, message: str, stage: str, details: dict = None):
@@ -1935,7 +2014,27 @@ class ETLPipelineService:
                     if filter_time > 0.1:
                         logger.debug(f"ETL DEBUG: Row {row_idx + 1} filtering/processing took {filter_time:.3f}s")
                     
-                    # Create Transaction
+                    # Check for existing transaction by filename and row_number before creating
+                    existing_tx = None
+                    if import_metadata and hasattr(instance, 'notes'):
+                        extra_fields = extra_fields_list[row_idx] if row_idx < len(extra_fields_list) else {}
+                        excel_row_number = extra_fields.get('__excel_row_number')
+                        filename = import_metadata.get('filename')
+                        log_id = import_metadata.get('log_id')
+                        excel_sheet_name = extra_fields.get('__excel_sheet_name') or sheet.get('sheet_name')
+                        
+                        if filename and excel_row_number:
+                            existing_tx = _find_existing_transaction_by_metadata(
+                                company_id=self.company_id,
+                                filename=filename,
+                                row_number=str(excel_row_number),
+                                log_id=log_id,
+                                sheet_name=excel_sheet_name
+                            )
+                            if existing_tx:
+                                logger.info(f"ETL: Found existing Transaction {existing_tx.id} for filename={filename}, row={excel_row_number}")
+                    
+                    # Create or update Transaction
                     action = "create"
                     if "id" in filtered and filtered["id"]:
                         pk = int(filtered["id"])
@@ -1943,8 +2042,25 @@ class ETLPipelineService:
                         for k, v in filtered.items():
                             setattr(instance, k, v)
                         action = "update"
+                    elif existing_tx:
+                        # Update existing transaction with new data (after transformations/substitutions)
+                        instance = existing_tx
+                        for k, v in filtered.items():
+                            # Don't overwrite id, created_at, created_by
+                            if k not in ('id', 'created_at', 'created_by'):
+                                setattr(instance, k, v)
+                        action = "update"
+                        logger.info(f"ETL: Updating existing Transaction {instance.id} with transformed data")
                     else:
                         instance = model(**filtered)
+                    
+                    # Track if dates changed for later journal entry date updates
+                    date_changed = False
+                    if existing_tx and action == "update":
+                        # Compare transaction date
+                        if instance.date != existing_tx.date:
+                            date_changed = True
+                            logger.info(f"ETL: Transaction {instance.id} date changed from {existing_tx.date} to {instance.date}")
                     
                     # Add notes metadata if notes field exists and this is a new record
                     logger.info(f"ETL NOTES DEBUG: action={action}, hasattr(instance, 'notes')={hasattr(instance, 'notes')}, import_metadata={import_metadata}")
@@ -2310,9 +2426,34 @@ class ETLPipelineService:
                         logger.info(f"ETL DATE DEBUG: Transaction {instance.id} -   Bank JE will use: {final_bank_date} {'(CUSTOM: je_bank_date)' if je_bank_date else '(DEFAULT: transaction.date)'}")
                         logger.info(f"ETL DATE DEBUG: Transaction {instance.id} -   Book JE will use: {final_book_date} {'(CUSTOM: je_book_date)' if je_book_date else '(DEFAULT: transaction.date)'}")
                         
-                        # Create bank account JournalEntry
-                        # Always create bank JournalEntry if pending bank account is enabled
-                        if use_pending_bank:
+                        # Check for existing journal entries and update dates if needed
+                        existing_bank_je = None
+                        existing_book_je = None
+                        if existing_tx or action == "update":
+                            existing_jes = list(JournalEntry.objects.filter(
+                                transaction_id=instance.id,
+                                company_id=self.company_id
+                            ))
+                            for je in existing_jes:
+                                if getattr(je, 'bank_designation_pending', False):
+                                    existing_bank_je = je
+                                else:
+                                    existing_book_je = je
+                            
+                            # Update dates if they differ
+                            if existing_bank_je and final_bank_date and existing_bank_je.date != final_bank_date:
+                                logger.info(f"ETL: Updating bank JE {existing_bank_je.id} date from {existing_bank_je.date} to {final_bank_date}")
+                                existing_bank_je.date = final_bank_date
+                                existing_bank_je.save(update_fields=['date'])
+                            
+                            if existing_book_je and final_book_date and existing_book_je.date != final_book_date:
+                                logger.info(f"ETL: Updating book JE {existing_book_je.id} date from {existing_book_je.date} to {final_book_date}")
+                                existing_book_je.date = final_book_date
+                                existing_book_je.save(update_fields=['date'])
+                        
+                        # Create bank account JournalEntry (only if it doesn't exist)
+                        # Always create bank JournalEntry if pending bank account is enabled and it doesn't exist
+                        if use_pending_bank and not existing_bank_je:
                             try:
                                 bank_je_create_start = time.time()
                                 # Get pending GL account from cache (already ensured by ensure_pending_bank_structs)
@@ -2386,12 +2527,12 @@ class ETLPipelineService:
                                 )
                         
                         # Create opposing account JournalEntry
-                        # Always try to create if account_path was provided
+                        # Always try to create if account_path was provided and it doesn't exist
                         if self.debug_account_substitution:
                             logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - Checking if opposing JE should be created")
-                            logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - account_path_value present: {bool(account_path_value)}, opposing_account found: {bool(opposing_account)}")
+                            logger.info(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - account_path_value present: {bool(account_path_value)}, opposing_account found: {bool(opposing_account)}, existing_book_je: {existing_book_je is not None}")
                         
-                        if account_path_value:
+                        if account_path_value and not existing_book_je:
                             if not opposing_account:
                                 # Account lookup failed, but we still want to show the error in output
                                 if self.debug_account_substitution:
