@@ -100,8 +100,10 @@ class TransactionFilter(filters.FilterSet):
             account__bank_account__isnull=False,
         )
         # A JE has at least one OK reconciliation
+        # Note: Reconciliation uses journal_entries (ManyToMany, plural)
+        # When used inside relevant_jes.annotate(), OuterRef('pk') refers to the JournalEntry's pk
         ok_recon = Reconciliation.objects.filter(
-            journal_entry__id=OuterRef('id'),
+            journal_entries=OuterRef('pk'),
             status__in=['matched', 'approved'],
         )
 
