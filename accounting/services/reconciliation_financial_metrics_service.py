@@ -444,6 +444,10 @@ class ReconciliationFinancialMetricsService:
         """
         Recalculate metrics for unposted (pending) transactions and journal entries matching the filters.
         
+        Also recalculates transaction and journal entry flags:
+        - is_balanced, is_reconciled, state, is_posted (for transactions)
+        - is_cash, is_reconciled (for journal entries)
+        
         Only processes transactions and journal entries with state='pending'.
         Posted transactions and journal entries are excluded from recalculation.
         
@@ -457,6 +461,8 @@ class ReconciliationFinancialMetricsService:
         
         Returns statistics about the recalculation.
         """
+        from accounting.utils import recalculate_transaction_and_journal_entry_status
+        
         if end_date is None:
             end_date = date.today()
         
@@ -502,11 +508,31 @@ class ReconciliationFinancialMetricsService:
             'transactions_processed': 0,
             'journal_entries_processed': 0,
             'metrics_calculated': 0,
+            'flags_updated': 0,
             'errors': [],
         }
         
+        # Get transaction IDs for status recalculation
+        tx_ids = list(tx_query.values_list('id', flat=True))
+        
         # Process journal entries first (since transaction metrics depend on them)
         with transaction.atomic():
+            # First, recalculate transaction and journal entry flags (is_balanced, is_reconciled, etc.)
+            if tx_ids:
+                try:
+                    flag_stats = recalculate_transaction_and_journal_entry_status(
+                        transaction_ids=tx_ids,
+                        company_id=company_id
+                    )
+                    self.stats['flags_updated'] = (
+                        flag_stats.get('transactions_updated', 0) + 
+                        flag_stats.get('journal_entries_updated', 0)
+                    )
+                except Exception as e:
+                    log.error(f"Error recalculating flags: {e}")
+                    self.stats['errors'].append(f"Flag recalculation: {str(e)}")
+            
+            # Then calculate reconciliation financial metrics
             for je in je_query:
                 try:
                     je_metrics = self.calculate_journal_entry_metrics(je)
