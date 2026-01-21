@@ -548,7 +548,12 @@ class ETLPipelineService:
                             logger.info(f"ETL DATE DEBUG: Row {row_number} - Processing {target_field} from column '{source_col}': raw_value={value} (type: {type(value).__name__})")
                             parsed_date = self._parse_date_value(value)
                             if parsed_date:
-                                value = parsed_date
+                                # Create a fresh date object to avoid shared references when two columns
+                                # come from the same pandas Timestamp/value.
+                                if isinstance(parsed_date, date):
+                                    value = date(parsed_date.year, parsed_date.month, parsed_date.day)
+                                else:
+                                    value = parsed_date
                                 logger.info(f"ETL DATE DEBUG: Row {row_number} - ✓ Successfully parsed {target_field}={parsed_date}")
                             else:
                                 logger.warning(f"ETL DATE DEBUG: Row {row_number} - ✗ Failed to parse {target_field}='{value}', will be passed as-is")
@@ -2227,6 +2232,8 @@ class ETLPipelineService:
                             logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - Parsing je_bank_date from '{je_bank_date_raw}'...")
                             je_bank_date = self._parse_date_value(je_bank_date_raw)
                             if je_bank_date:
+                                if isinstance(je_bank_date, date):
+                                    je_bank_date = date(je_bank_date.year, je_bank_date.month, je_bank_date.day)
                                 # Ensure it's a Python date object, not a Timestamp or datetime
                                 # Check that it's a date but not a datetime (Timestamp is a subclass of datetime)
                                 if not isinstance(je_bank_date, date) or isinstance(je_bank_date, datetime):
@@ -2235,6 +2242,8 @@ class ETLPipelineService:
                                     # Ensure conversion succeeded
                                     if je_bank_date and isinstance(je_bank_date, datetime):
                                         je_bank_date = je_bank_date.date() if hasattr(je_bank_date, 'date') else None
+                                    if je_bank_date and isinstance(je_bank_date, date):
+                                        je_bank_date = date(je_bank_date.year, je_bank_date.month, je_bank_date.day)
                                 logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - ✓ Successfully parsed je_bank_date={je_bank_date} (type: {type(je_bank_date).__name__})")
                                 logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - je_bank_date vs transaction.date: {je_bank_date} vs {instance.date}")
                                 if je_bank_date < instance.date:
@@ -2262,6 +2271,8 @@ class ETLPipelineService:
                             logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - Parsing je_book_date from '{je_book_date_raw}'...")
                             je_book_date = self._parse_date_value(je_book_date_raw)
                             if je_book_date:
+                                if isinstance(je_book_date, date):
+                                    je_book_date = date(je_book_date.year, je_book_date.month, je_book_date.day)
                                 # Ensure it's a Python date object, not a Timestamp or datetime
                                 # Check that it's a date but not a datetime (Timestamp is a subclass of datetime)
                                 if not isinstance(je_book_date, date) or isinstance(je_book_date, datetime):
@@ -2270,6 +2281,8 @@ class ETLPipelineService:
                                     # Ensure conversion succeeded
                                     if je_book_date and isinstance(je_book_date, datetime):
                                         je_book_date = je_book_date.date() if hasattr(je_book_date, 'date') else None
+                                    if je_book_date and isinstance(je_book_date, date):
+                                        je_book_date = date(je_book_date.year, je_book_date.month, je_book_date.day)
                                 logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - ✓ Successfully parsed je_book_date={je_book_date} (type: {type(je_book_date).__name__})")
                                 logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - je_book_date vs transaction.date: {je_book_date} vs {instance.date}")
                                 if je_book_date < instance.date:
@@ -3103,6 +3116,8 @@ class ETLPipelineService:
                     logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - Parsing je_bank_date from '{je_bank_date_raw}'...")
                     je_bank_date = self._parse_date_value(je_bank_date_raw)
                     if je_bank_date:
+                        if isinstance(je_bank_date, date):
+                            je_bank_date = date(je_bank_date.year, je_bank_date.month, je_bank_date.day)
                         logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - ✓ Successfully parsed je_bank_date={je_bank_date} (type: {type(je_bank_date).__name__})")
                         logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - je_bank_date vs transaction.date: {je_bank_date} vs {transaction.date}")
                         if je_bank_date < transaction.date:
@@ -3121,6 +3136,8 @@ class ETLPipelineService:
                     logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - Parsing je_book_date from '{je_book_date_raw}'...")
                     je_book_date = self._parse_date_value(je_book_date_raw)
                     if je_book_date:
+                        if isinstance(je_book_date, date):
+                            je_book_date = date(je_book_date.year, je_book_date.month, je_book_date.day)
                         logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - ✓ Successfully parsed je_book_date={je_book_date} (type: {type(je_book_date).__name__})")
                         logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - je_book_date vs transaction.date: {je_book_date} vs {transaction.date}")
                         if je_book_date < transaction.date:

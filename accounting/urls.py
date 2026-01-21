@@ -33,6 +33,7 @@ from .views_reconciliation_metrics import (
     ReconciliationMetricsTransactionView,
     ReconciliationMetricsJournalEntryView,
 )
+from .views import FixImportedJournalEntryDates
 from .views_template_preview import template_preview_page, generate_preview
 from .views import (
     EmbeddingBackfillView,
@@ -103,4 +104,7 @@ urlpatterns = [
     re_path(r'^api/reconciliation-metrics/recalculate/?$', ReconciliationMetricsRecalculateView.as_view(), name='reconciliation-metrics-recalculate'),
     re_path(r'^api/reconciliation-metrics/transaction/(?P<transaction_id>\d+)/?$', ReconciliationMetricsTransactionView.as_view(), name='reconciliation-metrics-transaction'),
     re_path(r'^api/reconciliation-metrics/journal-entry/(?P<journal_entry_id>\d+)/?$', ReconciliationMetricsJournalEntryView.as_view(), name='reconciliation-metrics-journal-entry'),
+
+    # Fix imported JE dates using notes metadata
+    path("api/journal-entries/fix-imported-dates/", FixImportedJournalEntryDates.as_view(), name="journal-entries-fix-imported-dates"),
 ]

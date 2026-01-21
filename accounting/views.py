@@ -53,6 +53,7 @@ from django.db.models import Prefetch
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
 
 from accounting.models import Reconciliation, BankTransaction, JournalEntry
 
@@ -68,6 +69,7 @@ import os
 import time
 import requests
 from typing import List, Dict, Any, Optional
+from datetime import date as date_cls
 
 from rest_framework.views import APIView
 from rest_framework.permissions import AllowAny
@@ -118,6 +120,7 @@ from .serializers import (
     ResolvedReconciliationPipelineSerializer,
 )
 import re
+import re as re_module
 from accounting.utils import _normalize_digits, _normalize_raw_digits
 from rest_framework import permissions
 
@@ -4490,6 +4493,143 @@ class EmbeddingJobsListView(APIView):
             data["active_count"] = active.count()
 
         return Response(data, status=status.HTTP_200_OK)
+
+
+# --------- JE DATE FIX FOR IMPORTED RECORDS ---------
+
+NOTE_KV_RE = re_module.compile(r"(\w+):\s*([^|]+)")
+
+
+def _parse_notes_metadata(notes: str) -> dict:
+    meta = {}
+    if not notes:
+        return meta
+    for part in notes.split("|"):
+        m = NOTE_KV_RE.search(part)
+        if m:
+            k, v = m.group(1).strip().lower(), m.group(2).strip()
+            meta[k] = v
+    return meta
+
+
+class FixImportedJournalEntryDates(APIView):
+    """
+    Adjust dates of auto-created JournalEntries by matching Transactions via notes metadata.
+    Matches on filename + row_number, optionally sheet_name/log_id to disambiguate.
+
+    POST body:
+    {
+      "filename": "import.xlsx",
+      "log_id": "abc123",        # optional
+      "sheet_name": "Sheet1",    # optional
+      "dry_run": true,           # optional, default false
+      "rows": [
+        {"row_number": 12, "je_bank_date": "2025-01-02", "je_book_date": "2025-01-31"},
+        {"row_number": 13, "je_book_date": "2025-02-05"}
+      ]
+    }
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        data = request.data or {}
+        filename = data.get("filename")
+        log_id = data.get("log_id")
+        sheet_name = data.get("sheet_name")
+        dry_run = bool(data.get("dry_run", False))
+        rows = data.get("rows", []) or []
+        company = getattr(request.user, "company", None)
+
+        if not filename or not rows:
+            return Response({"error": "filename and rows are required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        results = []
+        with db_tx.atomic():
+            for row in rows:
+                row_number = row.get("row_number")
+                if not row_number:
+                    results.append({"row_number": row_number, "status": "error", "message": "row_number is required"})
+                    continue
+
+                je_bank_date_raw = row.get("je_bank_date")
+                je_book_date_raw = row.get("je_book_date")
+
+                def _to_date(val):
+                    if not val:
+                        return None
+                    if isinstance(val, date_cls):
+                        return date_cls(val.year, val.month, val.day)
+                    try:
+                        return date_cls.fromisoformat(str(val)[:10])
+                    except Exception:
+                        return None
+
+                bank_dt = _to_date(je_bank_date_raw)
+                book_dt = _to_date(je_book_date_raw)
+
+                # Find candidate transactions by notes metadata
+                tx_qs = Transaction.objects.filter(company=company, notes__icontains=filename)
+                candidates = []
+                for tx in tx_qs:
+                    meta = _parse_notes_metadata(tx.notes or "")
+                    fname = (meta.get("file") or meta.get("filename") or "").strip()
+                    if fname != filename:
+                        continue
+                    if log_id and (meta.get("log_id") or meta.get("logid")) != str(log_id):
+                        continue
+                    if sheet_name and (meta.get("sheet_name") or meta.get("sheet")) != sheet_name:
+                        continue
+                    if str(meta.get("row_number") or meta.get("row")) == str(row_number):
+                        candidates.append(tx)
+
+                if not candidates:
+                    results.append({"row_number": row_number, "status": "not_found"})
+                    continue
+                if len(candidates) > 1:
+                    results.append({"row_number": row_number, "status": "ambiguous", "count": len(candidates)})
+                    continue
+
+                tx = candidates[0]
+                jes = list(JournalEntry.objects.filter(transaction_id=tx.id, company=company))
+                bank_je = next((je for je in jes if getattr(je, "bank_designation_pending", False)), None)
+                book_je = next((je for je in jes if not getattr(je, "bank_designation_pending", False)), None)
+
+                updated = []
+                if bank_je and bank_dt:
+                    bank_je.date = bank_dt
+                    updated.append("bank")
+                if book_je and book_dt:
+                    book_je.date = book_dt
+                    updated.append("book")
+
+                if dry_run:
+                    results.append({
+                        "row_number": row_number,
+                        "status": "dry_run",
+                        "transaction_id": tx.id,
+                        "updated": updated,
+                        "bank_date": bank_dt,
+                        "book_date": book_dt,
+                    })
+                else:
+                    if bank_je and bank_dt:
+                        bank_je.save(update_fields=["date"])
+                    if book_je and book_dt:
+                        book_je.save(update_fields=["date"])
+                    results.append({
+                        "row_number": row_number,
+                        "status": "updated",
+                        "transaction_id": tx.id,
+                        "updated": updated,
+                        "bank_date": bank_dt,
+                        "book_date": book_dt,
+                    })
+
+            if dry_run:
+                db_tx.set_rollback(True)
+
+        return Response({"results": results}, status=status.HTTP_200_OK)
 
 
 class EmbeddingTaskStatusView(APIView):
