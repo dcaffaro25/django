@@ -36,7 +36,8 @@ class ReconciliationMetricsRecalculateView(APIView):
         "company_id": 1,               // Optional
         "entity_id": 2,                // Optional
         "account_id": 10,              // Optional (filters journal entries)
-        "transaction_ids": [100, 101]  // Optional (specific transactions, must be unposted)
+        "transaction_ids": [100, 101], // Optional (specific transactions, must be unposted)
+        "only_uncalculated": false     // Optional (default: false). If true, only process items that haven't been calculated yet
     }
     
     Response:
@@ -83,6 +84,7 @@ class ReconciliationMetricsRecalculateView(APIView):
         entity_id = request.data.get('entity_id')
         account_id = request.data.get('account_id')
         transaction_ids = request.data.get('transaction_ids')  # List of IDs
+        only_uncalculated = request.data.get('only_uncalculated', False)  # Boolean flag
         
         # Validate transaction_ids if provided
         if transaction_ids is not None:
@@ -113,6 +115,12 @@ class ReconciliationMetricsRecalculateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        # Convert only_uncalculated to boolean
+        if isinstance(only_uncalculated, str):
+            only_uncalculated = only_uncalculated.lower() in ('true', '1', 'yes')
+        elif not isinstance(only_uncalculated, bool):
+            only_uncalculated = bool(only_uncalculated)
+        
         # Trigger Celery task for async recalculation
         try:
             task = recalculate_reconciliation_metrics_task.delay(
@@ -122,6 +130,7 @@ class ReconciliationMetricsRecalculateView(APIView):
                 entity_id=entity_id,
                 account_id=account_id,
                 transaction_ids=transaction_ids,
+                only_uncalculated=only_uncalculated,
             )
             
             return Response(
@@ -137,6 +146,7 @@ class ReconciliationMetricsRecalculateView(APIView):
                         "entity_id": entity_id,
                         "account_id": account_id,
                         "transaction_ids": transaction_ids,
+                        "only_uncalculated": only_uncalculated,
                     }
                 },
                 status=status.HTTP_202_ACCEPTED

@@ -686,6 +686,7 @@ def recalculate_reconciliation_metrics_task(
     entity_id: Optional[int] = None,
     account_id: Optional[int] = None,
     transaction_ids: Optional[List[int]] = None,
+    only_uncalculated: bool = False,
 ) -> Dict[str, Any]:
     """
     Celery task to recalculate reconciliation financial metrics for unposted transactions and journal entries.
@@ -706,6 +707,9 @@ def recalculate_reconciliation_metrics_task(
         Optional account filter (for journal entries)
     transaction_ids: Optional[List[int]]
         Optional list of specific transaction IDs (must be unposted)
+    only_uncalculated: bool
+        If True, only process transactions and journal entries that haven't been calculated yet
+        (metrics_last_calculated_at IS NULL). Default: False
         
     Returns:
     --------
@@ -738,6 +742,7 @@ def recalculate_reconciliation_metrics_task(
         entity_id=entity_id,
         account_id=account_id,
         transaction_ids=transaction_ids,
+        only_uncalculated=only_uncalculated,
     )
     
     return result

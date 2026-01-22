@@ -440,6 +440,7 @@ class ReconciliationFinancialMetricsService:
         entity_id: Optional[int] = None,
         account_id: Optional[int] = None,
         transaction_ids: Optional[List[int]] = None,
+        only_uncalculated: bool = False,
     ) -> Dict[str, Any]:
         """
         Recalculate metrics for unposted (pending) transactions and journal entries matching the filters.
@@ -458,6 +459,7 @@ class ReconciliationFinancialMetricsService:
         - entity_id: Optional entity filter
         - account_id: Optional account filter (for journal entries)
         - transaction_ids: Optional list of specific transaction IDs (must be unposted)
+        - only_uncalculated: If True, only process transactions and journal entries that haven't been calculated yet (metrics_last_calculated_at IS NULL)
         
         Returns statistics about the recalculation.
         """
@@ -476,6 +478,10 @@ class ReconciliationFinancialMetricsService:
             'journal_entries__reconciliations__bank_transactions',
         )
         
+        # Filter by metrics_last_calculated_at if only_uncalculated is True
+        if only_uncalculated:
+            tx_query = tx_query.filter(metrics_last_calculated_at__isnull=True)
+        
         if company_id:
             tx_query = tx_query.filter(company_id=company_id)
         if entity_id:
@@ -493,6 +499,10 @@ class ReconciliationFinancialMetricsService:
         ).prefetch_related(
             'reconciliations__bank_transactions',
         )
+        
+        # Filter by metrics_last_calculated_at if only_uncalculated is True
+        if only_uncalculated:
+            je_query = je_query.filter(metrics_last_calculated_at__isnull=True)
         
         if company_id:
             je_query = je_query.filter(company_id=company_id)
@@ -564,6 +574,7 @@ class ReconciliationFinancialMetricsService:
                 'entity_id': entity_id,
                 'account_id': account_id,
                 'transaction_ids': transaction_ids,
+                'only_uncalculated': only_uncalculated,
             },
         }
 
