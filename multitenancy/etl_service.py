@@ -2016,7 +2016,9 @@ class ETLPipelineService:
                     
                     # Check for existing transaction by filename and row_number before creating
                     existing_tx = None
-                    if import_metadata and hasattr(instance, 'notes'):
+                    # Check if model has notes field (check model class, not instance, since instance doesn't exist yet)
+                    has_notes_field = hasattr(model, '_meta') and any(f.name == 'notes' for f in model._meta.get_fields())
+                    if import_metadata and has_notes_field:
                         extra_fields = extra_fields_list[row_idx] if row_idx < len(extra_fields_list) else {}
                         excel_row_number = extra_fields.get('__excel_row_number')
                         filename = import_metadata.get('filename')
