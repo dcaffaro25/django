@@ -70,50 +70,89 @@ def _parse_notes_metadata_newline(notes: str) -> dict:
 def _find_existing_transaction_by_metadata(
     company_id: int,
     filename: str,
-    row_number: str,
+    sheet_name: Optional[str] = None,
+    description: Optional[str] = None,
+    amount: Optional[Any] = None,
+    date: Optional[Any] = None,
     log_id: Optional[str] = None,
-    sheet_name: Optional[str] = None
 ) -> Optional[Any]:
     """
-    Find an existing Transaction by matching notes metadata.
+    Find an existing Transaction by matching notes metadata (filename, sheet_name) 
+    and then matching by description, amount, and date.
     
     Args:
         company_id: Company ID to filter by
         filename: Filename from import metadata
-        row_number: Excel row number
+        sheet_name: Sheet name from import metadata
+        description: Transaction description to match
+        amount: Transaction amount to match
+        date: Transaction date to match
         log_id: Optional log ID for disambiguation
-        sheet_name: Optional sheet name for disambiguation
         
     Returns:
         Transaction instance if found, None otherwise
     """
     from accounting.models import Transaction
+    from decimal import Decimal
     
-    if not filename or not row_number:
+    if not filename:
         return None
     
-    # Search for transactions with this filename in notes
-    candidates = Transaction.objects.filter(
+    # First, filter by filename in notes metadata
+    candidates_qs = Transaction.objects.filter(
         company_id=company_id,
         notes__icontains=filename
     )
     
-    matching_tx = None
-    for tx in candidates:
+    # Filter by sheet_name if provided (parse notes metadata for each candidate)
+    candidates = []
+    for tx in candidates_qs:
         meta = _parse_notes_metadata_newline(tx.notes or "")
         fname = meta.get("filename") or meta.get("file", "").strip()
         if fname != filename:
             continue
-        if log_id and meta.get("log_id") != str(log_id):
-            continue
         if sheet_name and meta.get("sheet_name") != sheet_name:
             continue
-        if str(meta.get("row_number") or meta.get("row", "")) == str(row_number):
-            if matching_tx:
-                # Multiple matches - ambiguous
-                logger.warning(f"Multiple transactions found for filename={filename}, row={row_number}")
-                return None
-            matching_tx = tx
+        candidates.append(tx)
+    
+    if not candidates:
+        return None
+    
+    # Now match by description, amount, and date
+    matching_tx = None
+    for tx in candidates:
+        # Match description (case-insensitive, trimmed)
+        if description:
+            tx_desc = (tx.description or "").strip()
+            new_desc = str(description).strip()
+            if tx_desc.lower() != new_desc.lower():
+                continue
+        
+        # Match amount (with tolerance for decimal precision)
+        if amount is not None:
+            tx_amount = Decimal(str(tx.amount)) if tx.amount else None
+            new_amount = Decimal(str(amount)) if amount else None
+            if tx_amount is None or new_amount is None:
+                continue
+            if abs(tx_amount - new_amount) > Decimal('0.01'):  # Allow 1 cent tolerance
+                continue
+        
+        # Match date (exact match)
+        if date:
+            tx_date = tx.date
+            match_date = date
+            if isinstance(match_date, str):
+                from django.utils.dateparse import parse_date
+                match_date = parse_date(match_date)
+            if not match_date or tx_date != match_date:
+                continue
+        
+        # If we get here, we have a match
+        if matching_tx:
+            # Multiple matches - ambiguous
+            logger.warning(f"Multiple transactions found for filename={filename}, sheet_name={sheet_name}, description={description}, amount={amount}, date={date}")
+            return None
+        matching_tx = tx
     
     return matching_tx
 
@@ -2014,27 +2053,33 @@ class ETLPipelineService:
                     if filter_time > 0.1:
                         logger.debug(f"ETL DEBUG: Row {row_idx + 1} filtering/processing took {filter_time:.3f}s")
                     
-                    # Check for existing transaction by filename and row_number before creating
+                    # Check for existing transaction by filename, sheet_name, description, amount, and date
                     existing_tx = None
                     # Check if model has notes field (check model class, not instance, since instance doesn't exist yet)
                     has_notes_field = hasattr(model, '_meta') and any(f.name == 'notes' for f in model._meta.get_fields())
                     if import_metadata and has_notes_field:
                         extra_fields = extra_fields_list[row_idx] if row_idx < len(extra_fields_list) else {}
-                        excel_row_number = extra_fields.get('__excel_row_number')
                         filename = import_metadata.get('filename')
                         log_id = import_metadata.get('log_id')
                         excel_sheet_name = extra_fields.get('__excel_sheet_name') or sheet.get('sheet_name')
                         
-                        if filename and excel_row_number:
+                        # Get description, amount, and date from filtered data for matching
+                        description = filtered.get('description')
+                        amount = filtered.get('amount')
+                        date = filtered.get('date')
+                        
+                        if filename:
                             existing_tx = _find_existing_transaction_by_metadata(
                                 company_id=self.company_id,
                                 filename=filename,
-                                row_number=str(excel_row_number),
+                                sheet_name=excel_sheet_name,
+                                description=description,
+                                amount=amount,
+                                date=date,
                                 log_id=log_id,
-                                sheet_name=excel_sheet_name
                             )
                             if existing_tx:
-                                logger.info(f"ETL: Found existing Transaction {existing_tx.id} for filename={filename}, row={excel_row_number}")
+                                logger.info(f"ETL: Found existing Transaction {existing_tx.id} for filename={filename}, sheet_name={excel_sheet_name}, description={description}, amount={amount}, date={date}")
                     
                     # Create or update Transaction
                     action = "create"
@@ -2045,14 +2090,11 @@ class ETLPipelineService:
                             setattr(instance, k, v)
                         action = "update"
                     elif existing_tx:
-                        # Update existing transaction with new data (after transformations/substitutions)
+                        # Use existing transaction without updating it (transactions are assumed correct)
+                        # We focus on getting Journal Entries correct
                         instance = existing_tx
-                        for k, v in filtered.items():
-                            # Don't overwrite id, created_at, created_by
-                            if k not in ('id', 'created_at', 'created_by'):
-                                setattr(instance, k, v)
                         action = "update"
-                        logger.info(f"ETL: Updating existing Transaction {instance.id} with transformed data")
+                        logger.info(f"ETL: Using existing Transaction {instance.id} without modification (focusing on Journal Entries)")
                     else:
                         instance = model(**filtered)
                     
@@ -2428,7 +2470,7 @@ class ETLPipelineService:
                         logger.info(f"ETL DATE DEBUG: Transaction {instance.id} -   Bank JE will use: {final_bank_date} {'(CUSTOM: je_bank_date)' if je_bank_date else '(DEFAULT: transaction.date)'}")
                         logger.info(f"ETL DATE DEBUG: Transaction {instance.id} -   Book JE will use: {final_book_date} {'(CUSTOM: je_book_date)' if je_book_date else '(DEFAULT: transaction.date)'}")
                         
-                        # Check for existing journal entries and update dates if needed
+                        # Check for existing journal entries and update them to match new data
                         existing_bank_je = None
                         existing_book_je = None
                         if existing_tx or action == "update":
@@ -2442,16 +2484,68 @@ class ETLPipelineService:
                                 else:
                                     existing_book_je = je
                             
-                            # Update dates if they differ
-                            if existing_bank_je and final_bank_date and existing_bank_je.date != final_bank_date:
-                                logger.info(f"ETL: Updating bank JE {existing_bank_je.id} date from {existing_bank_je.date} to {final_bank_date}")
-                                existing_bank_je.date = final_bank_date
-                                existing_bank_je.save(update_fields=['date'])
+                            # Update bank JE with new data if it exists and is not posted (can update pending or reconciled)
+                            if existing_bank_je and use_pending_bank:
+                                if existing_bank_je.state != 'posted':  # Can update if pending or reconciled, but not posted
+                                    pending_ba, pending_gl = pending_bank_cache[instance.currency_id]
+                                    update_fields = []
+                                    
+                                    if existing_bank_je.date != final_bank_date:
+                                        existing_bank_je.date = final_bank_date
+                                        update_fields.append('date')
+                                    
+                                    if existing_bank_je.debit_amount != bank_debit:
+                                        existing_bank_je.debit_amount = bank_debit
+                                        update_fields.append('debit_amount')
+                                    
+                                    if existing_bank_je.credit_amount != bank_credit:
+                                        existing_bank_je.credit_amount = bank_credit
+                                        update_fields.append('credit_amount')
+                                    
+                                    if existing_bank_je.account_id != pending_gl.id:
+                                        existing_bank_je.account_id = pending_gl.id
+                                        update_fields.append('account')
+                                    
+                                    if cost_center_id and existing_bank_je.cost_center_id != cost_center_id:
+                                        existing_bank_je.cost_center_id = cost_center_id
+                                        update_fields.append('cost_center')
+                                    
+                                    if update_fields:
+                                        logger.info(f"ETL: Updating bank JE {existing_bank_je.id} with new data: {update_fields} (state: {existing_bank_je.state}, reconciled: {existing_bank_je.is_reconciled})")
+                                        existing_bank_je.save(update_fields=update_fields)
+                                else:
+                                    logger.info(f"ETL: Skipping update of bank JE {existing_bank_je.id} - state is {existing_bank_je.state} (posted, cannot update)")
                             
-                            if existing_book_je and final_book_date and existing_book_je.date != final_book_date:
-                                logger.info(f"ETL: Updating book JE {existing_book_je.id} date from {existing_book_je.date} to {final_book_date}")
-                                existing_book_je.date = final_book_date
-                                existing_book_je.save(update_fields=['date'])
+                            # Update book JE with new data if it exists and is not posted (can update pending or reconciled)
+                            if existing_book_je and account_path_value and opposing_account:
+                                if existing_book_je.state != 'posted':  # Can update if pending or reconciled, but not posted
+                                    update_fields = []
+                                    
+                                    if existing_book_je.date != final_book_date:
+                                        existing_book_je.date = final_book_date
+                                        update_fields.append('date')
+                                    
+                                    if existing_book_je.debit_amount != opp_debit:
+                                        existing_book_je.debit_amount = opp_debit
+                                        update_fields.append('debit_amount')
+                                    
+                                    if existing_book_je.credit_amount != opp_credit:
+                                        existing_book_je.credit_amount = opp_credit
+                                        update_fields.append('credit_amount')
+                                    
+                                    if existing_book_je.account_id != opposing_account.id:
+                                        existing_book_je.account_id = opposing_account.id
+                                        update_fields.append('account')
+                                    
+                                    if cost_center_id and existing_book_je.cost_center_id != cost_center_id:
+                                        existing_book_je.cost_center_id = cost_center_id
+                                        update_fields.append('cost_center')
+                                    
+                                    if update_fields:
+                                        logger.info(f"ETL: Updating book JE {existing_book_je.id} with new data: {update_fields} (state: {existing_book_je.state}, reconciled: {existing_book_je.is_reconciled})")
+                                        existing_book_je.save(update_fields=update_fields)
+                                else:
+                                    logger.info(f"ETL: Skipping update of book JE {existing_book_je.id} - state is {existing_book_je.state} (posted, cannot update)")
                         
                         # Create bank account JournalEntry (only if it doesn't exist)
                         # Always create bank JournalEntry if pending bank account is enabled and it doesn't exist
