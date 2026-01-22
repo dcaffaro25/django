@@ -232,7 +232,13 @@ class ETLPipelineService:
         self.extra_fields_by_model: Dict[str, List[dict]] = {}  # Store for v2 response building
         
     def execute(self) -> dict:
-        """Main entry point - runs the full pipeline."""
+        """
+        Main entry point - runs the full pipeline.
+        
+        IMPORTANT: When commit=True, the entire pipeline is atomic. If any errors
+        (including substitution errors) are found after substitution or validation,
+        the transaction will be rolled back and no data will be committed.
+        """
         start_time = time.monotonic()
         
         try:
@@ -255,6 +261,12 @@ class ETLPipelineService:
             self._update_log_status('substituting')
             self._apply_substitutions()
             
+            # Check for errors after substitution - if any exist, fail immediately
+            if self.errors:
+                logger.error(f"ETL: Found {len(self.errors)} errors after substitution phase. Aborting import.")
+                self._update_log_status('failed')
+                return self._build_response(start_time, success=False)
+            
             # 4. Post-process (e.g., JournalEntry debit/credit calculation)
             self._post_process_data()
             
@@ -262,10 +274,25 @@ class ETLPipelineService:
             self._update_log_status('validating')
             self._validate_data()
             
+            # Check for errors after validation - if any exist, fail immediately
+            if self.errors:
+                logger.error(f"ETL: Found {len(self.errors)} errors after validation phase. Aborting import.")
+                self._update_log_status('failed')
+                return self._build_response(start_time, success=False)
+            
             # 6. Import or Preview
             if self.commit and self.transformed_data:
-                self._update_log_status('importing')
-                result = self._import_data()
+                # Wrap entire import in atomic transaction
+                # If any errors occur during import, everything will be rolled back
+                with transaction.atomic():
+                    self._update_log_status('importing')
+                    result = self._import_data()
+                    
+                    # Check for errors after import - if any exist, rollback will occur
+                    if self.errors:
+                        logger.error(f"ETL: Found {len(self.errors)} errors during import phase. Rolling back transaction.")
+                        # Raise exception to trigger rollback
+                        raise Exception(f"ETL import failed with {len(self.errors)} errors. Transaction rolled back.")
             else:
                 result = self._preview_data()
             
@@ -279,11 +306,14 @@ class ETLPipelineService:
             return self._build_response(start_time, success=(status != 'failed'), import_result=result)
             
         except Exception as e:
+            import traceback
             logger.exception("ETL Pipeline failed")
             self._add_error(
                 error_type='exception',
                 message=str(e),
-                stage='pipeline'
+                stage='pipeline',
+                traceback=traceback.format_exc(),
+                exception_type=type(e).__name__
             )
             self._update_log_status('failed')
             return self._build_response(start_time, success=False)
@@ -846,13 +876,18 @@ class ETLPipelineService:
                                     logger.info(f"ETL SUBSTITUTION: FK substitution applied - Row {row_idx + 1} - {field_name}: '{original_value}' -> '{new_value}' (rule: {rule.title or rule.id}, target: {related_model_name}.id)")
                                     break  # First matching rule wins
                             except Exception as e:
+                                import traceback
+                                error_traceback = traceback.format_exc()
                                 logger.error(f"ETL SUBSTITUTION: Error applying FK substitution rule '{rule}' to {field_name}: {str(e)}", exc_info=True)
-                                self._add_warning(
-                                    warning_type='substitution_error',
+                                self._add_error(
+                                    error_type='substitution_error',
                                     message=f"Error applying FK substitution rule '{rule}' to {field_name}: {str(e)}",
+                                    stage='substitution',
                                     model=model_name,
                                     field=field_name,
-                                    value=str(original_value)[:100]
+                                    value=str(original_value)[:100],
+                                    traceback=error_traceback,
+                                    exception_type=type(e).__name__
                                 )
             
             # Phase 2: Apply normal model-level substitutions
@@ -888,12 +923,17 @@ class ETLPipelineService:
                             row[field_name] = new_value
                             logger.debug(f"ETL: Substitution applied - {field_name}: '{original_value}' -> '{new_value}' (rule: {rule.title or rule.id})")
                     except Exception as e:
-                        self._add_warning(
-                            warning_type='substitution_error',
+                        import traceback
+                        error_traceback = traceback.format_exc()
+                        self._add_error(
+                            error_type='substitution_error',
                             message=f"Error applying substitution rule '{rule}': {str(e)}",
+                            stage='substitution',
                             model=model_name,
                             field=field_name,
-                            value=str(original_value)[:100]
+                            value=str(original_value)[:100],
+                            traceback=error_traceback,
+                            exception_type=type(e).__name__
                         )
     
     def _apply_substitution_rule(self, rule: SubstitutionRule, value: Any, row: dict = None) -> Any:
@@ -1441,6 +1481,67 @@ class ETLPipelineService:
                 model_name = import_item.get('model')
                 outputs = import_item.get('result', [])
                 normalized_result['results'][model_name] = outputs
+            
+            # Validate that each row created exactly 1 Transaction and 2 Journal Entries
+            # This validation only applies when auto_create_journal_entries is enabled
+            if transaction_import_result and self.auto_create_journal_entries and self.auto_create_journal_entries.get('enabled', False):
+                transaction_outputs = normalized_result.get('results', {}).get('Transaction', [])
+                journal_entry_outputs = normalized_result.get('results', {}).get('JournalEntry', [])
+                
+                # Build a map of transaction_id -> row_id from transaction outputs
+                transaction_id_to_row_id = {}
+                for tx_output in transaction_outputs:
+                    if tx_output.get('status') == 'success' and tx_output.get('action') == 'create':
+                        row_id = tx_output.get('__row_id') or tx_output.get('__excel_row_id')
+                        tx_data = tx_output.get('data', {})
+                        transaction_id = tx_data.get('id')
+                        if transaction_id and row_id:
+                            transaction_id_to_row_id[transaction_id] = row_id
+                
+                # Group by row_id
+                rows_by_id = {}
+                for tx_output in transaction_outputs:
+                    if tx_output.get('status') == 'success' and tx_output.get('action') == 'create':
+                        row_id = tx_output.get('__row_id') or tx_output.get('__excel_row_id')
+                        if row_id:
+                            if row_id not in rows_by_id:
+                                rows_by_id[row_id] = {'transactions': 0, 'journal_entries': 0, 'row_id': row_id}
+                            rows_by_id[row_id]['transactions'] += 1
+                
+                # Count journal entries per row by matching transaction_id
+                for je_output in journal_entry_outputs:
+                    if je_output.get('status') == 'success' and je_output.get('action') == 'create':
+                        je_data = je_output.get('data', {})
+                        transaction_id = je_data.get('transaction_id')
+                        if transaction_id and transaction_id in transaction_id_to_row_id:
+                            row_id = transaction_id_to_row_id[transaction_id]
+                            if row_id in rows_by_id:
+                                rows_by_id[row_id]['journal_entries'] += 1
+                
+                # Validate each row
+                validation_errors = []
+                for row_id, counts in rows_by_id.items():
+                    if counts['transactions'] != 1:
+                        validation_errors.append(
+                            f"Row {row_id}: Expected 1 Transaction, got {counts['transactions']}"
+                        )
+                    if counts['journal_entries'] != 2:
+                        validation_errors.append(
+                            f"Row {row_id}: Expected 2 Journal Entries, got {counts['journal_entries']}"
+                        )
+                
+                # If validation fails, rollback by raising an exception
+                if validation_errors:
+                    error_message = f"ETL validation failed: Expected 1 Transaction and 2 Journal Entries per row, but found mismatches:\n" + "\n".join(validation_errors)
+                    logger.error(error_message)
+                    for error in validation_errors:
+                        self._add_error(
+                            error_type='validation_error',
+                            message=error,
+                            stage='import',
+                            model='Transaction'
+                        )
+                    raise Exception(error_message)
             
             # Update log with import stats (log update happens inside transaction)
             records_created = {}
