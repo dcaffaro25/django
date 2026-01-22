@@ -10,6 +10,7 @@ from .views import (
     # ETL Pipeline views
     ImportTransformationRuleViewSet, ETLPipelineLogViewSet,
     ETLPipelinePreviewView, ETLPipelineExecuteView, ETLPipelineAnalyzeView,
+    ETLPipelineErrorReportView,
 )
 from .views_etl_html import ETLPreviewHTMLView, ETLExecuteHTMLView
 from accounting.views import CurrencyViewSet
@@ -53,6 +54,7 @@ urlpatterns = [
     re_path(r'^api/core/etl/preview/?$', ETLPipelinePreviewView.as_view(), name='etl-preview'),
     re_path(r'^api/core/etl/execute/?$', ETLPipelineExecuteView.as_view(), name='etl-execute'),
     re_path(r'^api/core/etl/analyze/?$', ETLPipelineAnalyzeView.as_view(), name='etl-analyze'),
+    re_path(r'^api/core/etl/logs/(?P<pk>\d+)/error-report/?$', ETLPipelineErrorReportView.as_view(), name='etl-error-report'),
     
     # ETL Pipeline HTML interface
     re_path(r'^etl/preview/?$', ETLPreviewHTMLView.as_view(), name='etl-preview-html'),

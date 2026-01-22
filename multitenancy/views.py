@@ -1102,6 +1102,17 @@ class ETLPipelinePreviewView(APIView):
         )
         
         result = service.execute()
+        
+        # Add organized errors array to response
+        result['errors_organized'] = {
+            'all_errors': service.errors,
+            'python_errors': service.python_errors,
+            'database_errors': service.database_errors,
+            'substitution_errors': service.substitution_errors,
+            'warnings': service.warnings,
+            'error_report_text': service.generate_error_report() if (service.errors or service.warnings) else None
+        }
+        
         result = _scrub_json(result)
         
         http_status = status.HTTP_200_OK if result.get('success') else status.HTTP_400_BAD_REQUEST
@@ -1190,10 +1201,137 @@ class ETLPipelineExecuteView(APIView):
         )
         
         result = service.execute()
+        
+        # Add organized errors array to response
+        result['errors_organized'] = {
+            'all_errors': service.errors,
+            'python_errors': service.python_errors,
+            'database_errors': service.database_errors,
+            'substitution_errors': service.substitution_errors,
+            'warnings': service.warnings,
+            'error_report_text': service.generate_error_report() if (service.errors or service.warnings) else None
+        }
+        
         result = _scrub_json(result)
         
         http_status = status.HTTP_200_OK if result.get('success') else status.HTTP_400_BAD_REQUEST
         return Response(result, status=http_status)
+
+
+class ETLPipelineErrorReportView(APIView):
+    """
+    Download error report for an ETL pipeline log.
+    
+    GET /api/{tenant_id}/etl/logs/{log_id}/error-report/
+    
+    Returns a text file with all errors, warnings, and logs.
+    """
+    
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+    
+    def get(self, request, tenant_id=None, pk=None):
+        from django.http import HttpResponse
+        from .models import ETLPipelineLog
+        
+        log_id = pk or request.query_params.get('log_id')
+        if not log_id:
+            return Response(
+                {'error': 'log_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            log = ETLPipelineLog.objects.get(id=log_id, company_id=tenant_id or request.data.get('company_id'))
+        except ETLPipelineLog.DoesNotExist:
+            return Response(
+                {'error': 'ETL log not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Reconstruct service to generate report
+        # Note: We can't fully reconstruct the service, but we can use the log data
+        from io import StringIO
+        
+        report = StringIO()
+        report.write("=" * 80 + "\n")
+        report.write("ETL PIPELINE ERROR REPORT\n")
+        report.write("=" * 80 + "\n\n")
+        
+        report.write(f"File: {log.file_name or 'Unknown'}\n")
+        report.write(f"Company ID: {log.company_id}\n")
+        report.write(f"Log ID: {log.id}\n")
+        report.write(f"Status: {log.status}\n")
+        report.write(f"Started: {log.created_at}\n")
+        if log.completed_at:
+            report.write(f"Completed: {log.completed_at}\n")
+        if log.duration_seconds:
+            report.write(f"Duration: {log.duration_seconds:.2f} seconds\n")
+        report.write("\n")
+        
+        # Parse errors and warnings from log
+        errors = log.errors if isinstance(log.errors, list) else []
+        warnings = log.warnings if isinstance(log.warnings, list) else []
+        
+        # Summary
+        report.write("=" * 80 + "\n")
+        report.write("SUMMARY\n")
+        report.write("=" * 80 + "\n")
+        report.write(f"Total Errors: {len(errors)}\n")
+        report.write(f"Total Warnings: {len(warnings)}\n")
+        report.write(f"Sheets Found: {len(log.sheets_found or [])}\n")
+        report.write(f"Sheets Processed: {len(log.sheets_processed or [])}\n")
+        report.write(f"Sheets Skipped: {len(log.sheets_skipped or [])}\n")
+        report.write(f"Sheets Failed: {len(log.sheets_failed or [])}\n")
+        report.write("\n")
+        
+        # Errors
+        if errors:
+            report.write("=" * 80 + "\n")
+            report.write("ERRORS\n")
+            report.write("=" * 80 + "\n")
+            for idx, error in enumerate(errors, 1):
+                if isinstance(error, dict):
+                    report.write(f"\n[{idx}] {error.get('type', 'error')}\n")
+                    report.write(f"Stage: {error.get('stage', 'unknown')}\n")
+                    report.write(f"Message: {error.get('message', 'No message')}\n")
+                    for key, value in error.items():
+                        if key not in ('type', 'stage', 'message', 'timestamp'):
+                            report.write(f"{key}: {value}\n")
+                    if error.get('traceback'):
+                        report.write(f"Traceback:\n{error.get('traceback')}\n")
+                    report.write(f"Timestamp: {error.get('timestamp', 'N/A')}\n")
+                else:
+                    report.write(f"\n[{idx}] {str(error)}\n")
+                report.write("-" * 80 + "\n")
+            report.write("\n")
+        
+        # Warnings
+        if warnings:
+            report.write("=" * 80 + "\n")
+            report.write("WARNINGS\n")
+            report.write("=" * 80 + "\n")
+            for idx, warning in enumerate(warnings, 1):
+                if isinstance(warning, dict):
+                    report.write(f"\n[{idx}] {warning.get('type', 'warning')}\n")
+                    report.write(f"Message: {warning.get('message', 'No message')}\n")
+                    for key, value in warning.items():
+                        if key not in ('type', 'message'):
+                            report.write(f"{key}: {value}\n")
+                else:
+                    report.write(f"\n[{idx}] {str(warning)}\n")
+                report.write("-" * 80 + "\n")
+            report.write("\n")
+        
+        report.write("=" * 80 + "\n")
+        report.write("END OF REPORT\n")
+        report.write("=" * 80 + "\n")
+        
+        response = HttpResponse(report.getvalue(), content_type='text/plain')
+        response['Content-Disposition'] = f'attachment; filename="etl_error_report_{log_id}.txt"'
+        return response
 
 
 class ETLPipelineAnalyzeView(APIView):

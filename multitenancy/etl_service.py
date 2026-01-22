@@ -216,6 +216,9 @@ class ETLPipelineService:
         self.log: Optional[ETLPipelineLog] = None
         self.errors: List[dict] = []
         self.warnings: List[dict] = []
+        self.substitution_errors: List[dict] = []  # Track substitution not found errors
+        self.database_errors: List[dict] = []  # Track database errors
+        self.python_errors: List[dict] = []  # Track Python exceptions
         self.file_hash: Optional[str] = None
         self.file_name: str = getattr(file, 'name', 'unknown')
         
@@ -2066,7 +2069,7 @@ class ETLPipelineService:
                         # Get description, amount, and date from filtered data for matching
                         description = filtered.get('description')
                         amount = filtered.get('amount')
-                        date = filtered.get('date')
+                        tx_date = filtered.get('date')
                         
                         if filename:
                             existing_tx = _find_existing_transaction_by_metadata(
@@ -2075,11 +2078,11 @@ class ETLPipelineService:
                                 sheet_name=excel_sheet_name,
                                 description=description,
                                 amount=amount,
-                                date=date,
+                                date=tx_date,
                                 log_id=log_id,
                             )
                             if existing_tx:
-                                logger.info(f"ETL: Found existing Transaction {existing_tx.id} for filename={filename}, sheet_name={excel_sheet_name}, description={description}, amount={amount}, date={date}")
+                                logger.info(f"ETL: Found existing Transaction {existing_tx.id} for filename={filename}, sheet_name={excel_sheet_name}, description={description}, amount={amount}, date={tx_date}")
                     
                     # Create or update Transaction
                     action = "create"
@@ -2336,12 +2339,15 @@ class ETLPipelineService:
                                 if self.debug_account_substitution:
                                     logger.warning(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - FAILED: Account not found for path: '{account_path_value}' (separator: '{detected_separator}', lookup_type: '{opposing_account_lookup}')")
                                 logger.warning(f"ETL: Account not found for path: {account_path_value} (separator: {detected_separator})")
-                                self._add_warning(
-                                    warning_type='account_not_found',
+                                self._add_error(
+                                    error_type='substitution_not_found',
                                     message=f"Account not found for path: {account_path_value}",
+                                    stage='import',
                                     model='Transaction',
                                     record_id=instance.id,
-                                    account_path=account_path_value
+                                    account_path=account_path_value,
+                                    field='account_path',
+                                    value=account_path_value
                                 )
                         else:
                             if self.debug_account_substitution:
@@ -2390,20 +2396,25 @@ class ETLPipelineService:
                         
                         if je_bank_date_raw:
                             logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - Parsing je_bank_date from '{je_bank_date_raw}'...")
-                            je_bank_date = self._parse_date_value(je_bank_date_raw)
-                            if je_bank_date:
-                                if isinstance(je_bank_date, date):
-                                    je_bank_date = date(je_bank_date.year, je_bank_date.month, je_bank_date.day)
+                            try:
+                                je_bank_date = self._parse_date_value(je_bank_date_raw)
+                                if je_bank_date:
+                                    # Import date type to avoid shadowing
+                                    from datetime import date as date_type
+                                    if isinstance(je_bank_date, date_type):
+                                        je_bank_date = date_type(je_bank_date.year, je_bank_date.month, je_bank_date.day)
                                 # Ensure it's a Python date object, not a Timestamp or datetime
                                 # Check that it's a date but not a datetime (Timestamp is a subclass of datetime)
-                                if not isinstance(je_bank_date, date) or isinstance(je_bank_date, datetime):
+                                from datetime import date as date_type
+                                if not isinstance(je_bank_date, date_type) or isinstance(je_bank_date, datetime):
                                     logger.warning(f"ETL DATE DEBUG: Transaction {instance.id} - je_bank_date is not a pure date object (type: {type(je_bank_date).__name__}), converting...")
                                     je_bank_date = self._parse_date_value(je_bank_date)  # Re-parse to ensure it's a date
                                     # Ensure conversion succeeded
+                                    from datetime import date as date_type
                                     if je_bank_date and isinstance(je_bank_date, datetime):
                                         je_bank_date = je_bank_date.date() if hasattr(je_bank_date, 'date') else None
-                                    if je_bank_date and isinstance(je_bank_date, date):
-                                        je_bank_date = date(je_bank_date.year, je_bank_date.month, je_bank_date.day)
+                                    if je_bank_date and isinstance(je_bank_date, date_type):
+                                        je_bank_date = date_type(je_bank_date.year, je_bank_date.month, je_bank_date.day)
                                 logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - ✓ Successfully parsed je_bank_date={je_bank_date} (type: {type(je_bank_date).__name__})")
                                 logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - je_bank_date vs transaction.date: {je_bank_date} vs {instance.date}")
                                 if je_bank_date < instance.date:
@@ -2431,18 +2442,19 @@ class ETLPipelineService:
                             logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - Parsing je_book_date from '{je_book_date_raw}'...")
                             je_book_date = self._parse_date_value(je_book_date_raw)
                             if je_book_date:
-                                if isinstance(je_book_date, date):
-                                    je_book_date = date(je_book_date.year, je_book_date.month, je_book_date.day)
+                                from datetime import date as date_type
+                                if isinstance(je_book_date, date_type):
+                                    je_book_date = date_type(je_book_date.year, je_book_date.month, je_book_date.day)
                                 # Ensure it's a Python date object, not a Timestamp or datetime
                                 # Check that it's a date but not a datetime (Timestamp is a subclass of datetime)
-                                if not isinstance(je_book_date, date) or isinstance(je_book_date, datetime):
+                                if not isinstance(je_book_date, date_type) or isinstance(je_book_date, datetime):
                                     logger.warning(f"ETL DATE DEBUG: Transaction {instance.id} - je_book_date is not a pure date object (type: {type(je_book_date).__name__}), converting...")
                                     je_book_date = self._parse_date_value(je_book_date)  # Re-parse to ensure it's a date
                                     # Ensure conversion succeeded
                                     if je_book_date and isinstance(je_book_date, datetime):
                                         je_book_date = je_book_date.date() if hasattr(je_book_date, 'date') else None
-                                    if je_book_date and isinstance(je_book_date, date):
-                                        je_book_date = date(je_book_date.year, je_book_date.month, je_book_date.day)
+                                    if je_book_date and isinstance(je_book_date, date_type):
+                                        je_book_date = date_type(je_book_date.year, je_book_date.month, je_book_date.day)
                                 logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - ✓ Successfully parsed je_book_date={je_book_date} (type: {type(je_book_date).__name__})")
                                 logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - je_book_date vs transaction.date: {je_book_date} vs {instance.date}")
                                 if je_book_date < instance.date:
@@ -2728,12 +2740,17 @@ class ETLPipelineService:
                             logger.warning(f"ETL OPPOSING JE: Row {row_idx + 1} Transaction {instance.id} - SKIPPED: No account_path_value, opposing JE will not be created")
                                 
                     except Exception as e:
+                        import traceback
+                        error_traceback = traceback.format_exc()
                         logger.error(f"ETL: Error creating JournalEntries for Transaction {instance.id}: {e}", exc_info=True)
-                        self._add_warning(
-                            warning_type='auto_journal_entry_error',
+                        self._add_error(
+                            error_type='python_error',
                             message=f"Error auto-creating JournalEntries for Transaction {instance.id}: {str(e)}",
+                            stage='import',
                             model='Transaction',
-                            record_id=instance.id
+                            record_id=instance.id,
+                            traceback=error_traceback,
+                            exception_type=type(e).__name__
                         )
                     finally:
                         je_prep_time = time.time() - je_prep_start
@@ -3373,8 +3390,9 @@ class ETLPipelineService:
                     logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - Parsing je_book_date from '{je_book_date_raw}'...")
                     je_book_date = self._parse_date_value(je_book_date_raw)
                     if je_book_date:
-                        if isinstance(je_book_date, date):
-                            je_book_date = date(je_book_date.year, je_book_date.month, je_book_date.day)
+                        from datetime import date as date_type
+                        if isinstance(je_book_date, date_type):
+                            je_book_date = date_type(je_book_date.year, je_book_date.month, je_book_date.day)
                         logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - ✓ Successfully parsed je_book_date={je_book_date} (type: {type(je_book_date).__name__})")
                         logger.info(f"ETL DATE DEBUG: Transaction {transaction_id} - je_book_date vs transaction.date: {je_book_date} vs {transaction.date}")
                         if je_book_date < transaction.date:
@@ -4864,9 +4882,19 @@ class ETLPipelineService:
             'type': error_type,
             'message': message,
             'stage': stage,
+            'timestamp': timezone.now().isoformat(),
             **kwargs
         }
         self.errors.append(error)
+        
+        # Categorize errors
+        if error_type in ('substitution_not_found', 'account_not_found', 'fk_substitution_failed'):
+            self.substitution_errors.append(error)
+        elif error_type in ('database_error', 'integrity_error', 'constraint_error'):
+            self.database_errors.append(error)
+        elif error_type in ('exception', 'python_error', 'type_error', 'value_error'):
+            self.python_errors.append(error)
+        
         logger.error(f"ETL Error [{stage}]: {message}")
     
     def _add_warning(self, warning_type: str, message: str, **kwargs):
@@ -5262,5 +5290,155 @@ class ETLPipelineService:
             }
         
         return response
+    
+    def generate_error_report(self) -> str:
+        """
+        Generate a comprehensive error report as a text file.
+        Includes all errors, warnings, substitution errors, database errors, and Python exceptions.
+        """
+        from io import StringIO
+        
+        report = StringIO()
+        report.write("=" * 80 + "\n")
+        report.write("ETL PIPELINE ERROR REPORT\n")
+        report.write("=" * 80 + "\n\n")
+        
+        # File information
+        report.write(f"File: {self.file_name}\n")
+        report.write(f"Company ID: {self.company_id}\n")
+        if self.log:
+            report.write(f"Log ID: {self.log.id}\n")
+            report.write(f"Status: {self.log.status}\n")
+            report.write(f"Started: {self.log.created_at}\n")
+            if self.log.completed_at:
+                report.write(f"Completed: {self.log.completed_at}\n")
+                if self.log.duration_seconds:
+                    report.write(f"Duration: {self.log.duration_seconds:.2f} seconds\n")
+        report.write("\n")
+        
+        # Summary
+        report.write("=" * 80 + "\n")
+        report.write("SUMMARY\n")
+        report.write("=" * 80 + "\n")
+        report.write(f"Total Errors: {len(self.errors)}\n")
+        report.write(f"  - Python/Exception Errors: {len(self.python_errors)}\n")
+        report.write(f"  - Database Errors: {len(self.database_errors)}\n")
+        report.write(f"  - Substitution Errors: {len(self.substitution_errors)}\n")
+        report.write(f"Total Warnings: {len(self.warnings)}\n")
+        report.write(f"Sheets Found: {len(self.sheets_found)}\n")
+        report.write(f"Sheets Processed: {len(self.sheets_processed)}\n")
+        report.write(f"Sheets Skipped: {len(self.sheets_skipped)}\n")
+        report.write(f"Sheets Failed: {len(self.sheets_failed)}\n")
+        report.write("\n")
+        
+        # Python/Exception Errors
+        if self.python_errors:
+            report.write("=" * 80 + "\n")
+            report.write("PYTHON/EXCEPTION ERRORS\n")
+            report.write("=" * 80 + "\n")
+            for idx, error in enumerate(self.python_errors, 1):
+                report.write(f"\n[{idx}] {error.get('exception_type', 'Exception')}\n")
+                report.write(f"Stage: {error.get('stage', 'unknown')}\n")
+                report.write(f"Message: {error.get('message', 'No message')}\n")
+                if error.get('model'):
+                    report.write(f"Model: {error.get('model')}\n")
+                if error.get('record_id'):
+                    report.write(f"Record ID: {error.get('record_id')}\n")
+                if error.get('traceback'):
+                    report.write(f"Traceback:\n{error.get('traceback')}\n")
+                report.write(f"Timestamp: {error.get('timestamp', 'N/A')}\n")
+                report.write("-" * 80 + "\n")
+            report.write("\n")
+        
+        # Database Errors
+        if self.database_errors:
+            report.write("=" * 80 + "\n")
+            report.write("DATABASE ERRORS\n")
+            report.write("=" * 80 + "\n")
+            for idx, error in enumerate(self.database_errors, 1):
+                report.write(f"\n[{idx}] {error.get('type', 'database_error')}\n")
+                report.write(f"Stage: {error.get('stage', 'unknown')}\n")
+                report.write(f"Message: {error.get('message', 'No message')}\n")
+                if error.get('model'):
+                    report.write(f"Model: {error.get('model')}\n")
+                if error.get('record_id'):
+                    report.write(f"Record ID: {error.get('record_id')}\n")
+                report.write(f"Timestamp: {error.get('timestamp', 'N/A')}\n")
+                report.write("-" * 80 + "\n")
+            report.write("\n")
+        
+        # Substitution Errors
+        if self.substitution_errors:
+            report.write("=" * 80 + "\n")
+            report.write("SUBSTITUTION ERRORS (Not Found)\n")
+            report.write("=" * 80 + "\n")
+            for idx, error in enumerate(self.substitution_errors, 1):
+                report.write(f"\n[{idx}] {error.get('type', 'substitution_error')}\n")
+                report.write(f"Stage: {error.get('stage', 'unknown')}\n")
+                report.write(f"Message: {error.get('message', 'No message')}\n")
+                if error.get('field'):
+                    report.write(f"Field: {error.get('field')}\n")
+                if error.get('value'):
+                    report.write(f"Value: {error.get('value')}\n")
+                if error.get('account_path'):
+                    report.write(f"Account Path: {error.get('account_path')}\n")
+                if error.get('model'):
+                    report.write(f"Model: {error.get('model')}\n")
+                if error.get('record_id'):
+                    report.write(f"Record ID: {error.get('record_id')}\n")
+                report.write(f"Timestamp: {error.get('timestamp', 'N/A')}\n")
+                report.write("-" * 80 + "\n")
+            report.write("\n")
+        
+        # All Other Errors
+        other_errors = [e for e in self.errors if e not in self.python_errors and e not in self.database_errors and e not in self.substitution_errors]
+        if other_errors:
+            report.write("=" * 80 + "\n")
+            report.write("OTHER ERRORS\n")
+            report.write("=" * 80 + "\n")
+            for idx, error in enumerate(other_errors, 1):
+                report.write(f"\n[{idx}] {error.get('type', 'error')}\n")
+                report.write(f"Stage: {error.get('stage', 'unknown')}\n")
+                report.write(f"Message: {error.get('message', 'No message')}\n")
+                for key, value in error.items():
+                    if key not in ('type', 'stage', 'message', 'timestamp'):
+                        report.write(f"{key}: {value}\n")
+                report.write(f"Timestamp: {error.get('timestamp', 'N/A')}\n")
+                report.write("-" * 80 + "\n")
+            report.write("\n")
+        
+        # Warnings
+        if self.warnings:
+            report.write("=" * 80 + "\n")
+            report.write("WARNINGS\n")
+            report.write("=" * 80 + "\n")
+            for idx, warning in enumerate(self.warnings, 1):
+                report.write(f"\n[{idx}] {warning.get('type', 'warning')}\n")
+                report.write(f"Message: {warning.get('message', 'No message')}\n")
+                for key, value in warning.items():
+                    if key not in ('type', 'message'):
+                        report.write(f"{key}: {value}\n")
+                report.write("-" * 80 + "\n")
+            report.write("\n")
+        
+        # Sheets Information
+        if self.sheets_found:
+            report.write("=" * 80 + "\n")
+            report.write("SHEETS INFORMATION\n")
+            report.write("=" * 80 + "\n")
+            report.write(f"Found: {', '.join(self.sheets_found)}\n")
+            if self.sheets_processed:
+                report.write(f"Processed: {', '.join(self.sheets_processed)}\n")
+            if self.sheets_skipped:
+                report.write(f"Skipped: {', '.join(self.sheets_skipped)}\n")
+            if self.sheets_failed:
+                report.write(f"Failed: {', '.join(self.sheets_failed)}\n")
+            report.write("\n")
+        
+        report.write("=" * 80 + "\n")
+        report.write("END OF REPORT\n")
+        report.write("=" * 80 + "\n")
+        
+        return report.getvalue()
 
 
