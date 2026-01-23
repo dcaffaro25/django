@@ -2531,8 +2531,9 @@ class ETLPipelineService:
                                     logger.warning(f"ETL DATE DEBUG: Transaction {instance.id} - ✗ je_bank_date is earlier than transaction.date, falling back to transaction.date")
                                 else:
                                     logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - ✓ je_bank_date is valid (>= transaction.date)")
-                            else:
-                                logger.warning(f"ETL DATE DEBUG: Transaction {instance.id} - ✗ Failed to parse je_bank_date='{je_bank_date_raw}', will use transaction.date")
+                            except Exception as e:
+                                logger.warning(f"ETL DATE DEBUG: Transaction {instance.id} - ✗ Failed to parse je_bank_date='{je_bank_date_raw}', will use transaction.date. Error: {e}")
+                                je_bank_date = None
                         else:
                             logger.info(f"ETL DATE DEBUG: Transaction {instance.id} - No je_bank_date provided in extra_fields - will use transaction.date={instance.date}")
                         
