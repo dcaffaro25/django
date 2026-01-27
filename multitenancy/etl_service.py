@@ -3121,15 +3121,10 @@ class ETLPipelineService:
         if len(transaction_outputs) > 0:
             logger.info(f"ETL DEBUG: Average time per transaction: {total_time/len(transaction_outputs):.3f}s")
         
-        # Build result dict in the format expected by execute_import_job
-        transaction_import_result = {'imports': []}
-        if transaction_outputs:
-            transaction_import_result['imports'].append({
-                'model': 'Transaction',
-                'result': transaction_outputs
-            })
-        
-        return transaction_import_result
+        # Return result (Transaction + JournalEntry). Previously the code built
+        # transaction_import_result with only Transaction and returned that,
+        # so JournalEntry outputs were never included and validation saw 0 JEs per row.
+        return result
         
         bank_account_field = auto_config.get('bank_account_field', 'bank_account_id')
         opposing_account_field = auto_config.get('opposing_account_field', 'account_path')
