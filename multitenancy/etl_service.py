@@ -1693,38 +1693,51 @@ class ETLPipelineService:
             # Validate that each row created exactly 1 Transaction and 2 Journal Entries
             # This validation only applies when auto_create_journal_entries is enabled
             if transaction_import_result and self.auto_create_journal_entries and self.auto_create_journal_entries.get('enabled', False):
+                from multitenancy.tasks import _norm_row_key as _norm_row_key_validation
                 transaction_outputs = normalized_result.get('results', {}).get('Transaction', [])
-                journal_entry_outputs = normalized_result.get('results', {}).get('JournalEntry', [])
+                journal_entry_outputs = normalized_result.get('results', {}).get('JournalEntry', []) or []
                 
-                # Build a map of transaction_id -> row_id from transaction outputs
+                # Build a map of transaction_id -> row_id from transaction outputs.
+                # Use int(transaction_id) as key when possible so int/str mismatch (e.g. from JSON) does not break matching.
                 transaction_id_to_row_id = {}
                 for tx_output in transaction_outputs:
                     if tx_output.get('status') == 'success' and tx_output.get('action') == 'create':
-                        row_id = tx_output.get('__row_id') or tx_output.get('__excel_row_id')
+                        row_id_raw = tx_output.get('__row_id') or tx_output.get('__excel_row_id')
                         tx_data = tx_output.get('data', {})
                         transaction_id = tx_data.get('id')
-                        if transaction_id and row_id:
-                            transaction_id_to_row_id[transaction_id] = row_id
+                        if transaction_id is not None and row_id_raw is not None:
+                            row_id = _norm_row_key_validation(row_id_raw)
+                            try:
+                                tid_key = int(transaction_id)
+                            except (TypeError, ValueError):
+                                tid_key = transaction_id
+                            transaction_id_to_row_id[tid_key] = row_id
                 
-                # Group by row_id
+                # Group by normalized row_id so keys match when counting JEs
                 rows_by_id = {}
                 for tx_output in transaction_outputs:
                     if tx_output.get('status') == 'success' and tx_output.get('action') == 'create':
-                        row_id = tx_output.get('__row_id') or tx_output.get('__excel_row_id')
-                        if row_id:
+                        row_id_raw = tx_output.get('__row_id') or tx_output.get('__excel_row_id')
+                        if row_id_raw is not None:
+                            row_id = _norm_row_key_validation(row_id_raw)
                             if row_id not in rows_by_id:
                                 rows_by_id[row_id] = {'transactions': 0, 'journal_entries': 0, 'row_id': row_id}
                             rows_by_id[row_id]['transactions'] += 1
                 
-                # Count journal entries per row by matching transaction_id
+                # Count journal entries per row by matching transaction_id (try int and raw for lookup)
                 for je_output in journal_entry_outputs:
                     if je_output.get('status') == 'success' and je_output.get('action') == 'create':
                         je_data = je_output.get('data', {})
                         transaction_id = je_data.get('transaction_id')
-                        if transaction_id and transaction_id in transaction_id_to_row_id:
-                            row_id = transaction_id_to_row_id[transaction_id]
-                            if row_id in rows_by_id:
-                                rows_by_id[row_id]['journal_entries'] += 1
+                        if transaction_id is None:
+                            continue
+                        try:
+                            tid_key = int(transaction_id)
+                        except (TypeError, ValueError):
+                            tid_key = transaction_id
+                        row_id = transaction_id_to_row_id.get(tid_key) or transaction_id_to_row_id.get(transaction_id)
+                        if row_id is not None and row_id in rows_by_id:
+                            rows_by_id[row_id]['journal_entries'] += 1
                 
                 # Validate each row
                 validation_errors = []
