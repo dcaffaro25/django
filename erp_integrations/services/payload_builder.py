@@ -8,7 +8,7 @@ Produces JSON in the form:
 import copy
 from typing import Any, Dict, List, Optional
 
-from integrations.models import ERPAPIDefinition, ERPConnection
+from erp_integrations.models import ERPAPIDefinition, ERPConnection
 
 
 def build_payload(

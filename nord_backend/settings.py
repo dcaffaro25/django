@@ -168,6 +168,7 @@ INSTALLED_APPS = [
     'npl',              # nova app do pipeline
     'feedback',         # app de feedback supervisionado
     'knowledge_base',   # NotebookLM-like document Q&A with Gemini File Search
+    'erp_integrations', # ERP integration pipeline (Omie, etc.)
 ]
 
 MIDDLEWARE = [

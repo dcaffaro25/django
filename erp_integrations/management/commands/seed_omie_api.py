@@ -7,7 +7,7 @@ Usage:
 
 from django.core.management.base import BaseCommand
 
-from integrations.models import ERPAPIDefinition, ERPProvider
+from erp_integrations.models import ERPAPIDefinition, ERPProvider
 
 
 # lcpListarRequest params from https://app.omie.com.br/api/v1/financas/contapagar/#lcpListarRequest

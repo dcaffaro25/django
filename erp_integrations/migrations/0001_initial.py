@@ -1,4 +1,4 @@
-# Generated manually for integrations app
+# Generated manually for erp_integrations app
 
 from django.conf import settings
 from django.db import migrations, models
@@ -48,7 +48,7 @@ class Migration(migrations.Migration):
                 ("description", models.CharField(blank=True, max_length=255, null=True)),
                 ("is_active", models.BooleanField(default=True)),
                 ("created_by", models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name="%(class)s_created_by", to=settings.AUTH_USER_MODEL)),
-                ("provider", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="api_definitions", to="integrations.erpprovider")),
+                ("provider", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="api_definitions", to="erp_integrations.erpprovider")),
                 ("updated_by", models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name="%(class)s_updated_by", to=settings.AUTH_USER_MODEL)),
             ],
             options={
@@ -70,7 +70,7 @@ class Migration(migrations.Migration):
                 ("is_active", models.BooleanField(default=True)),
                 ("company", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="%(class)s_company", to="multitenancy.company")),
                 ("created_by", models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name="%(class)s_created_by", to=settings.AUTH_USER_MODEL)),
-                ("provider", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="connections", to="integrations.erpprovider")),
+                ("provider", models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name="connections", to="erp_integrations.erpprovider")),
                 ("updated_by", models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name="%(class)s_updated_by", to=settings.AUTH_USER_MODEL)),
             ],
             options={
