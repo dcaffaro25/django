@@ -1,6 +1,13 @@
 from django.apps import AppConfig
 
-
+class ErpIntegrationsConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'erp_integrations'
+    
+    #def ready(self):
+        # Import signals so that they register
+    #    from . import signals  # noqa
+'''
 class ErpIntegrationsConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
     name = "erp_integrations"
@@ -20,3 +27,4 @@ class ErpIntegrationsConfig(AppConfig):
             except NotRegistered:
                 pass
         from . import admin as _admin  # noqa: F401  # registers with our custom ModelAdmins
+'''
