@@ -2,7 +2,7 @@
 from django.contrib import admin
 from django.contrib.auth import get_user_model
 from django.contrib.auth.admin import UserAdmin
-from .models import Company, Entity  # adjust imports to your actual models
+from .models import Company, Entity, SubstitutionRule  # adjust imports to your actual models
 from django.contrib.admin.utils import model_ngettext
 from django.contrib.admin.views.main import ChangeList
 from django.utils.html import format_html
@@ -176,6 +176,83 @@ class EntityAdmin(CompanyScopedAdmin):
     search_fields = ("name", "id", "company__name", "notes")
     list_filter = ("company", "notes")
     autocomplete_fields = ("company",)
+
+
+def _filter_conditions_preview(obj, max_len=80):
+    if not obj.filter_conditions:
+        return "-"
+    import json
+    s = json.dumps(obj.filter_conditions, sort_keys=True)
+    return s[:max_len] + "…" if len(s) > max_len else s
+
+
+# Unregister if auto-registered, then register our custom SubstitutionRule admin
+try:
+    admin.site.unregister(SubstitutionRule)
+except admin.sites.NotRegistered:
+    pass
+
+
+@admin.register(SubstitutionRule)
+class SubstitutionRuleAdmin(CompanyScopedAdmin):
+    list_display = (
+        "id",
+        "title",
+        "model_name",
+        "field_name",
+        "match_type",
+        "match_value",
+        "substitution_value",
+        "company",
+        "filter_conditions_preview",
+        "is_deleted",
+        "notes",
+    )
+    list_filter = ("company", "model_name", "field_name", "match_type", "is_deleted")
+    search_fields = (
+        "title",
+        "model_name",
+        "field_name",
+        "match_value",
+        "substitution_value",
+        "notes",
+    )
+    list_select_related = ("company", "created_by", "updated_by")
+    autocomplete_fields = ("company",)
+    raw_id_fields = ("created_by", "updated_by")
+    ordering = ("company", "model_name", "field_name", "id")
+
+    fieldsets = (
+        (
+            None,
+            {
+                "fields": (
+                    "title",
+                    "company",
+                    "model_name",
+                    "field_name",
+                    "match_type",
+                    "match_value",
+                    "substitution_value",
+                    "filter_conditions",
+                    "notes",
+                ),
+            },
+        ),
+        (
+            _("Audit"),
+            {
+                "fields": ("is_deleted", "created_at", "created_by", "updated_at", "updated_by"),
+                "classes": ("collapse",),
+            },
+        ),
+    )
+
+    def filter_conditions_preview(self, obj):
+        return _filter_conditions_preview(obj)
+
+    filter_conditions_preview.short_description = _("Filter conditions")
+
 
 # Ensure the User admin has search_fields (for ReconciliationConfig.user autocomplete)
 try:

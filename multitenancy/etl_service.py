@@ -2297,6 +2297,9 @@ class ETLPipelineService:
         
         model = apps.get_model('accounting', 'Transaction')
         
+        # Track processed rows for commit substitutions to avoid processing twice
+        processed_substitution_rows = set()
+        
         total_start = time.time()
         logger.info(f"ETL DEBUG: Starting transaction processing for {len(transaction_sheets)} sheet(s)")
         
@@ -2316,7 +2319,9 @@ class ETLPipelineService:
                 raw_rows,
                 company_id=self.company_id,
                 model_name='Transaction',
-                return_audit=True
+                return_audit=True,
+                commit=self.commit,
+                processed_row_ids=processed_substitution_rows
             )
             subst_time = time.time() - subst_start
             logger.info(f"ETL DEBUG: Substitutions took {subst_time:.3f}s for {len(rows)} rows ({subst_time/len(rows)*1000:.2f}ms per row)")

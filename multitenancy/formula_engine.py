@@ -607,6 +607,8 @@ def apply_substitutions(
     column_names: Optional[List[str]] = None,
     *,
     return_audit: bool = False,
+    commit: bool = False,
+    processed_row_ids: Optional[set] = None,
 ) -> Union[
     List[Union[Dict[str, Any], List[Any]]],
     Tuple[List[Union[Dict[str, Any], List[Any]]], List[Dict[str, Any]]]
@@ -616,10 +618,24 @@ def apply_substitutions(
     Aceita campo JSON `filter_conditions` em SubstitutionRule para determinar se a regra se aplica.
     Quando `return_audit=True`, retorna também uma auditoria de mudanças por linha.
     Auditoria: lista de dicionários { "__row_id", "field", "old", "new", "rule_id", "rule_name" }.
+    
+    Quando `commit=True` e `processed_row_ids` é fornecido, rastreia quais linhas já foram processadas
+    para evitar processamento duplicado. O set `processed_row_ids` é atualizado in-place com os IDs
+    das linhas processadas.
     """
     if not company_id:
         raise ValueError("Company ID is required for substitutions.")
     from multitenancy.models import SubstitutionRule  # evitar import circular
+    
+    # Helper function to normalize row ID (matching tasks.py logic)
+    def _norm_row_key(key: Any) -> Any:
+        if isinstance(key, str):
+            return key.replace("\u00A0", " ").strip().lower()
+        return key
+    
+    # Initialize processed_row_ids set if not provided
+    if processed_row_ids is None:
+        processed_row_ids = set()
     rules_qs = SubstitutionRule.objects.filter(company_id=company_id)
     if model_name:
         rules_qs = rules_qs.filter(model_name=model_name)
@@ -780,6 +796,32 @@ def apply_substitutions(
             or getattr(rl, "description", None)
             or f"Rule#{rl.id}"
         )
+    
+    # Filter out already-processed rows and track new ones when commit=True
+    rows_to_process = []
+    skipped_count = 0
+    
+    for rec in rows:
+        # Skip already-processed rows when commit=True
+        if commit and model_name:
+            rid_raw = rec.get("__row_id") if isinstance(rec, dict) else None
+            if rid_raw is not None:
+                rid_normalized = _norm_row_key(rid_raw)
+                if rid_normalized in processed_row_ids:
+                    skipped_count += 1
+                    logger.debug(f"ETL SUBSTITUTION: Skipping already-processed row {rid_normalized} for {model_name}")
+                    continue
+                # Mark this row as being processed
+                processed_row_ids.add(rid_normalized)
+        
+        rows_to_process.append(rec)
+    
+    if skipped_count > 0:
+        logger.info(f"ETL SUBSTITUTION: Skipped {skipped_count} already-processed rows for {model_name}")
+    
+    # Process only the rows that haven't been processed yet
+    rows = rows_to_process
+    
     for rec in rows:
         # dicionários: usar __row_id e campos nomeados
         if isinstance(rec, dict):
