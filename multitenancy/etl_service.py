@@ -2299,6 +2299,8 @@ class ETLPipelineService:
         
         # Track processed rows for commit substitutions to avoid processing twice
         processed_substitution_rows = set()
+        # Cache substitutions: {model_name: {field_name: {original: substituted}}}
+        substitution_cache = {}
         
         total_start = time.time()
         logger.info(f"ETL DEBUG: Starting transaction processing for {len(transaction_sheets)} sheet(s)")
@@ -2306,7 +2308,8 @@ class ETLPipelineService:
         for sheet_idx, sheet in enumerate(transaction_sheets):
             sheet_start = time.time()
             raw_rows: List[Dict[str, Any]] = sheet.get("rows") or []
-            logger.info(f"ETL DEBUG: Sheet {sheet_idx + 1}: Processing {len(raw_rows)} raw rows")
+            sheet_name = sheet.get("sheet_name")  # Get sheet name for tracking
+            logger.info(f"ETL DEBUG: Sheet {sheet_idx + 1}: Processing {len(raw_rows)} raw rows (sheet_name: {sheet_name})")
             
             # Log entity_id values before substitutions
             for idx, row in enumerate(raw_rows):
@@ -2321,7 +2324,9 @@ class ETLPipelineService:
                 model_name='Transaction',
                 return_audit=True,
                 commit=self.commit,
-                processed_row_ids=processed_substitution_rows
+                processed_row_ids=processed_substitution_rows,
+                sheet_name=sheet_name,
+                substitution_cache=substitution_cache
             )
             subst_time = time.time() - subst_start
             logger.info(f"ETL DEBUG: Substitutions took {subst_time:.3f}s for {len(rows)} rows ({subst_time/len(rows)*1000:.2f}ms per row)")

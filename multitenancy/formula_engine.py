@@ -609,6 +609,8 @@ def apply_substitutions(
     return_audit: bool = False,
     commit: bool = False,
     processed_row_ids: Optional[set] = None,
+    sheet_name: Optional[str] = None,
+    substitution_cache: Optional[Dict[str, Dict[str, Dict[Any, Any]]]] = None,
 ) -> Union[
     List[Union[Dict[str, Any], List[Any]]],
     Tuple[List[Union[Dict[str, Any], List[Any]]], List[Dict[str, Any]]]
@@ -621,7 +623,13 @@ def apply_substitutions(
     
     Quando `commit=True` e `processed_row_ids` é fornecido, rastreia quais linhas já foram processadas
     para evitar processamento duplicado. O set `processed_row_ids` é atualizado in-place com os IDs
-    das linhas processadas.
+    das linhas processadas. Tracking usa (model_name, sheet_name, row_id) para permitir que o mesmo
+    row_id apareça em diferentes sheets do mesmo arquivo.
+    
+    Quando `substitution_cache` é fornecido, armazena mapeamentos de valores originais para valores
+    substituídos por modelo e campo: {model_name: {field_name: {original_value: substituted_value}}}.
+    Se um valor original já foi substituído anteriormente, reutiliza o resultado em cache em vez de
+    reavaliar as regras de substituição.
     """
     if not company_id:
         raise ValueError("Company ID is required for substitutions.")
@@ -636,6 +644,11 @@ def apply_substitutions(
     # Initialize processed_row_ids set if not provided
     if processed_row_ids is None:
         processed_row_ids = set()
+    
+    # Initialize substitution_cache if not provided
+    # Structure: {model_name: {field_name: {original_value: substituted_value}}}
+    if substitution_cache is None:
+        substitution_cache = {}
     rules_qs = SubstitutionRule.objects.filter(company_id=company_id)
     if model_name:
         rules_qs = rules_qs.filter(model_name=model_name)
@@ -798,6 +811,8 @@ def apply_substitutions(
         )
     
     # Filter out already-processed rows and track new ones when commit=True
+    # Track by (model_name, sheet_name, row_id) tuple to allow same row_id in different sheets
+    # For rows without __row_id, we can't track them, so they'll be processed
     rows_to_process = []
     skipped_count = 0
     
@@ -807,17 +822,23 @@ def apply_substitutions(
             rid_raw = rec.get("__row_id") if isinstance(rec, dict) else None
             if rid_raw is not None:
                 rid_normalized = _norm_row_key(rid_raw)
-                if rid_normalized in processed_row_ids:
+                # Use (model_name, sheet_name, row_id) as the key to allow same row_id in different sheets
+                # sheet_name can be None, which is fine - it will still differentiate sheets
+                tracking_key = (model_name, sheet_name, rid_normalized)
+                if tracking_key in processed_row_ids:
                     skipped_count += 1
-                    logger.debug(f"ETL SUBSTITUTION: Skipping already-processed row {rid_normalized} for {model_name}")
+                    logger.info(f"ETL SUBSTITUTION: Skipping already-processed row {rid_normalized} for {model_name} in sheet '{sheet_name}' (tracking_key={tracking_key})")
                     continue
-                # Mark this row as being processed
-                processed_row_ids.add(rid_normalized)
+                # Mark this row as being processed BEFORE substitution
+                # This ensures we don't process the same row_id twice within the same sheet
+                processed_row_ids.add(tracking_key)
+            # If row has no __row_id, we can't track it, so it will be processed
+            # This is intentional - rows without IDs might be legitimate duplicates
         
         rows_to_process.append(rec)
     
     if skipped_count > 0:
-        logger.info(f"ETL SUBSTITUTION: Skipped {skipped_count} already-processed rows for {model_name}")
+        logger.info(f"ETL SUBSTITUTION: Skipped {skipped_count} already-processed rows for {model_name} in sheet '{sheet_name}' (tracking by (model_name, sheet_name, row_id))")
     
     # Process only the rows that haven't been processed yet
     rows = rows_to_process
@@ -830,46 +851,118 @@ def apply_substitutions(
             for (mdl, fld), rule_list in grouped["model_field"].items():
                 if mdl == model_name and fld in rec:
                     original = rec[fld]
+                    
+                    # Check cache first - if we've already substituted this value, reuse it
+                    if model_name and fld:
+                        if model_name in substitution_cache and fld in substitution_cache[model_name]:
+                            field_cache = substitution_cache[model_name][fld]
+                            # Check if this original value has been cached (handles None correctly)
+                            if original in field_cache:
+                                cached_value = field_cache[original]
+                                # Found in cache, use cached substitution
+                                if cached_value != original:
+                                    rec[fld] = cached_value
+                                    if return_audit:
+                                        audit.append({
+                                            "__row_id": rid,
+                                            "field": fld,
+                                            "old": original,
+                                            "new": cached_value,
+                                            "rule_id": None,
+                                            "rule_name": "Cached substitution",
+                                        })
+                                continue  # Skip rule evaluation, use cached value
+                    
+                    # Not in cache, apply rules
+                    new_value = original
+                    applied_rule = None
                     for rl in rule_list:
                         _t0 = time.perf_counter()
                         apply, new_value = _should_apply_rule(rec, rl, fld, rec[fld])
                         rule_time[rl.id] += time.perf_counter() - _t0
                         rule_hits[rl.id] += 1
                         if apply:
-                            if new_value != original:
-                                rec[fld] = new_value
-                                if return_audit:
-                                    audit.append({
-                                        "__row_id": rid,
-                                        "field": fld,
-                                        "old": original,
-                                        "new": new_value,
-                                        "rule_id": rl.id,
-                                        "rule_name": _rule_name(rl),
-                                    })
+                            applied_rule = rl
                             break
+                    
+                    # Cache the substitution result if it changed
+                    if new_value != original and model_name and fld:
+                        if model_name not in substitution_cache:
+                            substitution_cache[model_name] = {}
+                        if fld not in substitution_cache[model_name]:
+                            substitution_cache[model_name][fld] = {}
+                        substitution_cache[model_name][fld][original] = new_value
+                        logger.debug(f"ETL SUBSTITUTION: Cached substitution for {model_name}.{fld}: '{original}' -> '{new_value}'")
+                    
+                    if new_value != original:
+                        rec[fld] = new_value
+                        if return_audit:
+                            audit.append({
+                                "__row_id": rid,
+                                "field": fld,
+                                "old": original,
+                                "new": new_value,
+                                "rule_id": applied_rule.id if applied_rule else None,
+                                "rule_name": _rule_name(applied_rule) if applied_rule else "Unknown",
+                            })
             # regras por column_name
             for col, rule_list in grouped["column_name"].items():
                 if col in rec:
                     original = rec[col]
+                    
+                    # Check cache first - if we've already substituted this value, reuse it
+                    if model_name and col:
+                        if model_name in substitution_cache and col in substitution_cache[model_name]:
+                            field_cache = substitution_cache[model_name][col]
+                            # Check if this original value has been cached (handles None correctly)
+                            if original in field_cache:
+                                cached_value = field_cache[original]
+                                # Found in cache, use cached substitution
+                                if cached_value != original:
+                                    rec[col] = cached_value
+                                    if return_audit:
+                                        audit.append({
+                                            "__row_id": rid,
+                                            "field": col,
+                                            "old": original,
+                                            "new": cached_value,
+                                            "rule_id": None,
+                                            "rule_name": "Cached substitution",
+                                        })
+                                continue  # Skip rule evaluation, use cached value
+                    
+                    # Not in cache, apply rules
+                    new_value = original
+                    applied_rule = None
                     for rl in rule_list:
                         _t0 = time.perf_counter()
                         apply, new_value = _should_apply_rule(rec, rl, col, rec[col])
                         rule_time[rl.id] += time.perf_counter() - _t0
                         rule_hits[rl.id] += 1
                         if apply:
-                            if new_value != original:
-                                rec[col] = new_value
-                                if return_audit:
-                                    audit.append({
-                                        "__row_id": rid,
-                                        "field": col,
-                                        "old": original,
-                                        "new": new_value,
-                                        "rule_id": rl.id,
-                                        "rule_name": _rule_name(rl),
-                                    })
+                            applied_rule = rl
                             break
+                    
+                    # Cache the substitution result if it changed
+                    if new_value != original and model_name and col:
+                        if model_name not in substitution_cache:
+                            substitution_cache[model_name] = {}
+                        if col not in substitution_cache[model_name]:
+                            substitution_cache[model_name][col] = {}
+                        substitution_cache[model_name][col][original] = new_value
+                        logger.debug(f"ETL SUBSTITUTION: Cached substitution for {model_name}.{col}: '{original}' -> '{new_value}'")
+                    
+                    if new_value != original:
+                        rec[col] = new_value
+                        if return_audit:
+                            audit.append({
+                                "__row_id": rid,
+                                "field": col,
+                                "old": original,
+                                "new": new_value,
+                                "rule_id": applied_rule.id if applied_rule else None,
+                                "rule_name": _rule_name(applied_rule) if applied_rule else "Unknown",
+                            })
         # listas ou tuplas: usar índices
         elif isinstance(rec, (list, tuple)):
             # converter tupla para lista para permitir mutação

@@ -642,6 +642,7 @@ def execute_import_job(
     token_to_id: Dict[str, int] = {}  # GLOBAL token->id registry across all sheets
     outputs_by_model: Dict[str, List[dict]] = {}
     processed_substitution_rows: set = set()  # Track processed rows for commit substitutions
+    substitution_cache: Dict[str, Dict[str, Dict[Any, Any]]] = {}  # Cache substitutions: {model_name: {field_name: {original: substituted}}}
 
     t0 = time.monotonic()
     with transaction.atomic():
@@ -685,7 +686,9 @@ def execute_import_job(
                         model_name=model_name,
                         return_audit=True,
                         commit=commit,
-                        processed_row_ids=processed_substitution_rows
+                        processed_row_ids=processed_substitution_rows,
+                        sheet_name=sheet_name,
+                        substitution_cache=substitution_cache
                     )
                 except Exception as e:
                     # Rollback the savepoint if substitution fails
