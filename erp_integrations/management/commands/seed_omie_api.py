@@ -34,11 +34,7 @@ LISTAR_CONTAS_PAGAR_PARAM_SCHEMA = [
     {"name": "exibir_obs", "type": "string", "description": "Exibir observações S/N", "required": False, "default": "N"},
 ]
 
-LISTAR_CONTAS_PAGAR_DEFAULT_PARAM = {
-    "pagina": 1,
-    "registros_por_pagina": 1000,
-    "apenas_importado_api": "N",
-}
+CONTAPAGAR_URL = "https://app.omie.com.br/api/v1/financas/contapagar/"
 
 
 class Command(BaseCommand):
@@ -49,7 +45,7 @@ class Command(BaseCommand):
             slug="omie",
             defaults={
                 "name": "Omie",
-                "base_url": "https://app.omie.com.br/api/v1/financas/contapagar/",
+                "base_url": CONTAPAGAR_URL,
                 "is_active": True,
             },
         )
@@ -62,8 +58,9 @@ class Command(BaseCommand):
             provider=provider,
             call="ListarContasPagar",
             defaults={
+                "url": CONTAPAGAR_URL,
+                "method": "POST",
                 "param_schema": LISTAR_CONTAS_PAGAR_PARAM_SCHEMA,
-                "default_param": LISTAR_CONTAS_PAGAR_DEFAULT_PARAM,
                 "description": "Listar Contas a Pagar (lcpListarRequest)",
                 "is_active": True,
             },

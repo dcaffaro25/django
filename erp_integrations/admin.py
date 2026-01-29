@@ -29,6 +29,6 @@ class ERPConnectionAdmin(admin.ModelAdmin):
 
 @admin.register(ERPAPIDefinition)
 class ERPAPIDefinitionAdmin(admin.ModelAdmin):
-    list_display = ("call", "provider", "description", "is_active")
+    list_display = ("call", "provider", "url", "method", "description", "is_active")
     list_filter = ("provider", "is_active")
-    search_fields = ("call", "description")
+    search_fields = ("call", "description", "url")

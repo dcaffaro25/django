@@ -3,7 +3,7 @@ ERP integration pipeline models.
 
 - ERPProvider: supported ERPs (Omie, etc.).
 - ERPConnection: per-company credentials (app_key, app_secret).
-- ERPAPIDefinition: API call name + param schema/defaults from API docs.
+- ERPAPIDefinition: API call + url, method, param schema (defaults from schema).
 """
 
 from django.db import models
@@ -58,8 +58,9 @@ class ERPAPIDefinition(BaseModel):
     API call + param schema from API documentation.
 
     Stores the main APIs available and the parameters used (e.g. lcpListarRequest
-    for ListarContasPagar). default_param holds the default param object;
-    param_schema documents each field (name, type, description, required).
+    for ListarContasPagar). param_schema documents each field (name, type,
+    description, required, default). Default payload is built from param_schema
+    defaults.
     """
 
     provider = models.ForeignKey(
@@ -71,15 +72,19 @@ class ERPAPIDefinition(BaseModel):
         max_length=128,
         help_text="API method name (e.g. ListarContasPagar).",
     )
+    url = models.URLField(
+        max_length=512,
+        help_text="Full URL for this API endpoint.",
+    )
+    method = models.CharField(
+        max_length=10,
+        default="POST",
+        help_text="HTTP method (e.g. POST, GET).",
+    )
     param_schema = models.JSONField(
         default=list,
         blank=True,
         help_text="List of param specs: [{name, type, description, required, default}, ...].",
-    )
-    default_param = models.JSONField(
-        default=dict,
-        blank=True,
-        help_text="Default param object used when building the request.",
     )
     description = models.CharField(max_length=255, blank=True, null=True)
     is_active = models.BooleanField(default=True)

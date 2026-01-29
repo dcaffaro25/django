@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from .models import ERPAPIDefinition, ERPConnection, ERPProvider
+from .services.payload_builder import payload_from_param_schema
 
 
 class ERPProviderMiniSerializer(serializers.ModelSerializer):
@@ -59,7 +60,10 @@ class ERPConnectionListSerializer(serializers.ModelSerializer):
 
 
 class ERPAPIDefinitionSerializer(serializers.ModelSerializer):
+    """Joined provider + API definition: url, method, param_schema, payload (defaults from schema)."""
+
     provider_display = serializers.CharField(source="provider.name", read_only=True)
+    payload = serializers.SerializerMethodField()
 
     class Meta:
         model = ERPAPIDefinition
@@ -68,11 +72,16 @@ class ERPAPIDefinitionSerializer(serializers.ModelSerializer):
             "provider",
             "provider_display",
             "call",
+            "url",
+            "method",
             "param_schema",
-            "default_param",
+            "payload",
             "description",
             "is_active",
         ]
+
+    def get_payload(self, obj):
+        return payload_from_param_schema(obj.param_schema or [])
 
 
 class BuildPayloadRequestSerializer(serializers.Serializer):

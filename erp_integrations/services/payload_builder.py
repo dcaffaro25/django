@@ -11,6 +11,19 @@ from typing import Any, Dict, List, Optional
 from erp_integrations.models import ERPAPIDefinition, ERPConnection
 
 
+def payload_from_param_schema(param_schema: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Build default param object from param_schema using each field's "default".
+
+    Only includes keys that have a "default" in the schema.
+    """
+    out: Dict[str, Any] = {}
+    for spec in param_schema or []:
+        if isinstance(spec, dict) and "default" in spec:
+            out[spec["name"]] = copy.deepcopy(spec["default"])
+    return out
+
+
 def build_payload(
     connection: ERPConnection,
     api_definition: ERPAPIDefinition,
@@ -22,13 +35,13 @@ def build_payload(
 
     Args:
         connection: ERP connection (app_key, app_secret).
-        api_definition: API call + default_param.
+        api_definition: API call + param_schema (defaults derived from schema).
         param_overrides: Override keys in the default param object. If the API
             uses a single param object (e.g. ListarContasPagar), we merge this
-            into default_param and emit param: [merged].
+            into the schema-derived defaults and emit param: [merged].
         param_list: If provided, use this as param directly (list of objects).
-            Otherwise we use default_param merged with param_overrides as
-            param: [merged].
+            Otherwise we use defaults from param_schema merged with
+            param_overrides as param: [merged].
 
     Returns:
         Dict with "call", "param", "app_key", "app_secret".
@@ -36,7 +49,7 @@ def build_payload(
     if param_list is not None:
         param = param_list
     else:
-        base = copy.deepcopy(api_definition.default_param) or {}
+        base = payload_from_param_schema(api_definition.param_schema or [])
         overrides = param_overrides or {}
         merged = {**base, **overrides}
         param = [merged]
