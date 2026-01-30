@@ -123,6 +123,7 @@ def build_detailed_statement_excel(
     request_params: Dict[str, Any],
     raw_history_rows: List[Dict[str, Any]],
     balance_type: str = 'posted',
+    journal_entry_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> bytes:
     """
     Build an Excel workbook for a detailed financial statement.
@@ -132,7 +133,10 @@ def build_detailed_statement_excel(
     raw_history_rows: list of dicts with keys account_id, account_code, account_name, year, month,
                      posted_total_debit, posted_total_credit, bank_reconciled_*, all_*,
                      balance_type_used, net_movement_used (or ending_balance_used for balance sheet)
+    journal_entry_rows: optional list of journal entry dicts (id, transaction_id, date, description,
+                        account_id, account_code, account_name, debit_amount, credit_amount, state, is_reconciled)
     """
+    journal_entry_rows = journal_entry_rows or []
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -257,8 +261,31 @@ def build_detailed_statement_excel(
         ws_raw.cell(row=1, column=1, value='No raw balance history rows (leaf accounts may have no history in period).')
     ws_raw.column_dimensions['A'].width = 50
 
+    # ----- Sheet 5: Journal Entries (lines that contributed to the report) -----
+    ws_je = wb.create_sheet('Journal Entries', 5)
+    if journal_entry_rows:
+        je_headers = [
+            'journal_entry_id', 'transaction_id', 'date', 'transaction_date', 'description',
+            'account_id', 'account_code', 'account_name', 'debit_amount', 'credit_amount',
+            'state', 'is_reconciled',
+        ]
+        for col, h in enumerate(je_headers, 1):
+            ws_je.cell(row=1, column=col, value=h.replace('_', ' ').title())
+        _style_header(ws_je, 1, len(je_headers))
+        for r_idx, row_data in enumerate(journal_entry_rows, start=2):
+            for c_idx, h in enumerate(je_headers, 1):
+                val = row_data.get(h)
+                if isinstance(val, (Decimal, float)):
+                    val = float(val) if isinstance(val, Decimal) else val
+                ws_je.cell(row=r_idx, column=c_idx, value=val)
+        for c in range(1, len(je_headers) + 1):
+            ws_je.column_dimensions[get_column_letter(c)].width = 16
+    else:
+        ws_je.cell(row=1, column=1, value='No journal entries in period for the report accounts (or filter excluded them).')
+    ws_je.column_dimensions['A'].width = 50
+
     # ----- Sheet 6: Leaf Account Summary (per-account totals from raw data) -----
-    ws_leaf = wb.create_sheet('Leaf Account Summary', 5)
+    ws_leaf = wb.create_sheet('Leaf Account Summary', 6)
     if raw_history_rows:
         def _dec(x):
             return Decimal(str(x)) if x is not None else Decimal('0')
@@ -327,6 +354,7 @@ def build_detailed_statement_excel_base64(
     request_params: Dict[str, Any],
     raw_history_rows: List[Dict[str, Any]],
     balance_type: str = 'posted',
+    journal_entry_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Same as build_detailed_statement_excel but returns base64-encoded string."""
     data = build_detailed_statement_excel(
@@ -335,5 +363,6 @@ def build_detailed_statement_excel_base64(
         request_params=request_params,
         raw_history_rows=raw_history_rows,
         balance_type=balance_type,
+        journal_entry_rows=journal_entry_rows,
     )
     return base64.b64encode(data).decode('ascii')

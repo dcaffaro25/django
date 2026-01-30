@@ -40,7 +40,7 @@ from .services.income_statement_service import IncomeStatementService
 from .services.balance_sheet_service import BalanceSheetService
 from .services.cash_flow_service import CashFlowService
 from .services.detailed_statement_excel import build_detailed_statement_excel_base64
-from .models import Currency, Account
+from .models import Currency, Account, JournalEntry
 
 log = logging.getLogger(__name__)
 
@@ -141,6 +141,54 @@ def _fetch_raw_balance_history(company_id, account_ids, currency_id, balance_typ
             'net_movement_used': float(net_movement),
         }
         rows.append(row)
+    return rows
+
+
+def _fetch_journal_entries_for_report(company_id, account_ids, currency_id, balance_type,
+                                       start_date=None, end_date=None, as_of_date=None):
+    """
+    Fetch JournalEntry rows that contributed to the report (same accounts, currency, period, balance_type).
+    For income/cash: entries with date in [start_date, end_date]. For balance sheet: date <= as_of_date.
+    Returns list of dicts with id, transaction_id, date, description, account_id, account_code, account_name,
+    debit_amount, credit_amount, state, is_reconciled, transaction_date.
+    """
+    if not account_ids:
+        return []
+    account_ids = list(account_ids)
+    qs = JournalEntry.objects.filter(
+        account_id__in=account_ids,
+        transaction__company_id=company_id,
+        transaction__currency_id=currency_id,
+    ).select_related('account', 'transaction').order_by('date', 'id')
+    if balance_type == 'posted':
+        qs = qs.filter(state='posted')
+    elif balance_type == 'bank_reconciled':
+        qs = qs.filter(is_reconciled=True)
+    # else 'all': no state filter
+    if as_of_date is not None:
+        qs = qs.filter(date__lte=as_of_date)
+    elif start_date is not None and end_date is not None:
+        qs = qs.filter(date__gte=start_date, date__lte=end_date)
+    else:
+        return []
+    rows = []
+    for je in qs:
+        tx = je.transaction
+        rows.append({
+            'journal_entry_id': je.id,
+            'transaction_id': tx.id if tx else None,
+            'date': str(je.date) if je.date else (str(tx.date) if tx else None),
+            'transaction_date': str(tx.date) if tx else None,
+            'description': je.description or (tx.description if tx else ''),
+            'transaction_description': tx.description if tx else '',
+            'account_id': je.account_id,
+            'account_code': je.account.account_code if je.account else '',
+            'account_name': je.account.name if je.account else '',
+            'debit_amount': float(je.debit_amount) if je.debit_amount is not None else None,
+            'credit_amount': float(je.credit_amount) if je.credit_amount is not None else None,
+            'state': je.state,
+            'is_reconciled': je.is_reconciled,
+        })
     return rows
 
 
@@ -2039,11 +2087,19 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 cost_depth=cost_depth,
                 expense_depth=expense_depth,
             )
-            # Build Excel with calculation memory and raw data; attach base64 for Retool download
+            # Build Excel with calculation memory, raw data, and journal entries; attach base64 for Retool download
             account_ids = _collect_account_ids_from_report(income_statement, 'income_statement')
             currency_id_report = (income_statement.get('currency') or {}).get('id')
             if currency_id_report is not None:
                 raw_history = _fetch_raw_balance_history(
+                    company_id=company_id,
+                    account_ids=account_ids,
+                    currency_id=currency_id_report,
+                    balance_type=balance_type,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                journal_entries = _fetch_journal_entries_for_report(
                     company_id=company_id,
                     account_ids=account_ids,
                     currency_id=currency_id_report,
@@ -2057,6 +2113,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     request_params=dict(request.data),
                     raw_history_rows=raw_history,
                     balance_type=balance_type,
+                    journal_entry_rows=journal_entries,
                 )
                 income_statement['excel_base64'] = excel_b64
                 income_statement['excel_filename'] = (
@@ -2172,11 +2229,18 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 liability_depth=liability_depth,
                 equity_depth=equity_depth,
             )
-            # Build Excel with calculation memory and raw data; attach base64 for Retool download
+            # Build Excel with calculation memory, raw data, and journal entries; attach base64 for Retool download
             account_ids = _collect_account_ids_from_report(balance_sheet, 'balance_sheet')
             currency_id_report = (balance_sheet.get('currency') or {}).get('id')
             if currency_id_report is not None:
                 raw_history = _fetch_raw_balance_history(
+                    company_id=company_id,
+                    account_ids=account_ids,
+                    currency_id=currency_id_report,
+                    balance_type=balance_type,
+                    as_of_date=as_of_date,
+                )
+                journal_entries = _fetch_journal_entries_for_report(
                     company_id=company_id,
                     account_ids=account_ids,
                     currency_id=currency_id_report,
@@ -2189,6 +2253,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     request_params=dict(request.data),
                     raw_history_rows=raw_history,
                     balance_type=balance_type,
+                    journal_entry_rows=journal_entries,
                 )
                 balance_sheet['excel_base64'] = excel_b64
                 balance_sheet['excel_filename'] = f"detailed_balance_sheet_{as_of_date}.xlsx"
@@ -2312,11 +2377,19 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 investing_depth=investing_depth,
                 financing_depth=financing_depth,
             )
-            # Build Excel with calculation memory and raw data; attach base64 for Retool download
+            # Build Excel with calculation memory, raw data, and journal entries; attach base64 for Retool download
             account_ids = _collect_account_ids_from_report(cash_flow, 'cash_flow')
             currency_id_report = (cash_flow.get('currency') or {}).get('id')
             if currency_id_report is not None:
                 raw_history = _fetch_raw_balance_history(
+                    company_id=company_id,
+                    account_ids=account_ids,
+                    currency_id=currency_id_report,
+                    balance_type=balance_type,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                journal_entries = _fetch_journal_entries_for_report(
                     company_id=company_id,
                     account_ids=account_ids,
                     currency_id=currency_id_report,
@@ -2330,6 +2403,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     request_params=dict(request.data),
                     raw_history_rows=raw_history,
                     balance_type=balance_type,
+                    journal_entry_rows=journal_entries,
                 )
                 cash_flow['excel_base64'] = excel_b64
                 cash_flow['excel_filename'] = (
