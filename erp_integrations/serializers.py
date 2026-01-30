@@ -88,3 +88,11 @@ class BuildPayloadRequestSerializer(serializers.Serializer):
     connection_id = serializers.IntegerField()
     api_definition_id = serializers.IntegerField()
     param_overrides = serializers.JSONField(required=False, default=dict)
+
+
+class ErpEtlImportRequestSerializer(serializers.Serializer):
+    """Request body for ERP API ETL import (preview or commit)."""
+
+    mapping_id = serializers.IntegerField(help_text="ErpApiEtlMapping id for this company.")
+    response = serializers.JSONField(help_text="Full API response dict (e.g. with produto_servico_cadastro).")
+    commit = serializers.BooleanField(default=False, help_text="True to write to DB; False for preview only.")

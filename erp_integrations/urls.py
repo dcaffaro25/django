@@ -5,6 +5,7 @@ from .views import (
     ERPConnectionViewSet,
     ERPAPIDefinitionViewSet,
     BuildPayloadView,
+    ErpEtlImportView,
 )
 
 
@@ -19,4 +20,5 @@ router.register("api-definitions", ERPAPIDefinitionViewSet, basename="erp-api-de
 urlpatterns = [
     re_path(r"api/", include(router.urls)),
     re_path(r"api/build-payload/?", BuildPayloadView.as_view(), name="erp-integrations-build-payload"),
+    re_path(r"api/etl-import/?", ErpEtlImportView.as_view(), name="erp-etl-import"),
 ]

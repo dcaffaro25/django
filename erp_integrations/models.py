@@ -95,3 +95,93 @@ class ERPAPIDefinition(BaseModel):
     class Meta:
         unique_together = ("provider", "call")
         ordering = ["provider", "call"]
+
+
+class ErpApiEtlMapping(TenantAwareBaseModel):
+    """
+    ETL mapping from ERP API JSON response to app models (same commit flow as Excel ETL).
+
+    Maps a list in the API response (e.g. produto_servico_cadastro) to target model rows
+    using field_mappings (API key -> model field). Output is fed into execute_import_job()
+    so substitution, validation, and commit behave like the Excel import.
+    """
+
+    name = models.CharField(max_length=100, help_text="e.g. Omie Produtos")
+    description = models.TextField(blank=True, null=True)
+
+    # Source: which key in the API response holds the list of items
+    response_list_key = models.CharField(
+        max_length=120,
+        help_text="JSON key containing the array of records (e.g. produto_servico_cadastro)",
+    )
+
+    # Target model (same names as in multitenancy.tasks.MODEL_APP_MAP)
+    target_model = models.CharField(
+        max_length=100,
+        help_text="Target model: ProductService, ProductServiceCategory, etc.",
+    )
+
+    # Map API field names (exact key in each item) -> model field names
+    field_mappings = models.JSONField(
+        default=dict,
+        help_text="""
+        Map API keys to model fields. Format: {"api_key": "model_field"}
+        Use __row_id for the row token (e.g. codigo -> __row_id for products).
+        Nested keys use dot notation: "dadosIbpt.aliqFederal" -> "some_field"
+        """,
+    )
+
+    # Static defaults for model fields not coming from API
+    default_values = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text='Default values, e.g. {"item_type": "product", "track_inventory": false}',
+    )
+
+    # API key whose value is used as __row_id (for token resolution). If blank, look for "__row_id" in field_mappings.
+    row_id_api_key = models.CharField(
+        max_length=80,
+        blank=True,
+        help_text="API key whose value is used as __row_id (e.g. codigo). Same key can still map to a model field.",
+    )
+
+    # Optional: emit a category sheet first (MPTT). Keys in same item used to build category rows.
+    category_from_same_response = models.BooleanField(
+        default=False,
+        help_text="If True, unique category keys are emitted as ProductServiceCategory rows first.",
+    )
+    category_name_key = models.CharField(
+        max_length=80,
+        blank=True,
+        help_text="API key for category name (e.g. descricao_familia)",
+    )
+    category_id_key = models.CharField(
+        max_length=80,
+        blank=True,
+        help_text="API key for stable category id (e.g. codigo_familia). Used for __row_id.",
+    )
+    category_target_model = models.CharField(
+        max_length=100,
+        blank=True,
+        default="ProductServiceCategory",
+        help_text="Model for category rows.",
+    )
+    category_fk_field = models.CharField(
+        max_length=60,
+        blank=True,
+        default="category_fk",
+        help_text="Target model FK field pointing to category (e.g. category_fk).",
+    )
+
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name = "ERP API ETL Mapping"
+        indexes = [
+            models.Index(fields=["company", "response_list_key"]),
+            models.Index(fields=["company", "is_active"]),
+        ]
+
+    def __str__(self):
+        return f"{self.name}: {self.response_list_key} → {self.target_model}"

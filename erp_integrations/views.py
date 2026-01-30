@@ -4,12 +4,14 @@ from rest_framework.views import APIView
 
 from multitenancy.mixins import ScopedQuerysetMixin
 
+from .erp_etl import execute_erp_etl_import
 from .models import ERPAPIDefinition, ERPConnection
 from .serializers import (
     BuildPayloadRequestSerializer,
     ERPAPIDefinitionSerializer,
     ERPConnectionListSerializer,
     ERPConnectionSerializer,
+    ErpEtlImportRequestSerializer,
 )
 from .services.payload_builder import build_payload_by_ids
 
@@ -77,3 +79,39 @@ class BuildPayloadView(APIView):
             )
 
         return Response({"payload": payload}, status=status.HTTP_200_OK)
+
+
+class ErpEtlImportView(APIView):
+    """
+    POST: Run ERP API ETL import (preview or commit).
+    Body: { "mapping_id": int, "response": { ... }, "commit": bool }.
+    Same flow as Excel ETL: preview first, then commit when ready.
+    """
+
+    def post(self, request, tenant_id=None):
+        serializer = ErpEtlImportRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        tenant = getattr(request, "tenant", None)
+        company_id = getattr(tenant, "id", None) if tenant and tenant != "all" else None
+        if not company_id and (not request.user or not request.user.is_superuser):
+            return Response(
+                {"detail": "Tenant (company) required for ERP ETL import."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        result = execute_erp_etl_import(
+            company_id=company_id,
+            response_payload=data["response"],
+            mapping_id=data["mapping_id"],
+            commit=data.get("commit", False),
+            import_metadata={"source": "ErpEtlImportView", "function": "execute_erp_etl_import"},
+        )
+        # Early failure (mapping not found, no sheets)
+        if result.get("errors"):
+            return Response(result, status=status.HTTP_400_BAD_REQUEST)
+        # Commit requested but transaction was rolled back (e.g. validation failed)
+        if data.get("commit") and not result.get("committed"):
+            return Response(result, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result, status=status.HTTP_200_OK)
