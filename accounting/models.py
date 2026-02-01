@@ -384,6 +384,8 @@ class Transaction(TenantAwareBaseModel):
             models.Index(fields=['amount']),
             # If you often filter by company (inherited from TenantAwareBaseModel), add:
             models.Index(fields=['company']),
+            # Performance: tenant + date range for list views and filters
+            models.Index(fields=['company', 'date']),
         ]
     
     def clean_fields(self, exclude=None):
@@ -555,6 +557,12 @@ class JournalEntry(TenantAwareBaseModel):
             models.Index(fields=['cost_center']),
             models.Index(fields=['date']),
             models.Index(fields=['bank_designation_pending']),
+            # Performance: account + date for financial statement JE fetches
+            models.Index(fields=['account', 'date']),
+            # Performance: tenant + account + date for report and balance queries
+            models.Index(fields=['company', 'account', 'date']),
+            # Performance: transaction detail views
+            models.Index(fields=['transaction', 'account']),
         ]
         constraints = [
             CheckConstraint(
@@ -724,6 +732,10 @@ class BankTransaction(TenantAwareBaseModel):
             models.Index(fields=['bank_account']),     # keep this; used in joins
             models.Index(fields=['amount']),
             models.Index(fields=['status']),
+            # Performance: tenant + date range for dashboards and filters
+            models.Index(fields=['company', 'date']),
+            # Performance: tenant + status for status-based filters
+            models.Index(fields=['company', 'status']),
         ]
 
     def __str__(self):
