@@ -134,7 +134,8 @@ def build_detailed_statement_excel(
                      posted_total_debit, posted_total_credit, bank_reconciled_*, all_*,
                      balance_type_used, net_movement_used (or ending_balance_used for balance sheet)
     journal_entry_rows: optional list of journal entry dicts (id, transaction_id, date, description,
-                        account_id, account_code, account_name, debit_amount, credit_amount, state, is_reconciled)
+                        account_id, account_code, account_name, debit_amount, credit_amount, state, is_reconciled,
+                        report_lines: semicolon-separated list of report line descriptions where the JE was considered)
     """
     journal_entry_rows = journal_entry_rows or []
     wb = Workbook()
@@ -267,7 +268,7 @@ def build_detailed_statement_excel(
         je_headers = [
             'journal_entry_id', 'transaction_id', 'date', 'transaction_date', 'description',
             'account_id', 'account_code', 'account_name', 'debit_amount', 'credit_amount',
-            'state', 'is_reconciled',
+            'state', 'is_reconciled', 'report_lines',
         ]
         for col, h in enumerate(je_headers, 1):
             ws_je.cell(row=1, column=col, value=h.replace('_', ' ').title())

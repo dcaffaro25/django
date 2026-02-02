@@ -66,6 +66,48 @@ def _collect_account_ids_from_report(report, report_type):
     return ids
 
 
+def _build_account_report_lines_map(report, report_type):
+    """
+    Build a mapping account_id -> list of report line descriptions (section > path/name)
+    so we can show where each journal entry was considered in the financial report.
+    """
+    section_config = {
+        'income_statement': [
+            ('revenues', 'Revenue'),
+            ('costs', 'Cost of Goods Sold'),
+            ('expenses', 'Expenses'),
+        ],
+        'balance_sheet': [
+            ('assets', 'Assets'),
+            ('liabilities', 'Liabilities'),
+            ('equity', 'Equity'),
+        ],
+        'cash_flow': [
+            ('operating', 'Operating Activities'),
+            ('investing', 'Investing Activities'),
+            ('financing', 'Financing Activities'),
+        ],
+    }
+    config = section_config.get(report_type, [])
+    account_to_lines = {}  # account_id -> list of "Section > Path" strings
+
+    def walk(nodes, section_label):
+        for node in (nodes or []):
+            acc_id = node.get('id')
+            if acc_id is not None:
+                path = (node.get('path') or '').strip()
+                name = (node.get('name') or '').strip()
+                label = path if path else (name or str(acc_id))
+                place = f"{section_label} > {label}" if label else section_label
+                account_to_lines.setdefault(acc_id, []).append(place)
+            walk(node.get('children') or [], section_label)
+
+    for key, section_label in config:
+        walk(report.get(key) or [], section_label)
+
+    return account_to_lines
+
+
 def _months_in_range(start_date, end_date):
     """Yield (year, month) from start_date through end_date (inclusive by month)."""
     from calendar import monthrange
@@ -2107,6 +2149,9 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     start_date=start_date,
                     end_date=end_date,
                 )
+                account_report_lines = _build_account_report_lines_map(income_statement, 'income_statement')
+                for je in journal_entries:
+                    je['report_lines'] = '; '.join(account_report_lines.get(je.get('account_id'), []))
                 excel_b64 = build_detailed_statement_excel_base64(
                     report=income_statement,
                     report_type='income_statement',
@@ -2247,6 +2292,9 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     balance_type=balance_type,
                     as_of_date=as_of_date,
                 )
+                account_report_lines = _build_account_report_lines_map(balance_sheet, 'balance_sheet')
+                for je in journal_entries:
+                    je['report_lines'] = '; '.join(account_report_lines.get(je.get('account_id'), []))
                 excel_b64 = build_detailed_statement_excel_base64(
                     report=balance_sheet,
                     report_type='balance_sheet',
@@ -2397,6 +2445,9 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     start_date=start_date,
                     end_date=end_date,
                 )
+                account_report_lines = _build_account_report_lines_map(cash_flow, 'cash_flow')
+                for je in journal_entries:
+                    je['report_lines'] = '; '.join(account_report_lines.get(je.get('account_id'), []))
                 excel_b64 = build_detailed_statement_excel_base64(
                     report=cash_flow,
                     report_type='cash_flow',
