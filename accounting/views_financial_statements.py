@@ -45,6 +45,32 @@ from .models import Currency, Account, JournalEntry
 log = logging.getLogger(__name__)
 
 
+def _get_report_scope_account_ids(company_id, *parent_id_lists):
+    """
+    Get all account IDs in the report scope (all descendants of the given parent IDs).
+    Use this for journal entries so we include entries for all report accounts,
+    including those filtered out (zero balance, depth limit) from the displayed report.
+    """
+    all_parent_ids = []
+    for lst in parent_id_lists:
+        all_parent_ids.extend(lst or [])
+    if not all_parent_ids:
+        return set()
+    parent_accounts = Account.objects.filter(
+        company_id=company_id,
+        id__in=all_parent_ids,
+        is_active=True,
+    )
+    account_ids = set()
+    for parent in parent_accounts:
+        descendants = parent.get_descendants(include_self=True).filter(
+            company_id=company_id,
+            is_active=True,
+        )
+        account_ids.update(descendants.values_list('id', flat=True))
+    return account_ids
+
+
 def _collect_account_ids_from_report(report, report_type):
     """Recursively collect all account IDs from report tree nodes (id is not None)."""
     section_keys = {
@@ -2130,12 +2156,16 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 expense_depth=expense_depth,
             )
             # Build Excel with calculation memory, raw data, and journal entries; attach base64 for Retool download
-            account_ids = _collect_account_ids_from_report(income_statement, 'income_statement')
+            # Use full report scope (all descendants) for journal entries so we include entries from
+            # all accounts (revenue, costs, expenses), including those filtered out by zero balance or depth
+            report_scope_account_ids = _get_report_scope_account_ids(
+                company_id, revenue_parent_ids, cost_parent_ids, expense_parent_ids
+            )
             currency_id_report = (income_statement.get('currency') or {}).get('id')
             if currency_id_report is not None:
                 raw_history = _fetch_raw_balance_history(
                     company_id=company_id,
-                    account_ids=account_ids,
+                    account_ids=report_scope_account_ids,
                     currency_id=currency_id_report,
                     balance_type=balance_type,
                     start_date=start_date,
@@ -2143,7 +2173,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 )
                 journal_entries = _fetch_journal_entries_for_report(
                     company_id=company_id,
-                    account_ids=account_ids,
+                    account_ids=report_scope_account_ids,
                     currency_id=currency_id_report,
                     balance_type=balance_type,
                     start_date=start_date,
@@ -2275,19 +2305,22 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 equity_depth=equity_depth,
             )
             # Build Excel with calculation memory, raw data, and journal entries; attach base64 for Retool download
-            account_ids = _collect_account_ids_from_report(balance_sheet, 'balance_sheet')
+            # Use full report scope so we include journal entries from all accounts (assets, liabilities, equity)
+            report_scope_account_ids = _get_report_scope_account_ids(
+                company_id, asset_parent_ids, liability_parent_ids, equity_parent_ids
+            )
             currency_id_report = (balance_sheet.get('currency') or {}).get('id')
             if currency_id_report is not None:
                 raw_history = _fetch_raw_balance_history(
                     company_id=company_id,
-                    account_ids=account_ids,
+                    account_ids=report_scope_account_ids,
                     currency_id=currency_id_report,
                     balance_type=balance_type,
                     as_of_date=as_of_date,
                 )
                 journal_entries = _fetch_journal_entries_for_report(
                     company_id=company_id,
-                    account_ids=account_ids,
+                    account_ids=report_scope_account_ids,
                     currency_id=currency_id_report,
                     balance_type=balance_type,
                     as_of_date=as_of_date,
@@ -2426,12 +2459,15 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 financing_depth=financing_depth,
             )
             # Build Excel with calculation memory, raw data, and journal entries; attach base64 for Retool download
-            account_ids = _collect_account_ids_from_report(cash_flow, 'cash_flow')
+            # Use full report scope so we include journal entries from all accounts (operating, investing, financing)
+            report_scope_account_ids = _get_report_scope_account_ids(
+                company_id, operating_parent_ids, investing_parent_ids, financing_parent_ids
+            )
             currency_id_report = (cash_flow.get('currency') or {}).get('id')
             if currency_id_report is not None:
                 raw_history = _fetch_raw_balance_history(
                     company_id=company_id,
-                    account_ids=account_ids,
+                    account_ids=report_scope_account_ids,
                     currency_id=currency_id_report,
                     balance_type=balance_type,
                     start_date=start_date,
@@ -2439,7 +2475,7 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 )
                 journal_entries = _fetch_journal_entries_for_report(
                     company_id=company_id,
-                    account_ids=account_ids,
+                    account_ids=report_scope_account_ids,
                     currency_id=currency_id_report,
                     balance_type=balance_type,
                     start_date=start_date,
