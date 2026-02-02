@@ -455,6 +455,18 @@ def _build_excel_for_quick_statement(statement, template=None):
         'as_of_date': str(as_of_date),
         'report_type': report_type,
     }
+    # Same line structure as markdown (Line | Label | Balance) plus debug: indent_level, is_bold, account_ids
+    template_lines = [
+        {
+            'line_number': getattr(l, 'line_number', None),
+            'indent_level': getattr(l, 'indent_level', 0) or 0,
+            'label': getattr(l, 'label', '') or '',
+            'is_bold': getattr(l, 'is_bold', False),
+            'balance': float(l.balance) if getattr(l, 'balance', None) is not None else None,
+            'account_ids': (getattr(l, 'account_ids', None) or []) if isinstance(getattr(l, 'account_ids', None), list) else [],
+        }
+        for l in lines
+    ]
     excel_b64 = build_detailed_statement_excel_base64(
         report=report,
         report_type=report_type,
@@ -463,6 +475,7 @@ def _build_excel_for_quick_statement(statement, template=None):
         balance_type=balance_type,
         journal_entry_rows=journal_entries,
         template_section_label=template_section_label,
+        template_lines=template_lines,
     )
     return excel_b64, filename
 

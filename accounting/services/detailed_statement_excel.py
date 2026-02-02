@@ -269,6 +269,7 @@ def build_detailed_statement_excel(
     balance_type: str = 'posted',
     journal_entry_rows: Optional[List[Dict[str, Any]]] = None,
     template_section_label: Optional[str] = None,
+    template_lines: Optional[List[Dict[str, Any]]] = None,
 ) -> bytes:
     """
     Build an Excel workbook for a detailed financial statement.
@@ -283,8 +284,11 @@ def build_detailed_statement_excel(
                         report_lines: semicolon-separated list of report line descriptions where the JE was considered)
     template_section_label: when set (template-based report), use this as the section label instead of
                             Revenue/Costs/Expenses or Assets/Liabilities/Equity for the single section with data.
+    template_lines: when set (template-based report), list of dicts with line_number, indent_level, label, is_bold,
+                    balance, account_ids. Used to build a "Statement Lines (Debug)" sheet matching markdown wording.
     """
     journal_entry_rows = journal_entry_rows or []
+    template_lines = template_lines or []
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -364,8 +368,42 @@ def build_detailed_statement_excel(
     for c in range(1, 9):
         ws_detail.column_dimensions[get_column_letter(c)].width = 18 if c in (5, 6) else 14
 
-    # ----- Sheet 3: Report Hierarchy with Journal Entries (pivot-style) -----
-    ws_hierarchy_je = wb.create_sheet('Report Hierarchy with Journal Entries', 2)
+    sheet_idx = 2
+    # ----- Statement Lines (Debug): same line names as markdown, with debug detail -----
+    if template_section_label and template_lines:
+        ws_debug = wb.create_sheet('Statement Lines (Debug)', sheet_idx)
+        # Same structure as markdown: Line | Label | Balance; plus debug: Indent Level | Label (indented) | Is Bold | Account IDs
+        debug_headers = ['Line Number', 'Indent Level', 'Label', 'Label (indented)', 'Is Bold', 'Balance', 'Account IDs']
+        for col, h in enumerate(debug_headers, 1):
+            ws_debug.cell(row=1, column=col, value=h)
+        _style_header(ws_debug, 1, len(debug_headers))
+        for r_idx, line_data in enumerate(template_lines, start=2):
+            line_num = line_data.get('line_number')
+            indent = line_data.get('indent_level', 0) or 0
+            label = (line_data.get('label') or '').strip()
+            label_indented = ('    ' * indent) + label  # same visual as markdown (4 spaces per level)
+            is_bold = line_data.get('is_bold', False)
+            balance = line_data.get('balance')
+            account_ids = line_data.get('account_ids') or []
+            account_ids_str = ', '.join(str(a) for a in account_ids) if isinstance(account_ids, list) else str(account_ids)
+            ws_debug.cell(row=r_idx, column=1, value=line_num)
+            ws_debug.cell(row=r_idx, column=2, value=indent)
+            ws_debug.cell(row=r_idx, column=3, value=label)
+            ws_debug.cell(row=r_idx, column=4, value=label_indented)
+            ws_debug.cell(row=r_idx, column=5, value=is_bold)
+            if balance is not None:
+                ws_debug.cell(row=r_idx, column=6, value=float(balance) if isinstance(balance, (Decimal, float)) else balance)
+            else:
+                ws_debug.cell(row=r_idx, column=6, value=None)
+            ws_debug.cell(row=r_idx, column=7, value=account_ids_str)
+        for c in range(1, len(debug_headers) + 1):
+            ws_debug.column_dimensions[get_column_letter(c)].width = 18 if c in (6, 7) else 14
+        ws_debug.column_dimensions['C'].width = 45
+        ws_debug.column_dimensions['D'].width = 50
+        sheet_idx += 1
+
+    # ----- Report Hierarchy with Journal Entries (pivot-style) -----
+    ws_hierarchy_je = wb.create_sheet('Report Hierarchy with Journal Entries', sheet_idx)
     hierarchy_je_rows = _build_hierarchy_with_je_rows(
         report, report_type, journal_entry_rows,
         template_section_label=template_section_label,
@@ -396,9 +434,10 @@ def build_detailed_statement_excel(
         ws_hierarchy_je.column_dimensions[get_column_letter(c)].width = 16
     ws_hierarchy_je.column_dimensions['C'].width = 45
     ws_hierarchy_je.column_dimensions['N'].width = 40
+    sheet_idx += 1
 
-    # ----- Sheet 4: Calculation Memory -----
-    ws_calc = wb.create_sheet('Calculation Memory', 3)
+    # ----- Calculation Memory -----
+    ws_calc = wb.create_sheet('Calculation Memory', sheet_idx)
     if template_section_label:
         # Template-based: use neutral wording (no Revenue/COGS/Expenses)
         calc_rows = _collect_calculation_memory_template(report, request_params, balance_type, report_type)
@@ -423,9 +462,10 @@ def build_detailed_statement_excel(
     ws_calc.column_dimensions['A'].width = 18
     ws_calc.column_dimensions['B'].width = 55
     ws_calc.column_dimensions['C'].width = 22
+    sheet_idx += 1
 
-    # ----- Sheet 5: Request Parameters -----
-    ws_params = wb.create_sheet('Request Parameters', 4)
+    # ----- Request Parameters -----
+    ws_params = wb.create_sheet('Request Parameters', sheet_idx)
     ws_params.cell(row=1, column=1, value='Parameter')
     ws_params.cell(row=1, column=2, value='Value')
     _style_header(ws_params, 1, 2)
@@ -458,9 +498,10 @@ def build_detailed_statement_excel(
     else:
         ws_raw.cell(row=1, column=1, value='No raw balance history rows (leaf accounts may have no history in period).')
     ws_raw.column_dimensions['A'].width = 50
+    sheet_idx += 1
 
-    # ----- Sheet 7: Journal Entries (pivot-friendly: Report Section, Report Line first) -----
-    ws_je = wb.create_sheet('Journal Entries', 6)
+    # ----- Journal Entries (pivot-friendly: Report Section, Report Line first) -----
+    ws_je = wb.create_sheet('Journal Entries', sheet_idx)
     if journal_entry_rows:
         # Pivot-friendly: Report Section and Report Line first so Excel Pivot Table can group by them
         je_headers = [
@@ -507,9 +548,10 @@ def build_detailed_statement_excel(
     else:
         ws_je.cell(row=1, column=1, value='No journal entries in period for the report accounts (or filter excluded them).')
     ws_je.column_dimensions['A'].width = 22
+    sheet_idx += 1
 
-    # ----- Sheet 8: Leaf Account Summary (per-account totals from raw data) -----
-    ws_leaf = wb.create_sheet('Leaf Account Summary', 7)
+    # ----- Leaf Account Summary (per-account totals from raw data) -----
+    ws_leaf = wb.create_sheet('Leaf Account Summary', sheet_idx)
     if raw_history_rows:
         def _dec(x):
             return Decimal(str(x)) if x is not None else Decimal('0')
@@ -580,6 +622,7 @@ def build_detailed_statement_excel_base64(
     balance_type: str = 'posted',
     journal_entry_rows: Optional[List[Dict[str, Any]]] = None,
     template_section_label: Optional[str] = None,
+    template_lines: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Same as build_detailed_statement_excel but returns base64-encoded string."""
     data = build_detailed_statement_excel(
@@ -590,5 +633,6 @@ def build_detailed_statement_excel_base64(
         balance_type=balance_type,
         journal_entry_rows=journal_entry_rows,
         template_section_label=template_section_label,
+        template_lines=template_lines,
     )
     return base64.b64encode(data).decode('ascii')
