@@ -92,6 +92,33 @@ def _collect_account_ids_from_report(report, report_type):
     return ids
 
 
+def _build_account_section_fallback_map(company_id, *parent_id_lists_with_sections):
+    """
+    Map account_id -> section label for ALL accounts in report scope.
+    Used as fallback when an account is in scope but not in the displayed report (filtered out).
+    parent_id_lists_with_sections: list of (parent_id_list, section_label) tuples.
+    """
+    parent_to_section = {}
+    all_parent_ids = []
+    for parent_ids, section_label in parent_id_lists_with_sections:
+        for pid in (parent_ids or []):
+            parent_to_section[pid] = section_label
+            all_parent_ids.append(pid)
+    if not all_parent_ids:
+        return {}
+    scope_ids = _get_report_scope_account_ids(company_id, *[p for p, _ in parent_id_lists_with_sections])
+    if not scope_ids:
+        return {}
+    account_to_section = {}
+    accounts = Account.objects.filter(id__in=scope_ids)
+    for acc in accounts:
+        for ancestor in acc.get_ancestors(include_self=True):
+            if ancestor.id in parent_to_section:
+                account_to_section[acc.id] = parent_to_section[ancestor.id]
+                break
+    return account_to_section
+
+
 def _build_account_report_lines_map(report, report_type):
     """
     Build a mapping account_id -> list of report line descriptions (section > path/name)
@@ -2180,8 +2207,17 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     end_date=end_date,
                 )
                 account_report_lines = _build_account_report_lines_map(income_statement, 'income_statement')
+                account_section_fallback = _build_account_section_fallback_map(
+                    company_id,
+                    (revenue_parent_ids, 'Revenue'),
+                    (cost_parent_ids, 'Cost of Goods Sold'),
+                    (expense_parent_ids, 'Expenses'),
+                )
                 for je in journal_entries:
-                    je['report_lines'] = '; '.join(account_report_lines.get(je.get('account_id'), []))
+                    lines = account_report_lines.get(je.get('account_id'), [])
+                    if not lines and je.get('account_id') in account_section_fallback:
+                        lines = [account_section_fallback[je['account_id']]]
+                    je['report_lines'] = '; '.join(lines)
                 excel_b64 = build_detailed_statement_excel_base64(
                     report=income_statement,
                     report_type='income_statement',
@@ -2326,8 +2362,17 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     as_of_date=as_of_date,
                 )
                 account_report_lines = _build_account_report_lines_map(balance_sheet, 'balance_sheet')
+                account_section_fallback = _build_account_section_fallback_map(
+                    company_id,
+                    (asset_parent_ids, 'Assets'),
+                    (liability_parent_ids, 'Liabilities'),
+                    (equity_parent_ids, 'Equity'),
+                )
                 for je in journal_entries:
-                    je['report_lines'] = '; '.join(account_report_lines.get(je.get('account_id'), []))
+                    lines = account_report_lines.get(je.get('account_id'), [])
+                    if not lines and je.get('account_id') in account_section_fallback:
+                        lines = [account_section_fallback[je['account_id']]]
+                    je['report_lines'] = '; '.join(lines)
                 excel_b64 = build_detailed_statement_excel_base64(
                     report=balance_sheet,
                     report_type='balance_sheet',
@@ -2482,8 +2527,17 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     end_date=end_date,
                 )
                 account_report_lines = _build_account_report_lines_map(cash_flow, 'cash_flow')
+                account_section_fallback = _build_account_section_fallback_map(
+                    company_id,
+                    (operating_parent_ids, 'Operating Activities'),
+                    (investing_parent_ids, 'Investing Activities'),
+                    (financing_parent_ids, 'Financing Activities'),
+                )
                 for je in journal_entries:
-                    je['report_lines'] = '; '.join(account_report_lines.get(je.get('account_id'), []))
+                    lines = account_report_lines.get(je.get('account_id'), [])
+                    if not lines and je.get('account_id') in account_section_fallback:
+                        lines = [account_section_fallback[je['account_id']]]
+                    je['report_lines'] = '; '.join(lines)
                 excel_b64 = build_detailed_statement_excel_base64(
                     report=cash_flow,
                     report_type='cash_flow',
