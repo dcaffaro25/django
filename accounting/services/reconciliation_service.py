@@ -848,108 +848,13 @@ class ReconciliationPipelineEngine:
     # ------------------------ Stage handlers ------------------------
 
     def _run_exact_1to1(self, banks, books, stage: StageConfig):
-        log.info("_run_exact_1to1: starting with banks=%d books=%d", len(banks), len(books))
-        tol = int(stage.avg_date_delta_days or 0)
-        # Deterministic sorting for stable results
-        banks_sorted = sorted(banks, key=lambda b: (b.date or date.min, b.id))
-        books_sorted = sorted(books, key=lambda b: (b.date or date.min, b.id))
-        
-        matches_attempted = 0
-        matches_tested = 0
-        matches_found = 0
-        
-        for bank in banks_sorted:
-            if self._time_exceeded():
-                log.debug("_run_exact_1to1: time exceeded, stopping")
-                return
-            
-            # Check inside lock for thread safety
-            with self._used_banks_lock:
-                if bank.id in self.used_banks:
-                    continue
-            
-            matches_attempted += 1
-            log.debug(
-                "exact_1to1: testing bank_id=%d amount=%s date=%s currency_id=%d company_id=%d",
-                bank.id, bank.amount_base, bank.date, bank.currency_id, bank.company_id,
-            )
-            
-            for book in books_sorted:
-                # Check inside lock for thread safety
-                with self._used_books_lock:
-                    if book.id in self.used_books:
-                        continue
-                
-                matches_tested += 1
-                log.debug(
-                    "exact_1to1: testing pair bank_id=%d vs book_id=%d "
-                    "(bank_amount=%s book_amount=%s bank_date=%s book_date=%s)",
-                    bank.id, book.id,
-                    bank.amount_base, book.amount_base,
-                    bank.date, book.date,
-                )
-                
-                if bank.company_id != book.company_id:
-                    log.debug(
-                        "exact_1to1: REJECTED bank_id=%d book_id=%d - company mismatch "
-                        "(bank_company=%d book_company=%d)",
-                        bank.id, book.id, bank.company_id, book.company_id,
-                    )
-                    continue
-                if q2(bank.amount_base) != q2(book.amount_base):
-                    log.debug(
-                        "exact_1to1: REJECTED bank_id=%d book_id=%d - amount mismatch "
-                        "(bank_amount=%s book_amount=%s)",
-                        bank.id, book.id, bank.amount_base, book.amount_base,
-                    )
-                    continue
-                if bank.currency_id != book.currency_id:
-                    log.debug(
-                        "exact_1to1: REJECTED bank_id=%d book_id=%d - currency mismatch "
-                        "(bank_currency=%d book_currency=%d)",
-                        bank.id, book.id, bank.currency_id, book.currency_id,
-                    )
-                    continue
-                # Cross-side constraint: |bank.date - book.date| <= avg_date_delta_days
-                if bank.date and book.date:
-                    date_diff = abs((bank.date - book.date).days)
-                    if date_diff > tol:
-                        log.debug(
-                            "exact_1to1: REJECTED bank_id=%d book_id=%d - date delta too large "
-                            "(delta=%d tol=%d)",
-                            bank.id, book.id, date_diff, tol,
-                        )
-                        continue
-                    log.debug(
-                        "exact_1to1: date check PASSED bank_id=%d book_id=%d (delta=%d tol=%d)",
-                        bank.id, book.id, date_diff, tol,
-                    )
-                
-                log.info(
-                    "exact_1to1: MATCH FOUND bank_id=%d book_id=%d "
-                    "(amount=%s currency=%d date_diff=%d)",
-                    bank.id, book.id,
-                    bank.amount_base,
-                    bank.currency_id,
-                    abs((bank.date - book.date).days) if (bank.date and book.date) else 0,
-                )
-                matches_found += 1
-                self._record(
-                    self._make_suggestion(
-                        "exact_1to1",
-                        [bank],
-                        [book],
-                        1.0,
-                        stage=stage,
-                        weights=self.stage_weights,
-                    )
-                )
-                break
-        
-        log.info(
-            "_run_exact_1to1: completed - matches_attempted=%d matches_tested=%d matches_found=%d",
-            matches_attempted, matches_tested, matches_found,
-        )
+        """
+        Exact 1-to-1 uses the same logic as fuzzy 1-to-1 (date bins, amount buckets,
+        scoring, global non-overlapping selection) with the stage's bank/book combo
+        size (1-to-1), date tolerance (avg_date_delta_days), and amount tolerance
+        (amount_tol). Typically the exact stage config uses tighter/zero tolerances.
+        """
+        self._run_fuzzy_1to1(banks, books, stage, match_type="exact_1to1")
 
     
     def _find_mixed_many_to_one_group(
@@ -2016,9 +1921,10 @@ class ReconciliationPipelineEngine:
                             )
 
 
-    def _run_fuzzy_1to1(self, banks, books, stage: StageConfig):
+    def _run_fuzzy_1to1(self, banks, books, stage: StageConfig, match_type: str = "fuzzy_1to1"):
         """
         Fuzzy 1-to-1 matching with global non-overlapping selection.
+        Also used for exact_1to1 with tighter stage tolerances (amount_tol, avg_date_delta_days).
 
         Passos:
           1) Gerar todos os candidatos (bank, book) válidos com score
@@ -2028,8 +1934,8 @@ class ReconciliationPipelineEngine:
              stage.max_alternatives_per_anchor (sem marcar used_*).
         """
         log.info(
-            "_run_fuzzy_1to1: START - banks=%d books=%d used_banks=%d used_books=%d",
-            len(banks), len(books), len(self.used_banks), len(self.used_books),
+            "_run_fuzzy_1to1: START match_type=%s banks=%d books=%d used_banks=%d used_books=%d",
+            match_type, len(banks), len(books), len(self.used_banks), len(self.used_books),
         )
         
         win = stage.candidate_window_days
@@ -2262,7 +2168,7 @@ class ReconciliationPipelineEngine:
             )
 
             suggestion = self._make_suggestion(
-                "fuzzy_1to1",
+                match_type,
                 [bank],
                 [book],
                 scores["global_score"],
@@ -2327,7 +2233,7 @@ class ReconciliationPipelineEngine:
             weights = c["weights"]
 
             alt_suggestion = self._make_suggestion(
-                "fuzzy_1to1",
+                match_type,
                 [bank],
                 [book],
                 scores["global_score"],

@@ -1163,3 +1163,67 @@ class ReconciliationSuggestion(models.Model):
 
     def __str__(self):
         return f"Suggestion(task={self.task_id}, type={self.match_type}, conf={self.confidence_score}, status={self.status})"
+
+
+class ReconciliationRule(TenantAwareBaseModel):
+    """
+    Learned matching rules derived from accepted reconciliation matches.
+    Stores regex patterns for bank/book description matching; validated rules
+    can be applied in the reconciliation engine to improve accuracy.
+    """
+
+    RULE_TYPE_CHOICES = [
+        ("description_pattern", "Description Pattern"),
+        ("numeric_pattern", "Numeric Pattern (invoice/ref)"),
+        ("entity_match", "Entity/Counterpart Match"),
+    ]
+
+    STATUS_CHOICES = [
+        ("proposed", "Proposed"),      # generated, pending validation
+        ("validated", "Validated"),    # user confirmed
+        ("rejected", "Rejected"),      # user rejected
+        ("active", "Active"),          # in use for matching
+    ]
+
+    name = models.CharField(max_length=255)
+    rule_type = models.CharField(max_length=32, choices=RULE_TYPE_CHOICES)
+
+    # Pattern definition
+    bank_pattern = models.CharField(max_length=500)       # regex for bank description
+    book_pattern = models.CharField(max_length=500)       # regex for book description
+    extraction_groups = models.JSONField(default=dict)    # named capture groups mapping
+
+    # Confidence and stats
+    sample_count = models.PositiveIntegerField(default=0)   # matches this rule was derived from
+    accuracy_score = models.DecimalField(
+        max_digits=5, decimal_places=4, null=True, blank=True
+    )
+
+    # Status tracking
+    status = models.CharField(
+        max_length=16, choices=STATUS_CHOICES, default="proposed", db_index=True
+    )
+    validated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reconciliation_rules_validated",
+    )
+    validated_at = models.DateTimeField(null=True, blank=True)
+
+    # Sample matches used to derive this rule
+    sample_suggestions = models.ManyToManyField(
+        ReconciliationSuggestion,
+        blank=True,
+        related_name="derived_rules",
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["company", "rule_type"]),
+            models.Index(fields=["company", "status"]),
+        ]
+
+    def __str__(self):
+        return f"ReconciliationRule(id={self.id}, {self.name}, type={self.rule_type}, status={self.status})"

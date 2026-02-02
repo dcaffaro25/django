@@ -18,7 +18,8 @@ logger = logging.getLogger(__name__)
 from .models import (
     Currency, CostCenter, Bank, BankAccount, AllocationBase,
     Account, Transaction, JournalEntry, Rule,
-    BankTransaction, Reconciliation, ReconciliationTask, ReconciliationConfig
+    BankTransaction, Reconciliation, ReconciliationTask, ReconciliationConfig,
+    ReconciliationRule,
 )
 from .models_financial_statements import (
     FinancialStatementTemplate,
@@ -953,6 +954,17 @@ class ReconciliationTaskAdmin(PlainAdmin):
     list_display = ("id", "task_id", "tenant_id", "status", "created_at", "updated_at")
     list_filter = ("status",)
     search_fields = ("task_id", "tenant_id", "status")
+
+
+@admin.register(ReconciliationRule)
+class ReconciliationRuleAdmin(CompanyScopedAdmin):
+    list_display = ("id", "name", "rule_type", "status", "company", "sample_count", "validated_at")
+    list_filter = ("rule_type", "status", "company")
+    search_fields = ("name", "bank_pattern", "book_pattern")
+    autocomplete_fields = ("company", "validated_by")
+    filter_horizontal = ("sample_suggestions",)
+    readonly_fields = ("validated_at",)
+
 
 @admin.register(Rule)
 class RuleAdmin(PlainAdmin):

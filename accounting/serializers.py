@@ -4,7 +4,8 @@ from rest_framework import serializers
 from .models import (Currency, Account, Transaction, JournalEntry, 
                      ReconciliationTask, Rule, Bank, BankAccount, BankTransaction, 
                      Reconciliation, CostCenter, ReconciliationConfig,
-                     ReconciliationPipeline, ReconciliationPipelineStage)
+                     ReconciliationPipeline, ReconciliationPipelineStage,
+                     ReconciliationRule)
 from multitenancy.serializers import CompanySerializer, EntitySerializer, FlexibleRelatedField
 from multitenancy.serializers import CompanyMiniSerializer, EntityMiniSerializer
 from django.core.exceptions import ObjectDoesNotExist
@@ -720,6 +721,35 @@ class ResolvedReconciliationPipelineSerializer(serializers.ModelSerializer):
         if obj.scope == "company_user" and obj.company and obj.user:
             return f"Company+User Pipeline ({obj.company.name} | {obj.user.username})"
         return obj.scope
+
+
+class ProposedRuleSerializer(serializers.Serializer):
+    """Serializer for a proposed rule returned by the propose endpoint."""
+    temp_id = serializers.CharField(required=False)
+    rule_type = serializers.CharField()
+    name = serializers.CharField()
+    bank_pattern = serializers.CharField()
+    book_pattern = serializers.CharField()
+    extraction_groups = serializers.DictField(required=False, default=dict)
+    sample_count = serializers.IntegerField()
+    accuracy_score = serializers.DecimalField(max_digits=5, decimal_places=4)
+    samples = serializers.ListField(child=serializers.DictField(), required=False, default=list)
+
+
+class ReconciliationRuleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ReconciliationRule
+        fields = "__all__"
+        read_only_fields = ["validated_at"]
+
+
+class ValidateRulesSerializer(serializers.Serializer):
+    """Payload for POST validate: list of rule decisions."""
+    rules = serializers.ListField(
+        child=serializers.DictField(),
+        allow_empty=False,
+    )
+
 
 class StartEmbeddingBackfillSerializer(serializers.Serializer):
     per_model_limit = serializers.IntegerField(required=False, min_value=1)

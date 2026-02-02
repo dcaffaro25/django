@@ -14,7 +14,7 @@ from multitenancy.api_utils import generic_bulk_create, generic_bulk_update, gen
 from multitenancy.utils import resolve_tenant
 from multitenancy.models import CustomUser, Company, Entity
 from multitenancy.mixins import ScopedQuerysetMixin
-from .models import (Currency, Account, Transaction, JournalEntry, Rule, CostCenter, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter,ReconciliationTask, ReconciliationConfig, ReconciliationSuggestion)
+from .models import (Currency, Account, Transaction, JournalEntry, Rule, CostCenter, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter,ReconciliationTask, ReconciliationConfig, ReconciliationSuggestion, ReconciliationRule)
 from .serializers import (CurrencySerializer, AccountSerializer, TransactionSerializer, CostCenterSerializer, JournalEntrySerializer, JournalEntryListSerializer, RuleSerializer, BankSerializer, BankAccountSerializer, BankTransactionSerializer, ReconciliationSerializer, TransactionListSerializer,ReconciliationTaskSerializer,ReconciliationConfigSerializer)
 from .services.transaction_service import *
 from .utils import update_journal_entries_and_transaction_flags, parse_ofx_text, decode_ofx_content, generate_ofx_transaction_hash, find_book_combos
@@ -62,6 +62,11 @@ from .serializers import (
     ResolvedReconciliationPipelineSerializer,
 )
 from .serializers import ResolvedReconciliationConfigSerializer
+from .serializers import (
+    ProposedRuleSerializer,
+    ReconciliationRuleSerializer,
+    ValidateRulesSerializer,
+)
 
 # accounting/views_embeddings.py
 from accounting.tasks import match_many_to_many_task
@@ -4294,6 +4299,138 @@ class ReconciliationPipelineViewSet(viewsets.ModelViewSet):
         )
         serializer = ResolvedReconciliationPipelineSerializer(qs, many=True)
         return Response(serializer.data)
+
+
+class ReconciliationRuleViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
+    """
+    API endpoint for reconciliation rules learned from accepted matches.
+    - GET list: list stored rules (scoped by tenant/company).
+    - GET propose: analyze accepted matches and propose new regex rules (query: company_id, min_samples, date_from, date_to).
+    - POST validate: accept/reject proposed rules and persist validated ones (body: company_id, rules[] with temp_id, status, and full rule fields when status=validated).
+    """
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+
+    queryset = ReconciliationRule.objects.all().order_by("-id")
+    serializer_class = ReconciliationRuleSerializer
+
+    @action(detail=False, methods=["get"], url_path="propose")
+    def propose(self, request):
+        """
+        Analyze accepted reconciliation matches and propose regex-based rules.
+        Query params: company_id (required), min_samples (default 5), date_from, date_to.
+        """
+        company_id = request.query_params.get("company_id")
+        if not company_id:
+            return Response(
+                {"error": "company_id is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            company_id = int(company_id)
+        except (TypeError, ValueError):
+            return Response(
+                {"error": "company_id must be an integer"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        min_samples = request.query_params.get("min_samples", 5)
+        try:
+            min_samples = max(1, int(min_samples))
+        except (TypeError, ValueError):
+            min_samples = 5
+        date_from = request.query_params.get("date_from")
+        date_to = request.query_params.get("date_to")
+
+        from accounting.services.rule_extraction_service import analyze_accepted_matches
+
+        result = analyze_accepted_matches(
+            company_id=company_id,
+            min_samples=min_samples,
+            date_from=date_from or None,
+            date_to=date_to or None,
+        )
+        return Response(result)
+
+    @action(detail=False, methods=["post"], url_path="validate")
+    def validate(self, request):
+        """
+        Validate or reject proposed rules. For status=validated, creates ReconciliationRule.
+        Body: { "company_id": int, "rules": [ { "temp_id", "status", "reason"?, "name"?, "rule_type"?, "bank_pattern"?, "book_pattern"?, "extraction_groups"?, "sample_count"?, "accuracy_score"? } ] }
+        """
+        company_id = request.data.get("company_id")
+        if company_id is None:
+            return Response(
+                {"error": "company_id is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            company_id = int(company_id)
+        except (TypeError, ValueError):
+            return Response(
+                {"error": "company_id must be an integer"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        rules_payload = request.data.get("rules") or []
+        if not isinstance(rules_payload, list):
+            return Response(
+                {"error": "rules must be a list"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        created = []
+        rejected_count = 0
+        user = request.user if request.user.is_authenticated else None
+
+        with transaction.atomic():
+            for item in rules_payload:
+                temp_id = item.get("temp_id", "")
+                status_val = (item.get("status") or "").strip().lower()
+                if status_val == "validated":
+                    name = item.get("name")
+                    rule_type = item.get("rule_type")
+                    bank_pattern = item.get("bank_pattern")
+                    book_pattern = item.get("book_pattern")
+                    if not all([name, rule_type, bank_pattern, book_pattern]):
+                        continue
+                    extraction_groups = item.get("extraction_groups") or {}
+                    sample_count = item.get("sample_count")
+                    if sample_count is None:
+                        sample_count = 0
+                    try:
+                        sample_count = int(sample_count)
+                    except (TypeError, ValueError):
+                        sample_count = 0
+                    accuracy_score = item.get("accuracy_score")
+                    if accuracy_score is not None:
+                        try:
+                            accuracy_score = Decimal(str(accuracy_score))
+                        except Exception:
+                            accuracy_score = None
+
+                    rule = ReconciliationRule.objects.create(
+                        company_id=company_id,
+                        name=name,
+                        rule_type=rule_type,
+                        bank_pattern=bank_pattern[:500],
+                        book_pattern=book_pattern[:500],
+                        extraction_groups=extraction_groups,
+                        sample_count=sample_count,
+                        accuracy_score=accuracy_score,
+                        status="validated",
+                        validated_by=user,
+                        validated_at=timezone.now(),
+                    )
+                    created.append(ReconciliationRuleSerializer(rule).data)
+                elif status_val == "rejected":
+                    rejected_count += 1
+
+        return Response({
+            "created": created,
+            "rejected_count": rejected_count,
+        })
+
 
 class EmbeddingHealthView(APIView):
     if settings.AUTH_OFF:
