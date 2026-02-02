@@ -242,8 +242,10 @@ def _fetch_raw_balance_history(company_id, account_ids, currency_id, balance_typ
 def _fetch_journal_entries_for_report(company_id, account_ids, currency_id, balance_type,
                                        start_date=None, end_date=None, as_of_date=None):
     """
-    Fetch JournalEntry rows that contributed to the report (same accounts, currency, period, balance_type).
+    Fetch JournalEntry rows that contributed to the report (same accounts, period, balance_type).
     For income/cash: entries with date in [start_date, end_date]. For balance sheet: date <= as_of_date.
+    When currency_id is None, does NOT filter by currency - matches balance calculation behavior
+    (balance calc sums all JEs for the account regardless of transaction currency).
     Returns list of dicts with id, transaction_id, date, description, account_id, account_code, account_name,
     debit_amount, credit_amount, state, is_reconciled, transaction_date.
     """
@@ -253,8 +255,9 @@ def _fetch_journal_entries_for_report(company_id, account_ids, currency_id, bala
     qs = JournalEntry.objects.filter(
         account_id__in=account_ids,
         transaction__company_id=company_id,
-        transaction__currency_id=currency_id,
     ).select_related('account', 'transaction').order_by('date', 'id')
+    if currency_id is not None:
+        qs = qs.filter(transaction__currency_id=currency_id)
     if balance_type == 'posted':
         qs = qs.filter(state='posted')
     elif balance_type == 'bank_reconciled':
@@ -287,20 +290,25 @@ def _fetch_journal_entries_for_report(company_id, account_ids, currency_id, bala
     return rows
 
 
-def _build_excel_for_quick_statement(statement, template=None):
+def _build_excel_for_quick_statement(statement, template=None, include_pending=False):
     """
     Build the same comprehensive Excel (calculation memory, raw data, journal entries,
     hierarchy with JEs, pivot-friendly) for a template-based quick statement.
     Uses the template name as section label (row denominations from template), not
     Revenue/Costs/Expenses from the detailed endpoint.
+    include_pending: when True, fetch both posted and pending JEs (matches balance calc).
     Returns (excel_base64_string, filename) or (None, None) if no currency/accounts.
     """
     company_id = statement.company_id
     currency_id = statement.currency_id
     if currency_id is None:
         return None, None
+    # Match balance calculation: use balance_type='all' when include_pending, else 'posted'
+    balance_type = 'all' if include_pending else 'posted'
     template = template or getattr(statement, 'template', None)
     template_section_label = template.name if template else 'Statement Lines'
+    # Journal entries: pass currency_id=None to match balance calc (which sums all currencies)
+    je_currency_id = None
     # Collect all account IDs from statement lines
     lines = list(statement.lines.all().order_by('line_number'))
     all_account_ids = set()
@@ -315,7 +323,6 @@ def _build_excel_for_quick_statement(statement, template=None):
         all_account_ids = set(
             Account.objects.filter(company_id=company_id, is_active=True).values_list('id', flat=True)
         )
-    balance_type = 'posted'
     start_date = statement.start_date
     end_date = statement.end_date
     as_of_date = getattr(statement, 'as_of_date', None) or end_date
@@ -332,7 +339,7 @@ def _build_excel_for_quick_statement(statement, template=None):
         journal_entries = _fetch_journal_entries_for_report(
             company_id=company_id,
             account_ids=all_account_ids,
-            currency_id=currency_id,
+            currency_id=je_currency_id,
             balance_type=balance_type,
             as_of_date=as_of_date,
         )
@@ -348,18 +355,21 @@ def _build_excel_for_quick_statement(statement, template=None):
         journal_entries = _fetch_journal_entries_for_report(
             company_id=company_id,
             account_ids=all_account_ids,
-            currency_id=currency_id,
+            currency_id=je_currency_id,
             balance_type=balance_type,
             start_date=start_date,
             end_date=end_date,
         )
-    # Build account -> report line labels from statement lines (use template name, not Revenue/Costs/Expenses)
+    # Build account -> report line labels from statement lines (include expanded descendants
+    # so JEs from child accounts get the correct report line)
     account_report_lines = {}
     for line in lines:
         ids = line.account_ids if isinstance(line.account_ids, list) else []
         label = f"{template_section_label} > {line.label}"
-        for acc_id in ids or []:
-            account_report_lines.setdefault(acc_id, []).append(label)
+        if ids:
+            expanded = _get_report_scope_account_ids(company_id, list(ids))
+            for acc_id in expanded:
+                account_report_lines.setdefault(acc_id, []).append(label)
     for je in journal_entries:
         je['report_lines'] = '; '.join(account_report_lines.get(je.get('account_id'), []))
     # Build report dict compatible with build_detailed_statement_excel
@@ -516,7 +526,8 @@ def _build_excel_for_comparison_result(company_id, result, template, generator, 
     if not is_preview and statement_id:
         try:
             statement = FinancialStatement.objects.get(id=statement_id, company_id=company_id)
-            return _build_excel_for_quick_statement(statement)
+            inc_pending = result.get('include_pending', include_pending)
+            return _build_excel_for_quick_statement(statement, include_pending=inc_pending)
         except FinancialStatement.DoesNotExist:
             pass
 
@@ -617,7 +628,8 @@ def _build_excel_for_comparison_result(company_id, result, template, generator, 
     mock.total_equity = None
     mock.net_income = None
 
-    return _build_excel_for_quick_statement(mock, template=template)
+    include_pending = result.get('include_pending', include_pending)
+    return _build_excel_for_quick_statement(mock, template=template, include_pending=include_pending)
 
 
 class FinancialStatementTemplateViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
