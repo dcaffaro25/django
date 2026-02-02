@@ -204,6 +204,27 @@ def _collect_calculation_memory_cash_flow(report: Dict, request_params: Dict, ba
     return rows
 
 
+def _collect_calculation_memory_template(
+    report: Dict, request_params: Dict, balance_type: str, report_type: str
+) -> List[Dict]:
+    """Calculation memory for template-based reports (no Revenue/COGS/Expenses wording)."""
+    rows = []
+    totals = report.get('totals') or {}
+    if report_type == 'income_statement':
+        rows.append({'section': 'Parameters', 'description': 'Statement total (net income)', 'value': totals.get('net_income')})
+    elif report_type == 'balance_sheet':
+        rows.append({'section': 'Parameters', 'description': 'Statement total (liabilities and equity)', 'value': totals.get('total_liabilities_and_equity')})
+    else:
+        rows.append({'section': 'Parameters', 'description': 'Statement total (net cash flow)', 'value': totals.get('net_cash_flow')})
+    rows.append({'section': 'Parameters', 'description': 'Balance type used', 'value': balance_type})
+    if report.get('start_date') and report.get('end_date'):
+        rows.append({'section': 'Parameters', 'description': 'Period', 'value': f"{report.get('start_date')} to {report.get('end_date')}"})
+    if report.get('as_of_date'):
+        rows.append({'section': 'Parameters', 'description': 'As of date', 'value': report.get('as_of_date')})
+    rows.append({'section': 'Parameters', 'description': 'Currency', 'value': (report.get('currency') or {}).get('code') or (report.get('currency') or {}).get('name') or ''})
+    return rows
+
+
 def _style_header(ws, row_num: int, num_cols: int):
     """Apply header style to a row."""
     thin = Side(style='thin')
@@ -300,10 +321,18 @@ def build_detailed_statement_excel(
     ws_summary.cell(row=row, column=1, value='Totals')
     _style_header(ws_summary, row, 2)
     row += 1
-    for k in total_keys:
-        ws_summary.cell(row=row, column=1, value=k.replace('_', ' ').title())
-        ws_summary.cell(row=row, column=2, value=totals.get(k))
-        row += 1
+    if template_section_label:
+        # Template-based: do not use Revenue/COGS/Expenses labels; show only statement total
+        total_val = totals.get('net_income') if report_type == 'income_statement' else (
+            totals.get('total_liabilities_and_equity') if report_type == 'balance_sheet' else totals.get('net_cash_flow')
+        )
+        ws_summary.cell(row=row, column=1, value='Statement Total')
+        ws_summary.cell(row=row, column=2, value=total_val)
+    else:
+        for k in total_keys:
+            ws_summary.cell(row=row, column=1, value=k.replace('_', ' ').title())
+            ws_summary.cell(row=row, column=2, value=totals.get(k))
+            row += 1
     ws_summary.column_dimensions['A'].width = 35
     ws_summary.column_dimensions['B'].width = 18
 
@@ -370,7 +399,10 @@ def build_detailed_statement_excel(
 
     # ----- Sheet 4: Calculation Memory -----
     ws_calc = wb.create_sheet('Calculation Memory', 3)
-    if report_type == 'income_statement':
+    if template_section_label:
+        # Template-based: use neutral wording (no Revenue/COGS/Expenses)
+        calc_rows = _collect_calculation_memory_template(report, request_params, balance_type, report_type)
+    elif report_type == 'income_statement':
         calc_rows = _collect_calculation_memory_income(report, request_params, balance_type)
     elif report_type == 'balance_sheet':
         calc_rows = _collect_calculation_memory_balance_sheet(report, request_params, balance_type)
