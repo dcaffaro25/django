@@ -462,6 +462,116 @@ def _build_excel_for_quick_statement(statement):
     return excel_b64, filename
 
 
+def _build_excel_for_comparison_result(company_id, result, template, generator, is_preview, include_pending=False):
+    """
+    Build the same comprehensive Excel for a with_comparisons result.
+    - If not preview and result has statement.id: load FinancialStatement and use _build_excel_for_quick_statement.
+    - If preview or no id: use _calculate_statement_data to get lines with account_ids, build mock statement, then _build_excel_for_quick_statement.
+    Returns (excel_base64_string, filename) or (None, None).
+    """
+    # When dimension is used, result has 'periods'; use first period's statement for Excel
+    if 'periods' in result and result['periods']:
+        period_data = result['periods'][0]
+        statement_data = period_data.get('statement', {})
+        start_date = statement_data.get('start_date')
+        end_date = statement_data.get('end_date')
+    else:
+        statement_data = result.get('statement', {})
+        start_date = statement_data.get('start_date')
+        end_date = statement_data.get('end_date')
+
+    if not start_date or not end_date:
+        return None, None
+    if isinstance(start_date, str):
+        start_date = date.fromisoformat(start_date)
+    if isinstance(end_date, str):
+        end_date = date.fromisoformat(end_date)
+    as_of_date = end_date
+
+    # Persisted statement (generate_with_comparisons, no dimension)
+    statement_id = statement_data.get('id')
+    if not is_preview and statement_id:
+        try:
+            statement = FinancialStatement.objects.get(id=statement_id, company_id=company_id)
+            return _build_excel_for_quick_statement(statement)
+        except FinancialStatement.DoesNotExist:
+            pass
+
+    # Preview or dimension: build from _calculate_statement_data
+    try:
+        current_data = generator._calculate_statement_data(
+            template=template,
+            start_date=start_date,
+            end_date=end_date,
+            as_of_date=as_of_date,
+            include_pending=result.get('include_pending', include_pending),
+            currency_id=None,
+        )
+    except Exception:
+        return None, None
+
+    lines_data = current_data.get('lines') or []
+    if not lines_data:
+        return None, None
+
+    # Get currency for company (same as quick statement fallback)
+    currency = Currency.objects.filter(
+        account__company_id=company_id
+    ).distinct().first()
+    if not currency:
+        return None, None
+
+    # Mock line objects compatible with _build_excel_for_quick_statement
+    class MockLine:
+        __slots__ = ('line_number', 'label', 'balance', 'indent_level', 'is_bold', 'account_ids')
+        def __init__(self, ln, label, balance, indent_level, is_bold, account_ids):
+            self.line_number = ln
+            self.label = label
+            self.balance = balance
+            self.indent_level = indent_level or 0
+            self.is_bold = is_bold or False
+            self.account_ids = account_ids if isinstance(account_ids, list) else []
+
+    class MockLinesManager:
+        def __init__(self, lines_list):
+            self._lines = sorted(lines_list, key=lambda l: getattr(l, 'line_number', 0))
+        def all(self):
+            return self
+        def order_by(self, _):
+            return self._lines
+
+    mock_lines = [
+        MockLine(
+            ln=l.get('line_number', 0),
+            label=l.get('label', ''),
+            balance=l.get('balance'),
+            indent_level=l.get('indent_level', 0),
+            is_bold=l.get('is_bold', False),
+            account_ids=l.get('account_ids', []),
+        )
+        for l in lines_data
+    ]
+
+    class MockStatement:
+        pass
+    mock = MockStatement()
+    mock.company_id = company_id
+    mock.currency_id = currency.id
+    mock.currency = currency
+    mock.start_date = start_date
+    mock.end_date = end_date
+    mock.as_of_date = as_of_date
+    mock.report_type = template.report_type or 'income_statement'
+    mock.template_id = template.id
+    mock.lines = MockLinesManager(mock_lines)
+    mock.total_assets = None
+    mock.total_liabilities = None
+    mock.total_equity = None
+    mock.net_income = None
+
+    return _build_excel_for_quick_statement(mock)
+
+
 class FinancialStatementTemplateViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     """
     ViewSet for managing financial statement templates.
@@ -2212,6 +2322,14 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 'markdown': self._format_comparisons_as_markdown(result, currency),
                 'html': self._format_comparisons_as_html(result, currency),
             }
+            # Attach same comprehensive Excel (calculation memory, raw data, JEs, hierarchy, pivot-friendly)
+            excel_b64, excel_filename = _build_excel_for_comparison_result(
+                company_id, result, template, generator, is_preview,
+                include_pending=data.get('include_pending', False),
+            )
+            if excel_b64 and excel_filename:
+                result['excel_base64'] = excel_b64
+                result['excel_filename'] = excel_filename
             return Response(result, status=status.HTTP_200_OK)
     
     @action(detail=False, methods=['get'])
