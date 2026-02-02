@@ -2659,13 +2659,13 @@ class FinancialStatementGenerator:
         
         # Process all lines for all periods, computing sequentially per period
         for line_template in line_templates:
-        log.info(
-            "\n" + "-"*80 + "\n"
-            "PROCESSING LINE %s: %s FOR TIME SERIES\n"
-            + "-"*80,
-            line_template.line_number,
-            (line_template.label or '').replace('%', '%%'),
-        )
+            log.info(
+                "\n" + "-"*80 + "\n"
+                "PROCESSING LINE %s: %s FOR TIME SERIES\n"
+                + "-"*80,
+                line_template.line_number,
+                (line_template.label or '').replace('%', '%%'),
+            )
             
             line_series = []
             
