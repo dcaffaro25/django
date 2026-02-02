@@ -36,6 +36,120 @@ def _flatten_report_tree(nodes: List[Dict], depth: int = 0) -> List[Dict]:
     return rows
 
 
+def _flatten_report_tree_with_section(
+    nodes: List[Dict], section_label: str, depth: int = 0
+) -> List[Dict]:
+    """Flatten report nodes with section label for hierarchy + JE sheet."""
+    rows = []
+    for node in nodes or []:
+        path = (node.get('path') or '').strip() or (node.get('name') or '').strip()
+        report_line = f"{section_label} > {path}" if path else section_label
+        rows.append({
+            'section': section_label,
+            'depth': depth,
+            'id': node.get('id'),
+            'account_code': node.get('account_code') or '',
+            'name': node.get('name') or '',
+            'path': node.get('path') or '',
+            'report_line': report_line,
+            'balance': node.get('balance'),
+            'is_leaf': node.get('is_leaf', False),
+        })
+        if node.get('children'):
+            rows.extend(
+                _flatten_report_tree_with_section(
+                    node['children'], section_label, depth + 1
+                )
+            )
+    return rows
+
+
+def _build_hierarchy_with_je_rows(
+    report: Dict[str, Any],
+    report_type: str,
+    journal_entry_rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Build pivot-style rows: each report line (with level), then the journal entries
+    that compose that line. JEs are grouped by account_id and attached under the
+    report row for that account.
+    """
+    if report_type == 'income_statement':
+        section_headers = _section_headers_income()
+    elif report_type == 'balance_sheet':
+        section_headers = _section_headers_balance_sheet()
+    else:
+        section_headers = _section_headers_cash_flow()
+
+    # Group JEs by account_id for lookup
+    je_by_account: Dict[Any, List[Dict]] = {}
+    for je in journal_entry_rows or []:
+        acc_id = je.get('account_id')
+        if acc_id is not None:
+            je_by_account.setdefault(acc_id, []).append(je)
+
+    out: List[Dict[str, Any]] = []
+    for section_label, key in section_headers:
+        nodes = report.get(key) or []
+        flat = _flatten_report_tree_with_section(nodes, section_label)
+        for r in flat:
+            # One row for the report line (row_type = 'Report Line')
+            out.append({
+                'report_section': r['section'],
+                'level': r['depth'],
+                'report_line': r['report_line'],
+                'account_id': r.get('id'),
+                'account_code': r.get('account_code'),
+                'account_name': r.get('name'),
+                'line_balance': r.get('balance'),
+                'row_type': 'Report Line',
+                'journal_entry_id': None,
+                'transaction_id': None,
+                'date': None,
+                'transaction_date': None,
+                'description': None,
+                'debit_amount': None,
+                'credit_amount': None,
+                'state': None,
+                'is_reconciled': None,
+            })
+            # Rows for each JE that belongs to this account (leaf rows with account_id)
+            acc_id = r.get('id')
+            if acc_id is not None:
+                for je in je_by_account.get(acc_id, []):
+                    out.append({
+                        'report_section': r['section'],
+                        'level': r['depth'],
+                        'report_line': r['report_line'],
+                        'account_id': je.get('account_id'),
+                        'account_code': je.get('account_code'),
+                        'account_name': je.get('account_name'),
+                        'line_balance': r.get('balance'),
+                        'row_type': 'Journal Entry',
+                        'journal_entry_id': je.get('journal_entry_id'),
+                        'transaction_id': je.get('transaction_id'),
+                        'date': je.get('date'),
+                        'transaction_date': je.get('transaction_date'),
+                        'description': je.get('description') or je.get('transaction_description'),
+                        'debit_amount': je.get('debit_amount'),
+                        'credit_amount': je.get('credit_amount'),
+                        'state': je.get('state'),
+                        'is_reconciled': je.get('is_reconciled'),
+                    })
+    return out
+
+
+def _report_line_to_section_and_line(report_lines_str: Optional[str]) -> tuple:
+    """Split 'Section > Path' into (Report Section, Report Line). For pivot-friendly JE sheet."""
+    if not report_lines_str or not str(report_lines_str).strip():
+        return ('', '')
+    s = str(report_lines_str).strip()
+    if ' > ' in s:
+        part = s.split(' > ', 1)
+        return (part[0].strip(), s)
+    return (s, s)
+
+
 def _collect_calculation_memory_income(report: Dict, request_params: Dict, balance_type: str) -> List[Dict]:
     """Build calculation memory rows for income statement."""
     rows = []
@@ -203,8 +317,40 @@ def build_detailed_statement_excel(
     for c in range(1, 9):
         ws_detail.column_dimensions[get_column_letter(c)].width = 18 if c in (5, 6) else 14
 
-    # ----- Sheet 3: Calculation Memory -----
-    ws_calc = wb.create_sheet('Calculation Memory', 2)
+    # ----- Sheet 3: Report Hierarchy with Journal Entries (pivot-style) -----
+    ws_hierarchy_je = wb.create_sheet('Report Hierarchy with Journal Entries', 2)
+    hierarchy_je_rows = _build_hierarchy_with_je_rows(
+        report, report_type, journal_entry_rows
+    )
+    hierarchy_headers = [
+        'Report Section', 'Level', 'Report Line', 'Account ID', 'Account Code', 'Account Name',
+        'Line Balance', 'Row Type', 'Journal Entry ID', 'Transaction ID', 'Date',
+        'Transaction Date', 'Description', 'Debit Amount', 'Credit Amount', 'State', 'Is Reconciled',
+    ]
+    for col, h in enumerate(hierarchy_headers, 1):
+        ws_hierarchy_je.cell(row=1, column=col, value=h.replace('_', ' ').title())
+    _style_header(ws_hierarchy_je, 1, len(hierarchy_headers))
+    for r_idx, row_data in enumerate(hierarchy_je_rows, start=2):
+        for c_idx, key in enumerate(
+            [
+                'report_section', 'level', 'report_line', 'account_id', 'account_code',
+                'account_name', 'line_balance', 'row_type', 'journal_entry_id',
+                'transaction_id', 'date', 'transaction_date', 'description',
+                'debit_amount', 'credit_amount', 'state', 'is_reconciled',
+            ],
+            1,
+        ):
+            val = row_data.get(key)
+            if isinstance(val, (Decimal, float)):
+                val = float(val) if isinstance(val, Decimal) else val
+            ws_hierarchy_je.cell(row=r_idx, column=c_idx, value=val)
+    for c in range(1, len(hierarchy_headers) + 1):
+        ws_hierarchy_je.column_dimensions[get_column_letter(c)].width = 16
+    ws_hierarchy_je.column_dimensions['C'].width = 45
+    ws_hierarchy_je.column_dimensions['N'].width = 40
+
+    # ----- Sheet 4: Calculation Memory -----
+    ws_calc = wb.create_sheet('Calculation Memory', 3)
     if report_type == 'income_statement':
         calc_rows = _collect_calculation_memory_income(report, request_params, balance_type)
     elif report_type == 'balance_sheet':
@@ -227,8 +373,8 @@ def build_detailed_statement_excel(
     ws_calc.column_dimensions['B'].width = 55
     ws_calc.column_dimensions['C'].width = 22
 
-    # ----- Sheet 4: Request Parameters -----
-    ws_params = wb.create_sheet('Request Parameters', 3)
+    # ----- Sheet 5: Request Parameters -----
+    ws_params = wb.create_sheet('Request Parameters', 4)
     ws_params.cell(row=1, column=1, value='Parameter')
     ws_params.cell(row=1, column=2, value='Value')
     _style_header(ws_params, 1, 2)
@@ -243,8 +389,8 @@ def build_detailed_statement_excel(
     ws_params.column_dimensions['A'].width = 28
     ws_params.column_dimensions['B'].width = 50
 
-    # ----- Sheet 5: Raw Data - Balance History -----
-    ws_raw = wb.create_sheet('Raw Data - Balance History', 4)
+    # ----- Sheet 6: Raw Data - Balance History -----
+    ws_raw = wb.create_sheet('Raw Data - Balance History', 5)
     if raw_history_rows:
         headers = list(raw_history_rows[0].keys())
         for col, h in enumerate(headers, 1):
@@ -262,31 +408,57 @@ def build_detailed_statement_excel(
         ws_raw.cell(row=1, column=1, value='No raw balance history rows (leaf accounts may have no history in period).')
     ws_raw.column_dimensions['A'].width = 50
 
-    # ----- Sheet 5: Journal Entries (lines that contributed to the report) -----
-    ws_je = wb.create_sheet('Journal Entries', 5)
+    # ----- Sheet 7: Journal Entries (pivot-friendly: Report Section, Report Line first) -----
+    ws_je = wb.create_sheet('Journal Entries', 6)
     if journal_entry_rows:
+        # Pivot-friendly: Report Section and Report Line first so Excel Pivot Table can group by them
         je_headers = [
-            'journal_entry_id', 'transaction_id', 'date', 'transaction_date', 'description',
-            'account_id', 'account_code', 'account_name', 'debit_amount', 'credit_amount',
-            'state', 'is_reconciled', 'report_lines',
+            'report_section', 'report_line', 'journal_entry_id', 'transaction_id', 'date',
+            'transaction_date', 'description', 'account_id', 'account_code', 'account_name',
+            'debit_amount', 'credit_amount', 'state', 'is_reconciled',
         ]
-        for col, h in enumerate(je_headers, 1):
-            ws_je.cell(row=1, column=col, value=h.replace('_', ' ').title())
-        _style_header(ws_je, 1, len(je_headers))
+        display_headers = [
+            'Report Section', 'Report Line', 'Journal Entry ID', 'Transaction ID', 'Date',
+            'Transaction Date', 'Description', 'Account ID', 'Account Code', 'Account Name',
+            'Debit Amount', 'Credit Amount', 'State', 'Is Reconciled',
+        ]
+        for col, h in enumerate(display_headers, 1):
+            ws_je.cell(row=1, column=col, value=h)
+        _style_header(ws_je, 1, len(display_headers))
         for r_idx, row_data in enumerate(journal_entry_rows, start=2):
-            for c_idx, h in enumerate(je_headers, 1):
-                val = row_data.get(h)
+            report_lines_str = row_data.get('report_lines')
+            section, line = _report_line_to_section_and_line(report_lines_str)
+            out_row = {
+                'report_section': section,
+                'report_line': line or report_lines_str,
+                'journal_entry_id': row_data.get('journal_entry_id'),
+                'transaction_id': row_data.get('transaction_id'),
+                'date': row_data.get('date'),
+                'transaction_date': row_data.get('transaction_date'),
+                'description': row_data.get('description') or row_data.get('transaction_description'),
+                'account_id': row_data.get('account_id'),
+                'account_code': row_data.get('account_code'),
+                'account_name': row_data.get('account_name'),
+                'debit_amount': row_data.get('debit_amount'),
+                'credit_amount': row_data.get('credit_amount'),
+                'state': row_data.get('state'),
+                'is_reconciled': row_data.get('is_reconciled'),
+            }
+            for c_idx, key in enumerate(je_headers, 1):
+                val = out_row.get(key)
                 if isinstance(val, (Decimal, float)):
                     val = float(val) if isinstance(val, Decimal) else val
                 ws_je.cell(row=r_idx, column=c_idx, value=val)
-        for c in range(1, len(je_headers) + 1):
+        for c in range(1, len(display_headers) + 1):
             ws_je.column_dimensions[get_column_letter(c)].width = 16
+        ws_je.column_dimensions['B'].width = 50
+        ws_je.column_dimensions['G'].width = 40
     else:
         ws_je.cell(row=1, column=1, value='No journal entries in period for the report accounts (or filter excluded them).')
-    ws_je.column_dimensions['A'].width = 50
+    ws_je.column_dimensions['A'].width = 22
 
-    # ----- Sheet 6: Leaf Account Summary (per-account totals from raw data) -----
-    ws_leaf = wb.create_sheet('Leaf Account Summary', 6)
+    # ----- Sheet 8: Leaf Account Summary (per-account totals from raw data) -----
+    ws_leaf = wb.create_sheet('Leaf Account Summary', 7)
     if raw_history_rows:
         def _dec(x):
             return Decimal(str(x)) if x is not None else Decimal('0')

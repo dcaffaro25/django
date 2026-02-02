@@ -287,6 +287,181 @@ def _fetch_journal_entries_for_report(company_id, account_ids, currency_id, bala
     return rows
 
 
+def _build_excel_for_quick_statement(statement):
+    """
+    Build the same comprehensive Excel (calculation memory, raw data, journal entries,
+    hierarchy with JEs, pivot-friendly) for a template-based quick statement.
+    Returns (excel_base64_string, filename) or (None, None) if no currency/accounts.
+    """
+    company_id = statement.company_id
+    currency_id = statement.currency_id
+    if currency_id is None:
+        return None, None
+    # Collect all account IDs from statement lines
+    lines = list(statement.lines.all().order_by('line_number'))
+    all_account_ids = set()
+    for line in lines:
+        ids = line.account_ids if isinstance(line.account_ids, list) else []
+        all_account_ids.update(ids or [])
+    if not all_account_ids:
+        # Still build Excel with report structure but empty raw/JE sheets
+        all_account_ids = set()
+    balance_type = 'posted'
+    start_date = statement.start_date
+    end_date = statement.end_date
+    as_of_date = getattr(statement, 'as_of_date', None) or end_date
+    report_type = statement.report_type or 'income_statement'
+    # Fetch raw history and journal entries for those accounts
+    if report_type == 'balance_sheet':
+        raw_history = _fetch_raw_balance_history(
+            company_id=company_id,
+            account_ids=all_account_ids,
+            currency_id=currency_id,
+            balance_type=balance_type,
+            as_of_date=as_of_date,
+        )
+        journal_entries = _fetch_journal_entries_for_report(
+            company_id=company_id,
+            account_ids=all_account_ids,
+            currency_id=currency_id,
+            balance_type=balance_type,
+            as_of_date=as_of_date,
+        )
+    else:
+        raw_history = _fetch_raw_balance_history(
+            company_id=company_id,
+            account_ids=all_account_ids,
+            currency_id=currency_id,
+            balance_type=balance_type,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        journal_entries = _fetch_journal_entries_for_report(
+            company_id=company_id,
+            account_ids=all_account_ids,
+            currency_id=currency_id,
+            balance_type=balance_type,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    # Build account -> report line labels from statement lines
+    account_report_lines = {}
+    for line in lines:
+        ids = line.account_ids if isinstance(line.account_ids, list) else []
+        label = f"Statement Lines > {line.label}"
+        for acc_id in ids or []:
+            account_report_lines.setdefault(acc_id, []).append(label)
+    for je in journal_entries:
+        je['report_lines'] = '; '.join(account_report_lines.get(je.get('account_id'), []))
+    # Build report dict compatible with build_detailed_statement_excel
+    currency = statement.currency
+    currency_dict = {
+        'id': currency.id,
+        'code': getattr(currency, 'code', ''),
+        'name': getattr(currency, 'name', ''),
+    }
+    # One node per (line, account_id) so every JE matches a report row in the hierarchy sheet
+    line_nodes = []
+    for line in lines:
+        ids = line.account_ids if isinstance(line.account_ids, list) else []
+        balance_val = float(line.balance) if line.balance is not None else None
+        if ids:
+            for acc_id in ids:
+                line_nodes.append({
+                    'id': acc_id,
+                    'account_code': '',
+                    'name': line.label,
+                    'path': line.label,
+                    'balance': balance_val,
+                    'is_leaf': True,
+                    'children': None,
+                })
+        else:
+            line_nodes.append({
+                'id': None,
+                'account_code': '',
+                'name': line.label,
+                'path': line.label,
+                'balance': balance_val,
+                'is_leaf': True,
+                'children': None,
+            })
+    section_name = 'Statement Lines'
+    section_balance = sum(
+        (float(line.balance) if line.balance is not None else 0) for line in lines
+    )
+    if report_type == 'balance_sheet':
+        report = {
+            'as_of_date': str(as_of_date),
+            'currency': currency_dict,
+            'balance_type': balance_type,
+            'assets': [{
+                'id': None,
+                'account_code': '',
+                'name': section_name,
+                'path': section_name,
+                'balance': section_balance,
+                'is_leaf': False,
+                'children': line_nodes,
+            }],
+            'liabilities': [],
+            'equity': [],
+            'totals': {
+                'total_assets': float(statement.total_assets) if statement.total_assets is not None else None,
+                'total_liabilities': float(statement.total_liabilities) if statement.total_liabilities is not None else None,
+                'total_equity': float(statement.total_equity) if statement.total_equity is not None else None,
+                'total_liabilities_and_equity': None,
+            },
+        }
+        if statement.total_liabilities is not None and statement.total_equity is not None:
+            report['totals']['total_liabilities_and_equity'] = (
+                float(statement.total_liabilities) + float(statement.total_equity)
+            )
+        filename = f"quick_balance_sheet_{as_of_date}.xlsx"
+    else:
+        report = {
+            'start_date': str(start_date),
+            'end_date': str(end_date),
+            'currency': currency_dict,
+            'balance_type': balance_type,
+            'revenues': [],
+            'costs': [],
+            'expenses': [{
+                'id': None,
+                'account_code': '',
+                'name': section_name,
+                'path': section_name,
+                'balance': section_balance,
+                'is_leaf': False,
+                'children': line_nodes,
+            }],
+            'totals': {
+                'total_revenue': None,
+                'total_costs': None,
+                'gross_profit': None,
+                'total_expenses': section_balance,
+                'net_income': float(statement.net_income) if statement.net_income is not None else None,
+            },
+        }
+        filename = f"quick_income_statement_{start_date}_{end_date}.xlsx"
+    request_params = {
+        'template_id': statement.template_id,
+        'start_date': str(start_date),
+        'end_date': str(end_date),
+        'as_of_date': str(as_of_date),
+        'report_type': report_type,
+    }
+    excel_b64 = build_detailed_statement_excel_base64(
+        report=report,
+        report_type=report_type,
+        request_params=request_params,
+        raw_history_rows=raw_history,
+        balance_type=balance_type,
+        journal_entry_rows=journal_entries,
+    )
+    return excel_b64, filename
+
+
 class FinancialStatementTemplateViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     """
     ViewSet for managing financial statement templates.
@@ -1837,7 +2012,13 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         )
         
         serializer = self.get_serializer(statement)
-        return Response(serializer.data)
+        data = dict(serializer.data)
+        # Attach same comprehensive Excel (calculation memory, raw data, JEs, hierarchy, pivot-friendly)
+        excel_b64, excel_filename = _build_excel_for_quick_statement(statement)
+        if excel_b64 and excel_filename:
+            data['excel_base64'] = excel_b64
+            data['excel_filename'] = excel_filename
+        return Response(data)
     
     @action(detail=False, methods=['post'])
     def time_series(self, request, tenant_id=None):
@@ -2074,7 +2255,13 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         )
         
         serializer = self.get_serializer(statement)
-        return Response(serializer.data)
+        data = dict(serializer.data)
+        # Attach same comprehensive Excel (calculation memory, raw data, JEs, hierarchy, pivot-friendly)
+        excel_b64, excel_filename = _build_excel_for_quick_statement(statement)
+        if excel_b64 and excel_filename:
+            data['excel_base64'] = excel_b64
+            data['excel_filename'] = excel_filename
+        return Response(data)
     
     @action(detail=False, methods=['post'])
     def detailed_income_statement(self, request, tenant_id=None):
