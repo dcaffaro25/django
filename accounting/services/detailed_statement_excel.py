@@ -68,18 +68,27 @@ def _build_hierarchy_with_je_rows(
     report: Dict[str, Any],
     report_type: str,
     journal_entry_rows: List[Dict[str, Any]],
+    template_section_label: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Build pivot-style rows: each report line (with level), then the journal entries
     that compose that line. JEs are grouped by account_id and attached under the
     report row for that account.
+    When template_section_label is set (template-based report), use it instead of
+    Revenue/Costs/Expenses or Assets/Liabilities/Equity for the single section with data.
     """
     if report_type == 'income_statement':
         section_headers = _section_headers_income()
+        if template_section_label:
+            section_headers = [(template_section_label, 'expenses')]
     elif report_type == 'balance_sheet':
         section_headers = _section_headers_balance_sheet()
+        if template_section_label:
+            section_headers = [(template_section_label, 'assets')]
     else:
         section_headers = _section_headers_cash_flow()
+        if template_section_label:
+            section_headers = [(template_section_label, 'operating')]
 
     # Group JEs by account_id for lookup
     je_by_account: Dict[Any, List[Dict]] = {}
@@ -238,6 +247,7 @@ def build_detailed_statement_excel(
     raw_history_rows: List[Dict[str, Any]],
     balance_type: str = 'posted',
     journal_entry_rows: Optional[List[Dict[str, Any]]] = None,
+    template_section_label: Optional[str] = None,
 ) -> bytes:
     """
     Build an Excel workbook for a detailed financial statement.
@@ -250,6 +260,8 @@ def build_detailed_statement_excel(
     journal_entry_rows: optional list of journal entry dicts (id, transaction_id, date, description,
                         account_id, account_code, account_name, debit_amount, credit_amount, state, is_reconciled,
                         report_lines: semicolon-separated list of report line descriptions where the JE was considered)
+    template_section_label: when set (template-based report), use this as the section label instead of
+                            Revenue/Costs/Expenses or Assets/Liabilities/Equity for the single section with data.
     """
     journal_entry_rows = journal_entry_rows or []
     wb = Workbook()
@@ -259,12 +271,18 @@ def build_detailed_statement_excel(
     ws_summary = wb.create_sheet('Report Summary', 0)
     if report_type == 'income_statement':
         section_headers = _section_headers_income()
+        if template_section_label:
+            section_headers = [(template_section_label, 'expenses')]
         total_keys = ['total_revenue', 'total_costs', 'gross_profit', 'total_expenses', 'net_income']
     elif report_type == 'balance_sheet':
         section_headers = _section_headers_balance_sheet()
+        if template_section_label:
+            section_headers = [(template_section_label, 'assets')]
         total_keys = ['total_assets', 'total_liabilities', 'total_equity', 'total_liabilities_and_equity']
     else:
         section_headers = _section_headers_cash_flow()
+        if template_section_label:
+            section_headers = [(template_section_label, 'operating')]
         total_keys = ['total_operating', 'total_investing', 'total_financing', 'net_cash_flow']
 
     totals = report.get('totals') or {}
@@ -320,7 +338,8 @@ def build_detailed_statement_excel(
     # ----- Sheet 3: Report Hierarchy with Journal Entries (pivot-style) -----
     ws_hierarchy_je = wb.create_sheet('Report Hierarchy with Journal Entries', 2)
     hierarchy_je_rows = _build_hierarchy_with_je_rows(
-        report, report_type, journal_entry_rows
+        report, report_type, journal_entry_rows,
+        template_section_label=template_section_label,
     )
     hierarchy_headers = [
         'Report Section', 'Level', 'Report Line', 'Account ID', 'Account Code', 'Account Name',
@@ -528,6 +547,7 @@ def build_detailed_statement_excel_base64(
     raw_history_rows: List[Dict[str, Any]],
     balance_type: str = 'posted',
     journal_entry_rows: Optional[List[Dict[str, Any]]] = None,
+    template_section_label: Optional[str] = None,
 ) -> str:
     """Same as build_detailed_statement_excel but returns base64-encoded string."""
     data = build_detailed_statement_excel(
@@ -537,5 +557,6 @@ def build_detailed_statement_excel_base64(
         raw_history_rows=raw_history_rows,
         balance_type=balance_type,
         journal_entry_rows=journal_entry_rows,
+        template_section_label=template_section_label,
     )
     return base64.b64encode(data).decode('ascii')

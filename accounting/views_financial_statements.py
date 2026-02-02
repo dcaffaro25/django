@@ -287,16 +287,20 @@ def _fetch_journal_entries_for_report(company_id, account_ids, currency_id, bala
     return rows
 
 
-def _build_excel_for_quick_statement(statement):
+def _build_excel_for_quick_statement(statement, template=None):
     """
     Build the same comprehensive Excel (calculation memory, raw data, journal entries,
     hierarchy with JEs, pivot-friendly) for a template-based quick statement.
+    Uses the template name as section label (row denominations from template), not
+    Revenue/Costs/Expenses from the detailed endpoint.
     Returns (excel_base64_string, filename) or (None, None) if no currency/accounts.
     """
     company_id = statement.company_id
     currency_id = statement.currency_id
     if currency_id is None:
         return None, None
+    template = template or getattr(statement, 'template', None)
+    template_section_label = template.name if template else 'Statement Lines'
     # Collect all account IDs from statement lines
     lines = list(statement.lines.all().order_by('line_number'))
     all_account_ids = set()
@@ -344,11 +348,11 @@ def _build_excel_for_quick_statement(statement):
             start_date=start_date,
             end_date=end_date,
         )
-    # Build account -> report line labels from statement lines
+    # Build account -> report line labels from statement lines (use template name, not Revenue/Costs/Expenses)
     account_report_lines = {}
     for line in lines:
         ids = line.account_ids if isinstance(line.account_ids, list) else []
-        label = f"Statement Lines > {line.label}"
+        label = f"{template_section_label} > {line.label}"
         for acc_id in ids or []:
             account_report_lines.setdefault(acc_id, []).append(label)
     for je in journal_entries:
@@ -386,7 +390,7 @@ def _build_excel_for_quick_statement(statement):
                 'is_leaf': True,
                 'children': None,
             })
-    section_name = 'Statement Lines'
+    section_name = template_section_label
     section_balance = sum(
         (float(line.balance) if line.balance is not None else 0) for line in lines
     )
@@ -458,6 +462,7 @@ def _build_excel_for_quick_statement(statement):
         raw_history_rows=raw_history,
         balance_type=balance_type,
         journal_entry_rows=journal_entries,
+        template_section_label=template_section_label,
     )
     return excel_b64, filename
 
@@ -569,7 +574,7 @@ def _build_excel_for_comparison_result(company_id, result, template, generator, 
     mock.total_equity = None
     mock.net_income = None
 
-    return _build_excel_for_quick_statement(mock)
+    return _build_excel_for_quick_statement(mock, template=template)
 
 
 class FinancialStatementTemplateViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
