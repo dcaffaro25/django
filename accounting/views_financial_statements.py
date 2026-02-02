@@ -307,9 +307,14 @@ def _build_excel_for_quick_statement(statement, template=None):
     for line in lines:
         ids = line.account_ids if isinstance(line.account_ids, list) else []
         all_account_ids.update(ids or [])
+    # Expand to include all descendants (same as detailed_* endpoints) so we include JEs from child accounts
+    if all_account_ids:
+        all_account_ids = _get_report_scope_account_ids(company_id, list(all_account_ids))
     if not all_account_ids:
-        # Still build Excel with report structure but empty raw/JE sheets
-        all_account_ids = set()
+        # Fallback: include all company accounts (e.g. when template lines are formula/rollup only)
+        all_account_ids = set(
+            Account.objects.filter(company_id=company_id, is_active=True).values_list('id', flat=True)
+        )
     balance_type = 'posted'
     start_date = statement.start_date
     end_date = statement.end_date
@@ -532,10 +537,35 @@ def _build_excel_for_comparison_result(company_id, result, template, generator, 
     if not lines_data:
         return None, None
 
-    # Get currency for company (same as quick statement fallback)
-    currency = Currency.objects.filter(
-        account__company_id=company_id
-    ).distinct().first()
+    # Collect account IDs from lines for currency resolution
+    account_ids_from_lines = set()
+    for l in lines_data:
+        ids = l.get('account_ids') or []
+        if isinstance(ids, list):
+            account_ids_from_lines.update(ids)
+
+    # Get currency from report accounts (matches transaction currency for journal entries)
+    # Fallback to any company account currency if no accounts in scope
+    currency = None
+    if account_ids_from_lines:
+        from django.db.models import Count
+        currency_id = (
+            Account.objects.filter(
+                id__in=account_ids_from_lines,
+                company_id=company_id,
+            )
+            .values('currency_id')
+            .annotate(cnt=Count('id'))
+            .order_by('-cnt')
+            .values_list('currency_id', flat=True)
+            .first()
+        )
+        if currency_id:
+            currency = Currency.objects.filter(id=currency_id).first()
+    if not currency:
+        currency = Currency.objects.filter(
+            account__company_id=company_id
+        ).distinct().first()
     if not currency:
         return None, None
 

@@ -318,7 +318,7 @@ class FinancialStatementGenerator:
             "As of Date: %s\n"
             "Include Pending: %s\n"
             "Total Line Templates: %s\n"
-            "="*80,
+            + "="*80,
             template.name,
             template.id,
             template.report_type,
@@ -466,7 +466,7 @@ class FinancialStatementGenerator:
             "Include Pending: %s\n"
             "Currency: %s (ID: %s)\n"
             "Total Line Templates: %s\n"
-            "="*80,
+            + "="*80,
             template.name,
             template.id,
             template.report_type,
@@ -2634,7 +2634,7 @@ class FinancialStatementGenerator:
             "Line Numbers Filter: %s\n"
             "Total Periods: %s\n"
             "Total Line Templates: %s\n"
-            "="*80,
+            + "="*80,
             template.name,
             template.id,
             template.report_type,
@@ -2659,13 +2659,13 @@ class FinancialStatementGenerator:
         
         # Process all lines for all periods, computing sequentially per period
         for line_template in line_templates:
-            log.info(
-                "\n" + "-"*80 + "\n"
-                "PROCESSING LINE %s: %s FOR TIME SERIES\n"
-                "-"*80,
-                line_template.line_number,
-                line_template.label,
-            )
+        log.info(
+            "\n" + "-"*80 + "\n"
+            "PROCESSING LINE %s: %s FOR TIME SERIES\n"
+            + "-"*80,
+            line_template.line_number,
+            (line_template.label or '').replace('%', '%%'),
+        )
             
             line_series = []
             
@@ -2998,7 +2998,7 @@ class FinancialStatementGenerator:
             "Comparison Types: %s\n"
             "Dimension: %s\n"
             "Include Pending: %s\n"
-            "="*80,
+            + "="*80,
             template.name,
             template.id,
             template.report_type,
@@ -3055,7 +3055,7 @@ class FinancialStatementGenerator:
             log.info(
                 "\n" + "-"*80 + "\n"
                 "PROCESSING COMPARISON %s/%s: %s\n"
-                "-"*80,
+                + "-"*80,
                 comp_idx,
                 len(comparison_types),
                 comp_type,
