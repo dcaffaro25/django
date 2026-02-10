@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Views e endpoints para NFe: importação e CRUD + análise."""
+from django.conf import settings
 from rest_framework import viewsets, status
 from rest_framework.views import APIView
 from rest_framework.parsers import MultiPartParser
@@ -19,7 +20,7 @@ from .services.nfe_import_service import import_many
 from multitenancy.mixins import ScopedQuerysetMixin
 
 MAX_FILE_SIZE_BYTES = 1024 * 1024  # 1MB per file
-MAX_FILES = 10000
+MAX_FILES = settings.DATA_UPLOAD_MAX_NUMBER_FILES
 
 
 class NFeImportView(APIView):

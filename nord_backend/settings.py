@@ -20,6 +20,9 @@ DEBUG = True
 IMPORT_DEBUG = True
 AUTH_OFF = True
 
+# NFe import: allow up to 100 XML files per request (must be >= billing.views_nfe.MAX_FILES)
+DATA_UPLOAD_MAX_NUMBER_FILES = 10000
+
 class SlowOnlyFilter(logging.Filter):
     def __init__(self, threshold_ms=200):
         super().__init__()
