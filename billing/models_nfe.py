@@ -217,3 +217,112 @@ class NotaFiscalItem(TenantAwareBaseModel):
 
     def __str__(self):
         return f"Item {self.numero_item}: {self.descricao[:50]}"
+
+
+# Códigos de tipo de evento NFe (SEFAZ) para uso em choices e filtros
+TP_EVENTO_CHOICES = [
+    (110110, "Carta de Correção (CCe)"),
+    (110111, "Cancelamento"),
+    (110112, "Cancelamento por substituição"),
+    (110140, "EPEC - Emissão em contingência"),
+    (210200, "Manifestação: Confirmação da operação"),
+    (210210, "Manifestação: Ciência da operação"),
+    (210220, "Manifestação: Desconhecimento da operação"),
+    (210240, "Manifestação: Operação não realizada"),
+]
+
+
+class NFeEvento(TenantAwareBaseModel):
+    """
+    Evento vinculado a uma NFe (cancelamento, CCe, manifestação do destinatário, etc.).
+    Um mesmo documento pode ter vários eventos (ex.: autorização + CCe + manifestação).
+    A chave da NFe identifica o documento; nota_fiscal é FK opcional quando a NF estiver importada.
+    """
+    # Vínculo à NF quando existir no sistema; chave sempre preenchida para busca
+    nota_fiscal = models.ForeignKey(
+        NotaFiscal, null=True, blank=True, on_delete=models.CASCADE,
+        related_name="eventos", verbose_name="Nota Fiscal",
+        help_text="Preenchido quando a NF foi importada; senão use chave_nfe.",
+    )
+    chave_nfe = models.CharField(
+        "Chave NFe (44 dígitos)", max_length=44, db_index=True,
+        help_text="Chave do documento fiscal ao qual o evento se refere.",
+    )
+
+    tipo_evento = models.PositiveIntegerField(
+        "Tipo do evento", choices=TP_EVENTO_CHOICES, db_index=True,
+        help_text="110110=CCe, 110111=Cancelamento, 210200=Confirmação, etc.",
+    )
+    n_seq_evento = models.PositiveSmallIntegerField(
+        "Sequência do evento", default=1,
+        help_text="Número sequencial do evento para a mesma NF (nSeqEvento).",
+    )
+
+    data_evento = models.DateTimeField("Data/hora do evento", null=True, blank=True, db_index=True)
+    descricao = models.TextField(
+        "Descrição / correção", blank=True,
+        help_text="Para CCe: texto da correção (xCorrecao); para outros: xMotivo ou similar.",
+    )
+
+    # Retorno SEFAZ (quando disponível no XML de resposta)
+    protocolo = models.CharField("Protocolo", max_length=20, blank=True)
+    status_sefaz = models.CharField("Status SEFAZ", max_length=5, blank=True, db_index=True)
+    motivo_sefaz = models.CharField("Motivo SEFAZ", max_length=500, blank=True)
+    data_registro = models.DateTimeField("Data registro SEFAZ", null=True, blank=True)
+
+    xml_original = models.TextField("XML original", blank=True)
+    arquivo_origem = models.CharField("Arquivo de origem", max_length=500, blank=True)
+
+    class Meta:
+        verbose_name = "Evento NFe"
+        verbose_name_plural = "Eventos NFe"
+        ordering = ["chave_nfe", "data_evento", "n_seq_evento"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "chave_nfe", "tipo_evento", "n_seq_evento"],
+                name="billing_nfeevento_company_chave_tipo_seq_uniq",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["tipo_evento", "chave_nfe"]),
+            models.Index(fields=["status_sefaz"]),
+        ]
+
+    def __str__(self):
+        return f"Evento {self.tipo_evento} NF {self.chave_nfe[-8:]} seq {self.n_seq_evento}"
+
+
+class NFeInutilizacao(TenantAwareBaseModel):
+    """
+    Inutilização de numeração de NFe (ProcInutNFe).
+    Não é evento sobre uma NF específica; invalida um intervalo de números (nNFIni a nNFFin)
+    para uma série/ano/CNPJ.
+    """
+    cuf = models.CharField("UF", max_length=2, blank=True)
+    ano = models.CharField("Ano (2 dígitos)", max_length=2, db_index=True)
+    cnpj = models.CharField("CNPJ", max_length=14, db_index=True)
+    modelo = models.SmallIntegerField("Modelo (55=NF-e)", default=55)
+    serie = models.SmallIntegerField("Série", default=1)
+    n_nf_ini = models.IntegerField("Número NF inicial")
+    n_nf_fin = models.IntegerField("Número NF final")
+    x_just = models.CharField("Justificativa", max_length=255)
+    protocolo = models.CharField("Protocolo", max_length=20, blank=True)
+    status_sefaz = models.CharField("Status SEFAZ", max_length=5, blank=True, db_index=True)
+    motivo_sefaz = models.CharField("Motivo SEFAZ", max_length=500, blank=True)
+    data_registro = models.DateTimeField("Data registro SEFAZ", null=True, blank=True)
+    xml_original = models.TextField("XML original", blank=True)
+    arquivo_origem = models.CharField("Arquivo de origem", max_length=500, blank=True)
+
+    class Meta:
+        verbose_name = "Inutilização NFe"
+        verbose_name_plural = "Inutilizações NFe"
+        ordering = ["-data_registro", "ano", "serie", "n_nf_ini"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "ano", "serie", "n_nf_ini", "n_nf_fin"],
+                name="billing_nfeinut_company_ano_serie_ini_fin_uniq",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Inut {self.ano}/S{self.serie} nNF {self.n_nf_ini}-{self.n_nf_fin}"

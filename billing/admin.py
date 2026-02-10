@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.apps import apps
-from .models import *  # includes NotaFiscal, NotaFiscalItem from models_nfe
+from .models import *  # includes NotaFiscal, NotaFiscalItem, NFeEvento from models_nfe
 
 
 class NotaFiscalItemInline(admin.TabularInline):
@@ -30,9 +30,27 @@ class NotaFiscalItemAdmin(admin.ModelAdmin):
     search_fields = ('codigo_produto', 'descricao', 'ncm')
 
 
+@admin.register(NFeEvento)
+class NFeEventoAdmin(admin.ModelAdmin):
+    list_display = ('chave_nfe', 'tipo_evento', 'n_seq_evento', 'data_evento', 'status_sefaz', 'protocolo')
+    list_filter = ('tipo_evento', 'status_sefaz')
+    search_fields = ('chave_nfe', 'descricao')
+    date_hierarchy = 'data_evento'
+    readonly_fields = ('chave_nfe', 'protocolo', 'status_sefaz', 'data_registro')
+
+
+@admin.register(NFeInutilizacao)
+class NFeInutilizacaoAdmin(admin.ModelAdmin):
+    list_display = ('ano', 'serie', 'n_nf_ini', 'n_nf_fin', 'status_sefaz', 'data_registro')
+    list_filter = ('ano', 'serie', 'status_sefaz')
+    search_fields = ('cnpj', 'x_just', 'protocolo')
+    date_hierarchy = 'data_registro'
+    readonly_fields = ('protocolo', 'status_sefaz', 'data_registro')
+
+
 # Register remaining billing models (exclude NFe, already registered above)
 app_models = apps.get_app_config('billing').get_models()
-nfe_models = {NotaFiscal, NotaFiscalItem}
+nfe_models = {NotaFiscal, NotaFiscalItem, NFeEvento, NFeInutilizacao}
 for model in app_models:
     if model not in nfe_models:
         admin.site.register(model)

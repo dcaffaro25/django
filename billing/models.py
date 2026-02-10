@@ -184,4 +184,4 @@ class InvoiceLine(TenantAwareBaseModel):
 
 
 # Import NFe models so they are part of the app
-from .models_nfe import NotaFiscal, NotaFiscalItem  # noqa: E402
+from .models_nfe import NotaFiscal, NotaFiscalItem, NFeEvento, NFeInutilizacao  # noqa: E402

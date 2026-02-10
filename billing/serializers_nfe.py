@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Serializers para NotaFiscal e NotaFiscalItem."""
+"""Serializers para NotaFiscal, NotaFiscalItem e NFeEvento."""
 from rest_framework import serializers
-from .models_nfe import NotaFiscal, NotaFiscalItem
+from .models_nfe import NotaFiscal, NotaFiscalItem, NFeEvento
 
 
 class NotaFiscalItemSerializer(serializers.ModelSerializer):
@@ -68,4 +68,22 @@ class NFeImportResultSerializer(serializers.Serializer):
     """Resposta do endpoint de importação."""
     importadas = serializers.ListField(child=serializers.DictField())
     duplicadas = serializers.ListField(child=serializers.CharField())
+    erros = serializers.ListField(child=serializers.DictField())
+
+
+class NFeEventoSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = NFeEvento
+        fields = [
+            "id", "nota_fiscal", "chave_nfe", "tipo_evento", "n_seq_evento",
+            "data_evento", "descricao", "protocolo", "status_sefaz", "motivo_sefaz",
+            "data_registro", "arquivo_origem", "company", "created_at",
+        ]
+
+
+class NFeEventoImportResultSerializer(serializers.Serializer):
+    """Resposta do endpoint de importação de eventos e inutilizações."""
+    importados = serializers.ListField(child=serializers.DictField())
+    importados_inut = serializers.ListField(child=serializers.DictField())
+    duplicados = serializers.ListField(child=serializers.CharField())
     erros = serializers.ListField(child=serializers.DictField())

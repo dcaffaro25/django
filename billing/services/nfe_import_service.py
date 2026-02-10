@@ -2,14 +2,16 @@
 """
 Engine de importação de NFe: recebe XML(s), usa o parser e persiste em NotaFiscal/NotaFiscalItem.
 Suporta múltiplos arquivos; trata duplicatas por chave; resolve FKs (emitente, destinatário, produto).
+Antes de criar parceiros ou produtos, aplica SubstitutionRule (de-para) para resolver por identificador/código.
 """
+import re
 from decimal import Decimal, InvalidOperation
 from datetime import datetime
 
 from django.db import transaction
 
-# Parser está em scripts/nfe_engine (project root no path quando roda Django)
 from scripts.nfe_engine.parser import parse_nfe_xml
+from multitenancy.models import SubstitutionRule
 
 from billing.models import NotaFiscal, NotaFiscalItem, BusinessPartner, ProductService
 
@@ -104,8 +106,37 @@ def _build_referencias_json(referencias):
     return out
 
 
+def _apply_substitution_rule(company, model_name, field_name, incoming_value):
+    """
+    Aplica regras de substituição (SubstitutionRule) para um valor de um dado modelo/campo.
+    Retorna o valor substituído se alguma regra fizer match; caso contrário retorna None.
+    """
+    if incoming_value is None or (isinstance(incoming_value, str) and not incoming_value.strip()):
+        return None
+    incoming_str = str(incoming_value).strip()
+    rules = SubstitutionRule.objects.filter(
+        company=company, model_name=model_name, field_name=field_name
+    )
+    for rule in rules:
+        match_val = (rule.match_value or "").strip()
+        subst_val = (rule.substitution_value or "").strip()
+        if rule.match_type == "exact":
+            if match_val == incoming_str:
+                return subst_val if subst_val else None
+        elif rule.match_type == "caseless":
+            if match_val.lower() == incoming_str.lower():
+                return subst_val if subst_val else None
+        elif rule.match_type == "regex":
+            try:
+                if re.search(rule.match_value, incoming_str):
+                    return re.sub(rule.match_value, rule.substitution_value, incoming_str).strip() or None
+            except re.error:
+                continue
+    return None
+
+
 def _resolve_emitente(company, emit_cnpj, emit_nome="", emit_fantasia="", emit_uf="", emit_municipio=""):
-    """Retorna BusinessPartner existente por CNPJ ou cria um novo com dados da NFe (emitente)."""
+    """Retorna BusinessPartner: 1) direto por identifier, 2) via SubstitutionRule (de-para), 3) cria novo."""
     if not emit_cnpj or not company:
         return None
     cnpj_clean = "".join(c for c in str(emit_cnpj) if c.isdigit())[:50]
@@ -115,6 +146,13 @@ def _resolve_emitente(company, emit_cnpj, emit_nome="", emit_fantasia="", emit_u
     bp = qs.filter(identifier=emit_cnpj).first() or qs.filter(identifier=cnpj_clean).first()
     if bp:
         return bp
+    substituted = _apply_substitution_rule(company, "BusinessPartner", "identifier", cnpj_clean)
+    if not substituted:
+        substituted = _apply_substitution_rule(company, "BusinessPartner", "identifier", emit_cnpj)
+    if substituted:
+        bp = qs.filter(identifier=substituted).first()
+        if bp:
+            return bp
     name = (emit_nome or emit_fantasia or cnpj_clean).strip()[:255] or cnpj_clean
     try:
         bp = BusinessPartner.objects.create(
@@ -133,7 +171,7 @@ def _resolve_emitente(company, emit_cnpj, emit_nome="", emit_fantasia="", emit_u
 
 
 def _resolve_destinatario(company, dest_cnpj, dest_nome="", dest_uf=""):
-    """Retorna BusinessPartner existente por CNPJ ou cria um novo com dados da NFe (destinatário)."""
+    """Retorna BusinessPartner: 1) direto por identifier, 2) via SubstitutionRule (de-para), 3) cria novo."""
     if not dest_cnpj or not company:
         return None
     cnpj_clean = "".join(c for c in str(dest_cnpj) if c.isdigit())[:50]
@@ -143,6 +181,13 @@ def _resolve_destinatario(company, dest_cnpj, dest_nome="", dest_uf=""):
     bp = qs.filter(identifier=dest_cnpj).first() or qs.filter(identifier=cnpj_clean).first()
     if bp:
         return bp
+    substituted = _apply_substitution_rule(company, "BusinessPartner", "identifier", cnpj_clean)
+    if not substituted:
+        substituted = _apply_substitution_rule(company, "BusinessPartner", "identifier", dest_cnpj)
+    if substituted:
+        bp = qs.filter(identifier=substituted).first()
+        if bp:
+            return bp
     name = (dest_nome or cnpj_clean).strip()[:255] or cnpj_clean
     try:
         bp = BusinessPartner.objects.create(
@@ -160,19 +205,47 @@ def _resolve_destinatario(company, dest_cnpj, dest_nome="", dest_uf=""):
         return None
 
 
-def _resolve_produto(company, codigo_produto, ean):
+def _resolve_produto(company, codigo_produto, ean, descricao="", valor_unitario=None):
+    """
+    Retorna ProductService: 1) direto por code/EAN, 2) via SubstitutionRule (ProductService.code),
+    3) cria novo com dados do item da NFe.
+    """
     if not company:
         return None
     qs = ProductService.objects.filter(company=company)
-    if codigo_produto:
-        p = qs.filter(code=codigo_produto).first()
+    for code_candidate in (codigo_produto, ean):
+        if not code_candidate:
+            continue
+        p = qs.filter(code=code_candidate).first()
         if p:
             return p
-    if ean:
-        p = qs.filter(code=ean).first()
-        if p:
-            return p
-    return None
+    for code_candidate in (codigo_produto, ean):
+        if not code_candidate:
+            continue
+        substituted = _apply_substitution_rule(company, "ProductService", "code", code_candidate)
+        if substituted:
+            p = qs.filter(code=substituted).first()
+            if p:
+                return p
+    code_final = (codigo_produto or ean or "").strip()[:100]
+    if not code_final:
+        return None
+    name = (descricao or code_final).strip()[:255] or code_final
+    price = valor_unitario if valor_unitario is not None else Decimal("0")
+    try:
+        p = ProductService.objects.create(
+            company=company,
+            code=code_final,
+            name=name,
+            item_type="product",
+            price=price,
+            cost=valor_unitario,
+            category=None,
+            currency=None,
+        )
+        return p
+    except Exception:
+        return None
 
 
 def _map_parser_to_notafiscal(data, company, xml_content, arquivo_origem):
@@ -370,7 +443,10 @@ def _map_item_to_model(item_data, nota_fiscal, company):
             if v not in (None, ""):
                 impostos_json[k] = v
 
-    produto = _resolve_produto(company, codigo_produto, ean)
+    produto = _resolve_produto(
+        company, codigo_produto, ean,
+        descricao=descricao, valor_unitario=valor_unitario,
+    )
 
     return NotaFiscalItem(
         nota_fiscal=nota_fiscal,
