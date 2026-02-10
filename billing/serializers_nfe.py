@@ -26,22 +26,42 @@ class NotaFiscalItemSerializer(serializers.ModelSerializer):
 
 class NotaFiscalSerializer(serializers.ModelSerializer):
     itens = NotaFiscalItemSerializer(many=True, read_only=True)
-    emitente_nome = serializers.CharField(source="emitente.name", read_only=True, allow_null=True)
-    destinatario_nome = serializers.CharField(source="destinatario.name", read_only=True, allow_null=True)
+    emitente_nome = serializers.SerializerMethodField()
+    destinatario_nome = serializers.SerializerMethodField()
 
     class Meta:
         model = NotaFiscal
         fields = "__all__"
 
+    def get_emitente_nome(self, obj):
+        if obj.emitente_id:
+            return obj.emitente.name
+        return obj.emit_nome or None
+
+    def get_destinatario_nome(self, obj):
+        if obj.destinatario_id:
+            return obj.destinatario.name
+        return obj.dest_nome or None
+
 
 class NotaFiscalListSerializer(serializers.ModelSerializer):
     """Versão compacta para listagem (sem itens, sem xml_original, sem JSONFields grandes)."""
-    emitente_nome = serializers.CharField(source="emitente.name", read_only=True, allow_null=True)
-    destinatario_nome = serializers.CharField(source="destinatario.name", read_only=True, allow_null=True)
+    emitente_nome = serializers.SerializerMethodField()
+    destinatario_nome = serializers.SerializerMethodField()
 
     class Meta:
         model = NotaFiscal
         exclude = ["xml_original", "totais_json", "transporte_json", "financeiro_json", "referencias_json"]
+
+    def get_emitente_nome(self, obj):
+        if obj.emitente_id:
+            return obj.emitente.name
+        return obj.emit_nome or None
+
+    def get_destinatario_nome(self, obj):
+        if obj.destinatario_id:
+            return obj.destinatario.name
+        return obj.dest_nome or None
 
 
 class NFeImportResultSerializer(serializers.Serializer):

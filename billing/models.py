@@ -38,7 +38,7 @@ class BusinessPartner(TenantAwareBaseModel):
     name = models.CharField(max_length=255)
     partner_type = models.CharField(max_length=10, choices=PARTNER_TYPES)
     category = TreeForeignKey(BusinessPartnerCategory, null=True, blank=True, on_delete=models.SET_NULL)
-    identifier = models.CharField(max_length=50, unique=True)  # CPF/CNPJ
+    identifier = models.CharField(max_length=50)  # CPF/CNPJ; unique per company (see Meta)
     address = models.CharField(max_length=255, blank=True)
     city = models.CharField(max_length=100, blank=True)
     state = models.CharField(max_length=100, blank=True)
@@ -49,6 +49,14 @@ class BusinessPartner(TenantAwareBaseModel):
     currency = models.ForeignKey('accounting.Currency', on_delete=models.SET_NULL, null=True)
     payment_terms = models.CharField(max_length=50, blank=True)
     is_active = models.BooleanField(default=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['company', 'identifier'],
+                name='billing_bp_company_identifier_uniq',
+            ),
+        ]
 
     def __str__(self):
         return f"{self.name} ({self.partner_type})"

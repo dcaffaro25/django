@@ -104,22 +104,60 @@ def _build_referencias_json(referencias):
     return out
 
 
-def _resolve_emitente(company, emit_cnpj):
-    if not emit_cnpj:
+def _resolve_emitente(company, emit_cnpj, emit_nome="", emit_fantasia="", emit_uf="", emit_municipio=""):
+    """Retorna BusinessPartner existente por CNPJ ou cria um novo com dados da NFe (emitente)."""
+    if not emit_cnpj or not company:
         return None
-    cnpj_clean = "".join(c for c in str(emit_cnpj) if c.isdigit())
+    cnpj_clean = "".join(c for c in str(emit_cnpj) if c.isdigit())[:50]
+    if not cnpj_clean:
+        return None
     qs = BusinessPartner.objects.filter(company=company)
     bp = qs.filter(identifier=emit_cnpj).first() or qs.filter(identifier=cnpj_clean).first()
-    return bp
-
-
-def _resolve_destinatario(company, dest_cnpj):
-    if not dest_cnpj:
+    if bp:
+        return bp
+    name = (emit_nome or emit_fantasia or cnpj_clean).strip()[:255] or cnpj_clean
+    try:
+        bp = BusinessPartner.objects.create(
+            company=company,
+            identifier=cnpj_clean,
+            name=name,
+            partner_type="both",
+            state=emit_uf[:100] if emit_uf else "",
+            city=emit_municipio[:100] if emit_municipio else "",
+            category=None,
+            currency=None,
+        )
+        return bp
+    except Exception:
         return None
-    cnpj_clean = "".join(c for c in str(dest_cnpj) if c.isdigit())
+
+
+def _resolve_destinatario(company, dest_cnpj, dest_nome="", dest_uf=""):
+    """Retorna BusinessPartner existente por CNPJ ou cria um novo com dados da NFe (destinatário)."""
+    if not dest_cnpj or not company:
+        return None
+    cnpj_clean = "".join(c for c in str(dest_cnpj) if c.isdigit())[:50]
+    if not cnpj_clean:
+        return None
     qs = BusinessPartner.objects.filter(company=company)
     bp = qs.filter(identifier=dest_cnpj).first() or qs.filter(identifier=cnpj_clean).first()
-    return bp
+    if bp:
+        return bp
+    name = (dest_nome or cnpj_clean).strip()[:255] or cnpj_clean
+    try:
+        bp = BusinessPartner.objects.create(
+            company=company,
+            identifier=cnpj_clean,
+            name=name,
+            partner_type="both",
+            state=dest_uf[:100] if dest_uf else "",
+            city="",
+            category=None,
+            currency=None,
+        )
+        return bp
+    except Exception:
+        return None
 
 
 def _resolve_produto(company, codigo_produto, ean):
@@ -212,11 +250,18 @@ def _map_parser_to_notafiscal(data, company, xml_content, arquivo_origem):
 
     info_complementar = (ide.get("infCpl") or "")[:5000]
     info_fisco = (ide.get("infAdFisco") or "")[:5000]
-    xml_original = (xml_content or "")[:500000]
+    xml_original = (xml_content or "")  # store full XML (TextField has no practical limit)
     arquivo_origem_str = (arquivo_origem or "")[:500]
 
-    emitente = _resolve_emitente(company, emit_cnpj)
-    destinatario = _resolve_destinatario(company, dest_cnpj)
+    emitente = _resolve_emitente(
+        company, emit_cnpj,
+        emit_nome=emit_nome, emit_fantasia=emit_fantasia,
+        emit_uf=emit_uf, emit_municipio=emit_municipio,
+    )
+    destinatario = _resolve_destinatario(
+        company, dest_cnpj,
+        dest_nome=dest_nome, dest_uf=dest_uf,
+    )
 
     nf = NotaFiscal(
         company=company,
