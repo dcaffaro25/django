@@ -73,7 +73,7 @@ class NotaFiscalViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return NotaFiscalSerializer
 
     @action(methods=["get"], detail=False, url_path="resumo")
-    def resumo(self, request):
+    def resumo(self, request, **kwargs):
         """
         GET /api/nfe/resumo/?data_inicio=...&data_fim=...&emit_cnpj=...&dest_cnpj=...
         Retorna totais, soma por imposto, top emitentes, top produtos, distribuição por finalidade.
