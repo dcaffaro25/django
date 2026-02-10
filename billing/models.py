@@ -173,3 +173,7 @@ class InvoiceLine(TenantAwareBaseModel):
             
     def __str__(self):
         return f"{self.product_service.name} - {self.quantity} x {self.unit_price}"
+
+
+# Import NFe models so they are part of the app
+from .models_nfe import NotaFiscal, NotaFiscalItem  # noqa: E402

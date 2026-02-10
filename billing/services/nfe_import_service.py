@@ -1,0 +1,434 @@
+# -*- coding: utf-8 -*-
+"""
+Engine de importação de NFe: recebe XML(s), usa o parser e persiste em NotaFiscal/NotaFiscalItem.
+Suporta múltiplos arquivos; trata duplicatas por chave; resolve FKs (emitente, destinatário, produto).
+"""
+from decimal import Decimal, InvalidOperation
+from datetime import datetime
+
+from django.db import transaction
+
+# Parser está em scripts/nfe_engine (project root no path quando roda Django)
+from scripts.nfe_engine.parser import parse_nfe_xml
+
+from billing.models import NotaFiscal, NotaFiscalItem, BusinessPartner, ProductService
+
+
+def _safe_int(val, default=0):
+    if val is None or val == "":
+        return default
+    try:
+        return int(Decimal(str(val).strip().split(".")[0]))
+    except (ValueError, InvalidOperation):
+        return default
+
+
+def _safe_decimal(val, default=Decimal("0")):
+    if val is None or val == "":
+        return default
+    try:
+        return Decimal(str(val).strip().replace(",", "."))
+    except (ValueError, InvalidOperation):
+        return default
+
+
+def _safe_date(val):
+    if not val or not str(val).strip():
+        return None
+    s = str(val).strip()
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _build_transporte_json(transporte_rows, mod_frete_val):
+    """Monta transporte_json a partir da lista de linhas do parser."""
+    if not transporte_rows:
+        return {"modFrete": str(mod_frete_val), "transportadora": {}, "volumes": []}
+    first = transporte_rows[0]
+    transportadora = {}
+    if first.get("transporta_CNPJ"):
+        transportadora["CNPJ"] = first["transporta_CNPJ"]
+    if first.get("transporta_xNome"):
+        transportadora["xNome"] = first["transporta_xNome"]
+    if first.get("transporta_UF"):
+        transportadora["UF"] = first["transporta_UF"]
+    volumes = []
+    for row in transporte_rows:
+        vol = {}
+        for k, v in row.items():
+            if k.startswith("vol_") and v:
+                vol[k.replace("vol_", "")] = v
+        if vol:
+            volumes.append(vol)
+    return {
+        "modFrete": str(mod_frete_val),
+        "transportadora": transportadora,
+        "volumes": volumes,
+    }
+
+
+def _build_financeiro_json(duplicatas, pagamento):
+    """Lista única com tipo duplicata | pagamento."""
+    out = []
+    for d in duplicatas:
+        out.append({
+            "tipo": "duplicata",
+            "nDup": d.get("nDup", ""),
+            "dVenc": d.get("dVenc", ""),
+            "vDup": d.get("vDup", ""),
+        })
+    for p in pagamento:
+        out.append({
+            "tipo": "pagamento",
+            "indPag": p.get("indPag", ""),
+            "tPag": p.get("tPag", ""),
+            "vPag": p.get("vPag", ""),
+        })
+    return out
+
+
+def _build_referencias_json(referencias):
+    """Lista de chaves (refNFe) ou refNF como string identificadora."""
+    out = []
+    for r in referencias:
+        if r.get("refNFe"):
+            out.append(r["refNFe"])
+        elif r.get("refNF_CNPJ") or r.get("refNF_nNF"):
+            out.append({
+                "refNF_CNPJ": r.get("refNF_CNPJ", ""),
+                "refNF_nNF": r.get("refNF_nNF", ""),
+                "refNF_serie": r.get("refNF_serie", ""),
+            })
+    return out
+
+
+def _resolve_emitente(company, emit_cnpj):
+    if not emit_cnpj:
+        return None
+    cnpj_clean = "".join(c for c in str(emit_cnpj) if c.isdigit())
+    qs = BusinessPartner.objects.filter(company=company)
+    bp = qs.filter(identifier=emit_cnpj).first() or qs.filter(identifier=cnpj_clean).first()
+    return bp
+
+
+def _resolve_destinatario(company, dest_cnpj):
+    if not dest_cnpj:
+        return None
+    cnpj_clean = "".join(c for c in str(dest_cnpj) if c.isdigit())
+    qs = BusinessPartner.objects.filter(company=company)
+    bp = qs.filter(identifier=dest_cnpj).first() or qs.filter(identifier=cnpj_clean).first()
+    return bp
+
+
+def _resolve_produto(company, codigo_produto, ean):
+    if not company:
+        return None
+    qs = ProductService.objects.filter(company=company)
+    if codigo_produto:
+        p = qs.filter(code=codigo_produto).first()
+        if p:
+            return p
+    if ean:
+        p = qs.filter(code=ean).first()
+        if p:
+            return p
+    return None
+
+
+def _map_parser_to_notafiscal(data, company, xml_content, arquivo_origem):
+    """Mapeia resultado do parser para um único NotaFiscal + itens. Retorna (nf, None) ou (None, error_msg)."""
+    nfe_row = (data.get("nfe") or [{}])[0]
+    totais = (data.get("totais") or [{}])[0]
+    protocolo = (data.get("protocolo") or [{}])[0]
+    chave = (nfe_row.get("chave_NF") or "").strip()
+    if not chave or len(chave) != 44:
+        return None, "Chave inválida ou ausente"
+
+    if NotaFiscal.objects.filter(chave=chave).exists():
+        return "duplicada", None  # signal para não inserir, apenas reportar
+
+    # ide_*
+    ide = nfe_row
+    numero = _safe_int(ide.get("ide_nNF"))
+    serie = _safe_int(ide.get("ide_serie"), 1)
+    modelo = _safe_int(ide.get("ide_mod"), 55)
+    tipo_operacao = _safe_int(ide.get("ide_tpNF"), 0)
+    finalidade = _safe_int(ide.get("ide_finNFe"), 1)
+    natureza_operacao = (ide.get("ide_natOp") or "")[:200]
+    ambiente = _safe_int(ide.get("ide_tpAmb"), 1)
+    id_destino = _safe_int(ide.get("ide_idDest"), 1)
+    ind_final = _safe_int(ide.get("ide_indFinal"), 0)
+    ind_presenca = _safe_int(ide.get("ide_indPres"), 9)
+    data_emissao = _safe_date(ide.get("ide_dhEmi"))
+    data_saida_entrada = _safe_date(ide.get("ide_dhSaiEnt"))
+    if not data_emissao:
+        return None, "Data de emissão ausente"
+
+    # Emitente
+    emit_cnpj = (ide.get("emit_CNPJ") or "").strip()[:14]
+    emit_nome = (ide.get("emit_xNome") or "").strip()[:300]
+    emit_fantasia = (ide.get("emit_xFant") or "").strip()[:300]
+    emit_uf = (ide.get("emit_UF") or "").strip()[:2]
+    emit_municipio = (ide.get("emit_xMun") or "").strip()[:100]
+    emit_ie = (ide.get("emit_IE") or "")[:20]
+    emit_crt = (ide.get("emit_CRT") or "")[:1]
+
+    # Destinatário
+    dest_cnpj = (ide.get("dest_CNPJ") or "").strip()[:14]
+    dest_nome = (ide.get("dest_xNome") or "").strip()[:300]
+    dest_ie = (ide.get("dest_IE") or "")[:20]
+    dest_uf = (ide.get("dest_UF") or "").strip()[:2]
+    dest_ind_ie = (ide.get("dest_indIEDest") or "")[:1]
+
+    # Totais (row_nfe já traz vNF, vProd, vICMS, vPIS, vCOFINS, vFrete, vDesc)
+    valor_nota = _safe_decimal(ide.get("vNF"))
+    valor_produtos = _safe_decimal(ide.get("vProd"))
+    valor_icms = _safe_decimal(ide.get("vICMS"))
+    valor_icms_st = _safe_decimal(totais.get("tot_vST") or ide.get("vST"))
+    valor_ipi = _safe_decimal(totais.get("tot_vIPI") or ide.get("vIPI"))
+    valor_pis = _safe_decimal(ide.get("vPIS"))
+    valor_cofins = _safe_decimal(ide.get("vCOFINS"))
+    valor_frete = _safe_decimal(ide.get("vFrete"))
+    valor_seguro = _safe_decimal(totais.get("tot_vSeg"))
+    valor_desconto = _safe_decimal(ide.get("vDesc"))
+    valor_outras = _safe_decimal(totais.get("tot_vOutro"))
+    valor_icms_uf_dest = _safe_decimal(totais.get("tot_vICMSUFDest"))
+    valor_trib_aprox = _safe_decimal(totais.get("tot_vTotTrib"))
+
+    # Protocolo
+    protocolo_str = (protocolo.get("nProt") or "").strip()[:20]
+    status_sefaz = (protocolo.get("cStat") or "").strip()[:5]
+    motivo_sefaz = (protocolo.get("xMotivo") or "").strip()[:300]
+    data_autorizacao = _safe_date(protocolo.get("dhRecbto"))
+
+    # Transporte (modFrete vem da primeira linha de transporte)
+    mod_frete = _safe_int((data.get("transporte") or [{}])[0].get("modFrete"), 9)
+    transporte_json = _build_transporte_json(data.get("transporte") or [], mod_frete)
+    financeiro_json = _build_financeiro_json(data.get("duplicatas") or [], data.get("pagamento") or [])
+    referencias_json = _build_referencias_json(data.get("referencias") or [])
+    totais_json = {k.replace("tot_", ""): v for k, v in totais.items() if k.startswith("tot_") and v not in (None, "")}
+
+    info_complementar = (ide.get("infCpl") or "")[:5000]
+    info_fisco = (ide.get("infAdFisco") or "")[:5000]
+    xml_original = (xml_content or "")[:500000]
+    arquivo_origem_str = (arquivo_origem or "")[:500]
+
+    emitente = _resolve_emitente(company, emit_cnpj)
+    destinatario = _resolve_destinatario(company, dest_cnpj)
+
+    nf = NotaFiscal(
+        company=company,
+        chave=chave,
+        numero=numero,
+        serie=serie,
+        modelo=modelo,
+        tipo_operacao=tipo_operacao,
+        finalidade=finalidade,
+        natureza_operacao=natureza_operacao,
+        ambiente=ambiente,
+        id_destino=id_destino,
+        ind_final=ind_final,
+        ind_presenca=ind_presenca,
+        data_emissao=data_emissao,
+        data_saida_entrada=data_saida_entrada,
+        emit_cnpj=emit_cnpj,
+        emit_nome=emit_nome,
+        emit_fantasia=emit_fantasia,
+        emit_ie=emit_ie,
+        emit_crt=emit_crt,
+        emit_uf=emit_uf,
+        emit_municipio=emit_municipio,
+        emitente=emitente,
+        dest_cnpj=dest_cnpj,
+        dest_nome=dest_nome,
+        dest_ie=dest_ie,
+        dest_uf=dest_uf,
+        dest_ind_ie=dest_ind_ie,
+        destinatario=destinatario,
+        valor_nota=valor_nota,
+        valor_produtos=valor_produtos,
+        valor_icms=valor_icms,
+        valor_icms_st=valor_icms_st,
+        valor_ipi=valor_ipi,
+        valor_pis=valor_pis,
+        valor_cofins=valor_cofins,
+        valor_frete=valor_frete,
+        valor_seguro=valor_seguro,
+        valor_desconto=valor_desconto,
+        valor_outras=valor_outras,
+        valor_icms_uf_dest=valor_icms_uf_dest,
+        valor_trib_aprox=valor_trib_aprox,
+        protocolo=protocolo_str,
+        status_sefaz=status_sefaz,
+        motivo_sefaz=motivo_sefaz,
+        data_autorizacao=data_autorizacao,
+        mod_frete=mod_frete,
+        transporte_json=transporte_json,
+        financeiro_json=financeiro_json,
+        referencias_json=referencias_json,
+        totais_json=totais_json,
+        info_complementar=info_complementar,
+        info_fisco=info_fisco,
+        xml_original=xml_original,
+        arquivo_origem=arquivo_origem_str,
+    )
+    return nf, None
+
+
+def _map_item_to_model(item_data, nota_fiscal, company):
+    """Cria instância NotaFiscalItem a partir de um dict do parser (prefixos prod_, ICMS_, etc.)."""
+    n_item = _safe_int(item_data.get("nItem"), 1)
+    prod = item_data
+    codigo_produto = (prod.get("prod_cProd") or "").strip()[:60]
+    ean = (prod.get("prod_cEAN") or "").strip()[:14]
+    descricao = (prod.get("prod_xProd") or "").strip()[:500]
+    ncm = (prod.get("prod_NCM") or "").strip()[:8]
+    cest = (prod.get("prod_CEST") or "").strip()[:7]
+    cfop = (prod.get("prod_CFOP") or "").strip()[:4]
+    unidade = (prod.get("prod_uCom") or "UN").strip()[:6]
+    quantidade = _safe_decimal(prod.get("prod_qCom"))
+    valor_unitario = _safe_decimal(prod.get("prod_vUnCom"))
+    valor_total = _safe_decimal(prod.get("prod_vProd"))
+    info_adicional = (prod.get("infAdProd") or "")[:2000]
+
+    icms_origem = _safe_int(prod.get("ICMS_orig"), 0)
+    icms_cst = (prod.get("ICMS_CST") or "").strip()[:4]
+    icms_base = _safe_decimal(prod.get("ICMS_vBC"))
+    icms_aliquota = _safe_decimal(prod.get("ICMS_pICMS"))
+    icms_valor = _safe_decimal(prod.get("ICMS_vICMS"))
+    icms_st_base = _safe_decimal(prod.get("ICMS_vBCST"))
+    icms_st_valor = _safe_decimal(prod.get("ICMS_vICMSST"))
+
+    pis_cst = (prod.get("PIS_CST") or "").strip()[:2]
+    pis_base = _safe_decimal(prod.get("PIS_vBC"))
+    pis_aliquota = _safe_decimal(prod.get("PIS_pPIS"))
+    pis_valor = _safe_decimal(prod.get("PIS_vPIS"))
+
+    cofins_cst = (prod.get("COFINS_CST") or "").strip()[:2]
+    cofins_base = _safe_decimal(prod.get("COFINS_vBC"))
+    cofins_aliquota = _safe_decimal(prod.get("COFINS_pCOFINS"))
+    cofins_valor = _safe_decimal(prod.get("COFINS_vCOFINS"))
+
+    ipi_cst = (prod.get("IPI_CST") or "").strip()[:2]
+    ipi_valor = _safe_decimal(prod.get("IPI_vIPI"))
+
+    icms_uf_dest_base = _safe_decimal(prod.get("vBCUFDest"))
+    icms_uf_dest_valor = _safe_decimal(prod.get("vICMSUFDest"))
+    icms_uf_remet_valor = Decimal("0")  # parser pode não expor; manter 0
+
+    # Impostos completos: guardar dict com as chaves que vieram do parser para o item
+    impostos_json = {}
+    for k, v in prod.items():
+        if k.startswith("ICMS_") or k.startswith("PIS_") or k.startswith("COFINS_") or k in ("vBCUFDest", "vICMSUFDest", "vTotTrib"):
+            if v not in (None, ""):
+                impostos_json[k] = v
+
+    produto = _resolve_produto(company, codigo_produto, ean)
+
+    return NotaFiscalItem(
+        nota_fiscal=nota_fiscal,
+        company=company,
+        numero_item=n_item,
+        codigo_produto=codigo_produto or "0",
+        ean=ean,
+        descricao=descricao or "-",
+        ncm=ncm or "0",
+        cest=cest,
+        cfop=cfop or "0",
+        unidade=unidade,
+        quantidade=quantidade,
+        valor_unitario=valor_unitario,
+        valor_total=valor_total,
+        produto=produto,
+        icms_origem=icms_origem,
+        icms_cst=icms_cst,
+        icms_base=icms_base,
+        icms_aliquota=icms_aliquota,
+        icms_valor=icms_valor,
+        icms_st_base=icms_st_base,
+        icms_st_valor=icms_st_valor,
+        pis_cst=pis_cst,
+        pis_base=pis_base,
+        pis_aliquota=pis_aliquota,
+        pis_valor=pis_valor,
+        cofins_cst=cofins_cst,
+        cofins_base=cofins_base,
+        cofins_aliquota=cofins_aliquota,
+        cofins_valor=cofins_valor,
+        ipi_cst=ipi_cst,
+        ipi_valor=ipi_valor,
+        icms_uf_dest_base=icms_uf_dest_base,
+        icms_uf_dest_valor=icms_uf_dest_valor,
+        icms_uf_remet_valor=icms_uf_remet_valor,
+        impostos_json=impostos_json,
+        info_adicional=info_adicional,
+    )
+
+
+def import_one(xml_content, company, filename=""):
+    """
+    Importa um único XML. Retorna:
+    - ("importada", nf) em sucesso
+    - ("duplicada", chave) se a chave já existir
+    - ("erro", mensagem) em falha de parse ou validação
+    """
+    data = parse_nfe_xml(xml_content, source_path=filename)
+    if not data:
+        return "erro", "XML inválido ou não é NFe"
+
+    nf_or_signal, err = _map_parser_to_notafiscal(data, company, xml_content, filename)
+    if err:
+        return "erro", err
+    if nf_or_signal == "duplicada":
+        chave = (data.get("nfe") or [{}])[0].get("chave_NF", "")
+        return "duplicada", chave
+
+    nf = nf_or_signal
+    with transaction.atomic():
+        nf.save()
+        for item_data in data.get("itens") or []:
+            item = _map_item_to_model(item_data, nf, company)
+            item.save()
+    return "importada", nf
+
+
+def import_many(files, company):
+    """
+    files: lista de (filename, content) ou lista de arquivos tipo UploadedFile com .read() e .name.
+    company: instância Company (tenant).
+    Retorna: {"importadas": [{"chave": ..., "id": ...}], "duplicadas": [chave, ...], "erros": [{"arquivo": ..., "erro": ...}]}
+    """
+    importadas = []
+    duplicadas = []
+    erros = []
+
+    for f in files:
+        if hasattr(f, "read") and hasattr(f, "name"):
+            filename = getattr(f, "name", "") or ""
+            try:
+                content = f.read()
+                if isinstance(content, bytes):
+                    content = content.decode("utf-8", errors="replace")
+            except Exception as e:
+                erros.append({"arquivo": filename, "erro": str(e)})
+                continue
+        else:
+            filename, content = f[0], f[1]
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", errors="replace")
+
+        status, payload = import_one(content, company, filename)
+        if status == "importada":
+            importadas.append({"chave": payload.chave, "id": payload.pk, "numero": payload.numero})
+        elif status == "duplicada":
+            duplicadas.append(payload)
+        else:
+            erros.append({"arquivo": filename, "erro": payload})
+
+    return {
+        "importadas": importadas,
+        "duplicadas": duplicadas,
+        "erros": erros,
+    }
