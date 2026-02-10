@@ -19,7 +19,7 @@ from .services.nfe_import_service import import_many
 from multitenancy.mixins import ScopedQuerysetMixin
 
 MAX_FILE_SIZE_BYTES = 1024 * 1024  # 1MB per file
-MAX_FILES = 100
+MAX_FILES = 10000
 
 
 class NFeImportView(APIView):
