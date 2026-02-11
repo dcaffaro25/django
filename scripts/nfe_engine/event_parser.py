@@ -3,11 +3,13 @@
 Parser de XML de evento NFe (cancelamento, CCe, manifestação do destinatário, etc.).
 Suporta envEvento (pedido) e retEnvEvento (resposta SEFAZ).
 """
+import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from typing import Any, Dict, Optional, Union
 
 NS = {"nfe": "http://www.portalfiscal.inf.br/nfe"}
+logger = logging.getLogger("billing.nfe_events")
 
 
 def _text(el: Optional[ET.Element], default: str = "") -> str:
@@ -94,10 +96,12 @@ def parse_nfe_evento_xml(
     """
     try:
         root = ET.fromstring(content)
-    except ET.ParseError:
+    except ET.ParseError as e:
+        logger.debug("parse_nfe_evento_xml: ParseError %s source=%s", e, source_path)
         return None
 
     tag = root.tag.split("}")[-1] if "}" in root.tag else root.tag
+    logger.debug("parse_nfe_evento_xml: root tag=%r source=%s", tag, source_path)
     xml_str = content.decode("utf-8", errors="replace") if isinstance(content, bytes) else content
     arquivo = (source_path or "")[:500]
 
@@ -142,12 +146,22 @@ def parse_nfe_evento_xml(
             inf_resposta = inf_pedido
 
     if inf_pedido is None:
+        logger.debug(
+            "parse_nfe_evento_xml: infEvento não encontrado (tag=%r) source=%s",
+            tag,
+            source_path,
+        )
         return None
 
     req = _extract_from_inf_evento(inf_pedido)
     res = _extract_from_inf_evento(inf_resposta) if inf_resposta is not None else {}
     chave_nfe = req.get("chave_nfe") or res.get("chave_nfe") or ""
     if len(chave_nfe) != 44:
+        logger.debug(
+            "parse_nfe_evento_xml: chave_nfe inválida len=%s (esperado 44) source=%s",
+            len(chave_nfe),
+            source_path,
+        )
         return None
 
     tipo_evento = req.get("tipo_evento") or res.get("tipo_evento") or 0

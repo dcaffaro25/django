@@ -13,13 +13,25 @@ class NotaFiscalItemInline(admin.TabularInline):
     show_change_link = True
 
 
+class NotaFiscalReferenciaInline(admin.TabularInline):
+    model = NotaFiscalReferencia
+    fk_name = 'nota_fiscal'
+    extra = 0
+    fields = ('chave_referenciada', 'nota_referenciada')
+    readonly_fields = ('chave_referenciada', 'nota_referenciada')
+    can_delete = True
+    show_change_link = True
+    verbose_name = 'Referência a outra NF'
+    verbose_name_plural = 'Referências a outras NFs'
+
+
 @admin.register(NotaFiscal)
 class NotaFiscalAdmin(admin.ModelAdmin):
     list_display = ('numero', 'serie', 'chave', 'data_emissao', 'emit_nome', 'dest_nome', 'valor_nota', 'status_sefaz')
     list_filter = ('tipo_operacao', 'finalidade', 'data_emissao')
     search_fields = ('chave', 'numero', 'emit_nome', 'emit_cnpj', 'dest_nome', 'dest_cnpj')
     date_hierarchy = 'data_emissao'
-    inlines = [NotaFiscalItemInline]
+    inlines = [NotaFiscalItemInline, NotaFiscalReferenciaInline]
     readonly_fields = ('chave', 'protocolo', 'status_sefaz', 'data_autorizacao')
 
 
@@ -48,9 +60,17 @@ class NFeInutilizacaoAdmin(admin.ModelAdmin):
     readonly_fields = ('protocolo', 'status_sefaz', 'data_registro')
 
 
+@admin.register(NotaFiscalReferencia)
+class NotaFiscalReferenciaAdmin(admin.ModelAdmin):
+    list_display = ('nota_fiscal', 'chave_referenciada', 'nota_referenciada')
+    list_filter = ('nota_fiscal__finalidade',)
+    search_fields = ('chave_referenciada', 'nota_fiscal__chave')
+    raw_id_fields = ('nota_fiscal', 'nota_referenciada')
+
+
 # Register remaining billing models (exclude NFe, already registered above)
 app_models = apps.get_app_config('billing').get_models()
-nfe_models = {NotaFiscal, NotaFiscalItem, NFeEvento, NFeInutilizacao}
+nfe_models = {NotaFiscal, NotaFiscalItem, NotaFiscalReferencia, NFeEvento, NFeInutilizacao}
 for model in app_models:
     if model not in nfe_models:
         admin.site.register(model)

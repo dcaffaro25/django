@@ -219,6 +219,55 @@ class NotaFiscalItem(TenantAwareBaseModel):
         return f"Item {self.numero_item}: {self.descricao[:50]}"
 
 
+class NotaFiscalReferencia(TenantAwareBaseModel):
+    """
+    Vínculo explícito: uma NF referencia outra NF (ex.: devolução referencia a nota original).
+    Permite consulta bidirecional: "quem esta NF referencia?" e "quais NFs referenciam esta?".
+    A referência vem do XML (refNFe no grupo NFRef); ao importar, criamos estes registros
+    e preenchemos nota_referenciada quando a NF referenciada já existir no sistema.
+    """
+    # NF que contém a referência no XML (a "nova" NF, ex.: devolução)
+    nota_fiscal = models.ForeignKey(
+        NotaFiscal,
+        on_delete=models.CASCADE,
+        related_name="referencias_a_outras_notas",
+        verbose_name="Nota Fiscal (que referencia)",
+    )
+    # Chave da NF referenciada (sempre do XML; 44 dígitos para refNFe)
+    chave_referenciada = models.CharField(
+        "Chave NF referenciada", max_length=44, db_index=True,
+        help_text="Chave de 44 dígitos (refNFe) da NF ao qual esta nota faz referência.",
+    )
+    # Vínculo à NF referenciada quando ela existir no sistema (encadeamento)
+    nota_referenciada = models.ForeignKey(
+        NotaFiscal,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="notas_que_me_referenciam",
+        verbose_name="Nota referenciada (quando existir)",
+        help_text="Preenchido quando já existe NotaFiscal com chave = chave_referenciada.",
+    )
+
+    class Meta:
+        verbose_name = "Referência entre NFs"
+        verbose_name_plural = "Referências entre NFs"
+        ordering = ["nota_fiscal", "chave_referenciada"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "nota_fiscal", "chave_referenciada"],
+                name="billing_nfref_company_nf_chave_uniq",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["chave_referenciada"]),
+            models.Index(fields=["nota_referenciada"]),
+        ]
+
+    def __str__(self):
+        return f"NF {self.nota_fiscal_id} → {self.chave_referenciada[-8:]}"
+
+
 # Códigos de tipo de evento NFe (SEFAZ) para uso em choices e filtros
 TP_EVENTO_CHOICES = [
     (110110, "Carta de Correção (CCe)"),

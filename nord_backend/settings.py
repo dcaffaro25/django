@@ -116,6 +116,12 @@ LOGGING["loggers"]["chat.llm"] = {
     "level": "DEBUG",
     "propagate": False,
 }
+# NFe eventos/inutilização: import e detecção de tipo (DEBUG = ver parse e doc_type por arquivo)
+LOGGING["loggers"]["billing.nfe_events"] = {
+    "handlers": ["console_plain"],
+    "level": "DEBUG",
+    "propagate": False,
+}
 # Optional: see requests→urllib3 connection lines (INFO is usually enough)
 import logging as _pylog
 _pylog.getLogger("urllib3.connectionpool").setLevel(_pylog.INFO)

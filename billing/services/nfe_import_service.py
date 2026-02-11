@@ -13,7 +13,13 @@ from django.db import transaction
 from scripts.nfe_engine.parser import parse_nfe_xml
 from multitenancy.models import SubstitutionRule
 
-from billing.models import NotaFiscal, NotaFiscalItem, BusinessPartner, ProductService
+from billing.models import (
+    NotaFiscal,
+    NotaFiscalItem,
+    NotaFiscalReferencia,
+    BusinessPartner,
+    ProductService,
+)
 
 
 def _safe_int(val, default=0):
@@ -512,6 +518,34 @@ def import_one(xml_content, company, filename=""):
         for item_data in data.get("itens") or []:
             item = _map_item_to_model(item_data, nf, company)
             item.save()
+        # Vincular referências: criar NotaFiscalReferencia para cada refNFe (chave 44)
+        # e preencher nota_referenciada quando a NF referenciada já existir
+        for ref in nf.referencias_json or []:
+            chave_ref = None
+            if isinstance(ref, str) and len(ref.strip()) == 44:
+                chave_ref = ref.strip()
+            elif isinstance(ref, dict) and ref.get("refNFe") and len(str(ref["refNFe"]).strip()) == 44:
+                chave_ref = str(ref["refNFe"]).strip()
+            if not chave_ref:
+                continue
+            if NotaFiscalReferencia.objects.filter(
+                company=company, nota_fiscal=nf, chave_referenciada=chave_ref
+            ).exists():
+                continue
+            nota_ref = NotaFiscal.objects.filter(company=company, chave=chave_ref).first()
+            NotaFiscalReferencia.objects.create(
+                company=company,
+                nota_fiscal=nf,
+                chave_referenciada=chave_ref,
+                nota_referenciada=nota_ref,
+            )
+        # Preencher vínculos reversos: NFs que referenciam ESTA NF (por chave) e ainda
+        # tinham nota_referenciada=None passam a apontar para esta NF
+        NotaFiscalReferencia.objects.filter(
+            company=company,
+            chave_referenciada=nf.chave,
+            nota_referenciada__isnull=True,
+        ).update(nota_referenciada=nf)
     return "importada", nf
 
 
