@@ -11,8 +11,10 @@ from datetime import datetime
 from django.db import transaction
 
 from scripts.nfe_engine.parser import parse_nfe_xml
+from scripts.nfe_engine import detect_nfe_document_type
 from multitenancy.models import SubstitutionRule
 
+from billing.services.nfe_event_import_service import import_event_one
 from billing.models import (
     NotaFiscal,
     NotaFiscalItem,
@@ -503,6 +505,12 @@ def import_one(xml_content, company, filename=""):
     """
     data = parse_nfe_xml(xml_content, source_path=filename)
     if not data:
+        raw = xml_content if isinstance(xml_content, bytes) else xml_content.encode("utf-8")
+        doc_type = detect_nfe_document_type(raw)
+        if doc_type == "evento":
+            return "erro", "Este arquivo é um evento NFe (cancelamento, CCe, etc.). Use o import de EVENTOS (não o de NFe)."
+        if doc_type == "inutilizacao":
+            return "erro", "Este arquivo é uma inutilização de numeração (ProcInutNFe). Use o import de EVENTOS (não o de NFe)."
         return "erro", "XML inválido ou não é NFe"
 
     nf_or_signal, err = _map_parser_to_notafiscal(data, company, xml_content, filename)
@@ -584,6 +592,81 @@ def import_many(files, company):
 
     return {
         "importadas": importadas,
+        "duplicadas": duplicadas,
+        "erros": erros,
+    }
+
+
+def import_nfe_xml_many(files, company):
+    """
+    Um único ponto de importação: para cada XML detecta o tipo (NFe, evento ou inutilização)
+    e processa com o importador correto.
+    Retorna: importadas (NFe), importados (eventos), importados_inut (inutilizações),
+             duplicadas (chaves/identificadores), erros.
+    """
+    importadas = []
+    importados = []
+    importados_inut = []
+    duplicadas = []
+    erros = []
+
+    for f in files:
+        if hasattr(f, "read") and hasattr(f, "name"):
+            filename = getattr(f, "name", "") or ""
+            try:
+                content = f.read()
+                if isinstance(content, bytes):
+                    content = content.decode("utf-8", errors="replace")
+            except Exception as e:
+                erros.append({"arquivo": filename, "erro": str(e)})
+                continue
+        else:
+            filename, content = f[0], f[1]
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", errors="replace")
+
+        raw = content if isinstance(content, bytes) else content.encode("utf-8")
+        doc_type = detect_nfe_document_type(raw)
+
+        if doc_type == "nfe":
+            status, payload = import_one(content, company, filename)
+            if status == "importada":
+                importadas.append({"chave": payload.chave, "id": payload.pk, "numero": payload.numero})
+            elif status == "duplicada":
+                duplicadas.append(payload)
+            else:
+                erros.append({"arquivo": filename, "erro": payload})
+        elif doc_type in ("evento", "inutilizacao"):
+            status, payload = import_event_one(content, company, filename)
+            if status == "importado":
+                importados.append({
+                    "chave_nfe": payload.chave_nfe,
+                    "id": payload.pk,
+                    "tipo_evento": payload.tipo_evento,
+                    "n_seq_evento": payload.n_seq_evento,
+                })
+            elif status == "importado_inut":
+                importados_inut.append({
+                    "ano": payload.ano,
+                    "serie": payload.serie,
+                    "n_nf_ini": payload.n_nf_ini,
+                    "n_nf_fin": payload.n_nf_fin,
+                    "id": payload.pk,
+                })
+            elif status == "duplicado":
+                duplicadas.append(payload)
+            else:
+                erros.append({"arquivo": filename, "erro": payload})
+        else:
+            erros.append({
+                "arquivo": filename,
+                "erro": "Tipo de XML não reconhecido (esperado NFe, evento ou inutilização).",
+            })
+
+    return {
+        "importadas": importadas,
+        "importados": importados,
+        "importados_inut": importados_inut,
         "duplicadas": duplicadas,
         "erros": erros,
     }

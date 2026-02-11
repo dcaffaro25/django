@@ -65,9 +65,18 @@ class NotaFiscalListSerializer(serializers.ModelSerializer):
 
 
 class NFeImportResultSerializer(serializers.Serializer):
-    """Resposta do endpoint de importação."""
+    """Resposta do endpoint de importação (apenas NFe)."""
     importadas = serializers.ListField(child=serializers.DictField())
     duplicadas = serializers.ListField(child=serializers.CharField())
+    erros = serializers.ListField(child=serializers.DictField())
+
+
+class NFeUnifiedImportResultSerializer(serializers.Serializer):
+    """Resposta do endpoint unificado de importação (NFe + eventos + inutilizações)."""
+    importadas = serializers.ListField(child=serializers.DictField(), help_text="NFe importadas")
+    importados = serializers.ListField(child=serializers.DictField(), help_text="Eventos importados")
+    importados_inut = serializers.ListField(child=serializers.DictField(), help_text="Inutilizações importadas")
+    duplicadas = serializers.ListField(child=serializers.CharField(), help_text="Chaves/IDs já existentes")
     erros = serializers.ListField(child=serializers.DictField())
 
 

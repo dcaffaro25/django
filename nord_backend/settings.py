@@ -117,8 +117,15 @@ LOGGING["loggers"]["chat.llm"] = {
     "propagate": False,
 }
 # NFe eventos/inutilização: import e detecção de tipo (DEBUG = ver parse e doc_type por arquivo)
+# Handler em stdout para garantir visibilidade no Railway / Docker (capturam stdout)
+LOGGING["handlers"]["console_stdout"] = {
+    "class": "logging.StreamHandler",
+    "formatter": "plain",
+    "level": "DEBUG",
+    "stream": "ext://sys.stdout",
+}
 LOGGING["loggers"]["billing.nfe_events"] = {
-    "handlers": ["console_plain"],
+    "handlers": ["console_stdout", "console_plain"],
     "level": "DEBUG",
     "propagate": False,
 }

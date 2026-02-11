@@ -21,10 +21,11 @@ from .serializers_nfe import (
     NotaFiscalListSerializer,
     NotaFiscalItemSerializer,
     NFeImportResultSerializer,
+    NFeUnifiedImportResultSerializer,
     NFeEventoSerializer,
     NFeEventoImportResultSerializer,
 )
-from .services.nfe_import_service import import_many
+from .services.nfe_import_service import import_many, import_nfe_xml_many
 from .services.nfe_event_import_service import import_events_many
 from multitenancy.mixins import ScopedQuerysetMixin
 
@@ -33,45 +34,11 @@ MAX_FILES = settings.DATA_UPLOAD_MAX_NUMBER_FILES
 
 
 class NFeImportView(APIView):
-    """POST /api/nfe/import/ — upload de múltiplos XMLs (multipart/form-data, campo 'files')."""
-    parser_classes = [MultiPartParser]
-
-    def post(self, request, tenant_id=None):
-        company = getattr(request, "tenant", None)
-        if not company:
-            return Response(
-                {"detail": "Tenant (company) não identificado."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        files = request.FILES.getlist("files")
-        if not files:
-            return Response(
-                {"detail": "Envie um ou mais arquivos XML no campo 'files'."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if len(files) > MAX_FILES:
-            return Response(
-                {"detail": f"Máximo de {MAX_FILES} arquivos por requisição."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        for f in files:
-            if not (getattr(f, "name", "") or "").lower().endswith(".xml"):
-                return Response(
-                    {"detail": f"Arquivo '{getattr(f, 'name', '')}' não é .xml."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            if f.size > MAX_FILE_SIZE_BYTES:
-                return Response(
-                    {"detail": f"Arquivo '{getattr(f, 'name', '')}' excede 1MB."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-        result = import_many(files, company)
-        serializer = NFeImportResultSerializer(result)
-        return Response(serializer.data, status=status.HTTP_200_OK)
-
-
-class NFeEventoImportView(APIView):
-    """POST /api/nfe/eventos/import/ — upload de múltiplos XMLs de evento (cancelamento, CCe, manifestação)."""
+    """
+    POST /api/nfe/import/ — upload de múltiplos XMLs (multipart/form-data, campo 'files').
+    Interpreta cada arquivo: NFe (nota), evento (cancelamento, CCe, etc.) ou inutilização,
+    e processa com o importador correto. Um único endpoint para todos os tipos.
+    """
     parser_classes = [MultiPartParser]
 
     def post(self, request, tenant_id=None, **kwargs):
@@ -103,8 +70,8 @@ class NFeEventoImportView(APIView):
                     {"detail": f"Arquivo '{getattr(f, 'name', '')}' excede 1MB."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-        result = import_events_many(files, company)
-        serializer = NFeEventoImportResultSerializer(result)
+        result = import_nfe_xml_many(files, company)
+        serializer = NFeUnifiedImportResultSerializer(result)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 

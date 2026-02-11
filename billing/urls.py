@@ -12,7 +12,6 @@ from .views import (
 )
 from .views_nfe import (
     NFeImportView,
-    NFeEventoImportView,
     NotaFiscalViewSet,
     NotaFiscalItemViewSet,
     NFeEventoViewSet,
@@ -34,6 +33,6 @@ router.register('nfe-eventos', NFeEventoViewSet)
 
 urlpatterns = [
     re_path(r'api/nfe/import/?$', NFeImportView.as_view(), name='nfe-import'),
-    re_path(r'api/nfe/eventos/import/?$', NFeEventoImportView.as_view(), name='nfe-eventos-import'),
+    re_path(r'api/nfe/eventos/import/?$', NFeImportView.as_view(), name='nfe-eventos-import'),  # alias: mesmo endpoint
     re_path(r'api/', include(router.urls)),
 ]

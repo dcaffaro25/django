@@ -177,6 +177,13 @@ def import_events_many(files, company):
     duplicados = []
     erros = []
 
+    company_id = getattr(company, "pk", None) or getattr(company, "id", None)
+    logger.info(
+        "[NFe eventos] import_events_many: início n_files=%s company_id=%s",
+        len(files),
+        company_id,
+    )
+
     for f in files:
         if hasattr(f, "read") and hasattr(f, "name"):
             filename = getattr(f, "name", "") or ""
@@ -218,6 +225,13 @@ def import_events_many(files, company):
         else:
             erros.append({"arquivo": filename, "erro": payload})
 
+    logger.info(
+        "[NFe eventos] import_events_many: fim importados=%s inut=%s duplicados=%s erros=%s",
+        len(importados),
+        len(importados_inut),
+        len(duplicados),
+        len(erros),
+    )
     return {
         "importados": importados,
         "importados_inut": importados_inut,
