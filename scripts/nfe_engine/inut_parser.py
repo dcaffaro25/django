@@ -18,11 +18,15 @@ def _text(el: Optional[ET.Element], default: str = "") -> str:
 def _find_any(parent: Optional[ET.Element], *local_names: str) -> Optional[ET.Element]:
     if parent is None:
         return None
+    uri = NS["nfe"]
+    full_uri_prefix = "{" + uri + "}"
     for name in local_names:
-        for prefix in ("nfe:", "{" + NS["nfe"] + "}"):
-            el = parent.find(f".//{prefix}{name}")
-            if el is not None:
-                return el
+        el = parent.find(f".//nfe:{name}", NS)
+        if el is not None:
+            return el
+        el = parent.find(f".//{full_uri_prefix}{name}")
+        if el is not None:
+            return el
         el = parent.find(f".//{name}")
         if el is not None:
             return el

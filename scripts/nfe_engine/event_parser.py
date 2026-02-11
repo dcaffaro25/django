@@ -22,12 +22,17 @@ def _find_any(parent: Optional[ET.Element], *local_names: str) -> Optional[ET.El
     """Encontra o primeiro filho/descendente com uma das tags (com ou sem namespace)."""
     if parent is None:
         return None
+    uri = NS["nfe"]
+    full_uri_prefix = "{" + uri + "}"
     for name in local_names:
-        for prefix in ("nfe:", "{" + NS["nfe"] + "}"):
-            full = prefix + name
-            el = parent.find(f".//{full}")
-            if el is not None:
-                return el
+        # Com prefixo nfe: é obrigatório passar namespaces no find()
+        el = parent.find(f".//nfe:{name}", NS)
+        if el is not None:
+            return el
+        # Com URI completo não precisa de prefix map
+        el = parent.find(f".//{full_uri_prefix}{name}")
+        if el is not None:
+            return el
         el = parent.find(f".//{name}")
         if el is not None:
             return el
