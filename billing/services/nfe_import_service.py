@@ -5,7 +5,7 @@ Suporta múltiplos arquivos; trata duplicatas por chave; resolve FKs (emitente, 
 Antes de criar parceiros ou produtos, aplica SubstitutionRule (de-para) para resolver por identificador/código.
 """
 import re
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from datetime import datetime
 
 from django.db import transaction
@@ -40,6 +40,22 @@ def _safe_decimal(val, default=Decimal("0")):
         return Decimal(str(val).strip().replace(",", "."))
     except (ValueError, InvalidOperation):
         return default
+
+
+def _decimal_to_field(val, max_digits, decimal_places, default=Decimal("0")):
+    """
+    Converte valor para Decimal, trunca às casas decimais permitidas e limita ao
+    intervalo que cabe no campo (evita overflow em numeric(max_digits, decimal_places)).
+    """
+    d = _safe_decimal(val, default)
+    max_int_digits = max_digits - decimal_places
+    max_abs = (Decimal(10) ** max_int_digits) - (Decimal(10) ** -decimal_places)
+    if d > max_abs:
+        d = max_abs
+    elif d < -max_abs:
+        d = -max_abs
+    quantize_exp = Decimal(10) ** -decimal_places
+    return d.quantize(quantize_exp, rounding=ROUND_DOWN)
 
 
 def _safe_date(val):
@@ -301,20 +317,22 @@ def _map_parser_to_notafiscal(data, company, xml_content, arquivo_origem):
     dest_uf = (ide.get("dest_UF") or "").strip()[:2]
     dest_ind_ie = (ide.get("dest_indIEDest") or "")[:1]
 
-    # Totais (row_nfe já traz vNF, vProd, vICMS, vPIS, vCOFINS, vFrete, vDesc)
-    valor_nota = _safe_decimal(ide.get("vNF"))
-    valor_produtos = _safe_decimal(ide.get("vProd"))
-    valor_icms = _safe_decimal(ide.get("vICMS"))
-    valor_icms_st = _safe_decimal(totais.get("tot_vST") or ide.get("vST"))
-    valor_ipi = _safe_decimal(totais.get("tot_vIPI") or ide.get("vIPI"))
-    valor_pis = _safe_decimal(ide.get("vPIS"))
-    valor_cofins = _safe_decimal(ide.get("vCOFINS"))
-    valor_frete = _safe_decimal(ide.get("vFrete"))
-    valor_seguro = _safe_decimal(totais.get("tot_vSeg"))
-    valor_desconto = _safe_decimal(ide.get("vDesc"))
-    valor_outras = _safe_decimal(totais.get("tot_vOutro"))
-    valor_icms_uf_dest = _safe_decimal(totais.get("tot_vICMSUFDest"))
-    valor_trib_aprox = _safe_decimal(totais.get("tot_vTotTrib"))
+    # Totais (15,2) — truncar/limitar para evitar overflow
+    def _d15_2(v):
+        return _decimal_to_field(v, 15, 2)
+    valor_nota = _d15_2(ide.get("vNF"))
+    valor_produtos = _d15_2(ide.get("vProd"))
+    valor_icms = _d15_2(ide.get("vICMS"))
+    valor_icms_st = _d15_2(totais.get("tot_vST") or ide.get("vST"))
+    valor_ipi = _d15_2(totais.get("tot_vIPI") or ide.get("vIPI"))
+    valor_pis = _d15_2(ide.get("vPIS"))
+    valor_cofins = _d15_2(ide.get("vCOFINS"))
+    valor_frete = _d15_2(ide.get("vFrete"))
+    valor_seguro = _d15_2(totais.get("tot_vSeg"))
+    valor_desconto = _d15_2(ide.get("vDesc"))
+    valor_outras = _d15_2(totais.get("tot_vOutro"))
+    valor_icms_uf_dest = _d15_2(totais.get("tot_vICMSUFDest"))
+    valor_trib_aprox = _d15_2(totais.get("tot_vTotTrib"))
 
     # Protocolo
     protocolo_str = (protocolo.get("nProt") or "").strip()[:20]
@@ -414,34 +432,35 @@ def _map_item_to_model(item_data, nota_fiscal, company):
     cest = (prod.get("prod_CEST") or "").strip()[:7]
     cfop = (prod.get("prod_CFOP") or "").strip()[:4]
     unidade = (prod.get("prod_uCom") or "UN").strip()[:6]
-    quantidade = _safe_decimal(prod.get("prod_qCom"))
-    valor_unitario = _safe_decimal(prod.get("prod_vUnCom"))
-    valor_total = _safe_decimal(prod.get("prod_vProd"))
+    # Truncar/limitar decimais ao tamanho do campo para evitar overflow
+    quantidade = _decimal_to_field(prod.get("prod_qCom"), 15, 4)
+    valor_unitario = _decimal_to_field(prod.get("prod_vUnCom"), 18, 10)
+    valor_total = _decimal_to_field(prod.get("prod_vProd"), 15, 2)
     info_adicional = (prod.get("infAdProd") or "")[:2000]
 
     icms_origem = _safe_int(prod.get("ICMS_orig"), 0)
     icms_cst = (prod.get("ICMS_CST") or "").strip()[:4]
-    icms_base = _safe_decimal(prod.get("ICMS_vBC"))
-    icms_aliquota = _safe_decimal(prod.get("ICMS_pICMS"))
-    icms_valor = _safe_decimal(prod.get("ICMS_vICMS"))
-    icms_st_base = _safe_decimal(prod.get("ICMS_vBCST"))
-    icms_st_valor = _safe_decimal(prod.get("ICMS_vICMSST"))
+    icms_base = _decimal_to_field(prod.get("ICMS_vBC"), 15, 2)
+    icms_aliquota = _decimal_to_field(prod.get("ICMS_pICMS"), 7, 4)
+    icms_valor = _decimal_to_field(prod.get("ICMS_vICMS"), 15, 2)
+    icms_st_base = _decimal_to_field(prod.get("ICMS_vBCST"), 15, 2)
+    icms_st_valor = _decimal_to_field(prod.get("ICMS_vICMSST"), 15, 2)
 
     pis_cst = (prod.get("PIS_CST") or "").strip()[:2]
-    pis_base = _safe_decimal(prod.get("PIS_vBC"))
-    pis_aliquota = _safe_decimal(prod.get("PIS_pPIS"))
-    pis_valor = _safe_decimal(prod.get("PIS_vPIS"))
+    pis_base = _decimal_to_field(prod.get("PIS_vBC"), 15, 2)
+    pis_aliquota = _decimal_to_field(prod.get("PIS_pPIS"), 7, 4)
+    pis_valor = _decimal_to_field(prod.get("PIS_vPIS"), 15, 2)
 
     cofins_cst = (prod.get("COFINS_CST") or "").strip()[:2]
-    cofins_base = _safe_decimal(prod.get("COFINS_vBC"))
-    cofins_aliquota = _safe_decimal(prod.get("COFINS_pCOFINS"))
-    cofins_valor = _safe_decimal(prod.get("COFINS_vCOFINS"))
+    cofins_base = _decimal_to_field(prod.get("COFINS_vBC"), 15, 2)
+    cofins_aliquota = _decimal_to_field(prod.get("COFINS_pCOFINS"), 7, 4)
+    cofins_valor = _decimal_to_field(prod.get("COFINS_vCOFINS"), 15, 2)
 
     ipi_cst = (prod.get("IPI_CST") or "").strip()[:2]
-    ipi_valor = _safe_decimal(prod.get("IPI_vIPI"))
+    ipi_valor = _decimal_to_field(prod.get("IPI_vIPI"), 15, 2)
 
-    icms_uf_dest_base = _safe_decimal(prod.get("vBCUFDest"))
-    icms_uf_dest_valor = _safe_decimal(prod.get("vICMSUFDest"))
+    icms_uf_dest_base = _decimal_to_field(prod.get("vBCUFDest"), 15, 2)
+    icms_uf_dest_valor = _decimal_to_field(prod.get("vICMSUFDest"), 15, 2)
     icms_uf_remet_valor = Decimal("0")  # parser pode não expor; manter 0
 
     # Impostos completos: guardar dict com as chaves que vieram do parser para o item
@@ -601,6 +620,8 @@ def import_nfe_xml_many(files, company):
     """
     Um único ponto de importação: para cada XML detecta o tipo (NFe, evento ou inutilização)
     e processa com o importador correto.
+    Atômico: toda a operação roda em uma transação; se qualquer arquivo falhar,
+    nada é commitado (rollback completo).
     Retorna: importadas (NFe), importados (eventos), importados_inut (inutilizações),
              duplicadas (chaves/identificadores), erros.
     """
@@ -610,58 +631,65 @@ def import_nfe_xml_many(files, company):
     duplicadas = []
     erros = []
 
-    for f in files:
-        if hasattr(f, "read") and hasattr(f, "name"):
-            filename = getattr(f, "name", "") or ""
-            try:
-                content = f.read()
+    with transaction.atomic():
+        for f in files:
+            if hasattr(f, "read") and hasattr(f, "name"):
+                filename = getattr(f, "name", "") or ""
+                try:
+                    content = f.read()
+                    if isinstance(content, bytes):
+                        content = content.decode("utf-8", errors="replace")
+                except Exception as e:
+                    erros.append({"arquivo": filename, "erro": str(e)})
+                    continue
+            else:
+                filename, content = f[0], f[1]
                 if isinstance(content, bytes):
                     content = content.decode("utf-8", errors="replace")
-            except Exception as e:
-                erros.append({"arquivo": filename, "erro": str(e)})
-                continue
-        else:
-            filename, content = f[0], f[1]
-            if isinstance(content, bytes):
-                content = content.decode("utf-8", errors="replace")
 
-        raw = content if isinstance(content, bytes) else content.encode("utf-8")
-        doc_type = detect_nfe_document_type(raw)
+            raw = content if isinstance(content, bytes) else content.encode("utf-8")
+            doc_type = detect_nfe_document_type(raw)
 
-        if doc_type == "nfe":
-            status, payload = import_one(content, company, filename)
-            if status == "importada":
-                importadas.append({"chave": payload.chave, "id": payload.pk, "numero": payload.numero})
-            elif status == "duplicada":
-                duplicadas.append(payload)
+            if doc_type == "nfe":
+                status, payload = import_one(content, company, filename)
+                if status == "importada":
+                    importadas.append({"chave": payload.chave, "id": payload.pk, "numero": payload.numero})
+                elif status == "duplicada":
+                    duplicadas.append(payload)
+                else:
+                    erros.append({"arquivo": filename, "erro": payload})
+            elif doc_type in ("evento", "inutilizacao"):
+                status, payload = import_event_one(content, company, filename)
+                if status == "importado":
+                    importados.append({
+                        "chave_nfe": payload.chave_nfe,
+                        "id": payload.pk,
+                        "tipo_evento": payload.tipo_evento,
+                        "n_seq_evento": payload.n_seq_evento,
+                    })
+                elif status == "importado_inut":
+                    importados_inut.append({
+                        "ano": payload.ano,
+                        "serie": payload.serie,
+                        "n_nf_ini": payload.n_nf_ini,
+                        "n_nf_fin": payload.n_nf_fin,
+                        "id": payload.pk,
+                    })
+                elif status == "duplicado":
+                    duplicadas.append(payload)
+                else:
+                    erros.append({"arquivo": filename, "erro": payload})
             else:
-                erros.append({"arquivo": filename, "erro": payload})
-        elif doc_type in ("evento", "inutilizacao"):
-            status, payload = import_event_one(content, company, filename)
-            if status == "importado":
-                importados.append({
-                    "chave_nfe": payload.chave_nfe,
-                    "id": payload.pk,
-                    "tipo_evento": payload.tipo_evento,
-                    "n_seq_evento": payload.n_seq_evento,
+                erros.append({
+                    "arquivo": filename,
+                    "erro": "Tipo de XML não reconhecido (esperado NFe, evento ou inutilização).",
                 })
-            elif status == "importado_inut":
-                importados_inut.append({
-                    "ano": payload.ano,
-                    "serie": payload.serie,
-                    "n_nf_ini": payload.n_nf_ini,
-                    "n_nf_fin": payload.n_nf_fin,
-                    "id": payload.pk,
-                })
-            elif status == "duplicado":
-                duplicadas.append(payload)
-            else:
-                erros.append({"arquivo": filename, "erro": payload})
-        else:
-            erros.append({
-                "arquivo": filename,
-                "erro": "Tipo de XML não reconhecido (esperado NFe, evento ou inutilização).",
-            })
+
+        if erros:
+            transaction.set_rollback(True)
+            importadas = []
+            importados = []
+            importados_inut = []
 
     return {
         "importadas": importadas,

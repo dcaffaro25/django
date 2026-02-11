@@ -159,7 +159,10 @@ class NotaFiscalItem(TenantAwareBaseModel):
     cfop = models.CharField('CFOP', max_length=4, db_index=True)
     unidade = models.CharField('Unidade (uCom)', max_length=6)
     quantidade = models.DecimalField('Quantidade', max_digits=15, decimal_places=4)
-    valor_unitario = models.DecimalField('Valor unitário', max_digits=15, decimal_places=10)
+    valor_unitario = models.DecimalField(
+        'Valor unitário', max_digits=18, decimal_places=10,
+        help_text='(15,10) permitia até ~99.999; (18,10) evita overflow para valores maiores.',
+    )
     valor_total = models.DecimalField('Valor total item', max_digits=15, decimal_places=2)
     produto = models.ForeignKey(
         'billing.ProductService', null=True, blank=True,
