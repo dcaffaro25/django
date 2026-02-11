@@ -106,6 +106,11 @@ MODEL_APP_MAP: Dict[str, str] = {
     "Contract": "billing",
     "Invoice": "billing",
     "InvoiceLine": "billing",
+    "NotaFiscal": "billing",
+    "NotaFiscalItem": "billing",
+    "NotaFiscalReferencia": "billing",
+    "NFeEvento": "billing",
+    "NFeInutilizacao": "billing",
     # core
     "FinancialIndex": "core",
     "IndexQuote": "core",

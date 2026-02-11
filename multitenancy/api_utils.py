@@ -22,7 +22,8 @@ from core.models import FinancialIndex, IndexQuote, FinancialIndexQuoteForecast
 from billing.models import (
     BusinessPartnerCategory, BusinessPartner,
     ProductServiceCategory, ProductService,
-    Contract, Invoice, InvoiceLine)
+    Contract, Invoice, InvoiceLine,
+    NotaFiscal, NotaFiscalItem, NotaFiscalReferencia, NFeEvento, NFeInutilizacao)
 from hr.models import Employee, Position, TimeTracking, KPI, Bonus, RecurringAdjustment
 
 from multitenancy.formula_engine import apply_substitutions
@@ -889,9 +890,13 @@ class BulkImportTemplateDownloadView(APIView):
                                     "calculation_formula",
                                     "employer_cost_formula",
                                     "priority",
-                                    "default_account_fk"]
-        
-        
+                                    "default_account_fk"],
+            # NFe (Nota Fiscal Eletrônica)
+            "NotaFiscal": ["__row_id", "company_fk", "chave", "numero", "serie", "modelo", "tipo_operacao", "finalidade", "natureza_operacao", "ambiente", "id_destino", "ind_final", "ind_presenca", "data_emissao", "data_saida_entrada", "emit_cnpj", "emit_nome", "emit_fantasia", "emit_ie", "emit_crt", "emit_uf", "emit_municipio", "emitente_fk", "dest_cnpj", "dest_nome", "dest_ie", "dest_uf", "dest_ind_ie", "destinatario_fk", "valor_nota", "valor_produtos", "valor_icms", "valor_icms_st", "valor_ipi", "valor_pis", "valor_cofins", "valor_frete", "valor_seguro", "valor_desconto", "valor_outras", "valor_icms_uf_dest", "valor_trib_aprox", "protocolo", "status_sefaz", "motivo_sefaz", "data_autorizacao", "mod_frete", "info_complementar", "info_fisco"],
+            "NotaFiscalItem": ["__row_id", "company_fk", "nota_fiscal_fk", "numero_item", "codigo_produto", "ean", "descricao", "ncm", "cest", "cfop", "unidade", "quantidade", "valor_unitario", "valor_total", "produto_fk", "icms_origem", "icms_cst", "icms_base", "icms_aliquota", "icms_valor", "icms_st_base", "icms_st_valor", "pis_cst", "pis_base", "pis_aliquota", "pis_valor", "cofins_cst", "cofins_base", "cofins_aliquota", "cofins_valor", "ipi_cst", "ipi_valor", "icms_uf_dest_base", "icms_uf_dest_valor", "icms_uf_remet_valor", "info_adicional"],
+            "NotaFiscalReferencia": ["__row_id", "company_fk", "nota_fiscal_fk", "chave_referenciada", "nota_referenciada_fk"],
+            "NFeEvento": ["__row_id", "company_fk", "nota_fiscal_fk", "chave_nfe", "tipo_evento", "n_seq_evento", "data_evento", "descricao", "protocolo", "status_sefaz", "motivo_sefaz", "data_registro"],
+            "NFeInutilizacao": ["__row_id", "company_fk", "cuf", "ano", "cnpj", "modelo", "serie", "n_nf_ini", "n_nf_fin", "x_just", "protocolo", "status_sefaz", "motivo_sefaz", "data_registro"],
         }
 
 
@@ -929,6 +934,12 @@ class BulkImportTemplateDownloadView(APIView):
             ('BankTransaction', BankTransaction.objects.filter(company_id=tenant_id), ['id', 'entity_id', 'bank_account_id', 'date', 'amount', 'description', 'transaction_type', 'status']),
             ("IntegrationRule", IntegrationRule.objects.filter(company_id=tenant_id), ["id", "company_id","name","description","trigger_event","execution_order","filter_conditions","rule","use_celery","is_active","last_run_at","times_executed"]),
             ("SubstitutionRule", SubstitutionRule.objects.filter(company_id=tenant_id), ["id", "company_id","title","model_name","field_name","column_name","column_index","match_type","match_value","substitution_value","filter_conditions"]),
+            # NFe
+            ("NotaFiscal", NotaFiscal.objects.filter(company_id=tenant_id), ["id", "company_id", "chave", "numero", "serie", "modelo", "data_emissao", "emit_cnpj", "emit_nome", "dest_cnpj", "dest_nome", "valor_nota", "valor_produtos", "emitente_id", "destinatario_id"]),
+            ("NotaFiscalItem", NotaFiscalItem.objects.filter(company_id=tenant_id), ["id", "company_id", "nota_fiscal_id", "numero_item", "codigo_produto", "descricao", "ncm", "cfop", "quantidade", "valor_unitario", "valor_total", "produto_id"]),
+            ("NotaFiscalReferencia", NotaFiscalReferencia.objects.filter(company_id=tenant_id), ["id", "company_id", "nota_fiscal_id", "chave_referenciada", "nota_referenciada_id"]),
+            ("NFeEvento", NFeEvento.objects.filter(company_id=tenant_id), ["id", "company_id", "chave_nfe", "tipo_evento", "n_seq_evento", "data_evento", "descricao", "status_sefaz", "nota_fiscal_id"]),
+            ("NFeInutilizacao", NFeInutilizacao.objects.filter(company_id=tenant_id), ["id", "company_id", "ano", "serie", "n_nf_ini", "n_nf_fin", "cnpj", "status_sefaz", "data_registro"]),
         ]
 
         for title, queryset, columns in references:
