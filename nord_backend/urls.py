@@ -31,6 +31,7 @@ urlpatterns = [
     re_path(r'^(?P<tenant_id>[^/]+)/', include('hr.urls')),
     re_path(r'^(?P<tenant_id>[^/]+)/', include('multitenancy.urls')),
     re_path(r'^(?P<tenant_id>[^/]+)/', include('billing.urls')),
+    re_path(r'^(?P<tenant_id>[^/]+)/', include('inventory.urls')),
     re_path(r'^(?P<tenant_id>[^/]+)/', include('ML.urls')),
     re_path(r'^(?P<tenant_id>[^/]+)/', include('knowledge_base.urls')),
     re_path(r'^(?P<tenant_id>[^/]+)/', include('erp_integrations.urls')),

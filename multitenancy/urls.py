@@ -7,6 +7,7 @@ from .views import (
     LoginView, LogoutView, IntegrationRuleViewSet, ChangePasswordView,
     UserCreateView, PasswordResetForceView, AdminForcePasswordView,
     SubstitutionRuleViewSet, ValidateRuleView, ExecuteRuleView, BulkImportAPIView,
+    MergeRecordsView,
     # ETL Pipeline views
     ImportTransformationRuleViewSet, ETLPipelineLogViewSet,
     ETLPipelinePreviewView, ETLPipelineExecuteView, ETLPipelineAnalyzeView,
@@ -49,6 +50,7 @@ urlpatterns = [
     re_path(r'^api/core/bulk-import-preview/?$', BulkImportPreview.as_view(), name='bulk-import-preview'),
     re_path(r'^api/core/bulk-import-execute/?$', BulkImportExecute.as_view(), name='bulk-import-execute'),
     re_path(r'^api/core/bulk-import-template/?$', BulkImportTemplateDownloadView.as_view(), name='bulk-import-template'),
+    re_path(r'^api/core/merge-records/?$', MergeRecordsView.as_view(), name='merge-records'),
     
     # ETL Pipeline endpoints
     re_path(r'^api/core/etl/preview/?$', ETLPipelinePreviewView.as_view(), name='etl-preview'),

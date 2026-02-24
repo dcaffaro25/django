@@ -178,6 +178,7 @@ INSTALLED_APPS = [
     'accounting',
     'hr',
     'billing',
+    'inventory',
     'ML',
     'django_celery_results',
     'pgvector.django',

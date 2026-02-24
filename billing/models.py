@@ -183,7 +183,8 @@ class InvoiceLine(TenantAwareBaseModel):
         return f"{self.product_service.name} - {self.quantity} x {self.unit_price}"
 
 
-# Import NFe models so they are part of the app
+# Import CFOP (tabela nacional) e modelos NFe
+from .models_cfop import CFOP  # noqa: E402, F401
 from .models_nfe import (  # noqa: E402
     NotaFiscal,
     NotaFiscalItem,

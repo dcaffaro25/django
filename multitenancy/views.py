@@ -13,6 +13,7 @@ from .serializers import (
     ETLPipelineLogSerializer, ETLPipelineLogListSerializer,
 )
 from .api_utils import create_csv_response, create_excel_response, _to_bool
+from .merge_service import merge_rows_into_target, MergeError
 from rest_framework import permissions
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.decorators import action
@@ -939,6 +940,63 @@ class BulkImportAPIView(APIView):
 
         http_status = status.HTTP_200_OK if result.get("committed") else status.HTTP_400_BAD_REQUEST
         return Response(result, status=http_status)
+
+
+class MergeRecordsView(APIView):
+    """
+    Generic merge endpoint: merge N source rows into one target row.
+    POST body: { "model": "Entity", "target_id": 10, "source_ids": [5, 7], "dry_run": false }
+    """
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        model_name = request.data.get("model")
+        target_id = request.data.get("target_id")
+        source_ids = request.data.get("source_ids")
+        dry_run = _to_bool(request.data.get("dry_run"), default=False)
+
+        if not model_name:
+            return Response({"error": "model is required"}, status=status.HTTP_400_BAD_REQUEST)
+        if target_id is None:
+            return Response({"error": "target_id is required"}, status=status.HTTP_400_BAD_REQUEST)
+        if source_ids is None:
+            return Response({"error": "source_ids is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            target_id = int(target_id)
+        except (TypeError, ValueError):
+            return Response({"error": "target_id must be an integer"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not isinstance(source_ids, (list, tuple)):
+            return Response({"error": "source_ids must be a list"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            source_ids = [int(x) for x in source_ids]
+        except (TypeError, ValueError):
+            return Response({"error": "source_ids must contain integers"}, status=status.HTTP_400_BAD_REQUEST)
+
+        tenant = getattr(request, "tenant", None)
+        company_id = (
+            request.data.get("company_id")
+            or (getattr(tenant, "id", None) if tenant and tenant != "all" else None)
+            or getattr(request.user, "company_id", None)
+        )
+        if not company_id:
+            return Response({"error": "No company defined. Set company_id in body or use tenant context."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            result = merge_rows_into_target(
+                model_name=model_name,
+                target_id=target_id,
+                source_ids=source_ids,
+                company_id=company_id,
+                dry_run=dry_run,
+            )
+            return Response(result, status=status.HTTP_200_OK)
+        except MergeError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
 # ============================================================================

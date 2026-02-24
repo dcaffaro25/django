@@ -157,6 +157,15 @@ class NotaFiscalItem(TenantAwareBaseModel):
     ncm = models.CharField('NCM', max_length=8, db_index=True)
     cest = models.CharField('CEST', max_length=7, blank=True)
     cfop = models.CharField('CFOP', max_length=4, db_index=True)
+    cfop_ref = models.ForeignKey(
+        'billing.CFOP',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='nfe_itens',
+        verbose_name='CFOP (tabela)',
+        help_text='Vínculo à tabela CFOP para análises por grupo (venda, devolução, etc.).',
+    )
     unidade = models.CharField('Unidade (uCom)', max_length=6)
     quantidade = models.DecimalField('Quantidade', max_digits=15, decimal_places=4)
     valor_unitario = models.DecimalField(
@@ -216,6 +225,7 @@ class NotaFiscalItem(TenantAwareBaseModel):
         indexes = [
             models.Index(fields=['ncm']),
             models.Index(fields=['cfop']),
+            models.Index(fields=['cfop_ref']),
         ]
 
     def __str__(self):
