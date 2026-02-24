@@ -124,8 +124,27 @@ class StockMovementViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
         )
         return Response(result, status=status.HTTP_200_OK)
 
-
-class InventoryBalanceViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
+    @action(detail=False, methods=["post"])
+    def ingest_pending(self, request):
+        """Process all NFs that haven't been inventory-processed yet."""
+        tenant = getattr(request, "tenant", None)
+        if not tenant or tenant == "all":
+            return Response(
+                {"error": "Tenant required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        from billing.models_nfe import NotaFiscal
+        pending_ids = list(
+            NotaFiscal.objects.filter(company=tenant, inventory_processed=False)
+            .values_list("id", flat=True)
+        )
+        if not pending_ids:
+            return Response(
+                {"message": "No pending NFs", "created": 0, "skipped": 0, "errors": []},
+                status=status.HTTP_200_OK,
+            )
+        result = ingest_nf_to_movements(company=tenant, nota_fiscal_ids=pending_ids)
+        return Response(result, status=status.HTTP_200_OK)
     queryset = InventoryBalance.objects.select_related("product", "warehouse").all()
     serializer_class = InventoryBalanceSerializer
     filterset_fields = ["product", "warehouse"]

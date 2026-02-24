@@ -616,6 +616,19 @@ def import_many(files, company):
     }
 
 
+def _should_auto_ingest(company):
+    """Check if this tenant has auto-ingestion enabled."""
+    from inventory.models_costing import TenantCostingConfig
+    config = TenantCostingConfig.objects.filter(company=company).first()
+    return config is not None and getattr(config, "auto_ingest_on_nfe_import", False)
+
+
+def _schedule_inventory_ingest(company_id, nota_fiscal_ids):
+    """Fire the Celery task to ingest NF movements."""
+    from inventory.tasks import ingest_nf_movements_task
+    ingest_nf_movements_task.delay(company_id, nota_fiscal_ids=nota_fiscal_ids)
+
+
 def import_nfe_xml_many(files, company):
     """
     Um único ponto de importação: para cada XML detecta o tipo (NFe, evento ou inutilização)
@@ -691,10 +704,20 @@ def import_nfe_xml_many(files, company):
             importados = []
             importados_inut = []
 
+        nf_ids = [nf["id"] for nf in importadas]
+        if nf_ids and _should_auto_ingest(company):
+            transaction.on_commit(
+                lambda ids=nf_ids, cid=company.id: _schedule_inventory_ingest(cid, ids)
+            )
+            inventory_triggered = True
+        else:
+            inventory_triggered = False
+
     return {
         "importadas": importadas,
         "importados": importados,
         "importados_inut": importados_inut,
         "duplicadas": duplicadas,
         "erros": erros,
+        "inventory_triggered": inventory_triggered,
     }

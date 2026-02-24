@@ -119,6 +119,19 @@ class NotaFiscal(TenantAwareBaseModel):
         help_text='Conteúdo bruto do XML para auditoria e reprocessamento')
     arquivo_origem = models.CharField('Arquivo de origem', max_length=500, blank=True)
 
+    # ===== INVENTORY INTEGRATION =====
+    inventory_processed = models.BooleanField(
+        'Processada no estoque',
+        default=False,
+        db_index=True,
+        help_text='Set to True after inventory movements have been created from this NF.',
+    )
+    inventory_processed_at = models.DateTimeField(
+        'Data processamento estoque',
+        null=True,
+        blank=True,
+    )
+
     class Meta:
         verbose_name = 'Nota Fiscal Eletrônica'
         verbose_name_plural = 'Notas Fiscais Eletrônicas'

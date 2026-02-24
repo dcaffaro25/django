@@ -204,6 +204,11 @@ def ingest_nf_to_movements(company, nota_fiscal_id=None, nota_fiscal_ids=None):
                 except Exception as e:
                     errors.append(f"Item {item.id}: {e}")
 
+            # Mark NF as inventory-processed after handling all items
+            nf.inventory_processed = True
+            nf.inventory_processed_at = timezone.now()
+            nf.save(update_fields=["inventory_processed", "inventory_processed_at", "updated_at"])
+
     return {"created": created, "skipped": skipped, "errors": errors}
 
 

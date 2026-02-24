@@ -62,6 +62,10 @@ class TenantCostingConfig(TenantAwareBaseModel):
         default=False,
         help_text="Auto-post accounting entries for primary strategy.",
     )
+    auto_ingest_on_nfe_import = models.BooleanField(
+        default=False,
+        help_text="Automatically create stock movements when NF-e documents are imported.",
+    )
     period_close_day = models.SmallIntegerField(
         default=0,
         help_text="0 = month-end.",

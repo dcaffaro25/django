@@ -78,6 +78,10 @@ class NFeUnifiedImportResultSerializer(serializers.Serializer):
     importados_inut = serializers.ListField(child=serializers.DictField(), help_text="Inutilizações importadas")
     duplicadas = serializers.ListField(child=serializers.CharField(), help_text="Chaves/IDs já existentes")
     erros = serializers.ListField(child=serializers.DictField())
+    inventory_triggered = serializers.BooleanField(
+        default=False,
+        help_text="Whether inventory movement ingestion was triggered for the imported NFs.",
+    )
 
 
 class NFeEventoSerializer(serializers.ModelSerializer):
