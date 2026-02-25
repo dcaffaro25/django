@@ -68,7 +68,7 @@ class StockMovementViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
     ordering = ["-movement_date"]
 
     @action(detail=False, methods=["post"])
-    def manual(self, request):
+    def manual(self, request, **kwargs):
         """Create a manual stock adjustment. Requires: product_id, quantity, optional: unit_cost, warehouse_id, reference."""
         tenant = getattr(request, "tenant", None)
         if not tenant or tenant == "all":
@@ -107,7 +107,7 @@ class StockMovementViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=["post"])
-    def ingest_nf(self, request):
+    def ingest_nf(self, request, **kwargs):
         """Ingest NF-e items into stock movements. Body: {nota_fiscal_id?: int, nota_fiscal_ids?: [int]}."""
         tenant = getattr(request, "tenant", None)
         if not tenant or tenant == "all":
@@ -125,7 +125,7 @@ class StockMovementViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
         return Response(result, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=["post"])
-    def ingest_pending(self, request):
+    def ingest_pending(self, request, **kwargs):
         """Process all NFs that haven't been inventory-processed yet."""
         tenant = getattr(request, "tenant", None)
         if not tenant or tenant == "all":
@@ -157,7 +157,7 @@ class CostingComputeView(viewsets.ViewSet):
     """Trigger costing computation for strategies."""
 
     @action(detail=False, methods=["post"])
-    def compute(self, request):
+    def compute(self, request, **kwargs):
         """Run costing engine. Body: {strategy_keys?: [...], start_date?: str, end_date?: str}."""
         tenant = getattr(request, "tenant", None)
         if not tenant or tenant == "all":
@@ -222,7 +222,7 @@ class InventoryAlertViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     http_method_names = ["get", "patch", "head", "options"]
 
     @action(detail=False, methods=["post"])
-    def detect(self, request):
+    def detect(self, request, **kwargs):
         """POST ?lookback_days=90 - run anomaly detection."""
         tenant = getattr(request, "tenant", None)
         if not tenant or tenant == "all":
@@ -236,7 +236,7 @@ class ComparisonReportView(viewsets.ViewSet):
     """Comparison report and drilldown endpoints."""
 
     @action(detail=False, methods=["get"])
-    def report(self, request):
+    def report(self, request, **kwargs):
         """GET ?start_date=...&end_date=...&strategies=wavg,fifo,lifo"""
         tenant = getattr(request, "tenant", None)
         if not tenant or tenant == "all":
@@ -261,7 +261,7 @@ class ComparisonReportView(viewsets.ViewSet):
         return Response(result)
 
     @action(detail=False, methods=["get"])
-    def sku(self, request):
+    def sku(self, request, **kwargs):
         """GET ?product_id=...&start_date=...&end_date=...&strategies=..."""
         tenant = getattr(request, "tenant", None)
         if not tenant or tenant == "all":
@@ -286,7 +286,7 @@ class ComparisonReportView(viewsets.ViewSet):
         return Response(result)
 
     @action(detail=False, methods=["get"])
-    def movement(self, request):
+    def movement(self, request, **kwargs):
         """GET ?movement_id=...&strategies=..."""
         tenant = getattr(request, "tenant", None)
         if not tenant or tenant == "all":

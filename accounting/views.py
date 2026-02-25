@@ -936,7 +936,7 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
 
     # Post a transaction
     @action(detail=True, methods=['post'])
-    def post(self, request, pk=None):
+    def post(self, request, pk=None, **kwargs):
         transaction = self.get_object()
         try:
             post_transaction(transaction)
@@ -946,7 +946,7 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
 
     # Unpost a transaction
     @action(detail=True, methods=['post'])
-    def unpost(self, request, pk=None):
+    def unpost(self, request, pk=None, **kwargs):
         transaction = self.get_object()
         try:
             unpost_transaction(transaction)
@@ -1230,7 +1230,7 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     
     # Automatically create a balancing journal entry
     @action(detail=True, methods=['post'])
-    def create_balancing_entry(self, request, pk=None):
+    def create_balancing_entry(self, request, pk=None, **kwargs):
         transaction = self.get_object()
         account_id = request.data.get('account_id')
         if not account_id:
@@ -1413,7 +1413,7 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     
     # Get journal entries by transaction
     @action(detail=False, methods=['get'])
-    def by_transaction(self, request):
+    def by_transaction(self, request, **kwargs):
         transaction_id = request.query_params.get('transaction_id')
         if not transaction_id:
             return Response({'error': 'Transaction ID is required'}, status=status.HTTP_400_BAD_REQUEST)
@@ -1424,7 +1424,7 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
 
     # Filter journal entries by status or company
     @action(detail=False, methods=['get'])
-    def filtered(self, request):
+    def filtered(self, request, **kwargs):
         status_filter = request.query_params.get('status', None)
         company_id = request.query_params.get('tenant_id', None)
 
@@ -4317,7 +4317,7 @@ class ReconciliationRuleViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     serializer_class = ReconciliationRuleSerializer
 
     @action(detail=False, methods=["get"], url_path="propose")
-    def propose(self, request):
+    def propose(self, request, **kwargs):
         """
         Analyze accepted reconciliation matches and propose regex-based rules.
         Query params: company_id (required), min_samples (default 5), date_from, date_to.
@@ -4354,7 +4354,7 @@ class ReconciliationRuleViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return Response(result)
 
     @action(detail=False, methods=["post"], url_path="validate")
-    def validate(self, request):
+    def validate(self, request, **kwargs):
         """
         Validate or reject proposed rules. For status=validated, creates ReconciliationRule.
         Body: { "company_id": int, "rules": [ { "temp_id", "status", "reason"?, "name"?, "rule_type"?, "bank_pattern"?, "book_pattern"?, "extraction_groups"?, "sample_count"?, "accuracy_score"? } ] }

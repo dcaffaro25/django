@@ -19,15 +19,15 @@ class BusinessPartnerCategoryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet)
     serializer_class = BusinessPartnerCategorySerializer
 
     @action(methods=['post'], detail=False)
-    def bulk_create(self, request):
+    def bulk_create(self, request, **kwargs):
         return generic_bulk_create(self, request.data)
 
     @action(methods=['put'], detail=False)
-    def bulk_update(self, request):
+    def bulk_update(self, request, **kwargs):
         return generic_bulk_update(self, request.data)
 
     @action(methods=['delete'], detail=False)
-    def bulk_delete(self, request):
+    def bulk_delete(self, request, **kwargs):
         return generic_bulk_delete(self, request.data)
 
 class BusinessPartnerViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
@@ -35,15 +35,15 @@ class BusinessPartnerViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     serializer_class = BusinessPartnerSerializer
 
     @action(methods=['post'], detail=False)
-    def bulk_create(self, request):
+    def bulk_create(self, request, **kwargs):
         return generic_bulk_create(self, request.data)
 
     @action(methods=['put'], detail=False)
-    def bulk_update(self, request):
+    def bulk_update(self, request, **kwargs):
         return generic_bulk_update(self, request.data)
 
     @action(methods=['delete'], detail=False)
-    def bulk_delete(self, request):
+    def bulk_delete(self, request, **kwargs):
         return generic_bulk_delete(self, request.data)
 
 class ProductServiceCategoryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
@@ -51,15 +51,15 @@ class ProductServiceCategoryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     serializer_class = ProductServiceCategorySerializer
 
     @action(methods=['post'], detail=False)
-    def bulk_create(self, request):
+    def bulk_create(self, request, **kwargs):
         return generic_bulk_create(self, request.data)
 
     @action(methods=['put'], detail=False)
-    def bulk_update(self, request):
+    def bulk_update(self, request, **kwargs):
         return generic_bulk_update(self, request.data)
 
     @action(methods=['delete'], detail=False)
-    def bulk_delete(self, request):
+    def bulk_delete(self, request, **kwargs):
         return generic_bulk_delete(self, request.data)
 
 class ProductServiceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
@@ -67,15 +67,15 @@ class ProductServiceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     serializer_class = ProductServiceSerializer
 
     @action(methods=['post'], detail=False)
-    def bulk_create(self, request):
+    def bulk_create(self, request, **kwargs):
         return generic_bulk_create(self, request.data)
 
     @action(methods=['put'], detail=False)
-    def bulk_update(self, request):
+    def bulk_update(self, request, **kwargs):
         return generic_bulk_update(self, request.data)
 
     @action(methods=['delete'], detail=False)
-    def bulk_delete(self, request):
+    def bulk_delete(self, request, **kwargs):
         return generic_bulk_delete(self, request.data)
 
 class InvoiceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
@@ -83,15 +83,15 @@ class InvoiceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     serializer_class = InvoiceSerializer
 
     @action(methods=['post'], detail=False)
-    def bulk_create(self, request):
+    def bulk_create(self, request, **kwargs):
         return generic_bulk_create(self, request.data)
 
     @action(methods=['put'], detail=False)
-    def bulk_update(self, request):
+    def bulk_update(self, request, **kwargs):
         return generic_bulk_update(self, request.data)
 
     @action(methods=['delete'], detail=False)
-    def bulk_delete(self, request):
+    def bulk_delete(self, request, **kwargs):
         return generic_bulk_delete(self, request.data)
 
 class InvoiceLineViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
@@ -99,15 +99,15 @@ class InvoiceLineViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     serializer_class = InvoiceLineSerializer
 
     @action(methods=['post'], detail=False)
-    def bulk_create(self, request):
+    def bulk_create(self, request, **kwargs):
         return generic_bulk_create(self, request.data)
 
     @action(methods=['put'], detail=False)
-    def bulk_update(self, request):
+    def bulk_update(self, request, **kwargs):
         return generic_bulk_update(self, request.data)
 
     @action(methods=['delete'], detail=False)
-    def bulk_delete(self, request):
+    def bulk_delete(self, request, **kwargs):
         return generic_bulk_delete(self, request.data)
 
 class ContractViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
@@ -115,13 +115,13 @@ class ContractViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     serializer_class = ContractSerializer
     
     @action(methods=['post'], detail=False)
-    def bulk_create(self, request):
+    def bulk_create(self, request, **kwargs):
         return generic_bulk_create(self, request.data)
 
     @action(methods=['put'], detail=False)
-    def bulk_update(self, request):
+    def bulk_update(self, request, **kwargs):
         return generic_bulk_update(self, request.data)
 
     @action(methods=['delete'], detail=False)
-    def bulk_delete(self, request):
+    def bulk_delete(self, request, **kwargs):
         return generic_bulk_delete(self, request.data)
