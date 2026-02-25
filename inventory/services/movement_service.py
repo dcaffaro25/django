@@ -151,6 +151,8 @@ def ingest_nf_to_movements(company, nota_fiscal_id=None, nota_fiscal_ids=None):
         for nf in nfs:
             mov_date = nf.data_saida_entrada or nf.data_emissao
             default_warehouse = _get_default_warehouse(company)
+            nf_created = 0
+            nf_errors = 0
 
             for item in nf.itens.select_related("produto", "cfop_ref").all():
                 product = item.produto
@@ -250,6 +252,7 @@ def ingest_nf_to_movements(company, nota_fiscal_id=None, nota_fiscal_ids=None):
                         },
                     )
                     created += 1
+                    nf_created += 1
 
                     # Update inventory balance
                     delta = qty if is_inbound_like else -qty
@@ -258,11 +261,23 @@ def ingest_nf_to_movements(company, nota_fiscal_id=None, nota_fiscal_ids=None):
                     )
                 except Exception as e:
                     errors.append(f"Item {item.id}: {e}")
+                    nf_errors += 1
 
-            # Mark NF as inventory-processed after handling all items
-            nf.inventory_processed = True
+            # Set status atomically: only mark processed when movements were created
             nf.inventory_processed_at = timezone.now()
-            nf.save(update_fields=["inventory_processed", "inventory_processed_at", "updated_at"])
+            if nf_errors > 0:
+                nf.inventory_processing_status = NotaFiscal.PROCESSING_STATUS_ERROR
+            elif nf_created > 0:
+                nf.inventory_processing_status = NotaFiscal.PROCESSING_STATUS_PROCESSED
+            else:
+                nf.inventory_processing_status = NotaFiscal.PROCESSING_STATUS_ALL_SKIPPED
+            nf.save(
+                update_fields=[
+                    "inventory_processing_status",
+                    "inventory_processed_at",
+                    "updated_at",
+                ]
+            )
 
     return {
         "created": created,

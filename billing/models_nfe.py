@@ -120,14 +120,26 @@ class NotaFiscal(TenantAwareBaseModel):
     arquivo_origem = models.CharField('Arquivo de origem', max_length=500, blank=True)
 
     # ===== INVENTORY INTEGRATION =====
-    inventory_processed = models.BooleanField(
-        'Processada no estoque',
-        default=False,
+    PROCESSING_STATUS_PENDING = "pending"
+    PROCESSING_STATUS_PROCESSED = "processed"
+    PROCESSING_STATUS_ALL_SKIPPED = "all_skipped"
+    PROCESSING_STATUS_ERROR = "error"
+    INVENTORY_PROCESSING_STATUS_CHOICES = [
+        (PROCESSING_STATUS_PENDING, "Pending"),
+        (PROCESSING_STATUS_PROCESSED, "Processed"),
+        (PROCESSING_STATUS_ALL_SKIPPED, "All Skipped"),
+        (PROCESSING_STATUS_ERROR, "Error"),
+    ]
+    inventory_processing_status = models.CharField(
+        "Status processamento estoque",
+        max_length=20,
+        choices=INVENTORY_PROCESSING_STATUS_CHOICES,
+        default=PROCESSING_STATUS_PENDING,
         db_index=True,
-        help_text='Set to True after inventory movements have been created from this NF.',
+        help_text="pending=not run; processed=movements created; all_skipped=run but no movements; error=run with errors.",
     )
     inventory_processed_at = models.DateTimeField(
-        'Data processamento estoque',
+        "Data processamento estoque",
         null=True,
         blank=True,
     )

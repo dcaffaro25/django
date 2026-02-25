@@ -126,7 +126,12 @@ class StockMovementViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
 
     @action(detail=False, methods=["post"])
     def ingest_pending(self, request, **kwargs):
-        """Process all NFs that haven't been inventory-processed yet."""
+        """
+        Process NFs that need inventory ingestion.
+        Query param: include=pending (default) | pending_and_skipped
+        - pending: only NFs never processed (status=pending)
+        - pending_and_skipped: NFs with status pending or all_skipped (retry after fixes)
+        """
         tenant = getattr(request, "tenant", None)
         if not tenant or tenant == "all":
             return Response(
@@ -134,14 +139,22 @@ class StockMovementViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         from billing.models_nfe import NotaFiscal
+
+        include = (request.query_params.get("include") or "pending").strip().lower()
+        if include == "pending_and_skipped":
+            statuses = [NotaFiscal.PROCESSING_STATUS_PENDING, NotaFiscal.PROCESSING_STATUS_ALL_SKIPPED]
+        else:
+            statuses = [NotaFiscal.PROCESSING_STATUS_PENDING]
+
         pending_ids = list(
-            NotaFiscal.objects.filter(company=tenant, inventory_processed=False)
-            .values_list("id", flat=True)
+            NotaFiscal.objects.filter(
+                company=tenant, inventory_processing_status__in=statuses
+            ).values_list("id", flat=True)
         )
         if not pending_ids:
             return Response(
                 {
-                    "message": "No pending NFs",
+                    "message": f"No NFs to process (include={include})",
                     "created": 0,
                     "skipped": 0,
                     "skipped_by_reason": {},
@@ -151,6 +164,7 @@ class StockMovementViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_200_OK,
             )
         result = ingest_nf_to_movements(company=tenant, nota_fiscal_ids=pending_ids)
+        result["nfs_processed"] = len(pending_ids)
         return Response(result, status=status.HTTP_200_OK)
 
 
