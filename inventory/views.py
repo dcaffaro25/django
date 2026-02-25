@@ -145,6 +145,9 @@ class StockMovementViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
             )
         result = ingest_nf_to_movements(company=tenant, nota_fiscal_ids=pending_ids)
         return Response(result, status=status.HTTP_200_OK)
+
+
+class InventoryBalanceViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
     queryset = InventoryBalance.objects.select_related("product", "warehouse").all()
     serializer_class = InventoryBalanceSerializer
     filterset_fields = ["product", "warehouse"]
