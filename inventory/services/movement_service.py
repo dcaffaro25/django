@@ -115,7 +115,9 @@ def ingest_nf_to_movements(company, nota_fiscal_id=None, nota_fiscal_ids=None):
         nota_fiscal_ids: list of NF ids (optional)
 
     Returns:
-        dict: {created: int, skipped: int, errors: list}
+        dict: {created, skipped, skipped_by_reason, skipped_samples, errors}
+        - skipped_by_reason: counts per reason (no_product, not_product_type, track_inventory_disabled, already_processed)
+        - skipped_samples: up to 5 example refs per reason with hints for fixing
     """
     ids = []
     if nota_fiscal_id:
@@ -132,6 +134,18 @@ def ingest_nf_to_movements(company, nota_fiscal_id=None, nota_fiscal_ids=None):
     created = 0
     skipped = 0
     errors = []
+    skipped_by_reason = {
+        "no_product": 0,
+        "not_product_type": 0,
+        "track_inventory_disabled": 0,
+        "already_processed": 0,
+    }
+    skipped_samples = {k: [] for k in skipped_by_reason}
+    max_samples_per_reason = 5
+
+    def _add_sample(reason, ref):
+        if len(skipped_samples[reason]) < max_samples_per_reason:
+            skipped_samples[reason].append(ref)
 
     with transaction.atomic():
         for nf in nfs:
@@ -147,17 +161,58 @@ def ingest_nf_to_movements(company, nota_fiscal_id=None, nota_fiscal_ids=None):
                     ).first()
                 if not product:
                     skipped += 1
+                    skipped_by_reason["no_product"] += 1
+                    _add_sample(
+                        "no_product",
+                        {
+                            "nfe_item_id": item.id,
+                            "nota_fiscal_id": nf.id,
+                            "codigo_produto": item.codigo_produto,
+                            "ean": item.ean or "",
+                            "hint": "Link NF item to ProductService or add product with matching code/EAN",
+                        },
+                    )
                     continue
                 if product.item_type != "product":
                     skipped += 1
+                    skipped_by_reason["not_product_type"] += 1
+                    _add_sample(
+                        "not_product_type",
+                        {
+                            "nfe_item_id": item.id,
+                            "product_id": product.id,
+                            "product_code": product.code,
+                            "item_type": product.item_type,
+                            "hint": "Set product item_type to 'product' to track in inventory",
+                        },
+                    )
                     continue
                 if not product.track_inventory:
                     skipped += 1
+                    skipped_by_reason["track_inventory_disabled"] += 1
+                    _add_sample(
+                        "track_inventory_disabled",
+                        {
+                            "nfe_item_id": item.id,
+                            "product_id": product.id,
+                            "product_code": product.code,
+                            "hint": "Set product track_inventory=True to include in stock movements",
+                        },
+                    )
                     continue
 
                 idempotency_key = f"nfe_item:{item.id}"
                 if StockMovement.objects.filter(company=company, idempotency_key=idempotency_key).exists():
                     skipped += 1
+                    skipped_by_reason["already_processed"] += 1
+                    _add_sample(
+                        "already_processed",
+                        {
+                            "nfe_item_id": item.id,
+                            "product_code": product.code,
+                            "hint": "Movement already created; no action needed",
+                        },
+                    )
                     continue
 
                 movement_type = _determine_movement_type(nf, item, item.cfop_ref)
@@ -209,7 +264,13 @@ def ingest_nf_to_movements(company, nota_fiscal_id=None, nota_fiscal_ids=None):
             nf.inventory_processed_at = timezone.now()
             nf.save(update_fields=["inventory_processed", "inventory_processed_at", "updated_at"])
 
-    return {"created": created, "skipped": skipped, "errors": errors}
+    return {
+        "created": created,
+        "skipped": skipped,
+        "skipped_by_reason": skipped_by_reason,
+        "skipped_samples": skipped_samples,
+        "errors": errors,
+    }
 
 
 def create_manual_adjustment(company, product_id, quantity, unit_cost=None, warehouse_id=None, reference=""):

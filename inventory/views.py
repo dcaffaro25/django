@@ -140,7 +140,14 @@ class StockMovementViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
         )
         if not pending_ids:
             return Response(
-                {"message": "No pending NFs", "created": 0, "skipped": 0, "errors": []},
+                {
+                    "message": "No pending NFs",
+                    "created": 0,
+                    "skipped": 0,
+                    "skipped_by_reason": {},
+                    "skipped_samples": {},
+                    "errors": [],
+                },
                 status=status.HTTP_200_OK,
             )
         result = ingest_nf_to_movements(company=tenant, nota_fiscal_ids=pending_ids)
