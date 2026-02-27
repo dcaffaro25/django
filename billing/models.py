@@ -84,6 +84,56 @@ class ProductService(TenantAwareBaseModel):
     stock_quantity = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     is_active = models.BooleanField(default=True)
 
+    # Account mappings for inventory reporting (products only; fallback to TenantCostingConfig when blank)
+    inventory_account = models.ForeignKey(
+        "accounting.Account",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text="Inventory (balance sheet) account.",
+    )
+    cogs_account = models.ForeignKey(
+        "accounting.Account",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text="COGS (income statement) account.",
+    )
+    adjustment_account = models.ForeignKey(
+        "accounting.Account",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text="Inventory revaluation / adjustment account.",
+    )
+    revenue_account = models.ForeignKey(
+        "accounting.Account",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text="Sales revenue account.",
+    )
+    purchase_account = models.ForeignKey(
+        "accounting.Account",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text="Purchase / goods receipt account.",
+    )
+    discount_given_account = models.ForeignKey(
+        "accounting.Account",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text="Discount given on sales account.",
+    )
+
     def __str__(self):
         return f"{self.name} ({self.item_type})"
 

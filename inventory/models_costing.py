@@ -58,6 +58,30 @@ class TenantCostingConfig(TenantAwareBaseModel):
         related_name="+",
         help_text="Inventory Revaluation / Adjustment account.",
     )
+    revenue_account = models.ForeignKey(
+        "accounting.Account",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text="Default sales revenue account.",
+    )
+    purchase_account = models.ForeignKey(
+        "accounting.Account",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text="Default purchase / goods receipt account.",
+    )
+    discount_given_account = models.ForeignKey(
+        "accounting.Account",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text="Default discount given on sales account.",
+    )
     auto_post_primary = models.BooleanField(
         default=False,
         help_text="Auto-post accounting entries for primary strategy.",

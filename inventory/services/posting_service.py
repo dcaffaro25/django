@@ -18,6 +18,19 @@ from inventory.models import (
 from billing.models import ProductService
 
 
+def get_accounts_for_product(product, config):
+    """
+    Resolve inventory, COGS, and adjustment accounts for a product.
+    Uses product-level account fields when set, otherwise falls back to TenantCostingConfig.
+    Returns (inventory_account, cogs_account, adjustment_account).
+    """
+    return (
+        product.inventory_account or config.inventory_account,
+        product.cogs_account or config.cogs_account,
+        product.adjustment_account or config.adjustment_account,
+    )
+
+
 def _get_default_entity(company):
     """Get first entity for company, or None."""
     return Entity.objects.filter(company=company).first()
@@ -64,8 +77,8 @@ def post_cogs_entry(company, cogs_allocation, strategy):
         return None, "Already posted"
 
     config = _get_config(company)
-    cogs_account = config.cogs_account
-    inventory_account = config.inventory_account
+    product = cogs_allocation.product
+    inventory_account, cogs_account, _ = get_accounts_for_product(product, config)
     if not cogs_account or not inventory_account:
         return None, "COGS or Inventory account not configured"
 

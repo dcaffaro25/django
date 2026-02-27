@@ -2,6 +2,8 @@
 from django.contrib import admin
 from django.contrib.auth import get_user_model
 from django.contrib.auth.admin import UserAdmin
+from django.core.exceptions import FieldDoesNotExist
+from django.db import models
 from .models import Company, Entity, SubstitutionRule  # adjust imports to your actual models
 from django.contrib.admin.utils import model_ngettext
 from django.contrib.admin.views.main import ChangeList
@@ -10,6 +12,89 @@ from django.utils.translation import gettext_lazy as _
 from django.contrib.admin import SimpleListFilter
 
 User = get_user_model()
+
+
+def _is_tenant_scoped_model(related_model):
+    """Return True if the model has a company ForeignKey (tenant-scoped)."""
+    try:
+        f = related_model._meta.get_field("company")
+        return isinstance(f, models.ForeignKey)
+    except (FieldDoesNotExist, AttributeError):
+        return False
+
+
+class CompanyFKFilterMixin:
+    """
+    Filters FK combobox options for tenant-scoped related models based on the
+    selected company. When editing an existing object, options are filtered by
+    obj.company. When adding, ?company=<id> in the URL can pre-filter options.
+    """
+    def formfield_for_foreignkey(self, db_field, request, obj=None, **kwargs):
+        if db_field.name == "company":
+            return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+        if not hasattr(self.model, "company"):
+            return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+        related_model = getattr(db_field, "remote_field", None) and db_field.remote_field.model
+        if not related_model or not _is_tenant_scoped_model(related_model):
+            return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+        company_id = None
+        if obj is not None and obj.pk and hasattr(obj, "company_id"):
+            company_id = obj.company_id
+        if company_id is None:
+            resolver_kwargs = getattr(getattr(request, "resolver_match", None), "kwargs", None) or {}
+            pk = resolver_kwargs.get("object_id")
+            if pk and hasattr(self.model, "company"):
+                try:
+                    company_id = self.model.objects.filter(pk=pk).values_list("company_id", flat=True).first()
+                except (TypeError, ValueError):
+                    pass
+        if company_id is None:
+            company_id = request.GET.get("company")
+            if company_id:
+                try:
+                    company_id = int(company_id)
+                except (TypeError, ValueError):
+                    company_id = None
+
+        if company_id is not None:
+            kwargs["queryset"] = db_field.remote_field.model.objects.filter(company_id=company_id)
+
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+    def formfield_for_manytomany(self, db_field, request, obj=None, **kwargs):
+        if not hasattr(self.model, "company"):
+            return super().formfield_for_manytomany(db_field, request, **kwargs)
+
+        related_model = getattr(db_field, "remote_field", None) and getattr(db_field.remote_field, "model", None)
+        if not related_model or not _is_tenant_scoped_model(related_model):
+            return super().formfield_for_manytomany(db_field, request, **kwargs)
+
+        company_id = None
+        if obj is not None and obj.pk and hasattr(obj, "company_id"):
+            company_id = obj.company_id
+        if company_id is None:
+            resolver_kwargs = getattr(getattr(request, "resolver_match", None), "kwargs", None) or {}
+            pk = resolver_kwargs.get("object_id")
+            if pk and hasattr(self.model, "company"):
+                try:
+                    company_id = self.model.objects.filter(pk=pk).values_list("company_id", flat=True).first()
+                except (TypeError, ValueError):
+                    pass
+        if company_id is None:
+            company_id = request.GET.get("company")
+            if company_id:
+                try:
+                    company_id = int(company_id)
+                except (TypeError, ValueError):
+                    company_id = None
+
+        if company_id is not None:
+            kwargs["queryset"] = db_field.remote_field.model.objects.filter(company_id=company_id)
+
+        return super().formfield_for_manytomany(db_field, request, **kwargs)
 
 class FastDeleteMixin:
     """
@@ -114,7 +199,7 @@ class PerPageFilter(SimpleListFilter):
 
 
 
-class CompanyScopedAdmin(FastDeleteMixin, AuditColsMixin, admin.ModelAdmin):
+class CompanyScopedAdmin(CompanyFKFilterMixin, FastDeleteMixin, AuditColsMixin, admin.ModelAdmin):
     list_per_page = 100
     list_max_show_all = 5000
 

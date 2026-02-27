@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from django.contrib import admin
 
+from multitenancy.admin import CompanyScopedAdmin
+
 from .models import (
     Warehouse,
     UnitOfMeasure,
@@ -56,7 +58,7 @@ class InventoryBalanceAdmin(admin.ModelAdmin):
 
 
 @admin.register(TenantCostingConfig)
-class TenantCostingConfigAdmin(admin.ModelAdmin):
+class TenantCostingConfigAdmin(CompanyScopedAdmin):
     list_display = ("company", "primary_strategy", "negative_inventory_policy")
 
 

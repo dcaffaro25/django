@@ -689,6 +689,57 @@ def delete_reconciliations_for_journal_entries(journal_entry_ids, disable_signal
     return deleted_count, affected_journal_entry_ids
 
 
+def delete_reconciliations_for_bank_transactions(bank_transaction_ids, disable_signals=True):
+    """
+    Efficiently delete all reconciliations that reference the given bank transactions.
+    Uses bulk operations with batching to handle large datasets efficiently.
+    Mirrors delete_reconciliations_for_journal_entries but for the bank_transactions M2M.
+    """
+    if not bank_transaction_ids:
+        return 0, set()
+
+    reconciliation_ids = list(
+        Reconciliation.bank_transactions.through.objects.filter(
+            banktransaction_id__in=bank_transaction_ids
+        ).values_list('reconciliation_id', flat=True).distinct()
+    )
+
+    affected_bank_transaction_ids = set(bank_transaction_ids)
+
+    if not reconciliation_ids:
+        return 0, affected_bank_transaction_ids
+
+    deleted_count = 0
+
+    if disable_signals:
+        post_delete, m2m_changed, on_reconciliation_deleted, on_reconciliation_entries_changed, _ = _get_signal_handlers()
+        m2m_changed.disconnect(on_reconciliation_entries_changed, sender=Reconciliation.journal_entries.through)
+        post_delete.disconnect(on_reconciliation_deleted, sender=Reconciliation)
+
+    try:
+        for i in range(0, len(reconciliation_ids), RECONCILIATION_DELETE_BATCH_SIZE):
+            batch_reconciliation_ids = reconciliation_ids[i:i + RECONCILIATION_DELETE_BATCH_SIZE]
+
+            Reconciliation.journal_entries.through.objects.filter(
+                reconciliation_id__in=batch_reconciliation_ids
+            ).delete()
+
+            Reconciliation.bank_transactions.through.objects.filter(
+                reconciliation_id__in=batch_reconciliation_ids
+            ).delete()
+
+            deleted_count += Reconciliation.objects.filter(
+                id__in=batch_reconciliation_ids
+            ).delete()[0]
+    finally:
+        if disable_signals:
+            post_delete, m2m_changed, on_reconciliation_deleted, on_reconciliation_entries_changed, _ = _get_signal_handlers()
+            m2m_changed.connect(on_reconciliation_entries_changed, sender=Reconciliation.journal_entries.through)
+            post_delete.connect(on_reconciliation_deleted, sender=Reconciliation)
+
+    return deleted_count, affected_bank_transaction_ids
+
+
 @admin.register(Transaction)
 class TransactionAdmin(CompanyScopedAdmin):
     list_display = (
@@ -933,6 +984,70 @@ class BankTransactionAdmin(CompanyScopedAdmin):
         "currency__code",
         "notes",
     )
+
+    @admin.action(description="Delete selected bank transactions only")
+    def delete_bank_transactions_only(self, request, queryset):
+        """
+        Bulk delete bank transactions only. Removes them from any reconciliations
+        (M2M is cleared automatically on delete). Reconciliations are preserved.
+        """
+        bank_transaction_ids = list(queryset.values_list('id', flat=True))
+        total_count = len(bank_transaction_ids)
+
+        if not total_count:
+            self.message_user(request, "No bank transactions selected.", level='warning')
+            return
+
+        deleted_count = 0
+        with db_transaction.atomic():
+            for i in range(0, total_count, BULK_DELETE_BATCH_SIZE):
+                batch_ids = bank_transaction_ids[i:i + BULK_DELETE_BATCH_SIZE]
+                deleted_count += BankTransaction.objects.filter(id__in=batch_ids).delete()[0]
+
+        self.message_user(
+            request,
+            f"Successfully deleted {deleted_count} {model_ngettext(self.model, deleted_count)}.",
+            level='success'
+        )
+
+    @admin.action(description="Delete selected bank transactions (with related reconciliations)")
+    def delete_bank_transactions_with_reconciliations(self, request, queryset):
+        """
+        Bulk delete bank transactions and all reconciliations that reference them.
+        Reconciliations are deleted first, then bank transactions.
+        """
+        bank_transaction_ids = list(queryset.values_list('id', flat=True))
+        total_count = len(bank_transaction_ids)
+
+        if not total_count:
+            self.message_user(request, "No bank transactions selected.", level='warning')
+            return
+
+        deleted_reconciliations = 0
+        deleted_bank_transactions = 0
+
+        with db_transaction.atomic():
+            deleted_reconciliations, _ = delete_reconciliations_for_bank_transactions(
+                bank_transaction_ids, disable_signals=True
+            )
+
+            for i in range(0, total_count, BULK_DELETE_BATCH_SIZE):
+                batch_ids = bank_transaction_ids[i:i + BULK_DELETE_BATCH_SIZE]
+                deleted_bank_transactions += BankTransaction.objects.filter(id__in=batch_ids).delete()[0]
+
+        message_parts = [
+            f"Successfully deleted {deleted_bank_transactions} {model_ngettext(self.model, deleted_bank_transactions)}"
+        ]
+        if deleted_reconciliations > 0:
+            message_parts.append(f"{deleted_reconciliations} related reconciliations")
+
+        self.message_user(
+            request,
+            ". ".join(message_parts) + ".",
+            level='success'
+        )
+
+    actions = ['delete_bank_transactions_only', 'delete_bank_transactions_with_reconciliations']
 
 @admin.register(Reconciliation)
 class ReconciliationAdmin(CompanyScopedAdmin):
