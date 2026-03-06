@@ -1,16 +1,20 @@
 from rest_framework import status, viewsets
+from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from multitenancy.mixins import ScopedQuerysetMixin
 
 from .erp_etl import execute_erp_etl_import
-from .models import ERPAPIDefinition, ERPConnection
+from .models import ERPAPIDefinition, ERPConnection, ERPRawRecord, ERPSyncJob, ERPSyncRun
 from .serializers import (
     BuildPayloadRequestSerializer,
     ERPAPIDefinitionSerializer,
     ERPConnectionListSerializer,
     ERPConnectionSerializer,
+    ERPRawRecordSerializer,
+    ERPSyncJobSerializer,
+    ERPSyncRunSerializer,
     ErpEtlImportRequestSerializer,
 )
 from .services.payload_builder import build_payload_by_ids
@@ -115,3 +119,84 @@ class ErpEtlImportView(APIView):
         if data.get("commit") and not result.get("committed"):
             return Response(result, status=status.HTTP_400_BAD_REQUEST)
         return Response(result, status=status.HTTP_200_OK)
+
+
+class ERPSyncJobViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
+    """CRUD for ERP sync jobs. Actions: run, dry_run."""
+
+    queryset = ERPSyncJob.objects.select_related("connection", "api_definition").order_by("name")
+    serializer_class = ERPSyncJobSerializer
+
+    def perform_create(self, serializer):
+        obj = serializer.save()
+        if not obj.company_id and obj.connection:
+            obj.company = obj.connection.company
+            obj.save(update_fields=["company"])
+
+    def perform_update(self, serializer):
+        obj = serializer.save()
+        if not obj.company_id and obj.connection:
+            obj.company = obj.connection.company
+            obj.save(update_fields=["company"])
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        tenant = getattr(self.request, "tenant", None)
+        if tenant and tenant != "all" and hasattr(tenant, "id"):
+            return qs.filter(connection__company=tenant)
+        return qs
+
+    @action(detail=True, methods=["post"])
+    def run(self, request, pk=None):
+        """Trigger manual sync. Returns celery task_id."""
+        from .tasks import run_erp_sync_task
+
+        job = self.get_object()
+        result = run_erp_sync_task.delay(job.id)
+        return Response({"task_id": str(result.id)})
+
+    @action(detail=True, methods=["post"])
+    def dry_run(self, request, pk=None):
+        """Dry-run page 1 only, return diagnostics."""
+        from .services.omie_sync_service import execute_sync
+
+        job = self.get_object()
+        out = execute_sync(job.id, dry_run=True)
+        return Response(out)
+
+
+class ERPSyncRunViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
+    """Read-only list/detail of ERP sync runs."""
+
+    queryset = ERPSyncRun.objects.select_related("job").order_by("-started_at")
+    serializer_class = ERPSyncRunSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        tenant = getattr(self.request, "tenant", None)
+        job_id = self.request.query_params.get("job")
+        if tenant and tenant != "all" and hasattr(tenant, "id"):
+            qs = qs.filter(job__connection__company=tenant)
+        if job_id:
+            qs = qs.filter(job_id=job_id)
+        return qs
+
+
+class ERPRawRecordViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
+    """Read-only paginated list of raw records. Filter by api_call, sync_run, etc."""
+
+    queryset = ERPRawRecord.objects.select_related("sync_run").order_by("-fetched_at")
+    serializer_class = ERPRawRecordSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        tenant = getattr(self.request, "tenant", None)
+        if tenant and tenant != "all" and hasattr(tenant, "id"):
+            qs = qs.filter(company=tenant)
+        api_call = self.request.query_params.get("api_call")
+        if api_call:
+            qs = qs.filter(api_call=api_call)
+        sync_run = self.request.query_params.get("sync_run")
+        if sync_run:
+            qs = qs.filter(sync_run_id=sync_run)
+        return qs

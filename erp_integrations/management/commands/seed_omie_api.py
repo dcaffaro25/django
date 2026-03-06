@@ -54,6 +54,14 @@ class Command(BaseCommand):
         else:
             self.stdout.write("ERPProvider Omie already exists")
 
+        transform_config_listar = {
+            "records": {
+                "path": "lista_contas_pagar",
+                "fallbackPaths": ["data.lista_contas_pagar"],
+                "autoDiscover": True,
+                "rootAsOneRow": False,
+            },
+        }
         api_def, created = ERPAPIDefinition.objects.get_or_create(
             provider=provider,
             call="ListarContasPagar",
@@ -63,9 +71,15 @@ class Command(BaseCommand):
                 "param_schema": LISTAR_CONTAS_PAGAR_PARAM_SCHEMA,
                 "description": "Listar Contas a Pagar (lcpListarRequest)",
                 "is_active": True,
+                "transform_config": transform_config_listar,
             },
         )
         if created:
             self.stdout.write(self.style.SUCCESS("Created ERPAPIDefinition: ListarContasPagar"))
         else:
-            self.stdout.write("ERPAPIDefinition ListarContasPagar already exists")
+            if not api_def.transform_config:
+                api_def.transform_config = transform_config_listar
+                api_def.save()
+                self.stdout.write("Updated ERPAPIDefinition ListarContasPagar with transform_config")
+            else:
+                self.stdout.write("ERPAPIDefinition ListarContasPagar already exists")

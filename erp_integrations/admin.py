@@ -1,6 +1,14 @@
 from django.contrib import admin
 
-from .models import ERPAPIDefinition, ERPConnection, ErpApiEtlMapping, ERPProvider
+from .models import (
+    ERPAPIDefinition,
+    ERPConnection,
+    ErpApiEtlMapping,
+    ERPProvider,
+    ERPRawRecord,
+    ERPSyncJob,
+    ERPSyncRun,
+)
 
 
 @admin.register(ERPProvider)
@@ -58,3 +66,27 @@ class ErpApiEtlMappingAdmin(admin.ModelAdmin):
             },
         ),
     )
+
+
+@admin.register(ERPSyncJob)
+class ERPSyncJobAdmin(admin.ModelAdmin):
+    list_display = ("name", "connection", "api_definition", "is_active", "last_sync_status", "last_synced_at")
+    list_filter = ("is_active", "last_sync_status")
+    search_fields = ("name",)
+    raw_id_fields = ("connection", "api_definition")
+
+
+@admin.register(ERPSyncRun)
+class ERPSyncRunAdmin(admin.ModelAdmin):
+    list_display = ("id", "job", "status", "pages_fetched", "records_stored", "started_at")
+    list_filter = ("status",)
+    readonly_fields = ("started_at", "completed_at", "duration_seconds", "diagnostics")
+    raw_id_fields = ("job", "company")
+
+
+@admin.register(ERPRawRecord)
+class ERPRawRecordAdmin(admin.ModelAdmin):
+    list_display = ("id", "sync_run", "api_call", "page_number", "record_index", "global_index", "fetched_at")
+    list_filter = ("api_call",)
+    search_fields = ("record_hash",)
+    raw_id_fields = ("sync_run", "company")

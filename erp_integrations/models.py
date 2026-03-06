@@ -88,6 +88,26 @@ class ERPAPIDefinition(BaseModel):
     )
     description = models.CharField(max_length=255, blank=True, null=True)
     is_active = models.BooleanField(default=True)
+    transform_config = models.JSONField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text="Transform config spec: records extraction, explode rules, derived dates. See docs.",
+    )
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+        from .services.transform_engine import validate_transform_config
+
+        super().clean()
+        if self.transform_config:
+            errors = validate_transform_config(self.transform_config)
+            if errors:
+                raise ValidationError(
+                    {
+                        "transform_config": [f"{e.get('field', 'config')}: {e.get('message', '')}" for e in errors]
+                    }
+                )
 
     def __str__(self):
         return f"{self.provider.slug} / {self.call}"
@@ -185,3 +205,147 @@ class ErpApiEtlMapping(TenantAwareBaseModel):
 
     def __str__(self):
         return f"{self.name}: {self.response_list_key} → {self.target_model}"
+
+
+class ERPSyncJob(TenantAwareBaseModel):
+    """Scheduled or manual sync job: fetches from Omie API and stores raw records."""
+
+    connection = models.ForeignKey(
+        ERPConnection,
+        on_delete=models.CASCADE,
+        related_name="sync_jobs",
+    )
+    api_definition = models.ForeignKey(
+        ERPAPIDefinition,
+        on_delete=models.CASCADE,
+        related_name="sync_jobs",
+    )
+    name = models.CharField(max_length=150)
+    is_active = models.BooleanField(default=True)
+    schedule_rrule = models.CharField(
+        max_length=500,
+        blank=True,
+        null=True,
+        help_text="iCal RRULE for periodic runs (e.g. FREQ=HOURLY;INTERVAL=6)",
+    )
+    extra_params = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Override params for this job (e.g. pagina, registros_por_pagina)",
+    )
+    last_synced_at = models.DateTimeField(null=True, blank=True)
+    last_sync_status = models.CharField(
+        max_length=20,
+        choices=[
+            ("never", "Never"),
+            ("completed", "Completed"),
+            ("failed", "Failed"),
+            ("partial", "Partial"),
+            ("running", "Running"),
+        ],
+        default="never",
+    )
+    last_sync_record_count = models.IntegerField(default=0)
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name = "ERP Sync Job"
+
+    def __str__(self):
+        return f"{self.name} ({self.api_definition.call})"
+
+
+class ERPSyncRun(TenantAwareBaseModel):
+    """Audit log for each execution of an ERPSyncJob."""
+
+    STATUS_CHOICES = [
+        ("pending", "Pending"),
+        ("running", "Running"),
+        ("completed", "Completed"),
+        ("failed", "Failed"),
+        ("partial", "Partial"),
+    ]
+
+    job = models.ForeignKey(
+        ERPSyncJob,
+        on_delete=models.CASCADE,
+        related_name="runs",
+    )
+    celery_task_id = models.CharField(max_length=100, null=True, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="pending")
+    pages_fetched = models.IntegerField(default=0)
+    total_pages = models.IntegerField(null=True, blank=True)
+    records_extracted = models.IntegerField(default=0)
+    records_stored = models.IntegerField(default=0)
+    errors = models.JSONField(default=list)
+    diagnostics = models.JSONField(
+        default=dict,
+        help_text="Picked path, timing, retries, etc.",
+    )
+    started_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    duration_seconds = models.FloatField(null=True, blank=True)
+    request_payload_redacted = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Request payload with app_key/app_secret masked",
+    )
+
+    class Meta:
+        ordering = ["-started_at"]
+        indexes = [
+            models.Index(fields=["job", "-started_at"]),
+            models.Index(fields=["status"]),
+        ]
+
+    def __str__(self):
+        return f"Sync run #{self.id} [{self.status}] @ {self.started_at}"
+
+
+class ERPRawRecord(models.Model):
+    """
+    Stores individual raw JSON records extracted from Omie API responses.
+    Includes pagination header metadata from the page the record came from.
+    """
+
+    company = models.ForeignKey(
+        "multitenancy.Company",
+        on_delete=models.CASCADE,
+        related_name="erp_raw_records",
+    )
+    sync_run = models.ForeignKey(
+        ERPSyncRun,
+        on_delete=models.CASCADE,
+        related_name="records",
+    )
+    api_call = models.CharField(max_length=128, db_index=True)
+
+    # Record position
+    page_number = models.IntegerField()
+    record_index = models.IntegerField()
+    global_index = models.IntegerField()
+
+    # Pagination header from the page response
+    page_records_count = models.IntegerField()
+    total_pages = models.IntegerField()
+    total_records = models.IntegerField()
+    page_response_header = models.JSONField(
+        default=dict,
+        help_text="All top-level keys from the page response except the records array",
+    )
+
+    # Record data
+    data = models.JSONField()
+    record_hash = models.CharField(max_length=64, db_index=True)
+    fetched_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["company", "api_call", "-fetched_at"]),
+            models.Index(fields=["sync_run", "page_number", "record_index"]),
+            models.Index(fields=["sync_run", "global_index"]),
+            models.Index(fields=["record_hash"]),
+        ]
+
+    def __str__(self):
+        return f"Record {self.global_index} (page {self.page_number}, idx {self.record_index})"
