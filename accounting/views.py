@@ -1285,8 +1285,7 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     #queryset = JournalEntry.objects.all()
     queryset = (
         JournalEntry.objects
-        .select_related('company', 'account', 'transaction')
-        # If you also need cost_center or any other FK, include it too
+        .select_related('company', 'account', 'account__bank_account', 'transaction')
     )
     serializer_class = JournalEntrySerializer
     
@@ -1360,6 +1359,7 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             transaction_value=F('transaction__amount'),
             # Bank account fields
             bank_account_id=F('account__bank_account__id'),
+            bank_account_name=F('account__bank_account__name'),
             bank_date=Case(
                 When(account__bank_account__isnull=False, then=F('date')),
                 default=Value(None),

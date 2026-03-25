@@ -228,9 +228,6 @@ class JournalEntryListSerializer(serializers.ModelSerializer):
             value = instance.transaction_value
             data['transaction_value'] = float(value) if value is not None else None
         
-        if hasattr(instance, 'bank_account_id'):
-            data['bank_account'] = instance.bank_account_id
-        
         if hasattr(instance, 'bank_date'):
             data['bank_date'] = instance.bank_date
         
@@ -274,11 +271,17 @@ class JournalEntryListSerializer(serializers.ModelSerializer):
         return None
 
     def get_bank_account(self, obj):
-        """Returns the bank account ID if linked."""
-        if hasattr(obj, 'bank_account_id'):
-            return obj.bank_account_id
-        if obj.account and obj.account.bank_account:
-            return obj.account.bank_account.id
+        """Returns ``{"id", "name"}`` for the GL-linked bank account, or ``None``."""
+        if hasattr(obj, 'bank_account_id') and obj.bank_account_id is not None:
+            name = getattr(obj, 'bank_account_name', None)
+            account = getattr(obj, 'account', None)
+            if name is None and account and getattr(account, 'bank_account', None):
+                name = account.bank_account.name
+            return {'id': obj.bank_account_id, 'name': name}
+        account = getattr(obj, 'account', None)
+        if account and getattr(account, 'bank_account', None):
+            ba = account.bank_account
+            return {'id': ba.id, 'name': ba.name}
         return None
 
     def get_balance(self, obj):
