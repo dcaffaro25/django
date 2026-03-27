@@ -147,7 +147,7 @@ class ERPSyncJobViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return qs
 
     @action(detail=True, methods=["post"])
-    def run(self, request, pk=None):
+    def run(self, request, pk=None, tenant_id=None):
         """Trigger manual sync. Returns celery task_id."""
         from .tasks import run_erp_sync_task
 
@@ -156,7 +156,7 @@ class ERPSyncJobViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return Response({"task_id": str(result.id)})
 
     @action(detail=True, methods=["post"])
-    def dry_run(self, request, pk=None):
+    def dry_run(self, request, pk=None, tenant_id=None):
         """Dry-run page 1 only, return diagnostics."""
         from .services.omie_sync_service import execute_sync
 
