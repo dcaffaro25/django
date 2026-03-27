@@ -2,6 +2,7 @@
 Omie sync service: fetch paginated API responses, extract records, store raw JSON.
 """
 
+import copy
 import hashlib
 import json
 import logging
@@ -11,6 +12,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from erp_integrations.models import ERPRawRecord, ERPSyncJob, ERPSyncRun
+from erp_integrations.services.fetch_config import (
+    MODE_INCREMENTAL_DATES,
+    merge_static_params,
+    coalesce_segments,
+    next_cursor_after_incremental,
+)
 from erp_integrations.services.payload_builder import build_payload
 from erp_integrations.services.transform_engine import (
     DEFAULT_TRANSFORM_CONFIG,
@@ -142,27 +149,17 @@ def execute_sync(job_id: int, dry_run: bool = False) -> Dict[str, Any]:
     records_config = config.get("records", {}) or {}
     records_path = records_config.get("path")
 
-    # Build initial payload
-    base_params = dict(job.extra_params or {})
-    base_params.setdefault("pagina", 1)
-    base_params.setdefault("registros_por_pagina", 50)
-
-    payload = build_payload(
-        connection=connection,
-        api_definition=api_def,
-        param_overrides=base_params,
-    )
-    run = ERPSyncRun.objects.create(
-        job=job,
-        company_id=company_id,
-        status="running",
-        request_payload_redacted=_redact_payload(payload),
-    )
+    # Static params + optional date (or other) overlays per segment
+    static_params = merge_static_params(job)
+    segments = coalesce_segments(job)
+    fc_mode = (job.fetch_config or {}).get("mode", "pagination_only")
 
     diagnostics: Dict[str, Any] = {
         "picked_path": None,
         "retries": 0,
         "pages": [],
+        "segments": [],
+        "fetch_mode": fc_mode,
     }
 
     total_extracted = 0
@@ -171,86 +168,152 @@ def execute_sync(job_id: int, dry_run: bool = False) -> Dict[str, Any]:
     errors: List[str] = []
     pages_fetched = 0
     total_pages_seen = 1
+    last_incremental_segment = None
+    run = None  # set when a sync run row is created
 
     try:
-        page_num = 1
-        while page_num <= MAX_PAGES:
-            page_params = {**base_params, "pagina": page_num}
-            payload = build_payload(
-                connection=connection,
-                api_definition=api_def,
-                param_overrides=page_params,
+        if not segments:
+            run = ERPSyncRun.objects.create(
+                job=job,
+                company_id=company_id,
+                status="completed",
+                request_payload_redacted={},
+                diagnostics=diagnostics,
+                records_extracted=0,
+                records_stored=0,
+                pages_fetched=0,
             )
+            diagnostics["message"] = "No segments to fetch (check bounds and cursor)."
+            run.diagnostics = diagnostics
+            run.save(update_fields=["diagnostics"])
+            job.last_synced_at = run.started_at
+            job.last_sync_status = "completed"
+            job.last_sync_record_count = 0
+            job.save(update_fields=["last_synced_at", "last_sync_status", "last_sync_record_count"])
+            from django.utils import timezone as dj_tz
 
-            # Request with retry for consumo redundante
-            last_error = None
-            for attempt in range(MAX_RETRIES_CONSUMO):
-                try:
-                    resp = requests.post(
-                        api_def.url,
-                        json=payload,
-                        headers={"Content-Type": "application/json"},
-                        timeout=60,
-                    )
-                    if _is_consumo_redundante_error(resp) and attempt < MAX_RETRIES_CONSUMO - 1:
-                        wait = RETRY_BASE_SECONDS ** (attempt + 1)
-                        diagnostics["retries"] = diagnostics.get("retries", 0) + 1
-                        logger.warning("Omie consumo redundante, retry %s in %ss", attempt + 1, wait)
-                        time.sleep(wait)
-                        continue
-                    resp.raise_for_status()
-                    raw = resp.json()
+            run.completed_at = dj_tz.now()
+            if run.started_at:
+                run.duration_seconds = (run.completed_at - run.started_at).total_seconds()
+            run.save(update_fields=["completed_at", "duration_seconds"])
+            return {
+                "success": True,
+                "run_id": run.id,
+                "status": run.status,
+                "pages_fetched": 0,
+                "records_extracted": 0,
+                "records_stored": 0,
+                "dry_run": dry_run,
+                "diagnostics": diagnostics,
+                "errors": [],
+            }
+
+        # Initial redacted snapshot (first page of first segment)
+        first_base = {**static_params, **segments[0].params}
+        first_base.setdefault("pagina", 1)
+        first_base.setdefault("registros_por_pagina", 50)
+        first_payload = build_payload(
+            connection=connection,
+            api_definition=api_def,
+            param_overrides=first_base,
+        )
+        run = ERPSyncRun.objects.create(
+            job=job,
+            company_id=company_id,
+            status="running",
+            request_payload_redacted=_redact_payload(first_payload),
+        )
+
+        for seg in segments:
+            seg_diag: Dict[str, Any] = {"label": seg.label, "pages": []}
+            base_params = {**static_params, **seg.params}
+            base_params.setdefault("pagina", 1)
+            base_params.setdefault("registros_por_pagina", 50)
+
+            page_num = 1
+            while page_num <= MAX_PAGES:
+                page_params = {**base_params, "pagina": page_num}
+                payload = build_payload(
+                    connection=connection,
+                    api_definition=api_def,
+                    param_overrides=page_params,
+                )
+
+                last_error = None
+                for attempt in range(MAX_RETRIES_CONSUMO):
+                    try:
+                        resp = requests.post(
+                            api_def.url,
+                            json=payload,
+                            headers={"Content-Type": "application/json"},
+                            timeout=60,
+                        )
+                        if _is_consumo_redundante_error(resp) and attempt < MAX_RETRIES_CONSUMO - 1:
+                            wait = RETRY_BASE_SECONDS ** (attempt + 1)
+                            diagnostics["retries"] = diagnostics.get("retries", 0) + 1
+                            logger.warning("Omie consumo redundante, retry %s in %ss", attempt + 1, wait)
+                            time.sleep(wait)
+                            continue
+                        resp.raise_for_status()
+                        raw = resp.json()
+                        break
+                    except requests.RequestException as e:
+                        last_error = str(e)
+                        if attempt < MAX_RETRIES_CONSUMO - 1:
+                            wait = RETRY_BASE_SECONDS ** (attempt + 1)
+                            time.sleep(wait)
+                            continue
+                        raise
+
+                unwrapped = _unwrap_omie_response(raw)
+                header, records, pnum, total_pages, total_records = _extract_page_header_and_records(
+                    unwrapped, records_path, config
+                )
+
+                if diagnostics.get("picked_path") is None:
+                    diagnostics["picked_path"] = records_path or "auto"
+
+                total_pages_seen = max(total_pages_seen, total_pages)
+                pages_fetched += 1
+                total_extracted += len(records)
+
+                page_records_count = len(records)
+
+                if not dry_run:
+                    for i, rec in enumerate(records):
+                        h = _record_hash(rec)
+                        ERPRawRecord.objects.create(
+                            company_id=company_id,
+                            sync_run=run,
+                            api_call=api_def.call,
+                            page_number=pnum,
+                            record_index=i,
+                            global_index=global_index,
+                            page_records_count=page_records_count,
+                            total_pages=total_pages,
+                            total_records=total_records,
+                            page_response_header=header,
+                            data=rec,
+                            record_hash=h,
+                        )
+                        total_stored += 1
+                        global_index += 1
+
+                seg_diag["pages"].append({"page": pnum, "records": len(records)})
+                diagnostics["pages"].append({"segment": seg.label, "page": pnum, "records": len(records)})
+
+                if dry_run:
                     break
-                except requests.RequestException as e:
-                    last_error = str(e)
-                    if attempt < MAX_RETRIES_CONSUMO - 1:
-                        wait = RETRY_BASE_SECONDS ** (attempt + 1)
-                        time.sleep(wait)
-                        continue
-                    raise
 
-            unwrapped = _unwrap_omie_response(raw)
-            header, records, pnum, total_pages, total_records = _extract_page_header_and_records(
-                unwrapped, records_path, config
-            )
+                if page_num >= total_pages:
+                    break
+                page_num += 1
 
-            if diagnostics.get("picked_path") is None:
-                diagnostics["picked_path"] = records_path or "auto"
-
-            total_pages_seen = total_pages
-            pages_fetched += 1
-            total_extracted += len(records)
-
-            page_records_count = len(records)
-
-            if not dry_run:
-                for i, rec in enumerate(records):
-                    h = _record_hash(rec)
-                    ERPRawRecord.objects.create(
-                        company_id=company_id,
-                        sync_run=run,
-                        api_call=api_def.call,
-                        page_number=pnum,
-                        record_index=i,
-                        global_index=global_index,
-                        page_records_count=page_records_count,
-                        total_pages=total_pages,
-                        total_records=total_records,
-                        page_response_header=header,
-                        data=rec,
-                        record_hash=h,
-                    )
-                    total_stored += 1
-                    global_index += 1
-
-            diagnostics["pages"].append({"page": pnum, "records": len(records)})
+            diagnostics["segments"].append(seg_diag)
+            last_incremental_segment = seg
 
             if dry_run:
                 break
-
-            if page_num >= total_pages:
-                break
-            page_num += 1
 
         run.status = "completed"
         run.pages_fetched = pages_fetched
@@ -263,35 +326,62 @@ def execute_sync(job_id: int, dry_run: bool = False) -> Dict[str, Any]:
         job.last_synced_at = run.started_at
         job.last_sync_status = "completed"
         job.last_sync_record_count = total_stored
-        job.save(update_fields=["last_synced_at", "last_sync_status", "last_sync_record_count"])
+        update_fields = ["last_synced_at", "last_sync_status", "last_sync_record_count"]
+
+        if (
+            not dry_run
+            and fc_mode == MODE_INCREMENTAL_DATES
+            and last_incremental_segment is not None
+        ):
+            fc = copy.deepcopy(job.fetch_config or {})
+            fc["cursor"] = next_cursor_after_incremental(last_incremental_segment)
+            job.fetch_config = fc
+            update_fields.append("fetch_config")
+
+        job.save(update_fields=update_fields)
 
     except RecordExtractionError as e:
         errors.append(str(e))
-        run.status = "failed"
-        run.errors = errors
-        run.diagnostics = diagnostics
+        if run is not None:
+            run.status = "failed"
+            run.errors = errors
+            run.diagnostics = diagnostics
         job.last_sync_status = "failed"
         job.save(update_fields=["last_sync_status"])
     except Exception as e:
         logger.exception("ERPSyncJob %s failed", job_id)
         errors.append(str(e))
-        run.status = "failed"
-        run.errors = errors
-        run.diagnostics = diagnostics
+        if run is not None:
+            run.status = "failed"
+            run.errors = errors
+            run.diagnostics = diagnostics
         job.last_sync_status = "failed"
         job.save(update_fields=["last_sync_status"])
 
-    from django.utils import timezone
+    from django.utils import timezone as dj_tz
 
-    run.completed_at = timezone.now()
-    if run.started_at:
-        run.duration_seconds = (run.completed_at - run.started_at).total_seconds()
-    run.save(update_fields=["status", "pages_fetched", "total_pages", "records_extracted", "records_stored", "errors", "diagnostics", "completed_at", "duration_seconds"])
+    if run is not None:
+        run.completed_at = dj_tz.now()
+        if run.started_at:
+            run.duration_seconds = (run.completed_at - run.started_at).total_seconds()
+        run.save(
+            update_fields=[
+                "status",
+                "pages_fetched",
+                "total_pages",
+                "records_extracted",
+                "records_stored",
+                "errors",
+                "diagnostics",
+                "completed_at",
+                "duration_seconds",
+            ]
+        )
 
     return {
-        "success": run.status == "completed",
-        "run_id": run.id,
-        "status": run.status,
+        "success": (run.status == "completed") if run is not None else False,
+        "run_id": run.id if run is not None else None,
+        "status": run.status if run is not None else "failed",
         "pages_fetched": pages_fetched,
         "records_extracted": total_extracted,
         "records_stored": total_stored,

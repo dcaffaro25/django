@@ -28,6 +28,13 @@ class NotaFiscal(TenantAwareBaseModel):
 
     # ===== IDENTIFICAÇÃO =====
     chave = models.CharField('Chave de acesso', max_length=44, unique=True, db_index=True)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     numero = models.IntegerField('Número NF')
     serie = models.SmallIntegerField('Série', default=1)
     modelo = models.SmallIntegerField('Modelo', choices=MODELO, default=55)
@@ -152,6 +159,7 @@ class NotaFiscal(TenantAwareBaseModel):
             models.Index(fields=['emit_cnpj', 'data_emissao']),
             models.Index(fields=['dest_cnpj', 'data_emissao']),
             models.Index(fields=['finalidade']),
+            models.Index(fields=['company', 'cliente_erp_id']),
         ]
 
     def __str__(self):
@@ -174,6 +182,13 @@ class NotaFiscalItem(TenantAwareBaseModel):
         verbose_name='Nota Fiscal'
     )
     numero_item = models.SmallIntegerField('N. item')
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
 
     # ===== PRODUTO (dados desnormalizados + FK) =====
     codigo_produto = models.CharField('Código produto (cProd)', max_length=60)
@@ -251,6 +266,7 @@ class NotaFiscalItem(TenantAwareBaseModel):
             models.Index(fields=['ncm']),
             models.Index(fields=['cfop']),
             models.Index(fields=['cfop_ref']),
+            models.Index(fields=['company', 'cliente_erp_id']),
         ]
 
     def __str__(self):
@@ -286,6 +302,13 @@ class NotaFiscalReferencia(TenantAwareBaseModel):
         verbose_name="Nota referenciada (quando existir)",
         help_text="Preenchido quando já existe NotaFiscal com chave = chave_referenciada.",
     )
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
 
     class Meta:
         verbose_name = "Referência entre NFs"
@@ -300,6 +323,7 @@ class NotaFiscalReferencia(TenantAwareBaseModel):
         indexes = [
             models.Index(fields=["chave_referenciada"]),
             models.Index(fields=["nota_referenciada"]),
+            models.Index(fields=["company", "cliente_erp_id"]),
         ]
 
     def __str__(self):
@@ -359,6 +383,13 @@ class NFeEvento(TenantAwareBaseModel):
 
     xml_original = models.TextField("XML original", blank=True)
     arquivo_origem = models.CharField("Arquivo de origem", max_length=500, blank=True)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
 
     class Meta:
         verbose_name = "Evento NFe"
@@ -373,6 +404,7 @@ class NFeEvento(TenantAwareBaseModel):
         indexes = [
             models.Index(fields=["tipo_evento", "chave_nfe"]),
             models.Index(fields=["status_sefaz"]),
+            models.Index(fields=["company", "cliente_erp_id"]),
         ]
 
     def __str__(self):
@@ -399,6 +431,13 @@ class NFeInutilizacao(TenantAwareBaseModel):
     data_registro = models.DateTimeField("Data registro SEFAZ", null=True, blank=True)
     xml_original = models.TextField("XML original", blank=True)
     arquivo_origem = models.CharField("Arquivo de origem", max_length=500, blank=True)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
 
     class Meta:
         verbose_name = "Inutilização NFe"
@@ -409,6 +448,9 @@ class NFeInutilizacao(TenantAwareBaseModel):
                 fields=["company", "ano", "serie", "n_nf_ini", "n_nf_fin"],
                 name="billing_nfeinut_company_ano_serie_ini_fin_uniq",
             ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "cliente_erp_id"]),
         ]
 
     def __str__(self):

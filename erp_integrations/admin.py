@@ -74,6 +74,11 @@ class ERPSyncJobAdmin(admin.ModelAdmin):
     list_filter = ("is_active", "last_sync_status")
     search_fields = ("name",)
     raw_id_fields = ("connection", "api_definition")
+    fieldsets = (
+        (None, {"fields": ("company", "connection", "api_definition", "name", "is_active")}),
+        ("Schedule & params", {"fields": ("schedule_rrule", "extra_params", "fetch_config")}),
+        ("Last sync", {"fields": ("last_synced_at", "last_sync_status", "last_sync_record_count")}),
+    )
 
 
 @admin.register(ERPSyncRun)

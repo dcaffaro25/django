@@ -13,6 +13,13 @@ from multitenancy.models import TenantAwareBaseModel
 class Warehouse(TenantAwareBaseModel):
     """Warehouse or storage location (optional for single-location tenants)."""
     code = models.CharField(max_length=50)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     name = models.CharField(max_length=200)
     is_active = models.BooleanField(default=True)
 
@@ -25,6 +32,9 @@ class Warehouse(TenantAwareBaseModel):
                 name="inventory_warehouse_company_code_uniq",
             ),
         ]
+        indexes = [
+            models.Index(fields=["company", "cliente_erp_id"]),
+        ]
         ordering = ["code"]
 
     def __str__(self):
@@ -34,6 +44,13 @@ class Warehouse(TenantAwareBaseModel):
 class UnitOfMeasure(TenantAwareBaseModel):
     """Unit of measure (e.g. UN, KG, CX, M2)."""
     code = models.CharField(max_length=10)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     name = models.CharField(max_length=100)
 
     class Meta:
@@ -44,6 +61,9 @@ class UnitOfMeasure(TenantAwareBaseModel):
                 fields=["company", "code"],
                 name="inventory_uom_company_code_uniq",
             ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "cliente_erp_id"]),
         ]
         ordering = ["code"]
 
@@ -79,6 +99,13 @@ class UoMConversion(TenantAwareBaseModel):
         decimal_places=8,
         help_text="1 from_uom = factor * to_uom",
     )
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
 
     class Meta:
         verbose_name = "UoM Conversion"
@@ -88,6 +115,9 @@ class UoMConversion(TenantAwareBaseModel):
                 fields=["company", "product", "from_uom", "to_uom"],
                 name="inventory_uomconv_company_product_from_to_uniq",
             ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "cliente_erp_id"]),
         ]
 
     def __str__(self):
@@ -114,6 +144,13 @@ class StockMovement(TenantAwareBaseModel):
     ]
 
     movement_type = models.CharField(max_length=20, choices=MOVEMENT_TYPES)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     product = models.ForeignKey(
         "billing.ProductService",
         on_delete=models.PROTECT,
@@ -177,6 +214,7 @@ class StockMovement(TenantAwareBaseModel):
             models.Index(fields=["product", "movement_date"]),
             models.Index(fields=["warehouse", "movement_date"]),
             models.Index(fields=["movement_type"]),
+            models.Index(fields=["company", "cliente_erp_id"]),
         ]
         ordering = ["-movement_date", "-id"]
 
@@ -223,6 +261,13 @@ class InventoryLayer(TenantAwareBaseModel):
     layer_date = models.DateTimeField(db_index=True)
     is_exhausted = models.BooleanField(default=False, db_index=True)
     metadata = models.JSONField(default=dict, blank=True)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
 
     class Meta:
         verbose_name = "Inventory Layer"
@@ -230,6 +275,7 @@ class InventoryLayer(TenantAwareBaseModel):
         indexes = [
             models.Index(fields=["product", "warehouse", "layer_date"]),
             models.Index(fields=["is_exhausted"]),
+            models.Index(fields=["company", "cliente_erp_id"]),
         ]
         ordering = ["layer_date", "id"]
 
@@ -257,6 +303,13 @@ class InventoryBalance(TenantAwareBaseModel):
     on_hand_qty = models.DecimalField(max_digits=15, decimal_places=4, default=Decimal("0"))
     last_movement_date = models.DateTimeField(null=True, blank=True)
     last_rebuilt_at = models.DateTimeField(null=True, blank=True)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
 
     class Meta:
         verbose_name = "Inventory Balance"
@@ -270,6 +323,7 @@ class InventoryBalance(TenantAwareBaseModel):
         indexes = [
             models.Index(fields=["product"]),
             models.Index(fields=["warehouse"]),
+            models.Index(fields=["company", "cliente_erp_id"]),
         ]
 
     def __str__(self):

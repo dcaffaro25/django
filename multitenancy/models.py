@@ -139,6 +139,13 @@ class TenantAwareBaseModel(BaseModel):
 class Entity(TenantAwareBaseModel, MPTTModel):
     company = models.ForeignKey(Company, related_name='entities', on_delete=models.CASCADE)
     name = models.CharField(max_length=100)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     parent = TreeForeignKey('self', null=True, blank=True, related_name='children', on_delete=models.CASCADE)
     accounts = models.ManyToManyField('accounting.Account', related_name='entities', blank=True, default=None)
     cost_centers = models.ManyToManyField('accounting.CostCenter', related_name='entities', blank=True, default=None)
@@ -151,6 +158,9 @@ class Entity(TenantAwareBaseModel, MPTTModel):
     
     class Meta:
         unique_together = ('company', 'name')
+        indexes = [
+            models.Index(fields=['company', 'cliente_erp_id']),
+        ]
 
     def get_path(self):
         """Return the full path of this entity as a string."""
@@ -252,6 +262,13 @@ class IntegrationRule(TenantAwareBaseModel):
     ]
 
     name = models.CharField(max_length=100)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     description = models.TextField(blank=True, null=True)
     trigger_event = models.CharField(max_length=50, choices=TRIGGER_CHOICES)
     execution_order = models.PositiveIntegerField(default=0)
@@ -268,9 +285,14 @@ class IntegrationRule(TenantAwareBaseModel):
     last_run_at = models.DateTimeField(blank=True, null=True)
     times_executed = models.PositiveIntegerField(default=0)
 
+    class Meta:
+        indexes = [
+            models.Index(fields=['company', 'cliente_erp_id']),
+        ]
+
     def __str__(self):
         return f"{self.name} ({self.trigger_event} → {self.target_module})"
-    
+
     def apply_filter(self, payload):
         """
         Apply filter_conditions using the formula engine.
@@ -371,6 +393,13 @@ class SubstitutionRule(TenantAwareBaseModel):
     """
     # NOVO: título/descrição legível da regra, usado em relatórios
     title = models.CharField(max_length=255, null=True, blank=True)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     model_name = models.CharField(max_length=255)
     field_name = models.CharField(max_length=255)
 
@@ -401,7 +430,9 @@ class SubstitutionRule(TenantAwareBaseModel):
             'match_value',
             'filter_conditions'
         )
-
+        indexes = [
+            models.Index(fields=['company', 'cliente_erp_id']),
+        ]
 
     def __str__(self):
         if self.model_name and self.field_name:
@@ -566,12 +597,20 @@ class ImportTransformationRule(TenantAwareBaseModel):
         help_text="Order of execution when processing multiple sheets"
     )
     is_active = models.BooleanField(default=True)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     
     class Meta:
         ordering = ['execution_order', 'name']
         indexes = [
             models.Index(fields=['company', 'source_sheet_name']),
             models.Index(fields=['company', 'is_active']),
+            models.Index(fields=['company', 'cliente_erp_id']),
         ]
 
     def __str__(self):

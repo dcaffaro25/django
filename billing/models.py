@@ -6,7 +6,19 @@ from django.utils import timezone
 
 class BusinessPartnerCategory(TenantAwareBaseModel, MPTTModel):
     name = models.CharField(max_length=100)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     parent = TreeForeignKey('self', null=True, blank=True, related_name='children', on_delete=models.CASCADE)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['company', 'cliente_erp_id']),
+        ]
 
     def __str__(self):
         return self.name
@@ -36,6 +48,13 @@ class BusinessPartner(TenantAwareBaseModel):
     PARTNER_TYPES = [('client', 'Client'), ('vendor', 'Vendor'), ('both', 'Both')]
 
     name = models.CharField(max_length=255)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     partner_type = models.CharField(max_length=10, choices=PARTNER_TYPES)
     category = TreeForeignKey(BusinessPartnerCategory, null=True, blank=True, on_delete=models.SET_NULL)
     identifier = models.CharField(max_length=50)  # CPF/CNPJ; unique per company (see Meta)
@@ -57,13 +76,31 @@ class BusinessPartner(TenantAwareBaseModel):
                 name='billing_bp_company_identifier_uniq',
             ),
         ]
+        indexes = [
+            models.Index(fields=['company', 'cliente_erp_id']),
+        ]
 
     def __str__(self):
         return f"{self.name} ({self.partner_type})"
 
 class ProductServiceCategory(TenantAwareBaseModel, MPTTModel):
     name = models.CharField(max_length=100)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     parent = TreeForeignKey('self', null=True, blank=True, related_name='children', on_delete=models.CASCADE)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['company', 'cliente_erp_id']),
+        ]
+
+    class MPTTMeta:
+        order_insertion_by = ['name']
 
     def __str__(self):
         return self.name
@@ -73,6 +110,13 @@ class ProductService(TenantAwareBaseModel):
 
     name = models.CharField(max_length=255)
     code = models.CharField(max_length=100, unique=True)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     category = TreeForeignKey(ProductServiceCategory, null=True, blank=True, on_delete=models.SET_NULL)
     description = models.TextField(blank=True)
     item_type = models.CharField(max_length=10, choices=TYPES)
@@ -134,6 +178,11 @@ class ProductService(TenantAwareBaseModel):
         help_text="Discount given on sales account.",
     )
 
+    class Meta:
+        indexes = [
+            models.Index(fields=['company', 'cliente_erp_id']),
+        ]
+
     def __str__(self):
         return f"{self.name} ({self.item_type})"
 
@@ -141,6 +190,13 @@ class Contract(models.Model):
     company = models.ForeignKey('multitenancy.Company', on_delete=models.CASCADE)
     partner = models.ForeignKey('BusinessPartner', on_delete=models.CASCADE)
     contract_number = models.CharField(max_length=50, unique=True)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     start_date = models.DateField(default=timezone.now)
     end_date = models.DateField(null=True, blank=True)
 
@@ -172,6 +228,11 @@ class Contract(models.Model):
     description = models.TextField(blank=True)
     is_active = models.BooleanField(default=True)
 
+    class Meta:
+        indexes = [
+            models.Index(fields=['company', 'cliente_erp_id']),
+        ]
+
     def __str__(self):
         return f"Contract {self.contract_number} with {self.partner.name}"
     
@@ -186,6 +247,13 @@ class Invoice(TenantAwareBaseModel):
     ]
 
     partner = models.ForeignKey(BusinessPartner, on_delete=models.CASCADE)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     invoice_type = models.CharField(max_length=10, choices=INVOICE_TYPES)
     invoice_number = models.CharField(max_length=50)
     invoice_date = models.DateField()
@@ -199,6 +267,11 @@ class Invoice(TenantAwareBaseModel):
     recurrence_start_date = models.DateField(null=True, blank=True)
     recurrence_end_date = models.DateField(null=True, blank=True)
     description = models.TextField(blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['company', 'cliente_erp_id']),
+        ]
     
     def __str__(self):
         return f"Invoice {self.invoice_number} - {self.partner.name}"
@@ -211,11 +284,23 @@ class Invoice(TenantAwareBaseModel):
 class InvoiceLine(TenantAwareBaseModel):
     invoice = models.ForeignKey(Invoice, related_name='lines', on_delete=models.CASCADE)
     product_service = models.ForeignKey(ProductService, on_delete=models.CASCADE)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     description = models.CharField(max_length=255, blank=True)
     quantity = models.DecimalField(max_digits=12, decimal_places=2, default=1)
     unit_price = models.DecimalField(max_digits=12, decimal_places=2)
     total_price = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     tax_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['company', 'cliente_erp_id']),
+        ]
 
     def save(self, *args, **kwargs):
         self.total_price = self.quantity * self.unit_price

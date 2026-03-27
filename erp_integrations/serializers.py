@@ -114,6 +114,7 @@ class ERPSyncJobSerializer(serializers.ModelSerializer):
             "is_active",
             "schedule_rrule",
             "extra_params",
+            "fetch_config",
             "last_synced_at",
             "last_sync_status",
             "last_sync_record_count",

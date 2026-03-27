@@ -15,6 +15,13 @@ class Position(TenantAwareBaseModel):
     Represents the position of an employee (e.g. Developer, Manager).
     """
     title = models.CharField(max_length=100, unique=True)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     description = models.TextField(null=True, blank=True)
     department = models.CharField(max_length=100, null=True, blank=True)
     hierarchy_level = models.PositiveIntegerField(null=True, blank=True)
@@ -25,6 +32,11 @@ class Position(TenantAwareBaseModel):
         if self.min_salary and self.max_salary and self.min_salary > self.max_salary:
             raise ValidationError("Minimum salary cannot exceed maximum salary.")
 
+    class Meta:
+        indexes = [
+            models.Index(fields=['company', 'cliente_erp_id']),
+        ]
+
     def __str__(self):
         return f"{self.title}"
 
@@ -33,6 +45,13 @@ class Employee(TenantAwareBaseModel):
     Basic employee model.
     """
     CPF = models.CharField(max_length=14, unique=True)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     name = models.CharField(max_length=255)
     position = models.ForeignKey(Position, on_delete=models.SET_NULL, null=True, related_name='employees')
     hire_date = models.DateField()
@@ -59,6 +78,11 @@ class Employee(TenantAwareBaseModel):
         # Example: up to 30 days per year, proportionally
         return min((worked_days / 365) * 30, 30)
 
+    class Meta:
+        indexes = [
+            models.Index(fields=['company', 'cliente_erp_id']),
+        ]
+
     def __str__(self):
         return f"{self.name}"
 
@@ -76,6 +100,13 @@ class TimeTracking(TenantAwareBaseModel):
     ]
 
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='attendance_records')
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     month_date = models.DateField(help_text="First day of that month.")
     
     total_hours_worked = models.DecimalField(max_digits=7, decimal_places=2, default=0)
@@ -101,6 +132,9 @@ class TimeTracking(TenantAwareBaseModel):
         unique_together = ('employee', 'month_date')
         verbose_name = 'Employee Attendance'
         verbose_name_plural = 'Employee Attendances'
+        indexes = [
+            models.Index(fields=['company', 'cliente_erp_id']),
+        ]
 
     def clean(self):
         if (self.total_hours_worked < 0 or
@@ -155,9 +189,21 @@ class KPI(TenantAwareBaseModel):
     Stores KPI name & value for an employee.
     """
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     name = models.CharField(max_length=255)
     month_date = models.DateField(help_text="First day of that month.")
     value = models.DecimalField(max_digits=10, decimal_places=2)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['company', 'cliente_erp_id']),
+        ]
 
     def __str__(self):
         return f"{self.employee.name} - {self.month_date:%b %Y} - {self.name}"
@@ -167,8 +213,20 @@ class Bonus(TenantAwareBaseModel):
     Bonus calculation is formula-based, referencing KPI values.
     """
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     calculation_formula = models.TextField(null=True, blank=True)  # e.g. "0.1 * KPI_Performance + 0.05 * KPI_Attendance"
     value = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['company', 'cliente_erp_id']),
+        ]
 
     def calculate_bonus(self):
         from hr.models import KPI
@@ -207,6 +265,13 @@ class RecurringAdjustment(TenantAwareBaseModel):
     name = models.CharField(max_length=255)
     type = models.CharField(max_length=10, choices=TYPE_CHOICES)
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='recurring_adjustments')
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     start_date = models.DateField()
     end_date = models.DateField(null=True, blank=True)
     base_for_inss = models.BooleanField(default=False)
@@ -226,6 +291,11 @@ class RecurringAdjustment(TenantAwareBaseModel):
 
     # If relevant accounts need to be linked
     default_account = models.ManyToManyField('accounting.Account', blank=True, default=None)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['company', 'cliente_erp_id']),
+        ]
 
     def is_active(self):
         today_date = now().date()

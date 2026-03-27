@@ -125,6 +125,13 @@ def get_occurrences_between(rrule_str: str, dtstart: datetime, start: datetime, 
     return list(rule.between(start, end, inc=True))
 
 class FinancialIndex(BaseModel):
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     INDEX_TYPES = [
         ('inflation', 'Inflation Index'),
         ('currency', 'Currency Exchange Rate'),
@@ -164,11 +171,23 @@ class FinancialIndex(BaseModel):
         help_text="Defines how this index is quoted (e.g., rate or value)"
     )
     is_forecastable = models.BooleanField(default=False)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['cliente_erp_id']),
+        ]
     
     def __str__(self):
         return f"{self.name} ({self.code})"
 
 class IndexQuote(BaseModel):
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     index = models.ForeignKey(FinancialIndex, on_delete=models.CASCADE, related_name='quotes')
     date = models.DateField()
     value = models.DecimalField(max_digits=20, decimal_places=8)  # Adjust decimal places as necessary
@@ -178,12 +197,20 @@ class IndexQuote(BaseModel):
         ordering = ['index', 'date']
         indexes = [
             models.Index(fields=['index', 'date']),
+            models.Index(fields=['cliente_erp_id']),
         ]
 
     def __str__(self):
         return f"{self.index.code} @ {self.date}: {self.value}"
     
 class FinancialIndexQuoteForecast(models.Model):
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     index = models.ForeignKey(FinancialIndex, on_delete=models.CASCADE, related_name='forecast_quotes')
     date = models.DateField()
     estimated_value = models.DecimalField(max_digits=10, decimal_places=6)
@@ -193,6 +220,9 @@ class FinancialIndexQuoteForecast(models.Model):
         unique_together = ('index', 'date')
         ordering = ['index', 'date']
         verbose_name = 'Financial Index Quote Forecast'
+        indexes = [
+            models.Index(fields=['cliente_erp_id']),
+        ]
 
     def __str__(self):
         return f"{self.index.code} (forecast) @ {self.date}: {self.estimated_value}"

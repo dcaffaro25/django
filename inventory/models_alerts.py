@@ -32,6 +32,13 @@ class InventoryAlert(TenantAwareBaseModel):
     ]
 
     alert_type = models.CharField(max_length=30, choices=ALERT_TYPES)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     severity = models.CharField(max_length=20, choices=SEVERITY_CHOICES, default="warning")
     product = models.ForeignKey(
         "billing.ProductService",
@@ -85,6 +92,7 @@ class InventoryAlert(TenantAwareBaseModel):
         indexes = [
             models.Index(fields=["alert_type"]),
             models.Index(fields=["status"]),
+            models.Index(fields=["company", "cliente_erp_id"]),
         ]
         ordering = ["-created_at"]
 

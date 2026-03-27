@@ -73,7 +73,16 @@ router.register(r'balance-history', BalanceHistoryViewSet, basename="balance-his
 
 urlpatterns = [
     # IMPORTANT: no extra 'api/' here because the project urls already mount this file at /<tenant>/api/
-    re_path(r'api/', include(router.urls)),
+    # Merge accounting + ERP routers so /{tenant}/api/sync-jobs/ resolves (first tenant include wins globally).
+    re_path(
+        r"^api/",
+        include(
+            [
+                path("", include(router.urls)),
+                path("", include("erp_integrations.api_urls")),
+            ]
+        ),
+    ),
 
     # Custom routes  use re_path for optional trailing slash
     re_path(r'^transactions/(?P<pk>\d+)/post/?$',  TransactionViewSet.as_view({'post': 'post'}), name='transaction-post'),

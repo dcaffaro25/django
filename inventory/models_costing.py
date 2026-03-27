@@ -94,6 +94,13 @@ class TenantCostingConfig(TenantAwareBaseModel):
         default=0,
         help_text="0 = month-end.",
     )
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
 
     class Meta:
         verbose_name = "Tenant Costing Config"
@@ -103,6 +110,9 @@ class TenantCostingConfig(TenantAwareBaseModel):
                 fields=["company"],
                 name="inventory_tenantcostingconfig_company_uniq",
             ),
+        ]
+        indexes = [
+            models.Index(fields=["company", "cliente_erp_id"]),
         ]
 
     def __str__(self):
@@ -137,6 +147,13 @@ class InventoryValuationSnapshot(TenantAwareBaseModel):
         blank=True,
     )
     metadata = models.JSONField(default=dict, blank=True)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
 
     class Meta:
         verbose_name = "Inventory Valuation Snapshot"
@@ -149,6 +166,7 @@ class InventoryValuationSnapshot(TenantAwareBaseModel):
         ]
         indexes = [
             models.Index(fields=["strategy", "as_of_date"]),
+            models.Index(fields=["company", "cliente_erp_id"]),
         ]
         ordering = ["-as_of_date", "product"]
 
@@ -181,6 +199,13 @@ class CogsAllocation(TenantAwareBaseModel):
         help_text='[{"layer_id": 1, "qty_consumed": 5, "unit_cost": 10.00}, ...]',
     )
     metadata = models.JSONField(default=dict, blank=True)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
 
     class Meta:
         verbose_name = "COGS Allocation"
@@ -193,6 +218,7 @@ class CogsAllocation(TenantAwareBaseModel):
         ]
         indexes = [
             models.Index(fields=["strategy", "outbound_movement"]),
+            models.Index(fields=["company", "cliente_erp_id"]),
         ]
 
     def __str__(self):
@@ -234,6 +260,13 @@ class AccountingImpact(TenantAwareBaseModel):
     total_debit = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     total_credit = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     metadata = models.JSONField(default=dict, blank=True)
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
 
     class Meta:
         verbose_name = "Accounting Impact"
@@ -252,6 +285,7 @@ class AccountingImpact(TenantAwareBaseModel):
         ]
         indexes = [
             models.Index(fields=["strategy", "posting_type"]),
+            models.Index(fields=["company", "cliente_erp_id"]),
         ]
 
     def __str__(self):

@@ -127,6 +127,13 @@ class ErpApiEtlMapping(TenantAwareBaseModel):
     """
 
     name = models.CharField(max_length=100, help_text="e.g. Omie Produtos")
+    cliente_erp_id = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    )
     description = models.TextField(blank=True, null=True)
 
     # Source: which key in the API response holds the list of items
@@ -201,6 +208,7 @@ class ErpApiEtlMapping(TenantAwareBaseModel):
         indexes = [
             models.Index(fields=["company", "response_list_key"]),
             models.Index(fields=["company", "is_active"]),
+            models.Index(fields=["company", "cliente_erp_id"]),
         ]
 
     def __str__(self):
@@ -233,6 +241,11 @@ class ERPSyncJob(TenantAwareBaseModel):
         blank=True,
         help_text="Override params for this job (e.g. pagina, registros_por_pagina)",
     )
+    fetch_config = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Static/variable fetch rules: mode, static_params, date_dimension, bounds, cursor. See erp_integrations.services.fetch_config.",
+    )
     last_synced_at = models.DateTimeField(null=True, blank=True)
     last_sync_status = models.CharField(
         max_length=20,
@@ -253,6 +266,16 @@ class ERPSyncJob(TenantAwareBaseModel):
 
     def __str__(self):
         return f"{self.name} ({self.api_definition.call})"
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+
+        from erp_integrations.services.fetch_config import validate_fetch_config
+
+        super().clean()
+        errs = validate_fetch_config(self.fetch_config or {})
+        if errs:
+            raise ValidationError({"fetch_config": errs})
 
 
 class ERPSyncRun(TenantAwareBaseModel):

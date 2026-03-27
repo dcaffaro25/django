@@ -34,7 +34,7 @@ urlpatterns = [
     re_path(r'^(?P<tenant_id>[^/]+)/', include('inventory.urls')),
     re_path(r'^(?P<tenant_id>[^/]+)/', include('ML.urls')),
     re_path(r'^(?P<tenant_id>[^/]+)/', include('knowledge_base.urls')),
-    re_path(r'^(?P<tenant_id>[^/]+)/', include('erp_integrations.urls')),
+    # ERP API routes are merged under accounting/urls.py (api/) so they resolve; a standalone include here never runs.
     #path('api/', include('accounting.urls')),
     path(r'^api/token/?$', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     path(r'^api/token/refresh/?$', TokenRefreshView.as_view(), name='token_refresh'),
