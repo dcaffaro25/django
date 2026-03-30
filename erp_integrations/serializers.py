@@ -76,6 +76,7 @@ class ERPAPIDefinitionSerializer(serializers.ModelSerializer):
             "method",
             "param_schema",
             "payload",
+            "unique_id_config",
             "description",
             "is_active",
         ]
@@ -142,6 +143,8 @@ class ERPSyncRunSerializer(serializers.ModelSerializer):
             "total_pages",
             "records_extracted",
             "records_stored",
+            "records_skipped",
+            "records_updated",
             "errors",
             "diagnostics",
             "started_at",
@@ -166,5 +169,7 @@ class ERPRawRecordSerializer(serializers.ModelSerializer):
             "page_response_header",
             "data",
             "record_hash",
+            "external_id",
+            "is_duplicate",
             "fetched_at",
         ]

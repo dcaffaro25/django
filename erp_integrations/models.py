@@ -94,10 +94,23 @@ class ERPAPIDefinition(BaseModel):
         default=None,
         help_text="Transform config spec: records extraction, explode rules, derived dates. See docs.",
     )
+    unique_id_config = models.JSONField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=(
+            "How to derive a stable id per item for dedup within this api_call: "
+            "mode single_path with path, or mode composite with paths + optional separator; "
+            "on_duplicate: update | flag | add."
+        ),
+    )
 
     def clean(self):
         from django.core.exceptions import ValidationError
-        from .services.transform_engine import validate_transform_config
+        from .services.transform_engine import (
+            validate_transform_config,
+            validate_unique_id_config,
+        )
 
         super().clean()
         if self.transform_config:
@@ -106,6 +119,14 @@ class ERPAPIDefinition(BaseModel):
                 raise ValidationError(
                     {
                         "transform_config": [f"{e.get('field', 'config')}: {e.get('message', '')}" for e in errors]
+                    }
+                )
+        if self.unique_id_config:
+            errors = validate_unique_id_config(self.unique_id_config)
+            if errors:
+                raise ValidationError(
+                    {
+                        "unique_id_config": [f"{e.get('field', 'config')}: {e.get('message', '')}" for e in errors]
                     }
                 )
 
@@ -300,6 +321,14 @@ class ERPSyncRun(TenantAwareBaseModel):
     total_pages = models.IntegerField(null=True, blank=True)
     records_extracted = models.IntegerField(default=0)
     records_stored = models.IntegerField(default=0)
+    records_skipped = models.IntegerField(
+        default=0,
+        help_text="Items skipped on sync (unchanged hash when on_duplicate=update).",
+    )
+    records_updated = models.IntegerField(
+        default=0,
+        help_text="Existing raw rows updated when on_duplicate=update.",
+    )
     errors = models.JSONField(default=list)
     diagnostics = models.JSONField(
         default=dict,
@@ -360,6 +389,17 @@ class ERPRawRecord(models.Model):
     # Record data
     data = models.JSONField()
     record_hash = models.CharField(max_length=64, db_index=True)
+    external_id = models.CharField(
+        max_length=512,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Stable id extracted from item (single path or composite); scoped with api_call for lookups.",
+    )
+    is_duplicate = models.BooleanField(
+        default=False,
+        help_text="True when created with on_duplicate=flag and same external_id already existed.",
+    )
     fetched_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -368,6 +408,7 @@ class ERPRawRecord(models.Model):
             models.Index(fields=["sync_run", "page_number", "record_index"]),
             models.Index(fields=["sync_run", "global_index"]),
             models.Index(fields=["record_hash"]),
+            models.Index(fields=["company", "api_call", "external_id"]),
         ]
 
     def __str__(self):

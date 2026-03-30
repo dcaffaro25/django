@@ -71,6 +71,106 @@ def get_by_dot_path(obj: Any, path: str) -> Any:
     return current
 
 
+VALID_ON_DUPLICATE = frozenset({"update", "flag", "add"})
+
+
+def extract_external_id(
+    record: Dict[str, Any],
+    unique_id_config: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """
+    Build a string id from an API item using ERPAPIDefinition.unique_id_config.
+    Reuses get_by_dot_path for each path segment.
+    """
+    if not unique_id_config or not isinstance(unique_id_config, dict):
+        return None
+    mode = unique_id_config.get("mode")
+    if mode == "single_path":
+        path = unique_id_config.get("path")
+        if not path or not isinstance(path, str):
+            return None
+        val = get_by_dot_path(record, path.strip())
+        if val is None:
+            return None
+        return str(val).strip() or None
+    if mode == "composite":
+        paths = unique_id_config.get("paths") or []
+        if not isinstance(paths, list):
+            return None
+        sep = unique_id_config.get("separator")
+        if sep is None:
+            sep = "|"
+        if not isinstance(sep, str):
+            sep = "|"
+        parts: List[str] = []
+        for p in paths:
+            if not p or not isinstance(p, str):
+                continue
+            val = get_by_dot_path(record, p.strip())
+            parts.append(str(val) if val is not None else "")
+        if not parts:
+            return None
+        out = sep.join(parts).strip()
+        return out or None
+    return None
+
+
+def validate_unique_id_config(config: Any) -> List[Dict[str, str]]:
+    """
+    Validate unique_id_config on ERPAPIDefinition.
+    Returns list of {"field": str, "message": str} for each error.
+    """
+    errors: List[Dict[str, str]] = []
+
+    if config is None:
+        return errors
+    if not isinstance(config, dict):
+        errors.append({"field": "unique_id_config", "message": "Config must be a JSON object or null."})
+        return errors
+
+    mode = config.get("mode")
+    if mode not in ("single_path", "composite"):
+        errors.append(
+            {
+                "field": "mode",
+                "message": "mode must be 'single_path' or 'composite'.",
+            }
+        )
+        return errors
+
+    on_dup = config.get("on_duplicate", "update")
+    if on_dup not in VALID_ON_DUPLICATE:
+        errors.append(
+            {
+                "field": "on_duplicate",
+                "message": f"on_duplicate must be one of: {', '.join(sorted(VALID_ON_DUPLICATE))}.",
+            }
+        )
+
+    if mode == "single_path":
+        path = config.get("path")
+        if not path or not isinstance(path, str) or not str(path).strip():
+            errors.append({"field": "path", "message": "path is required and must be a non-empty string for single_path."})
+    else:
+        paths = config.get("paths")
+        if paths is None or not isinstance(paths, list):
+            errors.append({"field": "paths", "message": "paths must be a non-empty array for composite."})
+        elif not paths:
+            errors.append({"field": "paths", "message": "paths must contain at least one path string for composite."})
+        else:
+            for i, p in enumerate(paths):
+                if not p or not isinstance(p, str) or not str(p).strip():
+                    errors.append(
+                        {"field": f"paths[{i}]", "message": "Each path must be a non-empty string."},
+                    )
+
+    sep = config.get("separator")
+    if sep is not None and not isinstance(sep, str):
+        errors.append({"field": "separator", "message": "separator must be a string if set."})
+
+    return errors
+
+
 def _is_record_array(val: Any) -> bool:
     """Return True if val is a non-empty list of dicts."""
     if not isinstance(val, list):

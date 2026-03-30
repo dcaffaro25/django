@@ -40,6 +40,18 @@ class ERPAPIDefinitionAdmin(admin.ModelAdmin):
     list_display = ("call", "provider", "url", "method", "description", "is_active")
     list_filter = ("provider", "is_active")
     search_fields = ("call", "description", "url")
+    fieldsets = (
+        (None, {"fields": ("provider", "call", "url", "method", "description", "is_active")}),
+        ("Schema & transform", {"fields": ("param_schema", "transform_config", "unique_id_config")}),
+        (
+            "Audit",
+            {
+                "fields": ("created_by", "updated_by", "created_at", "updated_at", "is_deleted", "notes"),
+                "classes": ("collapse",),
+            },
+        ),
+    )
+    readonly_fields = ("created_at", "updated_at")
 
 
 @admin.register(ErpApiEtlMapping)
@@ -83,7 +95,16 @@ class ERPSyncJobAdmin(admin.ModelAdmin):
 
 @admin.register(ERPSyncRun)
 class ERPSyncRunAdmin(admin.ModelAdmin):
-    list_display = ("id", "job", "status", "pages_fetched", "records_stored", "started_at")
+    list_display = (
+        "id",
+        "job",
+        "status",
+        "pages_fetched",
+        "records_stored",
+        "records_skipped",
+        "records_updated",
+        "started_at",
+    )
     list_filter = ("status",)
     readonly_fields = ("started_at", "completed_at", "duration_seconds", "diagnostics")
     raw_id_fields = ("job", "company")
@@ -91,7 +112,17 @@ class ERPSyncRunAdmin(admin.ModelAdmin):
 
 @admin.register(ERPRawRecord)
 class ERPRawRecordAdmin(admin.ModelAdmin):
-    list_display = ("id", "sync_run", "api_call", "page_number", "record_index", "global_index", "fetched_at")
-    list_filter = ("api_call",)
-    search_fields = ("record_hash",)
+    list_display = (
+        "id",
+        "sync_run",
+        "api_call",
+        "external_id",
+        "is_duplicate",
+        "page_number",
+        "record_index",
+        "global_index",
+        "fetched_at",
+    )
+    list_filter = ("api_call", "is_duplicate")
+    search_fields = ("record_hash", "external_id")
     raw_id_fields = ("sync_run", "company")

@@ -10,6 +10,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from django.utils import timezone as dj_tz
 
 from erp_integrations.models import ERPRawRecord, ERPSyncJob, ERPSyncRun
 from erp_integrations.services.fetch_config import (
@@ -22,6 +23,7 @@ from erp_integrations.services.payload_builder import build_payload
 from erp_integrations.services.transform_engine import (
     DEFAULT_TRANSFORM_CONFIG,
     RecordExtractionError,
+    extract_external_id,
     pick_items_array,
 )
 
@@ -130,6 +132,23 @@ def _record_hash(data: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _latest_raw_record_same_external(
+    company_id: int,
+    api_call: str,
+    external_id: str,
+) -> Optional[ERPRawRecord]:
+    """Most recent raw row for same company, api_call, and external_id."""
+    return (
+        ERPRawRecord.objects.filter(
+            company_id=company_id,
+            api_call=api_call,
+            external_id=external_id,
+        )
+        .order_by("-fetched_at", "-id")
+        .first()
+    )
+
+
 def execute_sync(job_id: int, dry_run: bool = False) -> Dict[str, Any]:
     """
     Execute an ERPSyncJob: fetch pages from Omie API, extract records, store as ERPRawRecord.
@@ -143,6 +162,7 @@ def execute_sync(job_id: int, dry_run: bool = False) -> Dict[str, Any]:
     connection = job.connection
     api_def = job.api_definition
     company_id = connection.company_id
+    uid_cfg = api_def.unique_id_config if isinstance(api_def.unique_id_config, dict) else None
 
     config = dict(api_def.transform_config or {})
     config = {**DEFAULT_TRANSFORM_CONFIG, **config}
@@ -164,6 +184,8 @@ def execute_sync(job_id: int, dry_run: bool = False) -> Dict[str, Any]:
 
     total_extracted = 0
     total_stored = 0
+    total_skipped = 0
+    total_updated = 0
     global_index = 0
     errors: List[str] = []
     pages_fetched = 0
@@ -181,6 +203,8 @@ def execute_sync(job_id: int, dry_run: bool = False) -> Dict[str, Any]:
                 diagnostics=diagnostics,
                 records_extracted=0,
                 records_stored=0,
+                records_skipped=0,
+                records_updated=0,
                 pages_fetched=0,
             )
             diagnostics["message"] = "No segments to fetch (check bounds and cursor)."
@@ -190,7 +214,6 @@ def execute_sync(job_id: int, dry_run: bool = False) -> Dict[str, Any]:
             job.last_sync_status = "completed"
             job.last_sync_record_count = 0
             job.save(update_fields=["last_synced_at", "last_sync_status", "last_sync_record_count"])
-            from django.utils import timezone as dj_tz
 
             run.completed_at = dj_tz.now()
             if run.started_at:
@@ -203,6 +226,8 @@ def execute_sync(job_id: int, dry_run: bool = False) -> Dict[str, Any]:
                 "pages_fetched": 0,
                 "records_extracted": 0,
                 "records_stored": 0,
+                "records_skipped": 0,
+                "records_updated": 0,
                 "dry_run": dry_run,
                 "diagnostics": diagnostics,
                 "errors": [],
@@ -282,22 +307,144 @@ def execute_sync(job_id: int, dry_run: bool = False) -> Dict[str, Any]:
                 if not dry_run:
                     for i, rec in enumerate(records):
                         h = _record_hash(rec)
-                        ERPRawRecord.objects.create(
-                            company_id=company_id,
-                            sync_run=run,
-                            api_call=api_def.call,
-                            page_number=pnum,
-                            record_index=i,
-                            global_index=global_index,
-                            page_records_count=page_records_count,
-                            total_pages=total_pages,
-                            total_records=total_records,
-                            page_response_header=header,
-                            data=rec,
-                            record_hash=h,
-                        )
-                        total_stored += 1
-                        global_index += 1
+                        ext_id = extract_external_id(rec, uid_cfg) if uid_cfg else None
+
+                        if not uid_cfg:
+                            ERPRawRecord.objects.create(
+                                company_id=company_id,
+                                sync_run=run,
+                                api_call=api_def.call,
+                                page_number=pnum,
+                                record_index=i,
+                                global_index=global_index,
+                                page_records_count=page_records_count,
+                                total_pages=total_pages,
+                                total_records=total_records,
+                                page_response_header=header,
+                                data=rec,
+                                record_hash=h,
+                            )
+                            total_stored += 1
+                            global_index += 1
+                            continue
+
+                        if not ext_id:
+                            ERPRawRecord.objects.create(
+                                company_id=company_id,
+                                sync_run=run,
+                                api_call=api_def.call,
+                                page_number=pnum,
+                                record_index=i,
+                                global_index=global_index,
+                                page_records_count=page_records_count,
+                                total_pages=total_pages,
+                                total_records=total_records,
+                                page_response_header=header,
+                                data=rec,
+                                record_hash=h,
+                                external_id=None,
+                                is_duplicate=False,
+                            )
+                            total_stored += 1
+                            global_index += 1
+                            continue
+
+                        on_dup = uid_cfg.get("on_duplicate") or "update"
+                        if on_dup == "add":
+                            ERPRawRecord.objects.create(
+                                company_id=company_id,
+                                sync_run=run,
+                                api_call=api_def.call,
+                                page_number=pnum,
+                                record_index=i,
+                                global_index=global_index,
+                                page_records_count=page_records_count,
+                                total_pages=total_pages,
+                                total_records=total_records,
+                                page_response_header=header,
+                                data=rec,
+                                record_hash=h,
+                                external_id=ext_id,
+                                is_duplicate=False,
+                            )
+                            total_stored += 1
+                            global_index += 1
+                        elif on_dup == "flag":
+                            existing_flag = _latest_raw_record_same_external(
+                                company_id, api_def.call, ext_id
+                            )
+                            ERPRawRecord.objects.create(
+                                company_id=company_id,
+                                sync_run=run,
+                                api_call=api_def.call,
+                                page_number=pnum,
+                                record_index=i,
+                                global_index=global_index,
+                                page_records_count=page_records_count,
+                                total_pages=total_pages,
+                                total_records=total_records,
+                                page_response_header=header,
+                                data=rec,
+                                record_hash=h,
+                                external_id=ext_id,
+                                is_duplicate=existing_flag is not None,
+                            )
+                            total_stored += 1
+                            global_index += 1
+                        else:
+                            # on_duplicate == "update"
+                            existing_up = _latest_raw_record_same_external(
+                                company_id, api_def.call, ext_id
+                            )
+                            if existing_up is None:
+                                ERPRawRecord.objects.create(
+                                    company_id=company_id,
+                                    sync_run=run,
+                                    api_call=api_def.call,
+                                    page_number=pnum,
+                                    record_index=i,
+                                    global_index=global_index,
+                                    page_records_count=page_records_count,
+                                    total_pages=total_pages,
+                                    total_records=total_records,
+                                    page_response_header=header,
+                                    data=rec,
+                                    record_hash=h,
+                                    external_id=ext_id,
+                                    is_duplicate=False,
+                                )
+                                total_stored += 1
+                                global_index += 1
+                            elif existing_up.record_hash == h:
+                                total_skipped += 1
+                            else:
+                                existing_up.data = rec
+                                existing_up.record_hash = h
+                                existing_up.sync_run = run
+                                existing_up.page_number = pnum
+                                existing_up.record_index = i
+                                existing_up.page_records_count = page_records_count
+                                existing_up.total_pages = total_pages
+                                existing_up.total_records = total_records
+                                existing_up.page_response_header = header
+                                existing_up.is_duplicate = False
+                                existing_up.fetched_at = dj_tz.now()
+                                existing_up.save(
+                                    update_fields=[
+                                        "data",
+                                        "record_hash",
+                                        "sync_run",
+                                        "page_number",
+                                        "record_index",
+                                        "page_records_count",
+                                        "total_pages",
+                                        "total_records",
+                                        "page_response_header",
+                                        "is_duplicate",
+                                        "fetched_at",
+                                    ]
+                                )
+                                total_updated += 1
 
                 seg_diag["pages"].append({"page": pnum, "records": len(records)})
                 diagnostics["pages"].append({"segment": seg.label, "page": pnum, "records": len(records)})
@@ -316,16 +463,12 @@ def execute_sync(job_id: int, dry_run: bool = False) -> Dict[str, Any]:
                 break
 
         run.status = "completed"
-        run.pages_fetched = pages_fetched
-        run.total_pages = total_pages_seen
-        run.records_extracted = total_extracted
-        run.records_stored = total_stored
         run.diagnostics = diagnostics
         run.errors = errors
 
         job.last_synced_at = run.started_at
         job.last_sync_status = "completed"
-        job.last_sync_record_count = total_stored
+        job.last_sync_record_count = total_stored + total_updated
         update_fields = ["last_synced_at", "last_sync_status", "last_sync_record_count"]
 
         if (
@@ -358,9 +501,13 @@ def execute_sync(job_id: int, dry_run: bool = False) -> Dict[str, Any]:
         job.last_sync_status = "failed"
         job.save(update_fields=["last_sync_status"])
 
-    from django.utils import timezone as dj_tz
-
     if run is not None:
+        run.pages_fetched = pages_fetched
+        run.total_pages = total_pages_seen
+        run.records_extracted = total_extracted
+        run.records_stored = total_stored
+        run.records_skipped = total_skipped
+        run.records_updated = total_updated
         run.completed_at = dj_tz.now()
         if run.started_at:
             run.duration_seconds = (run.completed_at - run.started_at).total_seconds()
@@ -371,6 +518,8 @@ def execute_sync(job_id: int, dry_run: bool = False) -> Dict[str, Any]:
                 "total_pages",
                 "records_extracted",
                 "records_stored",
+                "records_skipped",
+                "records_updated",
                 "errors",
                 "diagnostics",
                 "completed_at",
@@ -385,6 +534,8 @@ def execute_sync(job_id: int, dry_run: bool = False) -> Dict[str, Any]:
         "pages_fetched": pages_fetched,
         "records_extracted": total_extracted,
         "records_stored": total_stored,
+        "records_skipped": total_skipped,
+        "records_updated": total_updated,
         "dry_run": dry_run,
         "diagnostics": diagnostics,
         "errors": errors,
