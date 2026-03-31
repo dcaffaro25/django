@@ -2,6 +2,7 @@ from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from django.db.models import Q
 
 from multitenancy.mixins import ScopedQuerysetMixin
 
@@ -18,6 +19,7 @@ from .serializers import (
     ErpEtlImportRequestSerializer,
 )
 from .services.payload_builder import build_payload_by_ids
+from .services.transform_engine import extract_external_id
 
 
 class ERPConnectionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
@@ -200,3 +202,85 @@ class ERPRawRecordViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
         if sync_run:
             qs = qs.filter(sync_run_id=sync_run)
         return qs
+
+    @action(detail=False, methods=["post"], url_path="backfill-external-id")
+    def backfill_external_id(self, request, tenant_id=None):
+        """
+        Backfill external_id for raw records where external_id is null/blank,
+        using each record's ERPAPIDefinition.unique_id_config.
+
+        Optional body:
+        - api_call: str (limit backfill to one call)
+        - limit: int (max rows to process in this request, default 1000)
+        """
+        tenant = getattr(request, "tenant", None)
+        company_id = getattr(tenant, "id", None) if tenant and tenant != "all" else None
+        if not company_id and (not request.user or not request.user.is_superuser):
+            return Response(
+                {"detail": "Tenant (company) required to backfill ERP raw records."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        api_call = request.data.get("api_call")
+        try:
+            limit = int(request.data.get("limit", 1000))
+        except (TypeError, ValueError):
+            return Response({"detail": "limit must be an integer."}, status=status.HTTP_400_BAD_REQUEST)
+        if limit < 1 or limit > 50000:
+            return Response(
+                {"detail": "limit must be between 1 and 50000."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        qs = (
+            ERPRawRecord.objects.select_related("sync_run__job__api_definition")
+            .filter(Q(external_id__isnull=True) | Q(external_id=""))
+            .order_by("id")
+        )
+        if company_id:
+            qs = qs.filter(company_id=company_id)
+        if api_call:
+            qs = qs.filter(api_call=api_call)
+
+        updated = 0
+        processed = 0
+        skipped_no_definition = 0
+        skipped_no_unique_id_config = 0
+        skipped_no_value = 0
+
+        for raw in qs[:limit]:
+            processed += 1
+            sync_run = getattr(raw, "sync_run", None)
+            job = getattr(sync_run, "job", None) if sync_run else None
+            api_def = getattr(job, "api_definition", None) if job else None
+            if api_def is None:
+                skipped_no_definition += 1
+                continue
+
+            uid_cfg = api_def.unique_id_config if isinstance(api_def.unique_id_config, dict) else None
+            if not uid_cfg:
+                skipped_no_unique_id_config += 1
+                continue
+
+            rec_data = raw.data if isinstance(raw.data, dict) else {}
+            external_id = extract_external_id(rec_data, uid_cfg)
+            if not external_id:
+                skipped_no_value += 1
+                continue
+
+            raw.external_id = external_id
+            raw.save(update_fields=["external_id"])
+            updated += 1
+
+        return Response(
+            {
+                "processed": processed,
+                "updated": updated,
+                "skipped_no_definition": skipped_no_definition,
+                "skipped_no_unique_id_config": skipped_no_unique_id_config,
+                "skipped_no_value": skipped_no_value,
+                "api_call": api_call,
+                "limit": limit,
+            },
+            status=status.HTTP_200_OK,
+        )
