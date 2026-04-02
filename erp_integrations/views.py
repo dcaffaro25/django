@@ -1,12 +1,18 @@
+from django.core.exceptions import ValidationError as DjangoValidationError
+
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError as DRFValidationError
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.db.models import Q
+from django_filters.rest_framework import DjangoFilterBackend
 
 from multitenancy.mixins import ScopedQuerysetMixin
 
 from .erp_etl import execute_erp_etl_import
+from .filters import ERPRawRecordFilter, apply_json_field_filters
 from .models import ERPAPIDefinition, ERPConnection, ERPRawRecord, ERPSyncJob, ERPSyncRun
 from .serializers import (
     BuildPayloadRequestSerializer,
@@ -20,6 +26,12 @@ from .serializers import (
 )
 from .services.payload_builder import build_payload_by_ids
 from .services.transform_engine import extract_external_id
+
+
+class ERPRawRecordDataPagination(PageNumberPagination):
+    page_size = 50
+    page_size_query_param = "page_size"
+    max_page_size = 200
 
 
 class ERPConnectionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
@@ -185,23 +197,66 @@ class ERPSyncRunViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
 
 
 class ERPRawRecordViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
-    """Read-only paginated list of raw records. Filter by api_call, sync_run, etc."""
+    """Read-only list/detail of raw records. Use django-filter + JSON path filters (data__, page_response_header__)."""
 
     queryset = ERPRawRecord.objects.select_related("sync_run").order_by("-fetched_at")
     serializer_class = ERPRawRecordSerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_class = ERPRawRecordFilter
 
     def get_queryset(self):
         qs = super().get_queryset()
         tenant = getattr(self.request, "tenant", None)
         if tenant and tenant != "all" and hasattr(tenant, "id"):
             qs = qs.filter(company=tenant)
-        api_call = self.request.query_params.get("api_call")
-        if api_call:
-            qs = qs.filter(api_call=api_call)
-        sync_run = self.request.query_params.get("sync_run")
-        if sync_run:
-            qs = qs.filter(sync_run_id=sync_run)
         return qs
+
+    def filter_queryset(self, queryset):
+        qs = super().filter_queryset(queryset)
+        try:
+            return apply_json_field_filters(qs, self.request.query_params)
+        except DjangoValidationError as e:
+            raise DRFValidationError(detail=list(e.messages))
+
+    @action(detail=False, methods=["get"], url_path="data")
+    def data(self, request, tenant_id=None):
+        """
+        Return only the JSON payload stored in each row's `data` field.
+
+        - Filters: same query params as GET /raw-records/ (django-filter on model fields,
+          plus dynamic keys `data__...` and `page_response_header__...` — see apply_json_field_filters).
+        - Pagination: default `paginated=true` uses page / page_size (max 200 per page).
+        - Plain array: `paginated=false` with optional `limit` (default 1000, max 2000).
+        JSON filters are AND-only; OR across the same key uses repeated params (comma values use `in` lookup).
+        """
+        qs = self.filter_queryset(self.get_queryset())
+
+        raw = request.query_params.get("paginated", "true")
+        use_pagination = str(raw).strip().lower() not in ("false", "0", "no")
+
+        if use_pagination:
+            paginator = ERPRawRecordDataPagination()
+            page = paginator.paginate_queryset(qs, request, view=self)
+            if page is not None:
+                payload = [row.data for row in page]
+                return paginator.get_paginated_response(payload)
+            return Response([])
+
+        try:
+            limit = int(request.query_params.get("limit", 1000))
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "limit must be an integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if limit < 1 or limit > 2000:
+            return Response(
+                {"detail": "limit must be between 1 and 2000."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        rows = list(qs[:limit])
+        return Response([row.data for row in rows])
 
     @action(detail=False, methods=["post"], url_path="backfill-external-id")
     def backfill_external_id(self, request, tenant_id=None):
