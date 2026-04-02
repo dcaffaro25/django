@@ -315,7 +315,7 @@ class BulkImportPreview(APIView):
                 "Company", "Entity", "Currency", "Account", "CostCenter",
                 "Transaction", "JournalEntry", "DocTypeRule", "SpanRule"
             ]
-            sheet_names = [n for n in xls.keys() if n != "References"]
+            sheet_names = [n for n in xls.keys() if n not in ("References", "ImportHelp")]
             order_index = {name: i for i, name in enumerate(PREFERRED_ORDER)}
             sheet_names_sorted = sorted(sheet_names, key=lambda n: order_index.get(n, 999))
 
@@ -834,6 +834,19 @@ class BulkImportTemplateDownloadView(APIView):
     def get(self, request, tenant_id):
         wb = Workbook()
 
+        # -------- How-to sheet (skipped on import; see BulkImportAPIView) --------
+        ws_help = wb.active
+        ws_help.title = "ImportHelp"
+        ws_help.append(["Topic", "Description"])
+        for topic, desc in (
+            ("__row_id (create)", "Alphanumeric token (e.g. bp1): creates a row; reuse the token in *_fk on other sheets."),
+            ("__row_id (edit)", "Positive integer: must equal the database id of the row to update."),
+            ("__row_id (delete)", "Negative integer: -id deletes row id (soft-delete if the model has is_deleted)."),
+            ("id column (legacy)", "Explicit id column still works for updates."),
+            ("References", "Lookup-only sheet; not imported."),
+        ):
+            ws_help.append([topic, desc])
+
         # -------- Main sheets with templates --------
         sheet_defs = {
             "Company": ["__row_id", "name", "subdomain"],
@@ -900,8 +913,7 @@ class BulkImportTemplateDownloadView(APIView):
         }
 
 
-        ws = wb.active
-        ws.title = 'Company'
+        ws = wb.create_sheet("Company")
         ws.append(sheet_defs['Company'])
 
         for sheet_name, columns in sheet_defs.items():

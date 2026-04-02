@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import smtplib
@@ -175,6 +176,82 @@ def _norm_row_key(key: Any) -> Any:
     if isinstance(key, str):
         return key.replace("\u00A0", " ").strip().lower()
     return key
+
+
+def _parse_import_row_id(rid_raw: Any) -> Tuple[str, Any, Any]:
+    """
+    Classify __row_id for bulk import (single discriminator for create / update / delete).
+
+    Returns (mode, detail, display_rid):
+      - mode 'error': detail is an error message string; display_rid is None.
+      - mode 'create': detail is normalized token (str) or None (no token_to_id); display_rid for output.
+      - mode 'update': detail is pk (int); display_rid for output (usually same as pk).
+      - mode 'delete': detail is pk (int) to delete; display_rid is the original negative __row_id for output.
+
+    Rules:
+      - Alphanumeric (non-integer string): create + token for FK map.
+      - Integer > 0: update existing row with that id.
+      - Integer < 0: delete row with id abs(value).
+      - Integer 0: error.
+    """
+    if rid_raw is None:
+        return ("create", None, None)
+
+    if isinstance(rid_raw, bool):
+        return ("error", "Invalid __row_id: boolean value not allowed", None)
+
+    if isinstance(rid_raw, float):
+        if math.isnan(rid_raw) or not float(rid_raw).is_integer():
+            return ("error", "Invalid __row_id: non-integer number", None)
+        rid_raw = int(rid_raw)
+
+    if isinstance(rid_raw, int):
+        if rid_raw == 0:
+            return ("error", "Invalid __row_id: zero not allowed", None)
+        if rid_raw > 0:
+            return ("update", rid_raw, rid_raw)
+        return ("delete", abs(rid_raw), rid_raw)
+
+    s = str(rid_raw).replace("\u00A0", " ").strip()
+    if not s:
+        return ("create", None, None)
+    try:
+        n = int(s)
+    except (ValueError, TypeError):
+        tok = _norm_row_key(rid_raw)
+        return ("create", tok if tok else None, tok)
+
+    if n == 0:
+        return ("error", "Invalid __row_id: zero not allowed", None)
+    if n > 0:
+        return ("update", n, n)
+    return ("delete", abs(n), n)
+
+
+def _assert_import_tenant_scope(instance: Any, company_id: Optional[int]) -> None:
+    """Ensure imported row targets the current tenant when the model is company-scoped."""
+    if company_id is None:
+        return
+    if not hasattr(instance, "company_id"):
+        return
+    cid = getattr(instance, "company_id", None)
+    if cid is not None and int(cid) != int(company_id):
+        raise ValueError(
+            f"Record id={instance.pk} belongs to company {cid}, not {company_id}"
+        )
+
+
+def _apply_import_delete(instance: Any, model) -> str:
+    """
+    Soft-delete if the model has an is_deleted field; otherwise hard delete.
+    Returns 'soft' or 'hard'.
+    """
+    if any(getattr(f, "name", None) == "is_deleted" for f in model._meta.fields):
+        setattr(instance, "is_deleted", True)
+        instance.save(update_fields=["is_deleted"])
+        return "soft"
+    instance.delete()
+    return "hard"
 
 
 def _is_mptt_model(model) -> bool:
@@ -616,10 +693,15 @@ def execute_import_job(
     """
     Importer with token->id mapping for FK resolution and a single atomic transaction.
 
+    __row_id semantics:
+      - Alphanumeric token: create row; token is registered in token_to_id for *_fk on other sheets.
+      - Positive integer: update row with that primary key (legacy: explicit id column also updates).
+      - Negative integer: delete row with id abs(value); soft-delete if model has is_deleted.
+
     Flow:
       - Sort sheets using MODEL_APP_MAP order
       - For each row: substitutions -> filter -> company context -> MPTT path -> *_fk resolution to *_id
-      - Save, record token->id
+      - Save; register token->id only for new rows (alphanumeric __row_id)
       - On preview (commit=False): rollback entire transaction at the end
     
     Args:
@@ -721,7 +803,20 @@ def execute_import_job(
             for row in rows:
                 raw = dict(row or {})
                 rid_raw = raw.pop("__row_id", None)
-                rid = _norm_row_key(rid_raw)
+                mode, row_detail, rid_display = _parse_import_row_id(rid_raw)
+                rid = _norm_row_key(rid_display)
+
+                if mode == "error":
+                    outputs_by_model[model_name].append({
+                        "__row_id": rid_raw,
+                        "status": "error",
+                        "action": None,
+                        "data": raw,
+                        "message": str(row_detail),
+                        "observations": [],
+                        "external_id": None,
+                    })
+                    continue
 
                 # Use a savepoint for each row to isolate errors
                 row_sid = None
@@ -729,9 +824,9 @@ def execute_import_job(
                     row_sid = transaction.savepoint()
                 except Exception:
                     # If transaction is already in a failed state, skip this row
-                    logger.warning(f"Transaction in failed state, skipping row {rid} in {model_name}")
+                    logger.warning(f"Transaction in failed state, skipping row {rid_display} in {model_name}")
                     outputs_by_model[model_name].append({
-                        "__row_id": rid,
+                        "__row_id": rid_display,
                         "status": "error",
                         "action": None,
                         "data": raw,
@@ -742,8 +837,40 @@ def execute_import_job(
                     continue
 
                 try:
+                    # ---- delete (only needs pk from __row_id) ----
+                    if mode == "delete":
+                        pk_del = int(row_detail)
+                        instance_del = model.objects.get(pk=pk_del)
+                        _assert_import_tenant_scope(instance_del, company_id)
+                        del_kind = _apply_import_delete(instance_del, model)
+                        msg_del = f"deleted ({del_kind})"
+                        outputs_by_model[model_name].append({
+                            "__row_id": rid_display,
+                            "status": "success",
+                            "action": "delete",
+                            "data": {"id": pk_del, "delete_mode": del_kind},
+                            "message": msg_del,
+                            "observations": _row_observations(audit_by_rowid, rid),
+                            "external_id": None,
+                        })
+                        if row_sid:
+                            transaction.savepoint_commit(row_sid)
+                        continue
+
                     # 2) filter unknowns (keep *_fk)
                     filtered, unknown = _filter_unknown(model, raw)
+
+                    # Legacy: explicit `id` column means update (same as positive numeric __row_id)
+                    if mode == "create" and filtered.get("id"):
+                        legacy_pk = _to_int_or_none_soft(filtered["id"])
+                        if legacy_pk:
+                            logger.info(
+                                "import_legacy_id_column model=%s pk=%s (prefer numeric __row_id for updates)",
+                                model_name,
+                                legacy_pk,
+                            )
+                            mode = "update"
+                            row_detail = legacy_pk
 
                     # 3) company context
                     filtered = _attach_company_context(model, filtered, company_id)
@@ -776,12 +903,19 @@ def execute_import_job(
                     filtered = _coerce_boolean_fields(model, filtered)
                     filtered = _quantize_decimal_fields(model, filtered)
 
-                    # 8) create/update
+                    # 8) create/update (__row_id positive int or legacy id column)
                     action = "create"
-                    if "id" in filtered and filtered["id"]:
-                        pk = _to_int_or_none_soft(filtered["id"])
-                        if not pk:
-                            raise ValueError("Invalid 'id' for update")
+                    create_token = row_detail if mode == "create" else None
+
+                    if mode == "update":
+                        pk = int(row_detail)
+                        if "id" in filtered:
+                            col_id = _to_int_or_none_soft(filtered["id"])
+                            if col_id is not None and col_id != pk:
+                                raise ValueError(
+                                    f"id column ({col_id}) conflicts with __row_id update target ({pk})"
+                                )
+                        filtered.pop("id", None)
                         instance = model.objects.get(id=pk)
                         for k, v in filtered.items():
                             setattr(instance, k, v)
@@ -860,9 +994,9 @@ def execute_import_job(
                     # Verify notes were saved
                     logger.info(f"IMPORT NOTES DEBUG: After save, instance.notes = {instance.notes[:100] if instance.notes else 'None'}...")
 
-                    # 10) register token->id (AFTER save to ensure an id exists)
-                    if rid:
-                        token_to_id[rid] = int(instance.pk)
+                    # 10) register token->id only for addition rows (alphanumeric __row_id)
+                    if create_token is not None:
+                        token_to_id[create_token] = int(instance.pk)
 
                     # 11) success output
                     msg = "ok"
@@ -870,7 +1004,7 @@ def execute_import_job(
                         msg += f" | Ignoring unknown columns: {', '.join(unknown)}"
 
                     outputs_by_model[model_name].append({
-                        "__row_id": rid,
+                        "__row_id": rid_display,
                         "status": "success",
                         "action": action,
                         "data": _safe_model_dict(
@@ -891,7 +1025,7 @@ def execute_import_job(
                     is_db_error = isinstance(e, (DatabaseError, IntegrityError))
                     
                     logger.exception("row error on %s rid=%s: %s (is_db_error=%s)", 
-                                   model_name, rid, e, is_db_error)
+                                   model_name, rid_display, e, is_db_error)
                     
                     # Rollback the savepoint to isolate this error
                     if row_sid:
@@ -899,14 +1033,14 @@ def execute_import_job(
                             transaction.savepoint_rollback(row_sid)
                         except Exception as rollback_err:
                             # If rollback fails, the transaction is likely already aborted
-                            logger.warning(f"Failed to rollback savepoint for row {rid}: {rollback_err}")
+                            logger.warning(f"Failed to rollback savepoint for row {rid_display}: {rollback_err}")
                     
                     error_message = str(e)
                     if is_db_error:
                         error_message = f"Database error: {error_message}"
                     
                     outputs_by_model[model_name].append({
-                        "__row_id": rid,
+                        "__row_id": rid_display,
                         "status": "error",
                         "action": None,
                         "data": raw,

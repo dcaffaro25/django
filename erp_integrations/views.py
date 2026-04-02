@@ -206,12 +206,16 @@ class ERPRawRecordViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
     @action(detail=False, methods=["post"], url_path="backfill-external-id")
     def backfill_external_id(self, request, tenant_id=None):
         """
-        Backfill external_id for raw records where external_id is null/blank,
-        using each record's ERPAPIDefinition.unique_id_config.
+        Recompute external_id from each record's ERPAPIDefinition.unique_id_config.
+
+        By default only rows with null/blank external_id are processed. Set
+        recalculate_all=true to recompute for every raw row (still capped by limit).
 
         Optional body:
-        - api_call: str (limit backfill to one call)
-        - limit: int (max rows to process in this request, default 1000)
+        - api_call: str — limit to one Omie call name
+        - limit: int — max rows to process this request (default 1000, max 50000)
+        - batch_size: int — alias for limit (if both sent, limit wins)
+        - recalculate_all: bool — if true, include rows that already have external_id
         """
         tenant = getattr(request, "tenant", None)
         company_id = getattr(tenant, "id", None) if tenant and tenant != "all" else None
@@ -222,27 +226,38 @@ class ERPRawRecordViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
             )
 
         api_call = request.data.get("api_call")
+        raw_limit = request.data.get("limit")
+        if raw_limit is None:
+            raw_limit = request.data.get("batch_size")
         try:
-            limit = int(request.data.get("limit", 1000))
+            limit = int(raw_limit if raw_limit is not None else 1000)
         except (TypeError, ValueError):
-            return Response({"detail": "limit must be an integer."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"detail": "limit (or batch_size) must be an integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if limit < 1 or limit > 50000:
             return Response(
                 {"detail": "limit must be between 1 and 50000."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        qs = (
-            ERPRawRecord.objects.select_related("sync_run__job__api_definition")
-            .filter(Q(external_id__isnull=True) | Q(external_id=""))
-            .order_by("id")
-        )
+        recalculate_all = request.data.get("recalculate_all", False)
+        if isinstance(recalculate_all, str):
+            recalculate_all = recalculate_all.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            recalculate_all = bool(recalculate_all)
+
+        qs = ERPRawRecord.objects.select_related("sync_run__job__api_definition").order_by("id")
+        if not recalculate_all:
+            qs = qs.filter(Q(external_id__isnull=True) | Q(external_id=""))
         if company_id:
             qs = qs.filter(company_id=company_id)
         if api_call:
             qs = qs.filter(api_call=api_call)
 
         updated = 0
+        unchanged = 0
         processed = 0
         skipped_no_definition = 0
         skipped_no_unique_id_config = 0
@@ -268,6 +283,11 @@ class ERPRawRecordViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
                 skipped_no_value += 1
                 continue
 
+            prev = raw.external_id
+            if prev is not None and str(prev).strip() == str(external_id).strip():
+                unchanged += 1
+                continue
+
             raw.external_id = external_id
             raw.save(update_fields=["external_id"])
             updated += 1
@@ -276,11 +296,13 @@ class ERPRawRecordViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
             {
                 "processed": processed,
                 "updated": updated,
+                "unchanged": unchanged,
                 "skipped_no_definition": skipped_no_definition,
                 "skipped_no_unique_id_config": skipped_no_unique_id_config,
                 "skipped_no_value": skipped_no_value,
                 "api_call": api_call,
                 "limit": limit,
+                "recalculate_all": recalculate_all,
             },
             status=status.HTTP_200_OK,
         )

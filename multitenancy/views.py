@@ -895,7 +895,7 @@ class BulkImportAPIView(APIView):
         book = pd.read_excel(up, sheet_name=None)
         sheets = []
         for model_name, df in book.items():
-            if model_name == "References":
+            if model_name in ("References", "ImportHelp"):
                 continue
             df = df.replace([np.inf, -np.inf], np.nan)
             df = df.where(df.notna(), None)        # NaN/NaT -> None
