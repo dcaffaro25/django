@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from itertools import combinations
-from typing import Callable, Dict, Iterable, List, Optional, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 from multitenancy.utils import resolve_tenant
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -56,6 +56,8 @@ class BankTransactionDTO:
     currency_id: int
     description: str
     embedding: Optional[List[float]] = None
+    numeros_boleto: List[str] = field(default_factory=list)
+    cnpj: Optional[str] = None
 
     @property
     def amount_base(self) -> Decimal:
@@ -73,10 +75,53 @@ class JournalEntryDTO:
     currency_id: int
     description: str
     embedding: Optional[List[float]] = None
+    numero_boleto: Optional[str] = None
+    cnpj: Optional[str] = None
 
     @property
     def amount_base(self) -> Decimal:
         return self.effective_amount
+
+
+def _normalize_cnpj(raw: Optional[str]) -> str:
+    if not raw:
+        return ""
+    return "".join(c for c in str(raw) if c.isdigit())
+
+
+def _normalize_numero_boleto(raw: Optional[str]) -> str:
+    if raw is None:
+        return ""
+    return "".join(str(raw).split()).strip()
+
+
+def _cnpj_pair_ok(bank: BankTransactionDTO, book: JournalEntryDTO, require: bool) -> bool:
+    if not require:
+        return True
+    bn = _normalize_cnpj(getattr(bank, "cnpj", None))
+    jn = _normalize_cnpj(getattr(book, "cnpj", None))
+    if not bn or not jn:
+        return True
+    return bn == jn
+
+
+def _cnpj_groups_compatible(
+    banks: List[BankTransactionDTO],
+    books: List[JournalEntryDTO],
+    require: bool,
+) -> bool:
+    if not require:
+        return True
+    vals: List[str] = []
+    for b in banks:
+        n = _normalize_cnpj(getattr(b, "cnpj", None))
+        if n:
+            vals.append(n)
+    for e in books:
+        n = _normalize_cnpj(getattr(e, "cnpj", None))
+        if n:
+            vals.append(n)
+    return len(set(vals)) <= 1
 
 
 @dataclass(frozen=True)
@@ -115,6 +160,8 @@ class StageConfig:
     # NEW: number of alternatives to keep per anchor (bank/book)
     # 1 = only best; 3 = best + 2 alternatives, etc.
     max_alternatives_per_anchor: int = 2
+
+    require_cnpj_match: bool = False
     
     @property
     def candidate_window_days(self) -> int:
@@ -613,6 +660,9 @@ class ReconciliationPipelineEngine:
           - group_span_days (books)
           - avg_date_delta_days between bank.date and weighted avg of book dates
         """
+        req_cnpj = bool(getattr(stage, "require_cnpj_match", False))
+        if req_cnpj:
+            local_books = [b for b in local_books if _cnpj_pair_ok(bank, b, req_cnpj)]
         n = len(local_books)
         if n == 0:
             return None
@@ -847,6 +897,99 @@ class ReconciliationPipelineEngine:
 
     # ------------------------ Stage handlers ------------------------
 
+    def _run_boleto_match(self, banks, books, stage: StageConfig):
+        """
+        Match bank lines to book lines when a book's numero_boleto is in the bank's
+        numeros_boleto list. Uses subset-sum to find groups of books matching the bank amount.
+        """
+        req = bool(getattr(stage, "require_cnpj_match", False))
+        tol = stage.amount_tol or CENT
+        max_book = max(1, int(stage.max_group_size_book or 1))
+
+        for bank in banks:
+            if self._time_exceeded():
+                return
+            if bank.id in self.used_banks:
+                continue
+            if bank.company_id != self.company_id:
+                continue
+            raw_nums = getattr(bank, "numeros_boleto", None) or []
+            if not raw_nums:
+                continue
+            num_set = {_normalize_numero_boleto(x) for x in raw_nums if _normalize_numero_boleto(x)}
+
+            candidates = [
+                b
+                for b in books
+                if b.id not in self.used_books
+                and b.company_id == self.company_id
+                and _normalize_numero_boleto(getattr(b, "numero_boleto", None)) in num_set
+            ]
+            if not candidates:
+                continue
+            if req:
+                candidates = [c for c in candidates if _cnpj_pair_ok(bank, c, req)]
+            if not candidates:
+                continue
+
+            amounts = [
+                (b.amount_base or Decimal("0")) if b.amount_base is not None else Decimal("0")
+                for b in candidates
+            ]
+            target = q2(bank.amount_base)
+            subs = branch_and_bound_subset_multi(
+                amounts,
+                target,
+                tol,
+                max_size=max_book,
+                max_results=3,
+                time_exceeded_fn=self._time_exceeded,
+            )
+            if not subs:
+                continue
+
+            for sub in subs:
+                combo = [candidates[i] for i in sub]
+                if any(b.currency_id != bank.currency_id for b in combo):
+                    continue
+                book_dates = [b.date for b in combo if b.date]
+                book_span = (max(book_dates) - min(book_dates)).days if len(book_dates) >= 2 else 0
+                if stage.group_span_days and book_span > stage.group_span_days:
+                    continue
+                bank_avg = bank.date
+                book_avg = self._weighted_avg_date(combo)
+                avg_delta = (
+                    abs((bank_avg - book_avg).days) if (bank_avg and book_avg) else stage.candidate_window_days + 1
+                )
+                if stage.avg_date_delta_days and avg_delta > stage.avg_date_delta_days:
+                    continue
+
+                book_total = sum((b.amount_base for b in combo), Decimal("0"))
+                amount_diff = abs(q2(book_total) - target)
+                embed_sim = self._cosine_similarity(bank.embedding or [], _avg_embedding(combo))
+                scores = compute_match_scores(
+                    embed_sim=embed_sim,
+                    amount_diff=amount_diff,
+                    amount_tol=tol,
+                    date_diff=avg_delta,
+                    date_tol=stage.avg_date_delta_days or 1,
+                    currency_match=1.0,
+                    weights=self.stage_weights,
+                )
+                conf = min(1.0, float(scores["global_score"]) + 0.05)
+                sug = self._make_suggestion(
+                    "boleto_match",
+                    [bank],
+                    combo,
+                    conf,
+                    stage=stage,
+                    weights=self.stage_weights,
+                    component_scores=scores,
+                    extra={"boleto_match": True},
+                )
+                self._record(sug)
+                break
+
     def _run_exact_1to1(self, banks, books, stage: StageConfig):
         """
         Exact 1-to-1 uses the same logic as fuzzy 1-to-1 (date bins, amount buckets,
@@ -875,6 +1018,9 @@ class ReconciliationPipelineEngine:
 
         Returns the BEST valid combination of banks by confidence score, or None.
         """
+        req_cnpj = bool(getattr(stage, "require_cnpj_match", False))
+        if req_cnpj:
+            local_banks = [b for b in local_banks if _cnpj_pair_ok(b, book, req_cnpj)]
         n = len(local_banks)
         if n == 0:
             return None
@@ -1355,6 +1501,9 @@ class ReconciliationPipelineEngine:
                         )
                         continue
 
+                    if not _cnpj_groups_compatible([bank], list(combo), bool(getattr(stage, "require_cnpj_match", False))):
+                        continue
+
                     book_dates = [b.date for b in combo if b.date]
                     book_span = (max(book_dates) - min(book_dates)).days if len(book_dates) >= 2 else 0
                     if stage.group_span_days and book_span > stage.group_span_days:
@@ -1807,6 +1956,9 @@ class ReconciliationPipelineEngine:
                     if any(b.currency_id != book.currency_id for b in combo):
                         continue
 
+                    if not _cnpj_groups_compatible(list(combo), [book], bool(getattr(stage, "require_cnpj_match", False))):
+                        continue
+
                     bank_dates = [b.date for b in combo if b.date]
                     bank_span = (max(bank_dates) - min(bank_dates)).days if len(bank_dates) >= 2 else 0
                     if stage.group_span_days and bank_span > stage.group_span_days:
@@ -2029,6 +2181,13 @@ class ReconciliationPipelineEngine:
                         "_run_fuzzy_1to1: REJECTED bank_id=%d book_id=%d - currency mismatch "
                         "(bank_currency=%d book_currency=%d)",
                         bank.id, book.id, bank.currency_id, book.currency_id,
+                    )
+                    continue
+
+                if not _cnpj_pair_ok(bank, book, bool(getattr(stage, "require_cnpj_match", False))):
+                    log.debug(
+                        "_run_fuzzy_1to1: REJECTED bank_id=%d book_id=%d - CNPJ mismatch under require_cnpj_match",
+                        bank.id, book.id,
                     )
                     continue
 
@@ -2385,6 +2544,11 @@ class ReconciliationPipelineEngine:
                             if diff > stage.amount_tol:
                                 continue
                             if any(b.currency_id != e.currency_id for b in bank_combo for e in book_combo):
+                                continue
+
+                            if not _cnpj_groups_compatible(
+                                list(bank_combo), list(book_combo), bool(getattr(stage, "require_cnpj_match", False))
+                            ):
                                 continue
     
                             bank_span = self._date_span_days(bank_combo)
@@ -3931,6 +4095,10 @@ class ReconciliationPipelineEngine:
                                 continue
                             if any(b.currency_id != e.currency_id for b in bank_combo for e in book_combo):
                                 continue
+                            if not _cnpj_groups_compatible(
+                                list(bank_combo), list(book_combo), bool(getattr(stage, "require_cnpj_match", False))
+                            ):
+                                continue
                             book_groups.append(book_combo)
                     log.debug(
                         "[FAST] MTM_FAST anchor_bank=%s bank_combo=%s exact book_groups=%s",
@@ -4660,6 +4828,7 @@ def run_single_config(cfg: object,
         avg_date_delta_days=getattr(cfg, "avg_date_delta_days", 0),
         allow_mixed_signs=allow_mixed,
         max_alternatives_per_anchor=max_alts,
+        require_cnpj_match=bool(getattr(cfg, "require_cnpj_match", False)),
     )
     
     log.debug("run_single_config: StageConfig=%s", stage)
@@ -4810,6 +4979,7 @@ def run_pipeline(
             else float(cfg.date_weight),
             allow_mixed_signs=bool(allow_mixed),
             max_alternatives_per_anchor=int(max_alts or 1),
+            require_cnpj_match=bool(getattr(cfg, "require_cnpj_match", False)),
         )
 
         log.debug("run_pipeline: stage[%d] StageConfig=%s", idx, stage_conf)
@@ -4863,7 +5033,118 @@ def run_pipeline(
     return engine.run(banks, books)
 
 
+def _build_reconciliation_candidate_dtos(
+    company_id: int,
+    bank_ids: Optional[List[Any]] = None,
+    book_ids: Optional[List[Any]] = None,
+    *,
+    log_prefix: str = "reconciliation",
+) -> tuple[List[BankTransactionDTO], List[JournalEntryDTO]]:
+    """Load unmatched bank transactions and journal entries and convert to DTOs."""
+    bank_ids = bank_ids or []
+    book_ids = book_ids or []
 
+    bank_qs = (
+        BankTransaction.objects.exclude(reconciliations__status__in=["matched", "approved"])
+        .filter(company_id=company_id)
+        .only(
+            "id",
+            "company_id",
+            "date",
+            "amount",
+            "currency_id",
+            "description",
+            "description_embedding",
+            "numeros_boleto",
+            "cnpj",
+        )
+    )
+    if bank_ids:
+        bank_qs = bank_qs.filter(id__in=bank_ids)
+
+    book_qs = (
+        JournalEntry.objects.exclude(reconciliations__status__in=["matched", "approved"])
+        .filter(company_id=company_id)
+        .filter(account__bank_account__isnull=False)
+        .select_related("transaction")
+        .only(
+            "id",
+            "company_id",
+            "transaction_id",
+            "date",
+            "debit_amount",
+            "credit_amount",
+            "account_id",
+            "transaction__date",
+            "transaction__currency_id",
+            "transaction__description",
+            "transaction__description_embedding",
+            "transaction__numero_boleto",
+            "transaction__cnpj",
+        )
+    )
+    if book_ids:
+        book_qs = book_qs.filter(id__in=book_ids)
+
+    book_qs = book_qs.filter(account__bank_account__isnull=False)
+
+    candidate_bank: List[BankTransactionDTO] = []
+    for tx in bank_qs:
+        amt = tx.amount or Decimal("0")
+        if q2(amt) == Decimal("0.00"):
+            continue
+        embedding = _as_vec_list(getattr(tx, "description_embedding", None))
+        nums = getattr(tx, "numeros_boleto", None) or []
+        candidate_bank.append(
+            BankTransactionDTO(
+                id=tx.id,
+                company_id=tx.company_id,
+                date=tx.date,
+                amount=amt,
+                currency_id=tx.currency_id,
+                description=tx.description,
+                embedding=embedding,
+                numeros_boleto=list(nums) if nums else [],
+                cnpj=getattr(tx, "cnpj", None) or None,
+            )
+        )
+
+    candidate_book: List[JournalEntryDTO] = []
+    for je in book_qs:
+        tr = getattr(je, "transaction", None)
+        tr_date = je.date or (tr.date if tr else None)
+        tr_curr_id = tr.currency_id if tr else None
+        tr_desc = tr.description if tr else ""
+        tr_vec = _as_vec_list(getattr(tr, "description_embedding", None)) if tr else None
+
+        eff_amt = je.get_effective_amount()
+        if eff_amt is None or q2(eff_amt) == Decimal("0.00"):
+            continue
+
+        tr_obj = tr
+        candidate_book.append(
+            JournalEntryDTO(
+                id=je.id,
+                company_id=je.company_id,
+                transaction_id=je.transaction_id,
+                date=tr_date,
+                effective_amount=eff_amt,
+                currency_id=tr_curr_id,
+                description=tr_desc,
+                embedding=tr_vec,
+                numero_boleto=getattr(tr_obj, "numero_boleto", None) if tr_obj else None,
+                cnpj=getattr(tr_obj, "cnpj", None) if tr_obj else None,
+            )
+        )
+
+    log.info(
+        "%s: built DTOs company_id=%s banks=%d books=%d",
+        log_prefix,
+        company_id,
+        len(candidate_bank),
+        len(candidate_book),
+    )
+    return candidate_bank, candidate_book
 
 
 class ReconciliationService:
@@ -4900,199 +5181,19 @@ class ReconciliationService:
         
         company_id = resolve_tenant(tenant_id).id
 
-        # Build candidate QuerySets
         bank_ids = data.get("bank_ids", [])
         book_ids = data.get("book_ids", [])
-        
+
         log.info(
             "match_many_to_many: building candidate sets company_id=%s "
             "bank_ids_provided=%d book_ids_provided=%d",
             company_id, len(bank_ids) if bank_ids else 0, len(book_ids) if book_ids else 0,
         )
-        
-        bank_qs = (
-            BankTransaction.objects
-            .exclude(reconciliations__status__in=["matched", "approved"])
-            .filter(company_id=company_id)
-            .only("id", "company_id", "date", "amount", "currency_id", "description", "description_embedding")
-        )
-        bank_count_initial = bank_qs.count()
-        log.info(
-            "match_many_to_many: initial unmatched bank transactions (company_id=%s): %d",
-            company_id, bank_count_initial,
-        )
-        
-        if bank_ids:
-            bank_qs = bank_qs.filter(id__in=bank_ids)
-            filtered_count = bank_qs.count()
-            log.info(
-                "match_many_to_many: filtered bank transactions by provided IDs (%d ids) "
-                "for company_id=%s: %d records remain",
-                len(bank_ids),
-                company_id,
-                filtered_count,
-            )
-        else:
-            log.info(
-                "match_many_to_many: no bank_ids provided; using all unmatched bank transactions "
-                "for company_id=%s (%d records)",
-                company_id,
-                bank_count_initial,
-            )
-        
-        book_qs = (
-            JournalEntry.objects
-            .exclude(reconciliations__status__in=["matched", "approved"])
-            .filter(company_id=company_id)
-            .filter(account__bank_account__isnull=False)
-            .select_related("transaction")
-            .only(
-                "id", "company_id", "transaction_id", "date",
-                "debit_amount", "credit_amount", "account_id",
-                "transaction__date", "transaction__currency_id",
-                "transaction__description", "transaction__description_embedding",
-            )
-        )
-        book_count_initial = book_qs.count()
-        log.debug(
-            "Initial unmatched journal entries count (company_id=%s): %d",
-            company_id,
-            book_count_initial,
+
+        candidate_bank, candidate_book = _build_reconciliation_candidate_dtos(
+            company_id, bank_ids, book_ids, log_prefix="match_many_to_many"
         )
 
-        if book_ids:
-            book_qs = book_qs.filter(id__in=book_ids)
-            filtered_book_count = book_qs.count()
-            log.debug(
-                "Filtered journal entries by provided IDs (%d ids) for company_id=%s: %d records remain",
-                len(book_ids),
-                company_id,
-                filtered_book_count,
-            )
-        else:
-            log.debug(
-                "No book_ids provided; using all unmatched journal entries for company_id=%s (%d records)",
-                company_id,
-                book_count_initial,
-            )
-
-        # Only consider journal entries that belong to a bank account
-        pre_account_count = book_qs.count()
-        book_qs = book_qs.filter(account__bank_account__isnull=False)
-        post_account_count = book_qs.count()
-        log.debug(
-            "Filtered journal entries to those linked to bank accounts: %d records remain (from %d)",
-            post_account_count,
-            pre_account_count,
-        )
-        
-        # ------------------------------------------------------------------
-        # Convert querysets to DTOs, EXCLUINDO amount == 0
-        # ------------------------------------------------------------------
-        log.info("match_many_to_many: converting bank transactions to DTOs...")
-        candidate_bank: List[BankTransactionDTO] = []
-        skipped_zero_bank = 0
-        skipped_no_embedding = 0
-
-        for tx in bank_qs:
-            amt = tx.amount or Decimal("0")
-            # usamos q2 para garantir consistência com o resto do engine
-            if q2(amt) == Decimal("0.00"):
-                skipped_zero_bank += 1
-                log.debug(
-                    "match_many_to_many: skipping bank tx_id=%d (zero amount: %s)",
-                    tx.id, amt,
-                )
-                continue
-
-            embedding = _as_vec_list(getattr(tx, "description_embedding", None))
-            if not embedding:
-                skipped_no_embedding += 1
-
-            candidate_bank.append(
-                BankTransactionDTO(
-                    id=tx.id,
-                    company_id=tx.company_id,
-                    date=tx.date,
-                    amount=amt,
-                    currency_id=tx.currency_id,
-                    description=tx.description,
-                    embedding=embedding,
-                )
-            )
-
-        log.info(
-            "match_many_to_many: created %d BankTransactionDTOs "
-            "(skipped %d with zero amount, %d without embedding)",
-            len(candidate_bank), skipped_zero_bank, skipped_no_embedding,
-        )
-        for dto in candidate_bank[:5]:
-            log.info(
-                "match_many_to_many: BankDTO sample: id=%s amount=%s date=%s "
-                "currency_id=%s company_id=%s has_embedding=%s",
-                dto.id, dto.amount, dto.date, dto.currency_id, dto.company_id,
-                bool(dto.embedding),
-            )
-        
-        log.info("match_many_to_many: converting journal entries to DTOs...")
-        candidate_book: List[JournalEntryDTO] = []
-        skipped_zero_book = 0
-        skipped_no_embedding = 0
-
-        for je in book_qs:
-            tr = getattr(je, "transaction", None)
-            tr_date = je.date or (tr.date if tr else None)
-            tr_curr_id = tr.currency_id if tr else None
-            tr_desc = tr.description if tr else ""
-            tr_vec = _as_vec_list(getattr(tr, "description_embedding", None)) if tr else None
-
-            eff_amt = je.get_effective_amount()
-            if eff_amt is None:
-                # sem valor efetivo → não tentamos conciliar agora
-                skipped_zero_book += 1
-                log.debug(
-                    "match_many_to_many: skipping journal entry_id=%d (no effective amount)",
-                    je.id,
-                )
-                continue
-            if q2(eff_amt) == Decimal("0.00"):
-                # valor efetivo 0 → fora desta etapa de conciliação
-                skipped_zero_book += 1
-                log.debug(
-                    "match_many_to_many: skipping journal entry_id=%d (zero effective amount: %s)",
-                    je.id, eff_amt,
-                )
-                continue
-        
-            if not tr_vec:
-                skipped_no_embedding += 1
-
-            candidate_book.append(
-                JournalEntryDTO(
-                    id=je.id,
-                    company_id=je.company_id,
-                    transaction_id=je.transaction_id,
-                    date=tr_date,
-                    effective_amount=eff_amt,
-                    currency_id=tr_curr_id,
-                    description=tr_desc,
-                    embedding=tr_vec,
-                )
-            )
-        
-        log.info(
-            "match_many_to_many: created %d JournalEntryDTOs "
-            "(skipped %d with zero/no effective_amount, %d without embedding)",
-            len(candidate_book), skipped_zero_book, skipped_no_embedding,
-        )
-        for dto in candidate_book[:5]:
-            log.info(
-                "match_many_to_many: BookDTO sample: id=%s tx_id=%s amount=%s date=%s "
-                "currency_id=%s company_id=%s has_embedding=%s",
-                dto.id, dto.transaction_id, dto.effective_amount,
-                dto.date, dto.currency_id, dto.company_id, bool(dto.embedding),
-            )
-        
         use_fast = bool(data.get("fast", False))
         
         log.info(
@@ -5248,17 +5349,60 @@ class ReconciliationService:
         }
 
         log.info(
-            "Recon task: company=%s config_id=%s pipeline_id=%s banks=%d books=%d suggestions=%d duration=%.3fs (skipped_zero_bank=%d, skipped_zero_book=%d)",
+            "Recon task: company=%s config_id=%s pipeline_id=%s banks=%d books=%d suggestions=%d duration=%.3fs",
             company_id, config_id, pipeline_id,
             bank_candidate_count, book_candidate_count,
             suggestion_count, duration,
-            skipped_zero_bank, skipped_zero_book,
         )
         
         return {
             "suggestions": suggestions,
             "auto_match": auto_info,
             "stats": stats,
+        }
+
+    @staticmethod
+    def match_boletos(
+        data: Dict[str, object],
+        tenant_id: Optional[str] = None,
+    ) -> Dict[str, object]:
+        """
+        Propose matches where book transaction numero_boleto is in bank numeros_boleto.
+        Request body keys: bank_ids, book_ids (optional), amount_tolerance, require_cnpj_match, max_group_size_book.
+        """
+        company_id = resolve_tenant(tenant_id).id
+        bank_ids = data.get("bank_ids", []) or []
+        book_ids = data.get("book_ids", []) or []
+        amount_tol = Decimal(str(data.get("amount_tolerance", "0.01")))
+        require_cnpj = bool(data.get("require_cnpj_match", False))
+        max_group_size_book = int(data.get("max_group_size_book", 20))
+
+        candidate_bank, candidate_book = _build_reconciliation_candidate_dtos(
+            company_id, bank_ids, book_ids, log_prefix="match_boletos"
+        )
+
+        stage = StageConfig(
+            type="boleto_match",
+            max_group_size_bank=1,
+            max_group_size_book=max_group_size_book,
+            amount_tol=amount_tol,
+            group_span_days=30,
+            avg_date_delta_days=30,
+            require_cnpj_match=require_cnpj,
+            max_alternatives_per_anchor=1,
+        )
+        pipe_cfg = PipelineConfig(stages=[stage], max_suggestions=10000)
+        engine = ReconciliationPipelineEngine(company_id=company_id, config=pipe_cfg)
+        engine.current_weights = {
+            "embedding": 0.5,
+            "amount": 0.35,
+            "currency": 0.1,
+            "date": 0.05,
+        }
+        suggestions = engine.run(candidate_bank, candidate_book)
+        return {
+            "suggestions": suggestions,
+            "stats": {"suggestion_count": len(suggestions)},
         }
 
     # ------------------------------------------------------------------

@@ -15,7 +15,7 @@ from multitenancy.utils import resolve_tenant
 from multitenancy.models import CustomUser, Company, Entity
 from multitenancy.mixins import ScopedQuerysetMixin
 from .models import (Currency, Account, Transaction, JournalEntry, Rule, CostCenter, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter,ReconciliationTask, ReconciliationConfig, ReconciliationSuggestion, ReconciliationRule)
-from .serializers import (CurrencySerializer, AccountSerializer, TransactionSerializer, CostCenterSerializer, JournalEntrySerializer, JournalEntryListSerializer, RuleSerializer, BankSerializer, BankAccountSerializer, BankTransactionSerializer, ReconciliationSerializer, TransactionListSerializer,ReconciliationTaskSerializer,ReconciliationConfigSerializer)
+from .serializers import (CurrencySerializer, AccountSerializer, TransactionSerializer, CostCenterSerializer, JournalEntrySerializer, JournalEntryListSerializer, JournalEntryDeriveFromSerializer, RuleSerializer, BankSerializer, BankAccountSerializer, BankTransactionSerializer, ReconciliationSerializer, TransactionListSerializer,ReconciliationTaskSerializer,ReconciliationConfigSerializer)
 from .services.transaction_service import *
 from .utils import update_journal_entries_and_transaction_flags, parse_ofx_text, decode_ofx_content, generate_ofx_transaction_hash, find_book_combos
 from datetime import datetime
@@ -45,6 +45,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from accounting.models import BankTransaction, JournalEntry, Reconciliation
 from accounting.services.bank_structs import ensure_pending_bank_structs, ensure_gl_account_for_bank
+from accounting.services.reconciliation_service import ReconciliationService
 
 import logging
 
@@ -1313,6 +1314,85 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     def bulk_delete(self, request, *args, **kwargs):
         ids = request.data  # Assuming request.data is a list of IDs
         return generic_bulk_delete(self, ids)
+
+    @action(detail=False, methods=["post"], url_path="derive_from")
+    def derive_from(self, request, tenant_id=None):
+        """
+        Create one or more journal entries on the same transaction as a template line.
+
+        Body:
+          - template_journal_entry_id: source journal entry (same transaction is used)
+          - entries: list of lines with account_id, debit_amount and/or credit_amount, optional
+            date, description, cost_center_id, state, bank_designation_pending, is_cash,
+            cliente_erp_id, notes
+        """
+        ser = JournalEntryDeriveFromSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        template_id = ser.validated_data["template_journal_entry_id"]
+        lines = ser.validated_data["entries"]
+
+        template = (
+            self.get_queryset()
+            .select_related("transaction", "company")
+            .filter(pk=template_id)
+            .first()
+        )
+        if not template:
+            return Response(
+                {"detail": "Template journal entry not found or not accessible."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        company_id = template.company_id
+        tx = template.transaction
+        created = []
+
+        with db_tx.atomic():
+            for line in lines:
+                account_id = line["account_id"]
+                if not Account.objects.filter(pk=account_id, company_id=company_id).exists():
+                    return Response(
+                        {"detail": f"Account id={account_id} not found for this company."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                cc_id = line.get("cost_center_id")
+                if cc_id is not None and not CostCenter.objects.filter(
+                    pk=cc_id, company_id=company_id
+                ).exists():
+                    return Response(
+                        {"detail": f"Cost center id={cc_id} not found for this company."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                line_date = line.get("date") or template.date or tx.date
+                desc = line.get("description")
+                if desc is None or desc == "":
+                    desc = template.description
+
+                je = JournalEntry.objects.create(
+                    company_id=company_id,
+                    transaction=tx,
+                    account_id=account_id,
+                    cost_center_id=cc_id,
+                    debit_amount=line.get("debit_amount"),
+                    credit_amount=line.get("credit_amount"),
+                    description=desc,
+                    date=line_date,
+                    state=line.get("state", "pending"),
+                    bank_designation_pending=line.get("bank_designation_pending", False),
+                    is_cash=line.get("is_cash", False),
+                    cliente_erp_id=line.get("cliente_erp_id") or None,
+                    notes=line.get("notes") or None,
+                )
+                created.append(je)
+
+            update_journal_entries_and_transaction_flags(created)
+
+        out = JournalEntrySerializer(created, many=True, context={"request": request})
+        return Response(
+            {"transaction_id": tx.id, "journal_entries": out.data},
+            status=status.HTTP_201_CREATED,
+        )
     
     @action(detail=False, methods=['get'], url_path='unmatched')
     def unmatched(self, request, tenant_id=None):
@@ -1357,6 +1437,8 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             transaction_date=F('transaction__date'),
             transaction_description=F('transaction__description'),
             transaction_value=F('transaction__amount'),
+            numero_boleto=F('transaction__numero_boleto'),
+            cnpj=F('transaction__cnpj'),
             # Bank account fields
             bank_account_id=F('account__bank_account__id'),
             bank_account_name=F('account__bank_account__name'),
@@ -2127,6 +2209,24 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     def bulk_delete(self, request, *args, **kwargs):
         ids = request.data  # Assuming request.data is a list of IDs
         return generic_bulk_delete(self, ids)
+
+    @action(detail=False, methods=["post"], url_path="match_boletos")
+    def match_boletos(self, request, tenant_id=None):
+        """
+        Match bank lines to book lines by boleto number (book.numero_boleto in bank.numeros_boleto).
+
+        Optional JSON body:
+          - bank_ids: list of BankTransaction IDs
+          - book_ids: list of JournalEntry IDs
+          - amount_tolerance: decimal string (default 0.01)
+          - require_cnpj_match: bool
+          - max_group_size_book: int (default 20)
+        """
+        try:
+            result = ReconciliationService.match_boletos(request.data or {}, tenant_id=tenant_id)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result, status=status.HTTP_200_OK)
     
     def _scan_ofx_files(self, files_data):
         """

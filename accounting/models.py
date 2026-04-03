@@ -417,6 +417,21 @@ class Transaction(TenantAwareBaseModel):
         null=True, blank=True,
         help_text="When metrics were last calculated (system updated, read-only)"
     )
+
+    numero_boleto = models.CharField(
+        max_length=50,
+        blank=True,
+        null=True,
+        db_index=True,
+        help_text="Número do boleto associado a este lançamento contábil.",
+    )
+    cnpj = models.CharField(
+        max_length=14,
+        blank=True,
+        null=True,
+        db_index=True,
+        help_text="CNPJ da contraparte para conciliação.",
+    )
     
     class Meta:
         indexes = [
@@ -754,6 +769,20 @@ class BankTransaction(TenantAwareBaseModel):
     status = models.CharField(max_length=50, default="pending")
     balance_validated = models.BooleanField(default=False)  # <-- NEW FIELD
     tx_hash = models.CharField(max_length=64, blank=True, null=True, db_index=True)
+
+    numeros_boleto = ArrayField(
+        base_field=models.CharField(max_length=50),
+        default=list,
+        blank=True,
+        help_text="Lista de números de boleto extraídos desta movimentação bancária.",
+    )
+    cnpj = models.CharField(
+        max_length=14,
+        blank=True,
+        null=True,
+        db_index=True,
+        help_text="CNPJ da contraparte para conciliação.",
+    )
     
     description_embedding = VectorField(
         dimensions=768, 
@@ -860,6 +889,11 @@ class ReconciliationConfig(models.Model):
         default=False,
         help_text="If false, only match groups where all amounts have the same sign as the bank. "
                   "If true, allow groups that mix positive and negative amounts.",
+    )
+
+    require_cnpj_match = models.BooleanField(
+        default=False,
+        help_text="When True, only allow matches where non-empty bank and book CNPJs are equal.",
     )
     
     # Thresholds / limits

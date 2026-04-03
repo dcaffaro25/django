@@ -191,6 +191,56 @@ class JournalEntrySerializer(serializers.ModelSerializer):
             "notes",
         ]
 
+
+class JournalEntryDerivedLineSerializer(serializers.Serializer):
+    """One new journal line to create on the same transaction as the template entry."""
+
+    date = serializers.DateField(required=False, allow_null=True)
+    description = serializers.CharField(required=False, allow_blank=True, max_length=1000)
+    debit_amount = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    credit_amount = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    account_id = serializers.IntegerField()
+    cost_center_id = serializers.IntegerField(required=False, allow_null=True)
+    state = serializers.ChoiceField(
+        choices=[("pending", "Pending"), ("posted", "Posted"), ("canceled", "Canceled")],
+        default="pending",
+        required=False,
+    )
+    bank_designation_pending = serializers.BooleanField(required=False, default=False)
+    is_cash = serializers.BooleanField(required=False, default=False)
+    cliente_erp_id = serializers.CharField(required=False, allow_blank=True, max_length=128)
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        from decimal import Decimal
+
+        d = attrs.get("debit_amount")
+        c = attrs.get("credit_amount")
+        if d is None and c is None:
+            raise serializers.ValidationError("Each line must set debit_amount or credit_amount.")
+        d = d if d is not None else Decimal("0")
+        c = c if c is not None else Decimal("0")
+        if d == 0 and c == 0:
+            raise serializers.ValidationError("debit_amount and credit_amount cannot both be zero.")
+        if d > 0 and c > 0:
+            raise serializers.ValidationError("Use only one of debit_amount or credit_amount as the primary amount.")
+        return attrs
+
+
+class JournalEntryDeriveFromSerializer(serializers.Serializer):
+    """
+    Create one or more journal entries on the same transaction as template_journal_entry_id.
+    """
+
+    template_journal_entry_id = serializers.IntegerField()
+    entries = JournalEntryDerivedLineSerializer(many=True)
+
+    def validate_entries(self, value):
+        if not value:
+            raise serializers.ValidationError("Provide at least one entry in entries.")
+        return value
+
+
 class JournalEntryListSerializer(serializers.ModelSerializer):
     company = serializers.PrimaryKeyRelatedField(read_only=True)
     currency = serializers.PrimaryKeyRelatedField(read_only=True)
@@ -203,13 +253,18 @@ class JournalEntryListSerializer(serializers.ModelSerializer):
     bank_account = serializers.SerializerMethodField()
     reconciliation_status = serializers.SerializerMethodField()
     bank_date = serializers.SerializerMethodField()
+    numero_boleto = serializers.SerializerMethodField()
+    cnpj = serializers.SerializerMethodField()
+
+    transaction_id = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = JournalEntry
         fields = [
-            'id', 'company', 'entity', 'currency', 'description', 'bank_date', 'balance',
+            'id', 'transaction_id', 'company', 'entity', 'currency', 'description', 'bank_date', 'balance',
             'transaction_date', 'transaction_description', 'transaction_value',
             'bank_account', 'reconciliation_status', 'notes',
+            'numero_boleto', 'cnpj',
         ]
 
     def to_representation(self, instance):
@@ -238,8 +293,25 @@ class JournalEntryListSerializer(serializers.ModelSerializer):
         
         if hasattr(instance, 'reconciliation_status'):
             data['reconciliation_status'] = instance.reconciliation_status
+
+        if hasattr(instance, 'numero_boleto'):
+            data['numero_boleto'] = instance.numero_boleto
+        if hasattr(instance, 'cnpj'):
+            data['cnpj'] = instance.cnpj
         
         return data
+
+    def get_numero_boleto(self, obj):
+        if hasattr(obj, 'numero_boleto'):
+            return obj.numero_boleto
+        tx = getattr(obj, 'transaction', None)
+        return getattr(tx, 'numero_boleto', None) if tx else None
+
+    def get_cnpj(self, obj):
+        if hasattr(obj, 'cnpj'):
+            return obj.cnpj
+        tx = getattr(obj, 'transaction', None)
+        return getattr(tx, 'cnpj', None) if tx else None
 
     def get_transaction_date(self, obj):
         """Returns date from related transaction or annotation."""
@@ -331,7 +403,7 @@ class TransactionListSerializer(serializers.ModelSerializer):
             'journal_entries_count', 'balance', 'journal_entries_summary',
             'journal_entries_bank_accounts', 'reconciliation_status', 'notes',
             'is_balanced', 'bank_recon_status', 'bank_linked_je_count', 'bank_reconciled_je_count',
-            'total_debit', 'total_credit'
+            'total_debit', 'total_credit', 'numero_boleto', 'cnpj',
         ]
 
     def get_journal_entries_count(self, obj):
@@ -486,7 +558,8 @@ class BankTransactionSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'company', 'bank_account', 'entity', 'entity_name', 'currency', 'date', 
             'description', 'amount', 'status', #'transaction_type',
-            'is_deleted', 'updated_at', 'updated_by', 'reconciliation_status', 'notes'
+            'is_deleted', 'updated_at', 'updated_by', 'reconciliation_status', 'notes',
+            'numeros_boleto', 'cnpj',
         ]
         extra_kwargs = {
             "bank_account": {"queryset": BankAccount.objects.all()},
