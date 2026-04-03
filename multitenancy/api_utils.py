@@ -825,6 +825,8 @@ def get_dynamic_value(obj, field_name):
         if acct is None:
             return False
         return acct.bank_account_id is not None
+    if field_name == "is_reconciled" and isinstance(obj, BankTransaction):
+        return obj.reconciliations.filter(status__in=["matched", "approved"]).exists()
     if field_name.startswith('@'):
         method_name = f"get_{field_name[1:]}"  # Remove '@' and prepend 'get_'
         method = getattr(obj, method_name, None)
@@ -871,9 +873,9 @@ class BulkImportTemplateDownloadView(APIView):
             "Contract": ["__row_id", "cliente_erp_id", "name", "company_fk", "partner_fk", "contract_number", "start_date", "end_date", "recurrence_rule", "base_value", "base_index_date", "adjustment_index_fk", "adjustment_frequency", "adjustment_cap", "description"],
             "Invoice": ["__row_id", "cliente_erp_id", "name", "company_fk", "partner_fk", "invoice_type", "invoice_number", "invoice_date", "due_date", "status", "currency", "total_amount", "tax_amount", "discount_amount", "recurrence_rule", "recurrence_start_date", "recurrence_end_date", "description"],
             "InvoiceLine": ["__row_id", "cliente_erp_id", "name", "company_fk", "invoice_fk", "product_service_fk", "description", "quantity", "unit_price", "tax_amount"],
-            "Transaction": ["__row_id", "cliente_erp_id", "company_fk", "date", "entity_fk", "description", "amount", "currency_fk", "numero_boleto", "cnpj"],
-            "JournalEntry": ["__row_id", "cliente_erp_id", "date", "company_fk", "transaction_fk", "account_fk", "cost_center_fk", "debit_amount", "credit_amount"],
-            "BankTransaction": ["__row_id", "cliente_erp_id", "company_fk", "entity_fk", "bank_account_fk", "date", "amount", "description", "currency_fk", "transaction_type", "check_number", "reference_number", "payee", "memo", "account_number", "routing_number", "transaction_id", "numeros_boleto", "cnpj"],
+            "Transaction": ["__row_id", "cliente_erp_id", "company_fk", "date", "entity_fk", "description", "amount", "currency_fk", "numero_boleto", "cnpj", "is_balanced", "is_reconciled"],
+            "JournalEntry": ["__row_id", "cliente_erp_id", "date", "company_fk", "transaction_fk", "account_fk", "cost_center_fk", "debit_amount", "credit_amount", "is_reconciled"],
+            "BankTransaction": ["__row_id", "cliente_erp_id", "company_fk", "entity_fk", "bank_account_fk", "date", "amount", "description", "currency_fk", "transaction_type", "check_number", "reference_number", "payee", "memo", "account_number", "routing_number", "transaction_id", "numeros_boleto", "cnpj", "balance_validated"],
             "IntegrationRule": ["__row_id", "cliente_erp_id", "company_fk","name","description","trigger_event","execution_order","filter_conditions","rule","use_celery","is_active","last_run_at","times_executed"],
             "SubstitutionRule": ["__row_id", "cliente_erp_id", "company_fk","title","model_name","field_name","column_name","column_index","match_type","match_value","substitution_value","filter_conditions"],
             "Position": ["__row_id", "cliente_erp_id", "company_fk","title","description","department","hierarchy_level","min_salary","max_salary"],
@@ -946,9 +948,9 @@ class BulkImportTemplateDownloadView(APIView):
             ('FinancialIndex', FinancialIndex.objects.all(), ['id', 'cliente_erp_id', 'name', 'code']),
             ('Invoice', Invoice.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'invoice_number', 'invoice_date']),
             ('Contract', Contract.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'contract_number', 'start_date']),
-            ('Transaction', Transaction.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'date', 'entity_id', 'description', 'amount', 'state', 'numero_boleto', 'cnpj']),
-            ('JournalEntry', JournalEntry.objects.filter(company_id=tenant_id).select_related('account'), ['id', 'cliente_erp_id', 'transaction_id', 'account_id', 'account_is_bank_account', 'debit_amount', 'credit_amount', 'date']),
-            ('BankTransaction', BankTransaction.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'entity_id', 'bank_account_id', 'date', 'amount', 'description', 'transaction_type', 'status', 'numeros_boleto', 'cnpj']),
+            ('Transaction', Transaction.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'date', 'entity_id', 'description', 'amount', 'state', 'numero_boleto', 'cnpj', 'is_balanced', 'is_reconciled']),
+            ('JournalEntry', JournalEntry.objects.filter(company_id=tenant_id).select_related('account'), ['id', 'cliente_erp_id', 'transaction_id', 'account_id', 'account_is_bank_account', 'is_reconciled', 'debit_amount', 'credit_amount', 'date']),
+            ('BankTransaction', BankTransaction.objects.filter(company_id=tenant_id).prefetch_related('reconciliations'), ['id', 'cliente_erp_id', 'entity_id', 'bank_account_id', 'date', 'amount', 'description', 'transaction_type', 'status', 'numeros_boleto', 'cnpj', 'balance_validated', 'is_reconciled']),
             ("IntegrationRule", IntegrationRule.objects.filter(company_id=tenant_id), ["id", "cliente_erp_id", "company_id","name","description","trigger_event","execution_order","filter_conditions","rule","use_celery","is_active","last_run_at","times_executed"]),
             ("SubstitutionRule", SubstitutionRule.objects.filter(company_id=tenant_id), ["id", "cliente_erp_id", "company_id","title","model_name","field_name","column_name","column_index","match_type","match_value","substitution_value","filter_conditions"]),
             # NFe
