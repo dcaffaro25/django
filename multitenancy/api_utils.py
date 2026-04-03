@@ -820,6 +820,11 @@ def get_dynamic_value(obj, field_name):
     - If the field starts with '@', call the corresponding get_<field>() method if it exists.
     - Otherwise, return the attribute directly.
     """
+    if field_name == "account_is_bank_account" and isinstance(obj, JournalEntry):
+        acct = getattr(obj, "account", None)
+        if acct is None:
+            return False
+        return acct.bank_account_id is not None
     if field_name.startswith('@'):
         method_name = f"get_{field_name[1:]}"  # Remove '@' and prepend 'get_'
         method = getattr(obj, method_name, None)
@@ -942,7 +947,7 @@ class BulkImportTemplateDownloadView(APIView):
             ('Invoice', Invoice.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'invoice_number', 'invoice_date']),
             ('Contract', Contract.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'contract_number', 'start_date']),
             ('Transaction', Transaction.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'date', 'entity_id', 'description', 'amount', 'state', 'numero_boleto', 'cnpj']),
-            ('JournalEntry', JournalEntry.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'transaction_id', 'account_id', 'debit_amount', 'credit_amount', 'date']),
+            ('JournalEntry', JournalEntry.objects.filter(company_id=tenant_id).select_related('account'), ['id', 'cliente_erp_id', 'transaction_id', 'account_id', 'account_is_bank_account', 'debit_amount', 'credit_amount', 'date']),
             ('BankTransaction', BankTransaction.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'entity_id', 'bank_account_id', 'date', 'amount', 'description', 'transaction_type', 'status', 'numeros_boleto', 'cnpj']),
             ("IntegrationRule", IntegrationRule.objects.filter(company_id=tenant_id), ["id", "cliente_erp_id", "company_id","name","description","trigger_event","execution_order","filter_conditions","rule","use_celery","is_active","last_run_at","times_executed"]),
             ("SubstitutionRule", SubstitutionRule.objects.filter(company_id=tenant_id), ["id", "cliente_erp_id", "company_id","title","model_name","field_name","column_name","column_index","match_type","match_value","substitution_value","filter_conditions"]),
