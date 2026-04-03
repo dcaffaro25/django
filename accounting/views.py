@@ -746,6 +746,8 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             "Amount",
             "OriginalDescription",
             "CleanDescriptionForEmbedding",
+            "NumerosBoleto",
+            "CNPJ",
             "SuggestedNewJournalAccount",
             "SuggestedCostCenter",
             "SuggestedCounterparty",
@@ -758,6 +760,8 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             acct = getattr(bt, "bank_account", None)
             acct_name = getattr(acct, "name", "") if acct else ""
             cleaned = clean_description_for_embedding(bt.description or "")
+            nums = getattr(bt, "numeros_boleto", None) or []
+            numeros_str = ",".join(str(x) for x in nums) if nums else ""
             ws_banks.append(
                 [
                     bt.id,
@@ -768,6 +772,8 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     float(bt.amount or 0),
                     bt.description or "",
                     cleaned,
+                    numeros_str,
+                    bt.cnpj or "",
                     "",
                     "",
                     "",
@@ -798,6 +804,8 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             "EffectiveAmount",
             "OriginalDescription",
             "CleanDescriptionForEmbedding",
+            "NumeroBoleto",
+            "CNPJ",
             "UserNotes",
         ]
         ws_books.append(book_headers)
@@ -824,6 +832,8 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     float(eff_amt),
                     desc,
                     cleaned,
+                    getattr(tx, "numero_boleto", "") or "" if tx else "",
+                    getattr(tx, "cnpj", "") or "" if tx else "",
                     "",
                 ]
             )
