@@ -4,7 +4,7 @@ from django.contrib.auth import authenticate, login, logout
 from rest_framework import views, viewsets, generics, status, serializers
 from rest_framework.response import Response
 from .models import CustomUser, Company, Entity, IntegrationRule, SubstitutionRule, ImportTransformationRule, ETLPipelineLog
-from .mixins import ScopedQuerysetMixin
+from .mixins import ScopedQuerysetMixin, SoftDeleteQuerysetMixin, apply_soft_delete_filter
 from .serializers import (
     CustomUserSerializer, CompanySerializer, EntitySerializer, UserLoginSerializer,
     IntegrationRuleSerializer, EntityMiniSerializer, ChangePasswordSerializer,
@@ -255,7 +255,7 @@ class CustomUserViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             return create_excel_response(serializer.data)
         return super().list(request, *args, **kwargs)
 
-class CompanyViewSet(viewsets.ModelViewSet):
+class CompanyViewSet(SoftDeleteQuerysetMixin, viewsets.ModelViewSet):
     #queryset = Company.objects.none()
     serializer_class = CompanySerializer
 
@@ -311,8 +311,10 @@ class CompanyViewSet(viewsets.ModelViewSet):
         state_in = request.query_params.get('state__in')
         include_empty = request.query_params.get('include_empty', 'false').lower() in ('true', '1', 'yes')
         
-        # Base transaction queryset
-        tx_qs = Transaction.objects.all()
+        # Base transaction queryset (respect ``deleted`` query param like other APIs)
+        tx_qs = apply_soft_delete_filter(Transaction.objects.all(), request)
+        je_qs = apply_soft_delete_filter(JournalEntry.objects.all(), request)
+        recon_qs = apply_soft_delete_filter(Reconciliation.objects.all(), request)
         
         if date_from:
             tx_qs = tx_qs.filter(date__gte=date_from)
@@ -323,12 +325,12 @@ class CompanyViewSet(viewsets.ModelViewSet):
             tx_qs = tx_qs.filter(state__in=states)
         
         # Subqueries for bank reconciliation status
-        bank_linked_jes = JournalEntry.objects.filter(
+        bank_linked_jes = je_qs.filter(
             transaction_id=OuterRef('id'),
             account__bank_account__isnull=False
         )
         
-        ok_recon = Reconciliation.objects.filter(
+        ok_recon = recon_qs.filter(
             journal_entries__id=OuterRef('id'),
             status__in=['matched', 'approved']
         )
@@ -707,16 +709,17 @@ class EntityTreeView(generics.ListAPIView):
         if hasattr(self.request, 'tenant'):
             if self.request.tenant == 'all':
                 # Handle 'all' differently if needed, for example, return all entities or handle as not allowed
-                return Entity.objects.all()
+                qs = Entity.objects.all()
             else:
                 # Assuming 'company_id' is still relevant, ensure it matches request.tenant as well for extra security
                 company_id = self.kwargs['company_id']
                 if str(self.request.tenant.id) == company_id:
-                    return Entity.objects.filter(company_id=company_id)
+                    qs = Entity.objects.filter(company_id=company_id)
                 else:
-                    return Entity.objects.none()  # Or handle as appropriate
+                    qs = Entity.objects.none()  # Or handle as appropriate
+            return apply_soft_delete_filter(qs, self.request)
         else:
-            return Entity.objects.none()  # Or handle as appropriate
+            return apply_soft_delete_filter(Entity.objects.none(), self.request)
 
 class ValidateRuleView(APIView):
 
@@ -816,7 +819,7 @@ class ExecuteRuleView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         
-class SubstitutionRuleViewSet(viewsets.ModelViewSet):
+class SubstitutionRuleViewSet(SoftDeleteQuerysetMixin, viewsets.ModelViewSet):
     """
     CRUD de regras de substituição (de‑para).
     """
@@ -875,6 +878,70 @@ def _scrub_json(o):
             pass
     return o
 
+
+def _resolve_bulk_import_company_id(request):
+    """
+    Resolve which company an Excel bulk import applies to.
+
+    Precedence:
+    1. Explicit ``company_id`` in multipart/form (must match URL tenant for non-superusers).
+    2. ``request.tenant`` when set by middleware (e.g. ``/{tenant_id}/api/...``).
+    3. ``request.user.company_id`` if present.
+
+    Returns ``(company_id: int | None, error_response: Response | None)``.
+    """
+    tenant = getattr(request, "tenant", None)
+    tenant_id = None
+    if tenant and tenant != "all" and hasattr(tenant, "id"):
+        tenant_id = int(tenant.id)
+
+    raw = request.data.get("company_id")
+    company_id = None
+    if raw is not None and str(raw).strip() != "":
+        try:
+            company_id = int(raw)
+        except (TypeError, ValueError):
+            return None, Response({"error": "company_id must be an integer"}, status=status.HTTP_400_BAD_REQUEST)
+
+    if company_id is None:
+        if tenant_id is not None:
+            company_id = tenant_id
+        else:
+            u = getattr(request.user, "company_id", None)
+            if u is not None:
+                try:
+                    company_id = int(u)
+                except (TypeError, ValueError):
+                    company_id = None
+    elif tenant_id is not None and not getattr(request.user, "is_superuser", False):
+        if int(company_id) != tenant_id:
+            return None, Response(
+                {
+                    "error": "company_id does not match request tenant",
+                    "detail": (
+                        f"The URL tenant is company {tenant_id}, but company_id={company_id} was sent. "
+                        f"Use company_id={tenant_id} or omit company_id to use the tenant."
+                    ),
+                    "tenant_company_id": tenant_id,
+                    "company_id_requested": company_id,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    if not company_id:
+        return None, Response(
+            {
+                "error": "No company defined",
+                "hint": (
+                    "Send multipart field company_id, use a tenant-scoped URL "
+                    "e.g. /{tenant_subdomain_or_id}/api/core/bulk-import/, or set user.company_id."
+                ),
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return company_id, None
+
+
 class BulkImportAPIView(APIView):
     
     if settings.AUTH_OFF:
@@ -905,9 +972,9 @@ class BulkImportAPIView(APIView):
         commit = _to_bool(request.data.get("commit"), default=False)
         use_celery = _to_bool(request.data.get("use_celery"), default=False)
 
-        company_id = request.data.get("company_id") or getattr(request.user, "company_id", None)
-        if not company_id:
-            return Response({"error": "No company defined"}, status=400)
+        company_id, err = _resolve_bulk_import_company_id(request)
+        if err is not None:
+            return err
         
         file_meta = {"sha256": file_sha256, "size": size, "filename": getattr(up, "name", None)}
         

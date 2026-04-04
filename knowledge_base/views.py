@@ -11,7 +11,7 @@ from django.shortcuts import get_object_or_404
 from django.core.files.uploadedfile import InMemoryUploadedFile
 from django.views.generic import TemplateView
 
-from multitenancy.mixins import ScopedQuerysetMixin
+from multitenancy.mixins import ScopedQuerysetMixin, SoftDeleteQuerysetMixin
 from .models import KnowledgeBase, KnowledgeDocument, Answer, AnswerFeedback
 from .serializers import (
     KnowledgeBaseSerializer,
@@ -363,7 +363,7 @@ class KnowledgeDocumentViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSe
         return qs
 
 
-class AnswerFeedbackView(viewsets.ModelViewSet):
+class AnswerFeedbackView(SoftDeleteQuerysetMixin, viewsets.ModelViewSet):
     """
     ViewSet for answer feedback.
     """

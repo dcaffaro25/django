@@ -237,7 +237,9 @@ def _assert_import_tenant_scope(instance: Any, company_id: Optional[int]) -> Non
     cid = getattr(instance, "company_id", None)
     if cid is not None and int(cid) != int(company_id):
         raise ValueError(
-            f"Record id={instance.pk} belongs to company {cid}, not {company_id}"
+            f"Record id={instance.pk} belongs to company {cid}, not import target {company_id}. "
+            f"Send company_id={cid} in the bulk-import multipart form (field company_id), "
+            f"or call the API under /{cid}/api/... so the tenant matches the rows you delete."
         )
 
 

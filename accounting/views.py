@@ -13,7 +13,7 @@ from itertools import product, combinations
 from multitenancy.api_utils import generic_bulk_create, generic_bulk_update, generic_bulk_delete
 from multitenancy.utils import resolve_tenant
 from multitenancy.models import CustomUser, Company, Entity
-from multitenancy.mixins import ScopedQuerysetMixin
+from multitenancy.mixins import ScopedQuerysetMixin, SoftDeleteQuerysetMixin
 from .models import (Currency, Account, Transaction, JournalEntry, Rule, CostCenter, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter,ReconciliationTask, ReconciliationConfig, ReconciliationSuggestion, ReconciliationRule)
 from .serializers import (CurrencySerializer, AccountSerializer, TransactionSerializer, CostCenterSerializer, JournalEntrySerializer, JournalEntryListSerializer, JournalEntryDeriveFromSerializer, RuleSerializer, BankSerializer, BankAccountSerializer, BankTransactionSerializer, ReconciliationSerializer, TransactionListSerializer,ReconciliationTaskSerializer,ReconciliationConfigSerializer)
 from .services.transaction_service import *
@@ -229,7 +229,7 @@ def _label_suggestions_for_match(
         )
 
 # Currency ViewSet
-class CurrencyViewSet(viewsets.ModelViewSet):
+class CurrencyViewSet(SoftDeleteQuerysetMixin, viewsets.ModelViewSet):
     queryset = Currency.objects.all()
     serializer_class = CurrencySerializer
     
@@ -1880,7 +1880,7 @@ class RuleViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return generic_bulk_delete(self, ids)
     
 # Bank ViewSet
-class BankViewSet(viewsets.ModelViewSet):
+class BankViewSet(SoftDeleteQuerysetMixin, viewsets.ModelViewSet):
     queryset = Bank.objects.all()
     serializer_class = BankSerializer
     if settings.AUTH_OFF:

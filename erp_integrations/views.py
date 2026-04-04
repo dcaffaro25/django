@@ -9,7 +9,7 @@ from rest_framework.views import APIView
 from django.db.models import Q
 from django_filters.rest_framework import DjangoFilterBackend
 
-from multitenancy.mixins import ScopedQuerysetMixin
+from multitenancy.mixins import ScopedQuerysetMixin, SoftDeleteQuerysetMixin
 
 from .erp_etl import execute_erp_etl_import
 from .filters import ERPRawRecordFilter, apply_json_field_filters
@@ -45,7 +45,7 @@ class ERPConnectionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return ERPConnectionSerializer
 
 
-class ERPAPIDefinitionViewSet(viewsets.ReadOnlyModelViewSet):
+class ERPAPIDefinitionViewSet(SoftDeleteQuerysetMixin, viewsets.ReadOnlyModelViewSet):
     """Read-only list of API definitions (global, not tenant-scoped)."""
 
     queryset = ERPAPIDefinition.objects.filter(is_active=True).select_related("provider").order_by("provider__slug", "call")

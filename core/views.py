@@ -16,6 +16,8 @@ from .serializers import (
 )
 from datetime import datetime
 
+from multitenancy.mixins import SoftDeleteQuerysetMixin, apply_soft_delete_filter
+
 # core/views.py
 from rest_framework.generics import ListAPIView
 from rest_framework.views import APIView
@@ -200,7 +202,7 @@ class CeleryTaskControlView(APIView):
             return Response({"ok": False, "error": "Unknown action"}, status=400)
 
 
-class FinancialIndexViewSet(viewsets.ModelViewSet):
+class FinancialIndexViewSet(SoftDeleteQuerysetMixin, viewsets.ModelViewSet):
     queryset = FinancialIndex.objects.all()
     serializer_class = FinancialIndexSerializer
     #filter_backends = [DjangoFilterBackend]
@@ -209,7 +211,7 @@ class FinancialIndexViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'])
     def quotes(self, request, pk=None):
         index = self.get_object()
-        quotes = index.quotes.all()
+        quotes = apply_soft_delete_filter(index.quotes.all(), request)
         use_mini = request.query_params.get("mini", "false") == "true"
         serializer = IndexQuoteMiniSerializer(quotes, many=True) if use_mini else IndexQuoteSerializer(quotes, many=True)
         return Response(serializer.data)
@@ -217,19 +219,19 @@ class FinancialIndexViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'])
     def forecast(self, request, pk=None):
         index = self.get_object()
-        forecasts = index.forecast_quotes.all()
+        forecasts = apply_soft_delete_filter(index.forecast_quotes.all(), request)
         serializer = FinancialIndexQuoteForecastSerializer(forecasts, many=True)
         return Response(serializer.data)
 
 
-class IndexQuoteViewSet(viewsets.ModelViewSet):
+class IndexQuoteViewSet(SoftDeleteQuerysetMixin, viewsets.ModelViewSet):
     queryset = IndexQuote.objects.all()
     serializer_class = IndexQuoteSerializer
     #filter_backends = [DjangoFilterBackend]
     filterset_fields = ['index', 'date']
 
 
-class FinancialIndexQuoteForecastViewSet(viewsets.ModelViewSet):
+class FinancialIndexQuoteForecastViewSet(SoftDeleteQuerysetMixin, viewsets.ModelViewSet):
     queryset = FinancialIndexQuoteForecast.objects.all()
     serializer_class = FinancialIndexQuoteForecastSerializer
     #filter_backends = [DjangoFilterBackend]

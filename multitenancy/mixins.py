@@ -1,6 +1,47 @@
 # multitenancy/mixins.py
 from django.http import Http404
 
+
+def model_has_soft_delete(model):
+    return any(getattr(f, "name", None) == "is_deleted" for f in model._meta.fields)
+
+
+def apply_soft_delete_filter(qs, request):
+    """
+    Restrict queryset by is_deleted using the ``deleted`` query parameter:
+
+    - Omitted or empty: only rows with ``is_deleted=False`` (default API behavior).
+    - ``deleted=all``: all rows (no filter on ``is_deleted``).
+    - ``deleted=only``: only rows with ``is_deleted=True``.
+
+    If the model has no ``is_deleted`` field, ``qs`` is returned unchanged.
+    """
+    if qs is None:
+        return qs
+    model = qs.model
+    if not model_has_soft_delete(model):
+        return qs
+
+    params = getattr(request, "query_params", None) or getattr(request, "GET", {})
+    raw = (params.get("deleted") or "").strip().lower()
+    if raw in ("all", "include", "true", "1", "yes"):
+        return qs
+    if raw in ("only", "soft", "deleted_only", "only_deleted"):
+        return qs.filter(is_deleted=True)
+    return qs.filter(is_deleted=False)
+
+
+class SoftDeleteQuerysetMixin:
+    """
+    Apply :func:`apply_soft_delete_filter` after ``super().get_queryset()``.
+    Use on viewsets that do *not* use :class:`ScopedQuerysetMixin` but whose
+    model inherits ``BaseModel`` / ``TenantAwareBaseModel`` with ``is_deleted``.
+    """
+
+    def get_queryset(self):
+        return apply_soft_delete_filter(super().get_queryset(), self.request)
+
+
 class ScopedQuerysetMixin:
     """
     A reusable mixin that applies tenant and user scoping rules.
@@ -20,27 +61,30 @@ class ScopedQuerysetMixin:
         # 🔹 Superuser can see everything
         if user.is_superuser:
             if tenant and tenant != "all":
-                return qs.filter(company=tenant)
-            return qs
+                qs = qs.filter(company=tenant)
+            return apply_soft_delete_filter(qs, self.request)
 
         # 🔹 Regular user
         model = qs.model
 
         # If querying CustomUser, restrict to own record
         if model.__name__ == "CustomUser":
-            return qs.filter(id=user.id)
+            qs = qs.filter(id=user.id)
+            return apply_soft_delete_filter(qs, self.request)
 
         # Otherwise, restrict by tenant if available
         if tenant and tenant != "all":
             if hasattr(model, "company_id"):
-                return qs.filter(company=tenant)
+                qs = qs.filter(company=tenant)
             elif hasattr(model, "entity") and hasattr(model.entity, "company_id"):
-                return qs.filter(entity__company=tenant)
-            # fallback: deny access if no tenant relation
-            raise Http404("Tenant scoping not available for this model.")
+                qs = qs.filter(entity__company=tenant)
+            else:
+                # fallback: deny access if no tenant relation
+                raise Http404("Tenant scoping not available for this model.")
+            return apply_soft_delete_filter(qs, self.request)
 
         # Fallback: no tenant, just return empty set
-        return qs.none()
+        return apply_soft_delete_filter(qs.none(), self.request)
 
 class TenantQuerysetMixin2:
     """
