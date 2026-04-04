@@ -5,11 +5,11 @@ from django.apps import apps
 from django.contrib.admin.views.main import ChangeList
 from django.contrib.admin.utils import model_ngettext
 from django.db import transaction as db_transaction
-from django.db.models import Count, Sum, F, DecimalField
+from django.db.models import Count, Sum, F, DecimalField, Q
 from django.db.models.functions import Coalesce
 from django import forms
 from django.shortcuts import render, redirect
-from django.urls import path
+from django.urls import path, reverse
 from django.utils.html import format_html
 from django.contrib import messages
 
@@ -740,21 +740,170 @@ def delete_reconciliations_for_bank_transactions(bank_transaction_ids, disable_s
     return deleted_count, affected_bank_transaction_ids
 
 
+class JournalEntryInline(admin.TabularInline):
+    """Journal lines shown on the Transaction change page."""
+
+    model = JournalEntry
+    extra = 0
+    fields = (
+        "id",
+        "is_deleted",
+        "account",
+        "cost_center",
+        "debit_amount",
+        "credit_amount",
+        "state",
+        "date",
+        "is_cash",
+        "is_reconciled",
+        "description",
+    )
+    readonly_fields = ("id", "is_deleted", "is_cash", "is_reconciled")
+    autocomplete_fields = ("account", "cost_center")
+    show_change_link = True
+    ordering = ("id",)
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related("account", "cost_center")
+
+
 @admin.register(Transaction)
 class TransactionAdmin(CompanyScopedAdmin):
     list_display = (
-        "id", "date", "description", "amount", "entity", "currency", "state",
-        "journal_entries_count", "transaction_balance",
-        "avg_payment_day_delta", "total_amount_discrepancy", "avg_amount_discrepancy",
-        "avg_bank_payment_date_delta", "min_bank_payment_date_delta", "max_bank_payment_date_delta",
-        "exact_match_count", "perfect_match_count", "reconciliation_rate",
-        "metrics_last_calculated_at",
-        "company", "notes"
+        "id",
+        "is_deleted",
+        "date",
+        "description",
+        "amount",
+        "entity",
+        "currency",
+        "state",
+        "is_balanced",
+        "journal_entries_count",
+        "transaction_balance",
+        "company",
     )
-    list_filter = ("state", "currency", "entity", "company", "date", "notes")
+    list_select_related = ("entity", "currency", "company")
+    list_filter = ("is_deleted", "state", "currency", "entity", "company", "date", "notes")
     autocomplete_fields = ("company", "entity", "currency")
-    search_fields = ("description", "entity__name", "notes")
-    
+    search_fields = (
+        "description",
+        "entity__name",
+        "notes",
+        "cliente_erp_id",
+        "numero_boleto",
+        "cnpj",
+    )
+    inlines = (JournalEntryInline,)
+    readonly_fields = (
+        "description_embedding",
+        "is_balanced",
+        "is_reconciled",
+        "is_posted",
+        "balance_validated",
+        "avg_payment_day_delta",
+        "min_payment_day_delta",
+        "max_payment_day_delta",
+        "total_amount_discrepancy",
+        "avg_amount_discrepancy",
+        "exact_match_count",
+        "perfect_match_count",
+        "avg_bank_payment_date_delta",
+        "min_bank_payment_date_delta",
+        "max_bank_payment_date_delta",
+        "reconciliation_rate",
+        "days_outstanding",
+        "metrics_last_calculated_at",
+    )
+    fieldsets = (
+        (
+            "Core",
+            {
+                "fields": (
+                    "date",
+                    "entity",
+                    "description",
+                    "amount",
+                    "currency",
+                    "state",
+                    "is_deleted",
+                ),
+            },
+        ),
+        (
+            "Matching / boleto",
+            {
+                "fields": ("numero_boleto", "cnpj", "cliente_erp_id"),
+            },
+        ),
+        (
+            "Balance flags",
+            {
+                "fields": (
+                    "is_balanced",
+                    "is_reconciled",
+                    "is_posted",
+                    "balance_validated",
+                ),
+            },
+        ),
+        (
+            "Reconciliation metrics",
+            {
+                "classes": ("collapse",),
+                "fields": (
+                    "avg_payment_day_delta",
+                    "min_payment_day_delta",
+                    "max_payment_day_delta",
+                    "total_amount_discrepancy",
+                    "avg_amount_discrepancy",
+                    "exact_match_count",
+                    "perfect_match_count",
+                    "avg_bank_payment_date_delta",
+                    "min_bank_payment_date_delta",
+                    "max_bank_payment_date_delta",
+                    "reconciliation_rate",
+                    "days_outstanding",
+                    "metrics_last_calculated_at",
+                ),
+            },
+        ),
+        (
+            "Metadata",
+            {
+                "fields": ("company", "notes", "rules"),
+            },
+        ),
+        (
+            "ML / embeddings",
+            {
+                "classes": ("collapse",),
+                "fields": ("description_embedding",),
+            },
+        ),
+    )
+
+    def save_formset(self, request, form, formset, change):
+        instances = formset.save(commit=False)
+        parent = form.instance
+        for obj in instances:
+            if hasattr(obj, "company_id") and not obj.company_id and getattr(parent, "company_id", None):
+                obj.company_id = parent.company_id
+            obj.save()
+        formset.save_m2m()
+        for obj in formset.deleted_objects:
+            obj.delete()
+
+    def get_search_results(self, request, queryset, search_term):
+        queryset, use_distinct = super().get_search_results(request, queryset, search_term)
+        term = (search_term or "").strip()
+        if term.isdigit():
+            pk = int(term)
+            numeric_qs = queryset.filter(Q(pk=pk) | Q(journal_entries__id=pk))
+            queryset = (queryset | numeric_qs).distinct()
+            use_distinct = True
+        return queryset, use_distinct
+
     def get_queryset(self, request):
         """Optimize queryset with annotations for journal entry count and balance"""
         queryset = super().get_queryset(request)
@@ -881,15 +1030,21 @@ class TransactionAdmin(CompanyScopedAdmin):
 @admin.register(JournalEntry)
 class JournalEntryAdmin(CompanyScopedAdmin):
     list_display = (
-        "id", "transaction", "account", "cost_center",
-        "debit_amount", "credit_amount", "state", "date",
-        "payment_day_delta", "journal_entry_date_delta", "bank_payment_date_delta", "amount_discrepancy",
-        "is_exact_match", "is_date_match", "is_perfect_match",
-        "account_confidence_score", "account_historical_matches",
-        "metrics_last_calculated_at",
-        "company", "notes"
+        "id",
+        "is_deleted",
+        "transaction_link",
+        "account",
+        "cost_center",
+        "debit_amount",
+        "credit_amount",
+        "state",
+        "date",
+        "is_cash",
+        "is_reconciled",
+        "company",
     )
-    list_filter = ("state", "date", "company", "notes")
+    list_select_related = ("transaction", "account", "cost_center", "company")
+    list_filter = ("is_deleted", "state", "date", "company", "notes")
     autocomplete_fields = ("company", "transaction", "account", "cost_center")
     search_fields = (
         "transaction__description",
@@ -897,8 +1052,99 @@ class JournalEntryAdmin(CompanyScopedAdmin):
         "account__account_code",
         "cost_center__name",
         "notes",
+        "cliente_erp_id",
+        "description",
     )
-    
+    readonly_fields = (
+        "is_cash",
+        "is_reconciled",
+        "bank_designation_pending",
+        "payment_day_delta",
+        "journal_entry_date_delta",
+        "bank_payment_date_delta",
+        "amount_discrepancy",
+        "is_exact_match",
+        "is_date_match",
+        "is_perfect_match",
+        "account_confidence_score",
+        "account_historical_matches",
+        "metrics_last_calculated_at",
+    )
+    fieldsets = (
+        (
+            "Core",
+            {
+                "fields": (
+                    "transaction",
+                    "account",
+                    "cost_center",
+                    "debit_amount",
+                    "credit_amount",
+                    "state",
+                    "date",
+                    "description",
+                    "is_deleted",
+                ),
+            },
+        ),
+        (
+            "Flags",
+            {
+                "fields": (
+                    "is_cash",
+                    "is_reconciled",
+                    "bank_designation_pending",
+                ),
+            },
+        ),
+        (
+            "Reconciliation metrics",
+            {
+                "classes": ("collapse",),
+                "fields": (
+                    "payment_day_delta",
+                    "journal_entry_date_delta",
+                    "bank_payment_date_delta",
+                    "amount_discrepancy",
+                    "is_exact_match",
+                    "is_date_match",
+                    "is_perfect_match",
+                    "account_confidence_score",
+                    "account_historical_matches",
+                    "metrics_last_calculated_at",
+                ),
+            },
+        ),
+        (
+            "Metadata",
+            {
+                "fields": ("company", "notes", "cliente_erp_id"),
+            },
+        ),
+    )
+
+    @admin.display(description="Transaction", ordering="transaction__id")
+    def transaction_link(self, obj):
+        if not obj.transaction_id:
+            return "—"
+        url = reverse("admin:accounting_transaction_change", args=[obj.transaction_id])
+        tx = obj.transaction
+        full = tx.description or ""
+        desc = full[:40]
+        if len(full) > 40:
+            desc += "…"
+        return format_html('<a href="{}">#{}</a> {}', url, obj.transaction_id, desc)
+
+    def get_search_results(self, request, queryset, search_term):
+        queryset, use_distinct = super().get_search_results(request, queryset, search_term)
+        term = (search_term or "").strip()
+        if term.isdigit():
+            pk = int(term)
+            numeric_qs = queryset.filter(Q(pk=pk) | Q(transaction_id=pk))
+            queryset = (queryset | numeric_qs).distinct()
+            use_distinct = True
+        return queryset, use_distinct
+
     @admin.action(description="Delete selected journal entries (with reconciliations, keep transactions)")
     def fast_delete_selected(self, request, queryset):
         """
