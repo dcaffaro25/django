@@ -259,7 +259,10 @@ def _soft_delete_with_collector(instance: Any) -> str:
     soft-deleted parents remain in the database, so FKs pointing to them stay valid.
     Processing order matches ``Collector.delete()`` (sort → fast_deletes → batches).
     """
-    using = router.db_for_write(instance.__class__, instance)
+    # db_for_write(model, **hints) — instance must be a keyword arg (not positional).
+    using = getattr(instance._state, "db", None) or router.db_for_write(
+        instance.__class__, instance=instance
+    )
     collector = Collector(using=using, origin=instance.__class__)
     collector.collect([instance])
 
