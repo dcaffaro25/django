@@ -812,7 +812,46 @@ class BulkImportTemplateDownloadView2(APIView):
             content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             headers={'Content-Disposition': f'attachment; filename="{filename}"'},
         )
-    
+
+
+def _reference_column_names(model_class):
+    """
+    Every concrete DB column for References export (model._meta.fields order),
+    excluding pgvector embeddings (too large for Excel). Inserts @path after
+    parent_id for MPTT models; adds computed columns for JournalEntry and BankTransaction.
+    """
+    try:
+        from pgvector.django import VectorField
+    except ImportError:
+        VectorField = None
+    try:
+        from mptt.models import MPTTModel
+    except ImportError:
+        MPTTModel = None  # type: ignore
+
+    names = []
+    for field in model_class._meta.fields:
+        if VectorField is not None and isinstance(field, VectorField):
+            continue
+        names.append(field.attname)
+
+    if MPTTModel is not None and "parent_id" in names and issubclass(model_class, MPTTModel):
+        names.insert(names.index("parent_id") + 1, "@path")
+
+    if model_class is JournalEntry:
+        if "account_id" in names:
+            names.insert(names.index("account_id") + 1, "account_is_bank_account")
+        else:
+            names.append("account_is_bank_account")
+
+    if model_class is BankTransaction:
+        if "entity_id" not in names:
+            names.append("entity_id")
+        if "is_reconciled" not in names:
+            names.append("is_reconciled")
+
+    return names
+
 
 def get_dynamic_value(obj, field_name):
     """
@@ -827,6 +866,18 @@ def get_dynamic_value(obj, field_name):
         return acct.bank_account_id is not None
     if field_name == "is_reconciled" and isinstance(obj, BankTransaction):
         return obj.reconciliations.filter(status__in=["matched", "approved"]).exists()
+    if field_name == "@path":
+        fn = getattr(obj, "get_path", None)
+        if callable(fn):
+            return fn()
+        if hasattr(obj, "get_ancestors"):
+            try:
+                return " > ".join(
+                    getattr(a, "name", str(a)) for a in obj.get_ancestors(include_self=True)
+                )
+            except Exception:
+                return None
+        return None
     if field_name.startswith('@'):
         method_name = f"get_{field_name[1:]}"  # Remove '@' and prepend 'get_'
         method = getattr(obj, method_name, None)
@@ -934,31 +985,38 @@ class BulkImportTemplateDownloadView(APIView):
         col_position = 1  # Start at column A
 
         references = [
-            ("Company", Company.objects.all(), ["id", "name", "subdomain", "notes"]),
-            ('Currency', Currency.objects.all(), ['id', 'cliente_erp_id', 'code', 'name', 'notes']),
-            ('Bank', Bank.objects.all(), ['id', 'cliente_erp_id', 'name', 'bank_code', 'notes']),
-            ("BankAccount", BankAccount.objects.all(), ["id", "cliente_erp_id", "name", "branch_id", "account_number", "company_id", "entity_id", "currency_id", "bank_id", "balance_date", "balance", "notes"],),
-            ('Entity', Entity.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'name', 'parent_id', '@path', 'notes']),
-            ('CostCenter', CostCenter.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'name', 'notes']),
-            ('Account', Account.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'name', 'account_code', 'parent_id', '@path', 'account_direction', 'bank_account_id', 'balance_date', 'balance', 'notes']),
-            ('BusinessPartnerCategory', BusinessPartnerCategory.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'name', 'parent_id', '@path', 'notes']),
-            ('BusinessPartner', BusinessPartner.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'name', 'partner_type', 'notes']),
-            ('ProductServiceCategory', ProductServiceCategory.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'name', 'parent_id', '@path', 'notes']),
-            ('ProductService', ProductService.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'name', 'code', 'notes']),
-            ('FinancialIndex', FinancialIndex.objects.all(), ['id', 'cliente_erp_id', 'name', 'code', 'notes']),
-            ('Invoice', Invoice.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'invoice_number', 'invoice_date', 'notes']),
-            ('Contract', Contract.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'contract_number', 'start_date']),
-            ('Transaction', Transaction.objects.filter(company_id=tenant_id), ['id', 'cliente_erp_id', 'date', 'entity_id', 'description', 'amount', 'state', 'numero_boleto', 'cnpj', 'is_balanced', 'is_reconciled', 'notes']),
-            ('JournalEntry', JournalEntry.objects.filter(company_id=tenant_id).select_related('account'), ['id', 'cliente_erp_id', 'transaction_id', 'account_id', 'account_is_bank_account', 'is_reconciled', 'debit_amount', 'credit_amount', 'date', 'notes']),
-            ('BankTransaction', BankTransaction.objects.filter(company_id=tenant_id).prefetch_related('reconciliations'), ['id', 'cliente_erp_id', 'entity_id', 'bank_account_id', 'date', 'amount', 'description', 'transaction_type', 'status', 'numeros_boleto', 'cnpj', 'balance_validated', 'is_reconciled', 'notes']),
-            ("IntegrationRule", IntegrationRule.objects.filter(company_id=tenant_id), ["id", "cliente_erp_id", "company_id","name","description","trigger_event","execution_order","filter_conditions","rule","use_celery","is_active","last_run_at","times_executed","notes"]),
-            ("SubstitutionRule", SubstitutionRule.objects.filter(company_id=tenant_id), ["id", "cliente_erp_id", "company_id","title","model_name","field_name","column_name","column_index","match_type","match_value","substitution_value","filter_conditions","notes"]),
-            # NFe
-            ("NotaFiscal", NotaFiscal.objects.filter(company_id=tenant_id), ["id", "cliente_erp_id", "company_id", "chave", "numero", "serie", "modelo", "data_emissao", "emit_cnpj", "emit_nome", "dest_cnpj", "dest_nome", "valor_nota", "valor_produtos", "valor_icms", "valor_icms_st", "valor_ipi", "valor_pis", "valor_cofins", "valor_icms_uf_dest", "valor_trib_aprox", "transporte_json", "financeiro_json", "referencias_json", "totais_json", "emitente_id", "destinatario_id", "notes"]),
-            ("NotaFiscalItem", NotaFiscalItem.objects.filter(company_id=tenant_id), ["id", "cliente_erp_id", "company_id", "nota_fiscal_id", "numero_item", "codigo_produto", "descricao", "ncm", "cfop", "quantidade", "valor_unitario", "valor_total", "produto_id", "icms_origem", "icms_cst", "icms_base", "icms_aliquota", "icms_valor", "icms_st_base", "icms_st_valor", "pis_cst", "pis_base", "pis_aliquota", "pis_valor", "cofins_cst", "cofins_base", "cofins_aliquota", "cofins_valor", "ipi_cst", "ipi_valor", "icms_uf_dest_base", "icms_uf_dest_valor", "icms_uf_remet_valor", "impostos_json", "notes"]),
-            ("NotaFiscalReferencia", NotaFiscalReferencia.objects.filter(company_id=tenant_id), ["id", "cliente_erp_id", "company_id", "nota_fiscal_id", "chave_referenciada", "nota_referenciada_id", "notes"]),
-            ("NFeEvento", NFeEvento.objects.filter(company_id=tenant_id), ["id", "cliente_erp_id", "company_id", "chave_nfe", "tipo_evento", "n_seq_evento", "data_evento", "descricao", "status_sefaz", "nota_fiscal_id", "notes"]),
-            ("NFeInutilizacao", NFeInutilizacao.objects.filter(company_id=tenant_id), ["id", "cliente_erp_id", "company_id", "ano", "serie", "n_nf_ini", "n_nf_fin", "cnpj", "status_sefaz", "data_registro", "notes"]),
+            ("Company", Company.objects.all(), _reference_column_names(Company)),
+            ("Currency", Currency.objects.all(), _reference_column_names(Currency)),
+            ("Bank", Bank.objects.all(), _reference_column_names(Bank)),
+            ("BankAccount", BankAccount.objects.all(), _reference_column_names(BankAccount)),
+            ("Entity", Entity.objects.filter(company_id=tenant_id), _reference_column_names(Entity)),
+            ("CostCenter", CostCenter.objects.filter(company_id=tenant_id), _reference_column_names(CostCenter)),
+            ("Account", Account.objects.filter(company_id=tenant_id), _reference_column_names(Account)),
+            ("BusinessPartnerCategory", BusinessPartnerCategory.objects.filter(company_id=tenant_id), _reference_column_names(BusinessPartnerCategory)),
+            ("BusinessPartner", BusinessPartner.objects.filter(company_id=tenant_id), _reference_column_names(BusinessPartner)),
+            ("ProductServiceCategory", ProductServiceCategory.objects.filter(company_id=tenant_id), _reference_column_names(ProductServiceCategory)),
+            ("ProductService", ProductService.objects.filter(company_id=tenant_id), _reference_column_names(ProductService)),
+            ("FinancialIndex", FinancialIndex.objects.all(), _reference_column_names(FinancialIndex)),
+            ("Invoice", Invoice.objects.filter(company_id=tenant_id), _reference_column_names(Invoice)),
+            ("Contract", Contract.objects.filter(company_id=tenant_id), _reference_column_names(Contract)),
+            ("Transaction", Transaction.objects.filter(company_id=tenant_id), _reference_column_names(Transaction)),
+            (
+                "JournalEntry",
+                JournalEntry.objects.filter(company_id=tenant_id).select_related("account"),
+                _reference_column_names(JournalEntry),
+            ),
+            (
+                "BankTransaction",
+                BankTransaction.objects.filter(company_id=tenant_id).prefetch_related("reconciliations"),
+                _reference_column_names(BankTransaction),
+            ),
+            ("IntegrationRule", IntegrationRule.objects.filter(company_id=tenant_id), _reference_column_names(IntegrationRule)),
+            ("SubstitutionRule", SubstitutionRule.objects.filter(company_id=tenant_id), _reference_column_names(SubstitutionRule)),
+            ("NotaFiscal", NotaFiscal.objects.filter(company_id=tenant_id), _reference_column_names(NotaFiscal)),
+            ("NotaFiscalItem", NotaFiscalItem.objects.filter(company_id=tenant_id), _reference_column_names(NotaFiscalItem)),
+            ("NotaFiscalReferencia", NotaFiscalReferencia.objects.filter(company_id=tenant_id), _reference_column_names(NotaFiscalReferencia)),
+            ("NFeEvento", NFeEvento.objects.filter(company_id=tenant_id), _reference_column_names(NFeEvento)),
+            ("NFeInutilizacao", NFeInutilizacao.objects.filter(company_id=tenant_id), _reference_column_names(NFeInutilizacao)),
         ]
 
         for title, queryset, columns in references:
