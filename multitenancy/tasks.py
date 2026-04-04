@@ -11,13 +11,15 @@ import time
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
+from operator import attrgetter
 from typing import Any, Dict, List, Optional, Tuple
 
 from celery import shared_task
 from django.apps import apps
 from django.conf import settings
 from django.core.mail import send_mail
-from django.db import transaction, models as dj_models
+from django.db import router, transaction, models as dj_models
+from django.db.models.deletion import Collector
 from django.forms.models import model_to_dict
 
 # Substitutions engine (kept local; no api_utils dependency)
@@ -243,17 +245,75 @@ def _assert_import_tenant_scope(instance: Any, company_id: Optional[int]) -> Non
         )
 
 
+def _model_has_soft_delete_field(model) -> bool:
+    return any(getattr(f, "name", None) == "is_deleted" for f in model._meta.fields)
+
+
+def _soft_delete_with_collector(instance: Any) -> str:
+    """
+    Mirror Django's delete() graph (CASCADE, PROTECT, RESTRICT, fast_deletes) but
+    apply ``is_deleted=True`` for models that define it, and ``QuerySet.delete()``
+    for models that do not (so their FK on_delete still applies).
+
+    We intentionally **do not** apply ``Collector.field_updates`` (SET_NULL, etc.):
+    soft-deleted parents remain in the database, so FKs pointing to them stay valid.
+    Processing order matches ``Collector.delete()`` (sort → fast_deletes → batches).
+    """
+    using = router.db_for_write(instance.__class__, instance)
+    collector = Collector(using=using, origin=instance.__class__)
+    collector.collect([instance])
+
+    parts: List[str] = []
+
+    # Match Collector.delete(): sort PKs within each model, then dependency order.
+    for model, instances in collector.data.items():
+        collector.data[model] = sorted(instances, key=attrgetter("pk"))
+    collector.sort()
+
+    # Fast deletes (same position as Django: after sort, before main batches).
+    for qs in collector.fast_deletes:
+        m = qs.model
+        if _model_has_soft_delete_field(m):
+            n = qs.update(is_deleted=True)
+            parts.append(f"{m.__name__}:{n} soft")
+        else:
+            n = qs._raw_delete(using=using)
+            parts.append(f"{m.__name__}:{n} hard")
+
+    # field_updates intentionally skipped — rows are not removed from DB.
+
+    for instances in collector.data.values():
+        instances.reverse()
+
+    for model, instances in collector.data.items():
+        pks = [obj.pk for obj in instances]
+        if not pks:
+            continue
+        if _model_has_soft_delete_field(model):
+            n = model._base_manager.using(using).filter(pk__in=pks).update(is_deleted=True)
+            parts.append(f"{model.__name__}:{n} soft")
+        else:
+            n, _ = model._base_manager.using(using).filter(pk__in=pks).delete()
+            parts.append(f"{model.__name__}:{n} hard")
+
+    summary = ", ".join(parts) if parts else "0 rows"
+    return f"soft_cascade({summary})"
+
+
 def _apply_import_delete(instance: Any, model) -> str:
     """
-    Soft-delete if the model has an is_deleted field; otherwise hard delete.
-    Returns 'soft' or 'hard'.
+    Delete semantics aligned with Django model FK ``on_delete``:
+
+    - If the model has no ``is_deleted`` field: ``instance.delete()`` (full collector;
+      CASCADE / PROTECT / RESTRICT / SET_NULL as defined on the model).
+    - If the model has ``is_deleted``: run the same collector graph as a real delete,
+      but rows on soft-delete models are flagged; related rows without ``is_deleted``
+      are removed with normal ``QuerySet.delete()``.
     """
-    if any(getattr(f, "name", None) == "is_deleted" for f in model._meta.fields):
-        setattr(instance, "is_deleted", True)
-        instance.save(update_fields=["is_deleted"])
-        return "soft"
-    instance.delete()
-    return "hard"
+    if not _model_has_soft_delete_field(model):
+        instance.delete()
+        return "hard"
+    return _soft_delete_with_collector(instance)
 
 
 def _is_mptt_model(model) -> bool:
