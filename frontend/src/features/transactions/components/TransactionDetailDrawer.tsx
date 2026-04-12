@@ -43,6 +43,10 @@ export function TransactionDetailDrawer({
               <p className="text-sm">{formatDate(transaction.date)}</p>
             </div>
             <div>
+              <label className="text-sm font-medium text-muted-foreground">Due Date</label>
+              <p className="text-sm">{transaction.due_date ? formatDate(transaction.due_date) : "-"}</p>
+            </div>
+            <div>
               <label className="text-sm font-medium text-muted-foreground">Amount</label>
               <p className="text-sm">{formatCurrency(transaction.amount)}</p>
             </div>
@@ -70,10 +74,20 @@ export function TransactionDetailDrawer({
                 </Badge>
               </div>
             </div>
+            <div>
+              <label className="text-sm font-medium text-muted-foreground">NF Number</label>
+              <p className="text-sm">{transaction.nf_number || "-"}</p>
+            </div>
             <div className="col-span-2">
               <label className="text-sm font-medium text-muted-foreground">Description</label>
               <p className="text-sm">{transaction.description}</p>
             </div>
+            {transaction.cliente_erp_id && (
+              <div>
+                <label className="text-sm font-medium text-muted-foreground">ERP ID</label>
+                <p className="text-sm">{transaction.cliente_erp_id}</p>
+              </div>
+            )}
           </div>
         </TabsContent>
 

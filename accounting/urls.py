@@ -34,7 +34,7 @@ from .views_reconciliation_metrics import (
     ReconciliationMetricsTransactionView,
     ReconciliationMetricsJournalEntryView,
 )
-from .views import FixImportedJournalEntryDates
+from .views import FixImportedJournalEntryDates, ReconciliationRecordTagBulkView, BankBookDailyBalanceView
 from .views_template_preview import template_preview_page, generate_preview
 from .views import (
     EmbeddingBackfillView,
@@ -118,4 +118,18 @@ urlpatterns = [
 
     # Fix imported JE dates using notes metadata
     path("api/journal-entries/fix-imported-dates/", FixImportedJournalEntryDates.as_view(), name="journal-entries-fix-imported-dates"),
+
+    # Bulk tag for reconciliation (books + banks)
+    path(
+        "api/reconciliation-record-tags/",
+        ReconciliationRecordTagBulkView.as_view(),
+        name="reconciliation-record-tags-bulk",
+    ),
+
+    # Bank vs book (GL) daily running balances for one bank account
+    path(
+        "api/bank-book-daily-balances/",
+        BankBookDailyBalanceView.as_view(),
+        name="bank-book-daily-balances",
+    ),
 ]

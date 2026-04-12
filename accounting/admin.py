@@ -773,11 +773,13 @@ class TransactionAdmin(CompanyScopedAdmin):
         "id",
         "is_deleted",
         "date",
+        "due_date",
         "description",
         "amount",
         "entity",
         "currency",
         "state",
+        "nf_number",
         "is_balanced",
         "journal_entries_count",
         "transaction_balance",
@@ -793,6 +795,7 @@ class TransactionAdmin(CompanyScopedAdmin):
         "cliente_erp_id",
         "numero_boleto",
         "cnpj",
+        "nf_number",
     )
     inlines = (JournalEntryInline,)
     readonly_fields = (
@@ -833,7 +836,7 @@ class TransactionAdmin(CompanyScopedAdmin):
         (
             "Matching / boleto",
             {
-                "fields": ("numero_boleto", "cnpj", "cliente_erp_id"),
+                "fields": ("due_date", "nf_number", "numero_boleto", "cnpj", "cliente_erp_id"),
             },
         ),
         (

@@ -135,6 +135,10 @@ PATH_SEP = " > "
 _WS_RE = re.compile(r"\s+")
 
 
+def _model_has_erp_id(model) -> bool:
+    return any(getattr(f, "name", None) == "cliente_erp_id" for f in model._meta.fields)
+
+
 def _is_missing(v) -> bool:
     if v is None or v == "":
         return True
@@ -365,22 +369,24 @@ def _allowed_keys(model) -> set:
             names.add(att)  # e.g. entity_id
     fk_aliases = {n + "_fk" for n in names}
     
-    # Add *_path fields for foreign keys that support path lookups
-    # (e.g., account_path, cost_center_path for Account and CostCenter which are MPTT models)
     path_aliases = set()
+    erp_id_aliases = set()
     for f in model._meta.fields:
         if isinstance(f, dj_models.ForeignKey):
             related_model = getattr(f, "related_model", None)
             if related_model and _is_mptt_model(related_model):
-                # This FK points to an MPTT model that supports path lookups
                 base_name = f.name
                 path_aliases.add(f"{base_name}_path")
-                # Also support code-based lookups for Account
                 if related_model.__name__ == "Account":
                     path_aliases.add(f"{base_name}_code")
-    
-    # allow path helper + id + __row_id and company_fk convenience
-    return names | fk_aliases | path_aliases | set(PATH_COLS) | {"__row_id", "id", "company_fk"}
+            if related_model and _model_has_erp_id(related_model):
+                erp_id_aliases.add(f"{f.name}_erp_id")
+
+    return (
+        names | fk_aliases | path_aliases | erp_id_aliases
+        | set(PATH_COLS)
+        | {"__row_id", "__erp_id", "id", "company_fk"}
+    )
 
 
 def _filter_unknown(model, row: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
@@ -634,6 +640,139 @@ def _apply_path_inputs(model, payload: dict, company_id: int, lookup_cache: Opti
     return out
 
 
+def _resolve_erp_id_to_fk_id(
+    model,
+    field_name: str,
+    erp_id_value: str,
+    company_id: Optional[int],
+    lookup_cache: Optional[Any] = None,
+) -> Optional[int]:
+    """
+    Resolve a ``cliente_erp_id`` value on the *related* model to its primary key.
+
+    Works for any FK whose target model defines ``cliente_erp_id``.
+    Company-scoped when the related model has a ``company_id`` field.
+    """
+    if _is_missing(erp_id_value):
+        return None
+
+    erp_val = str(erp_id_value).strip()
+    if not erp_val:
+        return None
+
+    try:
+        related_field = model._meta.get_field(field_name)
+        related_model = getattr(related_field, "related_model", None)
+        if not related_model or not _model_has_erp_id(related_model):
+            return None
+
+        if lookup_cache:
+            cached = _lookup_cache_erp_id(lookup_cache, related_model, erp_val)
+            if cached is not None:
+                return cached
+
+        qs = related_model.objects.filter(cliente_erp_id=erp_val)
+        if company_id and any(
+            getattr(f, "name", "") == "company" for f in related_model._meta.fields
+        ):
+            qs = qs.filter(company_id=company_id)
+        obj = qs.first()
+        if obj:
+            return obj.pk
+
+        raise ValueError(
+            f"{related_model.__name__} with cliente_erp_id='{erp_val}' not found "
+            f"for field '{field_name}'"
+        )
+
+    except ValueError:
+        raise
+    except Exception as e:
+        logger.warning(
+            "Error resolving erp_id '%s' for field '%s': %s", erp_val, field_name, e
+        )
+        return None
+
+
+def _lookup_cache_erp_id(cache, related_model, erp_val: str) -> Optional[int]:
+    """Try LookupCache for known model types; return None to fall through to DB."""
+    name = related_model.__name__
+    if name == "Account":
+        obj = cache.get_account_by_erp_id(erp_val) if hasattr(cache, "get_account_by_erp_id") else None
+        return obj.id if obj else None
+    if name == "Entity":
+        obj = cache.get_entity_by_erp_id(erp_val) if hasattr(cache, "get_entity_by_erp_id") else None
+        return obj.id if obj else None
+    if name == "Currency":
+        obj = cache.get_currency_by_erp_id(erp_val) if hasattr(cache, "get_currency_by_erp_id") else None
+        return obj.id if obj else None
+    return None
+
+
+def _apply_erp_id_inputs(
+    model,
+    payload: dict,
+    company_id: Optional[int],
+    lookup_cache: Optional[Any] = None,
+) -> dict:
+    """
+    Resolve ``*_erp_id`` columns to ``*_id`` assignments by looking up
+    ``cliente_erp_id`` on the related model.
+
+    E.g. ``account_erp_id="ACC-001"`` → look up Account where
+    ``cliente_erp_id="ACC-001"`` → set ``account_id=<pk>``.
+    """
+    out = dict(payload)
+    for k in list(out.keys()):
+        if not k.endswith("_erp_id"):
+            continue
+        base = k[: -len("_erp_id")]  # strip '_erp_id'
+        erp_value = out.pop(k, None)
+
+        if f"{base}_id" in out and out[f"{base}_id"]:
+            continue
+        if _is_missing(erp_value):
+            continue
+
+        fk_id = _resolve_erp_id_to_fk_id(
+            model, base, erp_value, company_id, lookup_cache=lookup_cache
+        )
+        if fk_id:
+            out[f"{base}_id"] = fk_id
+    return out
+
+
+def _resolve_row_by_erp_id(model, erp_id_value, company_id: Optional[int]):
+    """
+    Look up an existing row by ``cliente_erp_id`` on the *target* model
+    (the model being imported, not a related model).
+
+    Returns (instance, pk) or (None, None).
+    """
+    if _is_missing(erp_id_value):
+        return None, None
+
+    erp_val = str(erp_id_value).strip()
+    if not erp_val:
+        return None, None
+
+    if not _model_has_erp_id(model):
+        raise ValueError(
+            f"Model {model.__name__} does not have a cliente_erp_id field; "
+            f"cannot use __erp_id for row identification"
+        )
+
+    qs = model.objects.filter(cliente_erp_id=erp_val)
+    if company_id and any(
+        getattr(f, "name", "") == "company" for f in model._meta.fields
+    ):
+        qs = qs.filter(company_id=company_id)
+    obj = qs.first()
+    if obj:
+        return obj, obj.pk
+    return None, None
+
+
 def _apply_fk_inputs(model, payload: dict, original_input: dict, token_to_id: Dict[str, int]) -> dict:
     """
     Interpret '<field>_fk' keys into '<field>_id' assignments (integer IDs), and
@@ -868,8 +1007,43 @@ def execute_import_job(
             for row in rows:
                 raw = dict(row or {})
                 rid_raw = raw.pop("__row_id", None)
+                erp_id_raw = raw.pop("__erp_id", None)
                 mode, row_detail, rid_display = _parse_import_row_id(rid_raw)
                 rid = _norm_row_key(rid_display)
+
+                # __erp_id override: upsert by cliente_erp_id on the target model.
+                # If an existing record is found → update; otherwise → create.
+                # Prefix with "-" to delete (e.g. __erp_id = "-ERP123").
+                if not _is_missing(erp_id_raw) and mode != "delete":
+                    erp_str = str(erp_id_raw).strip()
+                    if erp_str.startswith("-"):
+                        erp_lookup = erp_str[1:]
+                        existing, existing_pk = _resolve_row_by_erp_id(model, erp_lookup, company_id)
+                        if not existing:
+                            raise_msg = (
+                                f"{model_name} with cliente_erp_id='{erp_lookup}' not found for delete"
+                            )
+                            outputs_by_model[model_name].append({
+                                "__row_id": rid_display,
+                                "status": "error",
+                                "action": None,
+                                "data": raw,
+                                "message": raise_msg,
+                                "observations": [],
+                                "external_id": erp_lookup,
+                            })
+                            continue
+                        mode = "delete"
+                        row_detail = existing_pk
+                    else:
+                        existing, existing_pk = _resolve_row_by_erp_id(model, erp_str, company_id)
+                        if existing:
+                            mode = "update"
+                            row_detail = existing_pk
+                            if rid_display is None:
+                                rid_display = existing_pk
+                                rid = _norm_row_key(rid_display)
+                        # else: stays as create
 
                 if mode == "error":
                     outputs_by_model[model_name].append({
@@ -888,7 +1062,6 @@ def execute_import_job(
                 try:
                     row_sid = transaction.savepoint()
                 except Exception:
-                    # If transaction is already in a failed state, skip this row
                     logger.warning(f"Transaction in failed state, skipping row {rid_display} in {model_name}")
                     outputs_by_model[model_name].append({
                         "__row_id": rid_display,
@@ -902,7 +1075,7 @@ def execute_import_job(
                     continue
 
                 try:
-                    # ---- delete (only needs pk from __row_id) ----
+                    # ---- delete (only needs pk from __row_id or __erp_id) ----
                     if mode == "delete":
                         pk_del = int(row_detail)
                         instance_del = model.objects.get(pk=pk_del)
@@ -960,7 +1133,10 @@ def execute_import_job(
 
                     # 5) Path resolution: *_path and *_code -> *_id (before FK resolution)
                     filtered = _apply_path_inputs(model, filtered, company_id, lookup_cache=lookup_cache)
-                    
+
+                    # 5.5) ERP ID resolution: *_erp_id -> *_id (cliente_erp_id on related model)
+                    filtered = _apply_erp_id_inputs(model, filtered, company_id, lookup_cache=lookup_cache)
+
                     # 6) FK application: *_fk -> *_id and rescue base tokens to *_id
                     filtered = _apply_fk_inputs(model, filtered, raw, token_to_id)
 

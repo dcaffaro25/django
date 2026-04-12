@@ -28,6 +28,11 @@ const columns: (onPost: (id: number) => void, onUnpost: (id: number) => void) =>
     cell: ({ row }) => formatDate(row.original.date),
   },
   {
+    accessorKey: "due_date",
+    header: "Due Date",
+    cell: ({ row }) => row.original.due_date ? formatDate(row.original.due_date) : "-",
+  },
+  {
     accessorKey: "description",
     header: "Description",
   },
@@ -35,6 +40,16 @@ const columns: (onPost: (id: number) => void, onUnpost: (id: number) => void) =>
     accessorKey: "amount",
     header: "Amount",
     cell: ({ row }) => formatCurrency(row.original.amount, "USD"),
+  },
+  {
+    accessorKey: "nf_number",
+    header: "NF",
+    cell: ({ row }) => row.original.nf_number || "-",
+  },
+  {
+    accessorKey: "cliente_erp_id",
+    header: "ERP ID",
+    cell: ({ row }) => row.original.cliente_erp_id || "-",
   },
   {
     accessorKey: "state",
@@ -186,6 +201,11 @@ export function TransactionsPage() {
       label: "Date Range",
     },
     {
+      id: "due_date_from",
+      type: "daterange",
+      label: "Due Date Range",
+    },
+    {
       id: "state",
       type: "select",
       label: "Status",
@@ -200,6 +220,18 @@ export function TransactionsPage() {
       type: "text",
       label: "Description",
       placeholder: "Search description...",
+    },
+    {
+      id: "nf_number",
+      type: "text",
+      label: "NF Number",
+      placeholder: "Search NF...",
+    },
+    {
+      id: "cliente_erp_id",
+      type: "text",
+      label: "ERP ID",
+      placeholder: "Search ERP ID...",
     },
   ]
 

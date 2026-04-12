@@ -20,10 +20,13 @@ import { useCreateTransaction, useUpdateTransaction } from "../hooks/use-transac
 
 const transactionSchema = z.object({
   date: z.date(),
+  due_date: z.date().nullable().optional(),
   description: z.string().min(1, "Description is required"),
   amount: z.number().positive("Amount must be positive"),
   entity: z.number(),
   currency: z.number(),
+  nf_number: z.string().max(60).optional().or(z.literal("")),
+  cliente_erp_id: z.string().max(128).optional().or(z.literal("")),
 })
 
 type TransactionFormData = z.infer<typeof transactionSchema>
@@ -59,10 +62,13 @@ export function TransactionFormModal({
     defaultValues: transaction
       ? {
           date: new Date(transaction.date),
+          due_date: transaction.due_date ? new Date(transaction.due_date) : null,
           description: transaction.description,
           amount: transaction.amount,
           entity: transaction.entity,
           currency: transaction.currency,
+          nf_number: transaction.nf_number ?? "",
+          cliente_erp_id: transaction.cliente_erp_id ?? "",
         }
       : undefined,
   })
@@ -71,10 +77,13 @@ export function TransactionFormModal({
     if (transaction) {
       reset({
         date: new Date(transaction.date),
+        due_date: transaction.due_date ? new Date(transaction.due_date) : null,
         description: transaction.description,
         amount: transaction.amount,
         entity: transaction.entity,
         currency: transaction.currency,
+        nf_number: transaction.nf_number ?? "",
+        cliente_erp_id: transaction.cliente_erp_id ?? "",
       })
     } else {
       reset()
@@ -99,6 +108,7 @@ export function TransactionFormModal({
   }
 
   const dateValue = watch("date")
+  const dueDateValue = watch("due_date")
 
   return (
     <Dialog open={open} onOpenChange={onClose}>
@@ -120,6 +130,15 @@ export function TransactionFormModal({
               required
               error={errors.date?.message}
             />
+            <DatePicker
+              label="Due Date"
+              value={dueDateValue ?? undefined}
+              onChange={(date) => setValue("due_date", date || null)}
+              error={errors.due_date?.message}
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
               <Label>
                 Entity <span className="text-destructive">*</span>
@@ -142,6 +161,13 @@ export function TransactionFormModal({
               {errors.entity && (
                 <p className="text-sm text-destructive">{errors.entity.message}</p>
               )}
+            </div>
+            <div className="space-y-2">
+              <Label>NF Number</Label>
+              <Input
+                {...register("nf_number")}
+                placeholder="Nota Fiscal number"
+              />
             </div>
           </div>
 
@@ -196,6 +222,14 @@ export function TransactionFormModal({
                 <p className="text-sm text-destructive">{errors.currency.message}</p>
               )}
             </div>
+          </div>
+
+          <div className="space-y-2">
+            <Label>ERP ID</Label>
+            <Input
+              {...register("cliente_erp_id")}
+              placeholder="External ERP identifier"
+            />
           </div>
 
           <DialogFooter>

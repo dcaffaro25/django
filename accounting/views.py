@@ -15,7 +15,7 @@ from multitenancy.utils import resolve_tenant
 from multitenancy.models import CustomUser, Company, Entity
 from multitenancy.mixins import ScopedQuerysetMixin, SoftDeleteQuerysetMixin
 from .models import (Currency, Account, Transaction, JournalEntry, Rule, CostCenter, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter,ReconciliationTask, ReconciliationConfig, ReconciliationSuggestion, ReconciliationRule)
-from .serializers import (CurrencySerializer, AccountSerializer, TransactionSerializer, CostCenterSerializer, JournalEntrySerializer, JournalEntryListSerializer, JournalEntryDeriveFromSerializer, RuleSerializer, BankSerializer, BankAccountSerializer, BankTransactionSerializer, ReconciliationSerializer, TransactionListSerializer,ReconciliationTaskSerializer,ReconciliationConfigSerializer)
+from .serializers import (CurrencySerializer, AccountSerializer, TransactionSerializer, CostCenterSerializer, JournalEntrySerializer, JournalEntryListSerializer, JournalEntryDeriveFromSerializer, RuleSerializer, BankSerializer, BankAccountSerializer, BankTransactionSerializer, ReconciliationSerializer, ReconciliationRecordTagBulkSerializer, TransactionListSerializer,ReconciliationTaskSerializer,ReconciliationConfigSerializer)
 from .services.transaction_service import *
 from .utils import update_journal_entries_and_transaction_flags, parse_ofx_text, decode_ofx_content, generate_ofx_transaction_hash, find_book_combos
 from datetime import datetime
@@ -36,7 +36,7 @@ from nord_backend.celery import app
 from multitenancy.api_utils import _to_bool
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters as drf_filters
-from .filters import BankTransactionFilter, TransactionFilter
+from .filters import BankTransactionFilter, TransactionFilter, JournalEntryFilter
 from django.db import transaction as db_tx
 import uuid
 import os
@@ -46,6 +46,7 @@ from rest_framework.response import Response
 from accounting.models import BankTransaction, JournalEntry, Reconciliation
 from accounting.services.bank_structs import ensure_pending_bank_structs, ensure_gl_account_for_bank
 from accounting.services.reconciliation_service import ReconciliationService
+from accounting.services.bank_book_daily_balance_service import build_bank_book_daily_balance_lines
 
 import logging
 
@@ -370,7 +371,8 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         Return reconciliations in a compact, 'matches-like' format.
     
         Query params:
-          - status: comma-separated list of statuses (default: matched,approved)
+          - status: comma-separated list of statuses (default: matched,approved).
+            Use e.g. ``open,pending,review`` to include in-progress reconciliations.
         """
         status_param = request.query_params.get("status", "matched,approved")
         wanted_status = [s.strip() for s in status_param.split(",") if s.strip()]
@@ -501,6 +503,8 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             
             results.append({
                 "reconciliation_id": rec.id,
+                "status": rec.status,
+                "is_closed": rec.status in ("matched", "approved"),
                 "bank_ids": bank_ids,
                 "book_ids": book_ids,
                 "bank_description": bank_description,
@@ -796,16 +800,19 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         book_headers = [
             "JournalEntryID",
             "TransactionID",
+            "ClienteErpId",
             "AccountID",
             "AccountName",
             "BankAccountID",
             "Date",
+            "DueDate",
             "Currency",
             "EffectiveAmount",
             "OriginalDescription",
             "CleanDescriptionForEmbedding",
             "NumeroBoleto",
             "CNPJ",
+            "NFNumber",
             "UserNotes",
         ]
         ws_books.append(book_headers)
@@ -820,20 +827,24 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             desc = getattr(tx, "description", "") or ""
             cleaned = clean_description_for_embedding(desc)
             d = je.date or (tx.date if tx else None)
+            due = getattr(tx, "due_date", None) if tx else None
             ws_books.append(
                 [
                     je.id,
                     je.transaction_id,
+                    getattr(tx, "cliente_erp_id", "") or "" if tx else "",
                     je.account_id,
                     getattr(acct, "name", "") if acct else "",
                     getattr(bank_acct, "id", None) if bank_acct else None,
                     d.isoformat() if d else "",
+                    due.isoformat() if due else "",
                     cur_code_val,
                     float(eff_amt),
                     desc,
                     cleaned,
                     getattr(tx, "numero_boleto", "") or "" if tx else "",
                     getattr(tx, "cnpj", "") or "" if tx else "",
+                    getattr(tx, "nf_number", "") or "" if tx else "",
                     "",
                 ]
             )
@@ -880,12 +891,15 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     
     filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
     filterset_class = TransactionFilter
-    search_fields = ["description", "entity__name", "journal_entries__account__name"]
+    search_fields = [
+        "description", "entity__name", "journal_entries__account__name",
+        "nf_number", "cliente_erp_id", "numero_boleto", "cnpj",
+    ]
     ordering_fields = ["date", "amount", "id", "created_at"]
     ordering = ["-date", "-id"]
     
     def get_serializer_class(self):
-        if self.action == 'list' or 'unmatched':
+        if self.action in ('list', 'unmatched'):
             return TransactionListSerializer
         return TransactionSerializer
     
@@ -1299,6 +1313,8 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         .select_related('company', 'account', 'account__bank_account', 'transaction')
     )
     serializer_class = JournalEntrySerializer
+    filter_backends = [DjangoFilterBackend]
+    filterset_class = JournalEntryFilter
     
     if settings.AUTH_OFF:
         permission_classes = []
@@ -1410,6 +1426,7 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         Returns journal entries that are unmatched (not reconciled).
         Optional query parameters:
         - date_from / date_to: filter by transaction date
+        - tag: exact match on reconciliation tag (same as list endpoint)
         """
         from django.db.models import Exists, OuterRef, Case, When, Value, CharField, F, Prefetch
         
@@ -1424,12 +1441,14 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             qs = qs.filter(date__gte=date_from)
         if date_to:
             qs = qs.filter(date__lte=date_to)
+        if "tag" in request.query_params:
+            qs = qs.filter(tag=request.query_params.get("tag", ""))
         
         # Optimize with select_related, annotations, and EXISTS subquery
         qs = qs.select_related(
             'transaction', 'account', 'account__bank_account', 'company'
         ).annotate(
-            # Reconciliation status annotation
+            # Reconciliation status: matched (closed) / open (partial) / pending (no link)
             reconciliation_status=Case(
                 When(
                     Exists(
@@ -1440,6 +1459,14 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     ),
                     then=Value('matched')
                 ),
+                When(
+                    Exists(
+                        Reconciliation.objects.filter(
+                            journal_entries=OuterRef('pk'),
+                        )
+                    ),
+                    then=Value('open')
+                ),
                 default=Value('pending'),
                 output_field=CharField()
             ),
@@ -1449,6 +1476,8 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             transaction_value=F('transaction__amount'),
             numero_boleto=F('transaction__numero_boleto'),
             cnpj=F('transaction__cnpj'),
+            due_date=F('transaction__due_date'),
+            nf_number=F('transaction__nf_number'),
             # Bank account fields
             bank_account_id=F('account__bank_account__id'),
             bank_account_name=F('account__bank_account__name'),
@@ -2172,7 +2201,7 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                             bank_transactions=OuterRef('pk')
                         )
                     ),
-                    then=Value('mixed')
+                    then=Value('open')
                 ),
                 default=Value('pending'),
                 output_field=CharField()
@@ -3190,7 +3219,7 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                         sum_journal += adjustment_amount
     
                 final_diff = sum_bank - sum_journal
-                rec_status = "matched" if final_diff == Decimal("0") else "pending"
+                rec_status = "matched" if final_diff == Decimal("0") else "open"
     
                 bank_ids_used = [x.id for x in bank_txs]
                 journal_ids_used = [x.id for x in journal_entries]
@@ -3661,7 +3690,7 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                             sum_journal += adjustment_amount
     
                     final_diff = sum_bank - sum_journal
-                    rec_status = "matched" if final_diff == Decimal("0") else "pending"
+                    rec_status = "matched" if final_diff == Decimal("0") else "open"
     
                     #_dbg("totals_final",request_id=request_id,i=idx,sum_bank=str(sum_bank),sum_journal=str(sum_journal),final_diff=str(final_diff),rec_status=rec_status)
     
@@ -3833,9 +3862,167 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             "status": res.status,
             "result": res.result if res.ready() else None
         })
-    
-    
-    
+
+
+class BankBookDailyBalanceView(APIView):
+    """
+    GET: paired daily **bank** (statement) and **book** (GL) running balances for one bank account.
+
+    Both series are returned in the same JSON: ``bank.line`` and ``book.line`` (same calendar days).
+
+    Query params:
+      - ``bank_account_id`` (required)
+      - ``date_from``, ``date_to`` (``YYYY-MM-DD``, required)
+      - ``include_pending_book`` (optional, default false) — include ``pending`` journal lines on the book side
+      - ``company_id`` (required when tenant scope is ``all`` for superusers)
+    """
+
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        tenant = getattr(request, "tenant", None)
+        if not tenant or tenant == "all":
+            if request.user.is_superuser and tenant == "all":
+                cid = request.query_params.get("company_id")
+                if not cid:
+                    return Response(
+                        {"detail": "company_id is required when using all-tenant scope."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                try:
+                    company_id = int(cid)
+                except (TypeError, ValueError):
+                    return Response(
+                        {"detail": "company_id must be an integer."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            else:
+                return Response(
+                    {"detail": "Tenant context required."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            company_id = tenant.pk
+
+        ba_raw = request.query_params.get("bank_account_id")
+        if not ba_raw:
+            return Response(
+                {"detail": "bank_account_id is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            ba_id = int(ba_raw)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "bank_account_id must be an integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        df_s = request.query_params.get("date_from")
+        dt_s = request.query_params.get("date_to")
+        if not df_s or not dt_s:
+            return Response(
+                {"detail": "date_from and date_to are required (YYYY-MM-DD)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            date_from = datetime.strptime(df_s, "%Y-%m-%d").date()
+            date_to = datetime.strptime(dt_s, "%Y-%m-%d").date()
+        except ValueError:
+            return Response(
+                {"detail": "date_from and date_to must be valid dates (YYYY-MM-DD)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        include_pending = _to_bool(request.query_params.get("include_pending_book", "false"))
+
+        ba = BankAccount.objects.filter(pk=ba_id, company_id=company_id).first()
+        if not ba:
+            return Response(
+                {"detail": "Bank account not found for this tenant."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        try:
+            payload = build_bank_book_daily_balance_lines(
+                ba,
+                date_from,
+                date_to,
+                include_pending_book=include_pending,
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class ReconciliationRecordTagBulkView(APIView):
+    """
+    POST: set the same ``tag`` on many journal entries and/or bank transactions at once.
+
+    Body JSON:
+      - ``tag`` (string, may be empty to clear)
+      - ``journal_entry_ids`` (optional list of int)
+      - ``bank_transaction_ids`` (optional list of int)
+      - ``company_id`` (required only when ``request.tenant`` is ``all`` and user is superuser)
+    """
+
+    if settings.AUTH_OFF:
+        permission_classes = []
+    else:
+        permission_classes = [IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        ser = ReconciliationRecordTagBulkSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        tag = (ser.validated_data.get("tag") or "").strip()
+        je_ids = ser.validated_data.get("journal_entry_ids") or []
+        bt_ids = ser.validated_data.get("bank_transaction_ids") or []
+        body_company_id = ser.validated_data.get("company_id")
+
+        tenant = getattr(request, "tenant", None)
+        if tenant and tenant != "all":
+            company_scope = tenant.pk
+        elif tenant == "all" and request.user.is_superuser:
+            if not body_company_id:
+                return Response(
+                    {"detail": "company_id is required when using all-tenant scope."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            company_scope = body_company_id
+        else:
+            return Response(
+                {"detail": "Tenant context required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        je_updated = bt_updated = 0
+        if je_ids:
+            je_updated = JournalEntry.objects.filter(
+                company_id=company_scope,
+                is_deleted=False,
+                pk__in=je_ids,
+            ).update(tag=tag)
+        if bt_ids:
+            bt_updated = BankTransaction.objects.filter(
+                company_id=company_scope,
+                is_deleted=False,
+                pk__in=bt_ids,
+            ).update(tag=tag)
+
+        return Response(
+            {
+                "tag": tag,
+                "updated_journal_entries": je_updated,
+                "updated_bank_transactions": bt_updated,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
 class UnreconciledDashboardView(APIView):
     """
     Dashboard endpoint providing aggregated metrics on unreconciled records.

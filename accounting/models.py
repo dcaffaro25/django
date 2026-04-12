@@ -418,6 +418,19 @@ class Transaction(TenantAwareBaseModel):
         help_text="When metrics were last calculated (system updated, read-only)"
     )
 
+    due_date = models.DateField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Data de vencimento do título/obrigação financeira.",
+    )
+    nf_number = models.CharField(
+        max_length=60,
+        blank=True,
+        null=True,
+        db_index=True,
+        help_text="Número da Nota Fiscal associada a esta transação.",
+    )
     numero_boleto = models.CharField(
         max_length=50,
         blank=True,
@@ -621,6 +634,14 @@ class JournalEntry(TenantAwareBaseModel):
         null=True, blank=True,
         help_text="When metrics were last calculated (system updated, read-only)"
     )
+
+    tag = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text="Free-text label for grouping lines in reconciliation workflows.",
+    )
     
     class Meta:
         indexes = [
@@ -782,6 +803,14 @@ class BankTransaction(TenantAwareBaseModel):
         null=True,
         db_index=True,
         help_text="CNPJ da contraparte para conciliação.",
+    )
+
+    tag = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text="Free-text label for grouping lines in reconciliation workflows.",
     )
     
     description_embedding = VectorField(
@@ -1129,12 +1158,14 @@ class Reconciliation(TenantAwareBaseModel):
         max_length=50,
         choices=[
             ('pending', 'Pending'),
+            ('open', 'Open (partial)'),
             ('matched', 'Matched'),
             ('unmatched', 'Unmatched'),
             ('review', 'Pending Review'),
             ('approved', 'Approved')
         ],
-        default='pending'
+        default='pending',
+        help_text="Use open/pending/review for in-progress (non-closed) reconciliations; matched/approved close the match.",
     )
     # Use a DateTimeField to capture exact time.
     #reconciled_at = models.DateTimeField(auto_now_add=True)

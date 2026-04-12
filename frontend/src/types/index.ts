@@ -68,33 +68,61 @@ export interface CostCenter extends BaseModel {
   current_balance?: number
 }
 
+/** Bank-side or list reconciliation state for a single line (JE or bank tx). */
+export type ReconciliationLineStatus = "pending" | "open" | "matched" | "mixed"
+
+/** Stored status on a Reconciliation record (API /api/reconciliation/). */
+export type ReconciliationRecordStatus =
+  | "pending"
+  | "open"
+  | "matched"
+  | "unmatched"
+  | "review"
+  | "approved"
+
+/** Transaction-level bank reconciliation aggregate (API transaction list/filters). */
+export type BankReconAggregateStatus = "matched" | "pending" | "open" | "mixed" | "na"
+
 export interface JournalEntry extends BaseModel {
   company: number
-  transaction: number
-  account: number
+  transaction?: number
+  transaction_id?: number
+  cliente_erp_id?: string | null
+  account?: number
   cost_center?: number
-  description: string
+  description?: string | null
   debit_amount?: number
   credit_amount?: number
-  state: "pending" | "posted" | "cancelled"
-  date: string
+  state: "pending" | "posted" | "canceled" | "cancelled"
+  date?: string | null
   bank_designation_pending?: boolean
   has_designated_bank?: boolean
+  notes?: string | null
+  tag?: string
+  /** From parent Transaction (list endpoints) */
+  due_date?: string | null
+  nf_number?: string | null
+  /** Present on list/unmatched responses for bank-linked lines */
+  reconciliation_status?: ReconciliationLineStatus
 }
 
 export interface Transaction extends BaseModel {
   date: string
+  due_date?: string | null
   entity: number
   description: string
   amount: number
   currency: number
-  state: "pending" | "posted" | "cancelled"
+  state: "pending" | "posted" | "canceled" | "cancelled" | "partial" | "mixed"
+  cliente_erp_id?: string | null
+  nf_number?: string | null
   balance?: number
   journal_entries?: JournalEntry[]
   journal_entries_count?: number
   journal_entries_summary?: string[]
   journal_entries_bank_accounts?: number[]
-  reconciliation_status?: "pending" | "matched" | "mixed"
+  reconciliation_status?: ReconciliationLineStatus
+  bank_recon_status?: BankReconAggregateStatus
   bank_date?: string
 }
 
@@ -108,17 +136,88 @@ export interface BankTransaction extends BaseModel {
   description: string
   currency: number
   status: string
-  reconciliation_status?: "pending" | "matched" | "mixed"
+  cliente_erp_id?: string | null
+  reconciliation_status?: ReconciliationLineStatus
+  tag?: string
 }
 
 export interface Reconciliation extends BaseModel {
   company: number
   bank_transactions: number[]
   journal_entries: number[]
-  status: "pending" | "matched" | "approved" | "rejected"
+  status: ReconciliationRecordStatus
   reference?: string
   notes?: string
   discrepancy?: number
+}
+
+/** Row from GET /api/reconciliation/summaries/ */
+export interface ReconciliationSummaryRow {
+  reconciliation_id: number
+  status: ReconciliationRecordStatus
+  is_closed: boolean
+  bank_ids: number[]
+  book_ids: number[]
+  bank_description: string
+  book_description: string
+  bank_sum_value: number
+  book_sum_value: number
+  difference: number
+  bank_amounts: number[]
+  book_amounts: number[]
+  bank_avg_date: string | null
+  book_avg_date: string | null
+  min_date: string | null
+  max_date: string | null
+  reference?: string | null
+  notes?: string | null
+  same_company: boolean
+  same_entity: boolean
+}
+
+/** POST /api/reconciliation-record-tags/ */
+export interface ReconciliationRecordTagBulkPayload {
+  tag: string
+  journal_entry_ids?: number[]
+  bank_transaction_ids?: number[]
+  /** Required when API tenant scope is `all` (superuser). */
+  company_id?: number
+}
+
+export interface ReconciliationRecordTagBulkResponse {
+  tag: string
+  updated_journal_entries: number
+  updated_bank_transactions: number
+}
+
+/** One day in GET /api/bank-book-daily-balances/ */
+export interface BankBookDailyBalancePoint {
+  date: string
+  movement: number
+  balance: number
+}
+
+/** GET /api/bank-book-daily-balances/ */
+export interface BankBookDailyBalancesResponse {
+  bank_account_id: number
+  company_id: number
+  currency_id: number
+  date_from: string
+  date_to: string
+  include_pending_book: boolean
+  linked_gl_account_ids: number[]
+  bank: {
+    anchor_date: string
+    anchor_balance: number
+    opening_balance: number
+    line: BankBookDailyBalancePoint[]
+  }
+  book: {
+    opening_balance: number
+    line: BankBookDailyBalancePoint[]
+    warning?: string | null
+    currency_mismatch?: string | null
+  }
 }
 
 export interface ReconciliationConfig extends BaseModel {

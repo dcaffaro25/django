@@ -26,11 +26,14 @@ class LookupCache:
         self._accounts_by_code: Dict[str, int] = {}  # code -> id
         self._accounts_by_name: Dict[str, List[int]] = defaultdict(list)  # name -> [ids] (may have duplicates)
         self._accounts_by_path: Dict[str, int] = {}  # path -> id
+        self._accounts_by_erp_id: Dict[str, int] = {}  # cliente_erp_id -> id
         self._accounts_tree: Dict[Optional[int], List[Any]] = defaultdict(list)  # parent_id -> [accounts]
         self._entities_by_id: Dict[int, Any] = {}
         self._entities_by_name: Dict[str, int] = {}
+        self._entities_by_erp_id: Dict[str, int] = {}  # cliente_erp_id -> id
         self._currencies_by_id: Dict[int, Any] = {}
         self._currencies_by_code: Dict[str, int] = {}
+        self._currencies_by_erp_id: Dict[str, int] = {}  # cliente_erp_id -> id
         self._loaded = False
         
     def load(self):
@@ -63,7 +66,11 @@ class LookupCache:
             if account.name:
                 name_key = str(account.name).strip().lower()
                 self._accounts_by_name[name_key].append(account.id)
-            
+
+            # Index by cliente_erp_id
+            if account.cliente_erp_id:
+                self._accounts_by_erp_id[str(account.cliente_erp_id).strip()] = account.id
+
             # Build tree structure for path lookups
             parent_id = account.parent_id if account.parent else None
             self._accounts_tree[parent_id].append(account)
@@ -85,6 +92,8 @@ class LookupCache:
             if entity.name:
                 name_key = str(entity.name).strip().lower()
                 self._entities_by_name[name_key] = entity.id
+            if entity.cliente_erp_id:
+                self._entities_by_erp_id[str(entity.cliente_erp_id).strip()] = entity.id
         
         entity_load_time = time.time() - entity_load_start
         logger.info(f"ETL DEBUG: Entity loading took {entity_load_time:.3f}s for {len(self._entities_by_id)} entities")
@@ -98,6 +107,8 @@ class LookupCache:
             if currency.code:
                 code_key = str(currency.code).strip().lower()
                 self._currencies_by_code[code_key] = currency.id
+            if currency.cliente_erp_id:
+                self._currencies_by_erp_id[str(currency.cliente_erp_id).strip()] = currency.id
         currency_load_time = time.time() - currency_load_start
         logger.info(f"ETL DEBUG: Currency loading took {currency_load_time:.3f}s for {len(self._currencies_by_id)} currencies")
         
@@ -198,6 +209,17 @@ class LookupCache:
         
         return self._accounts_by_id.get(parent_id) if parent_id else None
     
+    def get_account_by_erp_id(self, erp_id: str) -> Optional[Any]:
+        """Get account by cliente_erp_id (exact match)."""
+        if not self._loaded:
+            self.load()
+        if not erp_id:
+            return None
+        account_id = self._accounts_by_erp_id.get(str(erp_id).strip())
+        if account_id:
+            return self._accounts_by_id.get(account_id)
+        return None
+
     def get_entity_by_id(self, entity_id: int) -> Optional[Any]:
         """Get entity by ID."""
         if not self._loaded:
@@ -216,6 +238,17 @@ class LookupCache:
             return self._entities_by_id.get(entity_id)
         return None
     
+    def get_entity_by_erp_id(self, erp_id: str) -> Optional[Any]:
+        """Get entity by cliente_erp_id (exact match)."""
+        if not self._loaded:
+            self.load()
+        if not erp_id:
+            return None
+        entity_id = self._entities_by_erp_id.get(str(erp_id).strip())
+        if entity_id:
+            return self._entities_by_id.get(entity_id)
+        return None
+
     def get_currency_by_id(self, currency_id: int) -> Optional[Any]:
         """Get currency by ID."""
         if not self._loaded:
@@ -234,16 +267,30 @@ class LookupCache:
             return self._currencies_by_id.get(currency_id)
         return None
     
+    def get_currency_by_erp_id(self, erp_id: str) -> Optional[Any]:
+        """Get currency by cliente_erp_id (exact match)."""
+        if not self._loaded:
+            self.load()
+        if not erp_id:
+            return None
+        currency_id = self._currencies_by_erp_id.get(str(erp_id).strip())
+        if currency_id:
+            return self._currencies_by_id.get(currency_id)
+        return None
+
     def clear(self):
         """Clear the cache (useful for testing or memory management)."""
         self._accounts_by_id.clear()
         self._accounts_by_code.clear()
         self._accounts_by_name.clear()
         self._accounts_by_path.clear()
+        self._accounts_by_erp_id.clear()
         self._accounts_tree.clear()
         self._entities_by_id.clear()
         self._entities_by_name.clear()
+        self._entities_by_erp_id.clear()
         self._currencies_by_id.clear()
         self._currencies_by_code.clear()
+        self._currencies_by_erp_id.clear()
         self._loaded = False
 

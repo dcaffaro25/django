@@ -5,6 +5,10 @@ import type {
   ReconciliationConfig,
   ReconciliationPipeline,
   ReconciliationDashboard,
+  ReconciliationSummaryRow,
+  ReconciliationRecordTagBulkPayload,
+  ReconciliationRecordTagBulkResponse,
+  BankBookDailyBalancesResponse,
   PaginatedResponse,
 } from "@/types"
 
@@ -88,5 +92,55 @@ export async function getReconciliationTaskStatus(
   id: number
 ): Promise<ReconciliationTask> {
   return apiClient.get<ReconciliationTask>(`/api/reconciliation-tasks/${id}/status/`)
+}
+
+/**
+ * GET /api/reconciliation/summaries/?status=matched,approved (default) or e.g. open,pending,review
+ * Response is a raw list unless pagination query params are used (then DRF returns count/next/previous/results).
+ */
+export async function getReconciliationSummaries(
+  tenant: string,
+  params?: Record<string, unknown>
+): Promise<ReconciliationSummaryRow[] | PaginatedResponse<ReconciliationSummaryRow>> {
+  return apiClient.get<ReconciliationSummaryRow[] | PaginatedResponse<ReconciliationSummaryRow>>(
+    "/api/reconciliation/summaries/",
+    params
+  )
+}
+
+/** Bulk-set the same tag on journal lines and/or bank lines */
+export async function setReconciliationRecordTags(
+  tenant: string,
+  data: ReconciliationRecordTagBulkPayload
+): Promise<ReconciliationRecordTagBulkResponse> {
+  return apiClient.post<ReconciliationRecordTagBulkResponse>(
+    "/api/reconciliation-record-tags/",
+    data
+  )
+}
+
+/** GET /api/bank-book-daily-balances/ — bank statement vs GL running balance per day */
+export async function getBankBookDailyBalances(
+  tenant: string,
+  params: {
+    bank_account_id: number
+    date_from: string
+    date_to: string
+    include_pending_book?: boolean
+    company_id?: number
+  }
+): Promise<BankBookDailyBalancesResponse> {
+  const q: Record<string, unknown> = {
+    bank_account_id: params.bank_account_id,
+    date_from: params.date_from,
+    date_to: params.date_to,
+  }
+  if (params.include_pending_book !== undefined) {
+    q.include_pending_book = params.include_pending_book
+  }
+  if (params.company_id !== undefined) {
+    q.company_id = params.company_id
+  }
+  return apiClient.get<BankBookDailyBalancesResponse>("/api/bank-book-daily-balances/", q)
 }
 

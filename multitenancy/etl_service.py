@@ -2040,8 +2040,9 @@ class ETLPipelineService:
         from accounting.models import Account, BankAccount, Transaction, JournalEntry
         from accounting.serializers import TransactionSerializer, JournalEntrySerializer
         from multitenancy.tasks import apply_substitutions, _filter_unknown, _attach_company_context
-        from multitenancy.tasks import _apply_path_inputs, _apply_fk_inputs, _coerce_boolean_fields, _quantize_decimal_fields
+        from multitenancy.tasks import _apply_path_inputs, _apply_erp_id_inputs, _apply_fk_inputs, _coerce_boolean_fields, _quantize_decimal_fields
         from multitenancy.tasks import _safe_model_dict, _row_observations, _norm_row_key
+        from multitenancy.tasks import _parse_import_row_id, _resolve_row_by_erp_id, _is_missing, _assert_import_tenant_scope, _apply_import_delete
         from django.apps import apps
         
         if self.debug_account_substitution:
@@ -2349,8 +2350,77 @@ class ETLPipelineService:
                     logger.info(f"ETL DEBUG: Processing row {row_idx + 1}/{len(rows)}")
                 raw = dict(row or {})
                 rid_raw = raw.pop("__row_id", None)
-                rid = _norm_row_key(rid_raw)
-                
+                erp_id_raw = raw.pop("__erp_id", None)
+                mode, row_detail, rid_display = _parse_import_row_id(rid_raw)
+                rid = _norm_row_key(rid_display)
+
+                # __erp_id upsert/delete by cliente_erp_id
+                if not _is_missing(erp_id_raw) and mode != "delete":
+                    erp_str = str(erp_id_raw).strip()
+                    if erp_str.startswith("-"):
+                        erp_lookup = erp_str[1:]
+                        existing, existing_pk = _resolve_row_by_erp_id(model, erp_lookup, self.company_id)
+                        if not existing:
+                            transaction_outputs.append({
+                                "__row_id": rid_display,
+                                "status": "error",
+                                "action": None,
+                                "data": raw,
+                                "message": f"Transaction with cliente_erp_id='{erp_lookup}' not found for delete",
+                                "observations": [],
+                                "external_id": erp_lookup,
+                            })
+                            continue
+                        mode = "delete"
+                        row_detail = existing_pk
+                    else:
+                        existing, existing_pk = _resolve_row_by_erp_id(model, erp_str, self.company_id)
+                        if existing:
+                            mode = "update"
+                            row_detail = existing_pk
+                            if rid_display is None:
+                                rid_display = existing_pk
+                                rid = _norm_row_key(rid_display)
+
+                if mode == "error":
+                    transaction_outputs.append({
+                        "__row_id": rid_raw,
+                        "status": "error",
+                        "action": None,
+                        "data": raw,
+                        "message": str(row_detail),
+                        "observations": [],
+                        "external_id": None,
+                    })
+                    continue
+
+                if mode == "delete":
+                    try:
+                        pk_del = int(row_detail)
+                        instance_del = model.objects.get(pk=pk_del)
+                        _assert_import_tenant_scope(instance_del, self.company_id)
+                        del_kind = _apply_import_delete(instance_del, model)
+                        transaction_outputs.append({
+                            "__row_id": rid_display,
+                            "status": "success",
+                            "action": "delete",
+                            "data": {"id": pk_del, "delete_mode": del_kind},
+                            "message": f"deleted ({del_kind})",
+                            "observations": _row_observations(audit_by_rowid, rid),
+                            "external_id": None,
+                        })
+                    except Exception as e:
+                        transaction_outputs.append({
+                            "__row_id": rid_display,
+                            "status": "error",
+                            "action": None,
+                            "data": raw,
+                            "message": str(e),
+                            "observations": _row_observations(audit_by_rowid, rid),
+                            "external_id": None,
+                        })
+                    continue
+
                 # Log entity_id in raw row
                 if 'entity_id' in raw:
                     logger.debug(f"ETL DEBUG: Row {row_idx + 1} raw dict - entity_id: '{raw.get('entity_id')}' (type: {type(raw.get('entity_id')).__name__})")
@@ -2362,14 +2432,25 @@ class ETLPipelineService:
                     
                     # Company context
                     filtered = _attach_company_context(model, filtered, self.company_id)
-                    
+
+                    # Legacy: explicit `id` column means update
+                    if mode == "create" and filtered.get("id"):
+                        from multitenancy.tasks import _to_int_or_none_soft
+                        legacy_pk = _to_int_or_none_soft(filtered["id"])
+                        if legacy_pk:
+                            mode = "update"
+                            row_detail = legacy_pk
+
                     # Path resolution
                     path_start = time.time()
                     filtered = _apply_path_inputs(model, filtered, self.company_id, lookup_cache=self.lookup_cache)
                     path_time = time.time() - path_start
                     if path_time > 0.01:
                         logger.debug(f"ETL DEBUG: Row {row_idx + 1} path resolution took {path_time:.3f}s")
-                    
+
+                    # ERP ID FK resolution: *_erp_id -> *_id
+                    filtered = _apply_erp_id_inputs(model, filtered, self.company_id, lookup_cache=self.lookup_cache)
+
                     # FK application
                     fk_start = time.time()
                     filtered = _apply_fk_inputs(model, filtered, raw, token_to_id)
@@ -2390,8 +2471,11 @@ class ETLPipelineService:
                     
                     # Create or update Transaction
                     action = "create"
-                    if "id" in filtered and filtered["id"]:
-                        pk = int(filtered["id"])
+                    create_token = row_detail if mode == "create" else None
+
+                    if mode == "update":
+                        pk = int(row_detail)
+                        filtered.pop("id", None)
                         instance = model.objects.get(id=pk)
                         for k, v in filtered.items():
                             setattr(instance, k, v)
@@ -2493,8 +2577,10 @@ class ETLPipelineService:
                     save_time = time.time() - save_start
                     logger.info(f"ETL DEBUG: Row {row_idx + 1} total Transaction save took {save_time:.3f}s")
                     
-                    # Register token->id
-                    if rid:
+                    # Register token->id (only for create rows with alphanumeric __row_id)
+                    if create_token is not None:
+                        token_to_id[create_token] = int(instance.pk)
+                    elif rid:
                         token_to_id[rid] = int(instance.pk)
                     
                     # Success output for Transaction

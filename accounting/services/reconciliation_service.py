@@ -77,6 +77,9 @@ class JournalEntryDTO:
     embedding: Optional[List[float]] = None
     numero_boleto: Optional[str] = None
     cnpj: Optional[str] = None
+    nf_number: Optional[str] = None
+    due_date: Optional[date] = None
+    cliente_erp_id: Optional[str] = None
 
     @property
     def amount_base(self) -> Decimal:
@@ -5081,6 +5084,9 @@ def _build_reconciliation_candidate_dtos(
             "transaction__description_embedding",
             "transaction__numero_boleto",
             "transaction__cnpj",
+            "transaction__nf_number",
+            "transaction__due_date",
+            "transaction__cliente_erp_id",
         )
     )
     if book_ids:
@@ -5134,6 +5140,9 @@ def _build_reconciliation_candidate_dtos(
                 embedding=tr_vec,
                 numero_boleto=getattr(tr_obj, "numero_boleto", None) if tr_obj else None,
                 cnpj=getattr(tr_obj, "cnpj", None) if tr_obj else None,
+                nf_number=getattr(tr_obj, "nf_number", None) if tr_obj else None,
+                due_date=getattr(tr_obj, "due_date", None) if tr_obj else None,
+                cliente_erp_id=getattr(tr_obj, "cliente_erp_id", None) if tr_obj else None,
             )
         )
 

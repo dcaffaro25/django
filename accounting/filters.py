@@ -37,6 +37,8 @@ class BankTransactionFilter(filters.FilterSet):
     # Text contains
     description     = filters.CharFilter(field_name="description", lookup_expr="icontains")
     reference_number = filters.CharFilter(field_name="reference_number", lookup_expr="icontains")
+    tag             = filters.CharFilter(field_name="tag", lookup_expr="exact")
+    cliente_erp_id  = filters.CharFilter(field_name="cliente_erp_id", lookup_expr="exact")
 
     ordering = filters.OrderingFilter(
         fields=(("date","date"),("amount","amount"),("id","id"),("created_at","created_at"))
@@ -73,7 +75,11 @@ class TransactionFilter(filters.FilterSet):
     currency    = filters.NumberFilter(field_name="currency_id")
 
     description = filters.CharFilter(field_name="description", lookup_expr="icontains")
-    
+    nf_number = filters.CharFilter(field_name="nf_number", lookup_expr="icontains")
+    cliente_erp_id = filters.CharFilter(field_name="cliente_erp_id", lookup_expr="exact")
+    due_date_from = filters.DateFilter(field_name="due_date", lookup_expr="gte")
+    due_date_to = filters.DateFilter(field_name="due_date", lookup_expr="lte")
+
     # Booleans / flags
     unreconciled = filters.BooleanFilter(method="filter_unreconciled")
     is_balanced = filters.BooleanFilter(field_name="is_balanced")
@@ -106,6 +112,9 @@ class TransactionFilter(filters.FilterSet):
             journal_entries=OuterRef('pk'),
             status__in=['matched', 'approved'],
         )
+        any_recon = Reconciliation.objects.filter(
+            journal_entries=OuterRef('pk'),
+        )
 
         # There exists a relevant JE with NO ok reconciliation
         nonreconciled_exists = Exists(
@@ -115,11 +124,19 @@ class TransactionFilter(filters.FilterSet):
         any_reconciled_exists = Exists(
             relevant_jes.annotate(has_ok=Exists(ok_recon)).filter(has_ok=True)
         )
+        # Relevant JE has a reconciliation row but none closed yet (partial / in progress)
+        has_open_recon = Exists(
+            relevant_jes.annotate(
+                has_recon=Exists(any_recon),
+                has_ok=Exists(ok_recon),
+            ).filter(has_recon=True, has_ok=False)
+        )
 
         return qs.annotate(
             has_rel=Exists(relevant_jes),
             has_nonreconciled=nonreconciled_exists,
             has_any_reconciled=any_reconciled_exists,
+            has_open_recon=has_open_recon,
         )
 
     # ---- public filters ----
@@ -146,7 +163,7 @@ class TransactionFilter(filters.FilterSet):
 
     def filter_reconciliation_status(self, qs, name, value: str):
         """
-        ?reconciliation_status=matched|pending|mixed
+        ?reconciliation_status=matched|pending|open|mixed
         """
         qs = self._annotate_recon_flags(qs)
         v = (value or "").lower()
@@ -155,6 +172,12 @@ class TransactionFilter(filters.FilterSet):
         elif v == "pending":
             # No relevant JEs OR none of the relevant JEs are reconciled
             return qs.filter(Q(has_rel=False) | Q(has_any_reconciled=False)).distinct()
+        elif v == "open":
+            return qs.filter(
+                has_rel=True,
+                has_any_reconciled=False,
+                has_open_recon=True,
+            ).distinct()
         elif v == "mixed":
             # Has relevant JEs and both reconciled and unreconciled among them
             return qs.filter(has_rel=True, has_any_reconciled=True, has_nonreconciled=True).distinct()
@@ -164,11 +187,12 @@ class TransactionFilter(filters.FilterSet):
         """
         Filter by bank reconciliation status:
         - 'matched': All bank-linked JEs are reconciled
-        - 'pending': Has bank-linked JEs with no reconciliation
+        - 'open': All bank-linked JEs are in non-closed reconciliations (partial)
+        - 'pending': Has bank-linked JEs with no reconciliation (or includes partial; use 'open' to narrow)
         - 'mixed': Some matched, some pending
         - 'na': No bank-linked JEs
         
-        Usage: ?bank_recon_status=matched|pending|mixed|na
+        Usage: ?bank_recon_status=matched|pending|open|mixed|na
         """
         qs = self._annotate_recon_flags(qs)
         v = (value or "").lower()
@@ -179,6 +203,12 @@ class TransactionFilter(filters.FilterSet):
         elif v == "pending":
             # Has relevant JEs but NONE are reconciled
             return qs.filter(has_rel=True, has_any_reconciled=False).distinct()
+        elif v == "open":
+            return qs.filter(
+                has_rel=True,
+                has_any_reconciled=False,
+                has_open_recon=True,
+            ).distinct()
         elif v == "mixed":
             # Has relevant JEs and SOME are reconciled, SOME are not
             return qs.filter(has_rel=True, has_any_reconciled=True, has_nonreconciled=True).distinct()
@@ -190,6 +220,11 @@ class TransactionFilter(filters.FilterSet):
 class JournalEntryFilter(filters.FilterSet):
     bank_designation_pending = filters.BooleanFilter(field_name="bank_designation_pending")
     has_designated_bank = filters.BooleanFilter(method="filter_has_designated_bank")
+    tag = filters.CharFilter(field_name="tag", lookup_expr="exact")
+    cliente_erp_id = filters.CharFilter(field_name="cliente_erp_id", lookup_expr="exact")
+    transaction_nf_number = filters.CharFilter(field_name="transaction__nf_number", lookup_expr="icontains")
+    transaction_due_date_from = filters.DateFilter(field_name="transaction__due_date", lookup_expr="gte")
+    transaction_due_date_to = filters.DateFilter(field_name="transaction__due_date", lookup_expr="lte")
 
     def filter_has_designated_bank(self, qs, name, value):
         if value is True:

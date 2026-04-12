@@ -184,11 +184,12 @@ class JournalEntrySerializer(serializers.ModelSerializer):
     class Meta:
         model = JournalEntry
         fields = [
-            "id", "company", "transaction", "description","account", "cost_center",
+            "id", "company", "transaction", "cliente_erp_id",
+            "description", "account", "cost_center",
             "debit_amount", "credit_amount",
             "state", "date",
             "bank_designation_pending", "has_designated_bank",
-            "notes",
+            "notes", "tag",
         ]
 
 
@@ -255,16 +256,19 @@ class JournalEntryListSerializer(serializers.ModelSerializer):
     bank_date = serializers.SerializerMethodField()
     numero_boleto = serializers.SerializerMethodField()
     cnpj = serializers.SerializerMethodField()
+    due_date = serializers.SerializerMethodField()
+    nf_number = serializers.SerializerMethodField()
 
     transaction_id = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = JournalEntry
         fields = [
-            'id', 'transaction_id', 'company', 'entity', 'currency', 'description', 'bank_date', 'balance',
+            'id', 'transaction_id', 'company', 'entity', 'currency',
+            'cliente_erp_id', 'description', 'bank_date', 'balance',
             'transaction_date', 'transaction_description', 'transaction_value',
-            'bank_account', 'reconciliation_status', 'notes',
-            'numero_boleto', 'cnpj',
+            'bank_account', 'reconciliation_status', 'notes', 'tag',
+            'numero_boleto', 'cnpj', 'due_date', 'nf_number',
         ]
 
     def to_representation(self, instance):
@@ -298,6 +302,10 @@ class JournalEntryListSerializer(serializers.ModelSerializer):
             data['numero_boleto'] = instance.numero_boleto
         if hasattr(instance, 'cnpj'):
             data['cnpj'] = instance.cnpj
+        if hasattr(instance, 'due_date'):
+            data['due_date'] = instance.due_date
+        if hasattr(instance, 'nf_number'):
+            data['nf_number'] = instance.nf_number
         
         return data
 
@@ -312,6 +320,18 @@ class JournalEntryListSerializer(serializers.ModelSerializer):
             return obj.cnpj
         tx = getattr(obj, 'transaction', None)
         return getattr(tx, 'cnpj', None) if tx else None
+
+    def get_due_date(self, obj):
+        if hasattr(obj, 'due_date'):
+            return obj.due_date
+        tx = getattr(obj, 'transaction', None)
+        return getattr(tx, 'due_date', None) if tx else None
+
+    def get_nf_number(self, obj):
+        if hasattr(obj, 'nf_number'):
+            return obj.nf_number
+        tx = getattr(obj, 'transaction', None)
+        return getattr(tx, 'nf_number', None) if tx else None
 
     def get_transaction_date(self, obj):
         """Returns date from related transaction or annotation."""
@@ -370,12 +390,15 @@ class JournalEntryListSerializer(serializers.ModelSerializer):
         if hasattr(obj, 'reconciliation_status'):
             return obj.reconciliation_status
         if obj.account and obj.account.bank_account:
-            # Use prefetched reconciliations if available
-            if hasattr(obj, 'recon_list'):
-                if any(rec.status in ["matched", "approved"] for rec in obj.recon_list):
-                    return "matched"
-            elif obj.reconciliations.filter(status__in=["matched", "approved"]).exists():
+            recs = (
+                obj.recon_list
+                if hasattr(obj, 'recon_list')
+                else list(obj.reconciliations.all())
+            )
+            if any(rec.status in ["matched", "approved"] for rec in recs):
                 return "matched"
+            if recs:
+                return "open"
         return "pending"
 
 class TransactionListSerializer(serializers.ModelSerializer):
@@ -399,7 +422,8 @@ class TransactionListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Transaction
         fields = [
-            'id', 'company', 'entity', 'currency', 'date', 'bank_date', 'description', 'amount', 'state',
+            'id', 'company', 'entity', 'currency', 'date', 'due_date', 'bank_date',
+            'description', 'amount', 'state', 'cliente_erp_id', 'nf_number',
             'journal_entries_count', 'balance', 'journal_entries_summary',
             'journal_entries_bank_accounts', 'reconciliation_status', 'notes',
             'is_balanced', 'bank_recon_status', 'bank_linked_je_count', 'bank_reconciled_je_count',
@@ -467,39 +491,57 @@ class TransactionListSerializer(serializers.ModelSerializer):
         relevant_entries = [je for je in obj.journal_entries.all() if je.account and je.account.bank_account]
         if not relevant_entries:
             return 'pending'
-        # A journal entry is considered reconciled if any related Reconciliation has status 'matched' or 'approved'.
-        def is_reconciled(je):
-            return any(rec.status in ['matched', 'approved'] for rec in je.reconciliations.all())
-        statuses = [is_reconciled(je) for je in relevant_entries]
-        if all(statuses):
+
+        def je_state(je):
+            recs = list(je.reconciliations.all())
+            if any(rec.status in ['matched', 'approved'] for rec in recs):
+                return 'closed'
+            if recs:
+                return 'open'
+            return 'none'
+
+        states = [je_state(je) for je in relevant_entries]
+        if all(s == 'closed' for s in states):
             return 'matched'
-        elif not any(statuses):
-            return 'pending'
-        else:
+        if any(s == 'closed' for s in states):
             return 'mixed'
+        if all(s == 'none' for s in states):
+            return 'pending'
+        if any(s == 'open' for s in states):
+            return 'open'
+        return 'pending'
     
     def get_bank_recon_status(self, obj):
         """
         Returns the bank reconciliation status:
         - 'matched': All bank-linked JEs have reconciliations with status 'matched' or 'approved'
-        - 'pending': Has bank-linked JEs with no reconciliation
-        - 'mixed': Some matched, some pending
+        - 'open': All bank-linked JEs are linked to non-closed reconciliations (partial / in progress)
+        - 'pending': At least one bank-linked JE has no reconciliation at all
+        - 'mixed': Some closed, some not
         - 'na': No bank-linked JEs
         """
         relevant_entries = [je for je in obj.journal_entries.all() if je.account and je.account.bank_account]
         if not relevant_entries:
             return 'na'
-        
-        def is_reconciled(je):
-            return any(rec.status in ['matched', 'approved'] for rec in je.reconciliations.all())
-        
-        statuses = [is_reconciled(je) for je in relevant_entries]
-        if all(statuses):
+
+        def je_state(je):
+            recs = list(je.reconciliations.all())
+            if any(rec.status in ['matched', 'approved'] for rec in recs):
+                return 'closed'
+            if recs:
+                return 'open'
+            return 'none'
+
+        states = [je_state(je) for je in relevant_entries]
+        if all(s == 'closed' for s in states):
             return 'matched'
-        elif not any(statuses):
-            return 'pending'
-        else:
+        if any(s == 'closed' for s in states):
             return 'mixed'
+        if all(s == 'none' for s in states):
+            return 'pending'
+        if any(s == 'open' for s in states):
+            return 'open'
+        return 'pending'
     
     def get_bank_linked_je_count(self, obj):
         """Returns the count of journal entries linked to bank accounts."""
@@ -556,10 +598,10 @@ class BankTransactionSerializer(serializers.ModelSerializer):
     class Meta:
         model = BankTransaction
         fields = [
-            'id', 'company', 'bank_account', 'entity', 'entity_name', 'currency', 'date', 
-            'description', 'amount', 'status', #'transaction_type',
+            'id', 'company', 'bank_account', 'entity', 'entity_name', 'currency', 'date',
+            'description', 'amount', 'status', 'cliente_erp_id',
             'is_deleted', 'updated_at', 'updated_by', 'reconciliation_status', 'notes',
-            'numeros_boleto', 'cnpj',
+            'numeros_boleto', 'cnpj', 'tag',
         ]
         extra_kwargs = {
             "bank_account": {"queryset": BankAccount.objects.all()},
@@ -576,17 +618,18 @@ class BankTransactionSerializer(serializers.ModelSerializer):
             pass
         else:
             # Fallback: compute reconciliation_status the old way
-            qs = instance.reconciliations.all()
-            if not qs.exists():
+            qs = list(instance.reconciliations.all())
+            if not qs:
                 data['reconciliation_status'] = 'pending'
             else:
                 statuses = [rec.status for rec in qs]
-                if all(status in ['matched', 'approved'] for status in statuses):
-                    data['reconciliation_status'] = 'matched'
-                elif all(status not in ['matched', 'approved'] for status in statuses):
-                    data['reconciliation_status'] = 'pending'
+                if any(s in ['matched', 'approved'] for s in statuses):
+                    if all(s in ['matched', 'approved'] for s in statuses):
+                        data['reconciliation_status'] = 'matched'
+                    else:
+                        data['reconciliation_status'] = 'mixed'
                 else:
-                    data['reconciliation_status'] = 'mixed'
+                    data['reconciliation_status'] = 'open'
         
         return data
     
@@ -708,6 +751,31 @@ class ReconciliationSerializer(serializers.ModelSerializer):
         # Return True if there's exactly one unique entity ID, False otherwise
         # If no records or all have None, return False (treat as mismatch)
         return len(entity_ids) == 1
+
+
+class ReconciliationRecordTagBulkSerializer(serializers.Serializer):
+    """Bulk set the same free-text tag on journal lines and/or bank lines."""
+
+    tag = serializers.CharField(allow_blank=True, max_length=255, required=True)
+    journal_entry_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        required=False,
+        default=list,
+    )
+    bank_transaction_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        required=False,
+        default=list,
+    )
+    company_id = serializers.IntegerField(required=False, min_value=1)
+
+    def validate(self, attrs):
+        if not attrs.get("journal_entry_ids") and not attrs.get("bank_transaction_ids"):
+            raise serializers.ValidationError(
+                "Provide at least one of journal_entry_ids or bank_transaction_ids."
+            )
+        return attrs
+
 
 class ReconciliationConfigSerializer(serializers.ModelSerializer):
     company_name = serializers.CharField(source="company.name", read_only=True)
