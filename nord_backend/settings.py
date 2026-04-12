@@ -186,6 +186,7 @@ INSTALLED_APPS = [
     'feedback',         # app de feedback supervisionado
     'knowledge_base',   # NotebookLM-like document Q&A with Gemini File Search
     'erp_integrations', # ERP integration pipeline (Omie, etc.)
+    'api_meta',         # Introspection / Meta-API for OpenClaw agent
 ]
 
 MIDDLEWARE = [
@@ -200,6 +201,7 @@ MIDDLEWARE = [
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'multitenancy.middleware.TenantMiddleware',
     'crum.CurrentRequestUserMiddleware',
+    'api_meta.middleware.OpenClawReadOnlyMiddleware',
 ]
 
 ROOT_URLCONF = 'nord_backend.urls'
@@ -427,3 +429,21 @@ CSRF_TRUSTED_ORIGINS = [
     "https://nordventures.retool.com",
     "https://82f3-8-242-11-50.ngrok-free.app",
     ]
+
+# ---------------------------------------------------------------------------
+# OpenClaw Agent Configuration
+# ---------------------------------------------------------------------------
+# The origin(s) where the OpenClaw-built frontend will be hosted.
+# Add the actual production URL once known.
+OPENCLAW_FRONTEND_ORIGINS = os.getenv(
+    "OPENCLAW_FRONTEND_ORIGINS",
+    "http://localhost:3000,http://localhost:5173",
+).split(",")
+
+# When DEBUG is False, explicitly allow these in CORS:
+if not DEBUG:
+    CORS_ALLOWED_ORIGINS += [o.strip() for o in OPENCLAW_FRONTEND_ORIGINS if o.strip()]
+
+# Rate limiting for the OpenClaw token (advisory — enforce via reverse proxy
+# or django-ratelimit in production).
+OPENCLAW_RATE_LIMIT = os.getenv("OPENCLAW_RATE_LIMIT", "600/hour")  # 10 req/min

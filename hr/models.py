@@ -14,7 +14,7 @@ class Position(TenantAwareBaseModel):
     """
     Represents the position of an employee (e.g. Developer, Manager).
     """
-    title = models.CharField(max_length=100, unique=True)
+    title = models.CharField(max_length=100)
     cliente_erp_id = models.CharField(
         max_length=128,
         null=True,
@@ -33,6 +33,12 @@ class Position(TenantAwareBaseModel):
             raise ValidationError("Minimum salary cannot exceed maximum salary.")
 
     class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "title"],
+                name="hr_position_company_title_uniq",
+            ),
+        ]
         indexes = [
             models.Index(fields=['company', 'cliente_erp_id']),
         ]
@@ -44,7 +50,7 @@ class Employee(TenantAwareBaseModel):
     """
     Basic employee model.
     """
-    CPF = models.CharField(max_length=14, unique=True)
+    CPF = models.CharField(max_length=14)
     cliente_erp_id = models.CharField(
         max_length=128,
         null=True,
@@ -79,6 +85,12 @@ class Employee(TenantAwareBaseModel):
         return min((worked_days / 365) * 30, 30)
 
     class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["company", "CPF"],
+                name="hr_employee_company_cpf_uniq",
+            ),
+        ]
         indexes = [
             models.Index(fields=['company', 'cliente_erp_id']),
         ]

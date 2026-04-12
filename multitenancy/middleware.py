@@ -25,6 +25,7 @@ class TenantMiddleware:
             request.path.startswith('/api/login') or
             request.path.startswith('/api/logout') or
             request.path.startswith('/api/core') or
+            request.path.startswith('/api/meta') or
             request.path.startswith('/docs') or
             '/knowledge-base' in request.path
         ):

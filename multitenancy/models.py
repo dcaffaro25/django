@@ -39,7 +39,7 @@ class BaseModel(models.Model):
         on_delete=models.SET_NULL, related_name="%(class)s_updated_by"
     )
     created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
     is_deleted = models.BooleanField(default=False)
     notes = models.TextField(
         null=True, blank=True,

@@ -24,6 +24,7 @@ from accounting.views_celery import start_task, task_status
 urlpatterns = [
     re_path(r'^admin/?', admin.site.urls),
     re_path(r'^home/?$', views.index, name='index'),
+    path('api/meta/', include('api_meta.urls')),
     #re_path(r'^(?P<tenant_id>[^/]+)/', include('multitenancy.urls')),
     path('', include('multitenancy.urls')),
     path('', include('core.urls')),
