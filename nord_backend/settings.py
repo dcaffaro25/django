@@ -408,27 +408,28 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 CORS_ALLOW_CREDENTIALS = True
 
+# Shared allowlist: original production/dev origins (do not drop when adding hosts).
+_ORIGINAL_TRUSTED_ORIGINS = [
+    "https://server-production-e754.up.railway.app",
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+    "http://localhost:3000",
+    "https://nordventures.retool.com",
+    "https://82f3-8-242-11-50.ngrok-free.app",
+]
+# Extra origins appended to CORS + CSRF (e.g. Railway staging).
+_ADDITIONAL_TRUSTED_ORIGINS = [
+    "https://main-server-staging-e5d3.up.railway.app",
+]
+_TRUSTED_ORIGINS = _ORIGINAL_TRUSTED_ORIGINS + _ADDITIONAL_TRUSTED_ORIGINS
+
 # In development, allow all origins for easier testing
 if DEBUG:
     CORS_ALLOW_ALL_ORIGINS = True
 else:
-    CORS_ALLOWED_ORIGINS = [
-        "https://server-production-e754.up.railway.app",
-        "http://localhost:5173",
-        "http://127.0.0.1:3000",
-        "http://localhost:3000",
-        "https://nordventures.retool.com",
-        "https://82f3-8-242-11-50.ngrok-free.app",
-    ]
+    CORS_ALLOWED_ORIGINS = list(_TRUSTED_ORIGINS)
 
-CSRF_TRUSTED_ORIGINS = [
-    "https://server-production-e754.up.railway.app",
-    'http://localhost:5173',
-    'http://127.0.0.1:3000',
-    'http://localhost:3000',
-    "https://nordventures.retool.com",
-    "https://82f3-8-242-11-50.ngrok-free.app",
-    ]
+CSRF_TRUSTED_ORIGINS = list(_TRUSTED_ORIGINS)
 
 # ---------------------------------------------------------------------------
 # OpenClaw Agent Configuration
