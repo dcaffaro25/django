@@ -123,7 +123,7 @@ export async function setReconciliationRecordTags(
 export async function getBankBookDailyBalances(
   tenant: string,
   params: {
-    bank_account_id: number
+    bank_account_id?: number
     date_from: string
     date_to: string
     include_pending_book?: boolean
@@ -131,9 +131,11 @@ export async function getBankBookDailyBalances(
   }
 ): Promise<BankBookDailyBalancesResponse> {
   const q: Record<string, unknown> = {
-    bank_account_id: params.bank_account_id,
     date_from: params.date_from,
     date_to: params.date_to,
+  }
+  if (params.bank_account_id !== undefined) {
+    q.bank_account_id = params.bank_account_id
   }
   if (params.include_pending_book !== undefined) {
     q.include_pending_book = params.include_pending_book

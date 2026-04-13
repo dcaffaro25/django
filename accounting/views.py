@@ -46,7 +46,11 @@ from rest_framework.response import Response
 from accounting.models import BankTransaction, JournalEntry, Reconciliation
 from accounting.services.bank_structs import ensure_pending_bank_structs, ensure_gl_account_for_bank
 from accounting.services.reconciliation_service import ReconciliationService
-from accounting.services.bank_book_daily_balance_service import build_bank_book_daily_balance_lines
+from accounting.services.bank_book_daily_balance_service import (
+    bank_account_summary,
+    build_aggregate_bank_book_daily_balance,
+    build_bank_book_daily_balance_lines,
+)
 
 import logging
 
@@ -3866,12 +3870,16 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
 
 class BankBookDailyBalanceView(APIView):
     """
-    GET: paired daily **bank** (statement) and **book** (GL) running balances for one bank account.
+    GET: paired daily **bank** (statement) and **book** (GL) running balances.
 
-    Both series are returned in the same JSON: ``bank.line`` and ``book.line`` (same calendar days).
+    Always returns ``bank_accounts`` (all tenant bank accounts, summary rows) and ``aggregate``
+    (summed daily bank vs book lines per currency in ``by_currency``).
+
+    When ``bank_account_id`` is passed, the response also includes the single-account series
+    (``bank`` / ``book`` / ``linked_gl_account_ids`` / etc.) as before.
 
     Query params:
-      - ``bank_account_id`` (required)
+      - ``bank_account_id`` (optional) — include detailed lines for this account
       - ``date_from``, ``date_to`` (``YYYY-MM-DD``, required)
       - ``include_pending_book`` (optional, default false) — include ``pending`` journal lines on the book side
       - ``company_id`` (required when tenant scope is ``all`` for superusers)
@@ -3907,20 +3915,6 @@ class BankBookDailyBalanceView(APIView):
         else:
             company_id = tenant.pk
 
-        ba_raw = request.query_params.get("bank_account_id")
-        if not ba_raw:
-            return Response(
-                {"detail": "bank_account_id is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        try:
-            ba_id = int(ba_raw)
-        except (TypeError, ValueError):
-            return Response(
-                {"detail": "bank_account_id must be an integer."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
         df_s = request.query_params.get("date_from")
         dt_s = request.query_params.get("date_to")
         if not df_s or not dt_s:
@@ -3939,7 +3933,49 @@ class BankBookDailyBalanceView(APIView):
 
         include_pending = _to_bool(request.query_params.get("include_pending_book", "false"))
 
-        ba = BankAccount.objects.filter(pk=ba_id, company_id=company_id).first()
+        ba_qs = (
+            BankAccount.objects.filter(company_id=company_id, is_deleted=False)
+            .select_related("bank", "entity", "currency")
+            .order_by("entity__name", "name", "id")
+        )
+        ba_list = list(ba_qs)
+        bank_accounts_payload = [bank_account_summary(ba) for ba in ba_list]
+
+        try:
+            aggregate = build_aggregate_bank_book_daily_balance(
+                ba_list,
+                date_from,
+                date_to,
+                include_pending_book=include_pending,
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        ba_raw = request.query_params.get("bank_account_id")
+        if not ba_raw:
+            return Response(
+                {
+                    "company_id": company_id,
+                    "date_from": date_from.isoformat(),
+                    "date_to": date_to.isoformat(),
+                    "include_pending_book": include_pending,
+                    "bank_accounts": bank_accounts_payload,
+                    "aggregate": aggregate,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        try:
+            ba_id = int(ba_raw)
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "bank_account_id must be an integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        ba = next((b for b in ba_list if b.pk == ba_id), None)
+        if not ba:
+            ba = BankAccount.objects.filter(pk=ba_id, company_id=company_id).first()
         if not ba:
             return Response(
                 {"detail": "Bank account not found for this tenant."},
@@ -3956,6 +3992,8 @@ class BankBookDailyBalanceView(APIView):
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
+        payload["bank_accounts"] = bank_accounts_payload
+        payload["aggregate"] = aggregate
         return Response(payload, status=status.HTTP_200_OK)
 
 

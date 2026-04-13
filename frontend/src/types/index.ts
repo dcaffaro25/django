@@ -197,22 +197,64 @@ export interface BankBookDailyBalancePoint {
   balance: number
 }
 
-/** GET /api/bank-book-daily-balances/ */
-export interface BankBookDailyBalancesResponse {
-  bank_account_id: number
-  company_id: number
+export interface BankBookAccountSummary {
+  id: number
+  name: string
+  entity_id: number
+  entity_name?: string | null
+  bank_id: number
+  bank_name?: string | null
   currency_id: number
+  account_number: string
+  branch_id: string
+  balance: number
+  balance_date?: string | null
+}
+
+export interface BankBookDailyBalanceAggregateCurrency {
+  currency_id: number
+  bank_accounts_count: number
+  bank: {
+    opening_balance: number
+    line: BankBookDailyBalancePoint[]
+  }
+  book: {
+    opening_balance: number
+    line: BankBookDailyBalancePoint[]
+    warnings: Array<{ bank_account_id: number; warning: string }>
+    currency_mismatches: Array<{ bank_account_id: number; currency_mismatch: string }>
+  }
+  difference: {
+    line: Array<{ date: string; bank_minus_book: number }>
+  }
+}
+
+export interface BankBookDailyBalancesAggregate {
+  by_currency: Record<string, BankBookDailyBalanceAggregateCurrency>
+  totals: {
+    bank_accounts: number
+    currencies: number
+  }
+}
+
+/** GET /api/bank-book-daily-balances/ — with or without bank_account_id */
+export interface BankBookDailyBalancesResponse {
+  company_id?: number
+  bank_account_id?: number
+  currency_id?: number
   date_from: string
   date_to: string
   include_pending_book: boolean
-  linked_gl_account_ids: number[]
-  bank: {
+  linked_gl_account_ids?: number[]
+  bank_accounts: BankBookAccountSummary[]
+  aggregate: BankBookDailyBalancesAggregate
+  bank?: {
     anchor_date: string
     anchor_balance: number
     opening_balance: number
     line: BankBookDailyBalancePoint[]
   }
-  book: {
+  book?: {
     opening_balance: number
     line: BankBookDailyBalancePoint[]
     warning?: string | null
