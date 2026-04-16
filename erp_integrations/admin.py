@@ -99,6 +99,9 @@ class ERPSyncRunAdmin(admin.ModelAdmin):
         "id",
         "job",
         "status",
+        "segments_completed",
+        "segments_total",
+        "failed_segment_label",
         "pages_fetched",
         "records_stored",
         "records_skipped",
@@ -106,7 +109,10 @@ class ERPSyncRunAdmin(admin.ModelAdmin):
         "started_at",
     )
     list_filter = ("status",)
-    readonly_fields = ("started_at", "completed_at", "duration_seconds", "diagnostics")
+    readonly_fields = (
+        "started_at", "completed_at", "duration_seconds", "diagnostics",
+        "segments_total", "segments_completed", "failed_segment_label",
+    )
     raw_id_fields = ("job", "company")
 
 

@@ -307,14 +307,19 @@ CELERY_TASK_T_LIMIT = int(os.getenv("CELERY_TASK_TIME_LIMIT", 10))  # minutes
 CELERY_TASK_SOFT_TIME_LIMIT = (CELERY_TASK_T_LIMIT-3)*60  # 12 minutes
 CELERY_TASK_TIME_LIMIT = CELERY_TASK_T_LIMIT*60       # 15 minutes
 
-# Celery Beat: periodic embedding backfill (200 per model every 30 min)
+# Celery Beat: periodic tasks
 from celery.schedules import crontab
 CELERY_BEAT_SCHEDULE = {
     "embedding-backfill-every-30min": {
         "task": "accounting.tasks.generate_missing_embeddings",
-        "schedule": crontab(minute="*/30"),  # every 30 minutes
+        "schedule": crontab(minute="*/30"),
         "options": {"queue": "celery"},
         "kwargs": {"per_model_limit": 200},
+    },
+    "erp-sync-scheduled-jobs": {
+        "task": "erp_integrations.tasks.run_all_due_syncs",
+        "schedule": crontab(minute="*/15"),
+        "options": {"queue": "celery"},
     },
 }
 

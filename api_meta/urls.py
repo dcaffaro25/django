@@ -7,6 +7,8 @@ from django.urls import path
 
 from .views import (
     MetaCapabilitiesView,
+    MetaDocsDetailView,
+    MetaDocsListView,
     MetaEndpointsView,
     MetaEnumsView,
     MetaFiltersView,
@@ -25,4 +27,6 @@ urlpatterns = [
     path("filters/", MetaFiltersView.as_view(), name="meta-filters"),
     path("capabilities/", MetaCapabilitiesView.as_view(), name="meta-capabilities"),
     path("health/", MetaHealthView.as_view(), name="meta-health"),
+    path("docs/", MetaDocsListView.as_view(), name="meta-docs-list"),
+    path("docs/<path:doc_path>", MetaDocsDetailView.as_view(), name="meta-docs-detail"),
 ]

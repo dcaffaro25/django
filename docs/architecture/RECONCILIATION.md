@@ -24,6 +24,9 @@ The Reconciliation System automatically matches bank transactions with journal e
 - **Embedding-Based Matching**: Uses vector embeddings for semantic similarity
 - **Many-to-Many Matching**: Match multiple bank transactions with multiple journal entries
 - **Auto-Matching**: Automatically apply high-confidence matches
+- **Partial Reconciliation**: Create `open` reconciliations that can be built up incrementally over time
+- **Record Tags**: Free-text tags on journal entries and bank transactions for grouping and filtering
+- **Bank vs Book Daily Balances**: Compare daily running balances between bank and books
 - **Transaction Suggestions**: Generate book transactions for unmatched bank transactions based on historical patterns
 
 ### Key Concepts
@@ -251,10 +254,11 @@ Represents a matched relationship between bank transactions and journal entries.
 #### Status
 - `status`: `str` - Reconciliation status
   - `"pending"`: Pending review
-  - `"matched"`: Matched
-  - `"unmatched"`: Unmatched
-  - `"review"`: Pending review
-  - `"approved"`: Approved
+  - `"open"`: **Partial reconciliation** — manually created but not yet fully matched; allows adding more records over time
+  - `"matched"`: Fully matched and confirmed
+  - `"unmatched"`: Marked as unmatched
+  - `"review"`: Pending manual review
+  - `"approved"`: Approved by supervisor
 
 #### Metadata
 - `reference`: `str` - Optional reference
@@ -1065,6 +1069,71 @@ GET /api/bank-transactions/unreconciled/
 - `end_date`: Filter by end date
 - `min_amount`: Filter by minimum amount
 - `max_amount`: Filter by maximum amount
+
+### Reconciliation Record Tags (Bulk)
+
+Assign, change, or remove tags on journal entries and bank transactions in bulk:
+
+```
+POST /api/reconciliation-record-tags/
+{
+  "tags": [
+    {"record_type": "bank_transaction", "record_id": 101, "tag": "parcela-mar-2026"},
+    {"record_type": "journal_entry", "record_id": 205, "tag": "parcela-mar-2026"},
+    {"record_type": "journal_entry", "record_id": 206, "tag": ""}
+  ]
+}
+```
+
+- `record_type`: `"bank_transaction"` or `"journal_entry"`
+- `record_id`: The ID of the record to tag
+- `tag`: Free-text tag value. Empty string `""` removes the tag.
+
+**Response:**
+```json
+{"updated": 3}
+```
+
+Tags can then be used to filter records:
+- `GET /api/journal_entries/?tag=parcela-mar-2026`
+- `GET /api/bank_transactions/?tag=parcela-mar-2026`
+
+### Bank vs Book Daily Balances
+
+Compare daily running balances between bank statements and the general ledger:
+
+```
+GET /api/bank-book-daily-balances/?date_from=2026-03-01&date_to=2026-03-31
+```
+
+**Query Parameters:**
+- `date_from` (required): Start date
+- `date_to` (required): End date
+- `bank_account_id` (optional): Specific bank account (omit for aggregate by currency)
+
+**Response (aggregate mode):**
+```json
+{
+  "bank_accounts": [{"id": 1, "name": "BB C/C", "currency": "BRL"}],
+  "aggregate": {
+    "BRL": [
+      {"date": "2026-03-01", "bank_balance": 150000.00, "book_balance": 148500.00, "difference": 1500.00}
+    ]
+  }
+}
+```
+
+**Response (per-account mode with `bank_account_id`):**
+```json
+{
+  "bank_accounts": [{"id": 1, "name": "BB C/C", "currency": "BRL"}],
+  "bank": [{"date": "2026-03-01", "movement": 5000.00, "running_balance": 105000.00}],
+  "book": [{"date": "2026-03-01", "movement": 5000.00, "running_balance": 104500.00}]
+}
+```
+
+**Service:** `BankBookDailyBalanceService`
+**Location:** `accounting/services/bank_book_daily_balance_service.py`
 
 ---
 

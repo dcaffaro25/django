@@ -342,6 +342,20 @@ class ERPSyncRun(TenantAwareBaseModel):
         blank=True,
         help_text="Request payload with app_key/app_secret masked",
     )
+    segments_total = models.IntegerField(
+        default=0,
+        help_text="Total segments planned for this run.",
+    )
+    segments_completed = models.IntegerField(
+        default=0,
+        help_text="Segments successfully completed before stopping.",
+    )
+    failed_segment_label = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        help_text="Label of the segment that failed (e.g. '2026-03-16..2026-03-16').",
+    )
 
     class Meta:
         ordering = ["-started_at"]

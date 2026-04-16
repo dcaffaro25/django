@@ -178,6 +178,39 @@ class ERPSyncJobViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         out = execute_sync(job.id, dry_run=True)
         return Response(out)
 
+    @action(detail=True, methods=["post"])
+    def retry(self, request, pk=None, tenant_id=None):
+        """
+        Retry a failed/partial sync. Resumes from the current cursor.
+        Optional body: {"reset_cursor_to": "2026-03-10"} to rewind the cursor
+        before retrying.
+        """
+        import copy
+        from .tasks import run_erp_sync_task
+
+        job = self.get_object()
+        reset_to = request.data.get("reset_cursor_to")
+        if reset_to:
+            from datetime import date as _date
+            try:
+                parsed = _date.fromisoformat(str(reset_to).strip()[:10])
+            except (ValueError, TypeError):
+                return Response(
+                    {"detail": "reset_cursor_to must be a valid ISO date (YYYY-MM-DD)."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            fc = copy.deepcopy(job.fetch_config or {})
+            fc.setdefault("cursor", {})
+            fc["cursor"]["next_start"] = parsed.isoformat()
+            job.fetch_config = fc
+            job.save(update_fields=["fetch_config"])
+
+        result = run_erp_sync_task.delay(job.id)
+        return Response({
+            "task_id": str(result.id),
+            "cursor": (job.fetch_config or {}).get("cursor"),
+        })
+
 
 class ERPSyncRunViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
     """Read-only list/detail of ERP sync runs."""

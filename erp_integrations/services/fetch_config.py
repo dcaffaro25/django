@@ -6,7 +6,7 @@ fetch_config JSON shape (all keys optional except where noted):
 {
   "mode": "pagination_only" | "date_windows" | "incremental_dates",
   "static_params": {},           # merged over extra_params (static_params wins)
-  "max_segments_per_run": 100,   # safety cap for date_windows
+  "max_segments_per_run": 100,   # safety cap for date_windows and incremental_dates
   "timezone": "America/Sao_Paulo",
   "date_dimension": {
     "from_key": "dDtIncDe",
@@ -17,12 +17,17 @@ fetch_config JSON shape (all keys optional except where noted):
   },
   "bounds": {
     "start": "2025-01-01",       # ISO date (YYYY-MM-DD)
-    "end": "2025-12-31"          # optional; default today (in timezone)
+    "end": "2025-12-31",         # optional hard cap; default computed dynamically
+    "end_offset_days": -1        # dynamic end = today + offset (default -1 = yesterday)
   },
   "cursor": {
     "next_start": "2025-06-01"   # incremental_dates: first day of next window
   }
 }
+
+incremental_dates catch-up: yields ALL segments from cursor to bound_end in a
+single execution (capped by max_segments_per_run). The caller is responsible
+for advancing the cursor per-segment after success (see omie_sync_service).
 """
 
 from __future__ import annotations
@@ -119,6 +124,15 @@ def validate_fetch_config(fc: Optional[Dict[str, Any]]) -> List[str]:
     bounds = fc.get("bounds")
     if bounds is not None and not isinstance(bounds, dict):
         errors.append("fetch_config.bounds must be an object.")
+    elif isinstance(bounds, dict):
+        eod = bounds.get("end_offset_days")
+        if eod is not None:
+            try:
+                v = int(eod)
+                if v > 0:
+                    errors.append("fetch_config.bounds.end_offset_days must be <= 0 (0=today, -1=yesterday).")
+            except (TypeError, ValueError):
+                errors.append("fetch_config.bounds.end_offset_days must be an integer.")
 
     if fc.get("max_segments_per_run") is not None:
         try:
@@ -169,12 +183,20 @@ def iter_fetch_segments(job: Any) -> Iterator[Segment]:
 
     bounds = fc.get("bounds") or {}
     bound_start = _parse_iso_date(bounds.get("start"))
-    bound_end = _parse_iso_date(bounds.get("end"))
+    bound_end_fixed = _parse_iso_date(bounds.get("end"))
 
     max_seg = int(fc.get("max_segments_per_run") or DEFAULT_MAX_SEGMENTS)
     today = _today_in_tz(fc)
-    if bound_end is None:
-        bound_end = today
+
+    default_offset = -1 if mode == MODE_INCREMENTAL_DATES else 0
+    end_offset = int(bounds.get("end_offset_days", default_offset))
+    dynamic_end = today + timedelta(days=end_offset)
+
+    if bound_end_fixed is not None:
+        bound_end = min(bound_end_fixed, dynamic_end)
+    else:
+        bound_end = dynamic_end
+
     if bound_start is None:
         bound_start = today - timedelta(days=window_days - 1)
 
@@ -194,9 +216,14 @@ def iter_fetch_segments(job: Any) -> Iterator[Segment]:
             next_s = bound_start
         if next_s > bound_end:
             return
-        win_end = min(next_s + timedelta(days=window_days - 1), bound_end)
-        label = f"{next_s.isoformat()}..{win_end.isoformat()}"
-        yield Segment(params=overlay(next_s, win_end), label=label, date_start=next_s, date_end=win_end)
+        cur = next_s
+        count = 0
+        while cur <= bound_end and count < max_seg:
+            win_end = min(cur + timedelta(days=window_days - 1), bound_end)
+            label = f"{cur.isoformat()}..{win_end.isoformat()}"
+            yield Segment(params=overlay(cur, win_end), label=label, date_start=cur, date_end=win_end)
+            count += 1
+            cur = cur + timedelta(days=step_days)
         return
 
     # date_windows: backfill many segments in one run

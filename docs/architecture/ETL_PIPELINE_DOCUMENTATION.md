@@ -1877,3 +1877,59 @@ Response:
 }
 ```
 
+---
+
+## External ID Support (`__erp_id` and `*_erp_id`)
+
+The import pipeline supports using external ERP identifiers (`cliente_erp_id`) for both row identification (upsert/delete) and foreign key resolution.
+
+### Row Identification via `__erp_id`
+
+When the input data includes a column named `__erp_id`, the import system uses it to find existing records by their `cliente_erp_id` field:
+
+| `__erp_id` value | Behavior |
+|-------------------|----------|
+| `ERP-123` | **Upsert:** If a record with `cliente_erp_id = "ERP-123"` exists, it is updated. Otherwise, a new record is created. |
+| `-ERP-123` | **Delete:** The record with `cliente_erp_id = "ERP-123"` is deleted (prefix `-`). |
+| _(empty)_ | **Create:** A new record is created (default behavior). |
+
+This works for both template import (`/api/core/import/`) and ETL import (`/api/core/etl/execute/`), including the specialized Transaction + JournalEntry ETL path.
+
+### Foreign Key Resolution via `*_erp_id`
+
+Columns ending in `_erp_id` (e.g., `account_erp_id`, `entity_erp_id`, `currency_erp_id`) resolve the corresponding foreign key by looking up the related model's `cliente_erp_id`:
+
+```
+account_erp_id: "ACC-001"  →  Account.objects.get(cliente_erp_id="ACC-001", company=tenant).pk  →  account_id: 42
+```
+
+Supported `*_erp_id` columns (any FK field whose related model has `cliente_erp_id`):
+
+| Column | Resolves | Related Model |
+|--------|----------|---------------|
+| `account_erp_id` | `account_id` | Account |
+| `entity_erp_id` | `entity_id` | Entity |
+| `currency_erp_id` | `currency_id` | Currency |
+| `bank_account_erp_id` | `bank_account_id` | BankAccount |
+| `transaction_erp_id` | `transaction_id` | Transaction |
+| `cost_center_erp_id` | `cost_center_id` | CostCenter |
+| `category_erp_id` | `category_id` | BusinessPartnerCategory / ProductServiceCategory |
+| `partner_erp_id` | `partner_id` | BusinessPartner |
+| `index_erp_id` | `index_id` | FinancialIndex |
+
+### LookupCache Optimization
+
+The `LookupCache` class (in `multitenancy/lookup_cache.py`) pre-loads `cliente_erp_id` indexes for `Account`, `Entity`, and `Currency` to avoid repeated database queries during bulk imports. The cache methods `get_account_by_erp_id()`, `get_entity_by_erp_id()`, and `get_currency_by_erp_id()` provide O(1) lookups.
+
+### Transaction Fields
+
+The `Transaction` model includes additional fields relevant to import/ETL:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `due_date` | date | Payment due date (nullable) |
+| `nf_number` | string | Nota Fiscal number (nullable, max 60 chars) |
+| `cliente_erp_id` | string | External ERP identifier |
+
+These fields are available in both template import and ETL import, and are exposed in the export-unreconciled-report Excel output.
+
