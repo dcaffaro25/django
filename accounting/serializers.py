@@ -184,7 +184,7 @@ class JournalEntrySerializer(serializers.ModelSerializer):
     class Meta:
         model = JournalEntry
         fields = [
-            "id", "company", "transaction", "cliente_erp_id",
+            "id", "company", "transaction", "erp_id",
             "description", "account", "cost_center",
             "debit_amount", "credit_amount",
             "state", "date",
@@ -209,7 +209,7 @@ class JournalEntryDerivedLineSerializer(serializers.Serializer):
     )
     bank_designation_pending = serializers.BooleanField(required=False, default=False)
     is_cash = serializers.BooleanField(required=False, default=False)
-    cliente_erp_id = serializers.CharField(required=False, allow_blank=True, max_length=128)
+    erp_id = serializers.CharField(required=False, allow_blank=True, max_length=128)
     notes = serializers.CharField(required=False, allow_blank=True)
 
     def validate(self, attrs):
@@ -265,7 +265,7 @@ class JournalEntryListSerializer(serializers.ModelSerializer):
         model = JournalEntry
         fields = [
             'id', 'transaction_id', 'company', 'entity', 'currency',
-            'cliente_erp_id', 'description', 'bank_date', 'balance',
+            'erp_id', 'description', 'bank_date', 'balance',
             'transaction_date', 'transaction_description', 'transaction_value',
             'bank_account', 'reconciliation_status', 'notes', 'tag',
             'numero_boleto', 'cnpj', 'due_date', 'nf_number',
@@ -423,7 +423,7 @@ class TransactionListSerializer(serializers.ModelSerializer):
         model = Transaction
         fields = [
             'id', 'company', 'entity', 'currency', 'date', 'due_date', 'bank_date',
-            'description', 'amount', 'state', 'cliente_erp_id', 'nf_number',
+            'description', 'amount', 'state', 'erp_id', 'nf_number',
             'journal_entries_count', 'balance', 'journal_entries_summary',
             'journal_entries_bank_accounts', 'reconciliation_status', 'notes',
             'is_balanced', 'bank_recon_status', 'bank_linked_je_count', 'bank_reconciled_je_count',
@@ -599,7 +599,7 @@ class BankTransactionSerializer(serializers.ModelSerializer):
         model = BankTransaction
         fields = [
             'id', 'company', 'bank_account', 'entity', 'entity_name', 'currency', 'date',
-            'description', 'amount', 'status', 'cliente_erp_id',
+            'description', 'amount', 'status', 'erp_id',
             'is_deleted', 'updated_at', 'updated_by', 'reconciliation_status', 'notes',
             'numeros_boleto', 'cnpj', 'tag',
         ]

@@ -92,7 +92,7 @@ Catálogo completo de todos os endpoints disponíveis na plataforma Nord, organi
 | `POST` | `/{t}/api/transactions/bulk_update/` | Atualizar em lote |
 | `POST` | `/{t}/api/transactions/bulk_delete/` | Excluir em lote |
 
-**Filtros de Transação:** `nf_number`, `cliente_erp_id`, `due_date_from`, `due_date_to`, `search` (pesquisa em description, nf_number, cliente_erp_id, numero_boleto, cnpj)
+**Filtros de Transação:** `nf_number`, `erp_id`, `due_date_from`, `due_date_to`, `search` (pesquisa em description, nf_number, erp_id, numero_boleto, cnpj)
 
 ### Lançamentos Contábeis (Journal Entries)
 
@@ -108,7 +108,7 @@ Catálogo completo de todos os endpoints disponíveis na plataforma Nord, organi
 | `POST` | `/{t}/api/journal_entries/derive_from/` | Derivar lançamento |
 | `GET` | `/{t}/api/journal_entries/unmatched/` | Não conciliados |
 
-**Filtros de Lançamento:** `tag`, `cliente_erp_id`, `transaction_nf_number`, `transaction_due_date_from`, `transaction_due_date_to`
+**Filtros de Lançamento:** `tag`, `erp_id`, `transaction_nf_number`, `transaction_due_date_from`, `transaction_due_date_to`
 
 ### Centros de Custo
 
@@ -129,7 +129,7 @@ Catálogo completo de todos os endpoints disponíveis na plataforma Nord, organi
 | `POST` | `/{t}/api/bank_transactions/{id}/match_boletos/` | Vincular boletos |
 | `POST` | `/{t}/api/bank_transactions/suggest_matches/` | Sugerir correspondências |
 
-**Filtros de Transação Bancária:** `tag`, `cliente_erp_id`
+**Filtros de Transação Bancária:** `tag`, `erp_id`
 
 ### Histórico de Saldos e Comparações
 
@@ -320,7 +320,7 @@ Catálogo completo de todos os endpoints disponíveis na plataforma Nord, organi
 | `GET` | `/{t}/api/core/import/template/` | Baixar template de importação (Excel) |
 | `POST` | `/{t}/api/core/import/` | Importar via template (suporta `__erp_id`, `*_erp_id`) |
 
-**Colunas especiais na importação:** `__row_id` (upsert/delete por PK), `__erp_id` (upsert/delete por `cliente_erp_id`), `*_erp_id` (resolve FK por `cliente_erp_id` do modelo relacionado). Ver [seção 11.4b](11-etl-importacao.md) para detalhes e exemplos.
+**Colunas especiais na importação:** `__row_id` (upsert/delete por PK), `__erp_id` (upsert/delete por `erp_id`), `*_erp_id` (resolve FK por `erp_id` do modelo relacionado). Ver [seção 11.4b](11-etl-importacao.md) para detalhes e exemplos.
 
 ---
 

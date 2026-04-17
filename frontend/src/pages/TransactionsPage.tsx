@@ -47,9 +47,9 @@ const columns: (onPost: (id: number) => void, onUnpost: (id: number) => void) =>
     cell: ({ row }) => row.original.nf_number || "-",
   },
   {
-    accessorKey: "cliente_erp_id",
+    accessorKey: "erp_id",
     header: "ERP ID",
-    cell: ({ row }) => row.original.cliente_erp_id || "-",
+    cell: ({ row }) => row.original.erp_id || "-",
   },
   {
     accessorKey: "state",
@@ -228,7 +228,7 @@ export function TransactionsPage() {
       placeholder: "Search NF...",
     },
     {
-      id: "cliente_erp_id",
+      id: "erp_id",
       type: "text",
       label: "ERP ID",
       placeholder: "Search ERP ID...",

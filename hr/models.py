@@ -15,7 +15,7 @@ class Position(TenantAwareBaseModel):
     Represents the position of an employee (e.g. Developer, Manager).
     """
     title = models.CharField(max_length=100)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -40,7 +40,7 @@ class Position(TenantAwareBaseModel):
             ),
         ]
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def __str__(self):
@@ -51,7 +51,7 @@ class Employee(TenantAwareBaseModel):
     Basic employee model.
     """
     CPF = models.CharField(max_length=14)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -92,7 +92,7 @@ class Employee(TenantAwareBaseModel):
             ),
         ]
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def __str__(self):
@@ -112,7 +112,7 @@ class TimeTracking(TenantAwareBaseModel):
     ]
 
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='attendance_records')
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -145,7 +145,7 @@ class TimeTracking(TenantAwareBaseModel):
         verbose_name = 'Employee Attendance'
         verbose_name_plural = 'Employee Attendances'
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def clean(self):
@@ -201,7 +201,7 @@ class KPI(TenantAwareBaseModel):
     Stores KPI name & value for an employee.
     """
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -214,7 +214,7 @@ class KPI(TenantAwareBaseModel):
 
     class Meta:
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def __str__(self):
@@ -225,7 +225,7 @@ class Bonus(TenantAwareBaseModel):
     Bonus calculation is formula-based, referencing KPI values.
     """
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -237,7 +237,7 @@ class Bonus(TenantAwareBaseModel):
 
     class Meta:
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def calculate_bonus(self):
@@ -277,7 +277,7 @@ class RecurringAdjustment(TenantAwareBaseModel):
     name = models.CharField(max_length=255)
     type = models.CharField(max_length=10, choices=TYPE_CHOICES)
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='recurring_adjustments')
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -306,7 +306,7 @@ class RecurringAdjustment(TenantAwareBaseModel):
 
     class Meta:
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def is_active(self):

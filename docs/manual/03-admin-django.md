@@ -92,7 +92,7 @@ Entidades representam a **hierarquia organizacional** dentro de uma empresa.
 **Campos principais:**
 - `name` — Nome da entidade
 - `parent` — Entidade-pai (hierarquia em árvore)
-- `cliente_erp_id` — ID no ERP externo
+- `erp_id` — ID no ERP externo
 - `inherit_accounts` — Herdar contas do pai
 - `inherit_cost_centers` — Herdar centros de custo do pai
 

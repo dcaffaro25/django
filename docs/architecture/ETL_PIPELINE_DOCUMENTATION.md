@@ -1881,40 +1881,42 @@ Response:
 
 ## External ID Support (`__erp_id` and `*_erp_id`)
 
-The import pipeline supports using external ERP identifiers (`cliente_erp_id`) for both row identification (upsert/delete) and foreign key resolution.
+The import pipeline supports using external ERP identifiers (`erp_id`) for both row identification (upsert/delete) and foreign key resolution.
 
 ### Row Identification via `__erp_id`
 
-When the input data includes a column named `__erp_id`, the import system uses it to find existing records by their `cliente_erp_id` field:
+When the input data includes a column named `__erp_id`, the import system uses it to find existing records by their `erp_id` field:
 
 | `__erp_id` value | Behavior |
 |-------------------|----------|
-| `ERP-123` | **Upsert:** If a record with `cliente_erp_id = "ERP-123"` exists, it is updated. Otherwise, a new record is created. |
-| `-ERP-123` | **Delete:** The record with `cliente_erp_id = "ERP-123"` is deleted (prefix `-`). |
+| `ERP-123` | **Upsert:** If a record with `erp_id = "ERP-123"` exists, it is updated. Otherwise, a new record is created. |
+| `-ERP-123` | **Delete:** The record with `erp_id = "ERP-123"` is deleted (prefix `-`). |
 | _(empty)_ | **Create:** A new record is created (default behavior). |
 
 This works for both template import (`/api/core/import/`) and ETL import (`/api/core/etl/execute/`), including the specialized Transaction + JournalEntry ETL path.
 
-### `__erp_id` vs mapped `cliente_erp_id` (same semantics)
+### `__erp_id` vs mapped `erp_id` (same semantics)
 
-For models that define `cliente_erp_id`, bulk import treats a **mapped** `cliente_erp_id` column and an explicit **`__erp_id`** column as the **same ERP row key** when `erp_key_coalesce` is true (default on `ImportTransformationRule`). Either one can drive upsert or delete (value prefixed with `-`). If both are present on one row, they must match or the row fails.
+For models that define `erp_id`, bulk import treats a **mapped** `erp_id` column and an explicit **`__erp_id`** column as the **same ERP row key** when `erp_key_coalesce` is true (default on `ImportTransformationRule`). Either one can drive upsert or delete (value prefixed with `-`). If both are present on one row, they must match or the row fails.
 
 `ImportTransformationRule` fields (ETL):
 
-- **`erp_key_coalesce`** (default `True`): use mapped `cliente_erp_id` for upsert/delete when `__erp_id` is absent; set `False` to only use the `__erp_id` column for ERP-key matching.
+- **`erp_key_coalesce`** (default `True`): use mapped `erp_id` for upsert/delete when `__erp_id` is absent; set `False` to only use the `__erp_id` column for ERP-key matching.
 - **`erp_duplicate_behavior`**: `update` (default), `skip`, or `error` when a row’s ERP key matches an existing record.
 
 You can also pass `import_options` with the same keys on each sheet dict to `execute_import_job`, or under `import_metadata["import_options"]` for template imports.
 
 ### Foreign Key Resolution via `*_erp_id`
 
-Columns ending in `_erp_id` (e.g., `account_erp_id`, `entity_erp_id`, `currency_erp_id`) resolve the corresponding foreign key by looking up the related model's `cliente_erp_id`:
+**Convention:** The prefix before `_erp_id` must match a **`ForeignKey` field name** on the model being imported (e.g. `entity` on `Transaction` → column `entity_erp_id`). The supplied value is resolved against **`RelatedModel.erp_id`**. A literal column named **`erp_id`** (which does not use the `<fk>_erp_id` pattern) is stored on the imported row as its own external identifier.
+
+Columns ending in `_erp_id` (e.g., `account_erp_id`, `entity_erp_id`, `currency_erp_id`) resolve the corresponding foreign key by looking up the related model's `erp_id`:
 
 ```
-account_erp_id: "ACC-001"  →  Account.objects.get(cliente_erp_id="ACC-001", company=tenant).pk  →  account_id: 42
+account_erp_id: "ACC-001"  →  Account.objects.get(erp_id="ACC-001", company=tenant).pk  →  account_id: 42
 ```
 
-Supported `*_erp_id` columns (any FK field whose related model has `cliente_erp_id`):
+Supported `*_erp_id` columns (any FK field whose related model has `erp_id`):
 
 | Column | Resolves | Related Model |
 |--------|----------|---------------|
@@ -1930,7 +1932,7 @@ Supported `*_erp_id` columns (any FK field whose related model has `cliente_erp_
 
 ### LookupCache Optimization
 
-The `LookupCache` class (in `multitenancy/lookup_cache.py`) pre-loads `cliente_erp_id` indexes for `Account`, `Entity`, and `Currency` to avoid repeated database queries during bulk imports. The cache methods `get_account_by_erp_id()`, `get_entity_by_erp_id()`, and `get_currency_by_erp_id()` provide O(1) lookups.
+The `LookupCache` class (in `multitenancy/lookup_cache.py`) pre-loads `erp_id` indexes for `Account`, `Entity`, and `Currency` to avoid repeated database queries during bulk imports. The cache methods `get_account_by_erp_id()`, `get_entity_by_erp_id()`, and `get_currency_by_erp_id()` provide O(1) lookups.
 
 ### Transaction Fields
 
@@ -1940,7 +1942,7 @@ The `Transaction` model includes additional fields relevant to import/ETL:
 |-------|------|-------------|
 | `due_date` | date | Payment due date (nullable) |
 | `nf_number` | string | Nota Fiscal number (nullable, max 60 chars) |
-| `cliente_erp_id` | string | External ERP identifier |
+| `erp_id` | string | External ERP identifier |
 
 These fields are available in both template import and ETL import, and are exposed in the export-unreconciled-report Excel output.
 

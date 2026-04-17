@@ -28,7 +28,7 @@ class NotaFiscal(TenantAwareBaseModel):
 
     # ===== IDENTIFICAÇÃO =====
     chave = models.CharField('Chave de acesso', max_length=44, unique=True, db_index=True)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -159,7 +159,7 @@ class NotaFiscal(TenantAwareBaseModel):
             models.Index(fields=['emit_cnpj', 'data_emissao']),
             models.Index(fields=['dest_cnpj', 'data_emissao']),
             models.Index(fields=['finalidade']),
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def __str__(self):
@@ -182,7 +182,7 @@ class NotaFiscalItem(TenantAwareBaseModel):
         verbose_name='Nota Fiscal'
     )
     numero_item = models.SmallIntegerField('N. item')
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -266,7 +266,7 @@ class NotaFiscalItem(TenantAwareBaseModel):
             models.Index(fields=['ncm']),
             models.Index(fields=['cfop']),
             models.Index(fields=['cfop_ref']),
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def __str__(self):
@@ -302,7 +302,7 @@ class NotaFiscalReferencia(TenantAwareBaseModel):
         verbose_name="Nota referenciada (quando existir)",
         help_text="Preenchido quando já existe NotaFiscal com chave = chave_referenciada.",
     )
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -323,7 +323,7 @@ class NotaFiscalReferencia(TenantAwareBaseModel):
         indexes = [
             models.Index(fields=["chave_referenciada"]),
             models.Index(fields=["nota_referenciada"]),
-            models.Index(fields=["company", "cliente_erp_id"]),
+            models.Index(fields=["company", "erp_id"]),
         ]
 
     def __str__(self):
@@ -383,7 +383,7 @@ class NFeEvento(TenantAwareBaseModel):
 
     xml_original = models.TextField("XML original", blank=True)
     arquivo_origem = models.CharField("Arquivo de origem", max_length=500, blank=True)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -404,7 +404,7 @@ class NFeEvento(TenantAwareBaseModel):
         indexes = [
             models.Index(fields=["tipo_evento", "chave_nfe"]),
             models.Index(fields=["status_sefaz"]),
-            models.Index(fields=["company", "cliente_erp_id"]),
+            models.Index(fields=["company", "erp_id"]),
         ]
 
     def __str__(self):
@@ -431,7 +431,7 @@ class NFeInutilizacao(TenantAwareBaseModel):
     data_registro = models.DateTimeField("Data registro SEFAZ", null=True, blank=True)
     xml_original = models.TextField("XML original", blank=True)
     arquivo_origem = models.CharField("Arquivo de origem", max_length=500, blank=True)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -450,7 +450,7 @@ class NFeInutilizacao(TenantAwareBaseModel):
             ),
         ]
         indexes = [
-            models.Index(fields=["company", "cliente_erp_id"]),
+            models.Index(fields=["company", "erp_id"]),
         ]
 
     def __str__(self):

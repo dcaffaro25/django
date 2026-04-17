@@ -30,7 +30,7 @@ class DocTypeRule(models.Model):
     As âncoras de cada categoria (forte, fraca e negativa) são armazenadas em campos
     de texto, separadas por ';'. Por exemplo: "decido; defiro; julgo procedente".
     """
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -225,7 +225,7 @@ class SpanRule(models.Model):
     - anchor_embeddings: lista de vetores (um por âncora forte), armazenados como JSON.
     """
 
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -261,7 +261,7 @@ class SpanRule(models.Model):
     class Meta:
         unique_together = ('doc_type', 'label')
         indexes = [
-            models.Index(fields=['cliente_erp_id']),
+            models.Index(fields=['erp_id']),
         ]
     
     def __str__(self):

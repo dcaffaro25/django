@@ -836,7 +836,7 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 [
                     je.id,
                     je.transaction_id,
-                    getattr(tx, "cliente_erp_id", "") or "" if tx else "",
+                    getattr(tx, "erp_id", "") or "" if tx else "",
                     je.account_id,
                     getattr(acct, "name", "") if acct else "",
                     getattr(bank_acct, "id", None) if bank_acct else None,
@@ -897,7 +897,7 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     filterset_class = TransactionFilter
     search_fields = [
         "description", "entity__name", "journal_entries__account__name",
-        "nf_number", "cliente_erp_id", "numero_boleto", "cnpj",
+        "nf_number", "erp_id", "numero_boleto", "cnpj",
     ]
     ordering_fields = ["date", "amount", "id", "created_at"]
     ordering = ["-date", "-id"]
@@ -1354,7 +1354,7 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
           - template_journal_entry_id: source journal entry (same transaction is used)
           - entries: list of lines with account_id, debit_amount and/or credit_amount, optional
             date, description, cost_center_id, state, bank_designation_pending, is_cash,
-            cliente_erp_id, notes
+            erp_id, notes
         """
         ser = JournalEntryDeriveFromSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
@@ -1411,7 +1411,7 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     state=line.get("state", "pending"),
                     bank_designation_pending=line.get("bank_designation_pending", False),
                     is_cash=line.get("is_cash", False),
-                    cliente_erp_id=line.get("cliente_erp_id") or None,
+                    erp_id=line.get("erp_id") or None,
                     notes=line.get("notes") or None,
                 )
                 created.append(je)

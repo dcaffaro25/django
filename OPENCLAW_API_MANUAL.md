@@ -545,7 +545,7 @@ Uses `TenantAwareManager` which auto-filters by the current tenant. Has `clean()
 | id                        | integer          | auto     | yes    | auto    | PK                               |
 | company                   | FK → Company     | yes      | no     | —       |                                  |
 | name                      | string(100)      | yes      | no     | —       |                                  |
-| cliente_erp_id            | string(128)      | no       | no     | null    | External ERP identifier          |
+| erp_id            | string(128)      | no       | no     | null    | External ERP identifier          |
 | parent                    | TreeFK → self    | no       | no     | null    | Parent entity in hierarchy       |
 | accounts                  | M2M → Account    | no       | —      | —       | Directly assigned GL accounts    |
 | cost_centers              | M2M → CostCenter | no       | —      | —       | Directly assigned cost centers   |
@@ -554,7 +554,7 @@ Uses `TenantAwareManager` which auto-filters by the current tenant. Has `clean()
 | lft, rght, tree_id, level | integer          | auto     | —      | auto    | MPTT tree fields                 |
 
 
-**Constraints:** `unique_together = (company, name)`. Index on `(company, cliente_erp_id)`.
+**Constraints:** `unique_together = (company, name)`. Index on `(company, erp_id)`.
 
 **Computed properties:**
 
@@ -572,7 +572,7 @@ Uses `TenantAwareManager` which auto-filters by the current tenant. Has `clean()
 | ----------------- | ----------- | -------- | ------- | --------------------------------------------------------------------------------------------------------------------- |
 | id                | integer     | auto     | auto    | PK                                                                                                                    |
 | name              | string(100) | yes      | —       | Rule display name                                                                                                     |
-| cliente_erp_id    | string(128) | no       | null    | ERP sync key                                                                                                          |
+| erp_id    | string(128) | no       | null    | ERP sync key                                                                                                          |
 | description       | text        | no       | null    |                                                                                                                       |
 | trigger_event     | enum        | yes      | —       | One of: `payroll_approved`, `payroll_created`, `transaction_created`, `journal_entry_created`, `etl_import_completed` |
 | execution_order   | integer     | —        | 0       |                                                                                                                       |
@@ -626,7 +626,7 @@ Uses `TenantAwareManager` which auto-filters by the current tenant. Has `clean()
 | trigger_options          | json        | no       | {}      | Trigger configuration                                          |
 | execution_order          | integer     | —        | 0       |                                                                |
 | is_active                | boolean     | —        | true    |                                                                |
-| erp_key_coalesce         | boolean     | —        | true    | When true, mapped `cliente_erp_id` on each row also drives upsert/delete like `__erp_id` |
+| erp_key_coalesce         | boolean     | —        | true    | When true, mapped `erp_id` on each row also drives upsert/delete like `__erp_id` |
 | erp_duplicate_behavior   | string(20)  | —        | update  | `update`, `skip`, or `error` when ERP key matches an existing row |
 
 
@@ -750,7 +750,7 @@ Uses `TenantAwareManager` which auto-filters by the current tenant. Has `clean()
 | id             | integer     | auto     | yes    | PK                                    |
 | code           | string      | yes      | yes    | ISO currency code (e.g. "BRL", "USD") |
 | symbol         | string      | no       | no     | Display symbol                        |
-| cliente_erp_id | string(128) | no       | no     | ERP sync key                          |
+| erp_id | string(128) | no       | no     | ERP sync key                          |
 
 
 #### CostCenter
@@ -765,7 +765,7 @@ Uses `TenantAwareManager` which auto-filters by the current tenant. Has `clean()
 | center_type    | string      | no       | null    |                 |
 | balance        | decimal     | no       | 0       | Current balance |
 | balance_date   | date        | no       | null    |                 |
-| cliente_erp_id | string(128) | no       | null    |                 |
+| erp_id | string(128) | no       | null    |                 |
 
 
 **Constraints:** `unique_together = (company, name)`
@@ -781,7 +781,7 @@ Uses `TenantAwareManager` which auto-filters by the current tenant. Has `clean()
 | name           | string      | yes      | no     |                         |
 | bank_code      | string      | yes      | yes    | Bank institutional code |
 | country        | string      | no       | no     |                         |
-| cliente_erp_id | string(128) | no       | no     |                         |
+| erp_id | string(128) | no       | no     |                         |
 
 
 #### BankAccount
@@ -800,7 +800,7 @@ Uses `TenantAwareManager` which auto-filters by the current tenant. Has `clean()
 | branch_id       | string        | no       |               |
 | initial_balance | decimal       | no       |               |
 | current_balance | decimal       | no       |               |
-| cliente_erp_id  | string(128)   | no       |               |
+| erp_id  | string(128)   | no       |               |
 
 
 **Constraints:** `unique_together = (company, name, bank, account_number, branch_id)`
@@ -822,7 +822,7 @@ Uses `TenantAwareManager` which auto-filters by the current tenant. Has `clean()
 | bank_account                  | FK → BankAccount | no       | null    | Links GL account to bank account       |
 | parent                        | TreeFK → self    | no       | null    | Parent in account tree                 |
 | account_description_embedding | vector(768)      | no       | null    | pgvector embedding for semantic search |
-| cliente_erp_id                | string(128)      | no       | null    |                                        |
+| erp_id                | string(128)      | no       | null    |                                        |
 
 
 **Constraints:** `unique_together = (company, account_code, parent, name)`. HNSW vector index on embedding field.
@@ -848,7 +848,7 @@ Uses `TenantAwareManager` which auto-filters by the current tenant. Has `clean()
 | numero_boleto            | string        | no       | null    | Bank slip number                       |
 | cnpj                     | string        | no       | null    | Brazilian tax ID                       |
 | description_embedding    | vector(768)   | no       | null    | Semantic search embedding              |
-| cliente_erp_id           | string(128)   | no       | null    |                                        |
+| erp_id           | string(128)   | no       | null    |                                        |
 | recon_score_amount       | float         | no       | null    | Reconciliation metric                  |
 | recon_score_date         | float         | no       | null    |                                        |
 | recon_score_desc         | float         | no       | null    |                                        |
@@ -887,7 +887,7 @@ Uses `TenantAwareManager` which auto-filters by the current tenant. Has `clean()
 | is_cash                  | boolean          | —           | false   |                                                 |
 | is_reconciled            | boolean          | —           | false   |                                                 |
 | tag                      | string           | no          | null    | Classification tag                              |
-| cliente_erp_id           | string(128)      | no          | null    |                                                 |
+| erp_id           | string(128)      | no          | null    |                                                 |
 
 
 **DB Constraint:** `CheckConstraint: bank_designation_pending=True OR account IS NOT NULL`
@@ -919,7 +919,7 @@ Uses `TenantAwareManager` which auto-filters by the current tenant. Has `clean()
 | cnpj                  | string           | no       |                        |
 | tag                   | string           | no       | Classification tag     |
 | description_embedding | vector(768)      | no       |                        |
-| cliente_erp_id        | string(128)      | no       |                        |
+| erp_id        | string(128)      | no       |                        |
 
 
 **Computed property:** `entity` → derived from `bank_account.entity`
@@ -1027,7 +1027,7 @@ Stores monthly balance snapshots per account.
 | category       | FK → BusinessPartnerCategory | no       |                          |
 | partner_type   | enum                         | —        | customer, supplier, both |
 | is_active      | boolean                      | —        | true                     |
-| cliente_erp_id | string(128)                  | no       |                          |
+| erp_id | string(128)                  | no       |                          |
 
 
 **Constraints:** `UniqueConstraint(company, identifier)`
@@ -1046,7 +1046,7 @@ Stores monthly balance snapshots per account.
 | unit_price      | decimal                     |                        |
 | revenue_account | FK → Account                | GL account for revenue |
 | expense_account | FK → Account                | GL account for expense |
-| cliente_erp_id  | string(128)                 |                        |
+| erp_id  | string(128)                 |                        |
 
 
 #### Contract
@@ -1358,7 +1358,7 @@ Company ──┬── Entity (tree) ──── Account (M2M)
 
 #### Currencies — /api/core/currencies/
 
-Standard CRUD. Fields: code, symbol, cliente_erp_id.
+Standard CRUD. Fields: code, symbol, erp_id.
 
 #### Integration Rules — /api/core/integration-rules/
 
@@ -1549,7 +1549,7 @@ Authorization: Token <token>
 | bank_designation_pending  | boolean | Filter by pending bank designation       |
 | has_designated_bank       | boolean | Filter by whether account has bank link  |
 | tag                       | string  | Exact tag match                          |
-| cliente_erp_id            | string  | Exact ERP ID match                       |
+| erp_id            | string  | Exact ERP ID match                       |
 | transaction_nf_number     | string  | Filter by parent transaction's NF number |
 | transaction_due_date_from | date    | Parent transaction due date range        |
 | transaction_due_date_to   | date    |                                          |

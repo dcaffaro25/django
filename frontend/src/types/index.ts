@@ -87,7 +87,7 @@ export interface JournalEntry extends BaseModel {
   company: number
   transaction?: number
   transaction_id?: number
-  cliente_erp_id?: string | null
+  erp_id?: string | null
   account?: number
   cost_center?: number
   description?: string | null
@@ -114,7 +114,7 @@ export interface Transaction extends BaseModel {
   amount: number
   currency: number
   state: "pending" | "posted" | "canceled" | "cancelled" | "partial" | "mixed"
-  cliente_erp_id?: string | null
+  erp_id?: string | null
   nf_number?: string | null
   balance?: number
   journal_entries?: JournalEntry[]
@@ -136,7 +136,7 @@ export interface BankTransaction extends BaseModel {
   description: string
   currency: number
   status: string
-  cliente_erp_id?: string | null
+  erp_id?: string | null
   reconciliation_status?: ReconciliationLineStatus
   tag?: string
 }

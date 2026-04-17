@@ -41,7 +41,7 @@ O plano de contas é organizado em **árvore** (MPTT), seguindo o padrão contá
 | `account_direction` | choice | Direção: `debit` ou `credit` |
 | `balance` | decimal | Saldo atual |
 | `balance_date` | date | Data do saldo |
-| `cliente_erp_id` | string | ID no ERP externo |
+| `erp_id` | string | ID no ERP externo |
 
 ### Endpoints
 
@@ -100,7 +100,7 @@ Transações são os registros financeiros principais. Cada transação pode con
 | `state` | choice | Estado: `draft`, `posted`, `cancelled` |
 | `due_date` | date | Data de vencimento do título/obrigação financeira (opcional) |
 | `nf_number` | string | Número da Nota Fiscal associada (opcional) |
-| `cliente_erp_id` | string | ID no ERP externo para integração |
+| `erp_id` | string | ID no ERP externo para integração |
 
 ### Ciclo de Vida
 
@@ -160,14 +160,14 @@ GET /acme/api/transactions/?date_after=2026-03-01&date_before=2026-03-31&state=p
 # Transações não conciliadas
 GET /acme/api/transactions/unmatched/
 
-# Busca textual (pesquisa em description, nf_number, cliente_erp_id, numero_boleto, cnpj)
+# Busca textual (pesquisa em description, nf_number, erp_id, numero_boleto, cnpj)
 GET /acme/api/transactions/?search=aluguel+sede
 
 # Filtrar por Nota Fiscal
 GET /acme/api/transactions/?nf_number=000123456
 
 # Filtrar por ID do ERP externo
-GET /acme/api/transactions/?cliente_erp_id=ERP-TX-001
+GET /acme/api/transactions/?erp_id=ERP-TX-001
 
 # Filtrar por data de vencimento
 GET /acme/api/transactions/?due_date_from=2026-03-01&due_date_to=2026-03-31
@@ -193,9 +193,9 @@ Cada transação contém um ou mais lançamentos contábeis que debitam/creditam
 | `credit` | decimal | Valor a crédito |
 | `state` | choice | Estado (herda da transação) |
 | `tag` | string | Tag livre para classificação e agrupamento na conciliação |
-| `cliente_erp_id` | string | ID no ERP externo |
+| `erp_id` | string | ID no ERP externo |
 
-> **Campos herdados da Transação-pai:** Na listagem, cada lançamento também exibe `due_date`, `nf_number` e `cliente_erp_id` da transação associada. Isso permite filtrar lançamentos por data de vencimento, NF ou ID ERP sem precisar consultar a transação separadamente.
+> **Campos herdados da Transação-pai:** Na listagem, cada lançamento também exibe `due_date`, `nf_number` e `erp_id` da transação associada. Isso permite filtrar lançamentos por data de vencimento, NF ou ID ERP sem precisar consultar a transação separadamente.
 
 ### Filtros de Lançamentos
 
@@ -210,7 +210,7 @@ GET /acme/api/journal_entries/?transaction_nf_number=000123456
 GET /acme/api/journal_entries/?transaction_due_date_from=2026-03-01&transaction_due_date_to=2026-03-31
 
 # Lançamentos por ID ERP do cliente
-GET /acme/api/journal_entries/?cliente_erp_id=ERP-JE-001
+GET /acme/api/journal_entries/?erp_id=ERP-JE-001
 ```
 
 ### Exemplo: Lançamento de Pagamento de Aluguel
@@ -279,7 +279,7 @@ Cria um novo lançamento baseado em um existente.
 | `code` | string | Código ISO (BRL, USD, EUR) |
 | `name` | string | Nome completo |
 | `symbol` | string | Símbolo (R$, $, €) |
-| `cliente_erp_id` | string | ID no ERP externo |
+| `erp_id` | string | ID no ERP externo |
 
 ```bash
 # Listar moedas
@@ -325,7 +325,7 @@ Transações bancárias representam movimentações no extrato do banco. São us
 | `description` | text | Descrição do extrato |
 | `status` | choice | Status de conciliação |
 | `tag` | string | Tag livre para agrupamento na conciliação |
-| `cliente_erp_id` | string | ID no ERP externo |
+| `erp_id` | string | ID no ERP externo |
 
 ### Filtros de Transações Bancárias
 
@@ -334,7 +334,7 @@ Transações bancárias representam movimentações no extrato do banco. São us
 GET /acme/api/bank_transactions/?tag=revisar
 
 # Filtrar por ID ERP
-GET /acme/api/bank_transactions/?cliente_erp_id=ERP-BK-001
+GET /acme/api/bank_transactions/?erp_id=ERP-BK-001
 ```
 
 ### Endpoints de Transações Bancárias

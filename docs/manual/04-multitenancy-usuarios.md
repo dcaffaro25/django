@@ -110,7 +110,7 @@ POST /acme/api/entities/
 |-------|------|-------------|-----------|
 | `name` | string | Sim | Nome da entidade |
 | `parent` | integer | Não | ID da entidade-pai |
-| `cliente_erp_id` | string | Não | Identificador no ERP externo |
+| `erp_id` | string | Não | Identificador no ERP externo |
 | `inherit_accounts` | boolean | Não | Herdar contas contábeis do pai (padrão: `false`) |
 | `inherit_cost_centers` | boolean | Não | Herdar centros de custo do pai (padrão: `false`) |
 

@@ -392,6 +392,34 @@ class ImportTransformationRuleSerializer(serializers.ModelSerializer):
             )
         return value
 
+    def validate(self, attrs):
+        """
+        Targets listed in extra_fields_for_trigger must not also appear as column_mappings
+        values (those belong only in extra_fields_for_trigger).
+        """
+        inst = self.instance
+        col = attrs.get("column_mappings")
+        if col is None and inst is not None:
+            col = inst.column_mappings
+        col = col or {}
+        extra = attrs.get("extra_fields_for_trigger")
+        if extra is None and inst is not None:
+            extra = inst.extra_fields_for_trigger
+        extra = extra or {}
+        extra_keys = set(extra.keys())
+        overlap = sorted({v for v in col.values() if isinstance(v, str)} & extra_keys)
+        if overlap:
+            raise serializers.ValidationError(
+                {
+                    "column_mappings": (
+                        "These targets are also keys in extra_fields_for_trigger and must "
+                        "only be mapped there (remove from column_mappings): "
+                        + ", ".join(overlap)
+                    )
+                }
+            )
+        return attrs
+
 
 class ImportTransformationRuleListSerializer(serializers.ModelSerializer):
     """Lightweight serializer for listing transformation rules."""

@@ -792,7 +792,7 @@ class TransactionAdmin(CompanyScopedAdmin):
         "description",
         "entity__name",
         "notes",
-        "cliente_erp_id",
+        "erp_id",
         "numero_boleto",
         "cnpj",
         "nf_number",
@@ -836,7 +836,7 @@ class TransactionAdmin(CompanyScopedAdmin):
         (
             "Matching / boleto",
             {
-                "fields": ("due_date", "nf_number", "numero_boleto", "cnpj", "cliente_erp_id"),
+                "fields": ("due_date", "nf_number", "numero_boleto", "cnpj", "erp_id"),
             },
         ),
         (
@@ -1055,7 +1055,7 @@ class JournalEntryAdmin(CompanyScopedAdmin):
         "account__account_code",
         "cost_center__name",
         "notes",
-        "cliente_erp_id",
+        "erp_id",
         "description",
     )
     readonly_fields = (
@@ -1121,7 +1121,7 @@ class JournalEntryAdmin(CompanyScopedAdmin):
         (
             "Metadata",
             {
-                "fields": ("company", "notes", "cliente_erp_id"),
+                "fields": ("company", "notes", "erp_id"),
             },
         ),
     )

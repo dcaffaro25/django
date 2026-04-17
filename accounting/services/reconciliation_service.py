@@ -79,7 +79,7 @@ class JournalEntryDTO:
     cnpj: Optional[str] = None
     nf_number: Optional[str] = None
     due_date: Optional[date] = None
-    cliente_erp_id: Optional[str] = None
+    erp_id: Optional[str] = None
 
     @property
     def amount_base(self) -> Decimal:
@@ -5086,7 +5086,7 @@ def _build_reconciliation_candidate_dtos(
             "transaction__cnpj",
             "transaction__nf_number",
             "transaction__due_date",
-            "transaction__cliente_erp_id",
+            "transaction__erp_id",
         )
     )
     if book_ids:
@@ -5142,7 +5142,7 @@ def _build_reconciliation_candidate_dtos(
                 cnpj=getattr(tr_obj, "cnpj", None) if tr_obj else None,
                 nf_number=getattr(tr_obj, "nf_number", None) if tr_obj else None,
                 due_date=getattr(tr_obj, "due_date", None) if tr_obj else None,
-                cliente_erp_id=getattr(tr_obj, "cliente_erp_id", None) if tr_obj else None,
+                erp_id=getattr(tr_obj, "erp_id", None) if tr_obj else None,
             )
         )
 

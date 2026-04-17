@@ -38,7 +38,7 @@ class BankTransactionFilter(filters.FilterSet):
     description     = filters.CharFilter(field_name="description", lookup_expr="icontains")
     reference_number = filters.CharFilter(field_name="reference_number", lookup_expr="icontains")
     tag             = filters.CharFilter(field_name="tag", lookup_expr="exact")
-    cliente_erp_id  = filters.CharFilter(field_name="cliente_erp_id", lookup_expr="exact")
+    erp_id = filters.CharFilter(field_name="erp_id", lookup_expr="exact")
 
     ordering = filters.OrderingFilter(
         fields=(("date","date"),("amount","amount"),("id","id"),("created_at","created_at"))
@@ -76,7 +76,7 @@ class TransactionFilter(filters.FilterSet):
 
     description = filters.CharFilter(field_name="description", lookup_expr="icontains")
     nf_number = filters.CharFilter(field_name="nf_number", lookup_expr="icontains")
-    cliente_erp_id = filters.CharFilter(field_name="cliente_erp_id", lookup_expr="exact")
+    erp_id = filters.CharFilter(field_name="erp_id", lookup_expr="exact")
     due_date_from = filters.DateFilter(field_name="due_date", lookup_expr="gte")
     due_date_to = filters.DateFilter(field_name="due_date", lookup_expr="lte")
 
@@ -221,7 +221,7 @@ class JournalEntryFilter(filters.FilterSet):
     bank_designation_pending = filters.BooleanFilter(field_name="bank_designation_pending")
     has_designated_bank = filters.BooleanFilter(method="filter_has_designated_bank")
     tag = filters.CharFilter(field_name="tag", lookup_expr="exact")
-    cliente_erp_id = filters.CharFilter(field_name="cliente_erp_id", lookup_expr="exact")
+    erp_id = filters.CharFilter(field_name="erp_id", lookup_expr="exact")
     transaction_nf_number = filters.CharFilter(field_name="transaction__nf_number", lookup_expr="icontains")
     transaction_due_date_from = filters.DateFilter(field_name="transaction__due_date", lookup_expr="gte")
     transaction_due_date_to = filters.DateFilter(field_name="transaction__due_date", lookup_expr="lte")

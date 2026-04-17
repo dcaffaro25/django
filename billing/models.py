@@ -6,7 +6,7 @@ from django.utils import timezone
 
 class BusinessPartnerCategory(TenantAwareBaseModel, MPTTModel):
     name = models.CharField(max_length=100)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -17,7 +17,7 @@ class BusinessPartnerCategory(TenantAwareBaseModel, MPTTModel):
 
     class Meta:
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def __str__(self):
@@ -48,7 +48,7 @@ class BusinessPartner(TenantAwareBaseModel):
     PARTNER_TYPES = [('client', 'Client'), ('vendor', 'Vendor'), ('both', 'Both')]
 
     name = models.CharField(max_length=255)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -77,7 +77,7 @@ class BusinessPartner(TenantAwareBaseModel):
             ),
         ]
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def __str__(self):
@@ -85,7 +85,7 @@ class BusinessPartner(TenantAwareBaseModel):
 
 class ProductServiceCategory(TenantAwareBaseModel, MPTTModel):
     name = models.CharField(max_length=100)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -96,7 +96,7 @@ class ProductServiceCategory(TenantAwareBaseModel, MPTTModel):
 
     class Meta:
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     class MPTTMeta:
@@ -110,7 +110,7 @@ class ProductService(TenantAwareBaseModel):
 
     name = models.CharField(max_length=255)
     code = models.CharField(max_length=100, unique=True)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -180,7 +180,7 @@ class ProductService(TenantAwareBaseModel):
 
     class Meta:
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def __str__(self):
@@ -190,7 +190,7 @@ class Contract(models.Model):
     company = models.ForeignKey('multitenancy.Company', on_delete=models.CASCADE)
     partner = models.ForeignKey('BusinessPartner', on_delete=models.CASCADE)
     contract_number = models.CharField(max_length=50, unique=True)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -230,7 +230,7 @@ class Contract(models.Model):
 
     class Meta:
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def __str__(self):
@@ -247,7 +247,7 @@ class Invoice(TenantAwareBaseModel):
     ]
 
     partner = models.ForeignKey(BusinessPartner, on_delete=models.CASCADE)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -270,7 +270,7 @@ class Invoice(TenantAwareBaseModel):
 
     class Meta:
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
     
     def __str__(self):
@@ -284,7 +284,7 @@ class Invoice(TenantAwareBaseModel):
 class InvoiceLine(TenantAwareBaseModel):
     invoice = models.ForeignKey(Invoice, related_name='lines', on_delete=models.CASCADE)
     product_service = models.ForeignKey(ProductService, on_delete=models.CASCADE)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -299,7 +299,7 @@ class InvoiceLine(TenantAwareBaseModel):
 
     class Meta:
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def save(self, *args, **kwargs):

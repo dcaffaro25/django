@@ -27,7 +27,7 @@ from django.contrib.postgres.fields import ArrayField  # Postgres
 
 
 class Currency(BaseModel):
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -54,7 +54,7 @@ class CostCenter(TenantAwareBaseModel):
     
     #company = models.ForeignKey('multitenancy.Company', related_name='costcenters', on_delete=models.CASCADE)
     name = models.CharField(max_length=100)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -72,7 +72,7 @@ class CostCenter(TenantAwareBaseModel):
     class Meta:
         unique_together = ('company', 'name')
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def get_current_balance(self):
@@ -104,7 +104,7 @@ class Bank(BaseModel):
     name = models.CharField(max_length=100, unique = True)
     country = models.CharField(max_length=50)  # e.g., 'United States of America'
     bank_code = models.CharField(max_length=50, unique = True)  # e.g., 'BOFAUS3N'
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -120,7 +120,7 @@ class Bank(BaseModel):
 class BankAccount(TenantAwareBaseModel):
     entity = models.ForeignKey('multitenancy.Entity', related_name='bank_accounts', on_delete=models.CASCADE)
     name = models.CharField(max_length=100)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -141,7 +141,7 @@ class BankAccount(TenantAwareBaseModel):
     class Meta:
         unique_together = ('company', 'name', 'bank', 'account_number', 'branch_id')
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def get_current_balance(self):
@@ -182,7 +182,7 @@ class AllocationBase(TenantAwareBaseModel):
 class Account(TenantAwareBaseModel, MPTTModel):
     account_code = models.CharField(max_length=100, null=True, blank=True)
     name = models.CharField(max_length=100)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -222,7 +222,7 @@ class Account(TenantAwareBaseModel, MPTTModel):
                 ef_construction=64,
                 opclasses=["vector_cosine_ops"],
             ),
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
             ]
     def __str__(self):
         return f'({self.id}) {self.company} - {self.account_code} - {self.get_path()}'
@@ -340,7 +340,7 @@ class Account(TenantAwareBaseModel, MPTTModel):
 class Transaction(TenantAwareBaseModel):
     date = models.DateField()
     entity = models.ForeignKey('multitenancy.Entity', related_name='transactions', on_delete=models.CASCADE)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -463,7 +463,7 @@ class Transaction(TenantAwareBaseModel):
             models.Index(fields=['company']),
             # Performance: tenant + date range for list views and filters
             models.Index(fields=['company', 'date']),
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
     
     def clean_fields(self, exclude=None):
@@ -565,7 +565,7 @@ class Transaction(TenantAwareBaseModel):
 
 class JournalEntry(TenantAwareBaseModel):
     transaction = models.ForeignKey(Transaction, related_name='journal_entries', on_delete=models.CASCADE)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -656,7 +656,7 @@ class JournalEntry(TenantAwareBaseModel):
             models.Index(fields=['company', 'account', 'date']),
             # Performance: transaction detail views
             models.Index(fields=['transaction', 'account']),
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
         constraints = [
             CheckConstraint(
@@ -768,7 +768,7 @@ class Rule(models.Model):
 class BankTransaction(TenantAwareBaseModel):
     #entity = models.ForeignKey('multitenancy.Entity', related_name='bank_transactions', on_delete=models.CASCADE)
     bank_account = models.ForeignKey(BankAccount, on_delete=models.CASCADE)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -859,7 +859,7 @@ class BankTransaction(TenantAwareBaseModel):
             models.Index(fields=['company', 'date']),
             # Performance: tenant + status for status-based filters
             models.Index(fields=['company', 'status']),
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def __str__(self):

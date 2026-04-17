@@ -148,7 +148,7 @@ class ErpApiEtlMapping(TenantAwareBaseModel):
     """
 
     name = models.CharField(max_length=100, help_text="e.g. Omie Produtos")
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -229,7 +229,7 @@ class ErpApiEtlMapping(TenantAwareBaseModel):
         indexes = [
             models.Index(fields=["company", "response_list_key"]),
             models.Index(fields=["company", "is_active"]),
-            models.Index(fields=["company", "cliente_erp_id"]),
+            models.Index(fields=["company", "erp_id"]),
         ]
 
     def __str__(self):

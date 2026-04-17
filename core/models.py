@@ -125,7 +125,7 @@ def get_occurrences_between(rrule_str: str, dtstart: datetime, start: datetime, 
     return list(rule.between(start, end, inc=True))
 
 class FinancialIndex(BaseModel):
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -174,14 +174,14 @@ class FinancialIndex(BaseModel):
 
     class Meta:
         indexes = [
-            models.Index(fields=['cliente_erp_id']),
+            models.Index(fields=['erp_id']),
         ]
     
     def __str__(self):
         return f"{self.name} ({self.code})"
 
 class IndexQuote(BaseModel):
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -197,14 +197,14 @@ class IndexQuote(BaseModel):
         ordering = ['index', 'date']
         indexes = [
             models.Index(fields=['index', 'date']),
-            models.Index(fields=['cliente_erp_id']),
+            models.Index(fields=['erp_id']),
         ]
 
     def __str__(self):
         return f"{self.index.code} @ {self.date}: {self.value}"
     
 class FinancialIndexQuoteForecast(models.Model):
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -221,7 +221,7 @@ class FinancialIndexQuoteForecast(models.Model):
         ordering = ['index', 'date']
         verbose_name = 'Financial Index Quote Forecast'
         indexes = [
-            models.Index(fields=['cliente_erp_id']),
+            models.Index(fields=['erp_id']),
         ]
 
     def __str__(self):

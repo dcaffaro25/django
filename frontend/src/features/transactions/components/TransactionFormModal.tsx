@@ -26,7 +26,7 @@ const transactionSchema = z.object({
   entity: z.number(),
   currency: z.number(),
   nf_number: z.string().max(60).optional().or(z.literal("")),
-  cliente_erp_id: z.string().max(128).optional().or(z.literal("")),
+  erp_id: z.string().max(128).optional().or(z.literal("")),
 })
 
 type TransactionFormData = z.infer<typeof transactionSchema>
@@ -68,7 +68,7 @@ export function TransactionFormModal({
           entity: transaction.entity,
           currency: transaction.currency,
           nf_number: transaction.nf_number ?? "",
-          cliente_erp_id: transaction.cliente_erp_id ?? "",
+          erp_id: transaction.erp_id ?? "",
         }
       : undefined,
   })
@@ -83,7 +83,7 @@ export function TransactionFormModal({
         entity: transaction.entity,
         currency: transaction.currency,
         nf_number: transaction.nf_number ?? "",
-        cliente_erp_id: transaction.cliente_erp_id ?? "",
+        erp_id: transaction.erp_id ?? "",
       })
     } else {
       reset()
@@ -227,7 +227,7 @@ export function TransactionFormModal({
           <div className="space-y-2">
             <Label>ERP ID</Label>
             <Input
-              {...register("cliente_erp_id")}
+              {...register("erp_id")}
               placeholder="External ERP identifier"
             />
           </div>

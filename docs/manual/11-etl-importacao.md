@@ -156,17 +156,19 @@ Para campos de chave estrangeira, use a notação `campo__lookup`:
 
 ## 11.4b Identificação por ID Externo (ERP)
 
-Além de IDs internos, o pipeline de importação suporta o uso de **IDs do ERP externo** (`cliente_erp_id`) para identificar registros existentes e resolver chaves estrangeiras. Isso é essencial para integrações contínuas com ERPs como Omie, SAP, etc.
+Além de IDs internos, o pipeline de importação suporta o uso de **IDs do ERP externo** (`erp_id`) para identificar registros existentes e resolver chaves estrangeiras. Isso é essencial para integrações contínuas com ERPs como Omie, SAP, etc.
 
 ### Coluna Especial `__erp_id` (Upsert/Delete por ID ERP)
 
-Adicione a coluna `__erp_id` na planilha para que o sistema identifique registros por `cliente_erp_id`:
+Adicione a coluna `__erp_id` na planilha para que o sistema identifique registros por `erp_id`:
 
 | `__erp_id` | Comportamento |
 |-------------|---------------|
-| `ERP-123` | Se existe um registro com `cliente_erp_id = "ERP-123"`, **atualiza**. Caso contrário, **cria** o registro. |
-| `-ERP-123` | **Exclui** o registro com `cliente_erp_id = "ERP-123"` (prefixo `-`). |
+| `ERP-123` | Se existe um registro com `erp_id = "ERP-123"`, **atualiza**. Caso contrário, **cria** o registro. |
+| `-ERP-123` | **Exclui** o registro com `erp_id = "ERP-123"` (prefixo `-`). |
 | _(vazio)_ | **Cria** um novo registro (comportamento padrão). |
+
+**Coluna `erp_id` mapeada (import em massa / ETL):** Nos modelos que definem o campo `erp_id`, você pode enviar o identificador externo em uma coluna mapeada para `erp_id`. Com `erp_key_coalesce` ativo (padrão em `ImportTransformationRule`), essa coluna equivale à chave de upsert/delete usada por `__erp_id`. Se `__erp_id` e `erp_id` aparecerem na mesma linha, os valores precisam coincidir.
 
 **Exemplo de planilha com `__erp_id`:**
 
@@ -177,9 +179,9 @@ Adicione a coluna `__erp_id` na planilha para que o sistema identifique registro
 | -TX-003 | | | | |
 
 Neste exemplo:
-- **TX-001:** Se já existe uma transação com `cliente_erp_id = "TX-001"`, atualiza seus campos. Senão, cria uma nova.
+- **TX-001:** Se já existe uma transação com `erp_id = "TX-001"`, atualiza seus campos. Senão, cria uma nova.
 - **TX-002:** Mesmo comportamento de upsert.
-- **-TX-003:** Exclui a transação com `cliente_erp_id = "TX-003"`.
+- **-TX-003:** Exclui a transação com `erp_id = "TX-003"`.
 
 ### Coluna `__row_id` (Upsert/Delete por ID Interno)
 
@@ -195,16 +197,21 @@ O `__row_id` funciona da mesma forma, mas usando o **ID interno** (PK) do sistem
 
 ### Resolução de FK por ID ERP (`*_erp_id`)
 
-Além de identificar o próprio registro, você pode referenciar **chaves estrangeiras** pelo `cliente_erp_id` do registro relacionado. Use o sufixo `_erp_id` no nome da coluna:
+Além de identificar o próprio registro, você pode referenciar **chaves estrangeiras** pelo `erp_id` do registro relacionado. Use o sufixo `_erp_id` no nome da coluna:
+
+**Convenção:**
+
+- **`erp_id`** (sem prefixo de FK): grava o identificador externo **no registro que está sendo importado** (campo `erp_id` desse modelo).
+- **`<campo_fk>_erp_id`**: o trecho antes de `_erp_id` deve ser o **nome do campo `ForeignKey`** no modelo de destino (por exemplo, em `Transaction` o FK `entity` → coluna `entity_erp_id`). O valor informado é comparado com o campo `erp_id` do modelo relacionado (`Entity`, `Account`, etc.) para preencher `<campo_fk>_id`.
 
 | Coluna na Planilha | Significado |
 |---------------------|-------------|
-| `account_erp_id` | Resolve `account_id` buscando Account com `cliente_erp_id = valor` |
-| `entity_erp_id` | Resolve `entity_id` buscando Entity com `cliente_erp_id = valor` |
-| `currency_erp_id` | Resolve `currency_id` buscando Currency com `cliente_erp_id = valor` |
-| `bank_account_erp_id` | Resolve `bank_account_id` buscando BankAccount com `cliente_erp_id = valor` |
-| `transaction_erp_id` | Resolve `transaction_id` buscando Transaction com `cliente_erp_id = valor` |
-| `cost_center_erp_id` | Resolve `cost_center_id` buscando CostCenter com `cliente_erp_id = valor` |
+| `account_erp_id` | Resolve `account_id` buscando Account com `erp_id = valor` |
+| `entity_erp_id` | Resolve `entity_id` buscando Entity com `erp_id = valor` |
+| `currency_erp_id` | Resolve `currency_id` buscando Currency com `erp_id = valor` |
+| `bank_account_erp_id` | Resolve `bank_account_id` buscando BankAccount com `erp_id = valor` |
+| `transaction_erp_id` | Resolve `transaction_id` buscando Transaction com `erp_id = valor` |
+| `cost_center_erp_id` | Resolve `cost_center_id` buscando CostCenter com `erp_id = valor` |
 
 **Exemplo:** Importar lançamentos contábeis usando IDs do ERP para referenciar a conta e transação:
 
@@ -214,8 +221,8 @@ Além de identificar o próprio registro, você pode referenciar **chaves estran
 | JE-002 | CONTA-2101 | TX-001 | 0 | 5000.00 |
 
 Neste exemplo:
-- `account_erp_id = "CONTA-1101"` → busca a conta contábil com `cliente_erp_id = "CONTA-1101"` e usa seu `id` como `account_id`
-- `transaction_erp_id = "TX-001"` → busca a transação com `cliente_erp_id = "TX-001"` e usa seu `id` como `transaction_id`
+- `account_erp_id = "CONTA-1101"` → busca a conta contábil com `erp_id = "CONTA-1101"` e usa seu `id` como `account_id`
+- `transaction_erp_id = "TX-001"` → busca a transação com `erp_id = "TX-001"` e usa seu `id` como `transaction_id`
 
 > **Dica:** A resolução por `*_erp_id` pode ser combinada com resolução por caminho (`account__account_code`) na mesma planilha. O `*_erp_id` tem prioridade quando ambos estão preenchidos.
 
@@ -223,7 +230,7 @@ Neste exemplo:
 
 **Passo 1 — Prepare a planilha com a aba "Transaction":**
 
-| __erp_id | cliente_erp_id | date | due_date | description | amount | currency_erp_id | entity_erp_id | nf_number |
+| __erp_id | erp_id | date | due_date | description | amount | currency_erp_id | entity_erp_id | nf_number |
 |----------|----------------|------|----------|-------------|--------|-----------------|---------------|-----------|
 | TX-100 | TX-100 | 2026-03-15 | 2026-04-15 | Pagamento NF 456 | 5000.00 | MOEDA-BRL | FILIAL-SP | 000456 |
 | TX-101 | TX-101 | 2026-03-16 | 2026-04-16 | Recebimento NF 789 | 12000.00 | MOEDA-BRL | FILIAL-RJ | 000789 |
@@ -248,7 +255,7 @@ file: importacao_erp.xlsx
 **Resultado esperado:**
 - 2 transações criadas (ou atualizadas se `TX-100`/`TX-101` já existiam)
 - 4 lançamentos contábeis criados, cada um vinculado à transação correspondente via `transaction_erp_id`
-- FKs de conta, moeda e entidade resolvidos automaticamente pelo `cliente_erp_id` de cada modelo
+- FKs de conta, moeda e entidade resolvidos automaticamente pelo `erp_id` de cada modelo
 
 ---
 
@@ -457,7 +464,7 @@ GET /acme/api/bank_transactions/?bank_account=1&date_after=2026-03-01
 
 ### Cenário
 
-Sua empresa usa o ERP Omie e cada registro já tem um identificador (`cliente_erp_id`). Você quer importar transações e lançamentos contábeis usando os IDs do Omie para vincular registros, e quer que importações futuras atualizem os registros existentes automaticamente.
+Sua empresa usa o ERP Omie e cada registro já tem um identificador (`erp_id`). Você quer importar transações e lançamentos contábeis usando os IDs do Omie para vincular registros, e quer que importações futuras atualizem os registros existentes automaticamente.
 
 **Passo 1 — Baixar o template de importação:**
 ```bash
@@ -470,7 +477,7 @@ O template Excel contém:
 
 **Passo 2 — Preencher a aba Transaction:**
 
-| __erp_id | cliente_erp_id | date | due_date | description | amount | currency_erp_id | entity_erp_id | nf_number |
+| __erp_id | erp_id | date | due_date | description | amount | currency_erp_id | entity_erp_id | nf_number |
 |----------|----------------|------|----------|-------------|--------|-----------------|---------------|-----------|
 | OMIE-CP-001 | OMIE-CP-001 | 2026-03-10 | 2026-04-10 | Conta de Luz - Março | 2500.00 | BRL | FILIAL-01 | 000123 |
 | OMIE-CP-002 | OMIE-CP-002 | 2026-03-15 | 2026-04-15 | Aluguel Escritório | 8000.00 | BRL | FILIAL-01 | |
@@ -505,7 +512,7 @@ file: importacao_omie.xlsx
 
 Altere a planilha — por exemplo, corrija o valor da conta de luz:
 
-| __erp_id | cliente_erp_id | date | due_date | description | amount | currency_erp_id | entity_erp_id | nf_number |
+| __erp_id | erp_id | date | due_date | description | amount | currency_erp_id | entity_erp_id | nf_number |
 |----------|----------------|------|----------|-------------|--------|-----------------|---------------|-----------|
 | OMIE-CP-001 | OMIE-CP-001 | 2026-03-10 | 2026-04-10 | Conta de Luz - Março (corrigida) | 2750.00 | BRL | FILIAL-01 | 000123 |
 
@@ -516,7 +523,7 @@ Altere a planilha — por exemplo, corrija o valor da conta de luz:
 }
 ```
 
-> O registro com `cliente_erp_id = "OMIE-CP-001"` foi encontrado e atualizado, sem criar duplicatas.
+> O registro com `erp_id = "OMIE-CP-001"` foi encontrado e atualizado, sem criar duplicatas.
 
 **Passo 6 — Excluir um registro via planilha:**
 
@@ -531,7 +538,7 @@ Altere a planilha — por exemplo, corrija o valor da conta de luz:
 }
 ```
 
-> O prefixo `-` no `__erp_id` indica exclusão. A transação com `cliente_erp_id = "OMIE-CP-002"` é removida.
+> O prefixo `-` no `__erp_id` indica exclusão. A transação com `erp_id = "OMIE-CP-002"` é removida.
 
 ---
 
@@ -557,8 +564,8 @@ Altere a planilha — por exemplo, corrija o valor da conta de luz:
 | Erros de formato de data | Ajuste `transformations.date.format` |
 | Valores numéricos incorretos | Configure separadores decimal/milhar |
 | FK não encontrado | Verifique o lookup field, use `*_erp_id` ou crie regras de substituição |
-| `*_erp_id` não resolve FK | Confirme que o registro relacionado existe e tem o `cliente_erp_id` preenchido |
-| `__erp_id` não encontra registro | Confirme que o modelo tem o campo `cliente_erp_id` e que o valor corresponde |
+| `*_erp_id` não resolve FK | Confirme que o registro relacionado existe e tem o `erp_id` preenchido |
+| `__erp_id` não encontra registro | Confirme que o modelo tem o campo `erp_id` e que o valor corresponde |
 | Duplicatas | Use `__erp_id` ou `__row_id` para atualizar registros existentes em vez de criar novos |
 | Timeout | Reduza o tamanho da planilha ou verifique Celery |
 

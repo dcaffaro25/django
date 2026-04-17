@@ -82,10 +82,10 @@ export function TransactionDetailDrawer({
               <label className="text-sm font-medium text-muted-foreground">Description</label>
               <p className="text-sm">{transaction.description}</p>
             </div>
-            {transaction.cliente_erp_id && (
+            {transaction.erp_id && (
               <div>
                 <label className="text-sm font-medium text-muted-foreground">ERP ID</label>
-                <p className="text-sm">{transaction.cliente_erp_id}</p>
+                <p className="text-sm">{transaction.erp_id}</p>
               </div>
             )}
           </div>

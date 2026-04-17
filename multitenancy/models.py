@@ -139,7 +139,7 @@ class TenantAwareBaseModel(BaseModel):
 class Entity(TenantAwareBaseModel, MPTTModel):
     company = models.ForeignKey(Company, related_name='entities', on_delete=models.CASCADE)
     name = models.CharField(max_length=100)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -159,7 +159,7 @@ class Entity(TenantAwareBaseModel, MPTTModel):
     class Meta:
         unique_together = ('company', 'name')
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def get_path(self):
@@ -262,7 +262,7 @@ class IntegrationRule(TenantAwareBaseModel):
     ]
 
     name = models.CharField(max_length=100)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -287,7 +287,7 @@ class IntegrationRule(TenantAwareBaseModel):
 
     class Meta:
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def __str__(self):
@@ -393,7 +393,7 @@ class SubstitutionRule(TenantAwareBaseModel):
     """
     # NOVO: título/descrição legível da regra, usado em relatórios
     title = models.CharField(max_length=255, null=True, blank=True)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -431,7 +431,7 @@ class SubstitutionRule(TenantAwareBaseModel):
             'filter_conditions'
         )
         indexes = [
-            models.Index(fields=['company', 'cliente_erp_id']),
+            models.Index(fields=['company', 'erp_id']),
         ]
 
     def __str__(self):
@@ -600,7 +600,7 @@ class ImportTransformationRule(TenantAwareBaseModel):
     erp_key_coalesce = models.BooleanField(
         default=True,
         help_text=(
-            "When True, a mapped cliente_erp_id on each imported row also drives upsert/delete "
+            "When True, a mapped erp_id on each imported row also drives upsert/delete "
             "the same way as a dedicated __erp_id column. Set False to only use __erp_id for ERP-key matching."
         ),
     )
@@ -614,7 +614,7 @@ class ImportTransformationRule(TenantAwareBaseModel):
         ],
         help_text=(
             "When an import row resolves to an existing record by ERP key "
-            "(__erp_id or coalesced cliente_erp_id), choose update, skip, or error."
+            "(__erp_id or coalesced erp_id), choose update, skip, or error."
         ),
     )
 

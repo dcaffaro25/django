@@ -32,7 +32,7 @@ class InventoryAlert(TenantAwareBaseModel):
     ]
 
     alert_type = models.CharField(max_length=30, choices=ALERT_TYPES)
-    cliente_erp_id = models.CharField(
+    erp_id = models.CharField(
         max_length=128,
         null=True,
         blank=True,
@@ -92,7 +92,7 @@ class InventoryAlert(TenantAwareBaseModel):
         indexes = [
             models.Index(fields=["alert_type"]),
             models.Index(fields=["status"]),
-            models.Index(fields=["company", "cliente_erp_id"]),
+            models.Index(fields=["company", "erp_id"]),
         ]
         ordering = ["-created_at"]
 

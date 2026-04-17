@@ -2386,7 +2386,7 @@ class ETLPipelineService:
 
                 dup_beh = str(sheet_opts.get("erp_duplicate_behavior") or "update").lower()
 
-                # __erp_id / coalesced cliente_erp_id: upsert/delete by cliente_erp_id
+                # __erp_id / coalesced erp_id: upsert/delete by erp_id
                 if not _is_missing(erp_id_raw) and mode != "delete":
                     erp_str = str(erp_id_raw).strip()
                     if erp_str.startswith("-"):
@@ -2398,7 +2398,7 @@ class ETLPipelineService:
                                 "status": "error",
                                 "action": None,
                                 "data": raw,
-                                "message": f"Transaction with cliente_erp_id='{erp_lookup}' not found for delete",
+                                "message": f"Transaction with erp_id='{erp_lookup}' not found for delete",
                                 "observations": [],
                                 "external_id": erp_lookup,
                             })
@@ -2415,7 +2415,7 @@ class ETLPipelineService:
                                     "action": None,
                                     "data": raw,
                                     "message": (
-                                        "Transaction already exists for ERP key cliente_erp_id="
+                                        "Transaction already exists for ERP key erp_id="
                                         f"{erp_str!r} (erp_duplicate_behavior=error)"
                                     ),
                                     "observations": _row_observations(audit_by_rowid, rid),
@@ -2427,10 +2427,10 @@ class ETLPipelineService:
                                     "__row_id": rid_display,
                                     "status": "success",
                                     "action": "skipped_duplicate",
-                                    "data": {"id": existing_pk, "cliente_erp_id": erp_str},
+                                    "data": {"id": existing_pk, "erp_id": erp_str},
                                     "message": (
                                         f"Skipped: Transaction id={existing_pk} already has "
-                                        f"cliente_erp_id={erp_str!r}"
+                                        f"erp_id={erp_str!r}"
                                     ),
                                     "observations": _row_observations(audit_by_rowid, rid),
                                     "external_id": erp_str,

@@ -256,7 +256,7 @@ POST /acme/api/etl-mappings/
     "razao_social": "name",
     "cnpj_cpf": "document",
     "email": "email",
-    "codigo_cliente_omie": "cliente_erp_id"
+    "codigo_cliente_omie": "erp_id"
   }
 }
 ```
@@ -275,13 +275,13 @@ POST /acme/api/etl-import/
 - `commit: false` → Preview (mostra o que seria importado)
 - `commit: true` → Executa a importação
 
-### Upsert e Delete via `cliente_erp_id`
+### Upsert e Delete via `erp_id`
 
 O ETL de integrações ERP suporta as mesmas convenções de add/edit/delete do import por template:
 
-- **Upsert automático:** Quando o mapeamento inclui `cliente_erp_id`, o sistema verifica se já existe um registro com esse ID ERP. Se existir, **atualiza**; caso contrário, **cria**.
+- **Upsert automático:** Quando o mapeamento inclui `erp_id`, o sistema verifica se já existe um registro com esse ID ERP. Se existir, **atualiza**; caso contrário, **cria**.
 - **Delete:** Se o `__erp_id` na linha começa com `-`, o registro é **excluído**.
-- **FK por ID ERP:** Colunas como `account_erp_id`, `entity_erp_id`, `currency_erp_id` resolvem a FK buscando o registro relacionado pelo `cliente_erp_id`.
+- **FK por ID ERP:** Colunas como `account_erp_id`, `entity_erp_id`, `currency_erp_id` resolvem a FK buscando o registro relacionado pelo campo `erp_id` (o prefixo antes de `_erp_id` é o **nome do `ForeignKey`** no modelo de destino; o valor bate com o `erp_id` do modelo apontado).
 
 **Exemplo: Mapeamento ETL para Transações (Omie Contas a Pagar):**
 
@@ -293,7 +293,7 @@ POST /acme/api/etl-mappings/
   "target_model": "Transaction",
   "response_list_key": "conta_pagar_cadastro",
   "field_mappings": {
-    "codigo_lancamento_omie": "cliente_erp_id",
+    "codigo_lancamento_omie": "erp_id",
     "data_vencimento": "due_date",
     "numero_documento_fiscal": "nf_number",
     "valor_documento": "amount",
@@ -305,10 +305,10 @@ POST /acme/api/etl-mappings/
 ```
 
 Neste exemplo:
-- `codigo_lancamento_omie` → `cliente_erp_id` da transação (permite upsert em re-execuções)
+- `codigo_lancamento_omie` → `erp_id` da transação (permite upsert em re-execuções)
 - `data_vencimento` → `due_date` (campo de vencimento na transação)
 - `numero_documento_fiscal` → `nf_number` (número da NF na transação)
-- `codigo_cliente_fornecedor_integracao` → `entity_erp_id` (resolve Entity via `cliente_erp_id`)
+- `codigo_cliente_fornecedor_integracao` → `entity_erp_id` (resolve Entity via `erp_id`)
 
 ---
 

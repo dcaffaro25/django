@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from celery import shared_task
 from django.apps import apps
 from django.conf import settings
+from django.core.exceptions import FieldDoesNotExist
 from django.core.mail import send_mail
 from django.db import router, transaction, models as dj_models
 from django.db.models.deletion import Collector
@@ -136,7 +137,7 @@ _WS_RE = re.compile(r"\s+")
 
 
 def _model_has_erp_id(model) -> bool:
-    return any(getattr(f, "name", None) == "cliente_erp_id" for f in model._meta.fields)
+    return any(getattr(f, "name", None) == "erp_id" for f in model._meta.fields)
 
 
 def _merge_sheet_import_options(import_metadata: Optional[Dict[str, Any]], sheet: Dict[str, Any]) -> Dict[str, Any]:
@@ -165,7 +166,7 @@ def _erp_keys_conflict_message(left: Any, right: Any) -> Optional[str]:
     dl, vl = _erp_delete_key_parts(left)
     dr, vr = _erp_delete_key_parts(right)
     if (dl, vl) != (dr, vr):
-        return f"__erp_id and cliente_erp_id disagree ({left!r} vs {right!r})"
+        return f"__erp_id and mapped erp_id disagree ({left!r} vs {right!r})"
     return None
 
 
@@ -176,19 +177,19 @@ def _resolve_row_erp_identifier(
     import_options: Dict[str, Any],
 ) -> Tuple[Any, Optional[str]]:
     """
-    Unify __erp_id column and mapped cliente_erp_id on the row when erp_key_coalesce is True.
+    Unify __erp_id column and mapped erp_id on the row when erp_key_coalesce is True.
 
     Returns (effective_value_for_upsert_logic, error_message_or_none).
     """
     coalesce = bool(import_options.get("erp_key_coalesce", True))
     if coalesce and _model_has_erp_id(model):
-        cerp = raw.get("cliente_erp_id")
-        if not _is_missing(popped__erp_id) and not _is_missing(cerp):
-            msg = _erp_keys_conflict_message(popped__erp_id, cerp)
+        mapped_erp = raw.get("erp_id")
+        if not _is_missing(popped__erp_id) and not _is_missing(mapped_erp):
+            msg = _erp_keys_conflict_message(popped__erp_id, mapped_erp)
             if msg:
                 return None, msg
-        if _is_missing(popped__erp_id) and not _is_missing(cerp):
-            return cerp, None
+        if _is_missing(popped__erp_id) and not _is_missing(mapped_erp):
+            return mapped_erp, None
     return popped__erp_id, None
 
 
@@ -701,9 +702,9 @@ def _resolve_erp_id_to_fk_id(
     lookup_cache: Optional[Any] = None,
 ) -> Optional[int]:
     """
-    Resolve a ``cliente_erp_id`` value on the *related* model to its primary key.
+    Resolve an external key string against ``related_model.erp_id`` and return the PK.
 
-    Works for any FK whose target model defines ``cliente_erp_id``.
+    ``field_name`` is the parent model's FK attribute (e.g. ``entity`` for ``entity_erp_id``).
     Company-scoped when the related model has a ``company_id`` field.
     """
     if _is_missing(erp_id_value):
@@ -724,7 +725,7 @@ def _resolve_erp_id_to_fk_id(
             if cached is not None:
                 return cached
 
-        qs = related_model.objects.filter(cliente_erp_id=erp_val)
+        qs = related_model.objects.filter(erp_id=erp_val)
         if company_id and any(
             getattr(f, "name", "") == "company" for f in related_model._meta.fields
         ):
@@ -734,7 +735,7 @@ def _resolve_erp_id_to_fk_id(
             return obj.pk
 
         raise ValueError(
-            f"{related_model.__name__} with cliente_erp_id='{erp_val}' not found "
+            f"{related_model.__name__} with erp_id='{erp_val}' not found "
             f"for field '{field_name}'"
         )
 
@@ -770,15 +771,26 @@ def _apply_erp_id_inputs(
 ) -> dict:
     """
     Resolve ``*_erp_id`` columns to ``*_id`` assignments by looking up
-    ``cliente_erp_id`` on the related model.
+    ``erp_id`` on the related model.
 
     E.g. ``account_erp_id="ACC-001"`` → look up Account where
-    ``cliente_erp_id="ACC-001"`` → set ``account_id=<pk>``.
+    ``erp_id="ACC-001"`` → set ``account_id=<pk>``.
     """
     out = dict(payload)
     for k in list(out.keys()):
         if not k.endswith("_erp_id"):
             continue
+        # A real non-relation column named ``..._erp_id`` on this model must stay on the row
+        # (do not treat it as a virtual FK input). Virtual inputs use ``<fk>_erp_id`` where
+        # ``<fk>`` is a ForeignKey field on this model and there is no scalar column with that
+        # exact name.
+        try:
+            direct_field = model._meta.get_field(k)
+        except FieldDoesNotExist:
+            direct_field = None
+        if direct_field is not None and not direct_field.is_relation:
+            continue
+
         base = k[: -len("_erp_id")]  # strip '_erp_id'
         erp_value = out.pop(k, None)
 
@@ -797,7 +809,7 @@ def _apply_erp_id_inputs(
 
 def _resolve_row_by_erp_id(model, erp_id_value, company_id: Optional[int]):
     """
-    Look up an existing row by ``cliente_erp_id`` on the *target* model
+    Look up an existing row by ``erp_id`` on the *target* model
     (the model being imported, not a related model).
 
     Returns (instance, pk) or (None, None).
@@ -811,11 +823,11 @@ def _resolve_row_by_erp_id(model, erp_id_value, company_id: Optional[int]):
 
     if not _model_has_erp_id(model):
         raise ValueError(
-            f"Model {model.__name__} does not have a cliente_erp_id field; "
+            f"Model {model.__name__} does not have an erp_id field; "
             f"cannot use __erp_id for row identification"
         )
 
-    qs = model.objects.filter(cliente_erp_id=erp_val)
+    qs = model.objects.filter(erp_id=erp_val)
     if company_id and any(
         getattr(f, "name", "") == "company" for f in model._meta.fields
     ):
@@ -955,10 +967,10 @@ def execute_import_job(
       - Positive integer: update row with that primary key (legacy: explicit id column also updates).
       - Negative integer: delete row with id abs(value); soft-delete if model has is_deleted.
 
-    ERP row key (__erp_id vs cliente_erp_id):
+    ERP row key (__erp_id vs erp_id):
       - By default (import_options.erp_key_coalesce=True), the dedicated ``__erp_id`` column and a mapped
-        ``cliente_erp_id`` on the same row are interchangeable for upsert/delete-by-ERP-key (models that
-        define ``cliente_erp_id``). If both are set, they must agree or the row errors.
+        ``erp_id`` on the same row are interchangeable for upsert/delete-by-ERP-key (models that
+        define ``erp_id``). If both are set, they must agree or the row errors.
       - import_options.erp_duplicate_behavior: ``update`` (default), ``skip``, or ``error`` when a match
         by ERP key is found.
       - Per-sheet options: pass ``import_options`` on each sheet dict, or under import_metadata.import_options.
@@ -1091,9 +1103,9 @@ def execute_import_job(
 
                 dup_beh = str(sheet_import_options.get("erp_duplicate_behavior") or "update").lower()
 
-                # __erp_id / coalesced cliente_erp_id: upsert by cliente_erp_id on the target model.
+                # __erp_id / coalesced erp_id: upsert by erp_id on the target model.
                 # If an existing record is found → update (or skip/error per erp_duplicate_behavior).
-                # Prefix with "-" to delete (e.g. __erp_id = "-ERP123" or cliente_erp_id = "-ERP123").
+                # Prefix with "-" to delete (e.g. __erp_id = "-ERP123" or erp_id = "-ERP123").
                 if not _is_missing(erp_id_raw) and mode != "delete":
                     erp_str = str(erp_id_raw).strip()
                     if erp_str.startswith("-"):
@@ -1101,7 +1113,7 @@ def execute_import_job(
                         existing, existing_pk = _resolve_row_by_erp_id(model, erp_lookup, company_id)
                         if not existing:
                             raise_msg = (
-                                f"{model_name} with cliente_erp_id='{erp_lookup}' not found for delete"
+                                f"{model_name} with erp_id='{erp_lookup}' not found for delete"
                             )
                             outputs_by_model[model_name].append({
                                 "__row_id": rid_display,
@@ -1125,7 +1137,7 @@ def execute_import_job(
                                     "action": None,
                                     "data": raw,
                                     "message": (
-                                        f"{model_name} already exists for ERP key cliente_erp_id="
+                                        f"{model_name} already exists for ERP key erp_id="
                                         f"{erp_str!r} (erp_duplicate_behavior=error)"
                                     ),
                                     "observations": _row_observations(audit_by_rowid, rid),
@@ -1137,10 +1149,10 @@ def execute_import_job(
                                     "__row_id": rid_display,
                                     "status": "success",
                                     "action": "skipped_duplicate",
-                                    "data": {"id": existing_pk, "cliente_erp_id": erp_str},
+                                    "data": {"id": existing_pk, "erp_id": erp_str},
                                     "message": (
                                         f"Skipped: {model_name} id={existing_pk} already has "
-                                        f"cliente_erp_id={erp_str!r}"
+                                        f"erp_id={erp_str!r}"
                                     ),
                                     "observations": _row_observations(audit_by_rowid, rid),
                                     "external_id": erp_str,
@@ -1242,7 +1254,7 @@ def execute_import_job(
                     # 5) Path resolution: *_path and *_code -> *_id (before FK resolution)
                     filtered = _apply_path_inputs(model, filtered, company_id, lookup_cache=lookup_cache)
 
-                    # 5.5) ERP ID resolution: *_erp_id -> *_id (cliente_erp_id on related model)
+                    # 5.5) ERP ID resolution: *_erp_id -> *_id (erp_id on related model)
                     filtered = _apply_erp_id_inputs(model, filtered, company_id, lookup_cache=lookup_cache)
 
                     # 6) FK application: *_fk -> *_id and rescue base tokens to *_id
