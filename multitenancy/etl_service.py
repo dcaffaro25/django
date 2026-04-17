@@ -2377,16 +2377,20 @@ class ETLPipelineService:
                 "sheet_start": sheet_start,
             })
 
+        # Only pre-delete existing DB rows for erp_ids that appear on MORE than one import row
+        # in this file (split / multi-line same key). A normal re-import (one row per erp_id) must
+        # use in-place update; running replace-delete for every key soft-deletes rows and the
+        # update path never clears ``is_deleted`` (it is excluded from import payloads), so rows
+        # incorrectly stay deleted.
         erp_ids_with_splits_in_file = {e for e, c in merged_erp_id_counts.items() if c > 1}
-        if merged_erp_id_counts:
+        if erp_ids_with_splits_in_file:
             _delete_transactions_for_erp_ids_replace_import(
-                model, self.company_id, set(merged_erp_id_counts.keys())
+                model, self.company_id, erp_ids_with_splits_in_file
             )
             logger.info(
-                "ETL: erp_id replace-import for %d key(s); split keys (same erp_id on multiple "
-                "import rows): %s",
-                len(merged_erp_id_counts),
-                sorted(erp_ids_with_splits_in_file) if erp_ids_with_splits_in_file else "none",
+                "ETL: erp_id replace-import for %d split key(s) (same erp_id on multiple import rows): %s",
+                len(erp_ids_with_splits_in_file),
+                sorted(erp_ids_with_splits_in_file),
             )
 
         global_row_base = 0
@@ -2592,6 +2596,10 @@ class ETLPipelineService:
                         instance = model.objects.get(id=pk)
                         for k, v in filtered.items():
                             setattr(instance, k, v)
+                        # Re-import / upsert must not leave soft-deleted rows active: ``is_deleted`` is
+                        # stripped from import payloads, so it would otherwise stay True after replace-delete.
+                        if hasattr(instance, "is_deleted"):
+                            instance.is_deleted = False
                         action = "update"
                     else:
                         instance = model(**filtered)

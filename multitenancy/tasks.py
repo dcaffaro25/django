@@ -879,7 +879,11 @@ def _delete_transactions_for_erp_ids_replace_import(
     erp_ids: Set[str],
 ) -> int:
     """
-    Remove every Transaction for this company whose erp_id is in erp_ids (import delete semantics).
+    Remove existing Transactions for this company whose erp_id is in ``erp_ids`` (import delete semantics).
+
+    Intended only for **split imports**: the same ``erp_id`` appears on multiple rows in one file, so
+    existing DB rows for those keys must be cleared before creating multiple new transactions.
+    Do not pass every key in the file for a normal one-row-per-erp_id re-import (use upsert instead).
 
     Journal entries cascade hard-delete with Transaction when is_deleted is not used; otherwise
     soft-delete follows the same collector rules as normal import deletes.
@@ -1345,6 +1349,8 @@ def execute_import_job(
                         instance = model.objects.get(id=pk)
                         for k, v in filtered.items():
                             setattr(instance, k, v)
+                        if hasattr(instance, "is_deleted"):
+                            instance.is_deleted = False
                         action = "update"
                     else:
                         instance = model(**filtered)
