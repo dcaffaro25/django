@@ -1,6 +1,7 @@
 from django.contrib import admin
 from django.contrib.admin.utils import model_ngettext
 from django.apps import apps
+from django.core.exceptions import FieldDoesNotExist
 from django.db import transaction as db_transaction
 from .models import *  # includes NotaFiscal, NotaFiscalItem, NFeEvento from models_nfe
 
@@ -32,9 +33,9 @@ class NotaFiscalReferenciaInline(admin.TabularInline):
 
 @admin.register(NotaFiscal)
 class NotaFiscalAdmin(admin.ModelAdmin):
-    list_display = ('numero', 'serie', 'chave', 'data_emissao', 'emit_nome', 'dest_nome', 'valor_nota', 'status_sefaz')
+    list_display = ('numero', 'serie', 'erp_id', 'chave', 'data_emissao', 'emit_nome', 'dest_nome', 'valor_nota', 'status_sefaz')
     list_filter = ('tipo_operacao', 'finalidade', 'data_emissao')
-    search_fields = ('chave', 'numero', 'emit_nome', 'emit_cnpj', 'dest_nome', 'dest_cnpj')
+    search_fields = ('chave', 'numero', 'erp_id', 'emit_nome', 'emit_cnpj', 'dest_nome', 'dest_cnpj')
     date_hierarchy = 'data_emissao'
     inlines = [NotaFiscalItemInline, NotaFiscalReferenciaInline]
     readonly_fields = ('chave', 'protocolo', 'status_sefaz', 'data_autorizacao')
@@ -63,9 +64,9 @@ class NotaFiscalAdmin(admin.ModelAdmin):
 
 @admin.register(NotaFiscalItem)
 class NotaFiscalItemAdmin(admin.ModelAdmin):
-    list_display = ('nota_fiscal', 'numero_item', 'codigo_produto', 'descricao', 'ncm', 'cfop', 'quantidade', 'valor_total', 'produto')
+    list_display = ('nota_fiscal', 'numero_item', 'erp_id', 'codigo_produto', 'descricao', 'ncm', 'cfop', 'quantidade', 'valor_total', 'produto')
     list_filter = ('ncm', 'cfop')
-    search_fields = ('codigo_produto', 'descricao', 'ncm')
+    search_fields = ('codigo_produto', 'erp_id', 'descricao', 'ncm')
 
     @admin.action(description="Delete selected Nota Fiscal items")
     def fast_delete_selected(self, request, queryset):
@@ -91,9 +92,9 @@ class NotaFiscalItemAdmin(admin.ModelAdmin):
 
 @admin.register(NFeEvento)
 class NFeEventoAdmin(admin.ModelAdmin):
-    list_display = ('chave_nfe', 'tipo_evento', 'n_seq_evento', 'data_evento', 'status_sefaz', 'protocolo')
+    list_display = ('chave_nfe', 'erp_id', 'tipo_evento', 'n_seq_evento', 'data_evento', 'status_sefaz', 'protocolo')
     list_filter = ('tipo_evento', 'status_sefaz')
-    search_fields = ('chave_nfe', 'descricao')
+    search_fields = ('chave_nfe', 'erp_id', 'descricao')
     date_hierarchy = 'data_evento'
     readonly_fields = ('chave_nfe', 'protocolo', 'status_sefaz', 'data_registro')
 
@@ -121,18 +122,18 @@ class NFeEventoAdmin(admin.ModelAdmin):
 
 @admin.register(NFeInutilizacao)
 class NFeInutilizacaoAdmin(admin.ModelAdmin):
-    list_display = ('ano', 'serie', 'n_nf_ini', 'n_nf_fin', 'status_sefaz', 'data_registro')
+    list_display = ('erp_id', 'ano', 'serie', 'n_nf_ini', 'n_nf_fin', 'status_sefaz', 'data_registro')
     list_filter = ('ano', 'serie', 'status_sefaz')
-    search_fields = ('cnpj', 'x_just', 'protocolo')
+    search_fields = ('cnpj', 'erp_id', 'x_just', 'protocolo')
     date_hierarchy = 'data_registro'
     readonly_fields = ('protocolo', 'status_sefaz', 'data_registro')
 
 
 @admin.register(NotaFiscalReferencia)
 class NotaFiscalReferenciaAdmin(admin.ModelAdmin):
-    list_display = ('nota_fiscal', 'chave_referenciada', 'nota_referenciada')
+    list_display = ('nota_fiscal', 'erp_id', 'chave_referenciada', 'nota_referenciada')
     list_filter = ('nota_fiscal__finalidade',)
-    search_fields = ('chave_referenciada', 'nota_fiscal__chave')
+    search_fields = ('chave_referenciada', 'erp_id', 'nota_fiscal__chave')
     raw_id_fields = ('nota_fiscal', 'nota_referenciada')
 
     @admin.action(description="Delete selected Nota Fiscal referências")
@@ -163,16 +164,16 @@ from multitenancy.admin import CompanyScopedAdmin
 
 @admin.register(ProductServiceCategory)
 class ProductServiceCategoryAdmin(CompanyScopedAdmin):
-    list_display = ("name", "parent", "company")
+    list_display = ("erp_id", "name", "parent", "company")
     list_filter = ("company",)
-    search_fields = ("name",)
+    search_fields = ("name", "erp_id")
 
 
 @admin.register(ProductService)
 class ProductServiceAdmin(CompanyScopedAdmin):
-    list_display = ("code", "name", "item_type", "price", "track_inventory", "is_active")
+    list_display = ("code", "erp_id", "name", "item_type", "price", "track_inventory", "is_active")
     list_filter = ("item_type", "track_inventory", "is_active", "company")
-    search_fields = ("code", "name", "description")
+    search_fields = ("code", "name", "erp_id", "description")
     autocomplete_fields = (
         "category",
         "currency",
@@ -205,10 +206,35 @@ class ProductServiceAdmin(CompanyScopedAdmin):
     )
 
 
+class _ErpIdListDisplayMixin:
+    """Include erp_id on the changelist when the model defines that field."""
+
+    def get_list_display(self, request):
+        cols = list(super().get_list_display(request))
+        try:
+            self.model._meta.get_field("erp_id")
+        except FieldDoesNotExist:
+            return cols
+        if "erp_id" in cols:
+            return cols
+        if "id" in cols:
+            cols.insert(cols.index("id") + 1, "erp_id")
+        else:
+            cols.insert(0, "erp_id")
+        return cols
+
+
 # Register remaining billing models (exclude NFe, ProductService, ProductServiceCategory - already registered above)
 app_models = apps.get_app_config('billing').get_models()
 nfe_models = {NotaFiscal, NotaFiscalItem, NotaFiscalReferencia, NFeEvento, NFeInutilizacao}
 exclude_models = nfe_models | {ProductService, ProductServiceCategory}
 for model in app_models:
     if model not in exclude_models:
-        admin.site.register(model)
+        if admin.site.is_registered(model):
+            admin.site.unregister(model)
+        _Admin = type(
+            f"{model.__name__}Admin",
+            (_ErpIdListDisplayMixin, admin.ModelAdmin),
+            {},
+        )
+        admin.site.register(model, _Admin)

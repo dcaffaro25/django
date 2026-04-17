@@ -12,6 +12,7 @@ from django.shortcuts import render, redirect
 from django.urls import path, reverse
 from django.utils.html import format_html
 from django.contrib import messages
+from django.core.exceptions import FieldDoesNotExist
 
 logger = logging.getLogger(__name__)
 
@@ -51,22 +52,22 @@ def _get_signal_handlers():
 
 @admin.register(Currency)
 class CurrencyAdmin(PlainAdmin):
-    list_display = ("id", "code", "name", "symbol", "created_at", "updated_at")
-    search_fields = ("code", "name", "symbol")
+    list_display = ("id", "erp_id", "code", "name", "symbol", "created_at", "updated_at")
+    search_fields = ("code", "name", "symbol", "erp_id")
 
 @admin.register(Bank)
 class BankAdmin(PlainAdmin):
-    list_display = ("id", "bank_code", "name", "country", "is_active", "notes")
+    list_display = ("id", "erp_id", "bank_code", "name", "country", "is_active", "notes")
     list_filter = ("is_active", "country", "notes")
-    search_fields = ("bank_code", "name", "country", "notes")
+    search_fields = ("bank_code", "name", "country", "notes", "erp_id")
 
 @admin.register(BankAccount)
 class BankAccountAdmin(CompanyScopedAdmin):
-    list_display = ("id", "name", "bank", "account_number", "entity", "currency", "branch_id", "company", "notes")
+    list_display = ("id", "erp_id", "name", "bank", "account_number", "entity", "currency", "branch_id", "company", "notes")
     list_filter = ("bank", "currency", "entity", "company", "notes")
     autocomplete_fields = ("company", "entity", "bank", "currency")
     search_fields = (
-        "name", "account_number", "branch_id", "notes",
+        "name", "erp_id", "account_number", "branch_id", "notes",
         "bank__name", "bank__bank_code",
         "entity__name",
         "currency__code",
@@ -125,10 +126,10 @@ class AccountBulkEditForm(forms.Form):
 
 @admin.register(Account)
 class AccountAdmin(CompanyScopedAdmin):
-    list_display = ("id", "account_code", "name", "parent", "currency", "bank_account", "is_active", "company", "notes")
+    list_display = ("id", "erp_id", "account_code", "name", "parent", "currency", "bank_account", "is_active", "company", "notes")
     list_filter = ("is_active", "currency", "company", "notes")
     autocomplete_fields = ("company", "parent", "currency", "bank_account")
-    search_fields = ("account_code", "name", "description", "key_words", "examples", "parent__name", "notes")
+    search_fields = ("account_code", "name", "erp_id", "description", "key_words", "examples", "parent__name", "notes")
     
     # Simple bulk edit actions for common fields
     @admin.action(description="Bulk edit: Set balance date")
@@ -467,10 +468,10 @@ class AccountAdmin(CompanyScopedAdmin):
 
 @admin.register(CostCenter)
 class CostCenterAdmin(CompanyScopedAdmin):
-    list_display = ("id", "name", "center_type", "company", "balance_date", "balance", "notes")
+    list_display = ("id", "erp_id", "name", "center_type", "company", "balance_date", "balance", "notes")
     list_filter = ("center_type", "company", "notes")
     autocomplete_fields = ("company",)
-    search_fields = ("name", "description", "notes")
+    search_fields = ("name", "erp_id", "description", "notes")
 
 @admin.register(AllocationBase)
 class AllocationBaseAdmin(CompanyScopedAdmin):
@@ -771,6 +772,7 @@ class JournalEntryInline(admin.TabularInline):
 class TransactionAdmin(CompanyScopedAdmin):
     list_display = (
         "id",
+        "erp_id",
         "is_deleted",
         "date",
         "due_date",
@@ -1034,6 +1036,7 @@ class TransactionAdmin(CompanyScopedAdmin):
 class JournalEntryAdmin(CompanyScopedAdmin):
     list_display = (
         "id",
+        "erp_id",
         "is_deleted",
         "transaction_link",
         "account",
@@ -1220,13 +1223,14 @@ class JournalEntryAdmin(CompanyScopedAdmin):
 
 @admin.register(BankTransaction)
 class BankTransactionAdmin(CompanyScopedAdmin):
-    list_display = ("id", "date", "description", "amount", "bank_account", "currency", "status", "tx_hash", "company", "notes")
+    list_display = ("id", "erp_id", "date", "description", "amount", "bank_account", "currency", "status", "tx_hash", "company", "notes")
     list_filter = ("status", "currency", "bank_account__bank", "company", "date", "notes")
     autocomplete_fields = ("company", "bank_account", "currency")
     search_fields = (
         "description",
         "reference_number",
         "tx_hash",
+        "erp_id",
         "bank_account__name",
         "bank_account__account_number",
         "bank_account__entity__name",
@@ -1617,9 +1621,31 @@ class AccountBalanceHistoryAdmin(CompanyScopedAdmin):
             # Re-raise if it's a different error
             raise
 
-# (Optional) auto-register anything missed
+class _ErpIdListDisplayMixin:
+    """Include erp_id on the changelist when the model defines that field."""
+
+    def get_list_display(self, request):
+        cols = list(super().get_list_display(request))
+        try:
+            self.model._meta.get_field("erp_id")
+        except FieldDoesNotExist:
+            return cols
+        if "erp_id" in cols:
+            return cols
+        if "id" in cols:
+            cols.insert(cols.index("id") + 1, "erp_id")
+        else:
+            cols.insert(0, "erp_id")
+        return cols
+
+
+# Auto-register anything missed (explicit ModelAdmin classes register above)
 for model in apps.get_app_config("accounting").get_models():
-    try:
-        admin.site.register(model)
-    except admin.sites.AlreadyRegistered:
-        pass
+    if admin.site.is_registered(model):
+        continue
+    _Admin = type(
+        f"{model.__name__}Admin",
+        (_ErpIdListDisplayMixin, admin.ModelAdmin),
+        {},
+    )
+    admin.site.register(model, _Admin)

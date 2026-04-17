@@ -56,13 +56,13 @@ class ERPAPIDefinitionAdmin(admin.ModelAdmin):
 
 @admin.register(ErpApiEtlMapping)
 class ErpApiEtlMappingAdmin(admin.ModelAdmin):
-    list_display = ("name", "company", "response_list_key", "target_model", "category_from_same_response", "is_active")
+    list_display = ("name", "erp_id", "company", "response_list_key", "target_model", "category_from_same_response", "is_active")
     list_filter = ("is_active", "category_from_same_response", "target_model")
-    search_fields = ("name", "response_list_key", "target_model")
+    search_fields = ("name", "erp_id", "response_list_key", "target_model")
     raw_id_fields = ("company",)
     readonly_fields = ()
     fieldsets = (
-        (None, {"fields": ("name", "description", "company", "is_active")}),
+        (None, {"fields": ("name", "erp_id", "description", "company", "is_active")}),
         ("Source", {"fields": ("response_list_key",)}),
         ("Target", {"fields": ("target_model", "field_mappings", "default_values", "row_id_api_key")}),
         (

@@ -4,7 +4,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.admin import UserAdmin
 from django.core.exceptions import FieldDoesNotExist
 from django.db import models
-from .models import Company, Entity, SubstitutionRule  # adjust imports to your actual models
+from .models import Company, Entity, SubstitutionRule, IntegrationRule  # adjust imports to your actual models
 from django.contrib.admin.utils import model_ngettext
 from django.contrib.admin.views.main import ChangeList
 from django.utils.html import format_html
@@ -257,10 +257,28 @@ class CompanyAdmin(PlainAdmin):
 
 @admin.register(Entity)
 class EntityAdmin(CompanyScopedAdmin):
-    list_display = ("id", "name", "company", "notes")
-    search_fields = ("name", "id", "company__name", "notes")
+    list_display = ("id", "erp_id", "name", "company", "notes")
+    search_fields = ("name", "id", "erp_id", "company__name", "notes")
     list_filter = ("company", "notes")
     autocomplete_fields = ("company",)
+
+
+@admin.register(IntegrationRule)
+class IntegrationRuleAdmin(CompanyScopedAdmin):
+    list_display = (
+        "id",
+        "erp_id",
+        "name",
+        "trigger_event",
+        "execution_order",
+        "use_celery",
+        "is_active",
+        "company",
+    )
+    list_filter = ("company", "trigger_event", "is_active", "use_celery")
+    search_fields = ("name", "erp_id", "description", "trigger_event", "rule")
+    autocomplete_fields = ("company",)
+    ordering = ("company", "execution_order", "id")
 
 
 def _filter_conditions_preview(obj, max_len=80):
@@ -282,6 +300,7 @@ except admin.sites.NotRegistered:
 class SubstitutionRuleAdmin(CompanyScopedAdmin):
     list_display = (
         "id",
+        "erp_id",
         "title",
         "model_name",
         "field_name",
@@ -296,6 +315,7 @@ class SubstitutionRuleAdmin(CompanyScopedAdmin):
     list_filter = ("company", "model_name", "field_name", "match_type", "is_deleted")
     search_fields = (
         "title",
+        "erp_id",
         "model_name",
         "field_name",
         "match_value",

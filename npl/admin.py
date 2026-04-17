@@ -113,13 +113,13 @@ class ProcessPricingAdmin(admin.ModelAdmin):
     
 @admin.register(models.SpanRule)
 class SpanRuleAdmin(admin.ModelAdmin):
-    list_display = ('id', 'label', 'description', 'embedding_model')
-    search_fields = ('label', 'anchors_strong', 'anchors_weak', 'anchors_negative')
+    list_display = ('id', 'erp_id', 'label', 'description', 'embedding_model')
+    search_fields = ('erp_id', 'label', 'anchors_strong', 'anchors_weak', 'anchors_negative')
     list_filter = ('embedding_model',)
     readonly_fields = ('anchor_embeddings',)
     fieldsets = (
         (None, {
-            'fields': ('label', 'description')
+            'fields': ('erp_id', 'label', 'description')
         }),
         ('Âncoras', {
             'fields': ('anchors_strong', 'anchors_weak', 'anchors_negative'),
@@ -133,11 +133,11 @@ class SpanRuleAdmin(admin.ModelAdmin):
 
 @admin.register(models.DocTypeRule)
 class DocTypeRuleAdmin(admin.ModelAdmin):
-    list_display = ('doc_type', 'description')
-    search_fields = ('doc_type', 'description')
+    list_display = ('erp_id', 'doc_type', 'description')
+    search_fields = ('erp_id', 'doc_type', 'description')
     fieldsets = (
         (None, {
-            'fields': ('doc_type', 'description')
+            'fields': ('erp_id', 'doc_type', 'description')
         }),
         ('Âncoras', {
             'fields': ('anchors_strong', 'anchors_weak', 'anchors_negative'),
