@@ -372,6 +372,7 @@ class ImportTransformationRuleSerializer(serializers.ModelSerializer):
             'computed_columns', 'default_values', 'row_filter',
             'extra_fields_for_trigger', 'trigger_options',
             'execution_order', 'is_active',
+            'erp_key_coalesce', 'erp_duplicate_behavior',
             'created_at', 'updated_at',
         ]
         read_only_fields = ['created_at', 'updated_at']
@@ -400,6 +401,7 @@ class ImportTransformationRuleListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'source_sheet_name', 'target_model',
             'is_active', 'execution_order',
+            'erp_key_coalesce', 'erp_duplicate_behavior',
         ]
 
 

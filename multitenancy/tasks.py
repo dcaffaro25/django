@@ -139,6 +139,59 @@ def _model_has_erp_id(model) -> bool:
     return any(getattr(f, "name", None) == "cliente_erp_id" for f in model._meta.fields)
 
 
+def _merge_sheet_import_options(import_metadata: Optional[Dict[str, Any]], sheet: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge per-request and per-sheet import options (ETL passes options on each sheet dict)."""
+    meta_opts = (import_metadata or {}).get("import_options") or {}
+    sheet_opts = (sheet or {}).get("import_options") or {}
+    out: Dict[str, Any] = {**meta_opts, **sheet_opts}
+    if "erp_key_coalesce" not in out:
+        out["erp_key_coalesce"] = True
+    if "erp_duplicate_behavior" not in out:
+        out["erp_duplicate_behavior"] = "update"
+    return out
+
+
+def _erp_delete_key_parts(val: Any) -> Tuple[bool, str]:
+    """Return (delete_intent, key_without_leading_minus) for ERP row keys."""
+    if _is_missing(val):
+        return False, ""
+    s = str(val).strip()
+    if s.startswith("-"):
+        return True, s[1:].strip()
+    return False, s
+
+
+def _erp_keys_conflict_message(left: Any, right: Any) -> Optional[str]:
+    dl, vl = _erp_delete_key_parts(left)
+    dr, vr = _erp_delete_key_parts(right)
+    if (dl, vl) != (dr, vr):
+        return f"__erp_id and cliente_erp_id disagree ({left!r} vs {right!r})"
+    return None
+
+
+def _resolve_row_erp_identifier(
+    raw: Dict[str, Any],
+    popped__erp_id: Any,
+    model,
+    import_options: Dict[str, Any],
+) -> Tuple[Any, Optional[str]]:
+    """
+    Unify __erp_id column and mapped cliente_erp_id on the row when erp_key_coalesce is True.
+
+    Returns (effective_value_for_upsert_logic, error_message_or_none).
+    """
+    coalesce = bool(import_options.get("erp_key_coalesce", True))
+    if coalesce and _model_has_erp_id(model):
+        cerp = raw.get("cliente_erp_id")
+        if not _is_missing(popped__erp_id) and not _is_missing(cerp):
+            msg = _erp_keys_conflict_message(popped__erp_id, cerp)
+            if msg:
+                return None, msg
+        if _is_missing(popped__erp_id) and not _is_missing(cerp):
+            return cerp, None
+    return popped__erp_id, None
+
+
 def _is_missing(v) -> bool:
     if v is None or v == "":
         return True
@@ -902,6 +955,14 @@ def execute_import_job(
       - Positive integer: update row with that primary key (legacy: explicit id column also updates).
       - Negative integer: delete row with id abs(value); soft-delete if model has is_deleted.
 
+    ERP row key (__erp_id vs cliente_erp_id):
+      - By default (import_options.erp_key_coalesce=True), the dedicated ``__erp_id`` column and a mapped
+        ``cliente_erp_id`` on the same row are interchangeable for upsert/delete-by-ERP-key (models that
+        define ``cliente_erp_id``). If both are set, they must agree or the row errors.
+      - import_options.erp_duplicate_behavior: ``update`` (default), ``skip``, or ``error`` when a match
+        by ERP key is found.
+      - Per-sheet options: pass ``import_options`` on each sheet dict, or under import_metadata.import_options.
+
     Flow:
       - Sort sheets using MODEL_APP_MAP order
       - For each row: substitutions -> filter -> company context -> MPTT path -> *_fk resolution to *_id
@@ -1000,6 +1061,8 @@ def execute_import_job(
 
             logger.info("processing sheet '%s' rows=%d (after substitutions)", model_name, len(rows))
 
+            sheet_import_options = _merge_sheet_import_options(import_metadata, sheet)
+
             # If MPTT and path present, sort parents first
             if _is_mptt_model(model):
                 rows = sorted(rows, key=_path_depth)
@@ -1007,13 +1070,30 @@ def execute_import_job(
             for row in rows:
                 raw = dict(row or {})
                 rid_raw = raw.pop("__row_id", None)
-                erp_id_raw = raw.pop("__erp_id", None)
+                popped_erp = raw.pop("__erp_id", None)
+                erp_id_raw, erp_resolve_err = _resolve_row_erp_identifier(
+                    raw, popped_erp, model, sheet_import_options
+                )
+                if erp_resolve_err:
+                    outputs_by_model[model_name].append({
+                        "__row_id": rid_raw,
+                        "status": "error",
+                        "action": None,
+                        "data": raw,
+                        "message": erp_resolve_err,
+                        "observations": [],
+                        "external_id": None,
+                    })
+                    continue
+
                 mode, row_detail, rid_display = _parse_import_row_id(rid_raw)
                 rid = _norm_row_key(rid_display)
 
-                # __erp_id override: upsert by cliente_erp_id on the target model.
-                # If an existing record is found → update; otherwise → create.
-                # Prefix with "-" to delete (e.g. __erp_id = "-ERP123").
+                dup_beh = str(sheet_import_options.get("erp_duplicate_behavior") or "update").lower()
+
+                # __erp_id / coalesced cliente_erp_id: upsert by cliente_erp_id on the target model.
+                # If an existing record is found → update (or skip/error per erp_duplicate_behavior).
+                # Prefix with "-" to delete (e.g. __erp_id = "-ERP123" or cliente_erp_id = "-ERP123").
                 if not _is_missing(erp_id_raw) and mode != "delete":
                     erp_str = str(erp_id_raw).strip()
                     if erp_str.startswith("-"):
@@ -1038,6 +1118,34 @@ def execute_import_job(
                     else:
                         existing, existing_pk = _resolve_row_by_erp_id(model, erp_str, company_id)
                         if existing:
+                            if dup_beh == "error":
+                                outputs_by_model[model_name].append({
+                                    "__row_id": rid_display,
+                                    "status": "error",
+                                    "action": None,
+                                    "data": raw,
+                                    "message": (
+                                        f"{model_name} already exists for ERP key cliente_erp_id="
+                                        f"{erp_str!r} (erp_duplicate_behavior=error)"
+                                    ),
+                                    "observations": _row_observations(audit_by_rowid, rid),
+                                    "external_id": erp_str,
+                                })
+                                continue
+                            if dup_beh == "skip":
+                                outputs_by_model[model_name].append({
+                                    "__row_id": rid_display,
+                                    "status": "success",
+                                    "action": "skipped_duplicate",
+                                    "data": {"id": existing_pk, "cliente_erp_id": erp_str},
+                                    "message": (
+                                        f"Skipped: {model_name} id={existing_pk} already has "
+                                        f"cliente_erp_id={erp_str!r}"
+                                    ),
+                                    "observations": _row_observations(audit_by_rowid, rid),
+                                    "external_id": erp_str,
+                                })
+                                continue
                             mode = "update"
                             row_detail = existing_pk
                             if rid_display is None:

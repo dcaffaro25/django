@@ -1616,11 +1616,17 @@ class ETLPipelineService:
                         row_copy['__row_id'] = row_copy['__excel_row_id']
                     rows_with_row_id.append(row_copy)
                 
-                sheets.append({
+                sheet_payload: Dict[str, Any] = {
                     'model': model_name,
                     'rows': rows_with_row_id,
-                    'sheet_name': sheet_name  # Pass sheet name for metadata
-                })
+                    'sheet_name': sheet_name,  # Pass sheet name for metadata
+                }
+                if rule:
+                    sheet_payload['import_options'] = {
+                        'erp_key_coalesce': rule.erp_key_coalesce,
+                        'erp_duplicate_behavior': rule.erp_duplicate_behavior,
+                    }
+                sheets.append(sheet_payload)
             
             if not sheets:
                 return {'message': 'No data to import'}
@@ -2042,7 +2048,15 @@ class ETLPipelineService:
         from multitenancy.tasks import apply_substitutions, _filter_unknown, _attach_company_context
         from multitenancy.tasks import _apply_path_inputs, _apply_erp_id_inputs, _apply_fk_inputs, _coerce_boolean_fields, _quantize_decimal_fields
         from multitenancy.tasks import _safe_model_dict, _row_observations, _norm_row_key
-        from multitenancy.tasks import _parse_import_row_id, _resolve_row_by_erp_id, _is_missing, _assert_import_tenant_scope, _apply_import_delete
+        from multitenancy.tasks import (
+            _parse_import_row_id,
+            _resolve_row_by_erp_id,
+            _is_missing,
+            _assert_import_tenant_scope,
+            _apply_import_delete,
+            _merge_sheet_import_options,
+            _resolve_row_erp_identifier,
+        )
         from django.apps import apps
         
         if self.debug_account_substitution:
@@ -2350,11 +2364,29 @@ class ETLPipelineService:
                     logger.info(f"ETL DEBUG: Processing row {row_idx + 1}/{len(rows)}")
                 raw = dict(row or {})
                 rid_raw = raw.pop("__row_id", None)
-                erp_id_raw = raw.pop("__erp_id", None)
+                popped_erp = raw.pop("__erp_id", None)
+                sheet_opts = _merge_sheet_import_options(import_metadata, sheet)
+                erp_id_raw, erp_resolve_err = _resolve_row_erp_identifier(
+                    raw, popped_erp, model, sheet_opts
+                )
+                if erp_resolve_err:
+                    transaction_outputs.append({
+                        "__row_id": rid_raw,
+                        "status": "error",
+                        "action": None,
+                        "data": raw,
+                        "message": erp_resolve_err,
+                        "observations": [],
+                        "external_id": None,
+                    })
+                    continue
+
                 mode, row_detail, rid_display = _parse_import_row_id(rid_raw)
                 rid = _norm_row_key(rid_display)
 
-                # __erp_id upsert/delete by cliente_erp_id
+                dup_beh = str(sheet_opts.get("erp_duplicate_behavior") or "update").lower()
+
+                # __erp_id / coalesced cliente_erp_id: upsert/delete by cliente_erp_id
                 if not _is_missing(erp_id_raw) and mode != "delete":
                     erp_str = str(erp_id_raw).strip()
                     if erp_str.startswith("-"):
@@ -2376,6 +2408,34 @@ class ETLPipelineService:
                     else:
                         existing, existing_pk = _resolve_row_by_erp_id(model, erp_str, self.company_id)
                         if existing:
+                            if dup_beh == "error":
+                                transaction_outputs.append({
+                                    "__row_id": rid_display,
+                                    "status": "error",
+                                    "action": None,
+                                    "data": raw,
+                                    "message": (
+                                        "Transaction already exists for ERP key cliente_erp_id="
+                                        f"{erp_str!r} (erp_duplicate_behavior=error)"
+                                    ),
+                                    "observations": _row_observations(audit_by_rowid, rid),
+                                    "external_id": erp_str,
+                                })
+                                continue
+                            if dup_beh == "skip":
+                                transaction_outputs.append({
+                                    "__row_id": rid_display,
+                                    "status": "success",
+                                    "action": "skipped_duplicate",
+                                    "data": {"id": existing_pk, "cliente_erp_id": erp_str},
+                                    "message": (
+                                        f"Skipped: Transaction id={existing_pk} already has "
+                                        f"cliente_erp_id={erp_str!r}"
+                                    ),
+                                    "observations": _row_observations(audit_by_rowid, rid),
+                                    "external_id": erp_str,
+                                })
+                                continue
                             mode = "update"
                             row_detail = existing_pk
                             if rid_display is None:

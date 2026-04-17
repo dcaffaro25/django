@@ -597,20 +597,32 @@ class ImportTransformationRule(TenantAwareBaseModel):
         help_text="Order of execution when processing multiple sheets"
     )
     is_active = models.BooleanField(default=True)
-    cliente_erp_id = models.CharField(
-        max_length=128,
-        null=True,
-        blank=True,
-        db_index=True,
-        help_text="Stable identifier from the client's ERP (Omie/codigo, etc.) for upsert and sync.",
+    erp_key_coalesce = models.BooleanField(
+        default=True,
+        help_text=(
+            "When True, a mapped cliente_erp_id on each imported row also drives upsert/delete "
+            "the same way as a dedicated __erp_id column. Set False to only use __erp_id for ERP-key matching."
+        ),
     )
-    
+    erp_duplicate_behavior = models.CharField(
+        max_length=20,
+        default="update",
+        choices=[
+            ("update", "Update existing row when the same ERP key is found"),
+            ("skip", "Skip row when a row with the same ERP key already exists"),
+            ("error", "Fail the row when a row with the same ERP key already exists"),
+        ],
+        help_text=(
+            "When an import row resolves to an existing record by ERP key "
+            "(__erp_id or coalesced cliente_erp_id), choose update, skip, or error."
+        ),
+    )
+
     class Meta:
         ordering = ['execution_order', 'name']
         indexes = [
             models.Index(fields=['company', 'source_sheet_name']),
             models.Index(fields=['company', 'is_active']),
-            models.Index(fields=['company', 'cliente_erp_id']),
         ]
 
     def __str__(self):

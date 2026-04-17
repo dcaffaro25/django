@@ -626,6 +626,8 @@ Uses `TenantAwareManager` which auto-filters by the current tenant. Has `clean()
 | trigger_options          | json        | no       | {}      | Trigger configuration                                          |
 | execution_order          | integer     | —        | 0       |                                                                |
 | is_active                | boolean     | —        | true    |                                                                |
+| erp_key_coalesce         | boolean     | —        | true    | When true, mapped `cliente_erp_id` on each row also drives upsert/delete like `__erp_id` |
+| erp_duplicate_behavior   | string(20)  | —        | update  | `update`, `skip`, or `error` when ERP key matches an existing row |
 
 
 #### ETLPipelineLog
