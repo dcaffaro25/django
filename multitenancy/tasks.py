@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from operator import attrgetter
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from celery import shared_task
 from django.apps import apps
@@ -836,6 +836,71 @@ def _resolve_row_by_erp_id(model, erp_id_value, company_id: Optional[int]):
     if obj:
         return obj, obj.pk
     return None, None
+
+
+def _collect_transaction_erp_id_counts_for_sheet(
+    rows: Optional[List[Dict[str, Any]]],
+    sheet: Dict[str, Any],
+    import_metadata: Optional[Dict[str, Any]],
+    model,
+) -> Tuple[Dict[str, int], Set[str]]:
+    """
+    Count import rows per erp_id (after __erp_id / erp_id coalescing). Used by ETL split imports.
+
+    Ignores rows whose __row_id resolves to delete mode, delete-prefixed erp keys, and rows
+    with erp resolution errors or missing erp_id.
+    """
+    counts: Dict[str, int] = {}
+    sheet_opts = _merge_sheet_import_options(import_metadata, sheet)
+    for row in rows or []:
+        rc = dict(row or {})
+        rid_raw = rc.pop("__row_id", None)
+        popped_erp = rc.pop("__erp_id", None)
+        erp_id_raw, erp_resolve_err = _resolve_row_erp_identifier(
+            rc, popped_erp, model, sheet_opts
+        )
+        if erp_resolve_err:
+            continue
+        mode, _, _ = _parse_import_row_id(rid_raw)
+        if mode == "delete":
+            continue
+        if _is_missing(erp_id_raw):
+            continue
+        erp_str = str(erp_id_raw).strip()
+        if erp_str.startswith("-"):
+            continue
+        counts[erp_str] = counts.get(erp_str, 0) + 1
+    return counts, set(counts.keys())
+
+
+def _delete_transactions_for_erp_ids_replace_import(
+    model,
+    company_id: int,
+    erp_ids: Set[str],
+) -> int:
+    """
+    Remove every Transaction for this company whose erp_id is in erp_ids (import delete semantics).
+
+    Journal entries cascade hard-delete with Transaction when is_deleted is not used; otherwise
+    soft-delete follows the same collector rules as normal import deletes.
+    """
+    if not erp_ids:
+        return 0
+    removed = 0
+    for erp_val in erp_ids:
+        qs = model.objects.filter(company_id=company_id, erp_id=erp_val)
+        for inst in list(qs):
+            _assert_import_tenant_scope(inst, company_id)
+            _apply_import_delete(inst, model)
+            removed += 1
+    if removed:
+        logger.info(
+            "import_erp_replace removed=%d transaction(s) across %d erp_id key(s) for company_id=%s",
+            removed,
+            len(erp_ids),
+            company_id,
+        )
+    return removed
 
 
 def _apply_fk_inputs(model, payload: dict, original_input: dict, token_to_id: Dict[str, int]) -> dict:

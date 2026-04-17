@@ -1759,7 +1759,10 @@ class ETLPipelineService:
                 
                 # If validation fails, rollback by raising an exception
                 if validation_errors:
-                    error_message = f"ETL validation failed: Expected 1 Transaction and 2 Journal Entries per row, but found mismatches:\n" + "\n".join(validation_errors)
+                    error_message = (
+                        "ETL validation failed: Expected 1 Transaction and 2 Journal Entries per import row, "
+                        "but found mismatches:\n" + "\n".join(validation_errors)
+                    )
                     logger.error(error_message)
                     for error in validation_errors:
                         self._add_error(
@@ -2056,6 +2059,8 @@ class ETLPipelineService:
             _apply_import_delete,
             _merge_sheet_import_options,
             _resolve_row_erp_identifier,
+            _collect_transaction_erp_id_counts_for_sheet,
+            _delete_transactions_for_erp_ids_replace_import,
         )
         from django.apps import apps
         
@@ -2319,19 +2324,23 @@ class ETLPipelineService:
         
         total_start = time.time()
         logger.info(f"ETL DEBUG: Starting transaction processing for {len(transaction_sheets)} sheet(s)")
-        
+
+        prepared_sheets: List[Dict[str, Any]] = []
+        merged_erp_id_counts: Dict[str, int] = {}
         for sheet_idx, sheet in enumerate(transaction_sheets):
             sheet_start = time.time()
             raw_rows: List[Dict[str, Any]] = sheet.get("rows") or []
-            sheet_name = sheet.get("sheet_name")  # Get sheet name for tracking
-            logger.info(f"ETL DEBUG: Sheet {sheet_idx + 1}: Processing {len(raw_rows)} raw rows (sheet_name: {sheet_name})")
-            
-            # Log entity_id values before substitutions
+            sheet_name = sheet.get("sheet_name")
+            logger.info(
+                f"ETL DEBUG: Sheet {sheet_idx + 1}: Processing {len(raw_rows)} raw rows "
+                f"(sheet_name: {sheet_name})"
+            )
             for idx, row in enumerate(raw_rows):
                 if isinstance(row, dict) and 'entity_id' in row:
-                    logger.info(f"ETL DEBUG: Row {idx + 1} BEFORE substitutions - entity_id: '{row.get('entity_id')}' (type: {type(row.get('entity_id')).__name__})")
-            
-            # Apply substitutions
+                    logger.info(
+                        f"ETL DEBUG: Row {idx + 1} BEFORE substitutions - entity_id: "
+                        f"'{row.get('entity_id')}' (type: {type(row.get('entity_id')).__name__})"
+                    )
             subst_start = time.time()
             rows, audit = apply_substitutions(
                 raw_rows,
@@ -2341,23 +2350,62 @@ class ETLPipelineService:
                 commit=self.commit,
                 processed_row_ids=processed_substitution_rows,
                 sheet_name=sheet_name,
-                substitution_cache=substitution_cache
+                substitution_cache=substitution_cache,
             )
             subst_time = time.time() - subst_start
-            logger.info(f"ETL DEBUG: Substitutions took {subst_time:.3f}s for {len(rows)} rows ({subst_time/len(rows)*1000:.2f}ms per row)")
-            
-            # Log entity_id values after substitutions
+            per_row_ms = (subst_time / len(rows) * 1000) if rows else 0.0
+            logger.info(
+                f"ETL DEBUG: Substitutions took {subst_time:.3f}s for {len(rows)} rows ({per_row_ms:.2f}ms per row)"
+            )
             for idx, row in enumerate(rows):
                 if isinstance(row, dict) and 'entity_id' in row:
-                    logger.info(f"ETL DEBUG: Row {idx + 1} AFTER substitutions - entity_id: '{row.get('entity_id')}' (type: {type(row.get('entity_id')).__name__})")
+                    logger.info(
+                        f"ETL DEBUG: Row {idx + 1} AFTER substitutions - entity_id: "
+                        f"'{row.get('entity_id')}' (type: {type(row.get('entity_id')).__name__})"
+                    )
+            sheet_counts, _ = _collect_transaction_erp_id_counts_for_sheet(
+                rows, sheet, import_metadata, model
+            )
+            for e, c in sheet_counts.items():
+                merged_erp_id_counts[e] = merged_erp_id_counts.get(e, 0) + c
+            prepared_sheets.append({
+                "sheet": sheet,
+                "rows": rows,
+                "audit": audit,
+                "sheet_name": sheet_name,
+                "sheet_idx": sheet_idx,
+                "sheet_start": sheet_start,
+            })
+
+        erp_ids_with_splits_in_file = {e for e, c in merged_erp_id_counts.items() if c > 1}
+        if merged_erp_id_counts:
+            _delete_transactions_for_erp_ids_replace_import(
+                model, self.company_id, set(merged_erp_id_counts.keys())
+            )
+            logger.info(
+                "ETL: erp_id replace-import for %d key(s); split keys (same erp_id on multiple "
+                "import rows): %s",
+                len(merged_erp_id_counts),
+                sorted(erp_ids_with_splits_in_file) if erp_ids_with_splits_in_file else "none",
+            )
+
+        global_row_base = 0
+        for prep in prepared_sheets:
+            sheet = prep["sheet"]
+            rows = prep["rows"]
+            audit = prep["audit"]
+            sheet_name = prep["sheet_name"]
+            sheet_idx = prep["sheet_idx"]
+            sheet_start = prep["sheet_start"]
+
             audit_by_rowid: Dict[Any, List[dict]] = {}
             for ch in (audit or []):
                 key_norm = _norm_row_key(ch.get("__row_id"))
                 audit_by_rowid.setdefault(key_norm, []).append(ch)
-            
+
             row_processing_start = time.time()
             logger.info(f"ETL DEBUG: Starting row-by-row processing for {len(rows)} rows")
-            
+
             for row_idx, row in enumerate(rows):
                 row_start = time.time()
                 if row_idx % 10 == 0:
@@ -2408,7 +2456,11 @@ class ETLPipelineService:
                     else:
                         existing, existing_pk = _resolve_row_by_erp_id(model, erp_str, self.company_id)
                         if existing:
-                            if dup_beh == "error":
+                            if erp_str in erp_ids_with_splits_in_file:
+                                # Multiple import rows share this erp_id (split lines). Do not treat an
+                                # in-pass create as a duplicate; always insert another Transaction.
+                                existing, existing_pk = None, None
+                            elif dup_beh == "error":
                                 transaction_outputs.append({
                                     "__row_id": rid_display,
                                     "status": "error",
@@ -2422,7 +2474,7 @@ class ETLPipelineService:
                                     "external_id": erp_str,
                                 })
                                 continue
-                            if dup_beh == "skip":
+                            elif dup_beh == "skip":
                                 transaction_outputs.append({
                                     "__row_id": rid_display,
                                     "status": "success",
@@ -2436,11 +2488,12 @@ class ETLPipelineService:
                                     "external_id": erp_str,
                                 })
                                 continue
-                            mode = "update"
-                            row_detail = existing_pk
-                            if rid_display is None:
-                                rid_display = existing_pk
-                                rid = _norm_row_key(rid_display)
+                            else:
+                                mode = "update"
+                                row_detail = existing_pk
+                                if rid_display is None:
+                                    rid_display = existing_pk
+                                    rid = _norm_row_key(rid_display)
 
                 if mode == "error":
                     transaction_outputs.append({
@@ -2569,7 +2622,8 @@ class ETLPipelineService:
                         user_id = current_user.id if current_user and current_user.is_authenticated else None
                         
                         # Get Excel row metadata from extra_fields
-                        extra_fields = extra_fields_list[row_idx] if row_idx < len(extra_fields_list) else {}
+                        ef_idx = global_row_base + row_idx
+                        extra_fields = extra_fields_list[ef_idx] if ef_idx < len(extra_fields_list) else {}
                         excel_row_id = extra_fields.get('__excel_row_id')
                         excel_row_number = extra_fields.get('__excel_row_number')
                         excel_sheet_name = extra_fields.get('__excel_sheet_name')
@@ -2673,7 +2727,8 @@ class ETLPipelineService:
                     # NOW create JournalEntries immediately after Transaction is saved
                     # We're in the same transaction context, so the Transaction is accessible
                     je_prep_start = time.time()
-                    extra_fields = extra_fields_list[row_idx] if row_idx < len(extra_fields_list) else {}
+                    ef_idx = global_row_base + row_idx
+                    extra_fields = extra_fields_list[ef_idx] if ef_idx < len(extra_fields_list) else {}
                     
                     # Apply substitutions to extra_fields before using them
                     # For each field, check if there are substitutions for the target model
@@ -3135,6 +3190,7 @@ class ETLPipelineService:
                         "external_id": None,
                     })
             
+            global_row_base += len(rows)
             row_processing_time = time.time() - row_processing_start
             logger.info(f"ETL DEBUG: Sheet {sheet_idx + 1} row processing took {row_processing_time:.3f}s for {len(rows)} rows ({row_processing_time/len(rows):.3f}s per row)")
             sheet_time = time.time() - sheet_start
