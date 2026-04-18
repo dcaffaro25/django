@@ -17,7 +17,17 @@ from openpyxl import Workbook
 from django.forms.models import model_to_dict
 from django.utils.timezone import now
 from multitenancy.models import Company, Entity, IntegrationRule, SubstitutionRule
-from accounting.models import Currency, Bank, BankAccount, Account, CostCenter, Transaction, JournalEntry, BankTransaction
+from accounting.models import (
+    Currency,
+    Bank,
+    BankAccount,
+    Account,
+    CostCenter,
+    Transaction,
+    JournalEntry,
+    BankTransaction,
+    Reconciliation,
+)
 from core.models import FinancialIndex, IndexQuote, FinancialIndexQuoteForecast
 from billing.models import (
     BusinessPartnerCategory, BusinessPartner,
@@ -986,21 +996,25 @@ class BulkImportTemplateDownloadView(APIView):
         ref_ws = wb.create_sheet("References")
         col_position = 1  # Start at column A
 
+        # One block per import sheet (sheet_defs), same order, plus Reconciliation for lookup.
         references = [
             ("Company", Company.objects.all(), _reference_column_names(Company)),
             ("Currency", Currency.objects.all(), _reference_column_names(Currency)),
             ("Bank", Bank.objects.all(), _reference_column_names(Bank)),
             ("BankAccount", BankAccount.objects.all(), _reference_column_names(BankAccount)),
-            ("Entity", Entity.objects.filter(company_id=tenant_id), _reference_column_names(Entity)),
-            ("CostCenter", CostCenter.objects.filter(company_id=tenant_id), _reference_column_names(CostCenter)),
             ("Account", Account.objects.filter(company_id=tenant_id), _reference_column_names(Account)),
+            ("CostCenter", CostCenter.objects.filter(company_id=tenant_id), _reference_column_names(CostCenter)),
+            ("Entity", Entity.objects.filter(company_id=tenant_id), _reference_column_names(Entity)),
             ("BusinessPartnerCategory", BusinessPartnerCategory.objects.filter(company_id=tenant_id), _reference_column_names(BusinessPartnerCategory)),
             ("BusinessPartner", BusinessPartner.objects.filter(company_id=tenant_id), _reference_column_names(BusinessPartner)),
+            ("FinancialIndex", FinancialIndex.objects.all(), _reference_column_names(FinancialIndex)),
+            ("IndexQuote", IndexQuote.objects.all(), _reference_column_names(IndexQuote)),
+            ("FinancialIndexQuoteForecast", FinancialIndexQuoteForecast.objects.all(), _reference_column_names(FinancialIndexQuoteForecast)),
             ("ProductServiceCategory", ProductServiceCategory.objects.filter(company_id=tenant_id), _reference_column_names(ProductServiceCategory)),
             ("ProductService", ProductService.objects.filter(company_id=tenant_id), _reference_column_names(ProductService)),
-            ("FinancialIndex", FinancialIndex.objects.all(), _reference_column_names(FinancialIndex)),
-            ("Invoice", Invoice.objects.filter(company_id=tenant_id), _reference_column_names(Invoice)),
             ("Contract", Contract.objects.filter(company_id=tenant_id), _reference_column_names(Contract)),
+            ("Invoice", Invoice.objects.filter(company_id=tenant_id), _reference_column_names(Invoice)),
+            ("InvoiceLine", InvoiceLine.objects.filter(company_id=tenant_id), _reference_column_names(InvoiceLine)),
             ("Transaction", Transaction.objects.filter(company_id=tenant_id), _reference_column_names(Transaction)),
             (
                 "JournalEntry",
@@ -1012,8 +1026,13 @@ class BulkImportTemplateDownloadView(APIView):
                 BankTransaction.objects.filter(company_id=tenant_id).prefetch_related("reconciliations"),
                 _reference_column_names(BankTransaction),
             ),
+            ("Reconciliation", Reconciliation.objects.filter(company_id=tenant_id), _reference_column_names(Reconciliation)),
             ("IntegrationRule", IntegrationRule.objects.filter(company_id=tenant_id), _reference_column_names(IntegrationRule)),
             ("SubstitutionRule", SubstitutionRule.objects.filter(company_id=tenant_id), _reference_column_names(SubstitutionRule)),
+            ("Position", Position.objects.filter(company_id=tenant_id), _reference_column_names(Position)),
+            ("Employee", Employee.objects.filter(company_id=tenant_id), _reference_column_names(Employee)),
+            ("TimeTracking", TimeTracking.objects.filter(company_id=tenant_id), _reference_column_names(TimeTracking)),
+            ("RecurringAdjustment", RecurringAdjustment.objects.filter(company_id=tenant_id), _reference_column_names(RecurringAdjustment)),
             ("NotaFiscal", NotaFiscal.objects.filter(company_id=tenant_id), _reference_column_names(NotaFiscal)),
             ("NotaFiscalItem", NotaFiscalItem.objects.filter(company_id=tenant_id), _reference_column_names(NotaFiscalItem)),
             ("NotaFiscalReferencia", NotaFiscalReferencia.objects.filter(company_id=tenant_id), _reference_column_names(NotaFiscalReferencia)),
