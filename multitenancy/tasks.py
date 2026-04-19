@@ -411,6 +411,21 @@ def _normalize_full_path(path_str: str) -> str:
     return PATH_SEP.join(parts)
 
 
+def _import_path_matches_db_path(expected_norm: str, db_path_raw: str) -> bool:
+    """
+    True if the chart row ``db_path_raw`` is the same trail as ``expected_norm`` (normalized).
+
+    Accepts DB paths that have extra leading segments (e.g. a grouping node above ``Resultado``)
+    as long as the trail ends with the import path: ``… > Resultado > … > Leaf``.
+    """
+    db_norm = _normalize_full_path(db_path_raw)
+    if not expected_norm or not db_norm:
+        return False
+    if db_norm == expected_norm:
+        return True
+    return db_norm.endswith(PATH_SEP + expected_norm)
+
+
 def _path_depth(row: Dict[str, Any]) -> int:
     p = _get_path_value(row)
     return len(_split_path(p)) if p else 0
@@ -506,40 +521,144 @@ def _find_mptt_node_matching_path_string(
     company_id: Optional[int],
 ) -> Optional[Any]:
     """
-    Locate the node whose rendered path equals ``PATH_SEP.join(chain)`` (same idea as ``get_path()`` in the UI).
+    Locate the node for path prefix ``chain`` using the same trail as ``get_path()`` in the UI.
 
-    This avoids wrong matches when several nodes share the same ``name`` under different parents or when
-    multiple roots exist: the step-by-step ``(name, parent).first()`` walk can follow the wrong branch.
+    We intentionally **do not** filter by MPTT ``level``: the first segment of the import path is not
+    always the tree root (extra grouping nodes above ``Resultado`` are common), so ``level == len(chain)-1``
+    misses real rows and makes imports fail even when the path exists.
+
+    Match order:
+      1) Normalized ``get_path()`` equals the expected string.
+      2) Normalized DB path ends with ``PATH_SEP + expected`` (extra leading segments in DB).
+      Prefer the shortest DB path on ties. Optionally repeats without ``is_deleted`` if nothing found.
     """
     if not chain or not hasattr(model, "get_path"):
         return None
     expected = _normalize_full_path(PATH_SEP.join(chain))
-    level_attr = getattr(getattr(model, "_mptt_meta", None), "level_attr", None) or "level"
-    target_level = len(chain) - 1
-    qs = model.objects.all()
-    if company_id is not None and _model_has_concrete_field(model, "company"):
-        qs = qs.filter(company_id=int(company_id))
-    qs = _mptt_qs_active(qs, model)
-    qs = qs.filter(**{level_attr: target_level, "name": chain[-1]})
-    for cand in qs.iterator(chunk_size=200):
-        try:
-            rendered = _normalize_full_path(cand.get_path())
-        except Exception:
-            continue
-        if rendered == expected:
-            return cand
-    # Rare: leaf label differs slightly in DB but path string still matches after normalize — try same level.
-    qs2 = model.objects.all()
-    if company_id is not None and _model_has_concrete_field(model, "company"):
-        qs2 = qs2.filter(company_id=int(company_id))
-    qs2 = _mptt_qs_active(qs2, model).filter(**{level_attr: target_level})
-    for cand in qs2.iterator(chunk_size=500):
-        try:
-            if _normalize_full_path(cand.get_path()) == expected:
+    leaf_name = chain[-1]
+
+    def _scan(qs_base, use_active_filter: bool) -> Optional[Any]:
+        qs = qs_base
+        if use_active_filter:
+            qs = _mptt_qs_active(qs, model)
+        qs_leaf = qs.filter(name=leaf_name)
+        best: Optional[Any] = None
+        best_depth: Optional[int] = None
+
+        for cand in qs_leaf.iterator(chunk_size=400):
+            try:
+                raw_gp = cand.get_path()
+            except Exception:
+                continue
+            if not _import_path_matches_db_path(expected, raw_gp):
+                continue
+            nd = _normalize_full_path(raw_gp)
+            depth = len(_split_path(nd))
+            if nd == expected:
                 return cand
-        except Exception:
-            continue
+            if best is None or (best_depth is not None and depth < best_depth):
+                best, best_depth = cand, depth
+
+        if best is not None:
+            return best
+
+        # Leaf ``name`` in DB may differ slightly from the file; still try full-path / suffix match.
+        for cand in qs.iterator(chunk_size=2000):
+            try:
+                raw_gp = cand.get_path()
+            except Exception:
+                continue
+            if not _import_path_matches_db_path(expected, raw_gp):
+                continue
+            nd = _normalize_full_path(raw_gp)
+            depth = len(_split_path(nd))
+            if nd == expected:
+                return cand
+            if best is None or (best_depth is not None and depth < best_depth):
+                best, best_depth = cand, depth
+        return best
+
+    qs0 = model.objects.all()
+    if company_id is not None and _model_has_concrete_field(model, "company"):
+        qs0 = qs0.filter(company_id=int(company_id))
+
+    found = _scan(qs0, use_active_filter=True)
+    if found is not None:
+        return found
+    if _model_has_concrete_field(model, "is_deleted"):
+        return _scan(qs0, use_active_filter=False)
     return None
+
+
+def _debug_mptt_parent_resolution_failure(
+    model,
+    chain: List[str],
+    company_id: Optional[int],
+    failed_idx: int,
+    parent_inst: Optional[Any],
+    source_path_for_errors: Optional[str],
+) -> str:
+    """
+    Build a multi-line diagnostic block for import/API responses when parent path resolution fails.
+    """
+    node_name = chain[failed_idx]
+    missing_prefix = PATH_SEP.join(chain[: failed_idx + 1])
+    full_expected = PATH_SEP.join(chain)
+    norm_exp = _normalize_full_path(full_expected)
+    lines: List[str] = [
+        "Debug (MPTT parent resolution):",
+        f"  import_row_path_raw={source_path_for_errors!r}" if source_path_for_errors else "  import_row_path_raw=<not passed>",
+        f"  parent_prefix_segments={len(chain)} expected_parent_path={full_expected!r}",
+        f"  parent_prefix_normalized={norm_exp!r}",
+        f"  failed_step_index={failed_idx} missing_prefix_so_far={missing_prefix!r} missing_node_name={node_name!r}",
+        f"  company_id_for_scope={company_id!r}",
+    ]
+    if parent_inst is None:
+        lines.append("  reached_parent=None (walker expected a root with this name next).")
+    else:
+        try:
+            pp = parent_inst.get_path()
+        except Exception as ex:
+            pp = f"<get_path() failed: {ex!r}>"
+        del_p = getattr(parent_inst, "is_deleted", None)
+        lines.append(
+            f"  reached_parent=id={parent_inst.pk} is_deleted={del_p!r} get_path()={pp!r}"
+        )
+
+    base = model.objects.all()
+    if _model_has_concrete_field(model, "company"):
+        if company_id is not None:
+            base = base.filter(company_id=int(company_id))
+        else:
+            lines.append(
+                "  warning: company_id is None but model is company-scoped; "
+                "candidate counts below are not filtered by tenant."
+            )
+
+    exact = base.filter(name=node_name)
+    n_exact = exact.count()
+    lines.append(f"  db_rows_same_company_exact_name={n_exact} (name={node_name!r})")
+
+    if n_exact:
+        lines.append("  sample_rows_with_that_name (id, parent_id, is_deleted, get_path):")
+        for obj in exact.order_by("id")[:8]:
+            try:
+                gp = obj.get_path()
+            except Exception as ex:
+                gp = f"<get_path() failed: {ex!r}>"
+            del_o = getattr(obj, "is_deleted", None)
+            pid = getattr(obj, "parent_id", None)
+            under = ""
+            if parent_inst is not None:
+                under = " under_reached_parent" if pid == parent_inst.pk else " WRONG_PARENT"
+            lines.append(f"    id={obj.pk} parent_id={pid} is_deleted={del_o!r} path={gp!r}{under}")
+
+    lines.append(
+        "  hints: path match compares normalized get_path() (exact or DB suffix); "
+        "walker then requires name+parent chain. Fix spelling/accents/NBSP, parent link, "
+        "is_deleted, or company_id; or enable mptt_path_create_missing_ancestors."
+    )
+    return "\n".join(lines)
 
 
 def _resolve_parent_from_path_chain(
@@ -550,6 +669,7 @@ def _resolve_parent_from_path_chain(
     create_missing: bool = False,
     row_for_defaults: Optional[Dict[str, Any]] = None,
     raw_row: Optional[Dict[str, Any]] = None,
+    source_path_for_errors: Optional[str] = None,
 ):
     """
     Resolve the MPTT instance for the path prefix ``chain`` (the parent path of the row being imported).
@@ -559,6 +679,8 @@ def _resolve_parent_from_path_chain(
          with path lists shown in the product and fixes ambiguous ``.first()`` walks.
       2) Walk ``(name, parent)`` with company and soft-delete filters.
       3) Optionally create missing intermediate nodes (``mptt_path_create_missing_ancestors``).
+
+    ``source_path_for_errors``: original path cell from the row (shown in error messages for debugging).
     """
     if not chain:
         return None
@@ -581,9 +703,18 @@ def _resolve_parent_from_path_chain(
         if not row:
             if not create_missing:
                 missing = PATH_SEP.join(chain[: idx + 1])
+                detail = _debug_mptt_parent_resolution_failure(
+                    model,
+                    chain,
+                    company_id,
+                    idx,
+                    parent,
+                    source_path_for_errors,
+                )
                 raise ValueError(
-                    f"{model.__name__}: missing ancestor '{missing}'. Ensure parents are created before children, "
-                    f"or set import_options mptt_path_create_missing_ancestors=true to auto-create intermediate nodes."
+                    f"{model.__name__}: missing ancestor '{missing}'. Ensure parents exist under the correct "
+                    f"parent chain, or set import_options mptt_path_create_missing_ancestors=true to auto-create "
+                    f"intermediate nodes.\n{detail}"
                 )
             row = _mptt_create_missing_ancestor(
                 model, node_name, parent, company_id, fd, raw
@@ -1501,6 +1632,7 @@ def execute_import_job(
                                     create_missing=create_missing,
                                     row_for_defaults=filtered,
                                     raw_row=raw,
+                                    source_path_for_errors=path_val,
                                 )
                             filtered["name"] = filtered.get("name", leaf) or leaf
                             filtered["parent"] = parent
