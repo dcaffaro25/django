@@ -7,6 +7,7 @@ import math
 import os
 import re
 import smtplib
+import unicodedata
 import time
 import uuid
 from dataclasses import dataclass
@@ -149,6 +150,8 @@ def _merge_sheet_import_options(import_metadata: Optional[Dict[str, Any]], sheet
         out["erp_key_coalesce"] = True
     if "erp_duplicate_behavior" not in out:
         out["erp_duplicate_behavior"] = "update"
+    if "mptt_path_create_missing_ancestors" not in out:
+        out["mptt_path_create_missing_ancestors"] = False
     return out
 
 
@@ -394,23 +397,198 @@ def _split_path(path_str: str) -> List[str]:
     return [p.strip() for p in str(path_str).split(PATH_SEP) if p and p.strip()]
 
 
+def _normalize_path_segment(label: str) -> str:
+    """Normalize a single path label for comparison (NBSP, Unicode compatibility)."""
+    t = (label or "").replace("\u00a0", " ").strip()
+    try:
+        return unicodedata.normalize("NFKC", t)
+    except Exception:
+        return t
+
+
+def _normalize_full_path(path_str: str) -> str:
+    parts = [_normalize_path_segment(p) for p in str(path_str).split(PATH_SEP) if p.strip()]
+    return PATH_SEP.join(parts)
+
+
 def _path_depth(row: Dict[str, Any]) -> int:
     p = _get_path_value(row)
     return len(_split_path(p)) if p else 0
 
 
-def _resolve_parent_from_path_chain(model, chain: List[str]):
+def _model_has_concrete_field(model, field_name: str) -> bool:
+    try:
+        model._meta.get_field(field_name)
+        return True
+    except FieldDoesNotExist:
+        return False
+
+
+def _mptt_qs_active(qs, model):
+    if _model_has_concrete_field(model, "is_deleted"):
+        return qs.filter(is_deleted=False)
+    return qs
+
+
+def _fk_scalar_from_import_row(filtered: Dict[str, Any], raw: Dict[str, Any], base: str) -> Optional[int]:
+    """Resolve ``{base}_id`` or ``{base}_fk`` from row dicts before ``_apply_fk_inputs`` runs."""
+    for d in (filtered, raw):
+        for key in (f"{base}_id", f"{base}_fk"):
+            if key in d and not _is_missing(d.get(key)):
+                return _to_int_or_none_soft(d.get(key))
+    return None
+
+
+def _mptt_create_missing_ancestor(
+    model,
+    node_name: str,
+    parent: Any,
+    company_id: Optional[int],
+    filtered: Dict[str, Any],
+    raw: Dict[str, Any],
+):
     """
-    Resolve an existing parent chain in DB (or earlier created rows).
-    Assumes each node is uniquely identified by (name, parent) within the model.
+    Insert one intermediate MPTT node so a deeper path can attach.
+    Uses the same company and (for Account) currency / direction / balance fields as the leaf row.
     """
+    kwargs: Dict[str, Any] = {"name": node_name, "parent": parent}
+    if _model_has_concrete_field(model, "company"):
+        if not company_id:
+            raise ValueError(
+                f"{model.__name__}: cannot auto-create path ancestor {node_name!r} without company_id on the row."
+            )
+        kwargs["company_id"] = int(company_id)
+
+    model_name = model.__name__
+    if model_name == "Entity":
+        inst = model(**kwargs)
+        if hasattr(inst, "full_clean"):
+            inst.full_clean()
+        inst.save()
+        return inst
+
+    if model_name == "Account":
+        cid = _fk_scalar_from_import_row(filtered, raw, "currency")
+        if not cid:
+            raise ValueError(
+                f"{model.__name__}: cannot auto-create path ancestor {node_name!r} without "
+                f"currency_id or currency_fk on the row."
+            )
+        kwargs["currency_id"] = cid
+        for key in ("account_direction", "balance_date", "balance"):
+            if key in filtered and not _is_missing(filtered.get(key)):
+                kwargs[key] = filtered[key]
+        missing_req = [
+            k
+            for k in ("account_direction", "balance_date", "balance")
+            if k not in kwargs or _is_missing(kwargs.get(k))
+        ]
+        if missing_req:
+            raise ValueError(
+                f"{model.__name__}: cannot auto-create path ancestor {node_name!r}; "
+                f"the row must include {', '.join(missing_req)} (copied to intermediate nodes)."
+            )
+        inst = model(**kwargs)
+        if hasattr(inst, "full_clean"):
+            inst.full_clean()
+        inst.save()
+        return inst
+
+    raise ValueError(
+        f"{model.__name__}: missing path ancestor {node_name!r}; automatic creation is only "
+        f"supported for Account and Entity. Add parent rows to the import or implement stubs for this model."
+    )
+
+
+def _find_mptt_node_matching_path_string(
+    model,
+    chain: List[str],
+    company_id: Optional[int],
+) -> Optional[Any]:
+    """
+    Locate the node whose rendered path equals ``PATH_SEP.join(chain)`` (same idea as ``get_path()`` in the UI).
+
+    This avoids wrong matches when several nodes share the same ``name`` under different parents or when
+    multiple roots exist: the step-by-step ``(name, parent).first()`` walk can follow the wrong branch.
+    """
+    if not chain or not hasattr(model, "get_path"):
+        return None
+    expected = _normalize_full_path(PATH_SEP.join(chain))
+    level_attr = getattr(getattr(model, "_mptt_meta", None), "level_attr", None) or "level"
+    target_level = len(chain) - 1
+    qs = model.objects.all()
+    if company_id is not None and _model_has_concrete_field(model, "company"):
+        qs = qs.filter(company_id=int(company_id))
+    qs = _mptt_qs_active(qs, model)
+    qs = qs.filter(**{level_attr: target_level, "name": chain[-1]})
+    for cand in qs.iterator(chunk_size=200):
+        try:
+            rendered = _normalize_full_path(cand.get_path())
+        except Exception:
+            continue
+        if rendered == expected:
+            return cand
+    # Rare: leaf label differs slightly in DB but path string still matches after normalize — try same level.
+    qs2 = model.objects.all()
+    if company_id is not None and _model_has_concrete_field(model, "company"):
+        qs2 = qs2.filter(company_id=int(company_id))
+    qs2 = _mptt_qs_active(qs2, model).filter(**{level_attr: target_level})
+    for cand in qs2.iterator(chunk_size=500):
+        try:
+            if _normalize_full_path(cand.get_path()) == expected:
+                return cand
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_parent_from_path_chain(
+    model,
+    chain: List[str],
+    *,
+    company_id: Optional[int] = None,
+    create_missing: bool = False,
+    row_for_defaults: Optional[Dict[str, Any]] = None,
+    raw_row: Optional[Dict[str, Any]] = None,
+):
+    """
+    Resolve the MPTT instance for the path prefix ``chain`` (the parent path of the row being imported).
+
+    Resolution order:
+      1) Match the full rendered path string (``get_path()``), scoped by company when applicable — aligns
+         with path lists shown in the product and fixes ambiguous ``.first()`` walks.
+      2) Walk ``(name, parent)`` with company and soft-delete filters.
+      3) Optionally create missing intermediate nodes (``mptt_path_create_missing_ancestors``).
+    """
+    if not chain:
+        return None
+
+    inst = _find_mptt_node_matching_path_string(model, chain, company_id)
+    if inst:
+        return inst
+
+    has_company = _model_has_concrete_field(model, "company")
+    fd = dict(row_for_defaults or {})
+    raw = dict(raw_row or {})
     parent = None
+
     for idx, node_name in enumerate(chain):
-        inst = model.objects.filter(name=node_name, parent=parent).first()
-        if not inst:
-            missing = PATH_SEP.join(chain[: idx + 1])
-            raise ValueError(f"{model.__name__}: missing ancestor '{missing}'. Ensure parents are created before children.")
-        parent = inst
+        qs = model.objects.filter(name=node_name, parent=parent)
+        if has_company and company_id is not None:
+            qs = qs.filter(company_id=int(company_id))
+        qs = _mptt_qs_active(qs, model)
+        row = qs.order_by("id").first()
+        if not row:
+            if not create_missing:
+                missing = PATH_SEP.join(chain[: idx + 1])
+                raise ValueError(
+                    f"{model.__name__}: missing ancestor '{missing}'. Ensure parents are created before children, "
+                    f"or set import_options mptt_path_create_missing_ancestors=true to auto-create intermediate nodes."
+                )
+            row = _mptt_create_missing_ancestor(
+                model, node_name, parent, company_id, fd, raw
+            )
+        parent = row
     return parent
 
 
@@ -1312,7 +1490,18 @@ def execute_import_job(
                             leaf = parts[-1]
                             parent = None
                             if len(parts) > 1:
-                                parent = _resolve_parent_from_path_chain(model, parts[:-1])
+                                create_missing = bool(
+                                    sheet_import_options.get("mptt_path_create_missing_ancestors", False)
+                                )
+                                row_company_id = _to_int_or_none_soft(filtered.get("company_id"))
+                                parent = _resolve_parent_from_path_chain(
+                                    model,
+                                    parts[:-1],
+                                    company_id=row_company_id,
+                                    create_missing=create_missing,
+                                    row_for_defaults=filtered,
+                                    raw_row=raw,
+                                )
                             filtered["name"] = filtered.get("name", leaf) or leaf
                             filtered["parent"] = parent
                             filtered.pop("parent_id", None)
