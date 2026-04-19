@@ -531,28 +531,52 @@ def _mptt_create_missing_ancestor(
     )
 
 
+def _pick_mptt_child_by_name(
+    model,
+    node_name: str,
+    parent: Any,
+    company_id: Optional[int],
+    has_company: bool,
+    *,
+    active_only: bool = True,
+):
+    """
+    Find a direct child of ``parent`` whose ``name`` exactly matches the path segment (after strip).
+
+    Parents are expected to exist in the chart (or earlier import rows) with the same spelling as
+    the path cell. When ``active_only`` is False, soft-deleted rows are included as a second pass.
+    """
+    segment = (node_name or "").strip()
+    if not segment:
+        return None
+    qs = model.objects.filter(parent=parent, name=segment)
+    if has_company and company_id is not None:
+        qs = qs.filter(company_id=int(company_id))
+    if active_only:
+        qs = _mptt_qs_active(qs, model)
+    return qs.order_by("id").first()
+
+
 def _find_mptt_node_matching_path_string(
     model,
     chain: List[str],
     company_id: Optional[int],
 ) -> Optional[Any]:
     """
-    Locate the node for path prefix ``chain`` using the same trail as ``get_path()`` in the UI.
+    Locate the node for path prefix ``chain`` without scanning the whole tree.
 
-    We intentionally **do not** filter by MPTT ``level``: the first segment of the import path is not
-    always the tree root (extra grouping nodes above ``Resultado`` are common), so ``level == len(chain)-1``
-    misses real rows and makes imports fail even when the path exists.
+    Only rows whose **deepest segment name** equals ``chain[-1]`` (exact DB ``name``) are
+    considered; each candidate's rendered path is compared to the expected trail (normalized),
+    including DB paths that end with the import trail when the chart has extra leading segments.
 
-    Match order:
-      1) Normalized ``get_path()`` equals the expected string.
-      2) Normalized DB path ends with ``PATH_SEP + expected`` (extra leading segments in DB).
-      Prefer the shortest DB path on ties. Optionally repeats without ``is_deleted`` if nothing found.
+    If nothing matches, callers fall back to a per-level parent walk (also exact ``name`` only).
     """
     if not chain or not hasattr(model, "get_path"):
         return None
     expected = _normalize_full_path(PATH_SEP.join(chain))
-    leaf_name = chain[-1]
-    level_attr = getattr(getattr(model, "_mptt_meta", None), "level_attr", None) or "level"
+    leaf_name = (chain[-1] or "").strip()
+    if not leaf_name:
+        return None
 
     def _scan(qs_base, use_active_filter: bool) -> Optional[Any]:
         qs = qs_base
@@ -576,30 +600,6 @@ def _find_mptt_node_matching_path_string(
             if best is None or (best_depth is not None and depth < best_depth):
                 best, best_depth = cand, depth
 
-        if best is not None:
-            return best
-
-        # Leaf ``name`` in DB may differ slightly from the file; still try path / suffix match on a
-        # **narrowed** queryset (level band) to avoid scanning the entire tenant tree per row.
-        low = max(0, len(chain) - 1)
-        high = len(chain) + 30
-        try:
-            qs_narrow = qs.filter(**{f"{level_attr}__gte": low, f"{level_attr}__lte": high})
-        except Exception:
-            qs_narrow = qs
-        for cand in qs_narrow.iterator(chunk_size=800):
-            try:
-                raw_gp = _mptt_rendered_path_for_import_match(cand)
-            except Exception:
-                continue
-            if not _import_path_matches_db_path(expected, raw_gp):
-                continue
-            nd = _normalize_full_path(raw_gp)
-            depth = len(_split_path(nd))
-            if nd == expected:
-                return cand
-            if best is None or (best_depth is not None and depth < best_depth):
-                best, best_depth = cand, depth
         return best
 
     qs0 = model.objects.all()
@@ -663,6 +663,22 @@ def _debug_mptt_parent_resolution_failure(
     n_exact = exact.count()
     lines.append(f"  db_rows_same_company_exact_name={n_exact} (name={node_name!r})")
 
+    if parent_inst is not None and n_exact == 0:
+        sib = base.filter(parent_id=parent_inst.pk)
+        sib_active = _mptt_qs_active(sib, model)
+        n_children = sib_active.count()
+        lines.append(f"  active_children_under_reached_parent={n_children}")
+        if 0 < n_children <= 24:
+            sample = list(sib_active.order_by("id").values_list("name", flat=True)[:12])
+            lines.append(f"  sample_child_names={sample!r}")
+        want = _normalize_path_segment(node_name)
+        if want:
+            n_norm = 0
+            for nm in sib_active.order_by("id").values_list("name", flat=True).iterator(chunk_size=300):
+                if _normalize_path_segment(nm or "") == want:
+                    n_norm += 1
+            lines.append(f"  children_matching_normalized_missing_name={n_norm}")
+
     if n_exact:
         lines.append("  sample_rows_with_that_name (id, parent_id, is_deleted, get_path):")
         for obj in exact.order_by("id")[:8]:
@@ -678,9 +694,10 @@ def _debug_mptt_parent_resolution_failure(
             lines.append(f"    id={obj.pk} parent_id={pid} is_deleted={del_o!r} path={gp!r}{under}")
 
     lines.append(
-        "  hints: path match compares normalized get_path() (exact or DB suffix); "
-        "walker then requires name+parent chain. Fix spelling/accents/NBSP, parent link, "
-        "is_deleted, or company_id; or enable mptt_path_create_missing_ancestors."
+        "  hints: exact name per segment (trimmed) and normalized full-path match only on "
+        "rows that share the deepest segment name (no whole-tree scan). Order the sheet "
+        "parents-before-children when inserting both in one import; or enable "
+        "mptt_path_create_missing_ancestors."
     )
     return "\n".join(lines)
 
@@ -700,9 +717,9 @@ def _resolve_parent_from_path_chain(
     Resolve the MPTT instance for the path prefix ``chain`` (the parent path of the row being imported).
 
     Resolution order:
-      1) Match the full rendered path string (``get_path()``), scoped by company when applicable — aligns
-         with path lists shown in the product and fixes ambiguous ``.first()`` walks.
-      2) Walk ``(name, parent)`` with company and soft-delete filters.
+      1) Among nodes with ``name`` equal to the last path segment, pick the one whose rendered path
+         matches the full prefix (normalized; allows DB suffix when the chart has extra roots).
+      2) Walk root-to-node with one small query per segment: ``parent`` + exact ``name`` (after strip).
       3) Optionally create missing intermediate nodes (``mptt_path_create_missing_ancestors``).
 
     ``source_path_for_errors``: original path cell from the row (shown in error messages for debugging).
@@ -731,11 +748,13 @@ def _resolve_parent_from_path_chain(
     parent = None
 
     for idx, node_name in enumerate(chain):
-        qs = model.objects.filter(name=node_name, parent=parent)
-        if has_company and company_id is not None:
-            qs = qs.filter(company_id=int(company_id))
-        qs = _mptt_qs_active(qs, model)
-        row = qs.order_by("id").first()
+        row = _pick_mptt_child_by_name(
+            model, node_name, parent, company_id, has_company, active_only=True
+        )
+        if not row and _model_has_concrete_field(model, "is_deleted"):
+            row = _pick_mptt_child_by_name(
+                model, node_name, parent, company_id, has_company, active_only=False
+            )
         if not row:
             if not create_missing:
                 missing = PATH_SEP.join(chain[: idx + 1])
