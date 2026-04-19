@@ -411,6 +411,22 @@ def _normalize_full_path(path_str: str) -> str:
     return PATH_SEP.join(parts)
 
 
+def _mptt_rendered_path_for_import_match(node) -> str:
+    """
+    Same string shape as ``node.get_path()`` for path matching, without N+1 parent fetches.
+
+    Uses django-mptt ``get_ancestors`` (one query) instead of walking ``parent`` in Python.
+    """
+    get_anc = getattr(node, "get_ancestors", None)
+    if callable(get_anc):
+        try:
+            anc = get_anc(include_self=True).order_by("lft")
+            return PATH_SEP.join(anc.values_list("name", flat=True))
+        except Exception:
+            pass
+    return node.get_path()
+
+
 def _import_path_matches_db_path(expected_norm: str, db_path_raw: str) -> bool:
     """
     True if the chart row ``db_path_raw`` is the same trail as ``expected_norm`` (normalized).
@@ -536,6 +552,7 @@ def _find_mptt_node_matching_path_string(
         return None
     expected = _normalize_full_path(PATH_SEP.join(chain))
     leaf_name = chain[-1]
+    level_attr = getattr(getattr(model, "_mptt_meta", None), "level_attr", None) or "level"
 
     def _scan(qs_base, use_active_filter: bool) -> Optional[Any]:
         qs = qs_base
@@ -547,7 +564,7 @@ def _find_mptt_node_matching_path_string(
 
         for cand in qs_leaf.iterator(chunk_size=400):
             try:
-                raw_gp = cand.get_path()
+                raw_gp = _mptt_rendered_path_for_import_match(cand)
             except Exception:
                 continue
             if not _import_path_matches_db_path(expected, raw_gp):
@@ -562,10 +579,17 @@ def _find_mptt_node_matching_path_string(
         if best is not None:
             return best
 
-        # Leaf ``name`` in DB may differ slightly from the file; still try full-path / suffix match.
-        for cand in qs.iterator(chunk_size=2000):
+        # Leaf ``name`` in DB may differ slightly from the file; still try path / suffix match on a
+        # **narrowed** queryset (level band) to avoid scanning the entire tenant tree per row.
+        low = max(0, len(chain) - 1)
+        high = len(chain) + 30
+        try:
+            qs_narrow = qs.filter(**{f"{level_attr}__gte": low, f"{level_attr}__lte": high})
+        except Exception:
+            qs_narrow = qs
+        for cand in qs_narrow.iterator(chunk_size=800):
             try:
-                raw_gp = cand.get_path()
+                raw_gp = _mptt_rendered_path_for_import_match(cand)
             except Exception:
                 continue
             if not _import_path_matches_db_path(expected, raw_gp):
@@ -670,6 +694,7 @@ def _resolve_parent_from_path_chain(
     row_for_defaults: Optional[Dict[str, Any]] = None,
     raw_row: Optional[Dict[str, Any]] = None,
     source_path_for_errors: Optional[str] = None,
+    path_cache: Optional[Dict[Tuple[Any, str, Tuple[str, ...]], Any]] = None,
 ):
     """
     Resolve the MPTT instance for the path prefix ``chain`` (the parent path of the row being imported).
@@ -681,12 +706,23 @@ def _resolve_parent_from_path_chain(
       3) Optionally create missing intermediate nodes (``mptt_path_create_missing_ancestors``).
 
     ``source_path_for_errors``: original path cell from the row (shown in error messages for debugging).
+    ``path_cache``: optional per-sheet memo ``{(company_id, model_name, path_tuple): parent_instance}``
+    to avoid repeated expensive path resolution across many rows sharing the same prefix.
     """
     if not chain:
         return None
 
+    cache_key: Optional[Tuple[Any, str, Tuple[str, ...]]] = None
+    if path_cache is not None:
+        cache_key = (company_id, model.__name__, tuple(chain))
+        hit = path_cache.get(cache_key)
+        if hit is not None:
+            return hit
+
     inst = _find_mptt_node_matching_path_string(model, chain, company_id)
     if inst:
+        if path_cache is not None and cache_key is not None:
+            path_cache[cache_key] = inst
         return inst
 
     has_company = _model_has_concrete_field(model, "company")
@@ -720,6 +756,8 @@ def _resolve_parent_from_path_chain(
                 model, node_name, parent, company_id, fd, raw
             )
         parent = row
+    if path_cache is not None and cache_key is not None:
+        path_cache[cache_key] = parent
     return parent
 
 
@@ -1457,6 +1495,9 @@ def execute_import_job(
             if _is_mptt_model(model):
                 rows = sorted(rows, key=_path_depth)
 
+            # Reuse resolved parent chains across rows (same prefix = one DB path walk).
+            mptt_parent_path_cache: Dict[Tuple[Any, str, Tuple[str, ...]], Any] = {}
+
             for row in rows:
                 raw = dict(row or {})
                 rid_raw = raw.pop("__row_id", None)
@@ -1633,6 +1674,7 @@ def execute_import_job(
                                     row_for_defaults=filtered,
                                     raw_row=raw,
                                     source_path_for_errors=path_val,
+                                    path_cache=mptt_parent_path_cache,
                                 )
                             filtered["name"] = filtered.get("name", leaf) or leaf
                             filtered["parent"] = parent

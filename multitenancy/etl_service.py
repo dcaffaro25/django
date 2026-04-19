@@ -39,23 +39,18 @@ from .tasks import execute_import_job, MODEL_APP_MAP
 logger = logging.getLogger(__name__)
 
 
-def _derived_journal_entry_erp_id(transaction_erp_id: Any, line_role: str, max_len: int = 128) -> Optional[str]:
+def _journal_entry_erp_id_from_transaction(transaction_erp_id: Any, max_len: int = 128) -> Optional[str]:
     """
-    Stable ``JournalEntry.erp_id`` for ETL auto-created lines, derived from ``Transaction.erp_id``.
+    Use the same ``erp_id`` string as the parent ``Transaction`` on ETL auto-created journal lines.
 
-    Appends ``:<line_role>`` (e.g. ``bank``, ``opposing``) so the two legs are unique and repeatable
-    across imports. Returns None when the transaction has no usable ERP key (same as leaving the
-    field unset on manual rows).
+    Returns None when the transaction has no usable ERP key (same treatment as empty import values).
     """
     if transaction_erp_id is None:
         return None
     base = str(transaction_erp_id).strip()
     if not base or base.lower() in {"nan", "nat", "none"}:
         return None
-    suffix = f":{line_role}"
-    if len(base) + len(suffix) <= max_len:
-        return base + suffix
-    return (base[: max(0, max_len - len(suffix))] + suffix)[:max_len]
+    return base[:max_len]
 
 
 def _parse_notes_metadata_newline(notes: str) -> dict:
@@ -3016,7 +3011,7 @@ class ETLPipelineService:
                                 bank_je = JournalEntry(
                                     company_id=self.company_id,
                                     transaction_id=instance.id,
-                                    erp_id=_derived_journal_entry_erp_id(instance.erp_id, "bank"),
+                                    erp_id=_journal_entry_erp_id_from_transaction(instance.erp_id),
                                     date=final_bank_date,
                                     description=instance.description or '',
                                     debit_amount=bank_debit,
@@ -3113,7 +3108,7 @@ class ETLPipelineService:
                                     opposing_je = JournalEntry(
                                         company_id=self.company_id,
                                         transaction_id=instance.id,
-                                        erp_id=_derived_journal_entry_erp_id(instance.erp_id, "opposing"),
+                                        erp_id=_journal_entry_erp_id_from_transaction(instance.erp_id),
                                         account_id=opposing_account.id,
                                         date=final_book_date,
                                         description=instance.description or '',
@@ -3781,7 +3776,7 @@ class ETLPipelineService:
                         bank_je_data = {
                             'company': self.company_id,
                             'transaction': transaction.id,  # Use transaction instance ID
-                            'erp_id': _derived_journal_entry_erp_id(transaction.erp_id, "bank"),
+                            'erp_id': _journal_entry_erp_id_from_transaction(transaction.erp_id),
                             'date': bank_je_final_date,
                             'description': transaction.description or '',
                             'debit_amount': bank_debit,
@@ -3873,7 +3868,7 @@ class ETLPipelineService:
                         opposing_je_data = {
                             'company': self.company_id,
                             'transaction': transaction.id,  # Use transaction instance ID
-                            'erp_id': _derived_journal_entry_erp_id(transaction.erp_id, "opposing"),
+                            'erp_id': _journal_entry_erp_id_from_transaction(transaction.erp_id),
                             'account': opposing_account.id,
                             'date': opposing_je_final_date,
                             'description': transaction.description or '',
