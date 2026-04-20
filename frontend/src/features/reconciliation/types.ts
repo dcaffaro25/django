@@ -624,6 +624,15 @@ export interface AccountLite {
   currency?: { id: number; code: string; name: string } | null
   bank_account?: number | null
   current_balance?: number
+  // Extended writable fields exposed by AccountSerializer (write-side only
+  // cares about these; list/detail responses include them too).
+  description?: string | null
+  erp_id?: string | null
+  account_direction?: number | null  // 1 = debit, -1 = credit
+  balance?: number | string | null
+  balance_date?: string | null
+  key_words?: string | null
+  examples?: string | null
 }
 
 /**

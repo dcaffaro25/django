@@ -307,6 +307,32 @@ export function useAccounts() {
   })
 }
 
+/**
+ * Probe whether an account has any journal entries. Used to lock fields
+ * that would be destructive to change after activity (e.g. account_direction
+ * flipping signs on historical reports). Returns true/false; undefined while
+ * loading or if disabled.
+ */
+export function useAccountHasEntries(accountId: number | null | undefined) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["recon", sub, "account", accountId, "has_entries"],
+    queryFn: async () => {
+      const rows = await reconApi.listJournalEntries({
+        // DRF filterset on JournalEntry accepts `account` id filter.
+        // Fetch at most 1 row — we only need existence.
+        limit: 1,
+        page_size: 1,
+        // `account` may not be in the typed filter but DRF allows it.
+        ...({ account: accountId } as Record<string, unknown>),
+      })
+      return Array.isArray(rows) ? rows.length > 0 : false
+    },
+    enabled: !!sub && accountId != null,
+    staleTime: 60 * 1000,
+  })
+}
+
 export function useSuggestMatches() {
   return useMutation({ mutationFn: reconApi.suggestMatches })
 }
