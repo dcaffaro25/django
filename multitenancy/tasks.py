@@ -398,12 +398,13 @@ def _split_path(path_str: str) -> List[str]:
 
 
 def _normalize_path_segment(label: str) -> str:
-    """Normalize a single path label for comparison (NBSP, Unicode compatibility)."""
+    """Normalize a single path label for comparison (NBSP, Unicode compatibility, case-insensitive)."""
     t = (label or "").replace("\u00a0", " ").strip()
     try:
-        return unicodedata.normalize("NFKC", t)
+        t = unicodedata.normalize("NFKC", t)
     except Exception:
-        return t
+        pass
+    return t.casefold()
 
 
 def _normalize_full_path(path_str: str) -> str:
@@ -541,15 +542,15 @@ def _pick_mptt_child_by_name(
     active_only: bool = True,
 ):
     """
-    Find a direct child of ``parent`` whose ``name`` exactly matches the path segment (after strip).
+    Find a direct child of ``parent`` whose ``name`` matches the path segment (case-insensitive).
 
-    Parents are expected to exist in the chart (or earlier import rows) with the same spelling as
-    the path cell. When ``active_only`` is False, soft-deleted rows are included as a second pass.
+    Parents are expected to exist in the chart (or earlier import rows); spelling may differ in case
+    from the import file. When ``active_only`` is False, soft-deleted rows are included as a second pass.
     """
     segment = (node_name or "").strip()
     if not segment:
         return None
-    qs = model.objects.filter(parent=parent, name=segment)
+    qs = model.objects.filter(parent=parent, name__iexact=segment)
     if has_company and company_id is not None:
         qs = qs.filter(company_id=int(company_id))
     if active_only:
@@ -565,11 +566,12 @@ def _find_mptt_node_matching_path_string(
     """
     Locate the node for path prefix ``chain`` without scanning the whole tree.
 
-    Only rows whose **deepest segment name** equals ``chain[-1]`` (exact DB ``name``) are
-    considered; each candidate's rendered path is compared to the expected trail (normalized),
-    including DB paths that end with the import trail when the chart has extra leading segments.
+    Only rows whose **deepest segment name** matches ``chain[-1]`` (case-insensitive DB ``name``)
+    are considered; each candidate's rendered path is compared to the expected trail (normalized,
+    case-folded per segment), including DB paths that end with the import trail when the chart has
+    extra leading segments.
 
-    If nothing matches, callers fall back to a per-level parent walk (also exact ``name`` only).
+    If nothing matches, callers fall back to a per-level parent walk (also case-insensitive ``name``).
     """
     if not chain or not hasattr(model, "get_path"):
         return None
@@ -582,7 +584,7 @@ def _find_mptt_node_matching_path_string(
         qs = qs_base
         if use_active_filter:
             qs = _mptt_qs_active(qs, model)
-        qs_leaf = qs.filter(name=leaf_name)
+        qs_leaf = qs.filter(name__iexact=leaf_name)
         best: Optional[Any] = None
         best_depth: Optional[int] = None
 
@@ -694,8 +696,8 @@ def _debug_mptt_parent_resolution_failure(
             lines.append(f"    id={obj.pk} parent_id={pid} is_deleted={del_o!r} path={gp!r}{under}")
 
     lines.append(
-        "  hints: exact name per segment (trimmed) and normalized full-path match only on "
-        "rows that share the deepest segment name (no whole-tree scan). Order the sheet "
+        "  hints: case-insensitive name per segment (trimmed) and normalized case-folded full-path "
+        "match on rows sharing the deepest segment name (no whole-tree scan). Order the sheet "
         "parents-before-children when inserting both in one import; or enable "
         "mptt_path_create_missing_ancestors."
     )
@@ -717,9 +719,9 @@ def _resolve_parent_from_path_chain(
     Resolve the MPTT instance for the path prefix ``chain`` (the parent path of the row being imported).
 
     Resolution order:
-      1) Among nodes with ``name`` equal to the last path segment, pick the one whose rendered path
-         matches the full prefix (normalized; allows DB suffix when the chart has extra roots).
-      2) Walk root-to-node with one small query per segment: ``parent`` + exact ``name`` (after strip).
+      1) Among nodes whose ``name`` matches the last path segment (case-insensitive), pick the one
+         whose rendered path matches the full prefix (normalized; allows DB suffix when the chart has extra roots).
+      2) Walk root-to-node with one small query per segment: ``parent`` + ``name__iexact`` (after strip).
       3) Optionally create missing intermediate nodes (``mptt_path_create_missing_ancestors``).
 
     ``source_path_for_errors``: original path cell from the row (shown in error messages for debugging).
