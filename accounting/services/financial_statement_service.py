@@ -54,10 +54,19 @@ _formula_evaluator = SafeFormulaEvaluator()
 
 class FinancialStatementGenerator:
     """Generates financial statements from templates and accounting data."""
-    
+
     def __init__(self, company_id: int):
         self.company_id = company_id
-    
+        # Optional in-memory cache of AccountBalanceHistory rows keyed by
+        # (account_id, currency_id, year, month). Populated once per preview/
+        # generate call so _get_balance_from_history can skip DB round-trips
+        # for templates that reference many accounts.
+        self._history_cache: Optional[Dict[Tuple[int, int, int, int], AccountBalanceHistory]] = None
+        # Pre-computed ending balances per (account, currency, year, month,
+        # balance_type). Populated alongside _history_cache so lookups avoid
+        # the recursive DB chain inside AccountBalanceHistory._get_opening_balance.
+        self._ending_balance_cache: Optional[Dict[Tuple[int, int, int, int, str], Decimal]] = None
+
     def _ensure_balance_history_for_period(
         self,
         start_date: date,
@@ -156,7 +165,7 @@ class FinancialStatementGenerator:
         accounts = list(accounts_qs)
         if not accounts:
             return False
-        
+
         # Get currencies to check
         if currency_id:
             currencies = [Currency.objects.get(id=currency_id)]
@@ -166,33 +175,40 @@ class FinancialStatementGenerator:
                 account__company_id=self.company_id,
                 account__is_active=True
             ).distinct())
-        
-        # Check if history exists for all account/month/currency combinations
-        missing_periods = []
+
+        # Build the expected set of (account_id, currency_id, year, month) tuples.
+        # Skip combinations where the account's currency doesn't match the
+        # currency filter — mirrors the old inner `continue`.
+        account_ids = [a.id for a in accounts]
+        currency_ids = [c.id for c in currencies]
+
+        expected: Set[Tuple[int, int, int, int]] = set()
         for account in accounts:
             for currency in currencies:
-                # Only check if account currency matches (or if no currency filter)
                 if currency_id and account.currency_id != currency_id:
                     continue
-                
                 for year, month in months_to_check:
-                    # Check if history exists (one record per account/month/currency)
-                    exists = AccountBalanceHistory.objects.filter(
-                        company_id=self.company_id,
-                        account=account,
-                        year=year,
-                        month=month,
-                        currency=currency
-                    ).exists()
-                    
-                    if not exists:
-                        missing_periods.append((account.id, currency.id, year, month))
-        
-        # If no missing periods, return False (no recalculation needed)
+                    expected.add((account.id, currency.id, year, month))
+
+        if not expected:
+            return False
+
+        # One aggregated query replaces N*M*K .exists() round-trips. The
+        # (company, account, year, month) index keeps this fast at hundreds
+        # of accounts.
+        existing: Set[Tuple[int, int, int, int]] = set(
+            AccountBalanceHistory.objects.filter(
+                company_id=self.company_id,
+                account_id__in=account_ids,
+                currency_id__in=currency_ids,
+            ).values_list('account_id', 'currency_id', 'year', 'month')
+        )
+        missing_periods = list(expected - existing)
+
         if not missing_periods:
             log.debug(
-                "Balance history exists for period %s to %s, no recalculation needed",
-                start_date, end_date
+                "Balance history exists for period %s to %s (checked %d combos in 1 query)",
+                start_date, end_date, len(expected),
             )
             return False
         
@@ -223,9 +239,150 @@ class FinancialStatementGenerator:
             result['statistics']['records_created'],
             result['statistics']['duration_seconds']
         )
-        
+
         return True
-    
+
+    def _prefetch_history_cache(
+        self,
+        start_date: date,
+        end_date: date,
+        account_ids: Optional[List[int]] = None,
+        currency_id: Optional[int] = None,
+    ) -> None:
+        """
+        Populate self._history_cache with every AccountBalanceHistory row that
+        _calculate_line_value / _get_balance_from_history could plausibly need
+        during this preview/generate call.
+
+        One query up front, O(1) dict lookups afterwards — avoids per-line,
+        per-account DB round-trips from _get_balance_from_history when a
+        template touches dozens or hundreds of accounts.
+
+        The cache key is (account_id, currency_id, year, month). Missing keys
+        fall back to the DB path in _get_balance_from_history, so partial
+        prefetches are safe.
+        """
+        qs = AccountBalanceHistory.objects.filter(company_id=self.company_id)
+        if account_ids:
+            qs = qs.filter(account_id__in=account_ids)
+        if currency_id is not None:
+            qs = qs.filter(currency_id=currency_id)
+        # Widen the window by one month on each side to cover opening-balance
+        # lookups that use (start_date - 1 day), which can fall in the prior month.
+        year_month_bounds = Q()
+        start_year = start_date.year if start_date.month > 1 else start_date.year - 1
+        start_month = start_date.month - 1 if start_date.month > 1 else 12
+        end_year = end_date.year if end_date.month < 12 else end_date.year + 1
+        end_month = end_date.month + 1 if end_date.month < 12 else 1
+        year_month_bounds &= (
+            Q(year__gt=start_year)
+            | Q(year=start_year, month__gte=start_month)
+        )
+        year_month_bounds &= (
+            Q(year__lt=end_year)
+            | Q(year=end_year, month__lte=end_month)
+        )
+        qs = qs.filter(year_month_bounds).select_related('account')
+
+        # Keep a reference cache (in case callers still need the row object).
+        cache: Dict[Tuple[int, int, int, int], AccountBalanceHistory] = {}
+        for row in qs:
+            cache[(row.account_id, row.currency_id, row.year, row.month)] = row
+        self._history_cache = cache
+
+        # Pre-compute ending balances for every (row, balance_type) in memory.
+        # AccountBalanceHistory.get_ending_balance() recursively fetches the
+        # prior month from the DB via _get_opening_balance(); at 20 accounts
+        # × 6 months that's 120 round-trips per preview. Here we walk each
+        # account's months in order once, carrying the running balance,
+        # using the seed from account.balance + account.balance_date.
+        by_key: Dict[Tuple[int, int], List[AccountBalanceHistory]] = {}
+        for row in cache.values():
+            by_key.setdefault((row.account_id, row.currency_id), []).append(row)
+
+        ending: Dict[Tuple[int, int, int, int, str], Decimal] = {}
+        for (account_id, currency_id), rows in by_key.items():
+            rows.sort(key=lambda r: (r.year, r.month))
+            for balance_type in ('posted', 'bank_reconciled', 'all'):
+                prev_balance: Optional[Decimal] = None
+                for row in rows:
+                    if prev_balance is None:
+                        # First month in window: seed with account.balance if
+                        # balance_date predates period_start, else 0.00 — this
+                        # mirrors AccountBalanceHistory._get_opening_balance
+                        # for the "no prior month" case.
+                        account = row.account
+                        period_start = date(row.year, row.month, 1)
+                        if (
+                            account.balance is not None
+                            and account.balance_date is not None
+                            and account.balance_date < period_start
+                        ):
+                            prev_balance = Decimal(account.balance)
+                        else:
+                            prev_balance = Decimal('0.00')
+
+                    if balance_type == 'posted':
+                        debit = row.posted_total_debit
+                        credit = row.posted_total_credit
+                    elif balance_type == 'bank_reconciled':
+                        debit = row.bank_reconciled_total_debit
+                        credit = row.bank_reconciled_total_credit
+                    else:
+                        debit = row.all_total_debit
+                        credit = row.all_total_credit
+
+                    change = (debit - credit) * row.account.account_direction
+                    prev_balance = prev_balance + change
+                    ending[(account_id, currency_id, row.year, row.month, balance_type)] = prev_balance
+
+        self._ending_balance_cache = ending
+
+    def _collect_template_account_ids(
+        self,
+        template: FinancialStatementTemplate,
+    ) -> Optional[List[int]]:
+        """
+        Collect every account id a template references (direct, list, or via
+        account_code_prefix) so the prefetch query can stay narrow. Returns
+        None when the template has no account references, which signals the
+        prefetcher to consider all active accounts (rare — typically formula
+        or manual-only templates).
+
+        This mirrors the account-discovery logic in
+        _ensure_balance_history_for_period so the two stay consistent.
+        """
+        account_ids: Set[int] = set()
+        prefix_needed = False
+
+        for line in template.line_templates.all():
+            if line.account_id:
+                account_ids.add(line.account_id)
+            if getattr(line, 'account_ids', None):
+                account_ids.update(line.account_ids or [])
+            if getattr(line, 'account_code_prefix', None):
+                prefix_needed = True
+
+        if prefix_needed:
+            # Resolve prefix-based references in one query.
+            prefixes = list({
+                line.account_code_prefix
+                for line in template.line_templates.all()
+                if getattr(line, 'account_code_prefix', None)
+            })
+            if prefixes:
+                prefix_q = Q()
+                for p in prefixes:
+                    prefix_q |= Q(account_code__startswith=p)
+                prefix_ids = Account.objects.filter(
+                    prefix_q,
+                    company_id=self.company_id,
+                    is_active=True,
+                ).values_list('id', flat=True)
+                account_ids.update(prefix_ids)
+
+        return list(account_ids) if account_ids else None
+
     def generate_statement(
         self,
         template: FinancialStatementTemplate,
@@ -287,7 +444,16 @@ class FinancialStatementGenerator:
             template=template,  # Pass template to optimize account checking
             generated_by=generated_by,
         )
-        
+
+        # Prefetch AccountBalanceHistory rows for this period so line
+        # calculations hit the in-memory cache instead of per-account DB reads.
+        self._prefetch_history_cache(
+            start_date=start_date,
+            end_date=end_date,
+            account_ids=self._collect_template_account_ids(template),
+            currency_id=currency_id,
+        )
+
         # Create statement record
         statement = FinancialStatement.objects.create(
             company_id=self.company_id,
@@ -448,7 +614,16 @@ class FinancialStatementGenerator:
             template=template,  # Pass template to optimize account checking
             generated_by=None,  # Preview doesn't have a user
         )
-        
+
+        # Prefetch every AccountBalanceHistory row that _get_balance_from_history
+        # might need in one query, so per-line lookups become dict hits.
+        self._prefetch_history_cache(
+            start_date=start_date,
+            end_date=end_date,
+            account_ids=self._collect_template_account_ids(template),
+            currency_id=currency_id,
+        )
+
         # Generate lines without saving
         line_templates = template.line_templates.all().order_by('line_number')
         line_values: Dict[int, Decimal] = {}
@@ -1717,13 +1892,13 @@ class FinancialStatementGenerator:
     ) -> Optional[Decimal]:
         """
         Get balance from AccountBalanceHistory if available.
-        
+
         Parameters:
         -----------
         balance_type : str
             One of: 'posted', 'bank_reconciled', 'all'
             Determines which balance type to retrieve from history
-        
+
         Returns:
         --------
         Ending balance from the history table for the month containing as_of_date.
@@ -1731,10 +1906,21 @@ class FinancialStatementGenerator:
         """
         if currency is None:
             currency = account.currency
-        
+
         year = as_of_date.year
         month = as_of_date.month
-        
+
+        # Prefer the precomputed ending-balance cache — avoids the recursive
+        # per-month DB chain that lives inside
+        # AccountBalanceHistory._get_opening_balance. Missing keys fall
+        # through to the DB path so partial prefetches stay safe.
+        if self._ending_balance_cache is not None:
+            precomputed = self._ending_balance_cache.get(
+                (account.id, currency.id, year, month, balance_type)
+            )
+            if precomputed is not None:
+                return precomputed
+
         try:
             history = AccountBalanceHistory.objects.get(
                 account=account,
