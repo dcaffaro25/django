@@ -353,7 +353,7 @@ class FinancialStatementReportTest(TestCase):
                 # Compare (with tolerance)
                 tolerance = Decimal('0.01')
                 difference = abs(template_value - expected_value)
-                
+
                 self.assertTrue(
                     difference <= tolerance,
                     f"Line {line_number} ({line_label}) for month {month_key}: "
@@ -361,3 +361,116 @@ class FinancialStatementReportTest(TestCase):
                     f"(difference: {difference})"
                 )
 
+
+class PreviewHistoryQueryBudgetTest(TestCase):
+    """
+    Focused regression guard for the two `AccountBalanceHistory` N+1s that
+    `preview_statement` used to have:
+
+      1. `_ensure_balance_history_for_period` did one .exists() per
+         (account, currency, year-month) combo — N*M*K DB round-trips.
+      2. `_get_balance_from_history` hit the DB once per leaf-account lookup
+         during line calculation — another N queries per preview.
+
+    After the fix the first collapses to a single aggregated query and the
+    second is served by the prefetched cache. At a realistic template size
+    (20 accounts, 6 months) that's 120 + 20 = 140 AccountBalanceHistory
+    queries before, 2 after. We assert <= 3 to catch any regression while
+    still allowing a follow-up lookup or two.
+
+    Total query count for preview is a larger number (other unrelated N+1s
+    live in the per-line calc path — future work) so we don't budget that
+    here; we budget only what this change is supposed to fix.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        from multitenancy.models import Company
+        from accounting.models import Account
+        from accounting.models_financial_statements import (
+            AccountBalanceHistory,
+            FinancialStatementTemplate,
+            FinancialStatementLineTemplate,
+        )
+
+        cls.company = Company.objects.create(name="QB Co", subdomain="qb-co-perf")
+        cls.currency = (
+            Currency.objects.filter(code="BRL").first()
+            or Currency.objects.create(code="BRL", name="Brazilian Real")
+        )
+
+        cls.accounts = []
+        for i in range(20):
+            acct = Account.objects.create(
+                company=cls.company,
+                account_code=f"1.1.{i:03d}",
+                name=f"Acct {i}",
+                account_direction=1,
+                balance_date=date(2025, 1, 1),
+                balance=Decimal("0.00"),
+                currency=cls.currency,
+                is_active=True,
+            )
+            cls.accounts.append(acct)
+
+        cls.template = FinancialStatementTemplate.objects.create(
+            company=cls.company,
+            name="QB Template",
+            report_type="balance_sheet",
+            is_active=True,
+        )
+        for i, acct in enumerate(cls.accounts):
+            FinancialStatementLineTemplate.objects.create(
+                template=cls.template,
+                line_number=i + 1,
+                label=acct.name,
+                line_type="account",
+                account=acct,
+                account_ids=[acct.id],
+                calculation_method="ending_balance",
+                sign_policy="natural",
+            )
+
+        for acct in cls.accounts:
+            for month in range(1, 7):
+                AccountBalanceHistory.objects.create(
+                    company=cls.company,
+                    account=acct,
+                    year=2025,
+                    month=month,
+                    currency=cls.currency,
+                    all_total_debit=Decimal("100.00"),
+                    all_total_credit=Decimal("0.00"),
+                )
+
+    def test_balance_history_queries_are_bounded(self):
+        from accounting.services.financial_statement_service import (
+            FinancialStatementGenerator,
+        )
+        from django.test.utils import CaptureQueriesContext
+        from django.db import connection
+
+        generator = FinancialStatementGenerator(company_id=self.company.id)
+
+        with CaptureQueriesContext(connection) as ctx:
+            result = generator.preview_statement(
+                template=self.template,
+                start_date=date(2025, 1, 1),
+                end_date=date(2025, 6, 30),
+                currency_id=self.currency.id,
+            )
+
+        self.assertEqual(result["status"], "preview")
+        self.assertEqual(len(result["lines"]), len(self.accounts))
+
+        history_queries = [
+            q for q in ctx.captured_queries
+            if "accounting_accountbalancehistory" in q["sql"].lower()
+        ]
+        self.assertLessEqual(
+            len(history_queries),
+            3,
+            f"Expected <= 3 AccountBalanceHistory queries, got "
+            f"{len(history_queries)}. Sample:\n"
+            + "\n".join(q["sql"][:180] for q in history_queries[:10]),
+        )
