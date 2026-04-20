@@ -1,0 +1,101 @@
+{
+  "app": {
+    "name": "Nord",
+    "tagline": "Plataforma financeira"
+  },
+  "nav": {
+    "dashboard": "Painel",
+    "reconciliation": "Conciliação",
+    "reconciliation_dashboard": "Painel de conciliação",
+    "reconciliation_workbench": "Bancada",
+    "reconciliation_matches": "Conciliações",
+    "reconciliation_tasks": "Execuções",
+    "reconciliation_suggestions": "Sugestões",
+    "reconciliation_configs": "Configurações",
+    "reconciliation_pipelines": "Pipelines",
+    "reconciliation_embeddings": "Embeddings",
+    "reconciliation_balances": "Saldos",
+    "accounting": "Contabilidade",
+    "transactions": "Transações",
+    "journal_entries": "Lançamentos",
+    "accounts": "Plano de contas",
+    "bank_accounts": "Contas bancárias",
+    "bank_transactions": "Extratos bancários",
+    "financial_statements": "Demonstrativos",
+    "statements": "DREs e balanços",
+    "templates": "Modelos",
+    "billing": "Faturamento",
+    "hr": "RH",
+    "inventory": "Estoque",
+    "entities": "Entidades",
+    "settings": "Ajustes",
+    "other": "Outros"
+  },
+  "actions": {
+    "search": "Buscar",
+    "new": "Novo",
+    "save": "Salvar",
+    "cancel": "Cancelar",
+    "delete": "Excluir",
+    "edit": "Editar",
+    "confirm": "Confirmar",
+    "close": "Fechar",
+    "refresh": "Atualizar",
+    "export": "Exportar",
+    "import": "Importar",
+    "filter": "Filtrar",
+    "apply": "Aplicar",
+    "retry": "Tentar novamente",
+    "loading": "Carregando...",
+    "view_all": "Ver todos",
+    "columns": "Colunas"
+  },
+  "auth": {
+    "login": "Entrar",
+    "logout": "Sair",
+    "username": "Usuário",
+    "password": "Senha",
+    "signin_title": "Acesse sua conta",
+    "signin_subtitle": "Entre para acessar o Nord",
+    "token_login": "Entrar com token",
+    "dev_mode_active": "Modo de desenvolvimento ativo (token via .env)"
+  },
+  "tenant": {
+    "select": "Selecionar empresa",
+    "workspace": "Espaço de trabalho",
+    "no_tenants": "Nenhuma empresa disponível"
+  },
+  "command": {
+    "placeholder": "Digite um comando ou busque...",
+    "empty": "Nenhum resultado",
+    "navigate": "Navegar",
+    "actions": "Ações",
+    "recents": "Recentes"
+  },
+  "status": {
+    "queued": "Na fila",
+    "running": "Executando",
+    "completed": "Concluído",
+    "failed": "Falhou",
+    "cancelled": "Cancelado",
+    "pending": "Pendente",
+    "open": "Aberto",
+    "matched": "Conciliado",
+    "unmatched": "Não conciliado",
+    "review": "Revisão",
+    "approved": "Aprovado"
+  },
+  "time": {
+    "just_now": "agora",
+    "seconds_ago": "há {{count}}s",
+    "minutes_ago": "há {{count}}min",
+    "hours_ago": "há {{count}}h",
+    "days_ago": "há {{count}}d"
+  },
+  "errors": {
+    "generic": "Algo deu errado.",
+    "network": "Falha de rede — verifique sua conexão.",
+    "unauthorized": "Sessão expirada — faça login novamente.",
+    "not_found": "Não encontrado."
+  }
+}

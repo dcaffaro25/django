@@ -1,86 +1,30 @@
-import { createContext, useContext, useEffect, useState, ReactNode } from "react"
-import { useTenant } from "./TenantProvider"
-
-interface ThemeConfig {
-  primary: string
-  secondary: string
-  success: string
-  danger: string
-  warning: string
-  info: string
-  background: string
-  foreground: string
-}
-
-interface ThemeContextType {
-  theme: ThemeConfig
-  isTenantTheme: boolean
-}
-
-const defaultTheme: ThemeConfig = {
-  primary: "#025736",
-  secondary: "#025736",
-  success: "#059669",
-  danger: "#dc2626",
-  warning: "#cd6f00",
-  info: "#3170f9",
-  background: "#ffffff",
-  foreground: "#0d0d0d",
-}
-
-const ThemeContext = createContext<ThemeContextType>({
-  theme: defaultTheme,
-  isTenantTheme: false,
-})
+import { useEffect, type ReactNode } from "react"
+import { useAppStore } from "@/stores/app-store"
+import { DEFAULT_THEME, getTheme } from "@/lib/themes"
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
-  const { tenant } = useTenant()
-  const [theme, setTheme] = useState<ThemeConfig>(defaultTheme)
-  const [isTenantTheme, setIsTenantTheme] = useState(false)
+  const theme = useAppStore((s) => s.theme)
+  const palette = useAppStore((s) => s.palette)
 
-  useEffect(() => {
-    // TODO: When backend supports branding, fetch tenant theme
-    // For now, use default theme
-    // if (tenant?.id) {
-    //   const branding = await fetchTenantBranding(tenant.id)
-    //   if (branding) {
-    //     setTheme({
-    //       primary: branding.primary_color || defaultTheme.primary,
-    //       secondary: branding.secondary_color || defaultTheme.secondary,
-    //       ...defaultTheme,
-    //     })
-    //     setIsTenantTheme(true)
-    //   } else {
-    //     setTheme(defaultTheme)
-    //     setIsTenantTheme(false)
-    //   }
-    // } else {
-    setTheme(defaultTheme)
-    setIsTenantTheme(false)
-    // }
-  }, [tenant])
-
-  // Apply CSS variables separately to avoid infinite loop
+  // Mode (dark/light) — toggled via the .dark class on <html>.
   useEffect(() => {
     const root = document.documentElement
-    root.style.setProperty("--primary", theme.primary)
-    root.style.setProperty("--secondary", theme.secondary)
-    root.style.setProperty("--success", theme.success)
-    root.style.setProperty("--danger", theme.danger)
-    root.style.setProperty("--warning", theme.warning)
-    root.style.setProperty("--info", theme.info)
-    root.style.setProperty("--background", theme.background)
-    root.style.setProperty("--foreground", theme.foreground)
+    root.classList.toggle("dark", theme === "dark")
+    root.classList.toggle("light", theme === "light")
+    root.style.colorScheme = theme
   }, [theme])
 
-  return (
-    <ThemeContext.Provider value={{ theme, isTenantTheme }}>
-      {children}
-    </ThemeContext.Provider>
-  )
-}
+  // Palette — swapped via data-theme on <html>. Defaults to brand (which
+  // is the :root block in index.css), so no attribute is set for brand.
+  useEffect(() => {
+    const root = document.documentElement
+    const resolved = getTheme(palette).id
+    if (resolved === DEFAULT_THEME) {
+      root.removeAttribute("data-theme")
+    } else {
+      root.setAttribute("data-theme", resolved)
+    }
+  }, [palette])
 
-export function useTheme() {
-  return useContext(ThemeContext)
+  return <>{children}</>
 }
-

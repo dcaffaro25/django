@@ -1,26 +1,31 @@
-import { useState } from "react"
+import { type ReactNode } from "react"
+import { useHotkeys } from "react-hotkeys-hook"
 import { Sidebar } from "./Sidebar"
-import { Header } from "./Header"
+import { Topbar } from "./Topbar"
+import { CommandPalette } from "./CommandPalette"
+import { ErrorBoundary } from "@/components/ErrorBoundary"
+import { useAppStore } from "@/stores/app-store"
+import { cn } from "@/lib/utils"
 
-interface AppShellProps {
-  children: React.ReactNode
-}
+export function AppShell({ children }: { children: ReactNode }) {
+  const toggleSidebar = useAppStore((s) => s.toggleSidebar)
+  const setCommandOpen = useAppStore((s) => s.setCommandOpen)
 
-export function AppShell({ children }: AppShellProps) {
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  useHotkeys("mod+k", (e) => { e.preventDefault(); setCommandOpen(true) }, { enableOnFormTags: true })
+  useHotkeys("mod+b", (e) => { e.preventDefault(); toggleSidebar() })
 
   return (
-    <div className="flex h-screen overflow-hidden bg-gradient-to-br from-background via-background to-muted/20">
-      <Sidebar collapsed={sidebarCollapsed} onToggle={() => setSidebarCollapsed(!sidebarCollapsed)} />
-      <div className="flex flex-1 flex-col overflow-hidden">
-        <Header onSidebarToggle={() => setSidebarCollapsed(!sidebarCollapsed)} />
-        <main className="flex-1 overflow-y-auto bg-muted/30 p-8">
-          <div className="mx-auto max-w-7xl">
-            {children}
+    <div className="flex h-screen w-full overflow-hidden bg-background text-foreground">
+      <Sidebar />
+      <div className={cn("flex min-w-0 flex-1 flex-col")}>
+        <Topbar />
+        <main className="flex-1 overflow-y-auto">
+          <div className="mx-auto w-full max-w-[1440px] px-6 py-6">
+            <ErrorBoundary>{children}</ErrorBoundary>
           </div>
         </main>
       </div>
+      <CommandPalette />
     </div>
   )
 }
-

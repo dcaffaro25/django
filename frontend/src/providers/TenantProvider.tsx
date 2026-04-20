@@ -1,96 +1,67 @@
-import { createContext, useContext, useState, useEffect, ReactNode } from "react"
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react"
 import { useQuery } from "@tanstack/react-query"
-import { apiClient } from "@/lib/api-client"
-import type { Company } from "@/types"
+import { api, getStoredTenant, setStoredTenant, unwrapList } from "@/lib/api-client"
+import { useAuth } from "./AuthProvider"
+
+export interface Tenant {
+  id: number
+  name: string
+  subdomain: string
+}
 
 interface TenantContextType {
-  tenant: Company | null
-  tenants: Company[]
+  tenant: Tenant | null
+  tenants: Tenant[]
   isLoading: boolean
-  setTenant: (tenant: Company | null) => void
-  switchTenant: (tenantSubdomain: string) => void
+  setTenant: (t: Tenant | null) => void
+  switchTenant: (subdomain: string) => void
 }
 
 const TenantContext = createContext<TenantContextType | undefined>(undefined)
 
 export function TenantProvider({ children }: { children: ReactNode }) {
-  const [tenant, setTenantState] = useState<Company | null>(null)
+  const { isAuthenticated } = useAuth()
+  const [tenant, setTenantState] = useState<Tenant | null>(null)
 
-  // Fetch available tenants (companies)
-  // Only fetch if user is authenticated
-  const { data: tenantsData, isLoading } = useQuery({
-    queryKey: ["companies"],
-    queryFn: async () => {
-      const response = await apiClient.get<Company[] | { results: Company[] }>("/api/core/companies/")
-      // Handle both array and paginated response formats
-      if (Array.isArray(response)) {
-        return response
-      }
-      // If it's a paginated response, extract the results
-      if (response && typeof response === 'object' && 'results' in response) {
-        return (response as { results: Company[] }).results
-      }
-      return []
-    },
-    enabled: !!localStorage.getItem("auth_token"), // Only fetch if authenticated
-    retry: false, // Don't retry on failure
-    staleTime: 5 * 60 * 1000, // Cache for 5 minutes
+  const { data, isLoading } = useQuery({
+    queryKey: ["core", "companies"],
+    queryFn: () => api.get<Tenant[] | { results: Tenant[] }>("/api/core/companies/").then(unwrapList<Tenant>),
+    enabled: isAuthenticated,
+    staleTime: 5 * 60 * 1000,
   })
-  
-  // Ensure tenants is always an array
-  const tenants = Array.isArray(tenantsData) ? tenantsData : []
 
-  // Load tenant from localStorage on mount
+  const tenants = data ?? []
+
+  // On first load (or when tenants arrive), hydrate selection from storage or default.
   useEffect(() => {
-    const storedTenant = localStorage.getItem("selected_tenant")
-    if (storedTenant) {
-      try {
-        const parsed = JSON.parse(storedTenant)
-        setTenantState(parsed)
-        apiClient.setTenantId(parsed.subdomain)
-      } catch (error) {
-        console.error("Failed to parse tenant from localStorage", error)
-        localStorage.removeItem("selected_tenant")
-      }
+    if (tenant || tenants.length === 0) return
+    const storedSub = getStoredTenant()
+    const found = (storedSub && tenants.find((t) => t.subdomain === storedSub)) ?? tenants[0]
+    if (found) {
+      setTenantState(found)
+      setStoredTenant(found.subdomain)
     }
+  }, [tenants, tenant])
+
+  const setTenant = useCallback((next: Tenant | null) => {
+    setTenantState(next)
+    setStoredTenant(next?.subdomain ?? null)
   }, [])
 
-  const setTenant = (newTenant: Company | null) => {
-    setTenantState(newTenant)
-    if (newTenant) {
-      localStorage.setItem("selected_tenant", JSON.stringify(newTenant))
-      apiClient.setTenantId(newTenant.subdomain)
-    } else {
-      localStorage.removeItem("selected_tenant")
-      apiClient.setTenantId(null)
-    }
-  }
+  const switchTenant = useCallback((subdomain: string) => {
+    const found = tenants.find((t) => t.subdomain === subdomain)
+    if (found) setTenant(found)
+  }, [tenants, setTenant])
 
-  const switchTenant = (tenantSubdomain: string) => {
-    const foundTenant = tenants.find((t) => t.subdomain === tenantSubdomain)
-    if (foundTenant) {
-      setTenant(foundTenant)
-    } else {
-      console.error(`Tenant with subdomain ${tenantSubdomain} not found`)
-    }
-  }
-
-  const value: TenantContextType = {
-    tenant,
-    tenants,
-    isLoading,
-    setTenant,
-    switchTenant,
-  }
+  const value = useMemo<TenantContextType>(() => ({
+    tenant, tenants, isLoading, setTenant, switchTenant,
+  }), [tenant, tenants, isLoading, setTenant, switchTenant])
 
   return <TenantContext.Provider value={value}>{children}</TenantContext.Provider>
 }
 
 export function useTenant() {
-  const context = useContext(TenantContext)
-  if (context === undefined) {
-    throw new Error("useTenant must be used within a TenantProvider")
-  }
-  return context
+  const ctx = useContext(TenantContext)
+  if (!ctx) throw new Error("useTenant must be used within TenantProvider")
+  return ctx
 }
-

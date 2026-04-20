@@ -1,0 +1,628 @@
+import { useMemo, useState } from "react"
+import { useTranslation } from "react-i18next"
+import { useNavigate } from "react-router-dom"
+import {
+  AreaChart, Area, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis, Bar, BarChart, Legend,
+} from "recharts"
+import {
+  AlertTriangle, Banknote, AlarmClock, Sparkles, Play, Upload, ArrowRight, Activity, ListChecks,
+} from "lucide-react"
+import { KpiCard } from "@/components/ui/kpi-card"
+import { SectionHeader } from "@/components/ui/section-header"
+import { StatusBadge } from "@/components/ui/status-badge"
+import { useActiveTasks, useDailyBalances, useReconKPIs, useReconTasks } from "@/features/reconciliation"
+import type { BookCurrencyMismatch, BookDailyWarning } from "@/features/reconciliation/types"
+import { cn, formatCurrency, formatDateTime, formatDuration, formatNumber } from "@/lib/utils"
+
+type TxMode = "both" | "balanced" | "unbalanced"
+
+const PERIOD_OPTIONS = [7, 14, 30, 90] as const
+type PeriodDays = (typeof PERIOD_OPTIONS)[number]
+
+function isoDaysAgo(n: number) {
+  const d = new Date()
+  d.setDate(d.getDate() - n)
+  return d.toISOString().slice(0, 10)
+}
+
+export function DashboardPage() {
+  const { t } = useTranslation(["reconciliation", "common"])
+  const navigate = useNavigate()
+
+  const [period, setPeriod] = useState<PeriodDays>(30)
+
+  const dateFrom = useMemo(() => isoDaysAgo(period), [period])
+  const dateTo = useMemo(() => isoDaysAgo(0), [])
+
+  const { data: kpis, isLoading: kpisLoading } = useReconKPIs({
+    lookback_days: period,
+    trend_days: period,
+  })
+  const { data: balances, isLoading: balancesLoading } = useDailyBalances({
+    date_from: dateFrom,
+    date_to: dateTo,
+  })
+  const { data: tasks } = useReconTasks({ pollMs: 5000 })
+  const { data: active } = useActiveTasks(3000)
+
+  // Pick the first currency bucket for display (merge bank/book/diff lines by date)
+  const chartData = useMemo(() => {
+    const byCur = balances?.aggregate?.by_currency
+    if (!byCur) return []
+    const currencies = Object.keys(byCur)
+    if (!currencies.length) return []
+    const c = byCur[currencies[0]!]
+    if (!c) return []
+    const bankByDate = new Map<string, number>((c.bank?.line ?? []).map((p) => [p.date, Number(p.balance)]))
+    const bookByDate = new Map<string, number>((c.book?.line ?? []).map((p) => [p.date, Number(p.balance)]))
+    const diffByDate = new Map<string, number>((c.difference?.line ?? []).map((p) => [p.date, Number(p.bank_minus_book)]))
+    const dates = Array.from(new Set<string>([...bankByDate.keys(), ...bookByDate.keys(), ...diffByDate.keys()])).sort()
+    return dates.map((date) => ({
+      date,
+      bank: bankByDate.get(date) ?? 0,
+      book: bookByDate.get(date) ?? 0,
+      diff: diffByDate.get(date) ?? 0,
+    }))
+  }, [balances])
+
+  // Surface the service-level warnings the backend attaches to each currency
+  // bucket. `no_leaf_gl_linked_to_bank_account` is the main reason the book
+  // line appears flat: the daily-balances service returns a zero-opening,
+  // zero-movement series for any bank account without a leaf GL link.
+  const { linkWarnings, currencyMismatches } = useMemo(() => {
+    const warns: BookDailyWarning[] = []
+    const mismatches: BookCurrencyMismatch[] = []
+    const byCur = balances?.aggregate?.by_currency
+    if (byCur) {
+      for (const c of Object.values(byCur)) {
+        for (const w of c.book?.warnings ?? []) warns.push(w)
+        for (const m of c.book?.currency_mismatches ?? []) mismatches.push(m)
+      }
+    }
+    return { linkWarnings: warns, currencyMismatches: mismatches }
+  }, [balances])
+
+  const recentTasks = (tasks ?? []).slice(0, 6)
+  const activeTasks = active ?? []
+
+  // Transaction trend — derived from the KPI trend_14d series so it follows
+  // the same reconciled-count truth as the KPI cards.
+  //   balanced    = reconciled
+  //   unbalanced  = new_bank_tx - reconciled (clamped ≥ 0)
+  const [txMode, setTxMode] = useState<TxMode>("both")
+  const txTrendData = useMemo(() => {
+    const trend = kpis?.trend_14d ?? []
+    return trend.map((row) => {
+      const balanced = Math.max(0, Number(row.reconciled ?? 0))
+      const total = Math.max(0, Number(row.new_bank_tx ?? 0))
+      return {
+        date: row.date,
+        balanceadas: balanced,
+        nao_balanceadas: Math.max(0, total - balanced),
+      }
+    })
+  }, [kpis])
+  const txTrendTotals = useMemo(() => {
+    return txTrendData.reduce(
+      (acc, r) => {
+        acc.balanced += r.balanceadas
+        acc.unbalanced += r.nao_balanceadas
+        return acc
+      },
+      { balanced: 0, unbalanced: 0 },
+    )
+  }, [txTrendData])
+  const txTrendHasData =
+    txTrendData.length > 0 &&
+    (txTrendTotals.balanced > 0 || txTrendTotals.unbalanced > 0)
+
+  const unreconciledCount = kpis?.unreconciled.count ?? 0
+  const unreconciledAmount = kpis ? Number(kpis.unreconciled.amount_abs) : 0
+  const oldestAge = kpis?.unreconciled.oldest_age_days ?? null
+  const autoRate = kpis?.tasks_30d.automatch_rate != null ? kpis.tasks_30d.automatch_rate * 100 : null
+  const completedTasks = kpis?.tasks_30d.completed ?? 0
+
+  return (
+    <div className="space-y-6">
+      <SectionHeader
+        title={t("dashboard.title")}
+        subtitle={t("dashboard.subtitle") ?? ""}
+        actions={
+          <>
+            <button
+              onClick={() => navigate("/recon/tasks?new=1")}
+              className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
+            >
+              <Play className="h-3.5 w-3.5" /> {t("dashboard.quick_start")}
+            </button>
+            <button
+              onClick={() => navigate("/recon/suggestions")}
+              className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
+            >
+              <Sparkles className="h-3.5 w-3.5" /> {t("dashboard.quick_review_suggestions")}
+            </button>
+            <button
+              onClick={() => navigate("/accounting/bank-transactions?action=import")}
+              className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
+            >
+              <Upload className="h-3.5 w-3.5" /> {t("dashboard.quick_import_ofx")}
+            </button>
+          </>
+        }
+      />
+
+      {/* KPIs — clickable for drill-down */}
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <button onClick={() => navigate("/recon/workbench")} className="text-left transition-transform hover:scale-[1.01]">
+          <KpiCard
+            label={t("dashboard.kpi_unreconciled_count")}
+            value={kpisLoading ? "—" : formatNumber(unreconciledCount)}
+            icon={<AlertTriangle className="h-4 w-4" />}
+            tone="default"
+            hint={<span className="text-muted-foreground/70">abrir bancada →</span>}
+          />
+        </button>
+        <button onClick={() => navigate("/recon/workbench")} className="text-left transition-transform hover:scale-[1.01]">
+          <KpiCard
+            label={t("dashboard.kpi_unreconciled_amount")}
+            value={kpisLoading ? "—" : formatCurrency(unreconciledAmount)}
+            icon={<Banknote className="h-4 w-4" />}
+            tone="default"
+            hint={<span className="text-muted-foreground/70">bancárias em aberto →</span>}
+          />
+        </button>
+        <button onClick={() => navigate("/recon/tasks")} className="text-left transition-transform hover:scale-[1.01]">
+          <KpiCard
+            label={t("dashboard.kpi_automatch_rate")}
+            value={autoRate == null ? "—" : `${autoRate.toFixed(1)}%`}
+            icon={<Activity className="h-4 w-4" />}
+            tone="default"
+            hint={
+              <span className="text-muted-foreground/70">
+                {t("dashboard.period_executions_in_n_days", { count: completedTasks, n: period })} →
+              </span>
+            }
+          />
+        </button>
+        <button onClick={() => navigate("/recon/workbench")} className="text-left transition-transform hover:scale-[1.01]">
+          <KpiCard
+            label={t("dashboard.kpi_oldest_age")}
+            value={
+              oldestAge == null ? (
+                "—"
+              ) : (
+                <span>
+                  {oldestAge}
+                  <span className="ml-1 text-sm font-normal text-muted-foreground">{t("dashboard.days_short")}</span>
+                </span>
+              )
+            }
+            icon={<AlarmClock className="h-4 w-4" />}
+            tone="default"
+            hint={kpis?.unreconciled.oldest_date ? <span>desde {kpis.unreconciled.oldest_date}</span> : undefined}
+          />
+        </button>
+      </div>
+
+      {/* Data-quality warnings — surface service-side flags that make the
+          book series look flat or break per-currency aggregation. */}
+      {(linkWarnings.length > 0 || currencyMismatches.length > 0) && (
+        <div className="space-y-2">
+          {linkWarnings.length > 0 && (
+            <BookFlatWarning warnings={linkWarnings} onOpen={() => navigate("/accounting/bank-accounts")} />
+          )}
+          {currencyMismatches.length > 0 && (
+            <CurrencyMismatchWarning mismatches={currencyMismatches} />
+          )}
+        </div>
+      )}
+
+      {/* Chart + Active tasks */}
+      <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
+        <div className="card-elevated col-span-1 p-4 lg:col-span-2">
+          <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h3 className="text-[13px] font-semibold">{t("dashboard.chart_bank_vs_book")}</h3>
+              <p className="text-[11px] text-muted-foreground">
+                {t("dashboard.period_last_n_days", { n: period })}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <PeriodSwitch value={period} onChange={setPeriod} />
+              <TxModeSwitch value={txMode} onChange={setTxMode} />
+            </div>
+          </div>
+          <div className="h-[240px] w-full">
+            {balancesLoading ? (
+              <div className="h-full w-full animate-pulse rounded-md surface-3" />
+            ) : chartData.length === 0 ? (
+              <EmptyChart />
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={chartData} margin={{ top: 10, right: 8, bottom: 0, left: 0 }}>
+                  <defs>
+                    <linearGradient id="bank" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="hsl(var(--primary))" stopOpacity={0.4} />
+                      <stop offset="95%" stopColor="hsl(var(--primary))" stopOpacity={0.05} />
+                    </linearGradient>
+                    <linearGradient id="book" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="hsl(var(--info))" stopOpacity={0.4} />
+                      <stop offset="95%" stopColor="hsl(var(--info))" stopOpacity={0.05} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid stroke="hsl(var(--border))" strokeDasharray="3 3" vertical={false} />
+                  <XAxis dataKey="date" tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 10 }} tickLine={false} axisLine={false} />
+                  <YAxis tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 10 }} tickLine={false} axisLine={false} width={60} />
+                  <Tooltip
+                    contentStyle={{
+                      background: "hsl(var(--surface-3))",
+                      border: "1px solid hsl(var(--border))",
+                      borderRadius: 8,
+                      fontSize: 12,
+                    }}
+                  />
+                  <Legend wrapperStyle={{ fontSize: 11 }} />
+                  <Area type="monotone" name="Banco" dataKey="bank" stroke="hsl(var(--primary))" strokeWidth={2} fill="url(#bank)" />
+                  <Area type="monotone" name="Livro" dataKey="book" stroke="hsl(var(--info))" strokeWidth={2} fill="url(#book)" />
+                </AreaChart>
+              </ResponsiveContainer>
+            )}
+          </div>
+          {/* Transaction volume — balanced vs unbalanced per day. Toggled
+              via the TxModeSwitch above; defaults to stacked 'both'. */}
+          <div className="mt-3">
+            <div className="mb-1 flex items-center justify-between">
+              <span className="text-[11px] font-medium text-muted-foreground">
+                {t("dashboard.chart_tx_section")}
+              </span>
+              <span className="text-[10px] text-muted-foreground/70">
+                {txTrendHasData
+                  ? `${txTrendTotals.balanced + txTrendTotals.unbalanced} em ${txTrendData.length}d`
+                  : kpisLoading
+                    ? "…"
+                    : t("dashboard.period_no_movement_n_days", { n: period })}
+              </span>
+            </div>
+            <div className="h-24 w-full">
+              {txTrendHasData ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={txTrendData} margin={{ top: 4, right: 8, bottom: 0, left: 0 }}>
+                    <CartesianGrid stroke="hsl(var(--border))" strokeDasharray="3 3" vertical={false} />
+                    <XAxis dataKey="date" hide />
+                    <YAxis
+                      tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 10 }}
+                      tickLine={false}
+                      axisLine={false}
+                      width={60}
+                      allowDecimals={false}
+                    />
+                    <Tooltip
+                      contentStyle={{
+                        background: "hsl(var(--surface-3))",
+                        border: "1px solid hsl(var(--border))",
+                        borderRadius: 8,
+                        fontSize: 12,
+                      }}
+                    />
+                    {txMode !== "unbalanced" && (
+                      <Bar
+                        dataKey="balanceadas"
+                        name={t("dashboard.chart_tx_balanced") ?? "Balanceadas"}
+                        stackId="tx"
+                        fill="hsl(var(--success))"
+                        radius={txMode === "both" ? [0, 0, 0, 0] : [2, 2, 0, 0]}
+                      />
+                    )}
+                    {txMode !== "balanced" && (
+                      <Bar
+                        dataKey="nao_balanceadas"
+                        name={t("dashboard.chart_tx_unbalanced") ?? "Não balanceadas"}
+                        stackId="tx"
+                        fill="hsl(var(--danger))"
+                        radius={[2, 2, 0, 0]}
+                      />
+                    )}
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="flex h-full items-center justify-center rounded-md border border-dashed border-border text-[11px] text-muted-foreground">
+                  {kpisLoading
+                    ? "Carregando…"
+                    : t("dashboard.period_no_movement_n_days", { n: period })}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Active tasks strip */}
+        <div className="card-elevated p-4">
+          <div className="mb-3 flex items-center justify-between">
+            <h3 className="text-[13px] font-semibold">{t("dashboard.active_tasks")}</h3>
+            <button
+              onClick={() => navigate("/recon/tasks")}
+              className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+            >
+              {t("actions.view_all", { ns: "common" })} <ArrowRight className="h-3 w-3" />
+            </button>
+          </div>
+          {activeTasks.length === 0 ? (
+            <div className="flex h-[200px] flex-col items-center justify-center gap-2 rounded-md border border-dashed border-border text-[12px] text-muted-foreground">
+              <ListChecks className="h-5 w-5" />
+              {t("dashboard.no_active_tasks")}
+            </div>
+          ) : (
+            <ul className="space-y-2">
+              {activeTasks.slice(0, 6).map((task) => (
+                <li key={task.id} className="rounded-md border border-border p-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="font-mono text-[11px] text-muted-foreground">#{task.id}</span>
+                    <StatusBadge status={task.status} />
+                  </div>
+                  <div className="mt-1 truncate text-[13px] font-medium">
+                    {task.config_name ?? task.pipeline_name ?? "—"}
+                  </div>
+                  <div className="mt-1 flex items-center gap-3 text-[11px] text-muted-foreground">
+                    <span>Bancárias: <span className="tabular-nums text-foreground">{task.bank_candidates ?? 0}</span></span>
+                    <span>Sug.: <span className="tabular-nums text-foreground">{task.suggestion_count ?? 0}</span></span>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+
+      {/* Recent tasks */}
+      <div className="card-elevated p-4">
+        <div className="mb-3 flex items-center justify-between">
+          <h3 className="text-[13px] font-semibold">{t("dashboard.recent_tasks")}</h3>
+          <button
+            onClick={() => navigate("/recon/tasks")}
+            className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+          >
+            {t("actions.view_all", { ns: "common" })} <ArrowRight className="h-3 w-3" />
+          </button>
+        </div>
+        <div className="overflow-hidden rounded-md border border-border">
+          <table className="w-full text-[12px]">
+            <thead className="bg-surface-3 text-left text-[10px] uppercase tracking-wider text-muted-foreground">
+              <tr>
+                <th className="h-8 px-3">ID</th>
+                <th className="h-8 px-3">Status</th>
+                <th className="h-8 px-3">Configuração</th>
+                <th className="h-8 px-3 text-right">Bancárias</th>
+                <th className="h-8 px-3 text-right">Contábeis</th>
+                <th className="h-8 px-3 text-right">Sugestões</th>
+                <th className="h-8 px-3 text-right">Auto</th>
+                <th className="h-8 px-3 text-right">Duração</th>
+                <th className="h-8 px-3">Iniciado</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recentTasks.length === 0 ? (
+                <tr>
+                  <td className="h-16 px-3 text-center text-muted-foreground" colSpan={9}>
+                    {t("tasks.empty")}
+                  </td>
+                </tr>
+              ) : recentTasks.map((task) => {
+                // Past executions (completed/failed/cancelled) jump straight
+                // to the Sugestões page so the operator can act on the
+                // persisted suggestions; active tasks open the live detail.
+                const past = task.status === "completed" || task.status === "failed" || task.status === "cancelled"
+                const href = past ? `/recon/suggestions?task_id=${task.id}` : `/recon/tasks?id=${task.id}`
+                return (
+                <tr
+                  key={task.id}
+                  onClick={() => navigate(href)}
+                  className="cursor-pointer border-t border-border hover:bg-accent/50"
+                >
+                  <td className="h-9 px-3 font-mono text-muted-foreground">#{task.id}</td>
+                  <td className="h-9 px-3"><StatusBadge status={task.status} /></td>
+                  <td className="h-9 px-3 font-medium">{task.config_name ?? task.pipeline_name ?? "—"}</td>
+                  <td className="h-9 px-3 text-right tabular-nums">{task.bank_candidates ?? "—"}</td>
+                  <td className="h-9 px-3 text-right tabular-nums">{task.journal_candidates ?? "—"}</td>
+                  <td className="h-9 px-3 text-right tabular-nums">{task.suggestion_count ?? "—"}</td>
+                  <td className="h-9 px-3 text-right tabular-nums">{task.auto_match_applied ?? "—"}</td>
+                  <td className="h-9 px-3 text-right tabular-nums text-muted-foreground">{formatDuration(task.duration_seconds ?? null)}</td>
+                  <td className="h-9 px-3 text-muted-foreground">{task.created_at ? formatDateTime(task.created_at) : "—"}</td>
+                </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function EmptyChart() {
+  return (
+    <div className="flex h-full items-center justify-center rounded-md border border-dashed border-border text-[12px] text-muted-foreground">
+      Sem dados de saldos para o período selecionado.
+    </div>
+  )
+}
+
+/**
+ * Banner shown when one or more bank accounts in the dashboard window have
+ * no leaf GL account linked (`Account.bank_account=ba`). In that state the
+ * book daily-balances service returns zero-opening + zero-movement arrays
+ * for the affected accounts, which averages down to a ~flat aggregate book
+ * line on the chart. The CTA jumps to the bank-accounts list so the user
+ * can fix the link in Accounting.
+ */
+function BookFlatWarning({
+  warnings,
+  onOpen,
+}: {
+  warnings: BookDailyWarning[]
+  onOpen: () => void
+}) {
+  const { t } = useTranslation("reconciliation")
+  const ids = warnings.map((w) => w.bank_account_id)
+  const preview = ids.slice(0, 8).join(", ") + (ids.length > 8 ? ` (+${ids.length - 8})` : "")
+  return (
+    <div className="flex items-start gap-3 rounded-md border border-warning/40 bg-warning/10 p-3 text-[12px]">
+      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+      <div className="min-w-0 flex-1 space-y-1">
+        <div className="font-semibold text-foreground">
+          {t("dashboard.book_flat_warning_title")}
+        </div>
+        <div className="text-muted-foreground">
+          {t("dashboard.book_flat_warning_desc", { count: warnings.length })}
+        </div>
+        <div className="font-mono text-[11px] text-muted-foreground/80">
+          {t("dashboard.book_flat_warning_ids", { ids: preview })}
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={onOpen}
+        className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-border bg-background px-2 text-[11px] font-medium hover:bg-accent"
+      >
+        {t("dashboard.book_flat_warning_cta")} <ArrowRight className="h-3 w-3" />
+      </button>
+    </div>
+  )
+}
+
+/**
+ * Complementary warning for bank accounts whose linked leaf GL sits in a
+ * different currency from the bank account itself. The per-currency
+ * aggregation can't reconcile those cleanly — callers should know the book
+ * total for that currency may not match reality.
+ */
+function CurrencyMismatchWarning({
+  mismatches,
+}: {
+  mismatches: BookCurrencyMismatch[]
+}) {
+  const { t } = useTranslation("reconciliation")
+  const ids = mismatches.map((m) => m.bank_account_id)
+  const preview = ids.slice(0, 8).join(", ") + (ids.length > 8 ? ` (+${ids.length - 8})` : "")
+  return (
+    <div className="flex items-start gap-3 rounded-md border border-warning/40 bg-warning/10 p-3 text-[12px]">
+      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+      <div className="min-w-0 flex-1 space-y-1">
+        <div className="font-semibold text-foreground">
+          {t("dashboard.book_currency_mismatch_title")}
+        </div>
+        <div className="text-muted-foreground">
+          {t("dashboard.book_currency_mismatch_desc", { count: mismatches.length })}
+        </div>
+        <div className="font-mono text-[11px] text-muted-foreground/80">
+          {t("dashboard.book_flat_warning_ids", { ids: preview })}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Page-level period selector. Controls the lookback window for the
+ * bank/book balance chart, the transaction-volume chart, and the
+ * "X execuções em Nd" KPI hint. Offers 7/14/30/90 days.
+ */
+function PeriodSwitch({
+  value,
+  onChange,
+}: {
+  value: PeriodDays
+  onChange: (v: PeriodDays) => void
+}) {
+  const { t } = useTranslation("reconciliation")
+  return (
+    <div
+      role="tablist"
+      aria-label={t("dashboard.period_label")}
+      className="inline-flex h-8 shrink-0 items-center rounded-md border border-border bg-background p-0.5 text-[11px]"
+    >
+      {PERIOD_OPTIONS.map((opt) => {
+        const active = opt === value
+        return (
+          <button
+            key={opt}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            onClick={() => onChange(opt)}
+            className={cn(
+              "inline-flex h-7 min-w-[2.25rem] items-center justify-center rounded px-2 font-medium tabular-nums transition-colors",
+              active
+                ? "bg-accent text-foreground"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {t(`dashboard.period_${opt}d` as const)}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+/**
+ * Segmented control to filter the transaction-volume bar chart by
+ * reconciliation status. `both` stacks balanced + unbalanced; the other
+ * two render only the matching series.
+ */
+function TxModeSwitch({
+  value,
+  onChange,
+}: {
+  value: TxMode
+  onChange: (v: TxMode) => void
+}) {
+  const { t } = useTranslation("reconciliation")
+  const options: Array<{ id: TxMode; label: string; dot?: string }> = [
+    { id: "both", label: t("dashboard.chart_tx_all") },
+    {
+      id: "balanced",
+      label: t("dashboard.chart_tx_balanced"),
+      dot: "hsl(var(--success))",
+    },
+    {
+      id: "unbalanced",
+      label: t("dashboard.chart_tx_unbalanced"),
+      dot: "hsl(var(--danger))",
+    },
+  ]
+  return (
+    <div
+      role="tablist"
+      aria-label="Filtrar transações"
+      className="inline-flex h-7 shrink-0 items-center rounded-md border border-border bg-background p-0.5 text-[11px]"
+    >
+      {options.map((opt) => {
+        const active = opt.id === value
+        return (
+          <button
+            key={opt.id}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            onClick={() => onChange(opt.id)}
+            className={cn(
+              "inline-flex h-6 items-center gap-1.5 rounded px-2 font-medium transition-colors",
+              active
+                ? "bg-accent text-foreground"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {opt.dot && (
+              <span
+                aria-hidden
+                className="inline-block h-1.5 w-1.5 rounded-full"
+                style={{ backgroundColor: opt.dot }}
+              />
+            )}
+            {opt.label}
+          </button>
+        )
+      })}
+    </div>
+  )
+}

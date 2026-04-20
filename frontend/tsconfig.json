@@ -33,6 +33,20 @@
     }
   },
   "include": ["src"],
+  "exclude": [
+    "src/_legacy",
+    "src/components/transactions",
+    "src/components/layout/Header.tsx",
+    "src/components/layout/PageHeader.tsx",
+    "src/components/ui/toast.tsx",
+    "src/components/ui/toaster.tsx",
+    "src/components/ui/use-toast.ts",
+    "src/components/ui/filter-bar.tsx",
+    "src/components/ui/multi-select.tsx",
+    "src/components/ui/data-table.tsx",
+    "src/components/ui/date-picker.tsx",
+    "src/components/ui/drawer.tsx"
+  ],
   "references": [{ "path": "./tsconfig.node.json" }]
 }
 

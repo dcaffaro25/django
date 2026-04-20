@@ -2,52 +2,143 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ---------------------------------------------------------------------------
+   Brand palette (from Nord_Manual_210324.pdf):
+     - PANTONE 6160CP  #015736   primary forest green
+     - PANTONE 7732C   #007F46   secondary green
+     - PANTONE 7563C   #D29F13   gold
+     - PANTONE 7578C   #D5642F   terracotta
+     - PANTONE 4280C   #252A36   warm charcoal (used as "dark" neutral)
+     - PANTONE 427C    #D0D3D4   cool light gray (borders / dividers)
+
+   Proportion-of-use directive from the manual: 45% preto, 35% branco,
+   ~30% green. So the UI leans neutral — green is an accent for primary
+   CTAs, selected states, and branded moments, not the chrome.
+--------------------------------------------------------------------------- */
+
 @layer base {
   :root {
+    /* ------------ Light (secondary; app defaults to dark) ------------ */
     --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
+    --foreground: 222 19% 14%;         /* slightly warmer than blue-black */
+
+    --surface-1: 0 0% 100%;
+    --surface-2: 210 10% 98%;          /* neutral warm-gray, not blue-tinted */
+    --surface-3: 210 6% 94%;
+
+    --muted: 210 8% 96%;
+    --muted-foreground: 222 8% 42%;
+
     --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
+    --card-foreground: 222 19% 14%;
+
     --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
-    --primary: 142 67% 20%; /* #025736 - NORD Green */
-    --primary-foreground: 210 40% 98%;
-    --secondary: 240 4.8% 95.9%;
-    --secondary-foreground: 240 5.9% 10%;
-    --muted: 240 4.8% 95.9%;
-    --muted-foreground: 240 3.8% 46.1%;
-    --accent: 240 4.8% 95.9%;
-    --accent-foreground: 240 5.9% 10%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 240 5.9% 90%;
-    --input: 240 5.9% 90%;
-    --ring: 142 67% 20%;
-    --radius: 0.75rem;
-    --sidebar-width: 280px;
-    --sidebar-collapsed-width: 80px;
+    --popover-foreground: 222 19% 14%;
+
+    --accent: 210 8% 94%;
+    --accent-foreground: 222 19% 14%;
+
+    --border: 210 5% 84%;              /* PANTONE 427C #D0D3D4 */
+    --input:  210 5% 84%;
+
+    --primary: 155 98% 17%;            /* #015736 — brand forest green */
+    --primary-foreground: 0 0% 100%;
+    --primary-muted: 155 35% 93%;
+
+    --secondary: 210 8% 96%;
+    --secondary-foreground: 222 19% 14%;
+
+    /* Success shifted away from the brand green so data-viz and status
+       don't double up with the primary identity. Teal-leaning green. */
+    --success: 172 68% 32%;
+    --success-foreground: 0 0% 100%;
+
+    /* Warning = brand gold #D29F13 */
+    --warning: 44 82% 45%;
+    --warning-foreground: 44 15% 10%;
+
+    /* Danger = brand terracotta #D5642F (previously a pure red) */
+    --danger: 18 66% 51%;
+    --danger-foreground: 0 0% 100%;
+
+    --info: 215 80% 48%;
+    --info-foreground: 0 0% 100%;
+
+    /* Brand accents (charts, chips, emphasis) */
+    --brand-green-2: 150 100% 25%;     /* PANTONE 7732C #007F46 */
+    --brand-gold:    44 82% 45%;       /* #D29F13 */
+    --brand-terracotta: 18 66% 51%;    /* #D5642F */
+    --brand-charcoal: 222 19% 18%;     /* #252A36 */
+
+    --ring: 155 98% 22%;
+    --radius: 0.5rem;                  /* slightly tighter, more institutional */
+    --radius-sm: 0.375rem;
+
+    /* layout */
+    --sidebar-width: 240px;
+    --sidebar-collapsed-width: 64px;
+    --topbar-height: 48px;
+
+    /* typography — brand spec: Roboto for UI, Source Serif 4 for narrative */
+    --font-sans: "Roboto", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+      "Helvetica Neue", Arial, sans-serif;
+    --font-serif: "Source Serif 4", ui-serif, Georgia, "Times New Roman", serif;
+    --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+      "Liberation Mono", monospace;
   }
 
   .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
-    --card: 222.2 84% 4.9%;
-    --card-foreground: 210 40% 98%;
-    --popover: 222.2 84% 4.9%;
-    --popover-foreground: 210 40% 98%;
-    --primary: 217.2 91.2% 59.8%;
-    --primary-foreground: 222.2 47.4% 11.2%;
-    --secondary: 217.2 32.6% 17.5%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
-    --accent: 217.2 32.6% 17.5%;
-    --accent-foreground: 210 40% 98%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
-    --ring: 224.3 76.3% 48%;
+    /* ------------ Dark (default) — built on brand charcoal #252A36 ----
+       Previously this used a cold blue-black (#0e1014). We now scale
+       down from the brand warm-charcoal to get surfaces that feel
+       cohesive with the printed brand materials. */
+    --background: 222 20% 9%;          /* brand charcoal, darkened 9% */
+    --foreground: 210 8% 92%;
+
+    --surface-1: 222 18% 11%;          /* panels */
+    --surface-2: 222 17% 13%;          /* cards */
+    --surface-3: 222 16% 16%;          /* elevated */
+
+    --muted: 222 14% 16%;
+    --muted-foreground: 210 8% 62%;
+
+    --card: 222 18% 12%;
+    --card-foreground: 210 8% 92%;
+
+    --popover: 222 18% 12%;
+    --popover-foreground: 210 8% 92%;
+
+    --accent: 222 14% 18%;
+    --accent-foreground: 210 8% 92%;
+
+    --border: 222 10% 22%;
+    --input: 222 10% 22%;
+
+    /* Keep the forest green identity in dark mode — just lift enough for
+       legibility on the charcoal background without going neon. */
+    --primary: 152 60% 28%;
+    --primary-foreground: 0 0% 100%;
+    --primary-muted: 155 40% 16%;
+
+    --secondary: 222 14% 16%;
+    --secondary-foreground: 210 8% 92%;
+
+    /* Success + danger follow the same teal / terracotta pivots as light. */
+    --success: 172 55% 42%;
+    --success-foreground: 0 0% 100%;
+    --warning: 44 82% 55%;             /* brand gold lifted */
+    --warning-foreground: 44 15% 10%;
+    --danger: 18 72% 58%;              /* terracotta lifted */
+    --danger-foreground: 0 0% 100%;
+    --info: 215 85% 65%;
+    --info-foreground: 0 0% 100%;
+
+    --brand-green-2: 150 62% 38%;
+    --brand-gold:    44 82% 55%;
+    --brand-terracotta: 18 72% 58%;
+    --brand-charcoal: 222 19% 18%;
+
+    --ring: 152 60% 40%;
   }
 }
 
@@ -55,28 +146,115 @@
   * {
     @apply border-border;
   }
+
+  html, body, #root {
+    height: 100%;
+  }
+
   body {
     @apply bg-background text-foreground antialiased;
+    font-family: var(--font-sans);
+    /* Roboto doesn't honor the Inter OpenType features — keep just
+       ligatures + tabular-nums for aligned numbers. */
     font-feature-settings: "rlig" 1, "calt" 1;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0;                 /* Roboto renders tight by default */
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
   }
-  
-  /* Modern scrollbar styling */
+
+  /* Manual spec: Bold for titles, Light for subtitles. Default heading
+     weights were too heavy in combination with Roboto's visual weight. */
+  h1, h2, h3, h4, h5, h6 {
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+
+  /* Scrollbar — thin, subtle */
   ::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
+    width: 10px;
+    height: 10px;
   }
-  
   ::-webkit-scrollbar-track {
-    background: hsl(var(--muted));
+    background: transparent;
   }
-  
   ::-webkit-scrollbar-thumb {
-    background: hsl(var(--muted-foreground) / 0.3);
-    border-radius: 4px;
+    background: hsl(var(--muted-foreground) / 0.18);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
   }
-  
   ::-webkit-scrollbar-thumb:hover {
-    background: hsl(var(--muted-foreground) / 0.5);
+    background: hsl(var(--muted-foreground) / 0.32);
+    background-clip: padding-box;
+    border: 2px solid transparent;
+  }
+
+  /* Focus — strong, visible, not ugly */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-0;
+  }
+
+  /* Selection */
+  ::selection {
+    background: hsl(var(--primary) / 0.35);
   }
 }
 
+@layer components {
+  .surface-1 {
+    background-color: hsl(var(--surface-1));
+  }
+  .surface-2 {
+    background-color: hsl(var(--surface-2));
+  }
+  .surface-3 {
+    background-color: hsl(var(--surface-3));
+  }
+
+  .card-elevated {
+    @apply rounded-lg border bg-card shadow-sm;
+    background-color: hsl(var(--surface-2));
+  }
+
+  .hairline {
+    @apply border-b border-border;
+  }
+
+  .text-kbd {
+    @apply inline-flex h-5 min-w-[20px] items-center justify-center rounded border border-border bg-muted px-1 font-mono text-[10px] font-medium text-muted-foreground;
+  }
+
+  /* Serif utility for narrative prose / long-form text per brand spec. */
+  .font-serif-brand {
+    font-family: var(--font-serif);
+  }
+
+  /* Brand accent helpers — use sparingly (charts, category chips). */
+  .text-brand-gold { color: hsl(var(--brand-gold)); }
+  .text-brand-terracotta { color: hsl(var(--brand-terracotta)); }
+  .bg-brand-gold { background-color: hsl(var(--brand-gold)); }
+  .bg-brand-terracotta { background-color: hsl(var(--brand-terracotta)); }
+  .bg-brand-charcoal { background-color: hsl(var(--brand-charcoal)); }
+
+  /* Highlight for shared tokens in Sugestões card descriptions: we just
+     underline the matching word in yellow and leave the text flow/colour
+     intact. Works uniformly on any surface (card header, subtitle, truncated
+     single-line) and in both themes. `bg-transparent` defends against the
+     browser's default <mark> yellow background leaking through. */
+  .shared-token {
+    background-color: transparent;
+    color: inherit;
+    font-weight: 600;
+    text-decoration-line: underline;
+    text-decoration-style: solid;
+    text-decoration-color: hsl(48 96% 53%); /* amber-400/500 */
+    text-decoration-thickness: 2px;
+    text-underline-offset: 2px;
+    -webkit-text-decoration-line: underline;
+    -webkit-text-decoration-color: hsl(48 96% 53%);
+    padding: 0;
+    border-radius: 0;
+  }
+}
