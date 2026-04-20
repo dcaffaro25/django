@@ -1663,9 +1663,9 @@ function ManualSuggestionsView() {
       />
 
       <div className="card-elevated flex flex-wrap items-end gap-4 p-3">
-        <NumField label={t("suggestions.min_confidence")} value={minConfidence} step={0.05} min={0} max={1} onChange={setMinConfidence} />
-        <NumField label={t("suggestions.max_per_bank")} value={maxPerBank} step={1} min={1} max={20} onChange={setMaxPerBank} />
-        <NumField label={t("suggestions.min_match_count")} value={minMatchCount} step={1} min={1} max={10} onChange={setMinMatchCount} />
+        <NumField label={t("suggestions.min_confidence")} value={minConfidence} step={0.05} min={0} max={1} onChange={(v) => v != null && setMinConfidence(v)} />
+        <NumField label={t("suggestions.max_per_bank")} value={maxPerBank} step={1} min={1} max={20} onChange={(v) => v != null && setMaxPerBank(v)} />
+        <NumField label={t("suggestions.min_match_count")} value={minMatchCount} step={1} min={1} max={10} onChange={(v) => v != null && setMinMatchCount(v)} />
         <div className="ml-auto text-[12px] text-muted-foreground">
           {selectedBankIds.size > 0
             ? `${selectedBankIds.size} transações selecionadas`
