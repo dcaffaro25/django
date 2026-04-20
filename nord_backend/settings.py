@@ -239,6 +239,11 @@ REST_FRAMEWORK = {
         "rest_framework.filters.SearchFilter",
         "rest_framework.filters.OrderingFilter",
     ],
+    # Global pagination: keeps old clients working (unwrapList handles both
+    # shapes) while preventing accidental 100k-row responses from heavy
+    # endpoints like bank_transactions. Clients can tune with ?page_size=.
+    "DEFAULT_PAGINATION_CLASS": "core.utils.pagination.LargePageNumberPagination",
+    "PAGE_SIZE": 1000,
 }
 
 # Database
@@ -282,6 +287,28 @@ if os.environ.get('PGDATABASE'):
             'PORT': os.environ["PGPORT"],
         }
     }
+
+# Apply local_credentials.ini overrides (adds 'production' alias for cloning,
+# switches 'default' to homologation when mode=local/homolog, unless PGDATABASE
+# env vars already override default).
+try:
+    from nord_backend.local_settings_loader import (
+        get_database_config as _get_db_cfg,
+        get_environment_mode as _get_env_mode,
+    )
+    _mode = _get_env_mode()
+    ENVIRONMENT_MODE = _mode
+    if _mode in ("local", "homolog", "homologation"):
+        _prod_cfg = _get_db_cfg("production")
+        if _prod_cfg:
+            DATABASES["production"] = _prod_cfg
+        # Only override default if no explicit env-var DB is set
+        if not os.environ.get("PGDATABASE"):
+            _default_cfg = _get_db_cfg("default")
+            if _default_cfg:
+                DATABASES["default"] = _default_cfg
+except Exception:
+    pass
 
 EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
 EMAIL_HOST = "smtp.office365.com"

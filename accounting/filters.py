@@ -10,6 +10,11 @@ class BankTransactionFilter(filters.FilterSet):
     # Ranges
     date_from   = filters.DateFilter(field_name="date", lookup_expr="gte")
     date_to     = filters.DateFilter(field_name="date", lookup_expr="lte")
+    # Aliases matching the frontend's Workbench params (DRF/django-filter convention).
+    # Without these, the params were silently dropped and the pane showed the full
+    # un-filtered table (inflating the count from 258 pending → 8998 total).
+    date_after  = filters.DateFilter(field_name="date", lookup_expr="gte")
+    date_before = filters.DateFilter(field_name="date", lookup_expr="lte")
     amount_min  = filters.NumberFilter(field_name="amount", lookup_expr="gte")
     amount_max  = filters.NumberFilter(field_name="amount", lookup_expr="lte")
 
@@ -19,6 +24,11 @@ class BankTransactionFilter(filters.FilterSet):
 
     # Booleans / flags
     unreconciled = filters.BooleanFilter(method="filter_unreconciled")
+
+    # Reconciliation status — mirrors the `reconciliation_status` annotation
+    # applied in BankTransactionViewSet.get_queryset (matched / open / pending).
+    # The Workbench sends ?reconciliation_status=pending for the bank pane.
+    reconciliation_status = filters.CharFilter(method="filter_reconciliation_status")
 
     # Exact / nested (✅ fixed to go through bank_account)
     entity          = filters.NumberFilter(field_name="bank_account__entity_id")
@@ -59,6 +69,38 @@ class BankTransactionFilter(filters.FilterSet):
             return qs.annotate(
                 has_matched_recon=Exists(matched_recon)
             ).filter(has_matched_recon=False).distinct()
+        return qs
+
+    def filter_reconciliation_status(self, qs, name, value: str):
+        """
+        ?reconciliation_status=matched|open|pending
+
+        Semantics match JournalEntryFilter.filter_reconciliation_status so the
+        Workbench's two panes stay symmetric:
+          - matched: has a Reconciliation in status matched/approved
+          - open:    has a Reconciliation but none is matched/approved
+          - pending: "not matched" — either no Reconciliation at all, or an
+                     open/in-progress one. This is the set the Workbench bank
+                     pane actually wants to see.
+        """
+        v = (value or "").strip().lower()
+        if not v:
+            return qs
+
+        matched_rec = Reconciliation.objects.filter(
+            bank_transactions=OuterRef("pk"),
+            status__in=["matched", "approved"],
+        )
+        any_rec = Reconciliation.objects.filter(bank_transactions=OuterRef("pk"))
+
+        if v == "matched":
+            return qs.filter(Exists(matched_rec)).distinct()
+        if v == "open":
+            return qs.filter(Exists(any_rec)).exclude(Exists(matched_rec)).distinct()
+        if v == "pending":
+            # "Not matched" — the Workbench only cares about these on the bank
+            # pane (mirrors JE filter's `pending` semantics).
+            return qs.exclude(Exists(matched_rec)).distinct()
         return qs
 
 
@@ -222,13 +264,88 @@ class JournalEntryFilter(filters.FilterSet):
     has_designated_bank = filters.BooleanFilter(method="filter_has_designated_bank")
     tag = filters.CharFilter(field_name="tag", lookup_expr="exact")
     erp_id = filters.CharFilter(field_name="erp_id", lookup_expr="exact")
+    # Let the frontend hydrate a batch of JEs by id (e.g. Sugestões page
+    # rendering persisted match suggestions that only stored bank_ids and
+    # journal_entries_ids). Mirrors the same filter on BankTransactionFilter.
+    id__in = NumberInFilter(field_name="id", lookup_expr="in")
     transaction_nf_number = filters.CharFilter(field_name="transaction__nf_number", lookup_expr="icontains")
     transaction_due_date_from = filters.DateFilter(field_name="transaction__due_date", lookup_expr="gte")
     transaction_due_date_to = filters.DateFilter(field_name="transaction__due_date", lookup_expr="lte")
+
+    # --- Workbench / reconciliation filters -------------------------------
+    # The frontend Workbench sends these params; without explicit declarations
+    # django_filter silently drops them and the endpoint returns the full
+    # (un-paginated) JE table, which times out under load.
+
+    # Ranges on the related Transaction.date (what the serializer exposes as
+    # `transaction_date`).
+    transaction_date_after = filters.DateFilter(
+        field_name="transaction__date", lookup_expr="gte"
+    )
+    transaction_date_before = filters.DateFilter(
+        field_name="transaction__date", lookup_expr="lte"
+    )
+
+    # Narrow to JEs hitting a specific bank GL (the cash/bank side of the
+    # transaction). The Workbench uses this to pair book rows against one
+    # bank statement.
+    bank_account = filters.NumberFilter(field_name="account__bank_account_id")
+
+    # Reconciliation status — mirrors JournalEntryListSerializer.get_reconciliation_status
+    # so the client-side and server-side views of the status agree.
+    reconciliation_status = filters.CharFilter(method="filter_reconciliation_status")
+
+    # Explicit ordering whitelist — lets the Workbench sort by the related
+    # transaction date (its default) without relying on DRF defaults.
+    ordering = filters.OrderingFilter(
+        fields=(
+            ("transaction__date", "transaction_date"),
+            ("date", "date"),
+            ("id", "id"),
+        )
+    )
 
     def filter_has_designated_bank(self, qs, name, value):
         if value is True:
             return qs.filter(account__bank_account__isnull=False)
         if value is False:
             return qs.filter(account__bank_account__isnull=True)
+        return qs
+
+    def filter_reconciliation_status(self, qs, name, value):
+        """
+        ?reconciliation_status=matched|open|pending
+
+        Matches the three-state classification used in
+        JournalEntryListSerializer.get_reconciliation_status:
+          - matched: linked to a Reconciliation in status matched/approved
+          - open:    linked to a Reconciliation that is not yet matched
+          - pending: bank-linked JE with no Reconciliation link
+        """
+        v = (value or "").strip().lower()
+        if not v:
+            return qs
+
+        matched_rec = Reconciliation.objects.filter(
+            journal_entries=OuterRef("pk"),
+            status__in=["matched", "approved"],
+        )
+        any_rec = Reconciliation.objects.filter(journal_entries=OuterRef("pk"))
+
+        if v == "matched":
+            return qs.filter(Exists(matched_rec))
+        if v == "open":
+            return (
+                qs.filter(account__bank_account__isnull=False)
+                .filter(Exists(any_rec))
+                .exclude(Exists(matched_rec))
+            )
+        if v == "pending":
+            # Bank-linked JEs without any matched reconciliation. The
+            # Workbench only cares about these (the book side of a
+            # bank-vs-book comparison).
+            return (
+                qs.filter(account__bank_account__isnull=False)
+                .exclude(Exists(matched_rec))
+            )
         return qs

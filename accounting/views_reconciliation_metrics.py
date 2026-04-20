@@ -283,3 +283,164 @@ class ReconciliationMetricsJournalEntryView(APIView):
             } if journal_entry.transaction_id else None,
         }, status=status.HTTP_200_OK)
 
+
+class ReconciliationKPIsView(APIView):
+    """
+    Tenant-scoped KPI snapshot for the Reconciliation dashboard.
+
+    GET /{tenant}/api/reconciliation/kpis/
+    Optional query params:
+      - date_from, date_to: YYYY-MM-DD (restrict unreconciled computation; defaults: no lower bound, today)
+      - lookback_days:      integer, default 30, window used for auto-match rate + task counts
+      - trend_days:         integer, default 14, window for daily unreconciled-count sparkline
+
+    Response:
+    {
+      "as_of": "2026-04-18",
+      "unreconciled": {
+        "count": 123,
+        "amount_abs": "12345.67",
+        "oldest_age_days": 42,
+        "oldest_date": "2026-03-07"
+      },
+      "tasks_30d": {
+        "completed": 17,
+        "failed": 2,
+        "running": 1,
+        "suggestion_count": 900,
+        "auto_match_applied": 750,
+        "automatch_rate": 0.8333
+      },
+      "trend_14d": [
+        {"date": "2026-04-05", "new_bank_tx": 12, "reconciled": 10}, ...
+      ]
+    }
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, tenant_id=None):
+        from decimal import Decimal
+        from datetime import timedelta
+        from django.db.models import Sum, Count, Q, F, Min
+        from django.db.models.functions import Abs, TruncDate
+        from multitenancy.utils import resolve_tenant
+        from accounting.models import BankTransaction, Reconciliation, ReconciliationTask
+
+        try:
+            company_id = resolve_tenant(tenant_id).id
+        except Exception:
+            return Response({"error": "invalid tenant"}, status=status.HTTP_400_BAD_REQUEST)
+
+        today = date.today()
+        date_to = parse_date(request.query_params.get("date_to") or "") or today
+        date_from = parse_date(request.query_params.get("date_from") or "")
+        try:
+            lookback_days = int(request.query_params.get("lookback_days") or 30)
+            trend_days = int(request.query_params.get("trend_days") or 14)
+        except (TypeError, ValueError):
+            return Response({"error": "lookback_days and trend_days must be integers"}, status=status.HTTP_400_BAD_REQUEST)
+
+        lookback_start = today - timedelta(days=lookback_days)
+        trend_start = today - timedelta(days=trend_days - 1)
+
+        # --- Unreconciled bank transactions ---
+        # A bank tx is unreconciled if it has NO reconciliation record with a "closed" status.
+        closed_statuses = ["matched", "approved"]
+        bt_qs = BankTransaction.objects.filter(
+            company_id=company_id,
+            is_deleted=False,
+        ).exclude(
+            reconciliations__status__in=closed_statuses,
+            reconciliations__is_deleted=False,
+        )
+        if date_from:
+            bt_qs = bt_qs.filter(date__gte=date_from)
+        if date_to:
+            bt_qs = bt_qs.filter(date__lte=date_to)
+
+        agg = bt_qs.aggregate(
+            count=Count("id", distinct=True),
+            amount_abs=Sum(Abs(F("amount"))),
+            oldest_date=Min("date"),
+        )
+        count = int(agg.get("count") or 0)
+        amount_abs = agg.get("amount_abs") or Decimal("0")
+        oldest_date = agg.get("oldest_date")
+        oldest_age = (today - oldest_date).days if oldest_date else None
+
+        # --- Tasks in lookback window ---
+        tasks = ReconciliationTask.objects.filter(
+            tenant_id=str(company_id),
+            updated_at__date__gte=lookback_start,
+        )
+        task_totals = tasks.aggregate(
+            completed=Count("id", filter=Q(status="completed")),
+            failed=Count("id", filter=Q(status="failed")),
+            running=Count("id", filter=Q(status__in=["running", "queued"])),
+            suggestion_count=Sum("suggestion_count", filter=Q(status="completed")),
+            auto_match_applied=Sum("auto_match_applied", filter=Q(status="completed")),
+        )
+        sug = int(task_totals.get("suggestion_count") or 0)
+        auto = int(task_totals.get("auto_match_applied") or 0)
+        automatch_rate = float(auto / sug) if sug > 0 else None
+
+        # --- Trend: daily new bank tx vs. daily reconciliations ---
+        bt_trend = (
+            BankTransaction.objects.filter(
+                company_id=company_id,
+                is_deleted=False,
+                date__gte=trend_start,
+                date__lte=today,
+            )
+            .values("date")
+            .annotate(n=Count("id"))
+            .order_by("date")
+        )
+        bt_by_day = {r["date"]: r["n"] for r in bt_trend}
+
+        rec_trend = (
+            Reconciliation.objects.filter(
+                company_id=company_id,
+                is_deleted=False,
+                status__in=closed_statuses,
+                updated_at__date__gte=trend_start,
+                updated_at__date__lte=today,
+            )
+            .annotate(d=TruncDate("updated_at"))
+            .values("d")
+            .annotate(n=Count("id"))
+            .order_by("d")
+        )
+        rec_by_day = {r["d"]: r["n"] for r in rec_trend}
+
+        trend = []
+        for i in range(trend_days):
+            d = trend_start + timedelta(days=i)
+            trend.append({
+                "date": d.isoformat(),
+                "new_bank_tx": int(bt_by_day.get(d) or 0),
+                "reconciled": int(rec_by_day.get(d) or 0),
+            })
+
+        return Response(
+            {
+                "as_of": today.isoformat(),
+                "unreconciled": {
+                    "count": count,
+                    "amount_abs": str(amount_abs),
+                    "oldest_age_days": oldest_age,
+                    "oldest_date": oldest_date.isoformat() if oldest_date else None,
+                },
+                "tasks_30d": {
+                    "completed": int(task_totals.get("completed") or 0),
+                    "failed": int(task_totals.get("failed") or 0),
+                    "running": int(task_totals.get("running") or 0),
+                    "suggestion_count": sug,
+                    "auto_match_applied": auto,
+                    "automatch_rate": automatch_rate,
+                },
+                "trend_14d": trend,
+            },
+            status=status.HTTP_200_OK,
+        )

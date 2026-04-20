@@ -33,7 +33,11 @@ from .views_reconciliation_metrics import (
     ReconciliationMetricsRecalculateView,
     ReconciliationMetricsTransactionView,
     ReconciliationMetricsJournalEntryView,
+    ReconciliationKPIsView,
 )
+from .views_search import GlobalSearchView
+from .views_notifications import NotificationsView
+from .views_reconciliation_filters import FilterColumnsView, PreviewCountsView
 from .views import FixImportedJournalEntryDates, ReconciliationRecordTagBulkView, BankBookDailyBalanceView
 from .views_template_preview import template_preview_page, generate_preview
 from .views import (
@@ -111,6 +115,20 @@ urlpatterns = [
     # Balance history recalculation
     re_path(r'^api/balance-history/recalculate/?$', BalanceHistoryRecalculateView.as_view(), name='balance-history-recalculate'),
     
+    # Reconciliation KPIs (dashboard aggregation)
+    re_path(r'^api/reconciliation-kpis/?$', ReconciliationKPIsView.as_view(), name='reconciliation-kpis'),
+
+    # Reconciliation filter-stack UI support (hyphenated to avoid
+    # collision with ReconciliationViewSet's /reconciliation/<pk>/ route)
+    re_path(r'^api/reconciliation-filter-columns/?$', FilterColumnsView.as_view(), name='reconciliation-filter-columns'),
+    re_path(r'^api/reconciliation-preview-counts/?$', PreviewCountsView.as_view(), name='reconciliation-preview-counts'),
+
+    # Global cross-entity search (⌘K)
+    re_path(r'^api/search/?$', GlobalSearchView.as_view(), name='global-search'),
+
+    # Notifications (derived feed for topbar bell)
+    re_path(r'^api/notifications/?$', NotificationsView.as_view(), name='notifications'),
+
     # Reconciliation metrics
     re_path(r'^api/reconciliation-metrics/recalculate/?$', ReconciliationMetricsRecalculateView.as_view(), name='reconciliation-metrics-recalculate'),
     re_path(r'^api/reconciliation-metrics/transaction/(?P<transaction_id>\d+)/?$', ReconciliationMetricsTransactionView.as_view(), name='reconciliation-metrics-transaction'),

@@ -49,7 +49,36 @@ class ScopedQuerysetMixin:
     - If not superuser:
         - For CustomUser: only their own record.
         - For other models: restrict to current tenant if request.tenant exists.
+
+    DELETE handling:
+    When the model has an ``is_deleted`` field, ``perform_destroy`` **soft-deletes**
+    by setting ``is_deleted=True`` instead of removing the row. Callers can opt in
+    to a hard delete by passing ``?hard=1`` (superusers only — regular users cannot
+    bypass the soft-delete safety net).
     """
+
+    def perform_destroy(self, instance):
+        model = type(instance)
+        if not model_has_soft_delete(model):
+            instance.delete()
+            return
+        hard = (
+            str(self.request.query_params.get("hard", "")).lower() in ("1", "true", "yes")
+            if hasattr(self.request, "query_params")
+            else False
+        )
+        user = getattr(self.request, "user", None)
+        if hard and user is not None and getattr(user, "is_superuser", False):
+            instance.delete()
+            return
+        # Soft-delete path: mark the row and save just the flag + updated_at.
+        instance.is_deleted = True
+        update_fields = ["is_deleted"]
+        if any(getattr(f, "name", None) == "updated_at" for f in model._meta.fields):
+            from django.utils import timezone
+            instance.updated_at = timezone.now()
+            update_fields.append("updated_at")
+        instance.save(update_fields=update_fields)
 
     def get_queryset(self):
         qs = super().get_queryset()

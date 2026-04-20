@@ -117,6 +117,7 @@ from .serializers import EmbedTestSerializer, BackfillSerializer, EmbeddingSearc
 from django.core.cache import cache
 from core.models import Job
 from core.serializers import JobSerializer
+from core.utils.pagination import OptInPageNumberPagination
 from pgvector.django import CosineDistance
 
 from core.chat.retrieval import _vec_stats, _snippet, _strip_accents, json_safe
@@ -339,12 +340,57 @@ class AccountSummaryView(APIView):
 class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Reconciliation.objects.all()
     serializer_class = ReconciliationSerializer
-    
+
+    # Backward compatibility: the legacy frontend expects /api/reconciliation/
+    # and /api/reconciliation/summaries/ to return a flat array. New callers
+    # opt into pagination with ?page=, ?page_size=, or ?paginate=true.
+    pagination_class = OptInPageNumberPagination
+
     if settings.AUTH_OFF:
         permission_classes = []
     else:
         permission_classes = [permissions.IsAuthenticated]
-    
+
+    @action(methods=['post'], detail=True, url_path='unmatch')
+    def unmatch(self, request, pk=None, *args, **kwargs):
+        """
+        Undo a reconciliation. Clears M2M relations and marks the Reconciliation
+        as ``unmatched`` (or soft-deletes it when ``{"delete": true}`` is passed).
+        Freed BankTransactions/JournalEntries become available again.
+
+        POST /{tenant}/api/reconciliation/{id}/unmatch/
+        Body: {"reason": "...", "delete": false}
+        """
+        recon = self.get_object()
+        reason = (request.data or {}).get("reason", "")
+        do_delete = bool((request.data or {}).get("delete", False))
+
+        bank_ids = list(recon.bank_transactions.values_list("id", flat=True))
+        je_ids = list(recon.journal_entries.values_list("id", flat=True))
+        recon.bank_transactions.clear()
+        recon.journal_entries.clear()
+
+        suffix = f"[unmatched{' & deleted' if do_delete else ''}] {reason}".strip()
+        recon.notes = (recon.notes + "\n" if recon.notes else "") + suffix
+        if do_delete:
+            recon.is_deleted = True
+            recon.save(update_fields=["is_deleted", "notes", "updated_at"])
+        else:
+            recon.status = "unmatched"
+            recon.save(update_fields=["status", "notes", "updated_at"])
+
+        from accounting.models import BankTransaction as _BT, JournalEntry as _JE
+        _BT.objects.filter(id__in=bank_ids).update(balance_validated=False)
+        _JE.objects.filter(id__in=je_ids).update(is_reconciled=False)
+
+        return Response({
+            "id": recon.id,
+            "status": recon.status,
+            "is_deleted": recon.is_deleted,
+            "released_bank_transactions": bank_ids,
+            "released_journal_entries": je_ids,
+        }, status=status.HTTP_200_OK)
+
     # Bulk operations
     @action(methods=['post'], detail=False)
     def bulk_create(self, request, *args, **kwargs):
@@ -360,15 +406,15 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         #bank_filters = data.get("bank_filters", {})
         print(request.data)
         ids = request.data if isinstance(request.data, list) else []
-    
+
         if not ids:
             return Response(
                 {'detail': 'Provide a non-empty list of IDs to delete.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
+
         return generic_bulk_delete(self, ids)
-    
+
     @action(methods=['get'], detail=False, url_path='summaries')
     def summaries(self, request, *args, **kwargs):
         """
@@ -883,6 +929,12 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         permission_classes = []
     else:
         permission_classes = [permissions.IsAuthenticated]
+
+    # Opt out of pagination: the Transactions management page is expected to
+    # show the full set for the current filters so bulk actions and sort are
+    # consistent. Callers are expected to filter by date range / state to cap.
+    pagination_class = None
+
     #queryset = Transaction.objects.select_related('company').prefetch_related('journal_entries')
     queryset = (
         Transaction.objects
@@ -1319,7 +1371,12 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     serializer_class = JournalEntrySerializer
     filter_backends = [DjangoFilterBackend]
     filterset_class = JournalEntryFilter
-    
+
+    # Opt out of pagination for the same reason as BankTransactionViewSet:
+    # reconciliation candidates must be fully visible to the Workbench so
+    # selection + matching is consistent with the full unreconciled set.
+    pagination_class = None
+
     if settings.AUTH_OFF:
         permission_classes = []
     else:
@@ -1429,15 +1486,16 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         """
         Returns journal entries that are unmatched (not reconciled).
         Optional query parameters:
-        - date_from / date_to: filter by transaction date
+        - date_from / date_to: filter by JE date
+        - bank_account: restrict to a single bank account id
         - tag: exact match on reconciliation tag (same as list endpoint)
         """
         from django.db.models import Exists, OuterRef, Case, When, Value, CharField, F, Prefetch
-        
+
         # Use get_queryset() to ensure tenant filtering is applied via ScopedQuerysetMixin
         # Base queryset: only journal entries tied to a bank account
         qs = self.get_queryset().filter(account__bank_account__isnull=False)
-        
+
         # Apply optional date filters
         date_from = request.query_params.get("date_from")
         date_to = request.query_params.get("date_to")
@@ -1445,6 +1503,12 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             qs = qs.filter(date__gte=date_from)
         if date_to:
             qs = qs.filter(date__lte=date_to)
+        bank_account = request.query_params.get("bank_account")
+        if bank_account:
+            try:
+                qs = qs.filter(account__bank_account_id=int(bank_account))
+            except (TypeError, ValueError):
+                pass
         if "tag" in request.query_params:
             qs = qs.filter(tag=request.query_params.get("tag", ""))
         
@@ -2151,7 +2215,14 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         permission_classes = []
     else:
         permission_classes = [permissions.IsAuthenticated]
-        
+
+    # Opt out of the global LargePageNumberPagination: the reconciliation
+    # Workbench virtualizes the full candidate list and matches by explicit ID,
+    # so silent truncation to page_size=1000 would hide records and produce
+    # incomplete matches. Clients should apply date/bank/status filters to
+    # keep payloads reasonable.
+    pagination_class = None
+
     queryset = (
         BankTransaction.objects
         .select_related("bank_account", "bank_account__entity", "currency")
@@ -4178,11 +4249,16 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         Accepts payload keys:
           - bank_ids: optional list of BankTransaction IDs
           - book_ids: optional list of journal Transaction IDs
+          - bank_filter_overrides: optional filter-stack JSON applied to BankTransaction
+          - book_filter_overrides: optional filter-stack JSON applied to JournalEntry
+          - override_mode: "append" (default) | "replace" | "intersect" — how filter-resolved
+                           IDs combine with explicit bank_ids/book_ids
+          - merge_config_filters: if true, ALSO AND the stage config's own bank_filters/book_filters
           - config_id: ID of a ReconciliationConfig (run single stage)
           - pipeline_id: ID of a ReconciliationPipeline (run multi-stage)
           - auto_match_100: if true, auto-persist matches with confidence==1.0
         """
-        data = request.data
+        data = dict(request.data or {})
         auto_match_100 = _to_bool(data.get("auto_match_100", False))
 
         config_id = data.get("config_id")
@@ -4206,6 +4282,63 @@ class ReconciliationTaskViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 soft_limit = getattr(pipe, "soft_time_limit_seconds", None)
             except ReconciliationPipeline.DoesNotExist:
                 pipe = None
+
+        # -------------------------------------------------------------------
+        #  Filter-stack overrides → resolve to IDs and merge into bank/book_ids
+        # -------------------------------------------------------------------
+        try:
+            from accounting.services.filter_compiler import (
+                apply_stack, merge_ids, compile_stack_report,
+            )
+
+            company = resolve_tenant(tenant_id) if tenant_id else None
+            company_id = getattr(company, "id", None)
+
+            override_mode = (data.get("override_mode") or "append").lower()
+            if override_mode not in ("append", "replace", "intersect"):
+                override_mode = "append"
+            merge_cfg_filters = _to_bool(data.get("merge_config_filters", False))
+
+            def _scoped_qs(model):
+                qs = model.objects.all()
+                if company_id is not None:
+                    qs = qs.filter(company_id=company_id)
+                return qs
+
+            warnings_collected: list[str] = []
+
+            bank_override = data.get("bank_filter_overrides")
+            if bank_override or (merge_cfg_filters and cfg and cfg.bank_filters):
+                qs = _scoped_qs(BankTransaction)
+                if merge_cfg_filters and cfg and cfg.bank_filters:
+                    qs = apply_stack(qs, cfg.bank_filters, "bank_transaction")
+                if bank_override:
+                    qs = apply_stack(qs, bank_override, "bank_transaction")
+                    _, w = compile_stack_report(bank_override, "bank_transaction")
+                    warnings_collected.extend([f"bank: {m}" for m in w])
+                resolved_bank_ids = list(qs.values_list("id", flat=True))
+                data["bank_ids"] = merge_ids(
+                    data.get("bank_ids"), resolved_bank_ids, mode=override_mode,
+                )
+
+            book_override = data.get("book_filter_overrides")
+            if book_override or (merge_cfg_filters and cfg and cfg.book_filters):
+                qs = _scoped_qs(JournalEntry)
+                if merge_cfg_filters and cfg and cfg.book_filters:
+                    qs = apply_stack(qs, cfg.book_filters, "journal_entry")
+                if book_override:
+                    qs = apply_stack(qs, book_override, "journal_entry")
+                    _, w = compile_stack_report(book_override, "journal_entry")
+                    warnings_collected.extend([f"book: {m}" for m in w])
+                resolved_book_ids = list(qs.values_list("id", flat=True))
+                data["book_ids"] = merge_ids(
+                    data.get("book_ids"), resolved_book_ids, mode=override_mode,
+                )
+
+            if warnings_collected:
+                data["_filter_warnings"] = warnings_collected
+        except Exception:
+            logger.exception("Filter-override resolution failed; falling back to explicit IDs")
 
         task_obj = ReconciliationTask.objects.create(
             task_id=uuid.uuid4(),
