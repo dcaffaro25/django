@@ -10,19 +10,19 @@ from rest_framework.routers import DefaultRouter
 
 from .views import (
     AiStub,
-    CalculateStub,
-    ExportStub,
+    CalculateViewSet,
+    ExportViewSet,
     ReportInstanceViewSet,
     ReportTemplateViewSet,
-    SaveStub,
+    SaveViewSet,
 )
 
 router = DefaultRouter()
 router.register(r"templates", ReportTemplateViewSet, basename="reports-templates")
 router.register(r"instances", ReportInstanceViewSet, basename="reports-instances")
-router.register(r"calculate", CalculateStub, basename="reports-calculate")
-router.register(r"save", SaveStub, basename="reports-save")
-router.register(r"export", ExportStub, basename="reports-export")
+router.register(r"calculate", CalculateViewSet, basename="reports-calculate")
+router.register(r"save", SaveViewSet, basename="reports-save")
+router.register(r"export", ExportViewSet, basename="reports-export")
 router.register(r"ai", AiStub, basename="reports-ai")
 
 urlpatterns = router.urls

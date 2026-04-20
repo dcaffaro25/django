@@ -1,14 +1,14 @@
 """ViewSets for :mod:`accounting.reports`.
 
-PR 1 scope: CRUD for ``ReportTemplate`` and read + metadata-update for
-``ReportInstance``. The stateless ``/calculate/``, ``/save/``, ``/export/*``,
-and ``/ai/*`` endpoints land in later PRs; stubs are included here returning
-501 so the URL surface is stable from day one.
+PR 3: the stateless /calculate/, /save/, /export/{xlsx,pdf}/ endpoints now
+sit on the real ``ReportCalculator`` + exporters. AI endpoints remain stubs
+pending PR 6+.
 """
 
 from copy import deepcopy
 
 from django.db import transaction
+from django.http import HttpResponse
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
@@ -22,6 +22,13 @@ from .serializers import (
     ReportInstanceSerializer,
     ReportTemplateSerializer,
 )
+from .services.calculator import ReportCalculator
+from .services.document_schema import validate_document
+from .services.exporter_pdf import PdfBackendUnavailable, build_pdf
+from .services.exporter_xlsx import build_xlsx
+
+
+# --- Template CRUD ---------------------------------------------------------
 
 
 class ReportTemplateViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
@@ -41,9 +48,7 @@ class ReportTemplateViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return qs
 
     def perform_create(self, serializer):
-        tenant = getattr(self.request, "tenant", None)
-        if not tenant or tenant == "all":
-            raise ValidationError("Company/tenant not found in request")
+        tenant = _tenant_or_raise(self.request)
         with transaction.atomic():
             serializer.save(company=tenant)
 
@@ -70,7 +75,6 @@ class ReportTemplateViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def set_default(self, request, pk=None, tenant_id=None):
-        """Mark this template as the default for its report type."""
         tpl = self.get_object()
         ReportTemplate.objects.filter(
             company=tpl.company,
@@ -82,11 +86,13 @@ class ReportTemplateViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return Response({"status": "default set"})
 
 
+# --- Instances CRUD (metadata only) ---------------------------------------
+
+
 class ReportInstanceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     """Read + metadata-update (status, notes) for saved report instances.
 
-    Creation is handled by ``/api/reports/save/`` (see later PR); POST to the
-    collection endpoint is disabled.
+    Creation goes through ``/api/reports/save/`` (see :class:`SaveViewSet`).
     """
 
     queryset = ReportInstance.objects.all()
@@ -100,66 +106,240 @@ class ReportInstanceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset()
-        report_type = self.request.query_params.get("report_type")
-        if report_type:
-            qs = qs.filter(report_type=report_type)
-        status_param = self.request.query_params.get("status")
-        if status_param:
-            qs = qs.filter(status=status_param)
-        template = self.request.query_params.get("template")
-        if template:
-            qs = qs.filter(template_id=template)
+        rt = self.request.query_params.get("report_type")
+        if rt:
+            qs = qs.filter(report_type=rt)
+        status_q = self.request.query_params.get("status")
+        if status_q:
+            qs = qs.filter(status=status_q)
+        tpl = self.request.query_params.get("template")
+        if tpl:
+            qs = qs.filter(template_id=tpl)
         return qs
 
 
-# --- Stubs for later PRs ----------------------------------------------------
-#
-# These are registered now so the URL surface is stable and the OpenAPI / API
-# discovery is predictable. Each returns HTTP 501 until the corresponding PR
-# implements it.
+# --- Stateless: Calculate -------------------------------------------------
 
-class NotImplementedMixin:
+
+class CalculateViewSet(viewsets.ViewSet):
+    """``POST /api/reports/calculate/`` — runs ``ReportCalculator`` and returns
+    the result. Accepts either an inline ``template`` (the canonical JSON
+    document) or a saved ``template_id``. Never writes to the DB.
+    """
+
+    def create(self, request, tenant_id=None):
+        tenant = _tenant_or_raise(request)
+        body = request.data or {}
+
+        document = _resolve_inline_or_id(body, company=tenant)
+        periods = body.get("periods") or []
+        options = body.get("options") or {}
+        if not isinstance(periods, list) or not periods:
+            raise ValidationError({"periods": "At least one period is required"})
+
+        calc = ReportCalculator(company_id=tenant.id)
+        try:
+            result = calc.calculate(document=document, periods=periods, options=options)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        return Response(result, status=status.HTTP_200_OK)
+
+
+# --- Stateful: Save -------------------------------------------------------
+
+
+class SaveViewSet(viewsets.ViewSet):
+    """``POST /api/reports/save/`` — persists a ``ReportInstance``.
+
+    Accepts either ``{template_id, periods, options, name, status, notes}``
+    (the server runs /calculate/ internally and saves the result) or
+    ``{template, periods, options, result, name, status, notes}`` (the client
+    already has the result and just wants to save it). Supplying ``result``
+    avoids re-running the calculation; the server still re-validates the
+    document for the template_snapshot copy.
+    """
+
+    def create(self, request, tenant_id=None):
+        tenant = _tenant_or_raise(request)
+        body = request.data or {}
+
+        name = (body.get("name") or "").strip()
+        if not name:
+            raise ValidationError({"name": "Name is required"})
+
+        document = _resolve_inline_or_id(body, company=tenant)
+        periods = body.get("periods") or []
+        options = body.get("options") or {}
+        result = body.get("result")
+        state = body.get("status", "draft")
+
+        if not isinstance(periods, list) or not periods:
+            raise ValidationError({"periods": "At least one period is required"})
+
+        # Either recompute or trust what the client sends. Recomputing is
+        # cheaper than the round-trip of /calculate/ + /save/ for most cases,
+        # so default to recomputing unless the client explicitly passed a
+        # result payload.
+        if not result:
+            calc = ReportCalculator(company_id=tenant.id)
+            try:
+                result = calc.calculate(document=document, periods=periods, options=options)
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
+
+        template_id = body.get("template_id")
+        template_obj = None
+        if template_id:
+            try:
+                template_obj = ReportTemplate.objects.get(id=template_id, company=tenant)
+            except ReportTemplate.DoesNotExist:
+                pass  # soft reference; we snapshot the document regardless
+
+        with transaction.atomic():
+            instance = ReportInstance.objects.create(
+                company=tenant,
+                template=template_obj,
+                template_snapshot=_coerce_to_dict(document),
+                name=name,
+                report_type=_coerce_to_dict(document).get("report_type", "custom"),
+                periods=result.get("periods", periods),
+                result=result,
+                status=state,
+                generated_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+                notes=body.get("notes"),
+            )
+
+        serializer = ReportInstanceSerializer(instance)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+# --- Export: XLSX & PDF ---------------------------------------------------
+
+
+class ExportViewSet(viewsets.ViewSet):
+    """``POST /api/reports/export/{xlsx,pdf}/``.
+
+    Body: either ``{result, name?}`` (stateless — render what the client
+    already has) or ``{instance_id}`` (load the persisted result and render).
+    Both variants return the binary directly with the right content-type and
+    Content-Disposition so the browser downloads.
+    """
+
+    @action(detail=False, methods=["post"], url_path="xlsx")
+    def xlsx(self, request, tenant_id=None):
+        tenant = _tenant_or_raise(request)
+        result, name = _load_result(request.data or {}, tenant=tenant)
+        blob = build_xlsx(result, name=name)
+        resp = HttpResponse(
+            blob,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        resp["Content-Disposition"] = f'attachment; filename="{_safe_filename(name)}.xlsx"'
+        return resp
+
+    @action(detail=False, methods=["post"], url_path="pdf")
+    def pdf(self, request, tenant_id=None):
+        tenant = _tenant_or_raise(request)
+        result, name = _load_result(request.data or {}, tenant=tenant)
+        try:
+            blob = build_pdf(result, name=name)
+        except PdfBackendUnavailable as exc:
+            return Response(
+                {"error": str(exc)}, status=status.HTTP_501_NOT_IMPLEMENTED,
+            )
+        resp = HttpResponse(blob, content_type="application/pdf")
+        resp["Content-Disposition"] = f'attachment; filename="{_safe_filename(name)}.pdf"'
+        return resp
+
+
+# --- AI Stubs (implemented in later PRs) ----------------------------------
+
+
+class AiStub(viewsets.ViewSet):
     @staticmethod
-    def _not_implemented(feature: str):
+    def _ni(feature: str):
         return Response(
             {"error": f"{feature} — not yet implemented (lands in a later PR)"},
             status=status.HTTP_501_NOT_IMPLEMENTED,
         )
 
-
-class CalculateStub(NotImplementedMixin, viewsets.ViewSet):
-    def create(self, request, tenant_id=None):
-        return self._not_implemented("POST /api/reports/calculate/")
-
-
-class SaveStub(NotImplementedMixin, viewsets.ViewSet):
-    def create(self, request, tenant_id=None):
-        return self._not_implemented("POST /api/reports/save/")
-
-
-class ExportStub(NotImplementedMixin, viewsets.ViewSet):
-    @action(detail=False, methods=["post"], url_path="xlsx")
-    def xlsx(self, request, tenant_id=None):
-        return self._not_implemented("POST /api/reports/export/xlsx/")
-
-    @action(detail=False, methods=["post"], url_path="pdf")
-    def pdf(self, request, tenant_id=None):
-        return self._not_implemented("POST /api/reports/export/pdf/")
-
-
-class AiStub(NotImplementedMixin, viewsets.ViewSet):
     @action(detail=False, methods=["post"], url_path="generate-template")
     def generate_template(self, request, tenant_id=None):
-        return self._not_implemented("POST /api/reports/ai/generate-template/")
+        return self._ni("POST /api/reports/ai/generate-template/")
 
     @action(detail=False, methods=["post"])
     def refine(self, request, tenant_id=None):
-        return self._not_implemented("POST /api/reports/ai/refine/")
+        return self._ni("POST /api/reports/ai/refine/")
 
     @action(detail=False, methods=["post"])
     def chat(self, request, tenant_id=None):
-        return self._not_implemented("POST /api/reports/ai/chat/")
+        return self._ni("POST /api/reports/ai/chat/")
 
     @action(detail=False, methods=["post"])
     def explain(self, request, tenant_id=None):
-        return self._not_implemented("POST /api/reports/ai/explain/")
+        return self._ni("POST /api/reports/ai/explain/")
+
+
+# --- Helpers --------------------------------------------------------------
+
+
+def _tenant_or_raise(request):
+    tenant = getattr(request, "tenant", None)
+    if not tenant or tenant == "all":
+        raise ValidationError("Company/tenant not found in request")
+    return tenant
+
+
+def _resolve_inline_or_id(body: dict, company) -> dict:
+    """Return the document dict for either ``{template: {...}}`` or
+    ``{template_id: N}``. Inline wins if both are present.
+    """
+    inline = body.get("template") or body.get("document")
+    if inline:
+        # Validate now so /calculate/ gets a clean 400 instead of a cryptic
+        # exception from deeper in the stack.
+        try:
+            validate_document(inline)
+        except Exception as exc:
+            raise ValidationError({"template": str(exc)}) from exc
+        return inline
+
+    template_id = body.get("template_id")
+    if not template_id:
+        raise ValidationError(
+            {"template": "Provide either 'template' (inline) or 'template_id'"},
+        )
+    try:
+        tpl = ReportTemplate.objects.get(id=template_id, company=company)
+    except ReportTemplate.DoesNotExist:
+        raise ValidationError({"template_id": f"No template with id {template_id}"})
+    return tpl.document
+
+
+def _load_result(body: dict, tenant) -> tuple[dict, str]:
+    """Extract a result + name from either an inline result or an instance_id."""
+    if body.get("instance_id"):
+        try:
+            inst = ReportInstance.objects.get(id=body["instance_id"], company=tenant)
+        except ReportInstance.DoesNotExist:
+            raise ValidationError({"instance_id": "Not found"})
+        return inst.result, inst.name
+
+    result = body.get("result")
+    name = body.get("name") or "Demonstrativo"
+    if not isinstance(result, dict) or "lines" not in result:
+        raise ValidationError(
+            {"result": "Provide either 'instance_id' or a result dict with 'lines'"},
+        )
+    return result, name
+
+
+def _coerce_to_dict(doc) -> dict:
+    """Accept either a dict (inline) or a pydantic model (unlikely here)."""
+    if hasattr(doc, "model_dump"):
+        return doc.model_dump(mode="json")
+    return doc
+
+
+def _safe_filename(name: str) -> str:
+    return "".join(c for c in (name or "report") if c.isalnum() or c in "-_ ").strip() or "report"
