@@ -17,6 +17,7 @@ from django.contrib import admin
 from django.urls import path, include, re_path
 from django.conf import settings
 from django.conf.urls.static import static
+from rest_framework.authtoken.views import obtain_auth_token
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from . import views
 from accounting.views_celery import start_task, task_status
@@ -37,11 +38,13 @@ urlpatterns = [
     re_path(r'^(?P<tenant_id>[^/]+)/', include('knowledge_base.urls')),
     # ERP API routes are merged under accounting/urls.py (api/) so they resolve; a standalone include here never runs.
     #path('api/', include('accounting.urls')),
-    # JWT token endpoints — must use re_path for regex optional trailing slash;
-    # path() treated the leading ^ / trailing $/? literally and served a
-    # nonsensical URL, causing 404s on POST /api/token/ from the SPA.
-    re_path(r'^api/token/?$', TokenObtainPairView.as_view(), name='token_obtain_pair'),
-    re_path(r'^api/token/refresh/?$', TokenRefreshView.as_view(), name='token_refresh'),
+    # POST /api/token/ → DRF obtain_auth_token: returns {token} for the
+    # username/password SPA login flow. The client sends it back as
+    # Authorization: Token <key>, which DRF TokenAuthentication parses.
+    re_path(r'^api/token/?$', obtain_auth_token, name='obtain_auth_token'),
+    # SimpleJWT endpoints retained but not used by the SPA (other clients may).
+    re_path(r'^api/jwt/?$', TokenObtainPairView.as_view(), name='token_obtain_pair'),
+    re_path(r'^api/jwt/refresh/?$', TokenRefreshView.as_view(), name='token_refresh'),
     path("celery/start/", start_task, name="celery_start"),
     path("celery/status/<str:task_id>/", task_status, name="celery_status"),
     re_path('', include('npl.urls')),
