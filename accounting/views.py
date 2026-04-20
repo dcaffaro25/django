@@ -946,8 +946,31 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         serializer_class = self.get_serializer_class()  # use list vs detail serializer
         serializer = serializer_class(qs_unmatched, many=True)
         return Response(serializer.data)
-    
-    
+
+    @action(detail=True, methods=['get'], url_path='journal_entries')
+    def journal_entries(self, request, pk=None, tenant_id=None):
+        """
+        Return the journal entries of a single transaction.
+
+        GET /{tenant}/api/transactions/{id}/journal_entries/
+
+        Reuses the detail JournalEntrySerializer shape (id, account,
+        debit_amount, credit_amount, state, date, description, cost_center,
+        bank_designation_pending, has_designated_bank, notes, tag, erp_id)
+        so the frontend can render a nested JE table under each transaction
+        row without a second fetch per JE. Always unpaginated — one tx
+        typically has a handful of entries.
+        """
+        tx = self.get_object()  # ScopedQuerysetMixin ensures tenant scope
+        qs = (
+            tx.journal_entries
+            .select_related('account', 'cost_center')
+            .order_by('id')
+        )
+        serializer = JournalEntrySerializer(qs, many=True, context={'request': request})
+        return Response(serializer.data)
+
+
     
     # Bulk operations
     @action(methods=['post'], detail=False)
