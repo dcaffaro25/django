@@ -9,7 +9,6 @@ import {
   Loader2,
   Search,
   Trash2,
-  Undo2,
   X,
 } from "lucide-react"
 
@@ -55,7 +54,6 @@ import {
 import {
   useDeleteReconciliation,
   useReconciliationSummaries,
-  useUnmatchReconciliation,
   useUpdateReconciliation,
 } from "@/features/reconciliation"
 import type { ReconciliationSummary } from "@/features/reconciliation/types"
@@ -113,54 +111,20 @@ export function ReconciliationsPage() {
     return rows.filter((r) => matchesSearch(r, q))
   }, [rows, search])
 
-  const unmatch = useUnmatchReconciliation()
   const update = useUpdateReconciliation()
   const del = useDeleteReconciliation()
 
   // Dialog state ------------------------------------------------------------
-  const [unmatchTarget, setUnmatchTarget] = useState<ReconciliationSummary | null>(null)
-  const [unmatchReason, setUnmatchReason] = useState("")
-  const [unmatchHardDelete, setUnmatchHardDelete] = useState(false)
-
   const [approveTarget, setApproveTarget] = useState<ReconciliationSummary | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<ReconciliationSummary | null>(null)
   const [editTarget, setEditTarget] = useState<ReconciliationSummary | null>(null)
   const [editReference, setEditReference] = useState("")
   const [editNotes, setEditNotes] = useState("")
 
-  const openUnmatch = (row: ReconciliationSummary) => {
-    setUnmatchTarget(row)
-    setUnmatchReason("")
-    setUnmatchHardDelete(false)
-  }
-
   const openEdit = (row: ReconciliationSummary) => {
     setEditTarget(row)
     setEditReference(row.reference ?? "")
     setEditNotes(row.notes ?? "")
-  }
-
-  const confirmUnmatch = () => {
-    if (!unmatchTarget) return
-    unmatch.mutate(
-      {
-        id: unmatchTarget.reconciliation_id,
-        reason: unmatchReason || undefined,
-        delete: unmatchHardDelete || undefined,
-      },
-      {
-        onSuccess: () => {
-          toast.success(t("matches.toasts.unmatched"))
-          setUnmatchTarget(null)
-          setSelected((s) => {
-            const next = new Set(s)
-            next.delete(unmatchTarget.reconciliation_id)
-            return next
-          })
-        },
-        onError: () => toast.error(t("matches.toasts.error")),
-      },
-    )
   }
 
   const confirmApprove = () => {
@@ -221,18 +185,6 @@ export function ReconciliationsPage() {
     ).then((results) => {
       const ok = results.filter(Boolean).length
       toast.success(t("matches.toasts.approved") + ` (${ok}/${ids.length})`)
-      setSelected(new Set())
-    })
-  }
-
-  const bulkUnmatch = () => {
-    const ids = [...selected]
-    if (!ids.length) return
-    Promise.all(
-      ids.map((id) => unmatch.mutateAsync({ id }).catch(() => null)),
-    ).then((results) => {
-      const ok = results.filter(Boolean).length
-      toast.success(t("matches.toasts.unmatched") + ` (${ok}/${ids.length})`)
       setSelected(new Set())
     })
   }
@@ -327,10 +279,6 @@ export function ReconciliationsPage() {
             <Button size="sm" variant="outline" onClick={bulkApprove}>
               <CheckCircle2 className="mr-1 h-3.5 w-3.5" />
               {t("matches.bulk.approve")}
-            </Button>
-            <Button size="sm" variant="outline" onClick={bulkUnmatch}>
-              <Undo2 className="mr-1 h-3.5 w-3.5" />
-              {t("matches.bulk.unmatch")}
             </Button>
             <Button size="sm" variant="ghost" onClick={() => setSelected(new Set())}>
               {t("matches.bulk.clear")}
@@ -491,15 +439,6 @@ export function ReconciliationsPage() {
                           <Button
                             size="sm"
                             variant="ghost"
-                            className="h-7 w-7 p-0"
-                            title={t("matches.actions.unmatch") ?? ""}
-                            onClick={() => openUnmatch(row)}
-                          >
-                            <Undo2 className="h-3.5 w-3.5" />
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="ghost"
                             className="h-7 w-7 p-0 text-danger hover:text-danger"
                             title={t("matches.actions.delete") ?? ""}
                             onClick={() => setDeleteTarget(row)}
@@ -550,51 +489,6 @@ export function ReconciliationsPage() {
           </TableBody>
         </Table>
       </div>
-
-      {/* Unmatch dialog */}
-      <AlertDialog open={unmatchTarget !== null} onOpenChange={(o) => !o && setUnmatchTarget(null)}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>{t("matches.dialogs.unmatch_title")}</AlertDialogTitle>
-            <AlertDialogDescription>
-              {t("matches.dialogs.unmatch_description", {
-                bank: unmatchTarget?.bank_ids.length ?? 0,
-                book: unmatchTarget?.book_ids.length ?? 0,
-              })}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <div className="space-y-3">
-            <div>
-              <label className="mb-1 block text-xs text-muted-foreground">
-                {t("matches.dialogs.unmatch_reason")}
-              </label>
-              <Input
-                value={unmatchReason}
-                onChange={(e) => setUnmatchReason(e.target.value)}
-                placeholder={t("matches.dialogs.unmatch_reason") ?? ""}
-              />
-            </div>
-            <label className="flex items-center gap-2 text-xs">
-              <Checkbox
-                checked={unmatchHardDelete}
-                onCheckedChange={(v) => setUnmatchHardDelete(v === true)}
-              />
-              <span>{t("matches.dialogs.unmatch_delete")}</span>
-            </label>
-          </div>
-          <AlertDialogFooter>
-            <AlertDialogCancel>{t("common:actions.cancel")}</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={confirmUnmatch}
-              disabled={unmatch.isPending}
-              className="bg-danger text-danger-foreground hover:bg-danger/90"
-            >
-              {unmatch.isPending && <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />}
-              {t("matches.dialogs.unmatch_confirm")}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
 
       {/* Approve dialog */}
       <AlertDialog open={approveTarget !== null} onOpenChange={(o) => !o && setApproveTarget(null)}>

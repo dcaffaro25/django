@@ -239,10 +239,11 @@ REST_FRAMEWORK = {
         "rest_framework.filters.SearchFilter",
         "rest_framework.filters.OrderingFilter",
     ],
-    # Global pagination: keeps old clients working (unwrapList handles both
-    # shapes) while preventing accidental 100k-row responses from heavy
-    # endpoints like bank_transactions. Clients can tune with ?page_size=.
-    "DEFAULT_PAGINATION_CLASS": "core.utils.pagination.LargePageNumberPagination",
+    # Global pagination: opt-in. Callers that don't send ?page / ?page_size
+    # / ?paginate=true get the legacy flat-array shape; new callers opt into
+    # the paginated envelope by passing any of those params. This matches
+    # the pre-pagination behavior the frontend's unwrapList helper expects.
+    "DEFAULT_PAGINATION_CLASS": "core.utils.pagination.OptInPageNumberPagination",
     "PAGE_SIZE": 1000,
 }
 

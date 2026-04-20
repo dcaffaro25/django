@@ -59,6 +59,21 @@ interface Filters {
 const DEFAULT_DATE_FROM = ""
 const DEFAULT_DATE_TO = ""
 
+/**
+ * Parse an amount filter input. Returns:
+ *   - null when the input is empty (filter off)
+ *   - null when the value isn't a finite number (ignore malformed input
+ *     instead of killing the whole list)
+ *   - the numeric value otherwise — including 0, which must be a valid
+ *     filter value (was being coerced to null via `Number(x) || null`).
+ */
+function parseFilterAmount(raw: string): number | null {
+  const t = raw.trim()
+  if (t === "") return null
+  const n = Number(t)
+  return Number.isFinite(n) ? n : null
+}
+
 // Columns available for each bancada table. Defaults match what the pane
 // used to render pre-picker; operators can hide/show optional columns via
 // the ColumnMenu in each pane header. Amount + description are always on
@@ -70,6 +85,9 @@ const BANK_COLUMNS: ColumnDef[] = [
   { key: "entity", label: "Entidade", defaultVisible: true },
   { key: "status", label: "Status", defaultVisible: true },
   { key: "bank_account", label: "Conta bancária", defaultVisible: false },
+  { key: "erp_id", label: "ERP id", defaultVisible: false },
+  { key: "cnpj", label: "CNPJ", defaultVisible: false },
+  { key: "boletos", label: "Boletos", defaultVisible: false },
   { key: "amount", label: "Valor", alwaysVisible: true },
 ]
 
@@ -80,6 +98,10 @@ const BOOK_COLUMNS: ColumnDef[] = [
   { key: "bank_account", label: "Conta bancária", defaultVisible: true },
   { key: "status", label: "Status", defaultVisible: true },
   { key: "account", label: "Conta contábil", defaultVisible: false },
+  { key: "erp_id", label: "ERP id", defaultVisible: false },
+  { key: "cnpj", label: "CNPJ", defaultVisible: false },
+  { key: "nf_number", label: "NF", defaultVisible: false },
+  { key: "boleto", label: "Boleto", defaultVisible: false },
   { key: "amount", label: "Valor", alwaysVisible: true },
 ]
 
@@ -206,8 +228,8 @@ export function WorkbenchPage() {
   // applied on top of the server-side filters (amount/search/status/entity
   // run client-side for instant feedback).
   const bankTxs = useMemo(() => {
-    const min = Number(filters.bankAmountMin) || null
-    const max = Number(filters.bankAmountMax) || null
+    const min = parseFilterAmount(filters.bankAmountMin)
+    const max = parseFilterAmount(filters.bankAmountMax)
     const q = filters.bankSearch.trim().toLowerCase()
     const entId = filters.bankEntity || null
     const status = filters.bankStatus
@@ -230,8 +252,8 @@ export function WorkbenchPage() {
   ])
 
   const journalEntries = useMemo(() => {
-    const min = Number(filters.bookAmountMin) || null
-    const max = Number(filters.bookAmountMax) || null
+    const min = parseFilterAmount(filters.bookAmountMin)
+    const max = parseFilterAmount(filters.bookAmountMax)
     const q = filters.bookSearch.trim().toLowerCase()
     const status = filters.bookStatus
     return rawJournalEntries.filter((je) => {
@@ -978,6 +1000,46 @@ function ScopeRow({ children }: { children: React.ReactNode }) {
   return <div className="flex flex-wrap items-center gap-1.5">{children}</div>
 }
 
+/**
+ * Compact amount filter input with an inline × clear button. Kept in this
+ * file because it's specific to the workbench filter bar — zero should be a
+ * valid filter value, and an empty string must be explicitly representable
+ * (not "any falsy"). See parseFilterAmount for the predicate side.
+ */
+function AmountFilterInput({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: string
+  onChange: (next: string) => void
+  placeholder?: string
+}) {
+  const hasValue = value.trim() !== ""
+  return (
+    <div className="relative w-16 md:w-24">
+      <input
+        type="number"
+        step="0.01"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        className="h-7 w-full rounded-md border border-border bg-background pl-2 pr-5 text-[11px] tabular-nums outline-none focus:border-ring"
+      />
+      {hasValue && (
+        <button
+          type="button"
+          onClick={() => onChange("")}
+          aria-label="Limpar filtro"
+          className="absolute right-1 top-1/2 grid h-4 w-4 -translate-y-1/2 place-items-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground"
+        >
+          <X className="h-3 w-3" />
+        </button>
+      )}
+    </div>
+  )
+}
+
 function DateRange({
   from,
   to,
@@ -1077,21 +1139,15 @@ function BankPaneFilters({
             className="h-7 w-full rounded-md border border-border bg-background pl-7 pr-2 text-[11px] outline-none focus:border-ring"
           />
         </div>
-        <input
-          type="number"
-          step="0.01"
+        <AmountFilterInput
           value={filters.bankAmountMin}
-          onChange={(e) => setFilters((f) => ({ ...f, bankAmountMin: e.target.value }))}
+          onChange={(v) => setFilters((f) => ({ ...f, bankAmountMin: v }))}
           placeholder="Min"
-          className="h-7 w-16 rounded-md border border-border bg-background px-2 text-[11px] tabular-nums outline-none focus:border-ring md:w-20"
         />
-        <input
-          type="number"
-          step="0.01"
+        <AmountFilterInput
           value={filters.bankAmountMax}
-          onChange={(e) => setFilters((f) => ({ ...f, bankAmountMax: e.target.value }))}
+          onChange={(v) => setFilters((f) => ({ ...f, bankAmountMax: v }))}
           placeholder="Max"
-          className="h-7 w-16 rounded-md border border-border bg-background px-2 text-[11px] tabular-nums outline-none focus:border-ring md:w-20"
         />
         <select
           value={filters.bankEntity}
@@ -1201,21 +1257,15 @@ function BookPaneFilters({
             className="h-7 w-full rounded-md border border-border bg-background pl-7 pr-2 text-[11px] outline-none focus:border-ring"
           />
         </div>
-        <input
-          type="number"
-          step="0.01"
+        <AmountFilterInput
           value={filters.bookAmountMin}
-          onChange={(e) => setFilters((f) => ({ ...f, bookAmountMin: e.target.value }))}
+          onChange={(v) => setFilters((f) => ({ ...f, bookAmountMin: v }))}
           placeholder="Min"
-          className="h-7 w-16 rounded-md border border-border bg-background px-2 text-[11px] tabular-nums outline-none focus:border-ring md:w-20"
         />
-        <input
-          type="number"
-          step="0.01"
+        <AmountFilterInput
           value={filters.bookAmountMax}
-          onChange={(e) => setFilters((f) => ({ ...f, bookAmountMax: e.target.value }))}
+          onChange={(v) => setFilters((f) => ({ ...f, bookAmountMax: v }))}
           placeholder="Max"
-          className="h-7 w-16 rounded-md border border-border bg-background px-2 text-[11px] tabular-nums outline-none focus:border-ring md:w-20"
         />
         <select
           value={filters.bookStatus}
@@ -1299,10 +1349,22 @@ function BankList({
                   )}
                   <span className="truncate">{item.description}</span>
                 </div>
-                <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+                <div className="flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground">
                   {vis("date") && <span>{formatDate(item.date)}</span>}
                   {vis("entity") && item.entity_name && <span>· {item.entity_name}</span>}
                   {vis("bank_account") && bankAccName && <span>· {bankAccName}</span>}
+                  {vis("erp_id") && item.erp_id && (
+                    <span className="font-mono">· erp {item.erp_id}</span>
+                  )}
+                  {vis("cnpj") && item.cnpj && (
+                    <span className="font-mono">· {item.cnpj}</span>
+                  )}
+                  {vis("boletos") && item.numeros_boleto && item.numeros_boleto.length > 0 && (
+                    <span className="font-mono">
+                      · bol {item.numeros_boleto.slice(0, 2).join(", ")}
+                      {item.numeros_boleto.length > 2 ? ` +${item.numeros_boleto.length - 2}` : ""}
+                    </span>
+                  )}
                   {vis("status") && <StatusBadge status={item.reconciliation_status} className="h-4" />}
                 </div>
               </div>
@@ -1367,10 +1429,22 @@ function BookList({
                   )}
                   <span className="truncate">{item.description}</span>
                 </div>
-                <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+                <div className="flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground">
                   {vis("date") && <span>{formatDate(item.transaction_date)}</span>}
                   {vis("bank_account") && item.bank_account?.name && <span>· {item.bank_account.name}</span>}
                   {vis("account") && acctLabel && <span>· {acctLabel}</span>}
+                  {vis("erp_id") && item.erp_id && (
+                    <span className="font-mono">· erp {item.erp_id}</span>
+                  )}
+                  {vis("cnpj") && item.cnpj && (
+                    <span className="font-mono">· {item.cnpj}</span>
+                  )}
+                  {vis("nf_number") && item.nf_number && (
+                    <span className="font-mono">· NF {item.nf_number}</span>
+                  )}
+                  {vis("boleto") && item.numero_boleto && (
+                    <span className="font-mono">· bol {item.numero_boleto}</span>
+                  )}
                   {vis("status") && <StatusBadge status={item.reconciliation_status} className="h-4" />}
                 </div>
               </div>
