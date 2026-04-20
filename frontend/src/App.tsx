@@ -16,6 +16,7 @@ import { TransactionsPage } from "@/pages/accounting/TransactionsPage"
 import { JournalEntriesPage } from "@/pages/accounting/JournalEntriesPage"
 import { EntitiesPage } from "@/pages/settings/EntitiesPage"
 import { PlaceholderPage } from "@/pages/recon/PlaceholderPage"
+import { ReportBuilderPage } from "@/pages/statements/ReportBuilderPage"
 
 function Protected({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuth()
@@ -48,6 +49,8 @@ export default function App() {
                   <Route path="/accounting/transactions" element={<TransactionsPage />} />
                   <Route path="/accounting/journal-entries" element={<JournalEntriesPage />} />
                   <Route path="/accounting/*" element={<PlaceholderPage title="Contabilidade" />} />
+                  <Route path="/statements" element={<ReportBuilderPage />} />
+                  <Route path="/statements/templates" element={<ReportBuilderPage />} />
                   <Route path="/statements/*" element={<PlaceholderPage title="Demonstrativos" />} />
                   <Route path="/billing/*" element={<PlaceholderPage title="Faturamento" />} />
                   <Route path="/hr/*" element={<PlaceholderPage title="RH" />} />

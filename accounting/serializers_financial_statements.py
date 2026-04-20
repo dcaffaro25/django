@@ -52,10 +52,16 @@ class FinancialStatementLineTemplateSerializer(serializers.ModelSerializer):
 
 
 class FinancialStatementTemplateSerializer(serializers.ModelSerializer):
-    """Serializer for financial statement templates."""
-    
-    line_templates = FinancialStatementLineTemplateSerializer(many=True, read_only=True)
-    
+    """Serializer for financial statement templates.
+
+    Supports writing nested ``line_templates`` on create and update. On update,
+    the incoming list fully replaces the template's existing line templates
+    (delete-and-recreate semantics — simpler than per-id diffing and adequate
+    for the template-editor UX).
+    """
+
+    line_templates = FinancialStatementLineTemplateSerializer(many=True, required=False)
+
     class Meta:
         model = FinancialStatementTemplate
         fields = [
@@ -74,6 +80,24 @@ class FinancialStatementTemplateSerializer(serializers.ModelSerializer):
             'updated_at',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def create(self, validated_data):
+        lines = validated_data.pop('line_templates', [])
+        template = FinancialStatementTemplate.objects.create(**validated_data)
+        for line in lines:
+            FinancialStatementLineTemplate.objects.create(template=template, **line)
+        return template
+
+    def update(self, instance, validated_data):
+        lines = validated_data.pop('line_templates', None)
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        if lines is not None:
+            instance.line_templates.all().delete()
+            for line in lines:
+                FinancialStatementLineTemplate.objects.create(template=instance, **line)
+        return instance
 
 
 class FinancialStatementLineSerializer(serializers.ModelSerializer):

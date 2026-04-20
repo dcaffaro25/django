@@ -4,6 +4,7 @@ Views for Financial Statement generation and management.
 
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
@@ -649,7 +650,13 @@ class FinancialStatementTemplateViewSet(ScopedQuerysetMixin, viewsets.ModelViewS
         if is_active is not None:
             qs = qs.filter(is_active=is_active.lower() == 'true')
         return qs
-    
+
+    def perform_create(self, serializer):
+        tenant = getattr(self.request, 'tenant', None)
+        if not tenant or tenant == 'all':
+            raise ValidationError("Company/tenant not found in request")
+        serializer.save(company=tenant)
+
     @action(detail=True, methods=['post'])
     def set_default(self, request, pk=None, tenant_id=None):
         """Set this template as the default for its report type."""
