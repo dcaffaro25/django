@@ -449,9 +449,10 @@ _ORIGINAL_TRUSTED_ORIGINS = [
     "https://nordventures.retool.com",
     "https://82f3-8-242-11-50.ngrok-free.app",
 ]
-# Extra origins appended to CORS + CSRF (e.g. Railway staging).
+# Extra origins appended to CORS + CSRF (e.g. Railway staging, prod frontend).
 _ADDITIONAL_TRUSTED_ORIGINS = [
     "https://main-server-staging-e5d3.up.railway.app",
+    "https://nordventures.up.railway.app",
 ]
 _TRUSTED_ORIGINS = _ORIGINAL_TRUSTED_ORIGINS + _ADDITIONAL_TRUSTED_ORIGINS
 
