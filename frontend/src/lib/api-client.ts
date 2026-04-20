@@ -29,19 +29,11 @@ const http: AxiosInstance = axios.create({
   timeout: 60_000,
 })
 
-// JWTs have exactly two dots (header.payload.signature); opaque DRF Tokens
-// don't. Pick the scheme so SimpleJWT accepts login-flow tokens AND manual
-// paste / dev-token flows still work with the legacy DRF Token auth.
-function authHeader(token: string): string {
-  const scheme = token.split(".").length === 3 ? "Bearer" : "Token"
-  return `${scheme} ${token}`
-}
-
 http.interceptors.request.use((config) => {
   const token = getStoredToken()
   if (token && !config.headers?.Authorization) {
     config.headers = config.headers ?? {}
-    ;(config.headers as Record<string, string>).Authorization = authHeader(token)
+    ;(config.headers as Record<string, string>).Authorization = `Token ${token}`
   }
   return config
 })

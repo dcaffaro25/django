@@ -58,10 +58,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [fetchProfile])
 
   const loginWithCredentials = useCallback(async (username: string, password: string) => {
-    // JWT path
-    const res = await api.post<{ access: string; refresh?: string }>("/api/token/", { username, password })
-    setStoredToken(res.access)
-    setToken(res.access)
+    // DRF obtain_auth_token returns {token}; we send it back as Authorization: Token <key>.
+    const res = await api.post<{ token: string }>("/api/token/", { username, password })
+    setStoredToken(res.token)
+    setToken(res.token)
     await fetchProfile()
   }, [fetchProfile])
 
