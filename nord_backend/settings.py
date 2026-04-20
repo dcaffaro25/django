@@ -176,6 +176,7 @@ INSTALLED_APPS = [
     'django_filters',
     'core.apps.CoreConfig',#'core',
     'accounting',
+    'accounting.reports.apps.ReportsConfig',
     'hr',
     'billing',
     'inventory',

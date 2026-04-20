@@ -84,6 +84,7 @@ urlpatterns = [
             [
                 path("", include(router.urls)),
                 path("", include("erp_integrations.api_urls")),
+                path("reports/", include("accounting.reports.urls")),
             ]
         ),
     ),
