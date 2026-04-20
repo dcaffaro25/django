@@ -97,6 +97,60 @@ def _build_header_excluding_records(data: Any, records: List[Dict[str, Any]]) ->
     return data
 
 
+def fetch_and_parse_page(
+    connection,
+    api_def,
+    page_params: Dict[str, Any],
+    config: Dict[str, Any],
+    records_path: Optional[str],
+    retries_counter: Optional[Dict[str, int]] = None,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], int, int, int, Dict[str, Any]]:
+    """
+    One-page HTTP fetch + parse (shared by job sync and pipeline executor).
+
+    Returns: (header, records, page_num, total_pages, total_records, unwrapped_response).
+    Increments retries_counter["count"] on Omie 'consumo redundante' retries.
+    Raises requests exceptions on unrecoverable failures.
+    """
+    payload = build_payload(
+        connection=connection,
+        api_definition=api_def,
+        param_overrides=page_params,
+    )
+
+    raw: Optional[Dict[str, Any]] = None
+    for attempt in range(MAX_RETRIES_CONSUMO):
+        try:
+            resp = requests.post(
+                api_def.url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=60,
+            )
+            if _is_consumo_redundante_error(resp) and attempt < MAX_RETRIES_CONSUMO - 1:
+                wait = RETRY_BASE_SECONDS ** (attempt + 1)
+                if retries_counter is not None:
+                    retries_counter["count"] = retries_counter.get("count", 0) + 1
+                logger.warning("Omie consumo redundante, retry %s in %ss", attempt + 1, wait)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            raw = resp.json()
+            break
+        except requests.RequestException:
+            if attempt < MAX_RETRIES_CONSUMO - 1:
+                wait = RETRY_BASE_SECONDS ** (attempt + 1)
+                time.sleep(wait)
+                continue
+            raise
+
+    unwrapped = _unwrap_omie_response(raw or {})
+    header, records, pnum, total_pages, total_records = _extract_page_header_and_records(
+        unwrapped, records_path, config
+    )
+    return header, records, pnum, total_pages, total_records, unwrapped
+
+
 def _extract_page_header_and_records(
     page_data: Dict[str, Any],
     records_path: Optional[str],
@@ -259,42 +313,18 @@ def _fetch_segment_pages(
     idx = global_index
 
     page_num = 1
+    retries_counter = {"count": diagnostics.get("retries", 0)}
     while page_num <= MAX_PAGES:
         page_params = {**base_params, "pagina": page_num}
-        payload = build_payload(
+        header, records, pnum, total_pages, total_records, _unwrapped = fetch_and_parse_page(
             connection=connection,
-            api_definition=api_def,
-            param_overrides=page_params,
+            api_def=api_def,
+            page_params=page_params,
+            config=config,
+            records_path=records_path,
+            retries_counter=retries_counter,
         )
-
-        for attempt in range(MAX_RETRIES_CONSUMO):
-            try:
-                resp = requests.post(
-                    api_def.url,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                    timeout=60,
-                )
-                if _is_consumo_redundante_error(resp) and attempt < MAX_RETRIES_CONSUMO - 1:
-                    wait = RETRY_BASE_SECONDS ** (attempt + 1)
-                    diagnostics["retries"] = diagnostics.get("retries", 0) + 1
-                    logger.warning("Omie consumo redundante, retry %s in %ss", attempt + 1, wait)
-                    time.sleep(wait)
-                    continue
-                resp.raise_for_status()
-                raw = resp.json()
-                break
-            except requests.RequestException:
-                if attempt < MAX_RETRIES_CONSUMO - 1:
-                    wait = RETRY_BASE_SECONDS ** (attempt + 1)
-                    time.sleep(wait)
-                    continue
-                raise
-
-        unwrapped = _unwrap_omie_response(raw)
-        header, records, pnum, total_pages, total_records = _extract_page_header_and_records(
-            unwrapped, records_path, config
-        )
+        diagnostics["retries"] = retries_counter["count"]
 
         if diagnostics.get("picked_path") is None:
             diagnostics["picked_path"] = records_path or "auto"

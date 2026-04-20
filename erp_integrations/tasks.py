@@ -19,6 +19,14 @@ def run_erp_sync_task(self, job_id: int, dry_run: bool = False):
     return execute_sync(job_id, dry_run=dry_run)
 
 
+@shared_task(bind=True, max_retries=1, soft_time_limit=1200, time_limit=1320)
+def run_erp_pipeline_task(self, pipeline_id: int, dry_run: bool = False):
+    """Execute a composite ERPSyncPipeline. Longer limits than single-job sync."""
+    from .services.pipeline_service import execute_pipeline
+
+    return execute_pipeline(pipeline_id, dry_run=dry_run)
+
+
 def _is_job_due(schedule_rrule: str, last_synced_at, now: datetime) -> bool:
     """
     Check whether a job is due for execution based on its iCal RRULE

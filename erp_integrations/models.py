@@ -383,6 +383,22 @@ class ERPRawRecord(models.Model):
         ERPSyncRun,
         on_delete=models.CASCADE,
         related_name="records",
+        null=True,
+        blank=True,
+        help_text="Set when record came from a single-job sync. Null when from a pipeline run.",
+    )
+    pipeline_run = models.ForeignKey(
+        "erp_integrations.ERPSyncPipelineRun",
+        on_delete=models.CASCADE,
+        related_name="records",
+        null=True,
+        blank=True,
+        help_text="Set when record came from a pipeline execution.",
+    )
+    pipeline_step_order = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text="Order (1-based) of the pipeline step that produced this record.",
     )
     api_call = models.CharField(max_length=128, db_index=True)
 
@@ -423,7 +439,167 @@ class ERPRawRecord(models.Model):
             models.Index(fields=["sync_run", "global_index"]),
             models.Index(fields=["record_hash"]),
             models.Index(fields=["company", "api_call", "external_id"]),
+            models.Index(fields=["pipeline_run", "pipeline_step_order"]),
         ]
 
     def __str__(self):
         return f"Record {self.global_index} (page {self.page_number}, idx {self.record_index})"
+
+
+class ERPSyncPipeline(TenantAwareBaseModel):
+    """
+    Composite sync definition: ordered sequence of API calls whose outputs may
+    feed later steps' params. Parallels ERPSyncJob for registration/management;
+    does not replace it.
+    """
+
+    connection = models.ForeignKey(
+        ERPConnection,
+        on_delete=models.CASCADE,
+        related_name="sync_pipelines",
+    )
+    name = models.CharField(max_length=150)
+    description = models.TextField(blank=True, null=True)
+    is_active = models.BooleanField(default=True)
+    schedule_rrule = models.CharField(
+        max_length=500,
+        blank=True,
+        null=True,
+        help_text="iCal RRULE for periodic runs (e.g. FREQ=HOURLY;INTERVAL=6).",
+    )
+    last_run_at = models.DateTimeField(null=True, blank=True)
+    last_run_status = models.CharField(
+        max_length=20,
+        choices=[
+            ("never", "Never"),
+            ("completed", "Completed"),
+            ("failed", "Failed"),
+            ("partial", "Partial"),
+            ("running", "Running"),
+        ],
+        default="never",
+    )
+    last_run_record_count = models.IntegerField(default=0)
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name = "ERP Sync Pipeline"
+
+    def __str__(self):
+        return f"{self.name} (pipeline)"
+
+
+class ERPSyncPipelineStep(BaseModel):
+    """
+    One ordered step in a pipeline. Each step = one ERPAPIDefinition call,
+    with optional extra_params (static) and param_bindings (from prior steps).
+
+    param_bindings shape (JSON list):
+      [
+        {"mode": "static",   "into": "codigo_cliente", "value": 42},
+        {"mode": "jmespath", "source_step": 1, "expression": "clientes[0].codigo", "into": "codigo_cliente"},
+        {"mode": "fanout",   "source_step": 1, "expression": "clientes[*].codigo", "into": "codigo_cliente"}
+      ]
+
+    - "static": constant value merged into param_overrides.
+    - "jmespath": evaluates expression against step context, single value.
+    - "fanout": evaluates to a list; step runs once per value (only one fanout
+      binding allowed per step in v1).
+    """
+
+    pipeline = models.ForeignKey(
+        ERPSyncPipeline,
+        on_delete=models.CASCADE,
+        related_name="steps",
+    )
+    order = models.PositiveIntegerField(
+        help_text="1-based execution order within the pipeline.",
+    )
+    api_definition = models.ForeignKey(
+        ERPAPIDefinition,
+        on_delete=models.PROTECT,
+        related_name="pipeline_steps",
+    )
+    extra_params = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Static param overrides for this step (merged before bindings).",
+    )
+    param_bindings = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Ordered list of bindings that derive params from prior step outputs. See docstring.",
+    )
+    select_fields = models.JSONField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=(
+            "Optional JMESPath expression for preview projection (sandbox/dry_run). "
+            "Does not affect stored ERPRawRecord.data."
+        ),
+    )
+
+    class Meta:
+        ordering = ["pipeline", "order"]
+        unique_together = ("pipeline", "order")
+        verbose_name = "ERP Sync Pipeline Step"
+
+    def __str__(self):
+        return f"{self.pipeline.name} #{self.order} -> {self.api_definition.call}"
+
+
+class ERPSyncPipelineRun(TenantAwareBaseModel):
+    """Audit log for one execution of an ERPSyncPipeline."""
+
+    STATUS_CHOICES = [
+        ("pending", "Pending"),
+        ("running", "Running"),
+        ("completed", "Completed"),
+        ("failed", "Failed"),
+        ("partial", "Partial"),
+    ]
+
+    pipeline = models.ForeignKey(
+        ERPSyncPipeline,
+        on_delete=models.CASCADE,
+        related_name="runs",
+        null=True,
+        blank=True,
+        help_text="Null for ad-hoc sandbox executions with no persisted pipeline.",
+    )
+    celery_task_id = models.CharField(max_length=100, null=True, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="pending")
+    records_extracted = models.IntegerField(default=0)
+    records_stored = models.IntegerField(default=0)
+    records_skipped = models.IntegerField(default=0)
+    records_updated = models.IntegerField(default=0)
+    errors = models.JSONField(default=list)
+    diagnostics = models.JSONField(
+        default=dict,
+        help_text="Per-step diagnostics, bindings resolved, fanout counts, retries, etc.",
+    )
+    started_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    duration_seconds = models.FloatField(null=True, blank=True)
+    failed_step_order = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Order (1-based) of the step that failed, if any.",
+    )
+    is_sandbox = models.BooleanField(
+        default=False,
+        help_text="True for ad-hoc sandbox runs (preview-only, not persisted raw records).",
+    )
+
+    class Meta:
+        ordering = ["-started_at"]
+        indexes = [
+            models.Index(fields=["pipeline", "-started_at"]),
+            models.Index(fields=["status"]),
+        ]
+        verbose_name = "ERP Sync Pipeline Run"
+
+    def __str__(self):
+        label = self.pipeline.name if self.pipeline else "sandbox"
+        return f"Pipeline run #{self.id} [{self.status}] ({label})"

@@ -13,9 +13,12 @@ from .views import (
     ERPConnectionViewSet,
     ERPRawRecordViewSet,
     ERPSyncJobViewSet,
+    ERPSyncPipelineRunViewSet,
+    ERPSyncPipelineViewSet,
     ERPSyncRunViewSet,
     BuildPayloadView,
     ErpEtlImportView,
+    PipelineSandboxView,
 )
 
 
@@ -29,9 +32,12 @@ router.register("api-definitions", ERPAPIDefinitionViewSet, basename="erp-api-de
 router.register("sync-jobs", ERPSyncJobViewSet, basename="erp-sync-job")
 router.register("sync-runs", ERPSyncRunViewSet, basename="erp-sync-run")
 router.register("raw-records", ERPRawRecordViewSet, basename="erp-raw-record")
+router.register("sync-pipelines", ERPSyncPipelineViewSet, basename="erp-sync-pipeline")
+router.register("pipeline-runs", ERPSyncPipelineRunViewSet, basename="erp-pipeline-run")
 
 urlpatterns = [
     path("", include(router.urls)),
     re_path(r"^build-payload/?$", BuildPayloadView.as_view(), name="erp-integrations-build-payload"),
     re_path(r"^etl-import/?$", ErpEtlImportView.as_view(), name="erp-etl-import"),
+    re_path(r"^pipeline-sandbox/?$", PipelineSandboxView.as_view(), name="erp-pipeline-sandbox"),
 ]
