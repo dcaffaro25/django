@@ -308,6 +308,21 @@ export function useAccounts() {
 }
 
 /**
+ * Return the journal entries attached to one transaction. Fires only
+ * when `txId` is present (use it to power row-expansion on the
+ * transactions page so the list fetch stays single).
+ */
+export function useTransactionJournalEntries(txId: number | null | undefined) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["recon", sub, "transaction", txId, "journal_entries"],
+    queryFn: () => reconApi.listTransactionJournalEntries(txId as number),
+    enabled: !!sub && txId != null,
+    staleTime: 30 * 1000,
+  })
+}
+
+/**
  * Probe whether an account has any journal entries. Used to lock fields
  * that would be destructive to change after activity (e.g. account_direction
  * flipping signs on historical reports). Returns true/false; undefined while

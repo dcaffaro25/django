@@ -171,6 +171,16 @@ export const reconApi = {
     api.tenant.patch<JournalEntry>(`/api/journal_entries/${id}/`, body),
   deleteJournalEntry: (id: number) => api.tenant.delete<void>(`/api/journal_entries/${id}/`),
 
+  /**
+   * JEs attached to a single transaction. One query per expanded row;
+   * backed by TransactionViewSet.journal_entries @action. Returns the
+   * detail-serializer shape (id, account, debit/credit, state, …).
+   */
+  listTransactionJournalEntries: (txId: number) =>
+    api.tenant.get<Array<import("./types").TransactionJournalEntry>>(
+      `/api/transactions/${txId}/journal_entries/`,
+    ),
+
   listBankTransactions: (params?: {
     /**
      * Preferred "not matched" switch — maps to BankTransactionFilter.filter_unreconciled

@@ -147,6 +147,10 @@ export interface Transaction {
   is_reconciled?: boolean
   is_posted?: boolean
   erp_id?: string | null
+  due_date?: string | null
+  nf_number?: string | null
+  numero_boleto?: string | null
+  cnpj?: string | null
   created_at?: string
   updated_at?: string
 }
@@ -197,6 +201,29 @@ export interface JournalEntry {
   due_date?: string | null
   nf_number?: string | null
   erp_id?: string | null
+}
+
+/**
+ * Shape returned by GET /api/transactions/{id}/journal_entries/ — matches
+ * the detail JournalEntrySerializer. account/cost_center may come back as
+ * nested dicts or as PKs depending on the serializer's resolution; we
+ * accept both and render defensively.
+ */
+export interface TransactionJournalEntry {
+  id: number
+  transaction: number
+  erp_id?: string | null
+  description?: string | null
+  account?: { id: number; name: string; account_code?: string | null } | number | null
+  cost_center?: { id: number; name: string } | number | null
+  debit_amount: string | number
+  credit_amount: string | number
+  state?: string
+  date?: string
+  bank_designation_pending?: boolean
+  has_designated_bank?: boolean
+  notes?: string | null
+  tag?: string | null
 }
 
 export interface BankAccountFull {

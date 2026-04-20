@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState } from "react"
+import { Fragment, useEffect, useMemo, useState } from "react"
 import { useTranslation } from "react-i18next"
 import { toast } from "sonner"
 import { Drawer } from "vaul"
 import {
   Plus, Trash2, Save, X, Receipt, Copy, Search, Filter, RotateCcw,
-  CheckCircle2, PlayCircle, XCircle,
+  CheckCircle2, PlayCircle, XCircle, ChevronRight, ChevronDown, Loader2,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { ColumnMenu } from "@/components/ui/column-menu"
@@ -17,9 +17,16 @@ import { useSortable } from "@/lib/use-sortable"
 import { useRowSelection } from "@/lib/use-row-selection"
 import {
   useCurrencies, useDeleteTransaction, useEntities, useSaveTransaction,
-  useTransactionAction, useTransactions,
+  useTransactionAction, useTransactionJournalEntries, useTransactions,
 } from "@/features/reconciliation"
-import type { Transaction, TransactionWrite } from "@/features/reconciliation/types"
+import type {
+  Transaction,
+  TransactionJournalEntry,
+  TransactionWrite,
+} from "@/features/reconciliation/types"
+import { reconApi } from "@/features/reconciliation"
+import { useMutation, useQueryClient } from "@tanstack/react-query"
+import { useTenant } from "@/providers/TenantProvider"
 import { cn, formatCurrency, formatDate } from "@/lib/utils"
 
 function isoDaysAgo(n: number) {
@@ -71,6 +78,7 @@ export function TransactionsPage() {
   const columns: ColumnDef[] = useMemo(() => [
     { key: "id", label: "ID", alwaysVisible: true },
     { key: "date", label: "Data" },
+    { key: "due_date", label: "Vencimento", defaultVisible: false },
     { key: "entity", label: "Entidade" },
     { key: "description", label: "Descrição", alwaysVisible: true },
     { key: "amount", label: "Valor" },
@@ -81,6 +89,19 @@ export function TransactionsPage() {
 
   const del = useDeleteTransaction()
   const action = useTransactionAction()
+
+  // Row expansion for JE drill-down. Keyed by tx.id; expanded rows render
+  // a nested table below the main row.
+  const [expanded, setExpanded] = useState<Set<number>>(new Set())
+  const toggleExpand = (id: number, e?: React.MouseEvent) => {
+    e?.stopPropagation()
+    setExpanded((s) => {
+      const next = new Set(s)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
 
   const onDelete = (tx: Transaction, e: React.MouseEvent) => {
     e.stopPropagation()
@@ -193,6 +214,7 @@ export function TransactionsPage() {
         <table className="w-full text-[12px]">
           <thead className="bg-surface-3 text-left text-[10px] uppercase tracking-wider text-muted-foreground">
             <tr>
+              <th className="h-9 w-6 px-1"></th>
               <th className="h-9 w-10 px-3">
                 <SelectAllCheckbox
                   allSelected={selection.allSelected(sortedIds)}
@@ -202,6 +224,7 @@ export function TransactionsPage() {
               </th>
               <th className="h-9 px-3"><SortableHeader columnKey="id" label="ID" sort={sort} onToggle={toggleSort} /></th>
               {col.isVisible("date") && <th className="h-9 px-3"><SortableHeader columnKey="date" label="Data" sort={sort} onToggle={toggleSort} /></th>}
+              {col.isVisible("due_date") && <th className="h-9 px-3">Vencimento</th>}
               {col.isVisible("entity") && <th className="h-9 px-3"><SortableHeader columnKey="entity" label="Entidade" sort={sort} onToggle={toggleSort} /></th>}
               <th className="h-9 px-3"><SortableHeader columnKey="description" label="Descrição" sort={sort} onToggle={toggleSort} /></th>
               {col.isVisible("amount") && <th className="h-9 px-3 text-right"><SortableHeader columnKey="amount" align="right" label="Valor" sort={sort} onToggle={toggleSort} /></th>}
@@ -214,59 +237,104 @@ export function TransactionsPage() {
             {isLoading ? (
               Array.from({ length: 6 }).map((_, i) => (
                 <tr key={i} className="border-t border-border">
-                  <td colSpan={9} className="h-10 px-3"><div className="h-4 animate-pulse rounded bg-muted/60" /></td>
+                  <td colSpan={10} className="h-10 px-3"><div className="h-4 animate-pulse rounded bg-muted/60" /></td>
                 </tr>
               ))
             ) : sorted.length === 0 ? (
               <tr>
-                <td colSpan={9} className="h-24 px-3 text-center text-muted-foreground">Nenhuma transação no filtro atual</td>
+                <td colSpan={10} className="h-24 px-3 text-center text-muted-foreground">Nenhuma transação no filtro atual</td>
               </tr>
             ) : (
-              sorted.map((tx) => (
-                <tr key={tx.id} onClick={() => setEditing(tx)}
-                  className={cn(
-                    "group cursor-pointer border-t border-border hover:bg-accent/50",
-                    selection.isSelected(tx.id) && "bg-primary/5",
-                  )}>
-                  <td className="h-10 px-3">
-                    <RowCheckbox checked={selection.isSelected(tx.id)} onToggle={() => selection.toggle(tx.id)} />
-                  </td>
-                  <td className="h-10 px-3 font-mono text-muted-foreground">#{tx.id}</td>
-                  {col.isVisible("date") && <td className="h-10 px-3 text-muted-foreground">{formatDate(tx.date)}</td>}
-                  {col.isVisible("entity") && <td className="h-10 px-3 text-muted-foreground">{tx.entity_name ?? `#${tx.entity}`}</td>}
-                  <td className="h-10 px-3 font-medium">
-                    <span className="truncate">{tx.description}</span>
-                  </td>
-                  {col.isVisible("amount") && (
-                    <td className="h-10 px-3 text-right tabular-nums">{formatCurrency(Number(tx.amount), tx.currency_code ?? "BRL")}</td>
-                  )}
-                  {col.isVisible("state") && <td className="h-10 px-3"><StatusBadge status={tx.state} /></td>}
-                  {col.isVisible("flags") && (
-                    <td className="h-10 px-3 text-[10px] text-muted-foreground">
-                      {tx.is_balanced ? "✓B " : "—B "}
-                      {tx.is_reconciled ? "✓R " : "—R "}
-                      {tx.is_posted ? "✓P" : "—P"}
-                    </td>
-                  )}
-                  <RowActionsCell>
-                    {tx.state !== "posted" && (
-                      <RowAction
-                        icon={<PlayCircle className="h-3.5 w-3.5" />}
-                        label="Postar"
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          action.mutate({ id: tx.id, action: "post" }, {
-                            onSuccess: () => toast.success(`Transação #${tx.id} postada`),
-                            onError: (err: unknown) => toast.error(err instanceof Error ? err.message : "Erro"),
-                          })
-                        }}
-                      />
+              sorted.map((tx) => {
+                const isExpanded = expanded.has(tx.id)
+                const dueInfo = getDueDateStatus(tx)
+                return (
+                  <Fragment key={tx.id}>
+                    <tr onClick={() => setEditing(tx)}
+                      className={cn(
+                        "group cursor-pointer border-t border-border hover:bg-accent/50",
+                        selection.isSelected(tx.id) && "bg-primary/5",
+                        isExpanded && "bg-accent/20",
+                      )}>
+                      <td className="h-10 w-6 px-1">
+                        <button
+                          onClick={(e) => toggleExpand(tx.id, e)}
+                          className="grid h-6 w-6 place-items-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+                          aria-label={isExpanded ? "Recolher" : "Expandir"}
+                        >
+                          {isExpanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                        </button>
+                      </td>
+                      <td className="h-10 px-3">
+                        <RowCheckbox checked={selection.isSelected(tx.id)} onToggle={() => selection.toggle(tx.id)} />
+                      </td>
+                      <td className="h-10 px-3 font-mono text-muted-foreground">#{tx.id}</td>
+                      {col.isVisible("date") && <td className="h-10 px-3 text-muted-foreground">{formatDate(tx.date)}</td>}
+                      {col.isVisible("due_date") && (
+                        <td className="h-10 px-3 text-[11px]">
+                          {tx.due_date ? (
+                            <span className="flex items-center gap-1.5">
+                              <span className="text-muted-foreground">{formatDate(tx.due_date)}</span>
+                              {dueInfo.tone !== "neutral" && (
+                                <span
+                                  className={cn(
+                                    "rounded px-1 py-0.5 text-[9px] font-semibold uppercase",
+                                    dueInfo.tone === "ok" && "bg-emerald-500/15 text-emerald-500",
+                                    dueInfo.tone === "late" && "bg-destructive/15 text-destructive",
+                                  )}
+                                >
+                                  {dueInfo.label}
+                                </span>
+                              )}
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
+                      {col.isVisible("entity") && <td className="h-10 px-3 text-muted-foreground">{tx.entity_name ?? `#${tx.entity}`}</td>}
+                      <td className="h-10 px-3 font-medium">
+                        <span className="truncate">{tx.description}</span>
+                      </td>
+                      {col.isVisible("amount") && (
+                        <td className="h-10 px-3 text-right tabular-nums">{formatCurrency(Number(tx.amount), tx.currency_code ?? "BRL")}</td>
+                      )}
+                      {col.isVisible("state") && <td className="h-10 px-3"><StatusBadge status={tx.state} /></td>}
+                      {col.isVisible("flags") && (
+                        <td className="h-10 px-3 text-[10px] text-muted-foreground">
+                          {tx.is_balanced ? "✓B " : "—B "}
+                          {tx.is_reconciled ? "✓R " : "—R "}
+                          {tx.is_posted ? "✓P" : "—P"}
+                        </td>
+                      )}
+                      <RowActionsCell>
+                        {tx.state !== "posted" && (
+                          <RowAction
+                            icon={<PlayCircle className="h-3.5 w-3.5" />}
+                            label="Postar"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              action.mutate({ id: tx.id, action: "post" }, {
+                                onSuccess: () => toast.success(`Transação #${tx.id} postada`),
+                                onError: (err: unknown) => toast.error(err instanceof Error ? err.message : "Erro"),
+                              })
+                            }}
+                          />
+                        )}
+                        <RowAction icon={<Copy className="h-3.5 w-3.5" />} label="Duplicar" onClick={(e) => onDuplicate(tx, e)} />
+                        <RowAction icon={<Trash2 className="h-3.5 w-3.5" />} label="Excluir" variant="danger" onClick={(e) => onDelete(tx, e)} />
+                      </RowActionsCell>
+                    </tr>
+                    {isExpanded && (
+                      <tr className="border-t-0 bg-muted/10">
+                        <td colSpan={10} className="px-10 py-3">
+                          <JournalEntriesPanel transaction={tx} />
+                        </td>
+                      </tr>
                     )}
-                    <RowAction icon={<Copy className="h-3.5 w-3.5" />} label="Duplicar" onClick={(e) => onDuplicate(tx, e)} />
-                    <RowAction icon={<Trash2 className="h-3.5 w-3.5" />} label="Excluir" variant="danger" onClick={(e) => onDelete(tx, e)} />
-                  </RowActionsCell>
-                </tr>
-              ))
+                  </Fragment>
+                )
+              })
             )}
           </tbody>
         </table>
@@ -278,6 +346,293 @@ export function TransactionsPage() {
         onClose={() => setEditing(null)}
       />
     </div>
+  )
+}
+
+/**
+ * Due-date respect for a transaction. The tx.date is typically the
+ * posting/settlement date; if it lands on or before due_date we consider
+ * it on time. No due_date → neutral.
+ */
+function getDueDateStatus(tx: Transaction): { tone: "neutral" | "ok" | "late"; label: string } {
+  if (!tx.due_date) return { tone: "neutral", label: "—" }
+  if (!tx.is_posted) {
+    const today = new Date().toISOString().slice(0, 10)
+    if (today > tx.due_date) return { tone: "late", label: "atrasada" }
+    return { tone: "neutral", label: "em aberto" }
+  }
+  if (tx.date && tx.date > tx.due_date) return { tone: "late", label: "tardia" }
+  return { tone: "ok", label: "em dia" }
+}
+
+/**
+ * Inline JE drill-down for one transaction. Fetches JEs via the new
+ * /transactions/{id}/journal_entries/ action, lets operators edit the
+ * description/debit/credit/cost_center inline, delete, or append a new
+ * empty row. Edits / creates go through the existing journal_entries
+ * endpoints. Keeps the parent transaction list as the primary surface.
+ */
+function JournalEntriesPanel({ transaction }: { transaction: Transaction }) {
+  const { data: entries = [], isLoading, isError } = useTransactionJournalEntries(transaction.id)
+  const qc = useQueryClient()
+  const { tenant } = useTenant()
+
+  const invalidate = () => {
+    qc.invalidateQueries({
+      queryKey: ["recon", tenant?.subdomain, "transaction", transaction.id, "journal_entries"],
+    })
+    qc.invalidateQueries({ queryKey: ["recon", tenant?.subdomain, "transactions"] })
+  }
+
+  const delJE = useMutation({
+    mutationFn: (id: number) => reconApi.deleteJournalEntry(id),
+    onSuccess: () => {
+      toast.success("Lançamento excluído")
+      invalidate()
+    },
+    onError: (err: unknown) => toast.error(err instanceof Error ? err.message : "Erro"),
+  })
+
+  const addJE = useMutation({
+    mutationFn: () =>
+      reconApi.createJournalEntry({
+        transaction: transaction.id,
+        description: transaction.description,
+        debit_amount: "0.00",
+        credit_amount: "0.00",
+        date: transaction.date,
+        bank_designation_pending: true,
+      } as unknown as Partial<import("@/features/reconciliation/types").JournalEntry>),
+    onSuccess: () => {
+      toast.success("Lançamento adicionado")
+      invalidate()
+    },
+    onError: (err: unknown) => toast.error(err instanceof Error ? err.message : "Erro"),
+  })
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+        <Loader2 className="h-3 w-3 animate-spin" /> Carregando lançamentos…
+      </div>
+    )
+  }
+  if (isError) {
+    return <div className="text-[11px] text-destructive">Falha ao carregar lançamentos.</div>
+  }
+
+  const totalDebit = entries.reduce((s, e) => s + Number(e.debit_amount || 0), 0)
+  const totalCredit = entries.reduce((s, e) => s + Number(e.credit_amount || 0), 0)
+  const diff = totalDebit - totalCredit
+  const isBalanced = Math.abs(diff) < 0.005
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+          Lançamentos — {entries.length}
+        </div>
+        <button
+          onClick={(e) => {
+            e.stopPropagation()
+            addJE.mutate()
+          }}
+          disabled={addJE.isPending}
+          className="inline-flex h-6 items-center gap-1 rounded-md border border-border bg-background px-2 text-[11px] font-medium hover:bg-accent disabled:opacity-50"
+        >
+          <Plus className="h-3 w-3" /> Adicionar
+        </button>
+      </div>
+      {entries.length === 0 ? (
+        <div className="rounded-md border border-dashed border-border px-3 py-4 text-center text-[11px] text-muted-foreground">
+          Nenhum lançamento vinculado.
+        </div>
+      ) : (
+        <div className="overflow-hidden rounded-md border border-border">
+          <table className="w-full text-[11px]">
+            <thead className="bg-surface-3 text-left text-[9px] uppercase tracking-wider text-muted-foreground">
+              <tr>
+                <th className="h-7 px-2">#</th>
+                <th className="h-7 px-2">Conta</th>
+                <th className="h-7 px-2">Descrição</th>
+                <th className="h-7 px-2 text-right">Débito</th>
+                <th className="h-7 px-2 text-right">Crédito</th>
+                <th className="h-7 px-2">Status</th>
+                <th className="h-7 w-px px-2"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {entries.map((je) => (
+                <JeRow key={je.id} je={je} onDelete={() => delJE.mutate(je.id)} onSaved={invalidate} />
+              ))}
+              <tr className="border-t-2 border-border bg-muted/30 font-semibold">
+                <td colSpan={3} className="h-7 px-2 text-right text-[10px] uppercase tracking-wider text-muted-foreground">
+                  Totais
+                </td>
+                <td className="h-7 px-2 text-right tabular-nums">
+                  {totalDebit.toLocaleString("pt-BR", { minimumFractionDigits: 2 })}
+                </td>
+                <td className="h-7 px-2 text-right tabular-nums">
+                  {totalCredit.toLocaleString("pt-BR", { minimumFractionDigits: 2 })}
+                </td>
+                <td className="h-7 px-2 text-[10px]">
+                  {isBalanced ? (
+                    <span className="text-emerald-500">Balanceado</span>
+                  ) : (
+                    <span className="text-destructive">Diff {diff.toFixed(2)}</span>
+                  )}
+                </td>
+                <td></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * Editable row for one journal entry. Keeps local draft state; a pencil
+ * click flips to save/cancel. Fields deliberately minimal (description,
+ * debit, credit) — bigger edits go through the main TransactionEditor
+ * drawer. Account id changes need the account picker and are not exposed
+ * here yet (would hit PATCH /journal_entries/{id}/).
+ */
+function JeRow({
+  je,
+  onDelete,
+  onSaved,
+}: {
+  je: TransactionJournalEntry
+  onDelete: () => void
+  onSaved: () => void
+}) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState({
+    description: je.description ?? "",
+    debit_amount: String(je.debit_amount ?? "0"),
+    credit_amount: String(je.credit_amount ?? "0"),
+  })
+  const save = useMutation({
+    mutationFn: (body: Partial<import("@/features/reconciliation/types").JournalEntry>) =>
+      reconApi.updateJournalEntry(je.id, body),
+    onSuccess: () => {
+      toast.success("Lançamento atualizado")
+      setEditing(false)
+      onSaved()
+    },
+    onError: (err: unknown) => toast.error(err instanceof Error ? err.message : "Erro"),
+  })
+
+  const accountLabel =
+    typeof je.account === "object" && je.account !== null
+      ? `${je.account.account_code ? je.account.account_code + " · " : ""}${je.account.name}`
+      : typeof je.account === "number"
+      ? `#${je.account}`
+      : je.bank_designation_pending
+      ? "pendente"
+      : "—"
+
+  return (
+    <tr className="border-t border-border">
+      <td className="h-7 px-2 font-mono text-muted-foreground">#{je.id}</td>
+      <td className="h-7 px-2 text-muted-foreground">{accountLabel}</td>
+      <td className="h-7 px-2">
+        {editing ? (
+          <input
+            value={draft.description}
+            onChange={(e) => setDraft({ ...draft, description: e.target.value })}
+            className="h-6 w-full rounded border border-border bg-background px-1.5 text-[11px] outline-none focus:border-ring"
+          />
+        ) : (
+          je.description ?? ""
+        )}
+      </td>
+      <td className="h-7 px-2 text-right tabular-nums">
+        {editing ? (
+          <input
+            type="number"
+            step="0.01"
+            value={draft.debit_amount}
+            onChange={(e) => setDraft({ ...draft, debit_amount: e.target.value })}
+            className="h-6 w-20 rounded border border-border bg-background px-1.5 text-right text-[11px] outline-none focus:border-ring"
+          />
+        ) : (
+          Number(je.debit_amount).toLocaleString("pt-BR", { minimumFractionDigits: 2 })
+        )}
+      </td>
+      <td className="h-7 px-2 text-right tabular-nums">
+        {editing ? (
+          <input
+            type="number"
+            step="0.01"
+            value={draft.credit_amount}
+            onChange={(e) => setDraft({ ...draft, credit_amount: e.target.value })}
+            className="h-6 w-20 rounded border border-border bg-background px-1.5 text-right text-[11px] outline-none focus:border-ring"
+          />
+        ) : (
+          Number(je.credit_amount).toLocaleString("pt-BR", { minimumFractionDigits: 2 })
+        )}
+      </td>
+      <td className="h-7 px-2 text-[10px] text-muted-foreground">{je.state ?? "—"}</td>
+      <td className="h-7 px-2">
+        <div className="flex items-center gap-1">
+          {editing ? (
+            <>
+              <button
+                onClick={() =>
+                  save.mutate({
+                    description: draft.description,
+                    debit_amount: draft.debit_amount,
+                    credit_amount: draft.credit_amount,
+                  } as unknown as Partial<import("@/features/reconciliation/types").JournalEntry>)
+                }
+                disabled={save.isPending}
+                className="grid h-5 w-5 place-items-center rounded text-emerald-500 hover:bg-emerald-500/10 disabled:opacity-50"
+                title="Salvar"
+              >
+                <Save className="h-3 w-3" />
+              </button>
+              <button
+                onClick={() => {
+                  setDraft({
+                    description: je.description ?? "",
+                    debit_amount: String(je.debit_amount ?? "0"),
+                    credit_amount: String(je.credit_amount ?? "0"),
+                  })
+                  setEditing(false)
+                }}
+                className="grid h-5 w-5 place-items-center rounded text-muted-foreground hover:bg-accent"
+                title="Cancelar"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                onClick={() => setEditing(true)}
+                className="grid h-5 w-5 place-items-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+                title="Editar"
+              >
+                <Receipt className="h-3 w-3" />
+              </button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation()
+                  if (window.confirm(`Excluir lançamento #${je.id}?`)) onDelete()
+                }}
+                className="grid h-5 w-5 place-items-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                title="Excluir"
+              >
+                <Trash2 className="h-3 w-3" />
+              </button>
+            </>
+          )}
+        </div>
+      </td>
+    </tr>
   )
 }
 
