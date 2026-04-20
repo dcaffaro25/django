@@ -7,6 +7,9 @@ from .models import (
     ERPProvider,
     ERPRawRecord,
     ERPSyncJob,
+    ERPSyncPipeline,
+    ERPSyncPipelineRun,
+    ERPSyncPipelineStep,
     ERPSyncRun,
 )
 
@@ -121,6 +124,8 @@ class ERPRawRecordAdmin(admin.ModelAdmin):
     list_display = (
         "id",
         "sync_run",
+        "pipeline_run",
+        "pipeline_step_order",
         "api_call",
         "external_id",
         "is_duplicate",
@@ -131,4 +136,64 @@ class ERPRawRecordAdmin(admin.ModelAdmin):
     )
     list_filter = ("api_call", "is_duplicate")
     search_fields = ("record_hash", "external_id")
-    raw_id_fields = ("sync_run", "company")
+    raw_id_fields = ("sync_run", "pipeline_run", "company")
+
+
+class ERPSyncPipelineStepInline(admin.TabularInline):
+    model = ERPSyncPipelineStep
+    extra = 0
+    fields = ("order", "api_definition", "extra_params", "param_bindings", "select_fields")
+    raw_id_fields = ("api_definition",)
+    ordering = ("order",)
+
+
+@admin.register(ERPSyncPipeline)
+class ERPSyncPipelineAdmin(admin.ModelAdmin):
+    list_display = (
+        "name",
+        "connection",
+        "company",
+        "is_active",
+        "last_run_status",
+        "last_run_at",
+        "last_run_record_count",
+    )
+    list_filter = ("is_active", "last_run_status")
+    search_fields = ("name", "description")
+    raw_id_fields = ("connection", "company")
+    inlines = [ERPSyncPipelineStepInline]
+    fieldsets = (
+        (None, {"fields": ("company", "connection", "name", "description", "is_active")}),
+        ("Schedule", {"fields": ("schedule_rrule",)}),
+        (
+            "Last run",
+            {"fields": ("last_run_at", "last_run_status", "last_run_record_count")},
+        ),
+    )
+
+
+@admin.register(ERPSyncPipelineRun)
+class ERPSyncPipelineRunAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "pipeline",
+        "status",
+        "records_stored",
+        "records_extracted",
+        "failed_step_order",
+        "is_sandbox",
+        "started_at",
+    )
+    list_filter = ("status", "is_sandbox")
+    readonly_fields = (
+        "started_at",
+        "completed_at",
+        "duration_seconds",
+        "diagnostics",
+        "records_extracted",
+        "records_stored",
+        "records_skipped",
+        "records_updated",
+        "failed_step_order",
+    )
+    raw_id_fields = ("pipeline", "company")

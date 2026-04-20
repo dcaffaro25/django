@@ -54,3 +54,4 @@ pypdf==6.2.0
 openai==2.8.0
 google-generativeai>=0.8.0
 google-generativeai>=0.8.0
+jmespath>=1.0,<2.0

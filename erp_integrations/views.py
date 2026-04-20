@@ -13,7 +13,15 @@ from multitenancy.mixins import ScopedQuerysetMixin, SoftDeleteQuerysetMixin
 
 from .erp_etl import execute_erp_etl_import
 from .filters import ERPRawRecordFilter, apply_json_field_filters
-from .models import ERPAPIDefinition, ERPConnection, ERPRawRecord, ERPSyncJob, ERPSyncRun
+from .models import (
+    ERPAPIDefinition,
+    ERPConnection,
+    ERPRawRecord,
+    ERPSyncJob,
+    ERPSyncPipeline,
+    ERPSyncPipelineRun,
+    ERPSyncRun,
+)
 from .serializers import (
     BuildPayloadRequestSerializer,
     ERPAPIDefinitionSerializer,
@@ -21,8 +29,11 @@ from .serializers import (
     ERPConnectionSerializer,
     ERPRawRecordSerializer,
     ERPSyncJobSerializer,
+    ERPSyncPipelineRunSerializer,
+    ERPSyncPipelineSerializer,
     ERPSyncRunSerializer,
     ErpEtlImportRequestSerializer,
+    PipelineSandboxRequestSerializer,
 )
 from .services.payload_builder import build_payload_by_ids
 from .services.transform_engine import extract_external_id
@@ -394,3 +405,116 @@ class ERPRawRecordViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
             },
             status=status.HTTP_200_OK,
         )
+
+
+class ERPSyncPipelineViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
+    """CRUD for composite API pipelines. Actions: run, dry_run."""
+
+    queryset = (
+        ERPSyncPipeline.objects.select_related("connection", "connection__provider")
+        .prefetch_related("steps", "steps__api_definition")
+        .order_by("name")
+    )
+    serializer_class = ERPSyncPipelineSerializer
+
+    def perform_create(self, serializer):
+        obj = serializer.save()
+        if not obj.company_id and obj.connection:
+            obj.company = obj.connection.company
+            obj.save(update_fields=["company"])
+
+    def perform_update(self, serializer):
+        obj = serializer.save()
+        if not obj.company_id and obj.connection:
+            obj.company = obj.connection.company
+            obj.save(update_fields=["company"])
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        tenant = getattr(self.request, "tenant", None)
+        if tenant and tenant != "all" and hasattr(tenant, "id"):
+            return qs.filter(connection__company=tenant)
+        return qs
+
+    @action(detail=True, methods=["post"])
+    def run(self, request, pk=None, tenant_id=None):
+        """Queue full pipeline execution via Celery. Returns task_id."""
+        from .tasks import run_erp_pipeline_task
+
+        pipeline = self.get_object()
+        result = run_erp_pipeline_task.delay(pipeline.id)
+        return Response({"task_id": str(result.id)})
+
+    @action(detail=True, methods=["post"])
+    def dry_run(self, request, pk=None, tenant_id=None):
+        """Run pipeline inline, one page per step, preview rows only."""
+        from .services.pipeline_service import execute_pipeline
+
+        pipeline = self.get_object()
+        out = execute_pipeline(pipeline.id, dry_run=True)
+        return Response(out)
+
+
+class ERPSyncPipelineRunViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
+    """Read-only list/detail of pipeline runs."""
+
+    queryset = ERPSyncPipelineRun.objects.select_related("pipeline").order_by("-started_at")
+    serializer_class = ERPSyncPipelineRunSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        tenant = getattr(self.request, "tenant", None)
+        pipeline_id = self.request.query_params.get("pipeline")
+        if tenant and tenant != "all" and hasattr(tenant, "id"):
+            qs = qs.filter(company=tenant)
+        if pipeline_id:
+            qs = qs.filter(pipeline_id=pipeline_id)
+        return qs
+
+
+class PipelineSandboxView(APIView):
+    """
+    POST inline pipeline spec, return preview rows + diagnostics.
+
+    Ad-hoc execution with hard caps — does not persist a pipeline or raw
+    records. Intended for the frontend sandbox page to let users compose
+    and test multi-step calls before saving a pipeline.
+    """
+
+    def post(self, request, tenant_id=None):
+        serializer = PipelineSandboxRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        tenant = getattr(request, "tenant", None)
+        company_id = getattr(tenant, "id", None) if tenant and tenant != "all" else None
+        if not company_id and (not request.user or not request.user.is_superuser):
+            return Response(
+                {"detail": "Tenant (company) required for the pipeline sandbox."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        from .services.pipeline_service import (
+            SANDBOX_DEFAULT_MAX_FANOUT,
+            SANDBOX_DEFAULT_MAX_PAGES,
+            SANDBOX_DEFAULT_MAX_STEPS,
+            _PipelineCaps,
+            execute_pipeline_spec,
+        )
+
+        caps = _PipelineCaps(
+            max_steps=data.get("max_steps") or SANDBOX_DEFAULT_MAX_STEPS,
+            max_pages_per_step=data.get("max_pages_per_step") or SANDBOX_DEFAULT_MAX_PAGES,
+            max_fanout=data.get("max_fanout") or SANDBOX_DEFAULT_MAX_FANOUT,
+        )
+
+        result = execute_pipeline_spec(
+            connection_id=data["connection_id"],
+            steps=data["steps"],
+            company_id=company_id,
+            caps=caps,
+        )
+
+        if result.get("error") and not result.get("diagnostics"):
+            return Response(result, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result, status=status.HTTP_200_OK)

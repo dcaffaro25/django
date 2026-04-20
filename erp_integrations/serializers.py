@@ -1,6 +1,16 @@
 from rest_framework import serializers
 
-from .models import ERPAPIDefinition, ERPConnection, ERPProvider, ERPRawRecord, ERPSyncJob, ERPSyncRun
+from .models import (
+    ERPAPIDefinition,
+    ERPConnection,
+    ERPProvider,
+    ERPRawRecord,
+    ERPSyncJob,
+    ERPSyncPipeline,
+    ERPSyncPipelineRun,
+    ERPSyncPipelineStep,
+    ERPSyncRun,
+)
 from .services.payload_builder import payload_from_param_schema
 
 
@@ -162,6 +172,8 @@ class ERPRawRecordSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "sync_run",
+            "pipeline_run",
+            "pipeline_step_order",
             "api_call",
             "page_number",
             "record_index",
@@ -176,3 +188,134 @@ class ERPRawRecordSerializer(serializers.ModelSerializer):
             "is_duplicate",
             "fetched_at",
         ]
+
+
+class ERPSyncPipelineStepSerializer(serializers.ModelSerializer):
+    api_call = serializers.CharField(source="api_definition.call", read_only=True)
+
+    class Meta:
+        model = ERPSyncPipelineStep
+        fields = [
+            "id",
+            "order",
+            "api_definition",
+            "api_call",
+            "extra_params",
+            "param_bindings",
+            "select_fields",
+        ]
+
+
+class ERPSyncPipelineSerializer(serializers.ModelSerializer):
+    steps = ERPSyncPipelineStepSerializer(many=True, required=False)
+    connection_name = serializers.CharField(source="connection.name", read_only=True)
+    provider = serializers.IntegerField(source="connection.provider_id", read_only=True)
+
+    class Meta:
+        model = ERPSyncPipeline
+        fields = [
+            "id",
+            "connection",
+            "connection_name",
+            "provider",
+            "name",
+            "description",
+            "is_active",
+            "schedule_rrule",
+            "last_run_at",
+            "last_run_status",
+            "last_run_record_count",
+            "steps",
+        ]
+
+    def _validate_step_payload(self, step_data, pipeline_provider_id):
+        api_def = step_data.get("api_definition")
+        api_def_id = getattr(api_def, "id", api_def)
+        if api_def_id is None:
+            raise serializers.ValidationError({"steps": "Each step requires api_definition."})
+        if isinstance(api_def, ERPAPIDefinition):
+            if api_def.provider_id != pipeline_provider_id:
+                raise serializers.ValidationError(
+                    {"steps": f"api_definition {api_def_id} provider does not match pipeline connection provider."}
+                )
+
+    def create(self, validated_data):
+        steps_data = validated_data.pop("steps", [])
+        connection = validated_data.get("connection")
+        if connection and "company" not in validated_data:
+            validated_data["company"] = connection.company
+        pipeline = super().create(validated_data)
+
+        for i, step in enumerate(steps_data):
+            self._validate_step_payload(step, connection.provider_id if connection else None)
+            ERPSyncPipelineStep.objects.create(
+                pipeline=pipeline,
+                order=step.get("order") or (i + 1),
+                api_definition=step["api_definition"],
+                extra_params=step.get("extra_params") or {},
+                param_bindings=step.get("param_bindings") or [],
+                select_fields=step.get("select_fields"),
+            )
+        return pipeline
+
+    def update(self, instance, validated_data):
+        steps_data = validated_data.pop("steps", None)
+        instance = super().update(instance, validated_data)
+
+        if steps_data is not None:
+            provider_id = instance.connection.provider_id if instance.connection_id else None
+            instance.steps.all().delete()
+            for i, step in enumerate(steps_data):
+                self._validate_step_payload(step, provider_id)
+                ERPSyncPipelineStep.objects.create(
+                    pipeline=instance,
+                    order=step.get("order") or (i + 1),
+                    api_definition=step["api_definition"],
+                    extra_params=step.get("extra_params") or {},
+                    param_bindings=step.get("param_bindings") or [],
+                    select_fields=step.get("select_fields"),
+                )
+        return instance
+
+
+class ERPSyncPipelineRunSerializer(serializers.ModelSerializer):
+    pipeline_name = serializers.CharField(source="pipeline.name", read_only=True)
+
+    class Meta:
+        model = ERPSyncPipelineRun
+        fields = [
+            "id",
+            "pipeline",
+            "pipeline_name",
+            "celery_task_id",
+            "status",
+            "records_extracted",
+            "records_stored",
+            "records_skipped",
+            "records_updated",
+            "errors",
+            "diagnostics",
+            "started_at",
+            "completed_at",
+            "duration_seconds",
+            "failed_step_order",
+            "is_sandbox",
+        ]
+
+
+class _SandboxStepSerializer(serializers.Serializer):
+    """Inline step spec for the sandbox endpoint."""
+
+    order = serializers.IntegerField(required=False, min_value=1)
+    api_definition_id = serializers.IntegerField()
+    extra_params = serializers.JSONField(required=False, default=dict)
+    param_bindings = serializers.JSONField(required=False, default=list)
+    select_fields = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+
+
+class PipelineSandboxRequestSerializer(serializers.Serializer):
+    connection_id = serializers.IntegerField()
+    steps = _SandboxStepSerializer(many=True)
+    max_steps = serializers.IntegerField(required=False, min_value=1, max_value=10)
+    max_pages_per_step = serializers.IntegerField(required=False, min_value=1, max_value=5)
+    max_fanout = serializers.IntegerField(required=False, min_value=1, max_value=200)
