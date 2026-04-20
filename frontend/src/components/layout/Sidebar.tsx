@@ -4,6 +4,7 @@ import {
   LayoutDashboard, ArrowLeftRight, ListChecks, Sparkles, SlidersHorizontal, Workflow,
   Scale, Wallet, Receipt, BookOpen, FileBarChart, FileCog, CreditCard, Users, Boxes,
   Settings, ChevronLeft, PanelLeftOpen, Building2, CheckCircle2, Brain, Zap,
+  FileSpreadsheet, FileText, FileCode, Shuffle, UploadCloud,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/stores/app-store"
@@ -47,6 +48,16 @@ const GROUPS: NavGroup[] = [
     key: "integrations",
     items: [
       { key: "integrations_sandbox", path: "/integrations/sandbox", icon: Zap },
+    ],
+  },
+  {
+    key: "imports",
+    items: [
+      { key: "imports_etl", path: "/imports/etl", icon: UploadCloud },
+      { key: "imports_ofx", path: "/imports/ofx", icon: FileText },
+      { key: "imports_nf", path: "/imports/nf", icon: FileCode },
+      { key: "imports_templates", path: "/imports/templates", icon: FileSpreadsheet },
+      { key: "imports_substitutions", path: "/imports/substitutions", icon: Shuffle },
     ],
   },
   {

@@ -31,7 +31,13 @@
     "settings": "Ajustes",
     "other": "Outros",
     "integrations": "Integrações",
-    "integrations_sandbox": "Sandbox de API"
+    "integrations_sandbox": "Sandbox de API",
+    "imports": "Importações",
+    "imports_etl": "ETL (Excel)",
+    "imports_ofx": "OFX (extratos)",
+    "imports_nf": "NF-e (XML)",
+    "imports_templates": "Templates",
+    "imports_substitutions": "Substituições"
   },
   "actions": {
     "search": "Buscar",

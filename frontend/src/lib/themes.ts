@@ -127,7 +127,7 @@ export const THEMES: ThemeDefinition[] = [
   },
 ]
 
-export const DEFAULT_THEME: ThemeId = "brand"
+export const DEFAULT_THEME: ThemeId = "graphite"
 
 export function getTheme(id: string | null | undefined): ThemeDefinition {
   return (
