@@ -33,6 +33,7 @@
     "integrations": "Integrações",
     "integrations_sandbox": "Sandbox de API",
     "imports": "Importações",
+    "imports_hub": "Importar arquivos",
     "imports_etl": "ETL (Excel)",
     "imports_ofx": "OFX (extratos)",
     "imports_nf": "NF-e (XML)",

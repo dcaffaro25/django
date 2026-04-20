@@ -1,6 +1,6 @@
 import { useState } from "react"
 import { toast } from "sonner"
-import { Plus, Trash2, FileCog } from "lucide-react"
+import { Plus, Trash2, FileCog, Download } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import {
   useDeleteImportTemplate,
@@ -54,12 +54,22 @@ export function ImportTemplatesPage() {
         title="Templates de importação"
         subtitle="Regras de transformação reutilizáveis — definem como linhas de planilha viram registros."
         actions={
-          <button
-            onClick={() => setCreating((v) => !v)}
-            className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
-          >
-            <Plus className="h-3.5 w-3.5" /> {creating ? "Fechar" : "Novo template"}
-          </button>
+          <>
+            <a
+              href="/bulk_import_template.xlsx"
+              download
+              className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
+              title="Baixar modelo de planilha base (com __row_id e abas-exemplo)"
+            >
+              <Download className="h-3.5 w-3.5" /> Baixar template
+            </a>
+            <button
+              onClick={() => setCreating((v) => !v)}
+              className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
+            >
+              <Plus className="h-3.5 w-3.5" /> {creating ? "Fechar" : "Novo template"}
+            </button>
+          </>
         }
       />
 

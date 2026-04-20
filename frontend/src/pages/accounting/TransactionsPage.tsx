@@ -133,6 +133,12 @@ export function TransactionsPage() {
         }
       />
 
+      {/* KPI strip — quick quality signals on the current filtered set.
+          Deeper JE drill-down + due-date respect stats are planned as a
+          follow-up (requires per-transaction JE fetch or a new aggregate
+          endpoint on the backend). */}
+      <TransactionStats transactions={filtered} />
+
       {/* Filters */}
       <div className="card-elevated flex flex-wrap items-end gap-3 p-3">
         <div className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
@@ -271,6 +277,63 @@ export function TransactionsPage() {
         transaction={editing === "new" ? null : editing}
         onClose={() => setEditing(null)}
       />
+    </div>
+  )
+}
+
+/**
+ * KPI strip for the Transactions page. Computes lightweight aggregates
+ * across the currently filtered result set (no extra API calls). Stats
+ * that need per-JE data (due-date respect, reconciled coverage per line)
+ * can be added here once a dedicated endpoint exists.
+ */
+function TransactionStats({ transactions }: { transactions: Transaction[] }) {
+  const total = transactions.length
+  if (total === 0) return null
+  const balanced = transactions.filter((t) => t.is_balanced).length
+  const reconciled = transactions.filter((t) => t.is_reconciled).length
+  const posted = transactions.filter((t) => t.is_posted).length
+  const pct = (n: number) => (total === 0 ? 0 : Math.round((n / total) * 100))
+  const sumAbs = transactions.reduce((s, t) => s + Math.abs(Number(t.amount) || 0), 0)
+
+  return (
+    <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
+      <StatCard label="Transações" value={String(total)} hint={`∑ |valor| = ${sumAbs.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`} />
+      <StatCard label="Balanceadas" value={`${pct(balanced)}%`} hint={`${balanced}/${total}`} tone={pct(balanced) === 100 ? "ok" : pct(balanced) >= 90 ? "warn" : "bad"} />
+      <StatCard label="Postadas" value={`${pct(posted)}%`} hint={`${posted}/${total}`} tone={pct(posted) >= 90 ? "ok" : pct(posted) >= 50 ? "warn" : "bad"} />
+      <StatCard label="Conciliadas" value={`${pct(reconciled)}%`} hint={`${reconciled}/${total}`} tone={pct(reconciled) >= 80 ? "ok" : pct(reconciled) >= 40 ? "warn" : "bad"} />
+      <StatCard label="Abertas" value={String(total - posted)} hint="pendentes ou canceladas" />
+    </div>
+  )
+}
+
+function StatCard({
+  label,
+  value,
+  hint,
+  tone,
+}: {
+  label: string
+  value: string
+  hint?: string
+  tone?: "ok" | "warn" | "bad"
+}) {
+  return (
+    <div className="card-elevated p-3">
+      <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+        {label}
+      </div>
+      <div
+        className={cn(
+          "mt-0.5 text-[18px] font-semibold tabular-nums",
+          tone === "ok" && "text-emerald-500",
+          tone === "warn" && "text-amber-500",
+          tone === "bad" && "text-destructive",
+        )}
+      >
+        {value}
+      </div>
+      {hint && <div className="mt-0.5 text-[10px] text-muted-foreground">{hint}</div>}
     </div>
   )
 }

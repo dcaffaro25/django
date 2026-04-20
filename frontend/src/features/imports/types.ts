@@ -19,15 +19,27 @@ export interface EtlExecuteResponse {
   detail?: string
 }
 
+// Matches SubstitutionRule fields exposed by the backend serializer:
+// during ETL, a cell value `match_value` in `field_name` of `model_name`
+// gets replaced with `substitution_value` according to `match_type`.
+// Earlier this type claimed {name, source_value, target_value, rule_type}
+// which didn't match anything the backend returns — rows rendered blank.
+export type SubstitutionMatchType =
+  | "exact"
+  | "prefix"
+  | "suffix"
+  | "contains"
+  | "regex"
+
 export interface SubstitutionRule {
   id: number
-  name: string
-  description?: string | null
-  source_value?: string
-  target_value?: string
-  rule_type?: string
   company?: number
-  is_active?: boolean
+  model_name: string
+  field_name: string
+  match_type: SubstitutionMatchType | string
+  match_value: string
+  substitution_value: string
+  is_deleted?: boolean
   created_at?: string
   updated_at?: string
 }

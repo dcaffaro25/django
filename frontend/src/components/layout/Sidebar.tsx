@@ -4,7 +4,7 @@ import {
   LayoutDashboard, ArrowLeftRight, ListChecks, Sparkles, SlidersHorizontal, Workflow,
   Scale, Wallet, Receipt, BookOpen, FileBarChart, FileCog, CreditCard, Users, Boxes,
   Settings, ChevronLeft, PanelLeftOpen, Building2, CheckCircle2, Brain, Zap,
-  FileSpreadsheet, FileText, FileCode, Shuffle, UploadCloud,
+  FileSpreadsheet, Shuffle, UploadCloud,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/stores/app-store"
@@ -51,16 +51,6 @@ const GROUPS: NavGroup[] = [
     ],
   },
   {
-    key: "imports",
-    items: [
-      { key: "imports_etl", path: "/imports/etl", icon: UploadCloud },
-      { key: "imports_ofx", path: "/imports/ofx", icon: FileText },
-      { key: "imports_nf", path: "/imports/nf", icon: FileCode },
-      { key: "imports_templates", path: "/imports/templates", icon: FileSpreadsheet },
-      { key: "imports_substitutions", path: "/imports/substitutions", icon: Shuffle },
-    ],
-  },
-  {
     key: "other",
     items: [
       { key: "billing", path: "/billing", icon: CreditCard },
@@ -68,6 +58,16 @@ const GROUPS: NavGroup[] = [
       { key: "inventory", path: "/inventory", icon: Boxes },
       { key: "entities", path: "/settings/entities", icon: Building2 },
       { key: "settings", path: "/settings", icon: Settings },
+    ],
+  },
+  // Import/utility shortcuts pinned at the bottom of the sidebar so operator
+  // flows (conciliação, contabilidade) aren't pushed down by these.
+  {
+    key: "imports",
+    items: [
+      { key: "imports_hub", path: "/imports", icon: UploadCloud },
+      { key: "imports_templates", path: "/imports/templates", icon: FileSpreadsheet },
+      { key: "imports_substitutions", path: "/imports/substitutions", icon: Shuffle },
     ],
   },
 ]

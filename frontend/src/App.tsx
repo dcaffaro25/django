@@ -16,9 +16,7 @@ import { TransactionsPage } from "@/pages/accounting/TransactionsPage"
 import { JournalEntriesPage } from "@/pages/accounting/JournalEntriesPage"
 import { EntitiesPage } from "@/pages/settings/EntitiesPage"
 import { ApiSandboxPage } from "@/pages/integrations/ApiSandboxPage"
-import { EtlImportPage } from "@/pages/imports/EtlImportPage"
-import { OfxImportPage } from "@/pages/imports/OfxImportPage"
-import { NfImportPage } from "@/pages/imports/NfImportPage"
+import { ImportsHubPage } from "@/pages/imports/ImportsHubPage"
 import { SubstitutionRulesPage } from "@/pages/imports/SubstitutionRulesPage"
 import { ImportTemplatesPage } from "@/pages/imports/ImportTemplatesPage"
 import { PlaceholderPage } from "@/pages/recon/PlaceholderPage"
@@ -63,12 +61,10 @@ export default function App() {
                   <Route path="/inventory/*" element={<PlaceholderPage title="Estoque" />} />
                   <Route path="/integrations/sandbox" element={<ApiSandboxPage />} />
                   <Route path="/integrations/*" element={<PlaceholderPage title="Integrações" />} />
-                  <Route path="/imports/etl" element={<EtlImportPage />} />
-                  <Route path="/imports/ofx" element={<OfxImportPage />} />
-                  <Route path="/imports/nf" element={<NfImportPage />} />
+                  <Route path="/imports" element={<ImportsHubPage />} />
                   <Route path="/imports/templates" element={<ImportTemplatesPage />} />
                   <Route path="/imports/substitutions" element={<SubstitutionRulesPage />} />
-                  <Route path="/imports/*" element={<PlaceholderPage title="Importações" />} />
+                  <Route path="/imports/*" element={<ImportsHubPage />} />
                   <Route path="/settings/entities" element={<EntitiesPage />} />
                   <Route path="/settings/*" element={<PlaceholderPage title="Ajustes" />} />
                   <Route path="*" element={<Navigate to="/recon" replace />} />
