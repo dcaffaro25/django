@@ -958,6 +958,47 @@ class FinancialStatementGenerator:
         
         return total
     
+    def _aggregate_period_totals(
+        self,
+        accounts: List[Account],
+        start_date: date,
+        end_date: date,
+        include_pending: bool,
+    ) -> Dict[int, Dict[str, Decimal]]:
+        """
+        One grouped query that returns {account_id: {'debit': X, 'credit': Y}}
+        for every account in `accounts`. Replaces the per-account aggregate
+        loop that used to fire 2-4 DB round-trips per account.
+        """
+        if not accounts:
+            return {}
+        state_filter = Q(state='posted')
+        if include_pending:
+            state_filter = Q(state__in=['posted', 'pending'])
+
+        rows = (
+            JournalEntry.objects.filter(
+                account_id__in=[a.id for a in accounts],
+                date__gte=start_date,
+                date__lte=end_date,
+                transaction__company_id=self.company_id,
+            )
+            .filter(state_filter)
+            .values('account_id')
+            .annotate(
+                total_debit=Sum('debit_amount'),
+                total_credit=Sum('credit_amount'),
+            )
+        )
+
+        out: Dict[int, Dict[str, Decimal]] = {}
+        for r in rows:
+            out[r['account_id']] = {
+                'debit': r['total_debit'] or Decimal('0.00'),
+                'credit': r['total_credit'] or Decimal('0.00'),
+            }
+        return out
+
     def _calc_net_movement(
         self,
         accounts: List[Account],
@@ -967,89 +1008,46 @@ class FinancialStatementGenerator:
     ) -> Decimal:
         """
         Calculate net movement (debit - credit) within a period.
-        
+
         This is a FLOW measure - activity within a period.
         Used for Income Statement items.
-        
+
         Date range is inclusive: [start_date, end_date]
         """
-        state_filter = Q(state='posted')
-        if include_pending:
-            state_filter = Q(state__in=['posted', 'pending'])
-        
         log.info(
             "Calculating net_movement: %s account(s), period [%s, %s], "
             "include_pending=%s, company_id=%s",
-            len(accounts), start_date, end_date, include_pending, self.company_id
+            len(accounts), start_date, end_date, include_pending, self.company_id,
         )
-        
+
+        per_account = self._aggregate_period_totals(
+            accounts=accounts,
+            start_date=start_date,
+            end_date=end_date,
+            include_pending=include_pending,
+        )
+
         total = Decimal('0.00')
-        
         for account in accounts:
-            entries = JournalEntry.objects.filter(
-                account=account,
-                date__gte=start_date,
-                date__lte=end_date,
-                transaction__company_id=self.company_id,
-            ).filter(state_filter)
-            
-            entry_count = entries.count()
-            
-            result = entries.aggregate(
-                total_debit=Sum('debit_amount'),
-                total_credit=Sum('credit_amount')
-            )
-            
-            debit = result['total_debit'] or Decimal('0.00')
-            credit = result['total_credit'] or Decimal('0.00')
-            
-            # Apply account direction for proper sign
+            amounts = per_account.get(account.id)
+            if amounts is None:
+                debit = Decimal('0.00')
+                credit = Decimal('0.00')
+            else:
+                debit = amounts['debit']
+                credit = amounts['credit']
+
             net = (debit - credit) * account.account_direction
             total += net
-            
-            log.info(
-                "Account %s (ID: %s, Code: %s): %s entries found, "
-                "debit=%s, credit=%s, direction=%s, net=%s",
-                account.name,
-                account.id,
-                account.account_code,
-                entry_count,
-                debit,
-                credit,
-                account.account_direction,
-                net
+
+            log.debug(
+                "Account %s (id=%s): debit=%s credit=%s direction=%s net=%s",
+                account.name, account.id, debit, credit, account.account_direction, net,
             )
-            
-            # If no entries found, log potential reasons
-            if entry_count == 0:
-                # Check if entries exist for this account at all
-                all_entries_count = JournalEntry.objects.filter(
-                    account=account,
-                    transaction__company_id=self.company_id,
-                ).count()
-                
-                # Check entries in date range regardless of state
-                entries_any_state = JournalEntry.objects.filter(
-                    account=account,
-                    date__gte=start_date,
-                    date__lte=end_date,
-                    transaction__company_id=self.company_id,
-                ).count()
-                
-                log.warning(
-                    "Account %s (ID: %s): No entries found in period [%s, %s]. "
-                    "Total entries for account: %s, Entries in date range (any state): %s",
-                    account.name,
-                    account.id,
-                    start_date,
-                    end_date,
-                    all_entries_count,
-                    entries_any_state,
-                )
-        
-        log.info("Net movement total: %s", total)
+
+        log.info("Net movement total: %s (%s accounts)", total, len(accounts))
         return total
-    
+
     def _calc_debit_total(
         self,
         accounts: List[Account],
@@ -1059,27 +1057,20 @@ class FinancialStatementGenerator:
     ) -> Decimal:
         """
         Calculate total debits within a period.
-        
+
         Date range is inclusive: [start_date, end_date]
         """
-        state_filter = Q(state='posted')
-        if include_pending:
-            state_filter = Q(state__in=['posted', 'pending'])
-        
-        total = Decimal('0.00')
-        
-        for account in accounts:
-            result = JournalEntry.objects.filter(
-                account=account,
-                date__gte=start_date,
-                date__lte=end_date,
-                transaction__company_id=self.company_id,
-            ).filter(state_filter).aggregate(total=Sum('debit_amount'))
-            
-            total += result['total'] or Decimal('0.00')
-        
-        return total
-    
+        per_account = self._aggregate_period_totals(
+            accounts=accounts,
+            start_date=start_date,
+            end_date=end_date,
+            include_pending=include_pending,
+        )
+        return sum(
+            (per_account.get(a.id, {}).get('debit', Decimal('0.00')) for a in accounts),
+            Decimal('0.00'),
+        )
+
     def _calc_credit_total(
         self,
         accounts: List[Account],
@@ -1092,24 +1083,17 @@ class FinancialStatementGenerator:
         
         Date range is inclusive: [start_date, end_date]
         """
-        state_filter = Q(state='posted')
-        if include_pending:
-            state_filter = Q(state__in=['posted', 'pending'])
-        
-        total = Decimal('0.00')
-        
-        for account in accounts:
-            result = JournalEntry.objects.filter(
-                account=account,
-                date__gte=start_date,
-                date__lte=end_date,
-                transaction__company_id=self.company_id,
-            ).filter(state_filter).aggregate(total=Sum('credit_amount'))
-            
-            total += result['total'] or Decimal('0.00')
-        
-        return total
-    
+        per_account = self._aggregate_period_totals(
+            accounts=accounts,
+            start_date=start_date,
+            end_date=end_date,
+            include_pending=include_pending,
+        )
+        return sum(
+            (per_account.get(a.id, {}).get('credit', Decimal('0.00')) for a in accounts),
+            Decimal('0.00'),
+        )
+
     def _calculate_legacy(
         self,
         accounts: List[Account],
@@ -2381,175 +2365,84 @@ class FinancialStatementGenerator:
         calculation_type: str,
         include_pending: bool = False,
     ) -> Decimal:
-        """Calculate income statement line (period activity)."""
+        """
+        Calculate income statement line (period activity).
+
+        Bulk-aggregates leaf-account journal entries in a single GROUP BY
+        query instead of the old per-account count+aggregate loop (which
+        fired 3-5 DB round-trips per account on templates with hundreds of
+        expanded descendants — the direct cause of preview timeouts).
+
+        The 'balance' calculation_type still goes through
+        _calculate_account_balance_from_closing per account because it
+        has opening-balance / balance_date semantics that don't fit the
+        bulk pattern. That path is rare in income statements.
+        """
         log.info(
             "Calculating income statement line for %s account(s) "
             "from %s to %s (calculation_type: %s, include_pending: %s)",
-            len(accounts),
-            start_date,
-            end_date,
-            calculation_type,
-            include_pending,
+            len(accounts), start_date, end_date, calculation_type, include_pending,
         )
-        
-        total = Decimal('0.00')
-        
-        for idx, account in enumerate(accounts, 1):
-            log.info(
-                "[%s/%s] Processing account: %s (ID: %s, Code: %s, Is Leaf: %s, Direction: %s)",
-                idx,
-                len(accounts),
-                account.name,
-                account.id,
-                account.account_code,
-                account.is_leaf(),
-                account.account_direction,
-            )
-            
+
+        # Partition leaves (bulk path) from parents (recurse to children).
+        # is_leaf() triggers an MPTT query per account; do it once here.
+        leaf_accounts: List[Account] = []
+        parent_accounts: List[Account] = []
+        for account in accounts:
             if account.is_leaf():
-                # Leaf account: calculate from journal entries
-                log.debug(
-                    "  Account %s (ID: %s) is a leaf account, calculating from journal entries",
-                    account.name,
-                    account.id,
-                )
-                
-                if include_pending:
-                    state_filter = Q(state__in=['posted', 'pending'])
-                else:
-                    state_filter = Q(state='posted')
-                
-                entries = JournalEntry.objects.filter(
-                    account=account,
-                    date__gte=start_date,
-                    date__lte=end_date,
-                    transaction__company_id=self.company_id,
-                ).filter(state_filter)
-                
-                entry_count = entries.count()
-                log.debug(
-                    "  Found %s journal entry/entries for account %s (ID: %s) in period",
-                    entry_count,
-                    account.name,
-                    account.id,
-                )
-                
-                if calculation_type == 'difference':
-                    # Debit - Credit (no account direction)
-                    log.debug("  Using 'difference' calculation (debit - credit, no direction)")
-                    debit_total = entries.aggregate(
-                        total=Sum('debit_amount')
-                    )['total'] or Decimal('0.00')
-                    credit_total = entries.aggregate(
-                        total=Sum('credit_amount')
-                    )['total'] or Decimal('0.00')
-                    balance = debit_total - credit_total
-                    log.info(
-                        "  Account %s (ID: %s) - Debit: %s, Credit: %s, Difference: %s",
-                        account.name,
-                        account.id,
-                        debit_total,
-                        credit_total,
-                        balance,
-                    )
-                elif calculation_type == 'balance':
-                    # Balance: Use last closing balance + transactions after closing date
-                    log.debug("  Using 'balance' calculation (from closing balance)")
-                    balance = self._calculate_account_balance_from_closing(
+                leaf_accounts.append(account)
+            else:
+                parent_accounts.append(account)
+
+        total = Decimal('0.00')
+
+        if leaf_accounts:
+            if calculation_type == 'balance':
+                for account in leaf_accounts:
+                    total += self._calculate_account_balance_from_closing(
                         account=account,
                         as_of_date=end_date,
                         include_pending=include_pending,
                     )
-                    log.info(
-                        "  Account %s (ID: %s) balance from closing: %s",
-                        account.name,
-                        account.id,
-                        balance,
-                    )
-                else:
-                    # Sum: Period movements with account direction (e.g., cash flow)
-                    log.debug(
-                        "  Using 'sum' calculation (debit - credit) × direction %s",
-                        account.account_direction,
-                    )
-                    debit_total = entries.aggregate(
-                        total=Sum('debit_amount')
-                    )['total'] or Decimal('0.00')
-                    credit_total = entries.aggregate(
-                        total=Sum('credit_amount')
-                    )['total'] or Decimal('0.00')
-                    net_movement = debit_total - credit_total
-                    balance = net_movement * account.account_direction
-                    log.info(
-                        "  Account %s (ID: %s) - Debit: %s, Credit: %s, Net: %s, "
-                        "Direction: %s, Final: %s",
-                        account.name,
-                        account.id,
-                        debit_total,
-                        credit_total,
-                        net_movement,
-                        account.account_direction,
-                        balance,
-                    )
-                
-                total_before = total
-                total += balance
-                log.info(
-                    "  Running total: %s + %s = %s",
-                    total_before,
-                    balance,
-                    total,
-                )
             else:
-                # Parent account: sum children's period activity
-                log.info(
-                    "  Account %s (ID: %s) is a parent account, summing children",
-                    account.name,
-                    account.id,
+                per_account = self._aggregate_period_totals(
+                    accounts=leaf_accounts,
+                    start_date=start_date,
+                    end_date=end_date,
+                    include_pending=include_pending,
                 )
-                children = account.get_children().filter(company_id=self.company_id)
-                children_list = list(children)
-                log.info(
-                    "  Found %s child(ren) for parent account %s (ID: %s)",
-                    len(children_list),
-                    account.name,
-                    account.id,
+                for account in leaf_accounts:
+                    amounts = per_account.get(account.id)
+                    debit = amounts['debit'] if amounts else Decimal('0.00')
+                    credit = amounts['credit'] if amounts else Decimal('0.00')
+                    if calculation_type == 'difference':
+                        total += (debit - credit)
+                    else:
+                        # Default 'sum' — period net × direction.
+                        total += (debit - credit) * account.account_direction
+
+        if parent_accounts:
+            # Expand parents to their direct children and recurse. The child
+            # expansion itself is N parent queries — acceptable for typical
+            # templates where parent lines number in the single digits.
+            for parent in parent_accounts:
+                children = list(
+                    parent.get_children().filter(company_id=self.company_id)
                 )
-                
-                for child_idx, child in enumerate(children_list, 1):
-                    log.debug(
-                        "    [%s/%s] Recursively calculating child: %s (ID: %s)",
-                        child_idx,
-                        len(children_list),
-                        child.name,
-                        child.id,
-                    )
-                    # Recursively calculate child balance for the period
-                    child_balance = self._calculate_income_statement_line(
-                        accounts=[child],
-                        start_date=start_date,
-                        end_date=end_date,
-                        calculation_type=calculation_type,
-                        include_pending=include_pending,
-                    )
-                    total_before = total
-                    total += child_balance
-                    log.info(
-                        "    Child %s (ID: %s) balance: %s | Running total: %s + %s = %s",
-                        child.name,
-                        child.id,
-                        child_balance,
-                        total_before,
-                        child_balance,
-                        total,
-                    )
-        
+                if not children:
+                    continue
+                total += self._calculate_income_statement_line(
+                    accounts=children,
+                    start_date=start_date,
+                    end_date=end_date,
+                    calculation_type=calculation_type,
+                    include_pending=include_pending,
+                )
+
         log.info(
-            "Income statement line total: %s (from %s account(s))",
-            total,
-            len(accounts),
+            "Income statement line total: %s (%s leaves, %s parents)",
+            total, len(leaf_accounts), len(parent_accounts),
         )
-        
         return total
     
     def _calculate_cash_flow_line(

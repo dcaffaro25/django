@@ -1400,9 +1400,18 @@ class FinancialStatementViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             def __init__(self, lines_list):
                 self._lines_list = lines_list
             def all(self):
-                return self._lines_list
+                # Return self (not the list) so callers can chain .order_by(),
+                # which _format_as_html does via statement.lines.all().order_by(...)
+                return self
             def order_by(self, *args):
-                return self._lines_list
+                return sorted(
+                    self._lines_list,
+                    key=lambda line: getattr(line, 'line_number', 0),
+                )
+            def __iter__(self):
+                return iter(self._lines_list)
+            def __len__(self):
+                return len(self._lines_list)
         
         mock_statement = MockStatement(preview_data)
         mock_statement.lines = LinesManager(mock_statement._lines_list)
