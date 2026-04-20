@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next"
 import {
   LayoutDashboard, ArrowLeftRight, ListChecks, Sparkles, SlidersHorizontal, Workflow,
   Scale, Wallet, Receipt, BookOpen, FileBarChart, FileCog, CreditCard, Users, Boxes,
-  Settings, ChevronLeft, PanelLeftOpen, Building2, CheckCircle2, Brain,
+  Settings, ChevronLeft, PanelLeftOpen, Building2, CheckCircle2, Brain, Zap,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/stores/app-store"
@@ -41,6 +41,12 @@ const GROUPS: NavGroup[] = [
     items: [
       { key: "statements", path: "/statements", icon: FileBarChart },
       { key: "templates", path: "/statements/templates", icon: FileCog },
+    ],
+  },
+  {
+    key: "integrations",
+    items: [
+      { key: "integrations_sandbox", path: "/integrations/sandbox", icon: Zap },
     ],
   },
   {

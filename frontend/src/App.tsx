@@ -15,6 +15,7 @@ import { ChartOfAccountsPage } from "@/pages/accounting/ChartOfAccountsPage"
 import { TransactionsPage } from "@/pages/accounting/TransactionsPage"
 import { JournalEntriesPage } from "@/pages/accounting/JournalEntriesPage"
 import { EntitiesPage } from "@/pages/settings/EntitiesPage"
+import { ApiSandboxPage } from "@/pages/integrations/ApiSandboxPage"
 import { PlaceholderPage } from "@/pages/recon/PlaceholderPage"
 import { ReportBuilderPage } from "@/pages/statements/ReportBuilderPage"
 
@@ -55,6 +56,8 @@ export default function App() {
                   <Route path="/billing/*" element={<PlaceholderPage title="Faturamento" />} />
                   <Route path="/hr/*" element={<PlaceholderPage title="RH" />} />
                   <Route path="/inventory/*" element={<PlaceholderPage title="Estoque" />} />
+                  <Route path="/integrations/sandbox" element={<ApiSandboxPage />} />
+                  <Route path="/integrations/*" element={<PlaceholderPage title="Integrações" />} />
                   <Route path="/settings/entities" element={<EntitiesPage />} />
                   <Route path="/settings/*" element={<PlaceholderPage title="Ajustes" />} />
                   <Route path="*" element={<Navigate to="/recon" replace />} />

@@ -29,7 +29,9 @@
     "inventory": "Estoque",
     "entities": "Entidades",
     "settings": "Ajustes",
-    "other": "Outros"
+    "other": "Outros",
+    "integrations": "Integrações",
+    "integrations_sandbox": "Sandbox de API"
   },
   "actions": {
     "search": "Buscar",
