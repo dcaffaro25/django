@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next"
 import { KeyRound, LogIn, Sparkles } from "lucide-react"
 import { useAuth } from "@/providers/AuthProvider"
 import { cn } from "@/lib/utils"
+import nordVerde from "@/assets/nord-verde.png"
 
 export function LoginPage() {
   const { t } = useTranslation()
@@ -35,23 +36,23 @@ export function LoginPage() {
   }
 
   return (
-    <div className="grid min-h-screen grid-cols-1 bg-background lg:grid-cols-2">
-      {/* Left — hero */}
-      <div className="relative hidden flex-col justify-between overflow-hidden border-r border-border bg-gradient-to-br from-primary/[0.12] via-background to-background p-10 lg:flex">
-        <div className="flex items-center gap-2">
-          <div className="grid h-8 w-8 place-items-center rounded-md bg-primary text-primary-foreground text-sm font-bold">N</div>
-          <span className="text-sm font-semibold">Nord</span>
-        </div>
-        <div className="relative max-w-md">
-          <h2 className="text-3xl font-semibold tracking-tight">Conciliação bancária, <span className="text-primary">reinventada.</span></h2>
-          <p className="mt-3 text-sm text-muted-foreground">Uma plataforma financeira densa em dados, com dashboards em tempo real e fluxo de trabalho por teclado.</p>
-        </div>
-        <p className="text-xs text-muted-foreground">© {new Date().getFullYear()} Nord Ventures</p>
-        <div className="pointer-events-none absolute -right-16 top-1/3 h-72 w-72 rounded-full bg-primary/20 blur-3xl" />
+    <div className="grid min-h-screen grid-cols-1 bg-white lg:grid-cols-2">
+      {/* Left — brand pane (Nord green + white logo, no body copy) */}
+      <div
+        className="relative hidden overflow-hidden lg:block"
+        style={{
+          backgroundColor: "#015736",
+          backgroundImage: `url(${nordVerde})`,
+          backgroundSize: "cover",
+          backgroundPosition: "center",
+          backgroundRepeat: "no-repeat",
+        }}
+      >
+        <span className="sr-only">Nord Ventures</span>
       </div>
 
-      {/* Right — form */}
-      <div className="flex items-center justify-center p-6">
+      {/* Right — form on white */}
+      <div className="flex items-center justify-center bg-white p-6">
         <div className="w-full max-w-sm">
           <div className="mb-8">
             <h1 className="text-xl font-semibold">{t("auth.signin_title")}</h1>
