@@ -30,6 +30,7 @@ from .services.ai_assistant import (
     refine_template,
     summarize_changes,
 )
+from .services.ai_health import check_all as ai_check_all
 from .throttles import AIEndpointThrottle
 from .services.calculator import ReportCalculator
 from .services.document_schema import validate_document
@@ -271,8 +272,9 @@ class AiStub(viewsets.ViewSet):
     """
 
     def get_throttles(self):
-        # Usage aggregates aren't gated — they read from our own DB.
-        if getattr(self, "action", None) == "usage":
+        # Usage aggregates + key-status read from our own DB / cache, so
+        # they're not gated by the AI-call rate limit.
+        if getattr(self, "action", None) in ("usage", "key_status"):
             return []
         return [AIEndpointThrottle()]
 
@@ -490,6 +492,39 @@ class AiStub(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         return Response(payload, status=status.HTTP_200_OK)
+
+    # --- Provider key health for the dashboard cards ----------------------
+
+    @action(detail=False, methods=["get"], url_path="key-status")
+    def key_status(self, request, tenant_id=None):
+        """Ping each AI provider and report whether its shared key is healthy.
+
+        Query params
+        ------------
+        refresh : "true" to bypass the 5-minute cache and re-ping now.
+
+        Response shape::
+
+            {
+              "providers": [
+                {
+                  "provider": "openai",
+                  "configured": true,
+                  "status": "ok" | "error" | "not_configured",
+                  "model": "gpt-4o",
+                  "latency_ms": 123,
+                  "error_type": null,
+                  "error_message": null,
+                  "checked_at": "2026-04-21T12:34:56+00:00",
+                  "from_cache": false
+                },
+                ...
+              ]
+            }
+        """
+        _tenant_or_raise(request)
+        force = str(request.query_params.get("refresh", "")).lower() in ("1", "true", "yes")
+        return Response({"providers": ai_check_all(force=force)})
 
     # --- Usage aggregates for the dashboard -------------------------------
 

@@ -172,6 +172,27 @@ export const reportsApi = {
     endpoint?: string
   }) =>
     api.tenant.get<AiUsageSummary>("/api/reports/ai/usage/", { params }),
+
+  aiKeyStatus: (params?: { refresh?: boolean }) =>
+    api.tenant.get<AiKeyStatusResponse>(
+      "/api/reports/ai/key-status/",
+      { params: params?.refresh ? { refresh: "true" } : undefined },
+    ),
+}
+
+export interface AiProviderStatus {
+  provider: string
+  configured: boolean
+  status: "ok" | "error" | "not_configured"
+  model: string | null
+  latency_ms: number | null
+  error_type: string | null
+  error_message: string | null
+  checked_at: string | null
+  from_cache: boolean
+}
+export interface AiKeyStatusResponse {
+  providers: AiProviderStatus[]
 }
 
 export interface AiUsageTotals {

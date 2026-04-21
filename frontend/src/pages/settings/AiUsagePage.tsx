@@ -12,6 +12,7 @@ import type {
   AiUsageByEndpoint, AiUsageByProvider, AiUsageByUser, AiUsageDailyPoint,
   AiUsageRecentError,
 } from "@/features/reports"
+import { KeyStatusCards } from "./KeyStatusCards"
 
 const WINDOW_OPTIONS: Array<{ value: number; label: string }> = [
   { value: 1, label: "Hoje" },
@@ -47,6 +48,8 @@ export function AiUsagePage() {
         title="Uso da IA"
         subtitle="Chamadas, tokens e custo estimado do motor de demonstrativos"
       />
+
+      <KeyStatusCards />
 
       <div className="card-elevated flex flex-wrap items-center gap-2 p-2 text-[12px]">
         <span className="text-muted-foreground">Janela:</span>

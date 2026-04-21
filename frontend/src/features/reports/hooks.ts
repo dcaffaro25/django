@@ -166,3 +166,21 @@ export function useAiUsage(params?: {
     refetchInterval: 60000, // auto-refresh every minute
   })
 }
+
+export function useAiKeyStatus() {
+  const sub = useSub()
+  const qc = useQueryClient()
+  const q = useQuery({
+    queryKey: ["reports", sub, "ai-key-status"],
+    queryFn: () => reportsApi.aiKeyStatus(),
+    enabled: !!sub,
+    // Backend caches for 5 min; match that at the client.
+    staleTime: 5 * 60 * 1000,
+  })
+  const refresh = () =>
+    reportsApi.aiKeyStatus({ refresh: true }).then((data) => {
+      qc.setQueryData(["reports", sub, "ai-key-status"], data)
+      return data
+    })
+  return { ...q, refresh }
+}
