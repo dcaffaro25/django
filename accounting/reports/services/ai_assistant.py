@@ -42,6 +42,69 @@ class AiAssistantError(Exception):
     """Raised when the AI service fails to produce a valid template."""
 
 
+# --- Error humanization ---------------------------------------------------
+
+
+def _humanize_ai_error(exc: BaseException) -> str:
+    """Turn a raw provider error into a pt-BR message the UI can surface.
+
+    We keep the original exception's message available via ``exc.__cause__``
+    for logs; the returned string is what users see in the frontend's toast
+    or modal banner.
+    """
+    msg = str(exc) or ""
+    low = msg.lower()
+
+    # Context length exceeded — separate from rate limit (400 error class).
+    if (
+        "context_length" in low
+        or "context length" in low
+        or "maximum context" in low
+    ):
+        return (
+            "Prompt excedeu o tamanho máximo do modelo. "
+            "Reduza o número de blocos ou divida o modelo."
+        )
+
+    # OpenAI / Anthropic 429: rate limits (per-minute tokens or requests).
+    if "rate_limit" in low or "429" in msg or "too many requests" in low:
+        if "tokens per min" in low or "tpm" in low:
+            return (
+                "Limite de tokens por minuto do provedor atingido. "
+                "Aguarde ~1 minuto e tente novamente, ou peça ao admin "
+                "para subir o tier da conta OpenAI (adicionar método de "
+                "pagamento eleva de 10k para 30k TPM)."
+            )
+        return (
+            "Provedor de IA pediu para aguardar (limite de requisições). "
+            "Tente novamente em instantes."
+        )
+
+    # Provider auth
+    if "invalid_api_key" in low or "incorrect api key" in low or "401" in msg:
+        return (
+            "Chave de IA inválida ou expirada. Peça ao admin para "
+            "revalidar a chave em Ajustes → Uso da IA."
+        )
+
+    # Quota exhausted (distinct from rate limit — account has no credits)
+    if "insufficient_quota" in low or "billing" in low and "quota" in low:
+        return (
+            "A conta do provedor de IA está sem saldo. "
+            "Peça ao admin para recarregar créditos."
+        )
+
+    # Content policy refusals
+    if "content_policy" in low or "content policy" in low:
+        return (
+            "O provedor recusou a geração por política de conteúdo. "
+            "Reformule a solicitação."
+        )
+
+    # Fallback — return the original, trimmed. Useful during dev.
+    return msg[:300] or "Falha ao contatar o provedor de IA."
+
+
 # --- Usage-logging helper ---------------------------------------------------
 
 
@@ -136,23 +199,39 @@ def _record_usage(
 # --- Chart-of-accounts context ---------------------------------------------
 
 
-def _build_chart_context(company_id: int, limit: int = 400) -> Dict[str, Any]:
+def _build_chart_context(company_id: int, limit: int = 150) -> Dict[str, Any]:
     """Summarize a tenant's chart of accounts into a compact structure for
     the AI prompt. Returns a dict with top-level stats and a sample list.
 
-    We cap at ``limit`` accounts to keep prompts small. For larger charts,
-    the AI should use ``code_prefix`` selectors (which match by pattern, so
-    unseen accounts still get picked up at calculate-time).
+    Prompt-size tuning (post the 45k-token 429 incident):
+    - Default cap is 150 accounts, not 400 — saves ~15k tokens on a
+      large chart. The AI works with code_prefix patterns, so unseen
+      accounts still match at calculate-time.
+    - Accounts with a non-empty ``account_code`` are preferred; coded
+      accounts are more useful for pattern selectors and waste fewer
+      tokens than paths.
+    - Flat dicts, not nested — the serializer in the prompt emits one
+      compact line per account regardless.
 
     ``Account`` is an MPTTModel — there's no ``path`` column; we call
     ``get_path()`` on each instance instead.
     """
-    qs = (
-        Account.objects.filter(company_id=company_id, is_active=True)
-        .order_by("account_code", "name")
-    )
-    total = qs.count()
-    sample_instances = list(qs[:limit])
+    base = Account.objects.filter(company_id=company_id, is_active=True)
+    total = base.count()
+
+    # Prefer coded accounts; they're shorter + more useful for patterns.
+    # Fall back to all active accounts when the chart isn't coded.
+    coded = base.exclude(account_code__isnull=True).exclude(account_code__exact="")
+    primary = coded.order_by("account_code", "name")[:limit]
+    sample_instances = list(primary)
+    if len(sample_instances) < limit:
+        # Top up with uncoded accounts to fill the budget
+        remaining = limit - len(sample_instances)
+        fillers = (
+            base.filter(account_code__isnull=True).order_by("name")[:remaining]
+        )
+        sample_instances.extend(fillers)
+
     accounts: List[Dict[str, Any]] = []
     for a in sample_instances:
         try:
@@ -162,7 +241,9 @@ def _build_chart_context(company_id: int, limit: int = 400) -> Dict[str, Any]:
         accounts.append({
             "code": a.account_code or "",
             "name": a.name,
-            "path": path or "",
+            # Truncate path — most value is at the top of the hierarchy;
+            # we already give the AI the code and direction.
+            "path": (path or "")[:120],
             "direction": a.account_direction,
             "level": a.level,
         })
@@ -315,19 +396,21 @@ def generate_template(
             context=context, endpoint="generate_template",
         )
     except ExternalAIError as exc:
-        raise AiAssistantError(f"AI call failed: {exc}") from exc
+        raise AiAssistantError(_humanize_ai_error(exc)) from exc
 
     # Validate against pydantic; emit a single repair pass if validation fails.
     try:
         doc_model = validate_document(raw)
     except PydanticValidationError as exc:
         log.warning("AI document failed first-pass validation: %s", exc)
+        # Repair prompt: only the failed doc + the validation errors, no
+        # chart of accounts. Prevents the retry from blowing past the TPM
+        # limit (our original 429 was on repair calls with chart resent).
         repair_prompt = (
-            "The previous JSON document failed schema validation with these "
-            "errors:\n\n"
-            + json.dumps(exc.errors(), indent=2)
-            + "\n\nRegenerate the SAME template, corrected so it validates. "
-            "Respond with ONLY JSON."
+            "The JSON below failed schema validation. Regenerate it "
+            "corrected. Respond with ONLY the full corrected JSON.\n\n"
+            f"Errors:\n{json.dumps(exc.errors(), indent=2)}\n\n"
+            f"Previous (invalid) doc:\n{json.dumps(raw, ensure_ascii=False)}"
         )
         try:
             raw = _run_ai_call(
@@ -340,7 +423,7 @@ def generate_template(
                 f"AI returned an invalid document even after repair: {exc2}"
             ) from exc2
         except ExternalAIError as exc2:
-            raise AiAssistantError(f"AI repair call failed: {exc2}") from exc2
+            raise AiAssistantError(_humanize_ai_error(exc2)) from exc2
 
     # Force the user-requested report_type in case the model produced a
     # different one — the UI expects it to match.
@@ -434,6 +517,13 @@ def refine_template(
                 "accounts shown — prefer code_prefix selectors.)"
             )
 
+    # Refine actions are label/structure tweaks — GPT-4o-mini does them
+    # well at ~15% of the cost AND with ~20x higher TPM limit on Tier 1.
+    # Heavier structural work (generate_template) stays on gpt-4o.
+    effective_model = model
+    if not effective_model and (provider or "").lower() in ("", "openai"):
+        effective_model = "gpt-4o-mini"
+
     user_prompt = (
         f"Apply the following refine action to the template below.\n\n"
         f"Action: {action}\n"
@@ -446,11 +536,11 @@ def refine_template(
     )
 
     try:
-        client = ExternalAIClient(provider=provider, model=model)
+        client = ExternalAIClient(provider=provider, model=effective_model)
     except Exception as exc:
         raise AiAssistantError(f"AI client init failed: {exc}") from exc
 
-    log.info("ai_assistant.refine_template: action=%s", action)
+    log.info("ai_assistant.refine_template: action=%s model=%s", action, client.model)
 
     try:
         raw = _run_ai_call(
@@ -458,7 +548,7 @@ def refine_template(
             context=context, endpoint=f"refine.{action}",
         )
     except ExternalAIError as exc:
-        raise AiAssistantError(f"AI call failed: {exc}") from exc
+        raise AiAssistantError(_humanize_ai_error(exc)) from exc
 
     try:
         new_doc = validate_document(raw)
@@ -871,7 +961,7 @@ def chat(
             context=context, endpoint="chat",
         )
     except ExternalAIError as exc:
-        raise AiAssistantError(f"AI call failed: {exc}") from exc
+        raise AiAssistantError(_humanize_ai_error(exc)) from exc
 
     assistant_message = str(raw.get("assistant_message") or "").strip()
     operations = _validate_operations(raw.get("operations") or [])
