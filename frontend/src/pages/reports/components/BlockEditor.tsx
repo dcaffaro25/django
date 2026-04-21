@@ -1,4 +1,4 @@
-import { useMemo } from "react"
+import { useMemo, useState } from "react"
 import {
   DndContext, PointerSensor, closestCenter, useSensor, useSensors,
   type DragEndEvent,
@@ -8,27 +8,24 @@ import {
 } from "@dnd-kit/sortable"
 import { CSS } from "@dnd-kit/utilities"
 import {
-  FileText, Receipt, Equal, Sigma, Minus, Heading, GripVertical, Trash2, Plus, ChevronRight, AlertTriangle,
+  FileText, Receipt, Equal, Sigma, Minus, Heading, GripVertical, Trash2, Plus,
+  ChevronRight, AlertTriangle, MoreHorizontal, Sparkles,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import type {
-  Block, BlockType, LineBlock, SubtotalBlock, TotalBlock, TemplateDocument,
+  Block, BlockType, LineBlock, SectionBlock, SubtotalBlock, TemplateDocument, TotalBlock,
 } from "@/features/reports"
 import { collectBlockIds, detectFormulaCycle } from "@/features/reports"
 import {
   flattenForEdit, reorderFlat, uniqueBlockId, type FlatBlock,
 } from "./block-tree"
-import { FormulaInput } from "./FormulaInput"
-import { AccountTreePicker } from "./AccountTreePicker"
+import { BlockDetailDrawer } from "./BlockDetailDrawer"
 
 /**
- * Minimal flat-list block editor for PR 4. Supports:
- * - drag-reorder (within the flattened list; cross-section moves land in PR 9)
- * - inline label + type edit
- * - a collapsible detail row for calc method, sign, formula, account pattern
- * - add/remove root-level blocks
- *
- * PR 9 will replace this with a proper per-block drawer + block-type styling.
+ * PR9 refresh: the row is now compact — drag / type-icon / label / id /
+ * overflow (⋯) / delete — and every other setting lives in a right-side
+ * drawer (BlockDetailDrawer). Block types render with distinct styling
+ * (sections = colored strip, totals = top border, spacers = hairline).
  */
 export function BlockEditor({
   document,
@@ -41,6 +38,13 @@ export function BlockEditor({
   const validIds = useMemo(() => collectBlockIds(document), [document])
   const cycle = useMemo(() => detectFormulaCycle(document), [document])
   const cyclicIds = useMemo(() => new Set(cycle ?? []), [cycle])
+
+  const [drawerKey, setDrawerKey] = useState<string | null>(null)
+  const drawerBlock: Block | null = useMemo(() => {
+    if (!drawerKey) return null
+    const match = flat.find((fb) => fb._key === drawerKey)
+    return match?.block ?? null
+  }, [drawerKey, flat])
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }))
 
@@ -94,7 +98,6 @@ export function BlockEditor({
   const removeBlock = (key: string) => {
     const target = flat.find((fb) => fb._key === key)
     if (!target) return
-    // Removing a section removes its descendants too.
     const toRemove = new Set<string>([key])
     if (target.block.type === "section") {
       for (const fb of flat) {
@@ -123,16 +126,14 @@ export function BlockEditor({
           <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
           <div>
             <div className="font-medium">Referência circular detectada</div>
-            <div className="text-[10px] opacity-80">
-              {cycle.join(" → ")}
-            </div>
+            <div className="text-[10px] opacity-80">{cycle.join(" → ")}</div>
           </div>
         </div>
       )}
 
       {flat.length === 0 ? (
         <div className="rounded-md border border-dashed border-border p-6 text-center text-[12px] text-muted-foreground">
-          Sem blocos. Adicione um bloco ou gere um modelo com IA (em breve).
+          Sem blocos. Adicione um bloco, gere com IA, ou abra o chat.
         </div>
       ) : (
         <div className="rounded-md border border-border">
@@ -142,41 +143,83 @@ export function BlockEditor({
                 <BlockRow
                   key={fb._key}
                   item={fb}
-                  validIds={validIds}
                   isInCycle={cyclicIds.has(fb.block.id)}
                   onChange={(patch) => updateBlock(fb._key, patch)}
                   onRemove={() => removeBlock(fb._key)}
+                  onOpenDetail={() => setDrawerKey(fb._key)}
                 />
               ))}
             </SortableContext>
           </DndContext>
         </div>
       )}
+
+      <BlockDetailDrawer
+        open={drawerKey !== null}
+        block={drawerBlock}
+        validIds={validIds}
+        onChange={(patch) => {
+          if (drawerKey) updateBlock(drawerKey, patch)
+        }}
+        onClose={() => setDrawerKey(null)}
+      />
     </div>
   )
 }
 
+// ---- BlockRow -------------------------------------------------------------
+
 function BlockRow({
-  item, validIds, isInCycle, onChange, onRemove,
+  item, isInCycle, onChange, onRemove, onOpenDetail,
 }: {
   item: FlatBlock
-  validIds: Set<string>
   isInCycle: boolean
   onChange: (patch: Partial<Block>) => void
   onRemove: () => void
+  onOpenDetail: () => void
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: item._key })
   const style = { transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0.5 : 1 }
   const { block, depth } = item
+  const styling = rowStyleFor(block.type)
+  const label = (block as { label?: string | null }).label ?? ""
+  const isBold =
+    ((block as { bold?: boolean | null }).bold ?? false)
+    || block.type === "subtotal" || block.type === "total"
+    || block.type === "header" || block.type === "section"
+
+  // Spacer is a special minimal row — thin hairline with just a drag handle.
+  if (block.type === "spacer") {
+    return (
+      <div
+        ref={setNodeRef}
+        style={style}
+        className={cn(
+          "group flex items-center gap-2 border-b border-border/30 px-2 py-0.5 last:border-b-0",
+          isInCycle && "border-l-2 border-l-red-500",
+        )}
+      >
+        <button {...attributes} {...listeners}
+          className="grid h-5 w-5 cursor-grab place-items-center text-muted-foreground/50 hover:text-foreground">
+          <GripVertical className="h-3 w-3" />
+        </button>
+        <div className="flex-1 border-t border-dashed border-border/60" />
+        <code className="text-[10px] text-muted-foreground/60">{block.id}</code>
+        <button onClick={onRemove}
+          className="grid h-5 w-5 place-items-center rounded-md text-red-600/60 opacity-0 hover:bg-red-500/10 group-hover:opacity-100">
+          <Trash2 className="h-3 w-3" />
+        </button>
+      </div>
+    )
+  }
 
   return (
     <div
       ref={setNodeRef}
       style={style}
       className={cn(
-        "flex flex-wrap items-center gap-2 border-b border-border/50 px-2 py-1.5 last:border-b-0 hover:bg-accent/30",
-        block.type === "section" && "bg-surface-2/50",
-        block.type === "header" && "bg-surface-3/50",
+        "group flex flex-wrap items-center gap-2 border-b border-border/50 px-2 py-1.5 last:border-b-0 hover:bg-accent/30",
+        styling.row,
         isInCycle && "border-l-2 border-l-red-500 bg-red-500/5",
       )}
     >
@@ -189,35 +232,42 @@ function BlockRow({
         <GripVertical className="h-3 w-3" />
       </button>
 
-      <TypeIcon type={block.type} />
+      <div className={cn("grid h-5 w-5 place-items-center rounded", styling.iconBg)}>
+        <TypeIcon type={block.type} />
+      </div>
 
       <div style={{ width: `${depth * 12}px` }} />
 
       <input
-        value={block.type === "spacer" ? "" : ((block as { label?: string | null }).label ?? "")}
+        value={label}
         onChange={(e) => onChange({ label: e.target.value } as Partial<Block>)}
-        disabled={block.type === "spacer"}
-        placeholder={block.type === "spacer" ? "— espaçador —" : "Rótulo"}
+        placeholder="Rótulo"
         className={cn(
-          "h-7 flex-1 min-w-[120px] rounded-md border border-border bg-background px-2 text-[12px] outline-none focus:border-ring disabled:bg-muted/50 disabled:text-muted-foreground",
-          ((block as { bold?: boolean | null }).bold
-            || block.type === "subtotal" || block.type === "total"
-            || block.type === "header" || block.type === "section") && "font-semibold",
+          "h-7 flex-1 min-w-[140px] rounded-md border border-border bg-background px-2 text-[12px] outline-none focus:border-ring",
+          isBold && "font-semibold",
         )}
       />
 
       <code className="text-[10px] text-muted-foreground">{block.id}</code>
 
-      {(block.type === "line" || block.type === "subtotal" || block.type === "total") && (
-        <InlineDetail
-          block={block as LineBlock | SubtotalBlock | TotalBlock}
-          validIds={validIds}
-          onChange={onChange}
+      {(block as { ai_explanation?: string | null }).ai_explanation && (
+        <Sparkles
+          className="h-3 w-3 text-amber-500"
+          aria-label="Sugerido pela IA"
         />
       )}
 
       <button
+        onClick={onOpenDetail}
+        title="Configurações do bloco"
+        className="grid h-6 w-6 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+      >
+        <MoreHorizontal className="h-3 w-3" />
+      </button>
+
+      <button
         onClick={onRemove}
+        title="Remover"
         className="grid h-6 w-6 place-items-center rounded-md text-red-600/70 hover:bg-red-500/10 hover:text-red-600"
         aria-label="Remover"
       >
@@ -227,41 +277,43 @@ function BlockRow({
   )
 }
 
-function InlineDetail({
-  block,
-  validIds,
-  onChange,
-}: {
-  block: LineBlock | SubtotalBlock | TotalBlock
-  validIds: Set<string>
-  onChange: (patch: Partial<Block>) => void
-}) {
-  const showFormula = block.type === "subtotal" || block.type === "total"
-  const showAccounts = block.type === "line" || block.type === "subtotal"
-  return (
-    <div className="flex flex-wrap items-center gap-1.5">
-      {showAccounts && (
-        <AccountTreePicker
-          value={(block as LineBlock).accounts}
-          onChange={(sel) => onChange({ accounts: sel } as Partial<Block>)}
-        />
-      )}
+// ---- Style helpers --------------------------------------------------------
 
-      {showFormula && (
-        <div className="w-[200px]">
-          <FormulaInput
-            value={(block as SubtotalBlock | TotalBlock).formula ?? ""}
-            validIds={validIds}
-            onChange={(v) => onChange({ formula: v || null } as Partial<Block>)}
-          />
-        </div>
-      )}
-    </div>
-  )
+interface RowStyle {
+  row: string
+  iconBg: string
+}
+
+function rowStyleFor(type: BlockType): RowStyle {
+  switch (type) {
+    case "section":
+      return {
+        row: "bg-gradient-to-r from-blue-500/10 to-transparent border-l-2 border-l-blue-500/60",
+        iconBg: "bg-blue-500/20 text-blue-700 dark:text-blue-300",
+      }
+    case "header":
+      return {
+        row: "bg-surface-3/50",
+        iconBg: "bg-surface-3",
+      }
+    case "subtotal":
+      return {
+        row: "border-t border-t-foreground/30",
+        iconBg: "bg-muted",
+      }
+    case "total":
+      return {
+        row: "border-t-2 border-t-foreground/70 bg-surface-2/40",
+        iconBg: "bg-primary/20 text-primary",
+      }
+    case "line":
+    default:
+      return { row: "", iconBg: "bg-muted/60" }
+  }
 }
 
 function TypeIcon({ type }: { type: BlockType }) {
-  const cls = "h-3.5 w-3.5 text-muted-foreground"
+  const cls = "h-3 w-3"
   if (type === "section") return <ChevronRight className={cls} />
   if (type === "header") return <Heading className={cls} />
   if (type === "line") return <Receipt className={cls} />
@@ -301,7 +353,6 @@ function labelForType(type: BlockType): string {
 }
 
 function buildBlocksFromFlat(flat: FlatBlock[]): Block[] {
-  // Same logic as unflattenForSave but returns only the blocks array.
   const childrenByParent = new Map<string, FlatBlock[]>()
   const roots: FlatBlock[] = []
   for (const fb of flat) {
@@ -316,9 +367,14 @@ function buildBlocksFromFlat(flat: FlatBlock[]): Block[] {
   function build(fb: FlatBlock): Block {
     if (fb.block.type === "section") {
       const children = (childrenByParent.get(fb.block.id) ?? []).map(build)
-      return { ...fb.block, children }
+      return { ...fb.block, children } as SectionBlock
     }
     return fb.block
   }
   return roots.map(build)
 }
+
+// Suppress unused-import warnings for the types we import purely for narrowing
+// above (TS compile is satisfied by their use in types, but ESLint sometimes
+// flags them). They are intentional.
+export type { LineBlock }
