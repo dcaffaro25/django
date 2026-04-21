@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react"
 import { toast } from "sonner"
+import { useHotkeys } from "react-hotkeys-hook"
 import {
   Save, Play, Download, FileSpreadsheet, FileText, Plus, Copy, Trash2, Layers, Sparkles,
   MessageSquare, Code, LayoutGrid,
@@ -222,6 +223,40 @@ export function BuilderPage() {
     setPreview(null)
   }
 
+  // Keyboard shortcuts — preventDefault so the browser's Save dialog
+  // doesn't show on Ctrl/Cmd+S, and the textarea/input don't submit a
+  // form on Ctrl/Cmd+Enter.
+  useHotkeys(
+    "mod+s",
+    (e) => {
+      e.preventDefault()
+      if (dirty && !saveTemplate.isPending) onSaveTemplate()
+    },
+    { enableOnFormTags: true },
+    [dirty, saveTemplate.isPending, doc, selectedTemplateId],
+  )
+  useHotkeys(
+    "mod+enter",
+    (e) => {
+      e.preventDefault()
+      if (!calculate.isPending) onCalculate()
+    },
+    { enableOnFormTags: true },
+    [calculate.isPending, doc, periods],
+  )
+  useHotkeys(
+    "slash",
+    (e) => {
+      // Only trigger when not typing inside a text control.
+      const t = e.target as HTMLElement
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) {
+        return
+      }
+      e.preventDefault()
+      setChatOpen(true)
+    },
+  )
+
   return (
     <div className="space-y-3">
       <SectionHeader
@@ -399,7 +434,7 @@ export function BuilderPage() {
               </BtnGhost>
             </div>
           </div>
-          <ReportRenderer result={preview} />
+          <ReportRenderer result={preview} document={doc} />
         </div>
       </div>
     </div>

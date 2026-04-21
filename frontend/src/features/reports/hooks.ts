@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   reportsApi,
   type AiChatRequest,
+  type AiExplainRequest,
   type AiGenerateTemplateRequest,
   type AiRefineRequest,
 } from "./api"
@@ -142,5 +143,11 @@ export function useAiRefine() {
 export function useAiChat() {
   return useMutation({
     mutationFn: (body: AiChatRequest) => reportsApi.aiChat(body),
+  })
+}
+
+export function useAiExplain() {
+  return useMutation({
+    mutationFn: (body: AiExplainRequest) => reportsApi.aiExplain(body),
   })
 }

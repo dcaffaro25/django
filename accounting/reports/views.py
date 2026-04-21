@@ -25,6 +25,7 @@ from .serializers import (
 from .services.ai_assistant import (
     AiAssistantError,
     chat as ai_chat,
+    explain as ai_explain,
     generate_template,
     refine_template,
     summarize_changes,
@@ -417,7 +418,63 @@ class AiStub(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"])
     def explain(self, request, tenant_id=None):
-        return self._ni("POST /api/reports/ai/explain/")
+        """Explain a single cell in the preview result.
+
+        Body::
+
+            {
+              "document": {...},
+              "result":   {...},  // /calculate/ response
+              "block_id": "revenue_gross",
+              "period_id": "cur",
+              "provider": "openai"|"anthropic" (optional),
+              "model":    "..."  (optional)
+            }
+
+        Returns::
+
+            {
+              "text": "Explicação em pt-BR ...",
+              "block_id": "...",
+              "period_id": "...",
+              "value": <number|null>,
+              "accounts": [{id, account_code, name, path}, ...]
+            }
+
+        Falls back to a coded (non-AI) explanation if the AI call fails —
+        the UI still gets something useful, just less conversational.
+        """
+        tenant = _tenant_or_raise(request)
+        body = request.data or {}
+
+        document = body.get("document")
+        result = body.get("result")
+        block_id = body.get("block_id")
+        period_id = body.get("period_id")
+
+        if not isinstance(document, dict):
+            raise ValidationError({"document": "Provide the template document"})
+        if not isinstance(result, dict):
+            raise ValidationError({"result": "Provide a /calculate/ result"})
+        if not block_id or not period_id:
+            raise ValidationError({"block_id": "block_id and period_id required"})
+
+        try:
+            payload = ai_explain(
+                company_id=tenant.id,
+                document=document,
+                result=result,
+                block_id=block_id,
+                period_id=period_id,
+                provider=body.get("provider"),
+                model=body.get("model"),
+            )
+        except AiAssistantError as exc:
+            return Response(
+                {"error": str(exc), "error_type": "ai_error"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(payload, status=status.HTTP_200_OK)
 
 
 # --- Helpers --------------------------------------------------------------

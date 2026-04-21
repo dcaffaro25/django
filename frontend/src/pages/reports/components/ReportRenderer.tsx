@@ -1,17 +1,42 @@
+import { useMemo, useState } from "react"
+import { HelpCircle } from "lucide-react"
 import { cn } from "@/lib/utils"
-import type { ReportResult } from "@/features/reports"
+import type { ReportResult, TemplateDocument } from "@/features/reports"
+import { LineSparkline } from "./LineSparkline"
+import { ExplainPopover } from "./ExplainPopover"
 
 /**
  * Renders a ``ReportResult`` as a multi-column table. Single render path
  * across the builder preview, history view, and print mode. No server HTML.
+ *
+ * Optional ``document`` enables the per-cell "explain this number" popover.
+ * Omit it on read-only instance views where AI access isn't available.
  */
 export function ReportRenderer({
   result,
+  document,
   printMode = false,
 }: {
   result: ReportResult | null
+  document?: TemplateDocument | null
   printMode?: boolean
 }) {
+  const [explain, setExplain] = useState<{
+    blockId: string
+    periodId: string
+    rect: DOMRect
+  } | null>(null)
+
+  // Concrete (non-variance) periods are the ones that form a meaningful
+  // trend line — sparklines only make sense for these. Computed here so
+  // the Decision to render a sparkline is cheap per row.
+  const trendPeriodIds = useMemo(() => {
+    if (!result) return [] as string[]
+    return result.periods
+      .filter((p) => p.type === "range" || p.type === "as_of")
+      .map((p) => p.id)
+  }, [result])
+
   if (!result) {
     return (
       <div className="flex h-[240px] items-center justify-center text-[12px] text-muted-foreground">
@@ -22,6 +47,8 @@ export function ReportRenderer({
 
   const periods = result.periods
   const lines = result.lines
+  const canExplain = document != null
+  const showSparklines = trendPeriodIds.length >= 3
 
   return (
     <div className={cn("min-h-[280px]", printMode && "bg-white p-6 text-black")}>
@@ -42,6 +69,9 @@ export function ReportRenderer({
                   {p.label}
                 </th>
               ))}
+              {showSparklines && (
+                <th className="h-8 px-3 font-medium">Tendência</th>
+              )}
             </tr>
           </thead>
           <tbody>
@@ -49,7 +79,7 @@ export function ReportRenderer({
               if (line.type === "spacer") {
                 return (
                   <tr key={line.id} className="h-2">
-                    <td colSpan={periods.length + 1} />
+                    <td colSpan={periods.length + (showSparklines ? 2 : 1)} />
                   </tr>
                 )
               }
@@ -58,11 +88,18 @@ export function ReportRenderer({
                 line.bold || line.type === "subtotal" || line.type === "total" || isSection
               const hasBorderTop = line.type === "total" || line.type === "subtotal"
 
+              const trend = showSparklines
+                ? trendPeriodIds.map((pid) => ({
+                    label: pid,
+                    value: Number(line.values[pid] ?? 0),
+                  }))
+                : []
+
               return (
                 <tr
                   key={line.id}
                   className={cn(
-                    "border-b border-border/50",
+                    "group border-b border-border/50",
                     isBoldRow && "font-semibold",
                     hasBorderTop && "border-t border-foreground/30",
                     isSection && "bg-surface-2/60",
@@ -75,17 +112,63 @@ export function ReportRenderer({
                   >
                     {line.label ?? line.id}
                   </td>
-                  {periods.map((p) => (
-                    <td key={p.id} className="h-8 px-3 text-right tabular-nums">
-                      <ValueCell periodType={p.type} value={line.values[p.id]} />
+                  {periods.map((p) => {
+                    const val = line.values[p.id]
+                    const explainable =
+                      canExplain
+                      && line.type !== "header"
+                      && line.type !== "spacer"
+                      && !p.type.startsWith("variance")
+                    return (
+                      <td
+                        key={p.id}
+                        className="relative h-8 px-3 text-right tabular-nums"
+                      >
+                        <div className="inline-flex items-center justify-end gap-1">
+                          <ValueCell periodType={p.type} value={val} />
+                          {explainable && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                setExplain({
+                                  blockId: line.id,
+                                  periodId: p.id,
+                                  rect: (e.currentTarget as HTMLElement).getBoundingClientRect(),
+                                })
+                              }}
+                              title="Explicar este valor"
+                              className="grid h-4 w-4 place-items-center rounded-sm text-muted-foreground/0 transition-opacity hover:text-foreground group-hover:text-muted-foreground"
+                            >
+                              <HelpCircle className="h-3 w-3" />
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    )
+                  })}
+                  {showSparklines && (
+                    <td className="h-8 px-3">
+                      {line.type !== "header" && line.type !== "section" && trend.length >= 2 && (
+                        <LineSparkline data={trend} />
+                      )}
                     </td>
-                  ))}
+                  )}
                 </tr>
               )
             })}
           </tbody>
         </table>
       </div>
+
+      <ExplainPopover
+        open={explain !== null}
+        document={document ?? null}
+        result={result}
+        blockId={explain?.blockId ?? null}
+        periodId={explain?.periodId ?? null}
+        anchorRect={explain?.rect ?? null}
+        onClose={() => setExplain(null)}
+      />
 
       {result.warnings && result.warnings.length > 0 && (
         <div className="mt-3 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-[11px]">

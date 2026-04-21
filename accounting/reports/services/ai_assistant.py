@@ -519,6 +519,167 @@ def _validate_operations(ops: List[Any]) -> List[dict]:
     return out
 
 
+def explain(
+    *,
+    company_id: int,
+    document: dict,
+    result: dict,
+    block_id: str,
+    period_id: str,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Explain a single value in the preview.
+
+    Looks up the block's calc memory (written by ``ReportCalculator`` at
+    calculate-time), resolves the contributing account ids back to full
+    names + codes, and asks the AI to compose a concise Portuguese
+    explanation. If the cell has no memory (formula/rollup block, or a
+    spacer), we still produce something useful — the block type, its
+    formula, and the computed value itself.
+    """
+    if not isinstance(result, dict):
+        raise AiAssistantError("missing result to explain")
+
+    # Find the line
+    lines = result.get("lines") or []
+    line = next((l for l in lines if l.get("id") == block_id), None)
+    if line is None:
+        raise AiAssistantError(f"block id '{block_id}' not found in result")
+
+    values = line.get("values") or {}
+    value = values.get(period_id)
+    if value is None and period_id not in values:
+        raise AiAssistantError(
+            f"period id '{period_id}' not present on block '{block_id}'"
+        )
+
+    periods = {p.get("id"): p for p in (result.get("periods") or [])}
+    period = periods.get(period_id, {})
+
+    memory = (line.get("memory") or {}).get(period_id) or {}
+    account_ids = memory.get("account_ids") or []
+
+    # Resolve account ids → names for the prompt (capped)
+    accounts_detail: List[Dict[str, Any]] = []
+    if account_ids:
+        rows = list(
+            Account.objects.filter(
+                company_id=company_id, id__in=account_ids[:40]
+            ).values("id", "name", "account_code", "path")
+        )
+        accounts_detail = rows
+
+    # Locate the block in the document so we can include its type/formula
+    block_info: Dict[str, Any] = {"id": block_id}
+
+    def _find(blocks: List[dict]) -> Optional[dict]:
+        for b in blocks or []:
+            if b.get("id") == block_id:
+                return b
+            if b.get("type") == "section":
+                hit = _find(b.get("children") or [])
+                if hit:
+                    return hit
+        return None
+
+    found = _find(document.get("blocks") or [])
+    if found:
+        for key in ("type", "label", "formula", "calculation_method",
+                    "sign_policy", "accounts"):
+            if found.get(key) is not None:
+                block_info[key] = found[key]
+
+    user_prompt = (
+        "Explique em português, em 1–3 frases curtas, por que este valor "
+        f"é {value} na coluna '{period.get('label', period_id)}' "
+        f"(período tipo '{period.get('type')}'). "
+        "Mencione as contas que contribuíram (com código + nome) e, se "
+        "houver fórmula, refira-se a ela pelos nomes dos blocos. Não use "
+        "markdown ou cabeçalhos — resposta em texto corrido.\n\n"
+        f"Bloco: {json.dumps(block_info, ensure_ascii=False)}\n"
+        f"Período: {json.dumps(period, ensure_ascii=False)}\n"
+        f"Valor: {value}\n"
+        f"Memória de cálculo: {json.dumps(memory, ensure_ascii=False)}\n"
+        f"Contas envolvidas: {json.dumps(accounts_detail, ensure_ascii=False)}\n"
+    )
+
+    explanation_text: str
+    try:
+        client = ExternalAIClient(provider=provider, model=model)
+        # Explain uses the chat system prompt but discards operations —
+        # simpler to ask for a raw JSON wrapping a single "text" field.
+        raw = client.generate_json(
+            prompt=user_prompt
+            + '\n\nResponda com JSON: {"text": "<explicação>"}',
+            system_prompt=(
+                "Você é um contador sênior explicando valores a um "
+                "usuário em um editor de demonstrativos. Seja direto, "
+                "referencie códigos de contas quando existir, mas fale "
+                "em português acessível."
+            ),
+        )
+        explanation_text = str(raw.get("text") or "").strip()
+    except (ExternalAIError, AiAssistantError) as exc:
+        # Fall back to a purely coded explanation — no AI call, still useful.
+        log.warning("explain: AI call failed, falling back to coded text: %s", exc)
+        explanation_text = _coded_explanation(
+            block_info=block_info,
+            period=period,
+            value=value,
+            memory=memory,
+            accounts=accounts_detail,
+        )
+
+    return {
+        "text": explanation_text,
+        "block_id": block_id,
+        "period_id": period_id,
+        "value": value,
+        "accounts": accounts_detail,
+    }
+
+
+def _coded_explanation(
+    *,
+    block_info: Dict[str, Any],
+    period: Dict[str, Any],
+    value: Any,
+    memory: Dict[str, Any],
+    accounts: List[Dict[str, Any]],
+) -> str:
+    """Deterministic fallback explanation when the AI is unavailable."""
+    parts: List[str] = []
+    btype = block_info.get("type", "linha")
+    label = block_info.get("label") or block_info.get("id")
+    period_label = period.get("label") or period.get("id")
+    parts.append(f"{btype.capitalize()} '{label}' = {value} em '{period_label}'.")
+
+    method = block_info.get("calculation_method") or memory.get("calc_method")
+    if method:
+        parts.append(f"Método de cálculo: {method}.")
+
+    formula = block_info.get("formula")
+    if formula:
+        parts.append(f"Fórmula: {formula}.")
+
+    if accounts:
+        samples = ", ".join(
+            f"{a.get('account_code') or '—'} {a.get('name', '')}".strip()
+            for a in accounts[:5]
+        )
+        extra = (
+            f" (+{len(accounts) - 5} outras)" if len(accounts) > 5 else ""
+        )
+        parts.append(f"Contas envolvidas: {samples}{extra}.")
+
+    sign = block_info.get("sign_policy")
+    if sign and sign != "natural":
+        parts.append(f"Sinal: {sign}.")
+
+    return " ".join(parts)
+
+
 def chat(
     *,
     messages: List[dict],

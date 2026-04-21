@@ -65,6 +65,28 @@ export interface AiChatResponse {
   operations: import("./operations").ChatOperation[]
 }
 
+export interface AiExplainRequest {
+  document: TemplateDocument
+  result: ReportResult
+  block_id: string
+  period_id: string
+  provider?: "openai" | "anthropic"
+  model?: string
+}
+
+export interface AiExplainResponse {
+  text: string
+  block_id: string
+  period_id: string
+  value: number | null
+  accounts: Array<{
+    id: number
+    name: string
+    account_code?: string | null
+    path?: string | null
+  }>
+}
+
 export const reportsApi = {
   // --- Templates ---------------------------------------------------------
   listTemplates: (params?: { report_type?: string; is_active?: boolean }) =>
@@ -139,4 +161,7 @@ export const reportsApi = {
 
   aiChat: (body: AiChatRequest) =>
     api.tenant.post<AiChatResponse>("/api/reports/ai/chat/", body),
+
+  aiExplain: (body: AiExplainRequest) =>
+    api.tenant.post<AiExplainResponse>("/api/reports/ai/explain/", body),
 }
