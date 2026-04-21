@@ -13,6 +13,10 @@ interface AuthContextType {
   user: User | null
   token: string | null
   isAuthenticated: boolean
+  /** Platform-admin gate. Mirrors the backend decision: superuser is the
+   *  single source of truth for "can see /admin/*". Derived from
+   *  ``user.is_superuser`` (undefined before the profile lands). */
+  isSuperuser: boolean
   loginWithToken: (token: string) => Promise<void>
   loginWithCredentials: (username: string, password: string) => Promise<void>
   logout: () => void
@@ -76,6 +80,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     user,
     token,
     isAuthenticated: !!token,
+    isSuperuser: !!user?.is_superuser,
     loginWithToken,
     loginWithCredentials,
     logout,

@@ -4,13 +4,15 @@ import {
   LayoutDashboard, ArrowLeftRight, ListChecks, Sparkles, SlidersHorizontal, Workflow,
   Scale, Wallet, Receipt, BookOpen, FileBarChart, FileCog, CreditCard, Users, Boxes,
   Settings, ChevronLeft, PanelLeftOpen, Building2, CheckCircle2, Brain, Zap,
-  FileSpreadsheet, Shuffle, UploadCloud,
+  FileSpreadsheet, Shuffle, UploadCloud, ShieldCheck,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/stores/app-store"
+import { useAuth } from "@/providers/AuthProvider"
 
 type NavItem = { key: string; path: string; icon: typeof LayoutDashboard }
-type NavGroup = { key: string; items: NavItem[] }
+type NavGroup = { key: string; items: NavItem[]; /** Rendered only when the predicate is true. */
+  visible?: (ctx: { isSuperuser: boolean }) => boolean }
 
 const GROUPS: NavGroup[] = [
   {
@@ -78,12 +80,24 @@ const GROUPS: NavGroup[] = [
       { key: "imports_substitutions", path: "/imports/substitutions", icon: Shuffle },
     ],
   },
+  // Platform-admin area. Hidden entirely from non-superusers — no
+  // "coming soon" teasing, no 403 click — matching the backend's
+  // IsSuperUser check on /api/admin/*.
+  {
+    key: "admin",
+    visible: ({ isSuperuser }) => isSuperuser,
+    items: [
+      { key: "admin_home", path: "/admin", icon: ShieldCheck },
+    ],
+  },
 ]
 
 export function Sidebar() {
   const { t } = useTranslation()
   const collapsed = useAppStore((s) => s.sidebarCollapsed)
   const toggle = useAppStore((s) => s.toggleSidebar)
+  const { isSuperuser } = useAuth()
+  const visibleGroups = GROUPS.filter((g) => !g.visible || g.visible({ isSuperuser }))
 
   return (
     <aside
@@ -119,7 +133,7 @@ export function Sidebar() {
       <div className="mx-3 my-1 h-px bg-border" />
 
       <nav className="flex-1 overflow-y-auto px-2 py-2">
-        {GROUPS.map((g, gi) => (
+        {visibleGroups.map((g, gi) => (
           <div key={g.key} className={cn("space-y-0.5", gi > 0 && "mt-3")}>
             {!collapsed && (
               <div className="px-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70">

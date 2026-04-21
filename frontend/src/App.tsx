@@ -25,6 +25,8 @@ import { BuilderPage as ReportsBuilderPage } from "@/pages/reports/BuilderPage"
 import { HistoryPage as ReportsHistoryPage } from "@/pages/reports/HistoryPage"
 import { ViewPage as ReportsViewPage } from "@/pages/reports/ViewPage"
 import { AiUsagePage } from "@/pages/settings/AiUsagePage"
+import { AdminHomePage } from "@/pages/admin/AdminHomePage"
+import { SuperuserGuard } from "@/pages/admin/SuperuserGuard"
 
 function Protected({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuth()
@@ -76,6 +78,11 @@ export default function App() {
                   <Route path="/imports/*" element={<ImportsHubPage />} />
                   <Route path="/settings/entities" element={<EntitiesPage />} />
                   <Route path="/settings/*" element={<PlaceholderPage title="Ajustes" />} />
+                  {/* Platform-admin area. SuperuserGuard renders a 403-ish
+                      screen for non-superusers; the backend independently
+                      enforces IsSuperUser on every /api/admin/* endpoint. */}
+                  <Route path="/admin" element={<SuperuserGuard><AdminHomePage /></SuperuserGuard>} />
+                  <Route path="/admin/*" element={<SuperuserGuard><AdminHomePage /></SuperuserGuard>} />
                   <Route path="*" element={<Navigate to="/recon" replace />} />
                 </Routes>
               </AppShell>
