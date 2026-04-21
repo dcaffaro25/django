@@ -24,6 +24,7 @@ from .serializers import (
 )
 from .services.ai_assistant import (
     AiAssistantError,
+    chat as ai_chat,
     generate_template,
     refine_template,
     summarize_changes,
@@ -366,7 +367,53 @@ class AiStub(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"])
     def chat(self, request, tenant_id=None):
-        return self._ni("POST /api/reports/ai/chat/")
+        """Conversational assistant with tool-calling operations.
+
+        Body::
+
+            {
+              "messages": [{"role": "user"|"assistant", "content": "..."}, ...],
+              "document": { ...current template... },
+              "preview_result": { ...optional /calculate/ result... },
+              "provider": "openai"|"anthropic" (optional),
+              "model": "..." (optional)
+            }
+
+        Returns::
+
+            {
+              "assistant_message": "human reply in pt-BR",
+              "operations": [ {op: "add_block"|"update_block"|..., ...}, ... ]
+            }
+
+        Operations are proposed changes — the UI renders each as a diff
+        card and applies only the ones the user accepts. Non-streaming in
+        this PR; SSE streaming is a later polish.
+        """
+        _tenant_or_raise(request)
+        body = request.data or {}
+
+        messages = body.get("messages")
+        document = body.get("document")
+        if not isinstance(messages, list) or not messages:
+            raise ValidationError({"messages": "Provide at least one message"})
+        if not isinstance(document, dict):
+            raise ValidationError({"document": "Provide the current template document"})
+
+        try:
+            result = ai_chat(
+                messages=messages,
+                document=document,
+                preview_result=body.get("preview_result"),
+                provider=body.get("provider"),
+                model=body.get("model"),
+            )
+        except AiAssistantError as exc:
+            return Response(
+                {"error": str(exc), "error_type": "ai_error"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(result, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=["post"])
     def explain(self, request, tenant_id=None):

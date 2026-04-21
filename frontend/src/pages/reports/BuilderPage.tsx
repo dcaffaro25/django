@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react"
 import { toast } from "sonner"
 import {
   Save, Play, Download, FileSpreadsheet, FileText, Plus, Copy, Trash2, Layers, Sparkles,
+  MessageSquare,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import {
@@ -26,6 +27,7 @@ import { ReportRenderer } from "./components/ReportRenderer"
 import { PeriodStrip } from "./components/PeriodStrip"
 import { AiGenerateModal } from "./components/AiGenerateModal"
 import { AiActionsToolbar } from "./components/AiActionsToolbar"
+import { AiChatDrawer } from "./components/AiChatDrawer"
 
 const REPORT_TYPES: { value: ReportType; label: string }[] = [
   { value: "income_statement", label: "DRE" },
@@ -68,6 +70,7 @@ export function BuilderPage() {
   const [periods, setPeriods] = useState<Period[]>(initialPreset)
   const [preview, setPreview] = useState<ReportResult | null>(null)
   const [aiOpen, setAiOpen] = useState(false)
+  const [chatOpen, setChatOpen] = useState(false)
 
   // Load selected template into the editor.
   useEffect(() => {
@@ -230,6 +233,12 @@ export function BuilderPage() {
             >
               <Sparkles className="h-3.5 w-3.5" /> Gerar com IA
             </button>
+            <button
+              onClick={() => setChatOpen(true)}
+              className="inline-flex h-8 items-center gap-2 rounded-md border border-blue-500/40 bg-blue-500/10 px-3 text-[12px] font-medium text-blue-700 hover:bg-blue-500/20 dark:text-blue-300"
+            >
+              <MessageSquare className="h-3.5 w-3.5" /> Chat IA
+            </button>
             <BtnGhost onClick={onNew}>
               <Plus className="h-3 w-3" /> Novo
             </BtnGhost>
@@ -262,6 +271,23 @@ export function BuilderPage() {
           setDirty(true)
           setPreview(null)
           toast.success("Modelo gerado pela IA — revise e salve")
+        }}
+      />
+
+      <AiChatDrawer
+        open={chatOpen}
+        onClose={() => setChatOpen(false)}
+        doc={doc}
+        preview={preview}
+        onDocChange={(next) => {
+          onDocChange(next)
+        }}
+        onPeriodPreset={(preset) => {
+          const next = buildPresetPeriods(
+            { ref: new Date().toISOString().slice(0, 10), reportType: doc.report_type },
+            preset,
+          )
+          setPeriods(next)
         }}
       />
 

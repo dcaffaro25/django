@@ -401,3 +401,185 @@ def _collect_blocks_flat(blocks: List[dict]) -> List[dict]:
         if b.get("type") == "section":
             out.extend(_collect_blocks_flat(b.get("children") or []))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Chat with tool-calling (PR 8)
+#
+# The assistant can only mutate the template through a whitelist of
+# "operations" it emits as structured JSON — never by rewriting the
+# document directly. The frontend renders each operation as a diff card
+# the user accepts or rejects. Operations are pure data, applied
+# client-side so the server doesn't have to track conversation state
+# between turns.
+# ---------------------------------------------------------------------------
+
+
+CHAT_SYSTEM_PROMPT = """\
+You are an expert assistant helping a user build a financial statement \
+template in a visual editor. You have access to the CURRENT template (a \
+block tree) and the CURRENT preview result (optional, may be missing). You \
+converse in Brazilian Portuguese by default (follow the user's language \
+otherwise).
+
+Crucially: you do NOT rewrite the template directly. You propose changes \
+as discrete OPERATIONS that the user will review and accept/reject one by \
+one. Every response MUST be valid JSON with this shape:
+
+{
+  "assistant_message": "string (pt-BR, human reply)",
+  "operations": [ ... list of operation objects, possibly empty ... ]
+}
+
+Allowed operation kinds (each an object with "op" and named fields):
+
+1. { "op": "add_block",
+     "parent_id": "existing_section_id | null",   // null = root
+     "after_id": "existing_block_id | null",      // null = append at start/end
+     "block": { type, id, label, ... }            // full block object
+   }
+   Inserts a new block. "after_id" anchors the position; if null the block
+   appends to the end of the chosen parent.
+
+2. { "op": "update_block",
+     "id": "existing_block_id",
+     "patch": { ...partial block fields... }
+   }
+   Patches specific fields on an existing block. Do not change "id" or
+   "type" via update_block — use remove_block + add_block instead.
+
+3. { "op": "remove_block", "id": "existing_block_id" }
+   Removes a block (and its descendants for sections).
+
+4. { "op": "set_period_preset",
+     "preset": "single|yoy|ytd_vs_ytd|qoq_4|mom_12|balance_now_vs_prior"
+   }
+   Asks the UI to re-apply a period preset.
+
+Rules:
+- Use snake_case ids; ids must be unique across the current tree.
+- Only reference ids that exist. When inserting, pick a parent_id that
+  does exist and make up a fresh id for the new block.
+- For subtotal/total blocks, set formula sensibly
+  (e.g. "sum(children)" or "rev_total - taxes").
+- Keep assistant_message concise (< 3 sentences). Mention what each
+  operation will do in plain language — the UI renders the operations
+  separately.
+- If the user asks a question that doesn't need any template change,
+  return { "assistant_message": "...", "operations": [] }.
+
+Respond with ONLY the JSON object, no markdown, no preamble.
+"""
+
+
+ALLOWED_OPS = {"add_block", "update_block", "remove_block", "set_period_preset"}
+ALLOWED_PRESETS = {
+    "single", "yoy", "ytd_vs_ytd", "qoq_4", "mom_12", "balance_now_vs_prior",
+}
+
+
+def _validate_operations(ops: List[Any]) -> List[dict]:
+    """Light structural validation of emitted operations.
+
+    We drop operations that don't match the whitelist rather than raising —
+    a single malformed op shouldn't torch the whole chat turn; the UI will
+    render the assistant_message and the subset of good operations.
+    """
+    out: List[dict] = []
+    for raw in ops or []:
+        if not isinstance(raw, dict):
+            continue
+        op = raw.get("op")
+        if op not in ALLOWED_OPS:
+            log.warning("dropping unknown op: %r", op)
+            continue
+        if op == "add_block":
+            block = raw.get("block")
+            if not isinstance(block, dict) or not block.get("id") or not block.get("type"):
+                continue
+            out.append({
+                "op": "add_block",
+                "parent_id": raw.get("parent_id"),
+                "after_id": raw.get("after_id"),
+                "block": block,
+            })
+        elif op == "update_block":
+            if not raw.get("id") or not isinstance(raw.get("patch"), dict):
+                continue
+            out.append({"op": "update_block", "id": raw["id"], "patch": raw["patch"]})
+        elif op == "remove_block":
+            if not raw.get("id"):
+                continue
+            out.append({"op": "remove_block", "id": raw["id"]})
+        elif op == "set_period_preset":
+            preset = raw.get("preset")
+            if preset not in ALLOWED_PRESETS:
+                continue
+            out.append({"op": "set_period_preset", "preset": preset})
+    return out
+
+
+def chat(
+    *,
+    messages: List[dict],
+    document: dict,
+    preview_result: Optional[dict] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """One chat turn.
+
+    Parameters
+    ----------
+    messages : list of {"role": "user"|"assistant", "content": str}
+        Conversation so far; the last message is the user's new turn.
+    document : current template doc (source of truth for the AI's context)
+    preview_result : optional — the most recent /calculate/ result, so the
+        AI can reference actual numbers in its replies.
+    """
+    if not messages:
+        raise AiAssistantError("chat requires at least one message")
+
+    try:
+        validate_document(document)
+    except PydanticValidationError as exc:
+        raise AiAssistantError(f"document failed validation: {exc}") from exc
+
+    # Summarize the preview if present — the full result can be large.
+    preview_summary = ""
+    if preview_result and isinstance(preview_result, dict):
+        periods = preview_result.get("periods") or []
+        lines_count = len(preview_result.get("lines") or [])
+        warnings_count = len(preview_result.get("warnings") or [])
+        preview_summary = (
+            f"\nPREVIEW RESULT (summary):\n"
+            f"- periods: {[p.get('id') for p in periods]}\n"
+            f"- lines: {lines_count}\n"
+            f"- warnings: {warnings_count}\n"
+        )
+
+    # Compose the user prompt carrying the current document + conversation.
+    conv = "\n".join(
+        f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
+        for m in messages[-10:]  # last 10 turns — cheap memory cap
+    )
+    user_prompt = (
+        f"Current template (JSON):\n{json.dumps(document, ensure_ascii=False)}\n"
+        f"{preview_summary}\n"
+        f"Conversation:\n{conv}\n\n"
+        f"Respond with JSON: {{\"assistant_message\": \"...\", \"operations\": [...]}}"
+    )
+
+    try:
+        client = ExternalAIClient(provider=provider, model=model)
+    except Exception as exc:
+        raise AiAssistantError(f"AI client init failed: {exc}") from exc
+
+    try:
+        raw = client.generate_json(user_prompt, system_prompt=CHAT_SYSTEM_PROMPT)
+    except ExternalAIError as exc:
+        raise AiAssistantError(f"AI call failed: {exc}") from exc
+
+    assistant_message = str(raw.get("assistant_message") or "").strip()
+    operations = _validate_operations(raw.get("operations") or [])
+    return {"assistant_message": assistant_message, "operations": operations}

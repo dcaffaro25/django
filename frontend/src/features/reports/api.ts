@@ -47,6 +47,24 @@ export interface AiRefineResponse {
   summary: AiRefineSummary
 }
 
+export interface AiChatMessage {
+  role: "user" | "assistant"
+  content: string
+}
+
+export interface AiChatRequest {
+  messages: AiChatMessage[]
+  document: TemplateDocument
+  preview_result?: ReportResult
+  provider?: "openai" | "anthropic"
+  model?: string
+}
+
+export interface AiChatResponse {
+  assistant_message: string
+  operations: import("./operations").ChatOperation[]
+}
+
 export const reportsApi = {
   // --- Templates ---------------------------------------------------------
   listTemplates: (params?: { report_type?: string; is_active?: boolean }) =>
@@ -118,4 +136,7 @@ export const reportsApi = {
 
   aiRefine: (body: AiRefineRequest) =>
     api.tenant.post<AiRefineResponse>("/api/reports/ai/refine/", body),
+
+  aiChat: (body: AiChatRequest) =>
+    api.tenant.post<AiChatResponse>("/api/reports/ai/chat/", body),
 }
