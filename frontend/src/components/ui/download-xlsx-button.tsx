@@ -2,6 +2,7 @@ import { useState } from "react"
 import { Download, Loader2 } from "lucide-react"
 import { toast } from "sonner"
 import { getStoredTenant, getStoredToken } from "@/lib/api-client"
+import { logAction, logError } from "@/lib/activity-beacon"
 import { cn } from "@/lib/utils"
 
 /**
@@ -51,6 +52,7 @@ export function DownloadXlsxButton({
     const url = `${base}/${tenant}${cleanPath}${qs.toString() ? `?${qs.toString()}` : ""}`
 
     setLoading(true)
+    const t0 = performance.now()
     try {
       const token = getStoredToken()
       const res = await fetch(url, {
@@ -77,7 +79,13 @@ export function DownloadXlsxButton({
       a.click()
       a.remove()
       URL.revokeObjectURL(objUrl)
+      logAction("download_xlsx", {
+        target_model: path,
+        duration_ms: Math.round(performance.now() - t0),
+        meta: { filename: resolved, size: blob.size },
+      })
     } catch (e) {
+      logError(e, { meta: { action: "download_xlsx", path } })
       toast.error(e instanceof Error ? e.message : "Falha no download")
     } finally {
       setLoading(false)

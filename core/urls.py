@@ -11,6 +11,11 @@ from .views import (
 # core/urls.py
 from django.urls import path
 from core.views import ActivityFeedView, CeleryQueuesView, CeleryResultsView, CeleryTaskControlView
+from core.views_activity import (
+    ActivityBeaconView,
+    AdminActivitySummaryView,
+    AdminActivityEventsView,
+)
 from .views import JobStatusView, JobListView, JobCancelView, TutorialView
 from .task_views import (
     TaskListView, TaskDetailView, TaskStopView,
@@ -35,6 +40,13 @@ urlpatterns = [
     path(r'^api/?$', include(router.urls)),
     path(r'^api/?$', include(custom_routes)),
     path("api/activity/", ActivityFeedView.as_view(), name="activity-feed"),
+    # Activity beacon (write): authenticated users POST their own
+    # session + events here. Separate from the legacy "activity feed"
+    # above — this one ingests tab-level telemetry.
+    path("api/activity/batch/", ActivityBeaconView.as_view(), name="activity-beacon"),
+    # Platform-admin reads — tenant-free, superuser-gated.
+    path("api/admin/activity/summary/", AdminActivitySummaryView.as_view(), name="admin-activity-summary"),
+    path("api/admin/activity/events/", AdminActivityEventsView.as_view(), name="admin-activity-events"),
     path("api/celery/queues/", CeleryQueuesView.as_view(), name="celery-queues"),
     path("api/celery/results/", CeleryResultsView.as_view(), name="celery-results"),
     path("api/celery/tasks/<uuid:task_id>/<str:action>/", CeleryTaskControlView.as_view(), name="celery-task-control"),

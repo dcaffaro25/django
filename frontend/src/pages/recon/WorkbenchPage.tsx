@@ -16,6 +16,7 @@ import { SectionHeader } from "@/components/ui/section-header"
 import { StatusBadge } from "@/components/ui/status-badge"
 import { ColumnMenu } from "@/components/ui/column-menu"
 import { DownloadXlsxButton } from "@/components/ui/download-xlsx-button"
+import { logAction, logError } from "@/lib/activity-beacon"
 import { useColumnVisibility, type ColumnDef } from "@/stores/column-visibility"
 import { RunRuleDrawer } from "@/components/reconciliation/RunRuleDrawer"
 import { MassReconcileDrawer } from "@/components/reconciliation/MassReconcileDrawer"
@@ -509,6 +510,7 @@ export function WorkbenchPage() {
       toast.error("Selecione ao menos 1 bancária e 1 contábil")
       return
     }
+    const t0 = performance.now()
     finalize.mutate(
       {
         matches: [
@@ -522,11 +524,27 @@ export function WorkbenchPage() {
       },
       {
         onSuccess: (res) => {
+          // Telemetry: matching is the primary workbench win-state.
+          // Meta captures the selection shape so the admin funnel
+          // view can distinguish 1:1 from 3:2 matches, etc.
+          logAction("recon.match", {
+            duration_ms: Math.round(performance.now() - t0),
+            meta: {
+              num_bank: selectedBank.size,
+              num_book: selectedBook.size,
+              adjustment_side: adjustment,
+              created: res.created?.length ?? 0,
+              problems: res.problems?.length ?? 0,
+            },
+          })
           if (res.problems?.length) toast.warning(`${res.created.length} criados, ${res.problems.length} com problemas`)
           else toast.success(t("workbench.matched_toast") ?? "Matched")
           clearSelection()
         },
-        onError: (err: unknown) => toast.error(err instanceof Error ? err.message : "Erro"),
+        onError: (err: unknown) => {
+          logError(err, { meta: { action: "recon.match", num_bank: selectedBank.size, num_book: selectedBook.size } })
+          toast.error(err instanceof Error ? err.message : "Erro")
+        },
       },
     )
   }
