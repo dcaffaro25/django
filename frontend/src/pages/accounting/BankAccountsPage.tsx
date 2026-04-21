@@ -5,6 +5,7 @@ import { Drawer } from "vaul"
 import { Plus, Trash2, Save, X, Wallet, Copy, RefreshCw } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { ColumnMenu } from "@/components/ui/column-menu"
+import { DownloadXlsxButton } from "@/components/ui/download-xlsx-button"
 import { SortableHeader } from "@/components/ui/sortable-header"
 import { RowAction, RowActionsCell } from "@/components/ui/row-actions"
 import { BulkAction, BulkActionsBar, RowCheckbox, SelectAllCheckbox } from "@/components/ui/bulk-actions-bar"
@@ -96,6 +97,7 @@ export function BankAccountsPage() {
               resetDefaults={col.resetDefaults}
               label={t("actions.columns", { ns: "common" })}
             />
+            <DownloadXlsxButton path="/api/bank_accounts/export_xlsx/" />
             <button
               onClick={() => void refetch()}
               className={cn(

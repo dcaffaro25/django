@@ -303,6 +303,20 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         ids = request.data  # Assuming request.data is a list of IDs
         return generic_bulk_delete(self, ids)
 
+    @action(methods=['get'], detail=False, url_path='export_xlsx')
+    def export_xlsx(self, request, *args, **kwargs):
+        """Full filtered chart-of-accounts as an .xlsx download."""
+        from accounting.services.queryset_xlsx import queryset_to_xlsx
+        qs = self.filter_queryset(self.get_queryset())
+        return queryset_to_xlsx(
+            qs,
+            self.get_serializer_class(),
+            context=self.get_serializer_context(),
+            filename="plano_de_contas.xlsx",
+            sheet_name="Plano de contas",
+        )
+
+
 class AccountSummaryView(APIView):
     
     if settings.AUTH_OFF:
@@ -444,9 +458,16 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             Prefetch("bank_transactions", queryset=bank_qs),
             Prefetch("journal_entries", queryset=book_qs),
         )
-    
+
+        # XLSX export bypasses pagination — the whole point of "download" is
+        # that the user gets every row, not just the page on screen. We use
+        # ``?export=xlsx`` rather than ``?format=xlsx`` because DRF reserves
+        # ``format`` for content negotiation / suffix routing and would 404
+        # the request before it reaches this view.
+        want_xlsx = request.query_params.get("export", "").lower() == "xlsx"
+
         # Pagination support
-        page = self.paginate_queryset(qs)
+        page = None if want_xlsx else self.paginate_queryset(qs)
         recs = page if page is not None else qs
     
         results = []
@@ -574,10 +595,17 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 "same_entity": same_entity,
             })
     
+        if want_xlsx:
+            from accounting.services.queryset_xlsx import serialized_rows_to_xlsx
+            return serialized_rows_to_xlsx(
+                results,
+                sheet_name="Conciliacoes",
+                filename="conciliacoes.xlsx",
+            )
         if page is not None:
             return self.get_paginated_response(results)
         return Response(results, status=status.HTTP_200_OK)
-    
+
     @action(detail=False, methods=["get"], url_path="export-unreconciled-report")
     def export_unreconciled_report(self, request, *args, **kwargs):
         """
@@ -1038,6 +1066,19 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         ids = request.data
         return generic_bulk_delete(self, ids)
 
+    @action(methods=['get'], detail=False, url_path='export_xlsx')
+    def export_xlsx(self, request, *args, **kwargs):
+        """Full filtered transactions list as .xlsx."""
+        from accounting.services.queryset_xlsx import queryset_to_xlsx
+        qs = self.filter_queryset(self.get_queryset())
+        return queryset_to_xlsx(
+            qs,
+            self.get_serializer_class(),
+            context=self.get_serializer_context(),
+            filename="transacoes.xlsx",
+            sheet_name="Transacoes",
+        )
+
     # Post a transaction
     @action(detail=True, methods=['post'])
     def post(self, request, pk=None, **kwargs):
@@ -1425,6 +1466,19 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         ids = request.data  # Assuming request.data is a list of IDs
         return generic_bulk_delete(self, ids)
 
+    @action(methods=['get'], detail=False, url_path='export_xlsx')
+    def export_xlsx(self, request, *args, **kwargs):
+        """Full filtered journal entries list as .xlsx."""
+        from accounting.services.queryset_xlsx import queryset_to_xlsx
+        qs = self.filter_queryset(self.get_queryset())
+        return queryset_to_xlsx(
+            qs,
+            self.get_serializer_class(),
+            context=self.get_serializer_context(),
+            filename="lancamentos.xlsx",
+            sheet_name="Lancamentos",
+        )
+
     @action(detail=False, methods=["post"], url_path="derive_from")
     def derive_from(self, request, tenant_id=None):
         """
@@ -1513,7 +1567,11 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         - bank_account: restrict to a single bank account id
         - tag: exact match on reconciliation tag (same as list endpoint)
         """
-        from django.db.models import Exists, OuterRef, Case, When, Value, CharField, F, Prefetch
+        from django.db.models import (
+            Exists, OuterRef, Case, When, Value, CharField, F, Prefetch,
+            ExpressionWrapper, DecimalField, IntegerField,
+        )
+        from django.db.models.functions import Coalesce
 
         # Use get_queryset() to ensure tenant filtering is applied via ScopedQuerysetMixin
         # Base queryset: only journal entries tied to a bank account
@@ -1564,7 +1622,20 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             # Transaction fields via F expressions (efficient)
             transaction_date=F('transaction__date'),
             transaction_description=F('transaction__description'),
-            transaction_value=F('transaction__amount'),
+            # ``transaction_value`` used to return the raw Transaction.amount
+            # control total, which disagreed with how the reconciliation
+            # engine aggregates book sums (je.get_effective_amount()). That
+            # mismatch caused the drawer to balance against a stale target
+            # and post entries that moved the book sum the wrong way — a
+            # "says balanced, result is 2×" bug. Now we surface the JE's
+            # own signed effective amount so what the Workbench displays
+            # matches what the Conciliações page later sums.
+            transaction_value=ExpressionWrapper(
+                (Coalesce('debit_amount', Value(0, output_field=DecimalField()))
+                 - Coalesce('credit_amount', Value(0, output_field=DecimalField())))
+                * Coalesce(F('account__account_direction'), Value(1, output_field=IntegerField())),
+                output_field=DecimalField(max_digits=14, decimal_places=2),
+            ),
             numero_boleto=F('transaction__numero_boleto'),
             cnpj=F('transaction__cnpj'),
             due_date=F('transaction__due_date'),
@@ -1618,11 +1689,23 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             )
         
         qs = qs.distinct()
-        
+
         serializer_class = self.get_serializer_class()  # use list vs detail serializer
+        # ``?export=xlsx`` returns the same rows as an .xlsx download so the
+        # Workbench's Book pane can export exactly what it shows. We avoid
+        # ``?format=xlsx`` because DRF's content-negotiation layer treats
+        # ``format`` as a renderer selector and 404s on unknown values.
+        if request.query_params.get("export", "").lower() == "xlsx":
+            from accounting.services.queryset_xlsx import queryset_to_xlsx
+            return queryset_to_xlsx(
+                qs,
+                serializer_class,
+                filename="lancamentos_pendentes.xlsx",
+                sheet_name="Lancamentos pendentes",
+            )
         serializer = serializer_class(qs, many=True)
         return Response(serializer.data)
-    
+
     # Get journal entries by transaction
     @action(detail=False, methods=['get'])
     def by_transaction(self, request, **kwargs):
@@ -2044,7 +2127,20 @@ class BankAccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     def bulk_delete(self, request, *args, **kwargs):
         ids = request.data  # Assuming request.data is a list of IDs
         return generic_bulk_delete(self, ids)
-    
+
+    @action(methods=['get'], detail=False, url_path='export_xlsx')
+    def export_xlsx(self, request, *args, **kwargs):
+        """Full filtered bank accounts list as .xlsx."""
+        from accounting.services.queryset_xlsx import queryset_to_xlsx
+        qs = self.filter_queryset(self.get_queryset())
+        return queryset_to_xlsx(
+            qs,
+            self.get_serializer_class(),
+            context=self.get_serializer_context(),
+            filename="contas_bancarias.xlsx",
+            sheet_name="Contas bancarias",
+        )
+
     @action(methods=['post'], detail=False)
     def ensure_pending(self, request, *args, **kwargs):
         """
@@ -2346,6 +2442,19 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     def bulk_delete(self, request, *args, **kwargs):
         ids = request.data  # Assuming request.data is a list of IDs
         return generic_bulk_delete(self, ids)
+
+    @action(methods=['get'], detail=False, url_path='export_xlsx')
+    def export_xlsx(self, request, *args, **kwargs):
+        """Full filtered bank transactions list as .xlsx."""
+        from accounting.services.queryset_xlsx import queryset_to_xlsx
+        qs = self.filter_queryset(self.get_queryset())
+        return queryset_to_xlsx(
+            qs,
+            self.get_serializer_class(),
+            context=self.get_serializer_context(),
+            filename="extratos_bancarios.xlsx",
+            sheet_name="Extratos bancarios",
+        )
 
     @action(detail=False, methods=["post"], url_path="match_boletos")
     def match_boletos(self, request, tenant_id=None):
@@ -2864,6 +2973,17 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                         # Create complementing journal entries
                         complementing_entries = suggestion_data.get('complementing_journal_entries', [])
                         for je_data in complementing_entries:
+                            # Per-row date override: accept a ``date`` in
+                            # each row (YYYY-MM-DD) so operators can stamp
+                            # individual splits (e.g. a tariff posted on a
+                            # later close) without forking transactions.
+                            # Falls back to the transaction's own date.
+                            row_date = je_data.get('date') or None
+                            if isinstance(row_date, str) and row_date.strip():
+                                try:
+                                    row_date = datetime.strptime(row_date.strip(), '%Y-%m-%d').date()
+                                except ValueError:
+                                    row_date = None
                             journal_entry = JournalEntry.objects.create(
                                 company_id=company_id,
                                 transaction=transaction,
@@ -2872,7 +2992,7 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                                 debit_amount=Decimal(str(je_data['debit_amount'])) if je_data.get('debit_amount') else None,
                                 credit_amount=Decimal(str(je_data['credit_amount'])) if je_data.get('credit_amount') else None,
                                 description=je_data.get('description', transaction.description),
-                                date=transaction.date,
+                                date=row_date or transaction.date,
                                 state='pending',
                             )
                             journal_entries.append(journal_entry)
@@ -2918,6 +3038,15 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                         je_data_list = suggestion_data.get('journal_entries', [])
                         
                         for je_data in je_data_list:
+                            # Per-row date override (same contract as the
+                            # ``use_existing_book`` branch); falls back to
+                            # the transaction date when empty/invalid.
+                            row_date = je_data.get('date') or None
+                            if isinstance(row_date, str) and row_date.strip():
+                                try:
+                                    row_date = datetime.strptime(row_date.strip(), '%Y-%m-%d').date()
+                                except ValueError:
+                                    row_date = None
                             journal_entry = JournalEntry.objects.create(
                                 company_id=company_id,
                                 transaction=transaction,
@@ -2926,7 +3055,7 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                                 debit_amount=Decimal(str(je_data['debit_amount'])) if je_data.get('debit_amount') else None,
                                 credit_amount=Decimal(str(je_data['credit_amount'])) if je_data.get('credit_amount') else None,
                                 description=je_data.get('description', transaction.description),
-                                date=transaction.date,
+                                date=row_date or transaction.date,
                                 state='pending',
                             )
                             

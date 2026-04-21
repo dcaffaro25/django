@@ -6,6 +6,7 @@ import {
   Plus, Trash2, Save, X, FileCog, Copy, Search, ChevronRight, ChevronDown, Lock, RefreshCw,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
+import { DownloadXlsxButton } from "@/components/ui/download-xlsx-button"
 import {
   useAccountHasEntries,
   useAccounts,
@@ -112,6 +113,7 @@ export function ChartOfAccountsPage() {
             >
               <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} /> Atualizar
             </button>
+            <DownloadXlsxButton path="/api/accounts/export_xlsx/" />
             <button
               onClick={expandAll}
               className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
