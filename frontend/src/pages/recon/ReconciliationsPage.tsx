@@ -2,13 +2,15 @@ import { Fragment, useMemo, useState } from "react"
 import { useTranslation } from "react-i18next"
 import { toast } from "sonner"
 import {
+  Calculator,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
   Edit3,
   Loader2,
+  RefreshCw,
   Search,
-  Trash2,
+  Unlink2,
   X,
 } from "lucide-react"
 
@@ -52,8 +54,9 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import {
-  useDeleteReconciliation,
+  useRecalcUnpostedFlags,
   useReconciliationSummaries,
+  useUnmatchReconciliation,
   useUpdateReconciliation,
 } from "@/features/reconciliation"
 import type { ReconciliationSummary } from "@/features/reconciliation/types"
@@ -103,6 +106,7 @@ export function ReconciliationsPage() {
     data: rows = [],
     isLoading,
     isFetching,
+    refetch,
   } = useReconciliationSummaries(summariesParams)
 
   const filtered = useMemo(() => {
@@ -112,14 +116,23 @@ export function ReconciliationsPage() {
   }, [rows, search])
 
   const update = useUpdateReconciliation()
-  const del = useDeleteReconciliation()
+  const unmatch = useUnmatchReconciliation()
+  const recalc = useRecalcUnpostedFlags()
 
   // Dialog state ------------------------------------------------------------
   const [approveTarget, setApproveTarget] = useState<ReconciliationSummary | null>(null)
-  const [deleteTarget, setDeleteTarget] = useState<ReconciliationSummary | null>(null)
+  const [unmatchTarget, setUnmatchTarget] = useState<ReconciliationSummary | null>(null)
+  const [unmatchReason, setUnmatchReason] = useState("")
+  const [unmatchAlsoDelete, setUnmatchAlsoDelete] = useState(false)
   const [editTarget, setEditTarget] = useState<ReconciliationSummary | null>(null)
   const [editReference, setEditReference] = useState("")
   const [editNotes, setEditNotes] = useState("")
+
+  const openUnmatch = (row: ReconciliationSummary) => {
+    setUnmatchTarget(row)
+    setUnmatchReason("")
+    setUnmatchAlsoDelete(false)
+  }
 
   const openEdit = (row: ReconciliationSummary) => {
     setEditTarget(row)
@@ -141,18 +154,34 @@ export function ReconciliationsPage() {
     )
   }
 
-  const confirmDelete = () => {
-    if (!deleteTarget) return
-    del.mutate(deleteTarget.reconciliation_id, {
-      onSuccess: () => {
-        toast.success(t("matches.toasts.deleted"))
-        setDeleteTarget(null)
-        setSelected((s) => {
-          const next = new Set(s)
-          next.delete(deleteTarget.reconciliation_id)
-          return next
-        })
+  const confirmUnmatch = () => {
+    if (!unmatchTarget) return
+    const targetId = unmatchTarget.reconciliation_id
+    unmatch.mutate(
+      {
+        id: targetId,
+        reason: unmatchReason.trim() || undefined,
+        delete: unmatchAlsoDelete,
       },
+      {
+        onSuccess: () => {
+          toast.success(t("matches.toasts.unmatched"))
+          setUnmatchTarget(null)
+          setSelected((s) => {
+            const next = new Set(s)
+            next.delete(targetId)
+            return next
+          })
+        },
+        onError: () => toast.error(t("matches.toasts.error")),
+      },
+    )
+  }
+
+  const onRecalcClick = () => {
+    recalc.mutate(undefined, {
+      onSuccess: (res) =>
+        toast.success(t("matches.toasts.recalc_queued", { task_id: res.task_id })),
       onError: () => toast.error(t("matches.toasts.error")),
     })
   }
@@ -225,10 +254,35 @@ export function ReconciliationsPage() {
         title={t("matches.title")}
         subtitle={t("matches.subtitle") ?? undefined}
         actions={
-          <span className="text-xs text-muted-foreground">
-            {isFetching && <Loader2 className="mr-1 inline h-3 w-3 animate-spin" />}
-            {totalLabel}
-          </span>
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-muted-foreground">{totalLabel}</span>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8"
+              onClick={() => void refetch()}
+              disabled={isFetching}
+              title={t("common:actions.refresh") ?? ""}
+            >
+              <RefreshCw className={cn("mr-1 h-3.5 w-3.5", isFetching && "animate-spin")} />
+              {t("common:actions.refresh")}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8"
+              onClick={onRecalcClick}
+              disabled={recalc.isPending}
+              title={t("matches.actions.recalc") ?? ""}
+            >
+              {recalc.isPending ? (
+                <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Calculator className="mr-1 h-3.5 w-3.5" />
+              )}
+              {t("matches.actions.recalc")}
+            </Button>
+          </div>
         }
       />
 
@@ -440,10 +494,10 @@ export function ReconciliationsPage() {
                             size="sm"
                             variant="ghost"
                             className="h-7 w-7 p-0 text-danger hover:text-danger"
-                            title={t("matches.actions.delete") ?? ""}
-                            onClick={() => setDeleteTarget(row)}
+                            title={t("matches.actions.unmatch") ?? ""}
+                            onClick={() => openUnmatch(row)}
                           >
-                            <Trash2 className="h-3.5 w-3.5" />
+                            <Unlink2 className="h-3.5 w-3.5" />
                           </Button>
                         </div>
                       </TableCell>
@@ -509,24 +563,46 @@ export function ReconciliationsPage() {
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* Delete dialog */}
-      <AlertDialog open={deleteTarget !== null} onOpenChange={(o) => !o && setDeleteTarget(null)}>
+      {/* Unmatch dialog */}
+      <AlertDialog open={unmatchTarget !== null} onOpenChange={(o) => !o && setUnmatchTarget(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>{t("matches.dialogs.delete_title")}</AlertDialogTitle>
+            <AlertDialogTitle>{t("matches.dialogs.unmatch_title")}</AlertDialogTitle>
             <AlertDialogDescription>
-              {t("matches.dialogs.delete_description")}
+              {t("matches.dialogs.unmatch_description", {
+                bank: unmatchTarget?.bank_ids.length ?? 0,
+                book: unmatchTarget?.book_ids.length ?? 0,
+              })}
             </AlertDialogDescription>
           </AlertDialogHeader>
+          <div className="space-y-3">
+            <div>
+              <label className="mb-1 block text-xs text-muted-foreground">
+                {t("matches.dialogs.unmatch_reason")}
+              </label>
+              <Textarea
+                value={unmatchReason}
+                onChange={(e) => setUnmatchReason(e.target.value)}
+                rows={3}
+              />
+            </div>
+            <label className="flex items-center gap-2 text-xs">
+              <Checkbox
+                checked={unmatchAlsoDelete}
+                onCheckedChange={(v) => setUnmatchAlsoDelete(v === true)}
+              />
+              {t("matches.dialogs.unmatch_delete")}
+            </label>
+          </div>
           <AlertDialogFooter>
             <AlertDialogCancel>{t("common:actions.cancel")}</AlertDialogCancel>
             <AlertDialogAction
-              onClick={confirmDelete}
-              disabled={del.isPending}
+              onClick={confirmUnmatch}
+              disabled={unmatch.isPending}
               className="bg-danger text-danger-foreground hover:bg-danger/90"
             >
-              {del.isPending && <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />}
-              {t("matches.dialogs.delete_confirm")}
+              {unmatch.isPending && <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />}
+              {t("matches.dialogs.unmatch_confirm")}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

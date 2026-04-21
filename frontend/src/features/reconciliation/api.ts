@@ -363,6 +363,13 @@ export const reconApi = {
   deleteReconciliation: (id: number) =>
     api.tenant.delete<void>(`/api/reconciliation/${id}/`),
 
+  /** Enqueue a Celery task that recomputes is_balanced/is_reconciled on all unposted transactions. */
+  recalcUnpostedFlags: () =>
+    api.tenant.post<{ task_id: string; status: string }>(
+      "/api/transactions/recalc-unposted-flags-task/",
+      {},
+    ),
+
   // Config CRUD
   getConfig: (id: number) => api.tenant.get<ReconciliationConfig>(`/api/reconciliation_configs/${id}/`),
   createConfig: (body: Partial<ReconciliationConfig>) =>

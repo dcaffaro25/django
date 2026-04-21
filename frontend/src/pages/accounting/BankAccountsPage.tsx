@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react"
 import { useTranslation } from "react-i18next"
 import { toast } from "sonner"
 import { Drawer } from "vaul"
-import { Plus, Trash2, Save, X, Wallet, Copy } from "lucide-react"
+import { Plus, Trash2, Save, X, Wallet, Copy, RefreshCw } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { ColumnMenu } from "@/components/ui/column-menu"
 import { SortableHeader } from "@/components/ui/sortable-header"
@@ -24,7 +24,7 @@ import { cn, formatCurrency } from "@/lib/utils"
 
 export function BankAccountsPage() {
   const { t } = useTranslation(["reconciliation", "common"])
-  const { data: accounts = [], isLoading } = useBankAccountsList()
+  const { data: accounts = [], isLoading, isFetching, refetch } = useBankAccountsList()
   const [editing, setEditing] = useState<BankAccountFull | "new" | null>(null)
 
   const { sort, sorted, toggle: toggleSort } = useSortable(accounts, {
@@ -96,6 +96,17 @@ export function BankAccountsPage() {
               resetDefaults={col.resetDefaults}
               label={t("actions.columns", { ns: "common" })}
             />
+            <button
+              onClick={() => void refetch()}
+              className={cn(
+                "inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent",
+                isFetching && "opacity-60",
+              )}
+              title={t("actions.refresh", { ns: "common" }) ?? ""}
+            >
+              <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} />
+              {t("actions.refresh", { ns: "common" })}
+            </button>
             <button
               onClick={() => setEditing("new")}
               className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"

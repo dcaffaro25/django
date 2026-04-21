@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react"
 import { toast } from "sonner"
-import { Plus, Trash2, Save, X, Search, ChevronDown, ChevronRight, ArrowRight } from "lucide-react"
+import { Plus, Trash2, Save, X, Search, ChevronDown, ChevronRight, ArrowRight, RefreshCw } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import {
   useDeleteSubstitutionRule,
@@ -21,7 +21,7 @@ type Draft = Partial<SubstitutionRule> & { company?: number }
 const MATCH_TYPES: SubstitutionMatchType[] = ["exact", "prefix", "suffix", "contains", "regex"]
 
 export function SubstitutionRulesPage() {
-  const { data: rules = [], isLoading } = useSubstitutionRules()
+  const { data: rules = [], isLoading, isFetching, refetch } = useSubstitutionRules()
   const save = useSaveSubstitutionRule()
   const del = useDeleteSubstitutionRule()
   const { tenant } = useTenant()
@@ -130,12 +130,24 @@ export function SubstitutionRulesPage() {
         title="Regras de substituição"
         subtitle={`${rules.length} regra(s) — substituições aplicadas durante importações ETL (de-para por modelo e campo)`}
         actions={
-          <button
-            onClick={onNew}
-            className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
-          >
-            <Plus className="h-3.5 w-3.5" /> Nova regra
-          </button>
+          <>
+            <button
+              onClick={() => void refetch()}
+              className={cn(
+                "inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent",
+                isFetching && "opacity-60",
+              )}
+              title="Atualizar"
+            >
+              <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} /> Atualizar
+            </button>
+            <button
+              onClick={onNew}
+              className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
+            >
+              <Plus className="h-3.5 w-3.5" /> Nova regra
+            </button>
+          </>
         }
       />
 

@@ -3,7 +3,7 @@ import { toast } from "sonner"
 import { useTranslation } from "react-i18next"
 import { Drawer } from "vaul"
 import {
-  Plus, Trash2, Save, X, FileCog, Copy, Search, ChevronRight, ChevronDown, Lock,
+  Plus, Trash2, Save, X, FileCog, Copy, Search, ChevronRight, ChevronDown, Lock, RefreshCw,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import {
@@ -60,7 +60,7 @@ function filterTree(nodes: TreeNode[], query: string): TreeNode[] {
 }
 
 export function ChartOfAccountsPage() {
-  const { data: accounts = [], isLoading } = useAccounts()
+  const { data: accounts = [], isLoading, isFetching, refetch } = useAccounts()
   const [editing, setEditing] = useState<AccountLite | "new" | null>(null)
   const [query, setQuery] = useState("")
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
@@ -102,6 +102,16 @@ export function ChartOfAccountsPage() {
         subtitle="Estrutura contábil hierárquica"
         actions={
           <>
+            <button
+              onClick={() => void refetch()}
+              className={cn(
+                "inline-flex h-8 items-center gap-1.5 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent",
+                isFetching && "opacity-60",
+              )}
+              title="Atualizar"
+            >
+              <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} /> Atualizar
+            </button>
             <button
               onClick={expandAll}
               className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
