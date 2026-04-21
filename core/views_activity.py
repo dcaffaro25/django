@@ -352,6 +352,53 @@ class AdminActivityUserDetailView(APIView):
         })
 
 
+class AdminActivityFunnelsView(APIView):
+    """GET /api/admin/activity/funnels/?days=30
+
+    Returns the full set of hardcoded funnels with per-step
+    counts, drop-off %, and inter-step p50/p95 timings. The
+    dashboard renders each funnel as a horizontal bar chart + the
+    timing column.
+    """
+
+    permission_classes = [IsSuperUser]
+
+    def get(self, request, *args, **kwargs):
+        try:
+            days = int(request.query_params.get("days", "30"))
+        except (TypeError, ValueError):
+            days = 30
+        days = max(1, min(days, 90))
+        from core.services.activity_funnels import compute_all_funnels
+        return Response({
+            "days": days,
+            "since": (timezone.now() - timedelta(days=days)).isoformat(),
+            "funnels": compute_all_funnels(days=days),
+        })
+
+
+class AdminActivityFrictionView(APIView):
+    """GET /api/admin/activity/friction/?days=30
+
+    Four friction signals in one payload — back-and-forth
+    navigation, long-dwell-no-action sessions, repeat-error
+    chains, slow actions (p95 duration_ms). Heuristic-only.
+    """
+
+    permission_classes = [IsSuperUser]
+
+    def get(self, request, *args, **kwargs):
+        try:
+            days = int(request.query_params.get("days", "30"))
+        except (TypeError, ValueError):
+            days = 30
+        days = max(1, min(days, 90))
+        from core.services.activity_friction import compute_friction
+        payload = compute_friction(days=days)
+        payload["since"] = (timezone.now() - timedelta(days=days)).isoformat()
+        return Response(payload)
+
+
 class AdminActivityAreaDetailView(APIView):
     """GET /api/admin/activity/areas/<area>/?days=30
 

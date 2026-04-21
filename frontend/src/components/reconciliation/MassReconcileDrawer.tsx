@@ -14,6 +14,7 @@ import {
 } from "lucide-react"
 import { useAccounts, useCreateSuggestions } from "@/features/reconciliation"
 import type { AccountLite, BankTransaction } from "@/features/reconciliation/types"
+import { logAction, logError } from "@/lib/activity-beacon"
 import { cn, formatCurrency, formatDate } from "@/lib/utils"
 
 /* ---------------- Helpers ---------------- */
@@ -247,6 +248,8 @@ export function MassReconcileDrawer({
         })),
       )
       setHeaderAccount(null)
+      // Funnel signal: drawer opened.
+      logAction("recon.mass_open", { meta: { count: bankItems.length } })
     }
   }, [open, bankItems])
 
@@ -271,6 +274,7 @@ export function MassReconcileDrawer({
       return
     }
     setRows((rs) => rs.map((r) => (r.selected ? { ...r, account_id: headerAccount } : r)))
+    logAction("recon.mass_apply", { meta: { applied_to: n, account_id: headerAccount } })
     toast.success(`Conta aplicada a ${n} linha${n > 1 ? "s" : ""}`)
   }
 
@@ -321,12 +325,18 @@ export function MassReconcileDrawer({
         }
       })
 
+    const t0 = performance.now()
     try {
       await createSuggestions.mutateAsync({ suggestions })
+      logAction("recon.mass_submit", {
+        duration_ms: Math.round(performance.now() - t0),
+        meta: { count: suggestions.length },
+      })
       toast.success(`${suggestions.length} conciliação(ões) criada(s)`)
       onCreated()
       onClose()
     } catch (err) {
+      logError(err, { meta: { action: "recon.mass_submit", count: suggestions.length } })
       toast.error(err instanceof Error ? err.message : "Erro ao criar")
     } finally {
       setSubmitting(false)

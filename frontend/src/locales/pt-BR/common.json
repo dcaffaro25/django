@@ -46,7 +46,9 @@
     "admin": "Administração",
     "admin_home": "Visão geral",
     "admin_users": "Usuários",
-    "admin_activity": "Atividade"
+    "admin_activity": "Atividade",
+    "admin_activity_funnels": "Funis",
+    "admin_activity_friction": "Fricção"
   },
   "actions": {
     "search": "Buscar",

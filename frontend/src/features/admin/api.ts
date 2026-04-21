@@ -90,6 +90,10 @@ export const adminApi = {
     api.get<ActivityAreaDetail>(`/api/admin/activity/areas/${encodeURIComponent(area)}/`, { params: { days } }),
   activityEvents: (params: { user?: number; area?: string; kind?: string; limit?: number; before_id?: number } = {}) =>
     api.get<ActivityEventList>("/api/admin/activity/events/", { params }),
+  activityFunnels: (days: number = 30) =>
+    api.get<ActivityFunnelsResponse>("/api/admin/activity/funnels/", { params: { days } }),
+  activityFriction: (days: number = 30) =>
+    api.get<ActivityFrictionResponse>("/api/admin/activity/friction/", { params: { days } }),
 }
 
 /* ---------------- Activity payload types ---------------- */
@@ -162,4 +166,72 @@ export interface ActivityAreaDetail {
 export interface ActivityEventList {
   events: ActivityRawEvent[]
   count: number
+}
+
+export interface FunnelStepResult {
+  id: string
+  label: string
+  reached: number
+  /** Null on the first step (nothing to drop-off from). */
+  dropoff_pct: number | null
+  timing_from_previous: {
+    p50_ms?: number | null
+    p95_ms?: number | null
+    median_ms?: number
+    samples?: number
+  }
+}
+export interface FunnelResult {
+  id: string
+  label: string
+  description: string
+  entered: number
+  completed: number
+  overall_pct: number | null
+  steps: FunnelStepResult[]
+}
+export interface ActivityFunnelsResponse {
+  days: number
+  since: string
+  funnels: FunnelResult[]
+}
+
+export interface BackAndForthRow {
+  from_area: string
+  to_area: string
+  count: number
+  sample_users: Array<{ id: number; username: string }>
+}
+export interface LongDwellRow {
+  session_id: number
+  area: string
+  user_id: number
+  username: string
+  focused_ms: number
+}
+export interface RepeatErrorRow {
+  user_id: number
+  username: string
+  area: string
+  errors: number
+  first_at: string
+  last_at: string
+  sample_messages: Array<string | null>
+}
+export interface SlowActionRow {
+  action: string
+  area: string
+  samples: number
+  p50_ms: number | null
+  p95_ms: number | null
+  median_ms: number
+  max_ms: number
+}
+export interface ActivityFrictionResponse {
+  days: number
+  since: string
+  back_and_forth: BackAndForthRow[]
+  long_dwell_no_action: LongDwellRow[]
+  repeat_errors: RepeatErrorRow[]
+  slow_actions: SlowActionRow[]
 }

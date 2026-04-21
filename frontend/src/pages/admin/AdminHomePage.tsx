@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom"
-import { Activity, ShieldCheck, Users } from "lucide-react"
+import { Activity, AlertTriangle, GitBranch, ShieldCheck, Users } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { useAuth } from "@/providers/AuthProvider"
 
@@ -17,7 +17,7 @@ export function AdminHomePage() {
         title="Administração da plataforma"
         subtitle={`Olá, ${user?.username ?? ""} — área visível apenas a superusuários.`}
       />
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
         <AdminCard
           to="/admin/users"
           icon={<Users className="h-4 w-4" />}
@@ -28,7 +28,19 @@ export function AdminHomePage() {
           to="/admin/activity"
           icon={<Activity className="h-4 w-4" />}
           title="Atividade"
-          subtitle="Tempo por área, gargalos, sinais de fricção nos fluxos."
+          subtitle="Tempo por usuário × área nos últimos dias."
+        />
+        <AdminCard
+          to="/admin/activity/funnels"
+          icon={<GitBranch className="h-4 w-4" />}
+          title="Funis de workflow"
+          subtitle="Passos, quedas e tempos entre passos nos fluxos principais."
+        />
+        <AdminCard
+          to="/admin/activity/friction"
+          icon={<AlertTriangle className="h-4 w-4" />}
+          title="Sinais de fricção"
+          subtitle="Ciclos A→B→A, ações lentas, erros repetidos, tempo sem ação."
         />
         <AdminCard
           to="/admin/audit"

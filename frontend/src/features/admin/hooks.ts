@@ -2,6 +2,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { adminApi, type AdminUser, type AdminUserWritable } from "./api"
 import type {
   ActivityAreaDetail,
+  ActivityFrictionResponse,
+  ActivityFunnelsResponse,
   ActivitySummaryResponse,
   ActivityUserDetail,
 } from "./api"
@@ -88,5 +90,21 @@ export function useActivityAreaDetail(area: string | null, days: number = 30) {
     queryFn: () => adminApi.activityAreaDetail(area as string, days),
     enabled: !!area,
     staleTime: 30_000,
+  })
+}
+
+export function useActivityFunnels(days: number = 30) {
+  return useQuery<ActivityFunnelsResponse>({
+    queryKey: ["admin", "activity", "funnels", days],
+    queryFn: () => adminApi.activityFunnels(days),
+    staleTime: 60_000,
+  })
+}
+
+export function useActivityFriction(days: number = 30) {
+  return useQuery<ActivityFrictionResponse>({
+    queryKey: ["admin", "activity", "friction", days],
+    queryFn: () => adminApi.activityFriction(days),
+    staleTime: 60_000,
   })
 }
