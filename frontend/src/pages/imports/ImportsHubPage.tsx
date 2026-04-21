@@ -1,19 +1,20 @@
-import { useState } from "react"
-import { FileSpreadsheet, FileText, FileCode } from "lucide-react"
+import { useSearchParams } from "react-router-dom"
+import { FileSpreadsheet, FileText, FileCode, FileCog, Replace } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { EtlImportPage } from "./EtlImportPage"
 import { OfxImportPage } from "./OfxImportPage"
 import { NfImportPage } from "./NfImportPage"
+import { ImportTemplatesPage } from "./ImportTemplatesPage"
+import { SubstitutionRulesPage } from "./SubstitutionRulesPage"
 import { cn } from "@/lib/utils"
 
 /**
- * One-stop landing page for file imports. Hosts the three distinct import
- * flows as tabs so operators don't need to remember three separate URLs.
- * Templates and Substitutions live on their own pages since their
- * lifecycle is different (CRUD, not transient upload → run → forget).
+ * One-stop landing page for file imports. Hosts the upload flows (ETL / OFX /
+ * NF-e) side-by-side with the CRUD pages (templates + substitution rules) so
+ * operators can manage mapping rules without changing pages mid-task.
  */
 
-type Tab = "etl" | "ofx" | "nf"
+type Tab = "etl" | "ofx" | "nf" | "templates" | "substitutions"
 
 const TABS: Array<{
   id: Tab
@@ -24,10 +25,21 @@ const TABS: Array<{
   { id: "etl", label: "ETL (Excel)", hint: "Importação genérica via planilha", icon: FileSpreadsheet },
   { id: "ofx", label: "OFX", hint: "Extratos bancários", icon: FileText },
   { id: "nf", label: "NF-e", hint: "XMLs de nota fiscal", icon: FileCode },
+  { id: "templates", label: "Templates", hint: "Regras de transformação reutilizáveis", icon: FileCog },
+  { id: "substitutions", label: "Substituições", hint: "Regras de-para aplicadas nos imports", icon: Replace },
 ]
 
+const VALID_TABS: Tab[] = ["etl", "ofx", "nf", "templates", "substitutions"]
+
 export function ImportsHubPage() {
-  const [tab, setTab] = useState<Tab>("etl")
+  const [searchParams, setSearchParams] = useSearchParams()
+  const urlTab = searchParams.get("tab") as Tab | null
+  const tab: Tab = urlTab && VALID_TABS.includes(urlTab) ? urlTab : "etl"
+  const setTab = (t: Tab) => {
+    const next = new URLSearchParams(searchParams)
+    next.set("tab", t)
+    setSearchParams(next, { replace: true })
+  }
 
   return (
     <div className="space-y-4">
@@ -61,6 +73,8 @@ export function ImportsHubPage() {
       {tab === "etl" && <EtlImportPage />}
       {tab === "ofx" && <OfxImportPage />}
       {tab === "nf" && <NfImportPage />}
+      {tab === "templates" && <ImportTemplatesPage />}
+      {tab === "substitutions" && <SubstitutionRulesPage />}
     </div>
   )
 }

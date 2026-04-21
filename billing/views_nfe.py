@@ -70,7 +70,17 @@ class NFeImportView(APIView):
                     {"detail": f"Arquivo '{getattr(f, 'name', '')}' excede 1MB."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-        result = import_nfe_xml_many(files, company)
+        # Preview mode: accept dry_run=1/true (form-data or query string) so the caller
+        # can reuse the same endpoint for the pre-import feedback UI. Parsing and
+        # validation run normally; the service guarantees rollback.
+        dry_run_raw = (
+            request.data.get("dry_run")
+            or request.query_params.get("dry_run")
+            or ""
+        )
+        dry_run = str(dry_run_raw).strip().lower() in ("1", "true", "yes", "on")
+
+        result = import_nfe_xml_many(files, company, dry_run=dry_run)
         serializer = NFeUnifiedImportResultSerializer(result)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
