@@ -15,6 +15,7 @@ import {
 } from "lucide-react"
 
 import { SectionHeader } from "@/components/ui/section-header"
+import { DownloadXlsxButton } from "@/components/ui/download-xlsx-button"
 import { StatusBadge } from "@/components/ui/status-badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -267,6 +268,15 @@ export function ReconciliationsPage() {
               <RefreshCw className={cn("mr-1 h-3.5 w-3.5", isFetching && "animate-spin")} />
               {t("common:actions.refresh")}
             </Button>
+            <DownloadXlsxButton
+              path="/api/reconciliation/summaries/"
+              params={{
+                status: STATUS_SCOPE_PARAM[statusScope],
+                ordering: "-id",
+                export: "xlsx",
+              }}
+              filename="conciliacoes.xlsx"
+            />
             <Button
               size="sm"
               variant="outline"

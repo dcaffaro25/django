@@ -92,13 +92,32 @@ def custom_exception_handler(exc, context):
     """
     Usa o handler padrão do DRF para erros de validação (400), e o nosso
     formata‑erros para os demais casos (500).
+
+    Captura o erro no ``ErrorReport`` table (admin dashboard
+    ``/admin/activity/errors``) quando o status for 5xx ou o DRF
+    não conseguir produzir uma resposta. 4xx do DRF
+    (validação, auth) é tráfego esperado, não bug — não capturamos.
     """
-    # primeiro trata erros do DRF (ValidationError, AuthenticationFailed, etc.)
     response = drf_exception_handler(exc, context)
+    request = context.get("request")
+
+    # Best-effort capture. If this path raises we swallow it — a
+    # broken telemetry pipe must not mask the real error.
+    try:
+        status_code = getattr(response, "status_code", None)
+        if response is None or (status_code is not None and status_code >= 500):
+            from core.models import ErrorReport
+            from core.services.error_capture import capture_exception
+            if request is not None and status_code is not None:
+                class _S:
+                    real = status_code
+                request._error_status = _S
+            capture_exception(exc, kind=ErrorReport.KIND_BACKEND_DRF, request=request)
+    except Exception:
+        pass
+
     if response is not None:
         return response
 
-    request = context.get("request")
-    # debug=True se estiver em modo DEBUG
-    debug = True#context.get("view").settings.DEBUG if hasattr(context.get("view"), "settings") else False
+    debug = True  # context.get("view").settings.DEBUG ... kept as-is
     return get_error_response(request, exc, debug=debug)

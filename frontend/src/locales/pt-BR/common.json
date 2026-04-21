@@ -42,7 +42,14 @@
     "reports_beta": "Demonstrativos (beta)",
     "reports_build": "Novo demonstrativo",
     "reports_history": "Histórico",
-    "ai_usage": "Uso da IA"
+    "ai_usage": "Uso da IA",
+    "admin": "Administração",
+    "admin_home": "Visão geral",
+    "admin_users": "Usuários",
+    "admin_activity": "Atividade",
+    "admin_activity_funnels": "Funis",
+    "admin_activity_friction": "Fricção",
+    "admin_activity_errors": "Erros"
   },
   "actions": {
     "search": "Buscar",

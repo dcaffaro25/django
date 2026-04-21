@@ -52,6 +52,19 @@ http.interceptors.response.use(
   },
 )
 
+// Tap the response pipeline for error telemetry. Kept in a separate
+// module so the interceptor can be unit-tested in isolation and so
+// this file doesn't import from the telemetry layer (which already
+// imports from here).
+try {
+  // Lazy import to avoid a circular init sequence at module load.
+  void import("@/lib/error-capture").then(({ attachAxiosErrorCapture }) =>
+    attachAxiosErrorCapture(http),
+  )
+} catch {
+  /* telemetry is best-effort */
+}
+
 function tenantPrefixed(path: string): string {
   const tenant = getStoredTenant()
   if (!tenant) throw new Error("No tenant selected. Set one via TenantProvider.")

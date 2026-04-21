@@ -9,14 +9,17 @@ import { toast } from "sonner"
 import { Drawer } from "vaul"
 import {
   Wallet, BookOpen, Check, X, Sparkles, ArrowLeftRight, AlertCircle, AlertTriangle,
-  Plus, Trash2, CheckCircle2, Search, RotateCcw, Loader2,
+  Plus, Trash2, CheckCircle2, Search, RotateCcw, Loader2, Wand2,
   ArrowUp, ArrowDown, ChevronsLeft, ChevronLeft, ChevronRight, ChevronsRight,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { StatusBadge } from "@/components/ui/status-badge"
 import { ColumnMenu } from "@/components/ui/column-menu"
+import { DownloadXlsxButton } from "@/components/ui/download-xlsx-button"
+import { logAction, logError } from "@/lib/activity-beacon"
 import { useColumnVisibility, type ColumnDef } from "@/stores/column-visibility"
 import { RunRuleDrawer } from "@/components/reconciliation/RunRuleDrawer"
+import { MassReconcileDrawer } from "@/components/reconciliation/MassReconcileDrawer"
 import {
   useAccounts,
   useBankAccountsList,
@@ -74,6 +77,62 @@ function parseFilterAmount(raw: string): number | null {
   return Number.isFinite(n) ? n : null
 }
 
+/**
+ * Search a bank row across every available column — including hidden ones —
+ * so "find by boleto" or "find by CNPJ" works even when those columns
+ * aren't currently shown. `q` is expected pre-lowercased; we avoid
+ * re-normalising it on every row.
+ */
+function bankMatchesSearch(
+  b: BankTransaction,
+  q: string,
+  bankAccNameById: Record<number, string>,
+): boolean {
+  const bankAcc = b.bank_account != null ? bankAccNameById[b.bank_account] : undefined
+  const hay = [
+    String(b.id),
+    b.description,
+    b.entity_name,
+    bankAcc,
+    b.erp_id,
+    b.cnpj,
+    (b.numeros_boleto ?? []).join(" "),
+    b.reconciliation_status,
+    b.tag,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase()
+  return hay.includes(q)
+}
+
+function bookMatchesSearch(je: JournalEntry, q: string): boolean {
+  const acctRef = je as unknown as {
+    account?: { name?: string; account_code?: string } | null
+    account_name?: string
+  }
+  const hay = [
+    String(je.id),
+    String(je.transaction_id),
+    je.description,
+    je.transaction_description,
+    je.bank_account?.name,
+    acctRef.account?.name,
+    acctRef.account?.account_code,
+    acctRef.account_name,
+    je.erp_id,
+    je.cnpj,
+    je.nf_number,
+    je.numero_boleto,
+    je.reconciliation_status,
+    je.tag,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase()
+  return hay.includes(q)
+}
+
 // Columns available for each bancada table. Defaults match what the pane
 // used to render pre-picker; operators can hide/show optional columns via
 // the ColumnMenu in each pane header. Amount + description are always on
@@ -84,7 +143,7 @@ const BANK_COLUMNS: ColumnDef[] = [
   { key: "date", label: "Data", defaultVisible: true },
   { key: "entity", label: "Entidade", defaultVisible: true },
   { key: "status", label: "Status", defaultVisible: true },
-  { key: "bank_account", label: "Conta bancária", defaultVisible: false },
+  { key: "bank_account", label: "Conta bancária", defaultVisible: true },
   { key: "erp_id", label: "ERP id", defaultVisible: false },
   { key: "cnpj", label: "CNPJ", defaultVisible: false },
   { key: "boletos", label: "Boletos", defaultVisible: false },
@@ -174,6 +233,10 @@ export function WorkbenchPage() {
 
   const { data: bankAccounts } = useBankAccountsList()
   const { data: entities } = useEntities()
+  const bankAccNameById = useMemo(
+    () => Object.fromEntries((bankAccounts ?? []).map((b) => [b.id, b.name])) as Record<number, string>,
+    [bankAccounts],
+  )
 
   // Column visibility for each pane (persisted in zustand). Used to control
   // which meta fields render per row + exposed via the ColumnMenu in the
@@ -236,10 +299,10 @@ export function WorkbenchPage() {
     return rawBankTxs.filter((b) => {
       if (entId && b.entity !== entId) return false
       if (status && b.reconciliation_status !== status) return false
-      const abs = Math.abs(Number(b.amount))
-      if (min != null && abs < min) return false
-      if (max != null && abs > max) return false
-      if (q && !(b.description ?? "").toLowerCase().includes(q)) return false
+      const n = Number(b.amount)
+      if (min != null && n < min) return false
+      if (max != null && n > max) return false
+      if (q && !bankMatchesSearch(b, q, bankAccNameById)) return false
       return true
     })
   }, [
@@ -249,6 +312,7 @@ export function WorkbenchPage() {
     filters.bankSearch,
     filters.bankEntity,
     filters.bankStatus,
+    bankAccNameById,
   ])
 
   const journalEntries = useMemo(() => {
@@ -258,10 +322,10 @@ export function WorkbenchPage() {
     const status = filters.bookStatus
     return rawJournalEntries.filter((je) => {
       if (status && je.reconciliation_status !== status) return false
-      const abs = Math.abs(Number(je.transaction_value))
-      if (min != null && abs < min) return false
-      if (max != null && abs > max) return false
-      if (q && !(je.description ?? "").toLowerCase().includes(q)) return false
+      const n = Number(je.transaction_value)
+      if (min != null && n < min) return false
+      if (max != null && n > max) return false
+      if (q && !bookMatchesSearch(je, q)) return false
       return true
     })
   }, [
@@ -371,10 +435,31 @@ export function WorkbenchPage() {
     return sortedJournalEntries.slice(start, start + bookPageSize)
   }, [sortedJournalEntries, bookPage, bookPageSize])
 
+  // Footer sums — visible (post-filter) vs. raw (pre-filter). The pager
+  // surfaces both so operators can sanity-check that a filter hides the
+  // rows they expected (and nothing else).
+  const bankSumVisible = useMemo(
+    () => bankTxs.reduce((s, b) => s + Number(b.amount), 0),
+    [bankTxs],
+  )
+  const bankSumTotal = useMemo(
+    () => rawBankTxs.reduce((s, b) => s + Number(b.amount), 0),
+    [rawBankTxs],
+  )
+  const bookSumVisible = useMemo(
+    () => journalEntries.reduce((s, je) => s + Number(je.transaction_value), 0),
+    [journalEntries],
+  )
+  const bookSumTotal = useMemo(
+    () => rawJournalEntries.reduce((s, je) => s + Number(je.transaction_value), 0),
+    [rawJournalEntries],
+  )
+
   const [selectedBank, setSelectedBank] = useState<Set<number>>(new Set())
   const [selectedBook, setSelectedBook] = useState<Set<number>>(new Set())
   const [suggestion, setSuggestion] = useState<SuggestMatchResponse["suggestions"][number] | null>(null)
   const [addOpen, setAddOpen] = useState(false)
+  const [massOpen, setMassOpen] = useState(false)
   const [runRuleOpen, setRunRuleOpen] = useState(false)
 
   // Keyboard-driven cursor state
@@ -425,6 +510,7 @@ export function WorkbenchPage() {
       toast.error("Selecione ao menos 1 bancária e 1 contábil")
       return
     }
+    const t0 = performance.now()
     finalize.mutate(
       {
         matches: [
@@ -438,11 +524,27 @@ export function WorkbenchPage() {
       },
       {
         onSuccess: (res) => {
+          // Telemetry: matching is the primary workbench win-state.
+          // Meta captures the selection shape so the admin funnel
+          // view can distinguish 1:1 from 3:2 matches, etc.
+          logAction("recon.match", {
+            duration_ms: Math.round(performance.now() - t0),
+            meta: {
+              num_bank: selectedBank.size,
+              num_book: selectedBook.size,
+              adjustment_side: adjustment,
+              created: res.created?.length ?? 0,
+              problems: res.problems?.length ?? 0,
+            },
+          })
           if (res.problems?.length) toast.warning(`${res.created.length} criados, ${res.problems.length} com problemas`)
           else toast.success(t("workbench.matched_toast") ?? "Matched")
           clearSelection()
         },
-        onError: (err: unknown) => toast.error(err instanceof Error ? err.message : "Erro"),
+        onError: (err: unknown) => {
+          logError(err, { meta: { action: "recon.match", num_bank: selectedBank.size, num_book: selectedBook.size } })
+          toast.error(err instanceof Error ? err.message : "Erro")
+        },
       },
     )
   }
@@ -580,6 +682,19 @@ export function WorkbenchPage() {
                 resetDefaults={bankCols.resetDefaults}
                 label="Colunas"
               />
+              <DownloadXlsxButton
+                path="/api/bank_transactions/export_xlsx/"
+                params={{
+                  unreconciled: true,
+                  bank_account: filters.bankAccount || undefined,
+                  date_after: filters.bankDateFrom || undefined,
+                  date_before: filters.bankDateTo || undefined,
+                  ordering: "-date",
+                }}
+                label=""
+                title="Baixar extratos filtrados (.xlsx)"
+                className="px-2"
+              />
             </div>
           }
           filters={
@@ -598,6 +713,9 @@ export function WorkbenchPage() {
               pageSize={bankPageSize}
               onPage={setBankPage}
               onPageSize={setBankPageSize}
+              sumVisible={bankSumVisible}
+              sumTotal={bankSumTotal}
+              rawTotal={rawBankTxs.length}
             />
           }
         >
@@ -636,6 +754,19 @@ export function WorkbenchPage() {
                 resetDefaults={bookCols.resetDefaults}
                 label="Colunas"
               />
+              <DownloadXlsxButton
+                path="/api/journal_entries/unmatched/"
+                params={{
+                  export: "xlsx",
+                  date_from: filters.bookDateFrom || undefined,
+                  date_to: filters.bookDateTo || undefined,
+                  bank_account: filters.bookBankAccount || undefined,
+                }}
+                filename="lancamentos_pendentes.xlsx"
+                label=""
+                title="Baixar lançamentos filtrados (.xlsx)"
+                className="px-2"
+              />
             </div>
           }
           filters={
@@ -653,6 +784,9 @@ export function WorkbenchPage() {
               pageSize={bookPageSize}
               onPage={setBookPage}
               onPageSize={setBookPageSize}
+              sumVisible={bookSumVisible}
+              sumTotal={bookSumTotal}
+              rawTotal={rawJournalEntries.length}
             />
           }
         >
@@ -691,6 +825,7 @@ export function WorkbenchPage() {
             onMatch={onMatch}
             onSuggest={onGenerateSuggestion}
             onAddEntries={() => setAddOpen(true)}
+            onMassReconcile={() => setMassOpen(true)}
             canSuggest={selectedBank.size === 1 && selectedBook.size === 0}
             suggestLoading={suggestApi.isPending}
             matching={finalize.isPending}
@@ -711,7 +846,16 @@ export function WorkbenchPage() {
         onClose={() => setAddOpen(false)}
         bankItems={selectedBankItems}
         bookItems={selectedBookItems}
+        bankSum={bankSum}
+        bookSum={bookSum}
         delta={delta}
+        onCreated={clearSelection}
+      />
+
+      <MassReconcileDrawer
+        open={massOpen}
+        onClose={() => setMassOpen(false)}
+        bankItems={selectedBankItems}
         onCreated={clearSelection}
       />
 
@@ -900,6 +1044,9 @@ function Pager({
   pageSize,
   onPage,
   onPageSize,
+  sumVisible,
+  sumTotal,
+  rawTotal,
 }: {
   total: number
   page: number
@@ -907,20 +1054,41 @@ function Pager({
   pageSize: number
   onPage: (p: number) => void
   onPageSize: (s: number) => void
+  /** Sum of the currently-filtered rows (what the user sees). */
+  sumVisible?: number
+  /** Sum of the unfiltered, server-returned rows (the "all" baseline). */
+  sumTotal?: number
+  /** Unfiltered row count, shown alongside sumTotal when filters are active. */
+  rawTotal?: number
 }) {
   const showAll = pageSize === 0
   const from = total === 0 ? 0 : showAll ? 1 : (page - 1) * pageSize + 1
   const to = showAll ? total : Math.min(total, page * pageSize)
   const goto = (p: number) => onPage(Math.max(1, Math.min(pageCount, p)))
+  const isFiltered = rawTotal != null && rawTotal !== total
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
-      <div className="text-muted-foreground">
-        <span className="tabular-nums">{from.toLocaleString("pt-BR")}</span>
-        <span className="mx-0.5">–</span>
-        <span className="tabular-nums">{to.toLocaleString("pt-BR")}</span>
-        <span className="mx-1">de</span>
-        <span className="tabular-nums">{total.toLocaleString("pt-BR")}</span>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-muted-foreground">
+        <span>
+          <span className="tabular-nums">{from.toLocaleString("pt-BR")}</span>
+          <span className="mx-0.5">–</span>
+          <span className="tabular-nums">{to.toLocaleString("pt-BR")}</span>
+          <span className="mx-1">de</span>
+          <span className="tabular-nums">{total.toLocaleString("pt-BR")}</span>
+        </span>
+        {sumVisible != null && (
+          <span>
+            <span className="mr-1">Soma visível:</span>
+            <span className="tabular-nums text-foreground">{formatCurrency(sumVisible)}</span>
+          </span>
+        )}
+        {isFiltered && sumTotal != null && (
+          <span>
+            <span className="mr-1">Total ({rawTotal!.toLocaleString("pt-BR")}):</span>
+            <span className="tabular-nums">{formatCurrency(sumTotal)}</span>
+          </span>
+        )}
       </div>
       <div className="flex items-center gap-1.5">
         <select
@@ -1464,7 +1632,8 @@ function BookList({
 function SelectionSummary({
   bankItems, bookItems, bankSum, bookSum, delta, balanced,
   bankAccounts, adjustment, setAdjustment,
-  onClear, onMatch, onSuggest, onAddEntries, canSuggest, suggestLoading, matching,
+  onClear, onMatch, onSuggest, onAddEntries, onMassReconcile,
+  canSuggest, suggestLoading, matching,
 }: {
   bankItems: BankTransaction[]
   bookItems: JournalEntry[]
@@ -1479,6 +1648,7 @@ function SelectionSummary({
   onMatch: () => void
   onSuggest: () => void
   onAddEntries: () => void
+  onMassReconcile: () => void
   canSuggest: boolean
   suggestLoading: boolean
   matching: boolean
@@ -1574,6 +1744,26 @@ function SelectionSummary({
           >
             <Plus className="h-3.5 w-3.5" />
             {t("add_entries.title")}
+          </button>
+          {/* Mass 1-to-1 reconciliation: pop open a list of the selected
+              bank rows and let the operator assign an account to many at
+              once. Only surfaces when the selection is bank-only (2+) —
+              for mixed bank/book selections the single-reconciliation
+              drawer (AddEntriesDrawer) is the right entry point. */}
+          <button
+            onClick={onMassReconcile}
+            disabled={bankItems.length < 2 || bookItems.length > 0}
+            title={
+              bookItems.length > 0
+                ? "Desmarque lançamentos contábeis para usar conciliação em massa"
+                : bankItems.length < 2
+                ? "Selecione 2 ou mais bancárias"
+                : `Conciliação em massa (${bankItems.length} bancárias)`
+            }
+            className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent disabled:opacity-50"
+          >
+            <Wand2 className="h-3.5 w-3.5" />
+            Em massa
           </button>
           <button
             onClick={onClear}
@@ -1704,10 +1894,32 @@ type EntryRow = {
   side: "debit" | "credit"
   amount: string
   description: string
+  /** YYYY-MM-DD; empty means "inherit from the transaction". */
+  date: string
 }
 
 function newEntryRow(partial: Partial<EntryRow> = {}): EntryRow {
-  return { account_id: "", side: "debit", amount: "", description: "", ...partial }
+  return { account_id: "", side: "debit", amount: "", description: "", date: "", ...partial }
+}
+
+/**
+ * Signed contribution a row would add to the book side of the reconciliation,
+ * matching the backend's ``JournalEntry.get_effective_amount()``:
+ *   (debit - credit) * account_direction
+ *
+ * This is what keeps the drawer's "Equilibrado" chip honest. Before, the
+ * drawer used raw ``debit - credit`` — which diverges from the engine on
+ * credit-natural accounts (direction=-1) and against any baseline derived
+ * from ``transaction.amount`` instead of effective amount. The reported
+ * symptom was a match that said "balanced" but landed with the book sum
+ * moved the wrong way by exactly 2× delta.
+ */
+function rowEffectiveAmount(r: EntryRow, accountDirById: Record<number, number>): number {
+  const amt = Number(r.amount || 0)
+  if (!Number.isFinite(amt)) return 0
+  const dir = (typeof r.account_id === "number" ? accountDirById[r.account_id] : undefined) ?? 1
+  const base = r.side === "debit" ? amt : -amt
+  return base * dir
 }
 
 /**
@@ -1720,23 +1932,59 @@ function seedInitialRows(bank: BankTransaction | undefined, delta: number): Entr
   if (!bank) return [newEntryRow()]
   const amt = Math.abs(delta) > 0.005 ? Math.abs(delta).toFixed(2) : ""
   // If delta > 0 we need a debit to bring the sum up; if delta < 0 a credit.
+  // Note: this pre-seed assumes a direction=1 account. The user can flip
+  // side / pick a credit-natural account and the balance chip re-evaluates.
   const side: "debit" | "credit" = delta >= 0 ? "debit" : "credit"
-  return [newEntryRow({ amount: amt, side, description: bank.description ?? "" })]
+  return [newEntryRow({
+    amount: amt,
+    side,
+    description: bank.description ?? "",
+    date: bank.date ?? "",
+  })]
 }
 
 function AddEntriesDrawer({
-  open, onClose, bankItems, bookItems, delta, onCreated,
+  open, onClose, bankItems, bookItems, bankSum, bookSum, delta, onCreated,
 }: {
   open: boolean
   onClose: () => void
   bankItems: BankTransaction[]
   bookItems: JournalEntry[]
+  /** Effective sum of selected bank rows (just bankItems[i].amount). */
+  bankSum: number
+  /** Effective sum of selected book rows — direction-aware, so this is
+   *  the same baseline the reconciliation engine uses when summing. */
+  bookSum: number
+  /** bankSum − bookSum; target the new entries need to close. */
   delta: number
   onCreated: () => void
 }) {
   const { t } = useTranslation(["reconciliation", "common"])
   const { data: accounts = [] } = useAccounts()
   const createSuggestions = useCreateSuggestions()
+
+  // Restrict the dropdown to leaf accounts — journal entries should never
+  // post to a group / parent. We derive leaf-ness client-side by checking
+  // whether any other account has this one as parent (the serializer
+  // doesn't expose is_leaf directly).
+  const leafAccounts = useMemo<AccountLite[]>(() => {
+    const parents = new Set<number>()
+    for (const a of accounts) {
+      if (a.parent != null) parents.add(a.parent)
+    }
+    return (accounts as AccountLite[])
+      .filter((a) => a.is_active !== false && !parents.has(a.id))
+      .sort((a, b) => (a.account_code ?? "").localeCompare(b.account_code ?? "", undefined, { numeric: true })
+        || a.path.localeCompare(b.path, undefined, { numeric: true }))
+  }, [accounts])
+
+  const accountDirById = useMemo<Record<number, number>>(() => {
+    const map: Record<number, number> = {}
+    for (const a of accounts) {
+      if (a.account_direction != null) map[a.id] = a.account_direction
+    }
+    return map
+  }, [accounts])
 
   const [rows, setRows] = useState<EntryRow[]>([newEntryRow()])
   // Operator override: by default we block unbalanced submit. Operators can
@@ -1757,12 +2005,13 @@ function AddEntriesDrawer({
     // retype it on every split; the side flips to absorb the remaining delta.
     const bank = bankItems[0]
     setRows((rs) => {
-      const runningSum = rs.reduce((s, r) => s + (r.side === "debit" ? Number(r.amount || 0) : -Number(r.amount || 0)), 0)
+      const runningSum = rs.reduce((s, r) => s + rowEffectiveAmount(r, accountDirById), 0)
       const remaining = delta - runningSum
       return [
         ...rs,
         newEntryRow({
           description: bank?.description ?? "",
+          date: bank?.date ?? "",
           side: remaining >= 0 ? "debit" : "credit",
           amount: Math.abs(remaining) > 0.005 ? Math.abs(remaining).toFixed(2) : "",
         }),
@@ -1770,11 +2019,11 @@ function AddEntriesDrawer({
     })
   }
 
-  const newSum = rows.reduce((s, r) => {
-    const amt = Number(r.amount || 0)
-    if (!Number.isFinite(amt)) return s
-    return s + (r.side === "debit" ? amt : -amt)
-  }, 0)
+  // newSum is now the signed effective amount (matches backend). Until the
+  // user picks an account for a row, we assume direction=1 (inside
+  // rowEffectiveAmount) — which means the chip stays un-green for rows
+  // that haven't been assigned an account yet, reflecting the real risk.
+  const newSum = rows.reduce((s, r) => s + rowEffectiveAmount(r, accountDirById), 0)
   const target = delta
   const balanceOk = Math.abs(newSum - target) < 0.005
   const hasRows = rows.some((r) => r.account_id && Number(r.amount) > 0)
@@ -1804,6 +2053,11 @@ function AddEntriesDrawer({
         // Per-row description: no global consolidated field anymore. Falls
         // back to the bank description only if the row itself is empty.
         description: r.description?.trim() || bank.description,
+        // Per-row date: operators can stamp each split with its own date
+        // (e.g. a tariff posted on a later ledger close). The backend
+        // falls back to the transaction date when this is empty, so the
+        // existing bank-date default is preserved for untouched rows.
+        date: r.date?.trim() || undefined,
         cost_center_id: null,
       }))
 
@@ -1860,12 +2114,32 @@ function AddEntriesDrawer({
           <div className="flex-1 space-y-4 overflow-y-auto p-4 text-[12px]">
             <p className="text-muted-foreground">{t("add_entries.subtitle")}</p>
 
-            {/* Context */}
+            {/* Context — surfaces both sides so the user sees which way
+                the reconciliation is currently tilting. bookSum here uses
+                the direction-aware effective amount (same value the
+                Conciliações page sums), so the "Diferença" agrees with
+                what the backend will compute post-match. */}
             <div className="rounded-md border border-border bg-surface-3 p-2.5 text-[11px]">
               <div className="mb-1 font-semibold uppercase tracking-wider text-muted-foreground">Contexto</div>
-              <div className="flex items-center justify-between">
-                <span>{bankItems.length} bancária(s), {bookItems.length} contábil(eis) selecionados</span>
-                <span className="tabular-nums">Diferença: <span className={Math.abs(delta) < 0.005 ? "text-success" : "text-warning"}>{formatCurrency(delta)}</span></span>
+              <div className="mb-2 text-muted-foreground">
+                {bankItems.length} bancária(s), {bookItems.length} contábil(eis) selecionados
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Soma bancária</div>
+                  <div className="tabular-nums font-semibold">{formatCurrency(bankSum)}</div>
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Soma contábil</div>
+                  <div className="tabular-nums font-semibold">{formatCurrency(bookSum)}</div>
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Diferença</div>
+                  <div className={cn(
+                    "tabular-nums font-semibold",
+                    Math.abs(delta) < 0.005 ? "text-success" : "text-warning",
+                  )}>{formatCurrency(delta)}</div>
+                </div>
               </div>
             </div>
 
@@ -1878,7 +2152,7 @@ function AddEntriesDrawer({
                 <EntryRowEditor
                   key={i}
                   row={r}
-                  accounts={accounts as AccountLite[]}
+                  accounts={leafAccounts}
                   onChange={(p) => updateRow(i, p)}
                   onRemove={rows.length > 1 ? () => removeRow(i) : undefined}
                 />
@@ -1973,13 +2247,14 @@ function EntryRowEditor({
   row, accounts, onChange, onRemove,
 }: {
   row: EntryRow
+  /** Already filtered to leaf accounts by the parent. */
   accounts: AccountLite[]
   onChange: (p: Partial<EntryRow>) => void
   onRemove?: () => void
 }) {
   const { t } = useTranslation(["reconciliation"])
   return (
-    <div className="grid grid-cols-[1fr_90px_120px_1fr_auto] items-end gap-2 rounded-md border border-border bg-surface-1 p-2">
+    <div className="grid grid-cols-[1fr_90px_110px_120px_1fr_auto] items-end gap-2 rounded-md border border-border bg-surface-1 p-2">
       <label className="flex flex-col gap-1">
         <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
           {t("add_entries.account")}
@@ -2007,6 +2282,15 @@ function EntryRowEditor({
           <option value="debit">{t("add_entries.debit")}</option>
           <option value="credit">{t("add_entries.credit")}</option>
         </select>
+      </label>
+      <label className="flex flex-col gap-1">
+        <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Data</span>
+        <input
+          type="date"
+          value={row.date}
+          onChange={(e) => onChange({ date: e.target.value })}
+          className="h-8 w-full rounded-md border border-border bg-background px-2 text-[12px] outline-none focus:border-ring [color-scheme:dark]"
+        />
       </label>
       <label className="flex flex-col gap-1">
         <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">

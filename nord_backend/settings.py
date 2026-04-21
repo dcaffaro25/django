@@ -350,6 +350,17 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": crontab(minute="*/15"),
         "options": {"queue": "celery"},
     },
+    # Weekly activity digest for the platform admin. Mondays 11:00 UTC
+    # ≈ 08:00 São Paulo (UTC-3), so the admin has it waiting at the
+    # start of the week. Recipient is ADMIN_DIGEST_EMAIL env var or
+    # the dcaffaro user's email as a fallback. See
+    # core/tasks_activity_digest.py for the logic.
+    "activity-digest-weekly": {
+        "task": "core.tasks_activity_digest.send_weekly_digest",
+        "schedule": crontab(day_of_week=1, hour=11, minute=0),
+        "options": {"queue": "celery"},
+        "kwargs": {"days": 7},
+    },
 }
 
 if not os.getenv("REDIS_URL"):
