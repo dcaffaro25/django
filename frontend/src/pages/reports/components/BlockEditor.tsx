@@ -8,15 +8,18 @@ import {
 } from "@dnd-kit/sortable"
 import { CSS } from "@dnd-kit/utilities"
 import {
-  FileText, Receipt, Equal, Sigma, Minus, Heading, GripVertical, Trash2, Plus, ChevronRight,
+  FileText, Receipt, Equal, Sigma, Minus, Heading, GripVertical, Trash2, Plus, ChevronRight, AlertTriangle,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import type {
   Block, BlockType, LineBlock, SubtotalBlock, TotalBlock, TemplateDocument,
 } from "@/features/reports"
+import { collectBlockIds, detectFormulaCycle } from "@/features/reports"
 import {
   flattenForEdit, reorderFlat, uniqueBlockId, type FlatBlock,
 } from "./block-tree"
+import { FormulaInput } from "./FormulaInput"
+import { AccountTreePicker } from "./AccountTreePicker"
 
 /**
  * Minimal flat-list block editor for PR 4. Supports:
@@ -35,6 +38,9 @@ export function BlockEditor({
   onChange: (next: TemplateDocument) => void
 }) {
   const flat = useMemo(() => flattenForEdit(document), [document])
+  const validIds = useMemo(() => collectBlockIds(document), [document])
+  const cycle = useMemo(() => detectFormulaCycle(document), [document])
+  const cyclicIds = useMemo(() => new Set(cycle ?? []), [cycle])
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }))
 
@@ -112,6 +118,18 @@ export function BlockEditor({
         <AddBlockButton onClick={() => addBlock("spacer")} icon={<Minus className="h-3 w-3" />} label="Espaçador" />
       </div>
 
+      {cycle && (
+        <div className="mb-2 flex items-start gap-2 rounded-md border border-red-500/50 bg-red-500/10 p-2 text-[11px] text-red-700 dark:text-red-300">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          <div>
+            <div className="font-medium">Referência circular detectada</div>
+            <div className="text-[10px] opacity-80">
+              {cycle.join(" → ")}
+            </div>
+          </div>
+        </div>
+      )}
+
       {flat.length === 0 ? (
         <div className="rounded-md border border-dashed border-border p-6 text-center text-[12px] text-muted-foreground">
           Sem blocos. Adicione um bloco ou gere um modelo com IA (em breve).
@@ -124,6 +142,8 @@ export function BlockEditor({
                 <BlockRow
                   key={fb._key}
                   item={fb}
+                  validIds={validIds}
+                  isInCycle={cyclicIds.has(fb.block.id)}
                   onChange={(patch) => updateBlock(fb._key, patch)}
                   onRemove={() => removeBlock(fb._key)}
                 />
@@ -137,9 +157,11 @@ export function BlockEditor({
 }
 
 function BlockRow({
-  item, onChange, onRemove,
+  item, validIds, isInCycle, onChange, onRemove,
 }: {
   item: FlatBlock
+  validIds: Set<string>
+  isInCycle: boolean
   onChange: (patch: Partial<Block>) => void
   onRemove: () => void
 }) {
@@ -155,6 +177,7 @@ function BlockRow({
         "flex flex-wrap items-center gap-2 border-b border-border/50 px-2 py-1.5 last:border-b-0 hover:bg-accent/30",
         block.type === "section" && "bg-surface-2/50",
         block.type === "header" && "bg-surface-3/50",
+        isInCycle && "border-l-2 border-l-red-500 bg-red-500/5",
       )}
     >
       <button
@@ -186,7 +209,11 @@ function BlockRow({
       <code className="text-[10px] text-muted-foreground">{block.id}</code>
 
       {(block.type === "line" || block.type === "subtotal" || block.type === "total") && (
-        <InlineDetail block={block as LineBlock | SubtotalBlock | TotalBlock} onChange={onChange} />
+        <InlineDetail
+          block={block as LineBlock | SubtotalBlock | TotalBlock}
+          validIds={validIds}
+          onChange={onChange}
+        />
       )}
 
       <button
@@ -202,9 +229,11 @@ function BlockRow({
 
 function InlineDetail({
   block,
+  validIds,
   onChange,
 }: {
   block: LineBlock | SubtotalBlock | TotalBlock
+  validIds: Set<string>
   onChange: (patch: Partial<Block>) => void
 }) {
   const showFormula = block.type === "subtotal" || block.type === "total"
@@ -212,29 +241,20 @@ function InlineDetail({
   return (
     <div className="flex flex-wrap items-center gap-1.5">
       {showAccounts && (
-        <input
-          value={(block as LineBlock).accounts?.code_prefix ?? ""}
-          onChange={(e) =>
-            onChange({
-              accounts: {
-                ...(block as LineBlock).accounts,
-                code_prefix: e.target.value || null,
-                include_descendants: (block as LineBlock).accounts?.include_descendants ?? true,
-              },
-            } as Partial<Block>)
-          }
-          placeholder="prefixo (4.01)"
-          className="h-6 w-[100px] rounded-md border border-border bg-background px-1.5 font-mono text-[11px] outline-none focus:border-ring"
+        <AccountTreePicker
+          value={(block as LineBlock).accounts}
+          onChange={(sel) => onChange({ accounts: sel } as Partial<Block>)}
         />
       )}
 
       {showFormula && (
-        <input
-          value={(block as SubtotalBlock | TotalBlock).formula ?? ""}
-          onChange={(e) => onChange({ formula: e.target.value || null } as Partial<Block>)}
-          placeholder="fórmula (ex. sum(children))"
-          className="h-6 w-[160px] rounded-md border border-border bg-background px-1.5 font-mono text-[11px] outline-none focus:border-ring"
-        />
+        <div className="w-[200px]">
+          <FormulaInput
+            value={(block as SubtotalBlock | TotalBlock).formula ?? ""}
+            validIds={validIds}
+            onChange={(v) => onChange({ formula: v || null } as Partial<Block>)}
+          />
+        </div>
       )}
     </div>
   )
