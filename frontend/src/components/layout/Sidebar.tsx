@@ -4,7 +4,7 @@ import {
   LayoutDashboard, ArrowLeftRight, ListChecks, Sparkles, SlidersHorizontal, Workflow,
   Scale, Wallet, Receipt, BookOpen, FileBarChart, FileCog, CreditCard, Users, Boxes,
   Settings, ChevronLeft, PanelLeftOpen, Building2, CheckCircle2, Brain, Zap,
-  FileSpreadsheet, Shuffle, UploadCloud, ShieldCheck,
+  FileSpreadsheet, Shuffle, UploadCloud, ShieldCheck, Activity,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/stores/app-store"
@@ -88,6 +88,8 @@ const GROUPS: NavGroup[] = [
     visible: ({ isSuperuser }) => isSuperuser,
     items: [
       { key: "admin_home", path: "/admin", icon: ShieldCheck },
+      { key: "admin_users", path: "/admin/users", icon: Users },
+      { key: "admin_activity", path: "/admin/activity", icon: Activity },
     ],
   },
 ]

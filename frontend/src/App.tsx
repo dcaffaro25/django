@@ -28,6 +28,9 @@ import { AiUsagePage } from "@/pages/settings/AiUsagePage"
 import { AdminHomePage } from "@/pages/admin/AdminHomePage"
 import { UsersPage as AdminUsersPage } from "@/pages/admin/UsersPage"
 import { SuperuserGuard } from "@/pages/admin/SuperuserGuard"
+import { ActivityHeatmapPage } from "@/pages/admin/activity/ActivityHeatmapPage"
+import { ActivityUserDetailPage } from "@/pages/admin/activity/ActivityUserDetailPage"
+import { ActivityAreaDetailPage } from "@/pages/admin/activity/ActivityAreaDetailPage"
 
 function Protected({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuth()
@@ -84,6 +87,9 @@ export default function App() {
                       enforces IsSuperUser on every /api/admin/* endpoint. */}
                   <Route path="/admin" element={<SuperuserGuard><AdminHomePage /></SuperuserGuard>} />
                   <Route path="/admin/users" element={<SuperuserGuard><AdminUsersPage /></SuperuserGuard>} />
+                  <Route path="/admin/activity" element={<SuperuserGuard><ActivityHeatmapPage /></SuperuserGuard>} />
+                  <Route path="/admin/activity/users/:id" element={<SuperuserGuard><ActivityUserDetailPage /></SuperuserGuard>} />
+                  <Route path="/admin/activity/areas/:id" element={<SuperuserGuard><ActivityAreaDetailPage /></SuperuserGuard>} />
                   <Route path="/admin/*" element={<SuperuserGuard><AdminHomePage /></SuperuserGuard>} />
                   <Route path="*" element={<Navigate to="/recon" replace />} />
                 </Routes>

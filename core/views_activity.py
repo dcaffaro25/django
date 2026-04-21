@@ -265,3 +265,147 @@ class AdminActivityEventsView(APIView):
             "duration_ms", "meta",
         ))
         return Response({"events": events, "count": len(events)})
+
+
+class AdminActivityUserDetailView(APIView):
+    """GET /api/admin/activity/users/<user_id>/?days=30
+
+    Deeper per-user breakdown that the timeline page consumes in a
+    single request. Returns:
+
+      * ``totals``: overall focused_ms + events count
+      * ``by_day``: [{date, focused_ms, events}] for the window
+      * ``by_area``: [{area, focused_ms, events}] sorted by time
+      * ``devices``: distinct user-agents seen, with last-seen
+      * ``recent_actions``: last N action/search events (no heartbeats)
+      * ``recent_errors``: last N errors
+    """
+
+    permission_classes = [IsSuperUser]
+
+    def get(self, request, user_id, *args, **kwargs):
+        try:
+            days = int(request.query_params.get("days", "30"))
+        except (TypeError, ValueError):
+            days = 30
+        days = max(1, min(days, 90))
+        since = timezone.now() - timedelta(days=days)
+
+        from django.contrib.auth import get_user_model
+        from django.db.models import Count, Max, Sum
+        from django.db.models.functions import TruncDate
+
+        User = get_user_model()
+        user = User.objects.filter(pk=user_id).first()
+        if not user:
+            return Response({"detail": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        ev = UserActivityEvent.objects.filter(user_id=user_id, created_at__gte=since)
+        hb = ev.filter(kind=UserActivityEvent.KIND_HEARTBEAT)
+
+        totals = hb.aggregate(focused_ms=Sum("duration_ms"), events=Count("id"))
+        by_day = list(
+            hb.annotate(date=TruncDate("created_at"))
+              .values("date")
+              .annotate(focused_ms=Sum("duration_ms"), events=Count("id"))
+              .order_by("date")
+        )
+        by_area = list(
+            hb.values("area")
+              .annotate(focused_ms=Sum("duration_ms"), events=Count("id"))
+              .order_by("-focused_ms")
+        )
+        devices = list(
+            UserActivitySession.objects
+              .filter(user_id=user_id, started_at__gte=since)
+              .values("user_agent", "viewport_width", "viewport_height")
+              .annotate(last_seen=Max("last_heartbeat_at"), sessions=Count("id"))
+              .order_by("-last_seen")
+        )
+        recent_actions = list(
+            ev.filter(kind__in=[UserActivityEvent.KIND_ACTION, UserActivityEvent.KIND_SEARCH])
+              .order_by("-id")[:40]
+              .values("id", "created_at", "kind", "area", "path", "action",
+                      "target_model", "target_id", "duration_ms", "meta")
+        )
+        recent_errors = list(
+            ev.filter(kind=UserActivityEvent.KIND_ERROR)
+              .order_by("-id")[:25]
+              .values("id", "created_at", "area", "path", "meta")
+        )
+
+        return Response({
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "is_superuser": user.is_superuser,
+            },
+            "since": since.isoformat(),
+            "days": days,
+            "totals": totals,
+            "by_day": by_day,
+            "by_area": by_area,
+            "devices": devices,
+            "recent_actions": recent_actions,
+            "recent_errors": recent_errors,
+        })
+
+
+class AdminActivityAreaDetailView(APIView):
+    """GET /api/admin/activity/areas/<area>/?days=30
+
+    Per-area "what happens on this page?" report. Returns top users
+    by time, top action labels, and a recent-activity sample so the
+    admin can see what's actually being done there.
+    """
+
+    permission_classes = [IsSuperUser]
+
+    def get(self, request, area, *args, **kwargs):
+        try:
+            days = int(request.query_params.get("days", "30"))
+        except (TypeError, ValueError):
+            days = 30
+        days = max(1, min(days, 90))
+        since = timezone.now() - timedelta(days=days)
+
+        from django.db.models import Count, Sum
+
+        ev = UserActivityEvent.objects.filter(area=area, created_at__gte=since)
+        hb = ev.filter(kind=UserActivityEvent.KIND_HEARTBEAT)
+
+        totals = {
+            "focused_ms": hb.aggregate(v=Sum("duration_ms"))["v"] or 0,
+            "events": ev.count(),
+            "distinct_users": ev.values("user_id").distinct().count(),
+        }
+        top_users = list(
+            hb.values("user_id", "user__username")
+              .annotate(focused_ms=Sum("duration_ms"), events=Count("id"))
+              .order_by("-focused_ms")[:20]
+        )
+        top_actions = list(
+            ev.filter(kind=UserActivityEvent.KIND_ACTION)
+              .exclude(action="")
+              .values("action")
+              .annotate(events=Count("id"), avg_duration_ms=Count("duration_ms"))
+              .order_by("-events")[:20]
+        )
+        recent = list(
+            ev.exclude(kind=UserActivityEvent.KIND_HEARTBEAT)
+              .select_related("user")
+              .order_by("-id")[:50]
+              .values("id", "created_at", "user_id", "user__username", "kind",
+                      "action", "path", "duration_ms", "meta")
+        )
+
+        return Response({
+            "area": area,
+            "since": since.isoformat(),
+            "days": days,
+            "totals": totals,
+            "top_users": top_users,
+            "top_actions": top_actions,
+            "recent": recent,
+        })

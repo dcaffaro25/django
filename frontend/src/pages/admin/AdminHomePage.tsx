@@ -29,7 +29,6 @@ export function AdminHomePage() {
           icon={<Activity className="h-4 w-4" />}
           title="Atividade"
           subtitle="Tempo por área, gargalos, sinais de fricção nos fluxos."
-          status="Em breve"
         />
         <AdminCard
           to="/admin/audit"

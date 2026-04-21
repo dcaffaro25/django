@@ -80,4 +80,86 @@ export const adminApi = {
     }>(`/api/admin/users/${id}/reset_password/`),
 
   listCompanies: () => api.get<AdminCompany[]>("/api/admin/companies/"),
+
+  /* ---------------- Activity dashboards ---------------- */
+  activitySummary: (days: number = 7) =>
+    api.get<ActivitySummaryResponse>("/api/admin/activity/summary/", { params: { days } }),
+  activityUserDetail: (userId: number, days: number = 30) =>
+    api.get<ActivityUserDetail>(`/api/admin/activity/users/${userId}/`, { params: { days } }),
+  activityAreaDetail: (area: string, days: number = 30) =>
+    api.get<ActivityAreaDetail>(`/api/admin/activity/areas/${encodeURIComponent(area)}/`, { params: { days } }),
+  activityEvents: (params: { user?: number; area?: string; kind?: string; limit?: number; before_id?: number } = {}) =>
+    api.get<ActivityEventList>("/api/admin/activity/events/", { params }),
+}
+
+/* ---------------- Activity payload types ---------------- */
+
+export interface ActivitySummaryRow {
+  user_id: number
+  user__username: string
+  area: string
+  total_ms: number | null
+  events: number
+}
+export interface ActivitySummaryResponse {
+  since: string
+  days: number
+  rows: ActivitySummaryRow[]
+}
+
+export interface ActivityByDay {
+  date: string
+  focused_ms: number | null
+  events: number
+}
+export interface ActivityByArea {
+  area: string
+  focused_ms: number | null
+  events: number
+}
+export interface ActivityDevice {
+  user_agent: string
+  viewport_width: number | null
+  viewport_height: number | null
+  last_seen: string
+  sessions: number
+}
+export interface ActivityRawEvent {
+  id: number
+  created_at: string
+  kind: string
+  area: string
+  path: string
+  action?: string
+  target_model?: string
+  target_id?: string
+  duration_ms?: number | null
+  meta?: Record<string, unknown> | null
+  user_id?: number
+  user__username?: string
+  company_id?: number | null
+}
+export interface ActivityUserDetail {
+  user: { id: number; username: string; email?: string; is_superuser?: boolean }
+  since: string
+  days: number
+  totals: { focused_ms: number | null; events: number }
+  by_day: ActivityByDay[]
+  by_area: ActivityByArea[]
+  devices: ActivityDevice[]
+  recent_actions: ActivityRawEvent[]
+  recent_errors: ActivityRawEvent[]
+}
+export interface ActivityAreaDetail {
+  area: string
+  since: string
+  days: number
+  totals: { focused_ms: number; events: number; distinct_users: number }
+  top_users: Array<{ user_id: number; user__username: string; focused_ms: number | null; events: number }>
+  top_actions: Array<{ action: string; events: number; avg_duration_ms?: number | null }>
+  recent: ActivityRawEvent[]
+}
+export interface ActivityEventList {
+  events: ActivityRawEvent[]
+  count: number
 }

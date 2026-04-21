@@ -15,6 +15,8 @@ from core.views_activity import (
     ActivityBeaconView,
     AdminActivitySummaryView,
     AdminActivityEventsView,
+    AdminActivityUserDetailView,
+    AdminActivityAreaDetailView,
 )
 from .views import JobStatusView, JobListView, JobCancelView, TutorialView
 from .task_views import (
@@ -47,6 +49,8 @@ urlpatterns = [
     # Platform-admin reads — tenant-free, superuser-gated.
     path("api/admin/activity/summary/", AdminActivitySummaryView.as_view(), name="admin-activity-summary"),
     path("api/admin/activity/events/", AdminActivityEventsView.as_view(), name="admin-activity-events"),
+    path("api/admin/activity/users/<int:user_id>/", AdminActivityUserDetailView.as_view(), name="admin-activity-user-detail"),
+    path("api/admin/activity/areas/<str:area>/", AdminActivityAreaDetailView.as_view(), name="admin-activity-area-detail"),
     path("api/celery/queues/", CeleryQueuesView.as_view(), name="celery-queues"),
     path("api/celery/results/", CeleryResultsView.as_view(), name="celery-results"),
     path("api/celery/tasks/<uuid:task_id>/<str:action>/", CeleryTaskControlView.as_view(), name="celery-task-control"),

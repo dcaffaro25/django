@@ -1,5 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { adminApi, type AdminUser, type AdminUserWritable } from "./api"
+import type {
+  ActivityAreaDetail,
+  ActivitySummaryResponse,
+  ActivityUserDetail,
+} from "./api"
 
 const KEY_USERS = ["admin", "users"] as const
 const KEY_COMPANIES = ["admin", "companies"] as const
@@ -57,3 +62,31 @@ export function useResetAdminUserPassword() {
 }
 
 export type { AdminUser }
+
+/* ---------------- Activity dashboards ---------------- */
+
+export function useActivitySummary(days: number = 7) {
+  return useQuery<ActivitySummaryResponse>({
+    queryKey: ["admin", "activity", "summary", days],
+    queryFn: () => adminApi.activitySummary(days),
+    staleTime: 30_000,
+  })
+}
+
+export function useActivityUserDetail(userId: number | null, days: number = 30) {
+  return useQuery<ActivityUserDetail>({
+    queryKey: ["admin", "activity", "user", userId, days],
+    queryFn: () => adminApi.activityUserDetail(userId as number, days),
+    enabled: userId != null,
+    staleTime: 30_000,
+  })
+}
+
+export function useActivityAreaDetail(area: string | null, days: number = 30) {
+  return useQuery<ActivityAreaDetail>({
+    queryKey: ["admin", "activity", "area", area, days],
+    queryFn: () => adminApi.activityAreaDetail(area as string, days),
+    enabled: !!area,
+    staleTime: 30_000,
+  })
+}

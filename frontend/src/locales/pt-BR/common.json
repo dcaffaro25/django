@@ -44,7 +44,9 @@
     "reports_history": "Histórico",
     "ai_usage": "Uso da IA",
     "admin": "Administração",
-    "admin_home": "Administração"
+    "admin_home": "Visão geral",
+    "admin_users": "Usuários",
+    "admin_activity": "Atividade"
   },
   "actions": {
     "search": "Buscar",
