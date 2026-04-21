@@ -20,6 +20,33 @@ export interface AiGenerateTemplateResponse {
   document: TemplateDocument
 }
 
+export type AiRefineAction =
+  | "normalize_labels"
+  | "translate_en"
+  | "translate_pt"
+  | "suggest_subtotals"
+  | "add_missing_accounts"
+
+export interface AiRefineRequest {
+  action: AiRefineAction
+  document: TemplateDocument
+  provider?: "openai" | "anthropic"
+  model?: string
+}
+
+export interface AiRefineSummary {
+  added_ids: string[]
+  removed_ids: string[]
+  renamed: Array<{ id: string; from: string; to: string }>
+  old_count: number
+  new_count: number
+}
+
+export interface AiRefineResponse {
+  document: TemplateDocument
+  summary: AiRefineSummary
+}
+
 export const reportsApi = {
   // --- Templates ---------------------------------------------------------
   listTemplates: (params?: { report_type?: string; is_active?: boolean }) =>
@@ -88,4 +115,7 @@ export const reportsApi = {
   // --- AI --------------------------------------------------------------
   aiGenerateTemplate: (body: AiGenerateTemplateRequest) =>
     api.tenant.post<AiGenerateTemplateResponse>("/api/reports/ai/generate-template/", body),
+
+  aiRefine: (body: AiRefineRequest) =>
+    api.tenant.post<AiRefineResponse>("/api/reports/ai/refine/", body),
 }

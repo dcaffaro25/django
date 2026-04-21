@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { reportsApi, type AiGenerateTemplateRequest } from "./api"
+import { reportsApi, type AiGenerateTemplateRequest, type AiRefineRequest } from "./api"
 import { useTenant } from "@/providers/TenantProvider"
 import type {
   CalculateRequest,
@@ -125,5 +125,11 @@ export function useDeleteReportInstance() {
 export function useAiGenerateTemplate() {
   return useMutation({
     mutationFn: (body: AiGenerateTemplateRequest) => reportsApi.aiGenerateTemplate(body),
+  })
+}
+
+export function useAiRefine() {
+  return useMutation({
+    mutationFn: (body: AiRefineRequest) => reportsApi.aiRefine(body),
   })
 }

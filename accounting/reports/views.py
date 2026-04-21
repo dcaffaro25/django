@@ -22,7 +22,12 @@ from .serializers import (
     ReportInstanceSerializer,
     ReportTemplateSerializer,
 )
-from .services.ai_assistant import AiAssistantError, generate_template
+from .services.ai_assistant import (
+    AiAssistantError,
+    generate_template,
+    refine_template,
+    summarize_changes,
+)
 from .services.calculator import ReportCalculator
 from .services.document_schema import validate_document
 from .services.exporter_pdf import PdfBackendUnavailable, build_pdf
@@ -313,7 +318,51 @@ class AiStub(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"])
     def refine(self, request, tenant_id=None):
-        return self._ni("POST /api/reports/ai/refine/")
+        """Apply a one-shot refine action to an existing template.
+
+        Body::
+
+            {
+              "action": "normalize_labels" | "translate_en" | "translate_pt"
+                        | "suggest_subtotals" | "add_missing_accounts",
+              "document": { ... full template document ... },
+              "provider": "openai" | "anthropic" (optional),
+              "model": "..." (optional)
+            }
+
+        Response::
+
+            {
+              "document": <refined document>,
+              "summary": { added_ids, removed_ids, renamed, old_count, new_count }
+            }
+
+        The client is expected to diff and preview before applying.
+        """
+        tenant = _tenant_or_raise(request)
+        body = request.data or {}
+        action_name = (body.get("action") or "").strip()
+        document = body.get("document")
+        if not isinstance(document, dict):
+            raise ValidationError({"document": "Provide the current template document"})
+        if not action_name:
+            raise ValidationError({"action": "Provide a refine action"})
+
+        try:
+            new_doc = refine_template(
+                company_id=tenant.id,
+                document=document,
+                action=action_name,
+                provider=body.get("provider"),
+                model=body.get("model"),
+            )
+        except AiAssistantError as exc:
+            return Response(
+                {"error": str(exc), "error_type": "ai_error"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        summary = summarize_changes(document, new_doc)
+        return Response({"document": new_doc, "summary": summary}, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=["post"])
     def chat(self, request, tenant_id=None):

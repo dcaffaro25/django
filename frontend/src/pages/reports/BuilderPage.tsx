@@ -25,6 +25,7 @@ import { BlockEditor } from "./components/BlockEditor"
 import { ReportRenderer } from "./components/ReportRenderer"
 import { PeriodStrip } from "./components/PeriodStrip"
 import { AiGenerateModal } from "./components/AiGenerateModal"
+import { AiActionsToolbar } from "./components/AiActionsToolbar"
 
 const REPORT_TYPES: { value: ReportType; label: string }[] = [
   { value: "income_statement", label: "DRE" },
@@ -310,10 +311,11 @@ export function BuilderPage() {
       <PeriodStrip periods={periods} reportType={doc.report_type} onChange={setPeriods} />
 
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
-        <div className="card-elevated p-3">
-          <h2 className="mb-2 text-[12px] font-semibold uppercase tracking-wider text-muted-foreground">
+        <div className="card-elevated space-y-2 p-3">
+          <h2 className="text-[12px] font-semibold uppercase tracking-wider text-muted-foreground">
             Estrutura do modelo
           </h2>
+          <AiActionsToolbar doc={doc} onApply={onDocChange} />
           <BlockEditor document={doc} onChange={onDocChange} />
         </div>
 
