@@ -5,8 +5,20 @@ import type {
   ReportInstanceListItem,
   ReportResult,
   ReportTemplate,
+  ReportType,
   SaveRequest,
+  TemplateDocument,
 } from "./types"
+
+export interface AiGenerateTemplateRequest {
+  report_type: ReportType
+  preferences?: string
+  provider?: "openai" | "anthropic"
+  model?: string
+}
+export interface AiGenerateTemplateResponse {
+  document: TemplateDocument
+}
 
 export const reportsApi = {
   // --- Templates ---------------------------------------------------------
@@ -72,4 +84,8 @@ export const reportsApi = {
 
   exportPdf: (body: { result?: ReportResult; instance_id?: number; name?: string }) =>
     api.tenant.post<Blob>("/api/reports/export/pdf/", body, { responseType: "blob" }),
+
+  // --- AI --------------------------------------------------------------
+  aiGenerateTemplate: (body: AiGenerateTemplateRequest) =>
+    api.tenant.post<AiGenerateTemplateResponse>("/api/reports/ai/generate-template/", body),
 }

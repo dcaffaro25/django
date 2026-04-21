@@ -22,6 +22,7 @@ from .serializers import (
     ReportInstanceSerializer,
     ReportTemplateSerializer,
 )
+from .services.ai_assistant import AiAssistantError, generate_template
 from .services.calculator import ReportCalculator
 from .services.document_schema import validate_document
 from .services.exporter_pdf import PdfBackendUnavailable, build_pdf
@@ -256,6 +257,10 @@ class ExportViewSet(viewsets.ViewSet):
 
 
 class AiStub(viewsets.ViewSet):
+    """AI endpoints. ``generate-template`` is live (PR 6); the rest land in
+    later PRs and return 501 with a helpful message until then.
+    """
+
     @staticmethod
     def _ni(feature: str):
         return Response(
@@ -265,7 +270,46 @@ class AiStub(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"], url_path="generate-template")
     def generate_template(self, request, tenant_id=None):
-        return self._ni("POST /api/reports/ai/generate-template/")
+        """Generate a draft template from the tenant's chart of accounts.
+
+        Body::
+
+            {
+              "report_type": "income_statement" | "balance_sheet" | "cash_flow",
+              "preferences": "optional free-text",
+              "provider": "openai" | "anthropic" (optional),
+              "model": "..." (optional)
+            }
+
+        Returns the draft ``TemplateDocument`` (JSON). Never persists.
+        """
+        tenant = _tenant_or_raise(request)
+        body = request.data or {}
+
+        report_type = (body.get("report_type") or "").strip()
+        if report_type not in ("income_statement", "balance_sheet", "cash_flow"):
+            raise ValidationError(
+                {"report_type": "Must be income_statement | balance_sheet | cash_flow"}
+            )
+
+        try:
+            doc = generate_template(
+                company_id=tenant.id,
+                report_type=report_type,
+                preferences=(body.get("preferences") or ""),
+                provider=body.get("provider"),
+                model=body.get("model"),
+            )
+        except AiAssistantError as exc:
+            # Service layer signals any upstream AI failure (missing key,
+            # malformed output, schema violation after repair) as this
+            # exception. Render a 502-ish via a structured 400 so the UI can
+            # surface the message.
+            return Response(
+                {"error": str(exc), "error_type": "ai_error"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response({"document": doc}, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=["post"])
     def refine(self, request, tenant_id=None):

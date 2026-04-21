@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react"
 import { toast } from "sonner"
 import {
-  Save, Play, Download, FileSpreadsheet, FileText, Plus, Copy, Trash2, Layers,
+  Save, Play, Download, FileSpreadsheet, FileText, Plus, Copy, Trash2, Layers, Sparkles,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import {
@@ -24,6 +24,7 @@ import type {
 import { BlockEditor } from "./components/BlockEditor"
 import { ReportRenderer } from "./components/ReportRenderer"
 import { PeriodStrip } from "./components/PeriodStrip"
+import { AiGenerateModal } from "./components/AiGenerateModal"
 
 const REPORT_TYPES: { value: ReportType; label: string }[] = [
   { value: "income_statement", label: "DRE" },
@@ -65,6 +66,7 @@ export function BuilderPage() {
   )
   const [periods, setPeriods] = useState<Period[]>(initialPreset)
   const [preview, setPreview] = useState<ReportResult | null>(null)
+  const [aiOpen, setAiOpen] = useState(false)
 
   // Load selected template into the editor.
   useEffect(() => {
@@ -221,6 +223,12 @@ export function BuilderPage() {
         subtitle="Novo motor — edite o modelo, veja a pré-visualização multi-período, exporte"
         actions={
           <>
+            <button
+              onClick={() => setAiOpen(true)}
+              className="inline-flex h-8 items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 text-[12px] font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-300"
+            >
+              <Sparkles className="h-3.5 w-3.5" /> Gerar com IA
+            </button>
             <BtnGhost onClick={onNew}>
               <Plus className="h-3 w-3" /> Novo
             </BtnGhost>
@@ -239,6 +247,21 @@ export function BuilderPage() {
             </button>
           </>
         }
+      />
+
+      <AiGenerateModal
+        open={aiOpen}
+        onClose={() => setAiOpen(false)}
+        onGenerated={(generated) => {
+          // AI-generated draft drops into the editor as a new unsaved template.
+          // Clear the selected template so the user doesn't accidentally
+          // overwrite a saved one.
+          setSelectedTemplateId(null)
+          setDoc(generated)
+          setDirty(true)
+          setPreview(null)
+          toast.success("Modelo gerado pela IA — revise e salve")
+        }}
       />
 
       <div className="card-elevated flex flex-wrap items-center gap-3 p-2 text-[12px]">
