@@ -1,20 +1,20 @@
 import { useSearchParams } from "react-router-dom"
-import { FileSpreadsheet, FileText, FileCode, FileCog, Replace } from "lucide-react"
+import { FileSpreadsheet, FileText, FileCode, FileCog } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { EtlImportPage } from "./EtlImportPage"
 import { OfxImportPage } from "./OfxImportPage"
 import { NfImportPage } from "./NfImportPage"
 import { ImportTemplatesPage } from "./ImportTemplatesPage"
-import { SubstitutionRulesPage } from "./SubstitutionRulesPage"
 import { cn } from "@/lib/utils"
 
 /**
- * One-stop landing page for file imports. Hosts the upload flows (ETL / OFX /
- * NF-e) side-by-side with the CRUD pages (templates + substitution rules) so
- * operators can manage mapping rules without changing pages mid-task.
+ * One-stop landing page for file imports. Hosts the four upload flows
+ * (ETL / OFX / NF-e / bulk workbook) as tabs. Substitution rules live on
+ * their own page (/imports/substitutions) because they're a long-lived
+ * CRUD surface rather than a per-upload concern.
  */
 
-type Tab = "etl" | "ofx" | "nf" | "templates" | "substitutions"
+type Tab = "etl" | "ofx" | "nf" | "templates"
 
 const TABS: Array<{
   id: Tab
@@ -25,11 +25,10 @@ const TABS: Array<{
   { id: "etl", label: "ETL (Excel)", hint: "Importação genérica via planilha", icon: FileSpreadsheet },
   { id: "ofx", label: "OFX", hint: "Extratos bancários", icon: FileText },
   { id: "nf", label: "NF-e", hint: "XMLs de nota fiscal", icon: FileCode },
-  { id: "templates", label: "Templates", hint: "Regras de transformação reutilizáveis", icon: FileCog },
-  { id: "substitutions", label: "Substituições", hint: "Regras de-para aplicadas nos imports", icon: Replace },
+  { id: "templates", label: "Templates", hint: "Importação multi-modelo via planilha mestre", icon: FileCog },
 ]
 
-const VALID_TABS: Tab[] = ["etl", "ofx", "nf", "templates", "substitutions"]
+const VALID_TABS: Tab[] = ["etl", "ofx", "nf", "templates"]
 
 export function ImportsHubPage() {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -74,7 +73,6 @@ export function ImportsHubPage() {
       {tab === "ofx" && <OfxImportPage />}
       {tab === "nf" && <NfImportPage />}
       {tab === "templates" && <ImportTemplatesPage />}
-      {tab === "substitutions" && <SubstitutionRulesPage />}
     </div>
   )
 }

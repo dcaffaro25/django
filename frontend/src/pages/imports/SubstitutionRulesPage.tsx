@@ -1,6 +1,18 @@
 import { useMemo, useState } from "react"
 import { toast } from "sonner"
-import { Plus, Trash2, Save, X, Search, ChevronDown, ChevronRight, ArrowRight, RefreshCw } from "lucide-react"
+import { Drawer } from "vaul"
+import {
+  ArrowRight,
+  ChevronDown,
+  ChevronRight,
+  Copy,
+  Plus,
+  RefreshCw,
+  Save,
+  Search,
+  Trash2,
+  X,
+} from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import {
   useDeleteSubstitutionRule,
@@ -14,11 +26,20 @@ import { cn } from "@/lib/utils"
 
 // UX: de-para rules are noisy at scale (we just saw 187 records on a real
 // tenant). Group by model_name by default and let operators drill into
-// the field or model they care about. Full CRUD available via the drawer.
+// the field or model they care about. Full CRUD via a right drawer.
 
 type Draft = Partial<SubstitutionRule> & { company?: number }
 
 const MATCH_TYPES: SubstitutionMatchType[] = ["exact", "prefix", "suffix", "contains", "regex"]
+
+const BLANK_DRAFT = (companyId: number | undefined, modelPrefill = ""): Draft => ({
+  model_name: modelPrefill,
+  field_name: "",
+  match_type: "exact",
+  match_value: "",
+  substitution_value: "",
+  company: companyId,
+})
 
 export function SubstitutionRulesPage() {
   const { data: rules = [], isLoading, isFetching, refetch } = useSubstitutionRules()
@@ -32,16 +53,12 @@ export function SubstitutionRulesPage() {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
   const [editing, setEditing] = useState<Draft | null>(null)
 
-  // Unique model names for the filter dropdown + group headers.
   const models = useMemo(() => {
     const s = new Set<string>()
     for (const r of rules) s.add(r.model_name ?? "—")
     return Array.from(s).sort((a, b) => a.localeCompare(b))
   }, [rules])
 
-  // Apply the filters and then group by model_name so operators can
-  // collapse sections. Grouping also surfaces "how many rules do we
-  // have for Entity / Account / …" at a glance.
   const grouped = useMemo(() => {
     const q = search.trim().toLowerCase()
     const filtered = rules.filter((r) => {
@@ -64,17 +81,20 @@ export function SubstitutionRulesPage() {
     return Array.from(map.entries()).sort((a, b) => a[0].localeCompare(b[0]))
   }, [rules, search, modelFilter, matchFilter])
 
-  const onNew = () =>
-    setEditing({
-      model_name: modelFilter || "",
-      field_name: "",
-      match_type: "exact",
-      match_value: "",
-      substitution_value: "",
-      company: tenant?.id,
-    })
+  const onNew = () => setEditing(BLANK_DRAFT(tenant?.id, modelFilter || ""))
 
   const onEdit = (r: SubstitutionRule) => setEditing({ ...r })
+
+  /**
+   * Duplicate shortcut: opens the drawer prefilled from ``r`` but with ``id``
+   * stripped so ``onSave`` creates a new record. We also blank the match_value
+   * and focus it implicitly — the user almost always wants to tweak that field.
+   */
+  const onDuplicate = (r: SubstitutionRule, e: React.MouseEvent) => {
+    e.stopPropagation()
+    const { id: _id, created_at: _created, updated_at: _updated, ...rest } = r
+    setEditing({ ...rest, match_value: "" })
+  }
 
   const onSave = () => {
     if (!editing) return
@@ -228,7 +248,7 @@ export function SubstitutionRulesPage() {
                         <th className="h-8 px-3">Campo</th>
                         <th className="h-8 px-3">Tipo</th>
                         <th className="h-8 px-3">Regra</th>
-                        <th className="h-8 w-px px-3"></th>
+                        <th className="h-8 w-[88px] px-3 text-right">Ações</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -237,7 +257,7 @@ export function SubstitutionRulesPage() {
                           key={r.id}
                           onClick={() => onEdit(r)}
                           className={cn(
-                            "cursor-pointer border-t border-border hover:bg-accent/50",
+                            "group cursor-pointer border-t border-border hover:bg-accent/50",
                           )}
                         >
                           <td className="h-9 px-3 font-mono text-muted-foreground">
@@ -259,13 +279,23 @@ export function SubstitutionRulesPage() {
                               </span>
                             </span>
                           </td>
-                          <td className="h-9 px-3">
-                            <button
-                              onClick={(e) => onDelete(r, e)}
-                              className="inline-flex h-6 items-center rounded px-1.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                            >
-                              <Trash2 className="h-3 w-3" />
-                            </button>
+                          <td className="h-9 px-3 text-right">
+                            <div className="inline-flex items-center gap-1">
+                              <button
+                                onClick={(e) => onDuplicate(r, e)}
+                                title="Duplicar — abre o drawer com os mesmos valores como um novo registro"
+                                className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-accent group-hover:opacity-100"
+                              >
+                                <Copy className="h-3 w-3" />
+                              </button>
+                              <button
+                                onClick={(e) => onDelete(r, e)}
+                                title="Excluir"
+                                className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100"
+                              >
+                                <Trash2 className="h-3 w-3" />
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       ))}
@@ -278,99 +308,136 @@ export function SubstitutionRulesPage() {
         )}
       </div>
 
-      {/* Editor drawer (inline card, not a modal — the list is the primary context) */}
-      {editing !== null && (
-        <div className="card-elevated space-y-3 p-4">
-          <div className="flex items-center justify-between">
-            <h3 className="text-[13px] font-semibold">
-              {editing.id ? `Editar regra #${editing.id}` : "Nova regra"}
-            </h3>
+      {/* Right drawer editor */}
+      <RuleEditorDrawer
+        open={editing !== null}
+        draft={editing}
+        setDraft={(d) => setEditing(d)}
+        onClose={() => setEditing(null)}
+        onSave={onSave}
+        saving={save.isPending}
+      />
+    </div>
+  )
+}
+
+function RuleEditorDrawer({
+  open,
+  draft,
+  setDraft,
+  onClose,
+  onSave,
+  saving,
+}: {
+  open: boolean
+  draft: Draft | null
+  setDraft: (d: Draft) => void
+  onClose: () => void
+  onSave: () => void
+  saving: boolean
+}) {
+  return (
+    <Drawer.Root open={open} onOpenChange={(o) => !o && onClose()} direction="right">
+      <Drawer.Portal>
+        <Drawer.Overlay className="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm" />
+        <Drawer.Content className="fixed right-0 top-0 z-50 flex h-full w-full max-w-[520px] flex-col border-l border-border surface-2 outline-none">
+          <div className="hairline flex h-12 shrink-0 items-center justify-between px-4">
+            <Drawer.Title className="text-[13px] font-semibold">
+              {draft?.id ? `Editar regra #${draft.id}` : "Nova regra de substituição"}
+            </Drawer.Title>
             <button
-              onClick={() => setEditing(null)}
-              className="text-muted-foreground hover:text-foreground"
+              onClick={onClose}
+              className="grid h-7 w-7 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+              aria-label="Fechar"
             >
               <X className="h-4 w-4" />
             </button>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Modelo">
-              <input
-                value={editing.model_name ?? ""}
-                onChange={(e) => setEditing({ ...editing, model_name: e.target.value })}
-                placeholder="Entity, Account, Transaction, …"
-                className="h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-[12px] outline-none focus:border-ring"
-              />
-            </Field>
-            <Field label="Campo">
-              <input
-                value={editing.field_name ?? ""}
-                onChange={(e) => setEditing({ ...editing, field_name: e.target.value })}
-                placeholder="id, name, account_code, …"
-                className="h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-[12px] outline-none focus:border-ring"
-              />
-            </Field>
-            <Field label="Tipo de match">
-              <select
-                value={editing.match_type ?? "exact"}
-                onChange={(e) =>
-                  setEditing({
-                    ...editing,
-                    match_type: e.target.value as SubstitutionMatchType,
-                  })
-                }
-                className="h-8 w-full rounded-md border border-border bg-background px-2 text-[12px] outline-none focus:border-ring"
-              >
-                {MATCH_TYPES.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <Field label="Valor original">
-              <input
-                value={editing.match_value ?? ""}
-                onChange={(e) => setEditing({ ...editing, match_value: e.target.value })}
-                className="h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-[12px] outline-none focus:border-ring"
-              />
-            </Field>
-            <Field label="Substituir por">
-              <input
-                value={editing.substitution_value ?? ""}
-                onChange={(e) =>
-                  setEditing({ ...editing, substitution_value: e.target.value })
-                }
-                className="h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-[12px] outline-none focus:border-ring"
-              />
-            </Field>
+          <div className="flex-1 space-y-4 overflow-y-auto p-4 text-[12px]">
+            {draft && (
+              <>
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="Modelo">
+                    <input
+                      value={draft.model_name ?? ""}
+                      onChange={(e) => setDraft({ ...draft, model_name: e.target.value })}
+                      placeholder="Entity, Account, Transaction, …"
+                      className="h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-[12px] outline-none focus:border-ring"
+                    />
+                  </Field>
+                  <Field label="Campo">
+                    <input
+                      value={draft.field_name ?? ""}
+                      onChange={(e) => setDraft({ ...draft, field_name: e.target.value })}
+                      placeholder="id, name, account_code, …"
+                      className="h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-[12px] outline-none focus:border-ring"
+                    />
+                  </Field>
+                </div>
+                <Field label="Tipo de match">
+                  <select
+                    value={draft.match_type ?? "exact"}
+                    onChange={(e) =>
+                      setDraft({
+                        ...draft,
+                        match_type: e.target.value as SubstitutionMatchType,
+                      })
+                    }
+                    className="h-8 w-full rounded-md border border-border bg-background px-2 text-[12px] outline-none focus:border-ring"
+                  >
+                    {MATCH_TYPES.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="Valor original">
+                  <input
+                    autoFocus
+                    value={draft.match_value ?? ""}
+                    onChange={(e) => setDraft({ ...draft, match_value: e.target.value })}
+                    className="h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-[12px] outline-none focus:border-ring"
+                  />
+                </Field>
+                <Field label="Substituir por">
+                  <input
+                    value={draft.substitution_value ?? ""}
+                    onChange={(e) => setDraft({ ...draft, substitution_value: e.target.value })}
+                    className="h-8 w-full rounded-md border border-border bg-background px-2 font-mono text-[12px] outline-none focus:border-ring"
+                  />
+                </Field>
+
+                <div className="rounded-md border border-dashed border-border p-2 text-[11px] text-muted-foreground">
+                  Durante importações, valores iguais a{" "}
+                  <code>{draft.match_value || "∅"}</code> em{" "}
+                  <code>{draft.model_name || "?"}</code>.
+                  <code>{draft.field_name || "?"}</code> ({draft.match_type ?? "?"}) serão
+                  substituídos por <code>{draft.substitution_value || "∅"}</code>.
+                </div>
+              </>
+            )}
           </div>
 
-          <div className="rounded-md border border-dashed border-border p-2 text-[11px] text-muted-foreground">
-            Durante importações, valores iguais a <code>{editing.match_value || "∅"}</code>{" "}
-            em <code>{editing.model_name || "?"}</code>.<code>{editing.field_name || "?"}</code>{" "}
-            ({editing.match_type ?? "?"}) serão substituídos por{" "}
-            <code>{editing.substitution_value || "∅"}</code>.
-          </div>
-
-          <div className="flex justify-end gap-2">
+          <div className="hairline flex shrink-0 items-center justify-end gap-2 border-t p-3">
             <button
-              onClick={() => setEditing(null)}
+              onClick={onClose}
               className="inline-flex h-8 items-center rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
             >
               Cancelar
             </button>
             <button
               onClick={onSave}
-              disabled={save.isPending}
+              disabled={saving}
               className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
             >
               <Save className="h-3.5 w-3.5" /> Salvar
             </button>
           </div>
-        </div>
-      )}
-    </div>
+        </Drawer.Content>
+      </Drawer.Portal>
+    </Drawer.Root>
   )
 }
 

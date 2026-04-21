@@ -1,7 +1,7 @@
 import { api, unwrapList } from "@/lib/api-client"
 import type {
+  BulkImportResponse,
   EtlExecuteResponse,
-  ImportTransformationRule,
   NfeImportResponse,
   OfxImportFile,
   OfxImportResponse,
@@ -43,6 +43,45 @@ export async function etlPreview(params: EtlExecuteParams): Promise<EtlExecuteRe
   })
 }
 
+// ---- Bulk-import (Excel workbook with many models) ---------------------
+
+/**
+ * Multi-model Excel bulk import. The backend reads every sheet in the
+ * workbook, resolves *_fk references via ``__row_id`` tokens, and returns a
+ * per-sheet report. With ``commit=false`` the whole thing runs inside a
+ * transaction that gets rolled back — ideal for a preview step.
+ */
+export async function bulkImport(
+  file: File,
+  opts: { commit?: boolean } = {},
+): Promise<BulkImportResponse> {
+  const fd = new FormData()
+  fd.append("file", file)
+  fd.append("commit", opts.commit ? "true" : "false")
+  return api.tenant.post<BulkImportResponse>("/api/core/bulk-import/", fd, {
+    headers: { "Content-Type": "multipart/form-data" },
+    validateStatus: (s) => s < 500,
+  })
+}
+
+/**
+ * Download the canonical workbook template (headers for every supported
+ * model, with an ImportHelp sheet describing __row_id / __erp_id / *_fk).
+ * Uses axios + blob so the Authorization header flows through.
+ */
+export async function downloadBulkImportTemplate(): Promise<void> {
+  const blob = await api.tenant.get<Blob>("/api/core/bulk-import-template/", {
+    responseType: "blob",
+  })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement("a")
+  a.href = url
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)
+  a.download = `bulk_import_template_${stamp}.xlsx`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
 // ---- Substitution rules ------------------------------------------------
 
 export const substitutionRulesApi = {
@@ -55,25 +94,6 @@ export const substitutionRulesApi = {
   update: (id: number, body: Partial<SubstitutionRule>) =>
     api.tenant.patch<SubstitutionRule>(`/api/core/substitution-rules/${id}/`, body),
   remove: (id: number) => api.tenant.delete<void>(`/api/core/substitution-rules/${id}/`),
-}
-
-// ---- Import templates (ImportTransformationRule) -----------------------
-
-export const importTemplatesApi = {
-  list: () =>
-    api.tenant
-      .get<ImportTransformationRule[] | { results: ImportTransformationRule[] }>(
-        "/api/core/etl/transformation-rules/",
-      )
-      .then(unwrapList<ImportTransformationRule>),
-  get: (id: number) =>
-    api.tenant.get<ImportTransformationRule>(`/api/core/etl/transformation-rules/${id}/`),
-  create: (body: Partial<ImportTransformationRule>) =>
-    api.tenant.post<ImportTransformationRule>("/api/core/etl/transformation-rules/", body),
-  update: (id: number, body: Partial<ImportTransformationRule>) =>
-    api.tenant.patch<ImportTransformationRule>(`/api/core/etl/transformation-rules/${id}/`, body),
-  remove: (id: number) =>
-    api.tenant.delete<void>(`/api/core/etl/transformation-rules/${id}/`),
 }
 
 // ---- OFX ---------------------------------------------------------------

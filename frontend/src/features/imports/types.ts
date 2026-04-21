@@ -79,14 +79,35 @@ export interface SubstitutionRule {
   updated_at?: string
 }
 
-export interface ImportTransformationRule {
-  id: number
-  name: string
-  description?: string | null
-  model_name?: string
-  mapping_config?: Record<string, unknown>
-  company?: number
-  is_active?: boolean
+/**
+ * One row in a sheet, as reported back by execute_import_job().
+ * ``status`` is usually "success" | "error" | "skipped"; ``action`` is
+ * "create" | "update" | "delete" | "upsert" | "noop", but both are
+ * free-form strings on the backend so we keep them loose.
+ */
+export interface BulkImportRowResult {
+  __row_id?: string | number | null
+  status?: string
+  action?: string | null
+  data?: Record<string, unknown>
+  message?: string
+  observations?: string[]
+  external_id?: string | number | null
+  [k: string]: unknown
+}
+
+export interface BulkImportSheetResult {
+  model: string
+  result: BulkImportRowResult[]
+}
+
+export interface BulkImportResponse {
+  committed: boolean
+  reason?: string | null
+  imports: BulkImportSheetResult[]
+  /** Top-level error when the request fails outside the per-row loop. */
+  error?: string
+  detail?: string
 }
 
 export interface OfxImportFile {
