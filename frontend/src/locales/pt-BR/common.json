@@ -38,7 +38,10 @@
     "imports_ofx": "OFX (extratos)",
     "imports_nf": "NF-e (XML)",
     "imports_templates": "Templates",
-    "imports_substitutions": "Substituições"
+    "imports_substitutions": "Substituições",
+    "reports_beta": "Demonstrativos (beta)",
+    "reports_build": "Novo demonstrativo",
+    "reports_history": "Histórico"
   },
   "actions": {
     "search": "Buscar",

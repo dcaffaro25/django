@@ -45,6 +45,13 @@ const GROUPS: NavGroup[] = [
     ],
   },
   {
+    key: "reports_beta",
+    items: [
+      { key: "reports_build", path: "/reports/build", icon: FileBarChart },
+      { key: "reports_history", path: "/reports/history", icon: ListChecks },
+    ],
+  },
+  {
     key: "integrations",
     items: [
       { key: "integrations_sandbox", path: "/integrations/sandbox", icon: Zap },
