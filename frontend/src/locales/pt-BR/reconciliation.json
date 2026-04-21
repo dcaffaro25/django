@@ -217,7 +217,8 @@
       "unmatch": "Desfazer conciliação",
       "delete": "Excluir",
       "edit": "Editar",
-      "view": "Abrir na bancada"
+      "view": "Abrir na bancada",
+      "recalc": "Recalcular saldos"
     },
     "bulk": {
       "selected": "{{count}} selecionadas",
@@ -247,6 +248,7 @@
       "approved": "Conciliação aprovada",
       "deleted": "Conciliação excluída",
       "updated": "Alterações salvas",
+      "recalc_queued": "Recálculo enfileirado (tarefa {{task_id}})",
       "error": "Operação falhou"
     },
     "empty": "Nenhuma conciliação encontrada no filtro atual",

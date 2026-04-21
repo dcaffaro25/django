@@ -654,6 +654,22 @@ export function useDeleteReconciliation() {
   })
 }
 
+/**
+ * Kick off the backend task that recomputes is_balanced / is_reconciled flags
+ * on all unposted transactions. Resolves immediately with the Celery task id.
+ */
+export function useRecalcUnpostedFlags() {
+  const sub = useSub()
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: reconApi.recalcUnpostedFlags,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["recon", sub, "reconciliations"] })
+      qc.invalidateQueries({ queryKey: ["recon", sub, "reconciliation_summaries"] })
+    },
+  })
+}
+
 // ---- Entities CRUD ----
 export function useSaveEntity() {
   const sub = useSub()

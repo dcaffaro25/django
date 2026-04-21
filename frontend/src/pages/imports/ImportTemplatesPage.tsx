@@ -1,6 +1,6 @@
 import { useState } from "react"
 import { toast } from "sonner"
-import { Plus, Trash2, FileCog, Download } from "lucide-react"
+import { Plus, Trash2, FileCog, Download, RefreshCw } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import {
   useDeleteImportTemplate,
@@ -9,9 +9,10 @@ import {
   type ImportTransformationRule,
 } from "@/features/imports"
 import { useTenant } from "@/providers/TenantProvider"
+import { cn } from "@/lib/utils"
 
 export function ImportTemplatesPage() {
-  const { data: templates = [], isLoading } = useImportTemplates()
+  const { data: templates = [], isLoading, isFetching, refetch } = useImportTemplates()
   const save = useSaveImportTemplate()
   const del = useDeleteImportTemplate()
   const { tenant } = useTenant()
@@ -55,6 +56,16 @@ export function ImportTemplatesPage() {
         subtitle="Regras de transformação reutilizáveis — definem como linhas de planilha viram registros."
         actions={
           <>
+            <button
+              onClick={() => void refetch()}
+              className={cn(
+                "inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent",
+                isFetching && "opacity-60",
+              )}
+              title="Atualizar"
+            >
+              <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} /> Atualizar
+            </button>
             <a
               href="/bulk_import_template.xlsx"
               download
