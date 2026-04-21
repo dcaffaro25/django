@@ -21,6 +21,9 @@ import { SubstitutionRulesPage } from "@/pages/imports/SubstitutionRulesPage"
 import { ImportTemplatesPage } from "@/pages/imports/ImportTemplatesPage"
 import { PlaceholderPage } from "@/pages/recon/PlaceholderPage"
 import { ReportBuilderPage } from "@/pages/statements/ReportBuilderPage"
+import { BuilderPage as ReportsBuilderPage } from "@/pages/reports/BuilderPage"
+import { HistoryPage as ReportsHistoryPage } from "@/pages/reports/HistoryPage"
+import { ViewPage as ReportsViewPage } from "@/pages/reports/ViewPage"
 
 function Protected({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuth()
@@ -56,6 +59,10 @@ export default function App() {
                   <Route path="/statements" element={<ReportBuilderPage />} />
                   <Route path="/statements/templates" element={<ReportBuilderPage />} />
                   <Route path="/statements/*" element={<PlaceholderPage title="Demonstrativos" />} />
+                  <Route path="/reports" element={<ReportsBuilderPage />} />
+                  <Route path="/reports/build" element={<ReportsBuilderPage />} />
+                  <Route path="/reports/history" element={<ReportsHistoryPage />} />
+                  <Route path="/reports/view/:id" element={<ReportsViewPage />} />
                   <Route path="/billing/*" element={<PlaceholderPage title="Faturamento" />} />
                   <Route path="/hr/*" element={<PlaceholderPage title="RH" />} />
                   <Route path="/inventory/*" element={<PlaceholderPage title="Estoque" />} />
