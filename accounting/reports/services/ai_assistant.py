@@ -50,27 +50,33 @@ def _build_chart_context(company_id: int, limit: int = 400) -> Dict[str, Any]:
     We cap at ``limit`` accounts to keep prompts small. For larger charts,
     the AI should use ``code_prefix`` selectors (which match by pattern, so
     unseen accounts still get picked up at calculate-time).
+
+    ``Account`` is an MPTTModel — there's no ``path`` column; we call
+    ``get_path()`` on each instance instead.
     """
     qs = (
         Account.objects.filter(company_id=company_id, is_active=True)
-        .order_by("account_code", "path")
-        .values("id", "name", "account_code", "path", "account_direction", "level")
+        .order_by("account_code", "name")
     )
     total = qs.count()
-    sample = list(qs[:limit])
+    sample_instances = list(qs[:limit])
+    accounts: List[Dict[str, Any]] = []
+    for a in sample_instances:
+        try:
+            path = a.get_path() if hasattr(a, "get_path") else ""
+        except Exception:
+            path = ""
+        accounts.append({
+            "code": a.account_code or "",
+            "name": a.name,
+            "path": path or "",
+            "direction": a.account_direction,
+            "level": a.level,
+        })
     return {
         "total_accounts": total,
-        "sampled": len(sample),
-        "accounts": [
-            {
-                "code": a["account_code"] or "",
-                "name": a["name"],
-                "path": a["path"] or "",
-                "direction": a["account_direction"],
-                "level": a["level"],
-            }
-            for a in sample
-        ],
+        "sampled": len(sample_instances),
+        "accounts": accounts,
     }
 
 
@@ -560,15 +566,26 @@ def explain(
     memory = (line.get("memory") or {}).get(period_id) or {}
     account_ids = memory.get("account_ids") or []
 
-    # Resolve account ids → names for the prompt (capped)
+    # Resolve account ids → names for the prompt (capped). ``Account`` is an
+    # MPTTModel, so ``path`` is a method, not a column — compute per-row.
     accounts_detail: List[Dict[str, Any]] = []
     if account_ids:
-        rows = list(
+        instances = list(
             Account.objects.filter(
                 company_id=company_id, id__in=account_ids[:40]
-            ).values("id", "name", "account_code", "path")
+            )
         )
-        accounts_detail = rows
+        for a in instances:
+            try:
+                path = a.get_path() if hasattr(a, "get_path") else ""
+            except Exception:
+                path = ""
+            accounts_detail.append({
+                "id": a.id,
+                "name": a.name,
+                "account_code": a.account_code,
+                "path": path,
+            })
 
     # Locate the block in the document so we can include its type/formula
     block_info: Dict[str, Any] = {"id": block_id}
@@ -607,8 +624,8 @@ def explain(
     explanation_text: str
     try:
         client = ExternalAIClient(provider=provider, model=model)
-        # Explain uses the chat system prompt but discards operations —
-        # simpler to ask for a raw JSON wrapping a single "text" field.
+        # Explain uses its own system prompt — simpler to ask for a raw JSON
+        # wrapping a single "text" field than to reuse the chat schema.
         raw = client.generate_json(
             prompt=user_prompt
             + '\n\nResponda com JSON: {"text": "<explicação>"}',
@@ -620,8 +637,12 @@ def explain(
             ),
         )
         explanation_text = str(raw.get("text") or "").strip()
-    except (ExternalAIError, AiAssistantError) as exc:
-        # Fall back to a purely coded explanation — no AI call, still useful.
+        if not explanation_text:
+            raise AiAssistantError("empty explanation text")
+    except Exception as exc:
+        # Any failure — missing API key, network, bad output, bad provider —
+        # falls back to the deterministic coded explanation. This is the
+        # core promise of the explain endpoint: users always get something.
         log.warning("explain: AI call failed, falling back to coded text: %s", exc)
         explanation_text = _coded_explanation(
             block_info=block_info,

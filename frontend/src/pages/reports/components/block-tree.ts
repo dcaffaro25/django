@@ -11,19 +11,21 @@ export interface FlatBlock {
   block: Block
 }
 
-let _keySeq = 0
-function mkKey(): string {
-  _keySeq += 1
-  return `b-${Date.now().toString(36)}-${_keySeq}`
-}
-
-/** Walk a document into a depth-ordered flat list with parent refs. */
+/** Walk a document into a depth-ordered flat list with parent refs.
+ *
+ * The ``_key`` mirrors the block id so React keys and drawer lookups stay
+ * stable across re-flattens. A fresh random key each call would break the
+ * detail drawer: it stores the clicked ``_key`` and looks the block up in
+ * the next render's flat list — new keys → null block → drawer closes on
+ * every edit. Since block ids are already uniqueness-validated by pydantic,
+ * using them directly is both simpler and safer.
+ */
 export function flattenForEdit(doc: TemplateDocument): FlatBlock[] {
   const out: FlatBlock[] = []
 
   function walk(blocks: Block[], depth: number, parentId: string | null) {
     for (const b of blocks) {
-      out.push({ _key: mkKey(), parent_id: parentId, depth, block: b })
+      out.push({ _key: b.id, parent_id: parentId, depth, block: b })
       if (b.type === "section") {
         walk((b as SectionBlock).children ?? [], depth + 1, b.id)
       }
