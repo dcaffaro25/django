@@ -94,6 +94,18 @@ export const adminApi = {
     api.get<ActivityFunnelsResponse>("/api/admin/activity/funnels/", { params: { days } }),
   activityFriction: (days: number = 30) =>
     api.get<ActivityFrictionResponse>("/api/admin/activity/friction/", { params: { days } }),
+  /** POST /api/admin/activity/digest/run/ — run the weekly digest
+   *  synchronously. ``dry_run=true`` returns stats without
+   *  emailing; useful for "show me what would be sent". */
+  runActivityDigest: (body: { days?: number; dry_run?: boolean; to?: string } = {}) =>
+    api.post<{
+      sent: boolean
+      recipient?: string
+      xlsx_bytes?: number
+      subject?: string
+      filename?: string
+      reason?: string
+    }>("/api/admin/activity/digest/run/", body),
 }
 
 /* ---------------- Activity payload types ---------------- */

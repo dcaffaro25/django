@@ -352,6 +352,42 @@ class AdminActivityUserDetailView(APIView):
         })
 
 
+class AdminActivityDigestRunView(APIView):
+    """POST /api/admin/activity/digest/run/
+
+    On-demand trigger for the weekly digest. Body accepts:
+
+    .. code-block:: json
+
+      { "days": 7, "dry_run": false, "to": "override@example.com" }
+
+    When ``dry_run=true``, the task returns the xlsx byte-count and
+    subject without actually sending — used by the "Gerar prévia"
+    button in the admin UI. The normal scheduled path goes through
+    Celery Beat; this endpoint short-circuits for the "send it to me
+    now" case.
+    """
+
+    permission_classes = [IsSuperUser]
+
+    def post(self, request, *args, **kwargs):
+        from core.tasks_activity_digest import send_weekly_digest
+
+        body = request.data or {}
+        try:
+            days = int(body.get("days", 7))
+        except (TypeError, ValueError):
+            days = 7
+        days = max(1, min(days, 90))
+        dry_run = bool(body.get("dry_run", False))
+        to = body.get("to") or None
+
+        # Run synchronously — the admin expects a result now, and the
+        # scheduled path already covers the fire-and-forget case.
+        result = send_weekly_digest.run(days=days, dry_run=dry_run, recipient=to)
+        return Response(result)
+
+
 class AdminActivityFunnelsView(APIView):
     """GET /api/admin/activity/funnels/?days=30
 

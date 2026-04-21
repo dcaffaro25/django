@@ -19,6 +19,7 @@ from core.views_activity import (
     AdminActivityAreaDetailView,
     AdminActivityFunnelsView,
     AdminActivityFrictionView,
+    AdminActivityDigestRunView,
 )
 from .views import JobStatusView, JobListView, JobCancelView, TutorialView
 from .task_views import (
@@ -55,6 +56,7 @@ urlpatterns = [
     path("api/admin/activity/areas/<str:area>/", AdminActivityAreaDetailView.as_view(), name="admin-activity-area-detail"),
     path("api/admin/activity/funnels/", AdminActivityFunnelsView.as_view(), name="admin-activity-funnels"),
     path("api/admin/activity/friction/", AdminActivityFrictionView.as_view(), name="admin-activity-friction"),
+    path("api/admin/activity/digest/run/", AdminActivityDigestRunView.as_view(), name="admin-activity-digest-run"),
     path("api/celery/queues/", CeleryQueuesView.as_view(), name="celery-queues"),
     path("api/celery/results/", CeleryResultsView.as_view(), name="celery-results"),
     path("api/celery/tasks/<uuid:task_id>/<str:action>/", CeleryTaskControlView.as_view(), name="celery-task-control"),
