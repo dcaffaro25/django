@@ -49,6 +49,7 @@ const GROUPS: NavGroup[] = [
     items: [
       { key: "reports_build", path: "/reports/build", icon: FileBarChart },
       { key: "reports_history", path: "/reports/history", icon: ListChecks },
+      { key: "ai_usage", path: "/settings/ai-usage", icon: Brain },
     ],
   },
   {

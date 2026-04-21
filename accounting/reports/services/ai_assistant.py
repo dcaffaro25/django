@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from pydantic import ValidationError as PydanticValidationError
@@ -30,6 +31,7 @@ from pydantic import ValidationError as PydanticValidationError
 from accounting.models import Account
 from accounting.services.external_ai_client import ExternalAIClient, ExternalAIError
 
+from .ai_pricing import estimate_cost_usd
 from .document_schema import TemplateDocument, validate_document
 
 
@@ -38,6 +40,97 @@ log = logging.getLogger(__name__)
 
 class AiAssistantError(Exception):
     """Raised when the AI service fails to produce a valid template."""
+
+
+# --- Usage-logging helper ---------------------------------------------------
+
+
+def _run_ai_call(
+    *,
+    client: ExternalAIClient,
+    prompt: str,
+    system_prompt: Optional[str],
+    context: Optional[Dict[str, Any]],
+    endpoint: str,
+) -> Dict[str, Any]:
+    """Invoke ``client.generate_json_with_meta`` and write an ``AIUsageLog``
+    row whether the call succeeds or fails.
+
+    ``context`` carries the request-scoped attribution (``user_id``,
+    ``company_id``); when it's ``None`` (e.g. internal calls, tests) we still
+    make the AI call but skip logging. Logging failures never propagate — a
+    DB hiccup must never make an otherwise-successful AI call look broken.
+    """
+    t0 = time.time()
+    try:
+        resp = client.generate_json_with_meta(prompt, system_prompt=system_prompt)
+        duration_ms = int((time.time() - t0) * 1000)
+        _record_usage(
+            context=context,
+            endpoint=endpoint,
+            provider=resp.get("provider", client.provider),
+            model=resp.get("model", client.model),
+            usage=resp.get("usage") or {},
+            duration_ms=duration_ms,
+            status="success",
+        )
+        return resp.get("content") or {}
+    except Exception as exc:
+        duration_ms = int((time.time() - t0) * 1000)
+        _record_usage(
+            context=context,
+            endpoint=endpoint,
+            provider=client.provider,
+            model=client.model,
+            usage={},
+            duration_ms=duration_ms,
+            status="error",
+            error=exc,
+        )
+        raise
+
+
+def _record_usage(
+    *,
+    context: Optional[Dict[str, Any]],
+    endpoint: str,
+    provider: str,
+    model: str,
+    usage: Dict[str, Any],
+    duration_ms: int,
+    status: str,
+    error: Optional[BaseException] = None,
+) -> None:
+    if context is None:
+        return
+    try:
+        from ..models import AIUsageLog  # local import to avoid circular at module-load
+        prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+        completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+        total_tokens = int(usage.get("total_tokens", 0) or (prompt_tokens + completion_tokens))
+        cost = estimate_cost_usd(
+            provider=provider,
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+        AIUsageLog.objects.create(
+            user_id=context.get("user_id"),
+            company_id=context.get("company_id"),
+            endpoint=endpoint,
+            provider=provider,
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            estimated_cost_usd=cost,
+            duration_ms=duration_ms,
+            status=status,
+            error_type=type(error).__name__ if error is not None else None,
+            error_message=str(error)[:1000] if error is not None else None,
+        )
+    except Exception as log_exc:  # pragma: no cover — logging must never blow up the caller
+        log.warning("AIUsageLog write failed: %s", log_exc)
 
 
 # --- Chart-of-accounts context ---------------------------------------------
@@ -187,6 +280,7 @@ def generate_template(
     preferences: str = "",
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Call the AI and return a validated :class:`TemplateDocument` as a dict.
 
@@ -216,7 +310,10 @@ def generate_template(
     )
 
     try:
-        raw = client.generate_json(user_prompt, system_prompt=_SYSTEM_PROMPT)
+        raw = _run_ai_call(
+            client=client, prompt=user_prompt, system_prompt=_SYSTEM_PROMPT,
+            context=context, endpoint="generate_template",
+        )
     except ExternalAIError as exc:
         raise AiAssistantError(f"AI call failed: {exc}") from exc
 
@@ -233,7 +330,10 @@ def generate_template(
             "Respond with ONLY JSON."
         )
         try:
-            raw = client.generate_json(repair_prompt, system_prompt=_SYSTEM_PROMPT)
+            raw = _run_ai_call(
+                client=client, prompt=repair_prompt, system_prompt=_SYSTEM_PROMPT,
+                context=context, endpoint="generate_template.repair",
+            )
             doc_model = validate_document(raw)
         except PydanticValidationError as exc2:
             raise AiAssistantError(
@@ -302,6 +402,7 @@ def refine_template(
     action: str,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run a one-shot refine action and return the modified document.
 
@@ -352,7 +453,10 @@ def refine_template(
     log.info("ai_assistant.refine_template: action=%s", action)
 
     try:
-        raw = client.generate_json(user_prompt, system_prompt=_SYSTEM_PROMPT)
+        raw = _run_ai_call(
+            client=client, prompt=user_prompt, system_prompt=_SYSTEM_PROMPT,
+            context=context, endpoint=f"refine.{action}",
+        )
     except ExternalAIError as exc:
         raise AiAssistantError(f"AI call failed: {exc}") from exc
 
@@ -534,6 +638,7 @@ def explain(
     period_id: str,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Explain a single value in the preview.
 
@@ -626,15 +731,17 @@ def explain(
         client = ExternalAIClient(provider=provider, model=model)
         # Explain uses its own system prompt — simpler to ask for a raw JSON
         # wrapping a single "text" field than to reuse the chat schema.
-        raw = client.generate_json(
-            prompt=user_prompt
-            + '\n\nResponda com JSON: {"text": "<explicação>"}',
+        raw = _run_ai_call(
+            client=client,
+            prompt=user_prompt + '\n\nResponda com JSON: {"text": "<explicação>"}',
             system_prompt=(
                 "Você é um contador sênior explicando valores a um "
                 "usuário em um editor de demonstrativos. Seja direto, "
                 "referencie códigos de contas quando existir, mas fale "
                 "em português acessível."
             ),
+            context=context,
+            endpoint="explain",
         )
         explanation_text = str(raw.get("text") or "").strip()
         if not explanation_text:
@@ -708,6 +815,7 @@ def chat(
     preview_result: Optional[dict] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """One chat turn.
 
@@ -758,7 +866,10 @@ def chat(
         raise AiAssistantError(f"AI client init failed: {exc}") from exc
 
     try:
-        raw = client.generate_json(user_prompt, system_prompt=CHAT_SYSTEM_PROMPT)
+        raw = _run_ai_call(
+            client=client, prompt=user_prompt, system_prompt=CHAT_SYSTEM_PROMPT,
+            context=context, endpoint="chat",
+        )
     except ExternalAIError as exc:
         raise AiAssistantError(f"AI call failed: {exc}") from exc
 

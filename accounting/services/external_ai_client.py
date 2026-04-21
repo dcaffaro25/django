@@ -176,7 +176,38 @@ class ExternalAIClient:
             return self._call_anthropic(prompt, system_prompt)
         else:
             raise ExternalAIError(f"Unsupported provider: {self.provider}")
-    
+
+    def generate_json_with_meta(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Like :meth:`generate_json`, but returns usage metadata alongside the
+        parsed content so callers can record per-call token counts for
+        attribution / cost estimation.
+
+        Returns a dict::
+
+            {
+              "content": <parsed JSON from the AI>,
+              "usage":   {"prompt_tokens": int, "completion_tokens": int,
+                          "total_tokens": int},
+              "model":   "<actual model used>",
+              "provider": "<openai|anthropic>",
+            }
+
+        Callers that don't care about usage should keep using ``generate_json``.
+        """
+        if not self.api_key:
+            raise ExternalAIError("No API key configured for external AI client")
+
+        if self.provider == self.PROVIDER_OPENAI:
+            return self._call_openai_with_meta(prompt, system_prompt)
+        elif self.provider == self.PROVIDER_ANTHROPIC:
+            return self._call_anthropic_with_meta(prompt, system_prompt)
+        else:
+            raise ExternalAIError(f"Unsupported provider: {self.provider}")
+
     def _call_openai(
         self,
         prompt: str,
@@ -289,6 +320,110 @@ class ExternalAIClient:
             log.exception("[ExternalAI] Anthropic API error: %s", e)
             raise ExternalAIError(f"Anthropic API error: {e}")
     
+    def _call_openai_with_meta(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Same as :meth:`_call_openai` but returns usage metadata alongside."""
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise ExternalAIError("openai package not installed. Run: pip install openai")
+
+        try:
+            client = OpenAI(api_key=self.api_key, timeout=self.timeout)
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                response_format={"type": "json_object"},
+            )
+            content = response.choices[0].message.content
+            if not content:
+                raise ExternalAIError("Empty response from OpenAI")
+
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                parsed = self._extract_json_from_text(content)
+                if not parsed:
+                    raise ExternalAIError("Invalid JSON in AI response")
+
+            usage = getattr(response, "usage", None)
+            return {
+                "content": parsed,
+                "usage": {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                    "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                    "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+                },
+                "model": self.model,
+                "provider": self.provider,
+            }
+        except Exception as e:
+            if isinstance(e, ExternalAIError):
+                raise
+            log.exception("[ExternalAI] OpenAI API error: %s", e)
+            raise ExternalAIError(f"OpenAI API error: {e}")
+
+    def _call_anthropic_with_meta(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Same as :meth:`_call_anthropic` but returns usage metadata alongside."""
+        try:
+            import anthropic
+        except ImportError:
+            raise ExternalAIError("anthropic package not installed. Run: pip install anthropic")
+
+        try:
+            client = anthropic.Anthropic(api_key=self.api_key, timeout=self.timeout)
+            message = client.messages.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                system=system_prompt or "",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            content = message.content[0].text if message.content else ""
+            if not content:
+                raise ExternalAIError("Empty response from Anthropic")
+
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                parsed = self._extract_json_from_text(content)
+                if not parsed:
+                    raise ExternalAIError("Invalid JSON in AI response")
+
+            usage = getattr(message, "usage", None)
+            return {
+                "content": parsed,
+                "usage": {
+                    # Anthropic uses input_tokens / output_tokens
+                    "prompt_tokens": getattr(usage, "input_tokens", 0) or 0,
+                    "completion_tokens": getattr(usage, "output_tokens", 0) or 0,
+                    "total_tokens": (
+                        (getattr(usage, "input_tokens", 0) or 0)
+                        + (getattr(usage, "output_tokens", 0) or 0)
+                    ),
+                },
+                "model": self.model,
+                "provider": self.provider,
+            }
+        except Exception as e:
+            if isinstance(e, ExternalAIError):
+                raise
+            log.exception("[ExternalAI] Anthropic API error: %s", e)
+            raise ExternalAIError(f"Anthropic API error: {e}")
+
     def _extract_json_from_text(self, text: str) -> Optional[Dict[str, Any]]:
         """
         Try to extract JSON from text that might contain markdown code blocks.

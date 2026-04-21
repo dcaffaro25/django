@@ -151,3 +151,18 @@ export function useAiExplain() {
     mutationFn: (body: AiExplainRequest) => reportsApi.aiExplain(body),
   })
 }
+
+export function useAiUsage(params?: {
+  days?: number
+  user?: number
+  company?: number
+  endpoint?: string
+}) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["reports", sub, "ai-usage", params ?? null],
+    queryFn: () => reportsApi.aiUsage(params),
+    enabled: !!sub,
+    refetchInterval: 60000, // auto-refresh every minute
+  })
+}

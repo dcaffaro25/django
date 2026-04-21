@@ -164,4 +164,65 @@ export const reportsApi = {
 
   aiExplain: (body: AiExplainRequest) =>
     api.tenant.post<AiExplainResponse>("/api/reports/ai/explain/", body),
+
+  aiUsage: (params?: {
+    days?: number
+    user?: number
+    company?: number
+    endpoint?: string
+  }) =>
+    api.tenant.get<AiUsageSummary>("/api/reports/ai/usage/", { params }),
+}
+
+export interface AiUsageTotals {
+  calls: number
+  tokens: number
+  cost_usd: number
+  errors: number
+  success_rate: number
+}
+export interface AiUsageDailyPoint {
+  day: string
+  calls: number
+  tokens: number
+  cost_usd: number
+  errors: number
+}
+export interface AiUsageByUser {
+  user_id: number | null
+  user__username: string | null
+  calls: number
+  tokens: number
+  cost_usd: number
+}
+export interface AiUsageByEndpoint {
+  endpoint: string
+  calls: number
+  tokens: number
+  cost_usd: number
+  errors: number
+}
+export interface AiUsageByProvider {
+  provider: string
+  model: string
+  calls: number
+  tokens: number
+  cost_usd: number
+}
+export interface AiUsageRecentError {
+  created_at: string
+  user__username: string | null
+  endpoint: string
+  provider: string
+  model: string
+  error_type: string | null
+  error_message: string | null
+}
+export interface AiUsageSummary {
+  totals: AiUsageTotals
+  daily: AiUsageDailyPoint[]
+  by_user: AiUsageByUser[]
+  by_endpoint: AiUsageByEndpoint[]
+  by_provider: AiUsageByProvider[]
+  recent_errors: AiUsageRecentError[]
 }

@@ -41,7 +41,8 @@
     "imports_substitutions": "Substituições",
     "reports_beta": "Demonstrativos (beta)",
     "reports_build": "Novo demonstrativo",
-    "reports_history": "Histórico"
+    "reports_history": "Histórico",
+    "ai_usage": "Uso da IA"
   },
   "actions": {
     "search": "Buscar",

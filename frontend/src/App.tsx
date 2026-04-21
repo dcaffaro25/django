@@ -24,6 +24,7 @@ import { ReportBuilderPage } from "@/pages/statements/ReportBuilderPage"
 import { BuilderPage as ReportsBuilderPage } from "@/pages/reports/BuilderPage"
 import { HistoryPage as ReportsHistoryPage } from "@/pages/reports/HistoryPage"
 import { ViewPage as ReportsViewPage } from "@/pages/reports/ViewPage"
+import { AiUsagePage } from "@/pages/settings/AiUsagePage"
 
 function Protected({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuth()
@@ -63,6 +64,7 @@ export default function App() {
                   <Route path="/reports/build" element={<ReportsBuilderPage />} />
                   <Route path="/reports/history" element={<ReportsHistoryPage />} />
                   <Route path="/reports/view/:id" element={<ReportsViewPage />} />
+                  <Route path="/settings/ai-usage" element={<AiUsagePage />} />
                   <Route path="/billing/*" element={<PlaceholderPage title="Faturamento" />} />
                   <Route path="/hr/*" element={<PlaceholderPage title="RH" />} />
                   <Route path="/inventory/*" element={<PlaceholderPage title="Estoque" />} />

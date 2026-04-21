@@ -114,3 +114,70 @@ class ReportInstance(TenantAwareBaseModel):
 
     def __str__(self) -> str:  # pragma: no cover
         return f"{self.name} [{self.status}] {self.generated_at:%Y-%m-%d}"
+
+
+AI_USAGE_STATUS_CHOICES = [
+    ("success", "Success"),
+    ("error", "Error"),
+]
+
+
+class AIUsageLog(models.Model):
+    """One row per AI call emitted by the report engine.
+
+    Append-only — never updated, never deleted (soft or hard) by application
+    code. This is the per-user attribution + cost-visibility layer; the
+    provider dashboard (OpenAI / Anthropic) remains authoritative for the
+    actual bill.
+
+    Not tenant-scoped via ``TenantAwareBaseModel`` on purpose — ``company``
+    is a soft reference so historical logs survive a company soft-delete.
+    The ``user`` FK is also soft (``SET_NULL``) for the same reason.
+    """
+
+    user = models.ForeignKey(
+        "multitenancy.CustomUser",
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="ai_usage_logs",
+        help_text="User who triggered the call (null if the user was later deleted).",
+    )
+    company = models.ForeignKey(
+        "multitenancy.Company",
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="ai_usage_logs",
+        help_text="Tenant the call ran under (soft ref for historical stability).",
+    )
+    endpoint = models.CharField(
+        max_length=40,
+        help_text="Which AI endpoint fired — generate_template, refine, chat, explain, etc.",
+    )
+    provider = models.CharField(max_length=20)
+    model = models.CharField(max_length=64)
+    prompt_tokens = models.IntegerField(default=0)
+    completion_tokens = models.IntegerField(default=0)
+    total_tokens = models.IntegerField(default=0)
+    estimated_cost_usd = models.DecimalField(
+        max_digits=12, decimal_places=6, default=0,
+        help_text="Estimated cost from our per-model pricing table. Not authoritative.",
+    )
+    duration_ms = models.IntegerField(default=0)
+    status = models.CharField(max_length=10, choices=AI_USAGE_STATUS_CHOICES)
+    error_type = models.CharField(max_length=80, null=True, blank=True)
+    error_message = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["user", "-created_at"]),
+            models.Index(fields=["company", "-created_at"]),
+            models.Index(fields=["endpoint", "-created_at"]),
+            models.Index(fields=["provider", "model"]),
+            models.Index(fields=["status", "-created_at"]),
+        ]
+
+    def __str__(self) -> str:  # pragma: no cover
+        who = self.user.username if self.user_id else "-"
+        return f"{self.endpoint} {self.status} {who} {self.total_tokens}tok"

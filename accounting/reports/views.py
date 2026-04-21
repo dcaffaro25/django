@@ -30,6 +30,7 @@ from .services.ai_assistant import (
     refine_template,
     summarize_changes,
 )
+from .throttles import AIEndpointThrottle
 from .services.calculator import ReportCalculator
 from .services.document_schema import validate_document
 from .services.exporter_pdf import PdfBackendUnavailable, build_pdf
@@ -264,16 +265,26 @@ class ExportViewSet(viewsets.ViewSet):
 
 
 class AiStub(viewsets.ViewSet):
-    """AI endpoints. ``generate-template`` is live (PR 6); the rest land in
-    later PRs and return 501 with a helpful message until then.
+    """AI endpoints (generate-template, refine, chat, explain) + /usage/
+    aggregates. ``generate-template`` and friends run the ``AIEndpointThrottle``
+    so a single user can't burn the shared provider key on a runaway loop.
     """
 
+    def get_throttles(self):
+        # Usage aggregates aren't gated — they read from our own DB.
+        if getattr(self, "action", None) == "usage":
+            return []
+        return [AIEndpointThrottle()]
+
     @staticmethod
-    def _ni(feature: str):
-        return Response(
-            {"error": f"{feature} — not yet implemented (lands in a later PR)"},
-            status=status.HTTP_501_NOT_IMPLEMENTED,
-        )
+    def _ctx(request):
+        """Build the attribution context carried into the AI service so every
+        call lands in AIUsageLog with the right user + tenant."""
+        tenant = getattr(request, "tenant", None)
+        return {
+            "user_id": request.user.id if getattr(request.user, "is_authenticated", False) else None,
+            "company_id": getattr(tenant, "id", None) if tenant and tenant != "all" else None,
+        }
 
     @action(detail=False, methods=["post"], url_path="generate-template")
     def generate_template(self, request, tenant_id=None):
@@ -306,6 +317,7 @@ class AiStub(viewsets.ViewSet):
                 preferences=(body.get("preferences") or ""),
                 provider=body.get("provider"),
                 model=body.get("model"),
+                context=self._ctx(request),
             )
         except AiAssistantError as exc:
             # Service layer signals any upstream AI failure (missing key,
@@ -357,6 +369,7 @@ class AiStub(viewsets.ViewSet):
                 action=action_name,
                 provider=body.get("provider"),
                 model=body.get("model"),
+                context=self._ctx(request),
             )
         except AiAssistantError as exc:
             return Response(
@@ -408,6 +421,7 @@ class AiStub(viewsets.ViewSet):
                 preview_result=body.get("preview_result"),
                 provider=body.get("provider"),
                 model=body.get("model"),
+                context=self._ctx(request),
             )
         except AiAssistantError as exc:
             return Response(
@@ -468,6 +482,7 @@ class AiStub(viewsets.ViewSet):
                 period_id=period_id,
                 provider=body.get("provider"),
                 model=body.get("model"),
+                context=self._ctx(request),
             )
         except AiAssistantError as exc:
             return Response(
@@ -475,6 +490,122 @@ class AiStub(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         return Response(payload, status=status.HTTP_200_OK)
+
+    # --- Usage aggregates for the dashboard -------------------------------
+
+    @action(detail=False, methods=["get"])
+    def usage(self, request, tenant_id=None):
+        """Return a rollup of AI usage for the dashboard.
+
+        Query params
+        ------------
+        days : int (default 30) — window length
+        user : int — restrict to a user id
+        company : int — restrict to a tenant id
+        endpoint : str — restrict to one endpoint (e.g. 'chat')
+
+        Response
+        --------
+        {
+          "totals": {calls, tokens, cost_usd, errors, success_rate},
+          "daily": [{day, calls, tokens, cost_usd, errors}, ...],
+          "by_user": [{user_id, username, calls, tokens, cost_usd}, ...],
+          "by_endpoint": [{endpoint, calls, tokens, cost_usd, errors}, ...],
+          "by_provider": [{provider, model, calls, tokens, cost_usd}, ...],
+          "recent_errors": [{...}, ...]
+        }
+        """
+        from datetime import timedelta
+        from django.db.models import Count, Q, Sum
+        from django.db.models.functions import TruncDate
+        from django.utils import timezone
+        from .models import AIUsageLog
+
+        _tenant_or_raise(request)
+        days = int(request.query_params.get("days") or 30)
+        since = timezone.now() - timedelta(days=days)
+
+        qs = AIUsageLog.objects.filter(created_at__gte=since)
+        if (u := request.query_params.get("user")):
+            qs = qs.filter(user_id=u)
+        if (c := request.query_params.get("company")):
+            qs = qs.filter(company_id=c)
+        if (e := request.query_params.get("endpoint")):
+            qs = qs.filter(endpoint=e)
+
+        total_calls = qs.count()
+        agg = qs.aggregate(
+            tokens=Sum("total_tokens"),
+            cost=Sum("estimated_cost_usd"),
+        )
+        errors = qs.filter(status="error").count()
+
+        # Daily buckets (TruncDate for cross-DB portability)
+        daily = list(
+            qs.annotate(day=TruncDate("created_at"))
+            .values("day")
+            .annotate(
+                calls=Count("id"),
+                tokens=Sum("total_tokens"),
+                cost_usd=Sum("estimated_cost_usd"),
+                errors=Count("id", filter=Q(status="error")),
+            )
+            .order_by("day")
+        )
+
+        by_user = list(
+            qs.values("user_id", "user__username")
+            .annotate(
+                calls=Count("id"),
+                tokens=Sum("total_tokens"),
+                cost_usd=Sum("estimated_cost_usd"),
+            )
+            .order_by("-tokens")[:20]
+        )
+        by_endpoint = list(
+            qs.values("endpoint")
+            .annotate(
+                calls=Count("id"),
+                tokens=Sum("total_tokens"),
+                cost_usd=Sum("estimated_cost_usd"),
+                errors=Count("id", filter=Q(status="error")),
+            )
+            .order_by("-tokens")
+        )
+        by_provider = list(
+            qs.values("provider", "model")
+            .annotate(
+                calls=Count("id"),
+                tokens=Sum("total_tokens"),
+                cost_usd=Sum("estimated_cost_usd"),
+            )
+            .order_by("-tokens")
+        )
+        recent_errors = list(
+            qs.filter(status="error")
+            .order_by("-created_at")
+            .values(
+                "created_at", "user__username", "endpoint",
+                "provider", "model", "error_type", "error_message",
+            )[:15]
+        )
+
+        return Response({
+            "totals": {
+                "calls": total_calls,
+                "tokens": int(agg["tokens"] or 0),
+                "cost_usd": float(agg["cost"] or 0),
+                "errors": errors,
+                "success_rate": (
+                    round(1 - errors / total_calls, 4) if total_calls else 1.0
+                ),
+            },
+            "daily": daily,
+            "by_user": by_user,
+            "by_endpoint": by_endpoint,
+            "by_provider": by_provider,
+            "recent_errors": recent_errors,
+        })
 
 
 # --- Helpers --------------------------------------------------------------
