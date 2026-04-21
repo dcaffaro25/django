@@ -1,20 +1,55 @@
+/**
+ * Common shape for every error dict the ETL service appends to its three
+ * buckets. All fields beyond `type`/`message` are optional because different
+ * error types populate different subsets (substitution errors carry
+ * `field`/`value`/`account_path`; python errors carry `traceback`; etc.).
+ */
+export interface EtlError {
+  type: string
+  message: string
+  stage?: string
+  timestamp?: string
+  model?: string
+  record_id?: number | string
+  sheet?: string
+  row?: number | string
+  field?: string
+  value?: string | number | null
+  account_path?: string
+  exception_type?: string
+  traceback?: string
+  [k: string]: unknown
+}
+
+export interface EtlWarning {
+  type: string
+  message: string
+  [k: string]: unknown
+}
+
 export interface EtlExecuteResponse {
   success: boolean
   summary?: {
     sheets_found?: string[]
     sheets_processed?: string[]
+    sheets_skipped?: string[]
+    sheets_failed?: string[]
     committed?: boolean
     [k: string]: unknown
   }
+  data?: Record<string, { row_count?: number; rows?: unknown[]; sample_columns?: string[] } | unknown>
   import_result?: Record<string, unknown>
+  errors?: EtlError[]
   errors_organized?: {
-    all_errors?: unknown[]
-    python_errors?: unknown[]
-    database_errors?: unknown[]
-    validation_errors?: unknown[]
+    all_errors?: EtlError[]
+    python_errors?: EtlError[]
+    database_errors?: EtlError[]
+    substitution_errors?: EtlError[]
+    warnings?: EtlWarning[]
+    error_report_text?: string | null
     [k: string]: unknown
   }
-  warnings?: unknown[]
+  warnings?: EtlWarning[]
   error?: string
   detail?: string
 }
@@ -68,27 +103,68 @@ export interface OfxImportedTx {
   [k: string]: unknown
 }
 
+export interface OfxLookupInfo {
+  result?: "Success" | "Error"
+  message?: string
+  value?: unknown
+}
+
+export interface OfxImportResult {
+  filename: string
+  /** On scan: object with lookup info. On older import responses: plain string. */
+  bank?: OfxLookupInfo | string
+  account?: OfxLookupInfo | string
+  inserted: number
+  duplicates: number
+  duplicate_ratio?: number
+  warning?: string | null
+  transactions?: OfxImportedTx[]
+}
+
 export interface OfxImportResponse {
-  import_results: Array<{
-    filename: string
-    bank?: string
-    account?: string
-    inserted: number
-    duplicates: number
-    duplicate_ratio?: number
-    transactions?: OfxImportedTx[]
-  }>
+  import_results: OfxImportResult[]
+}
+
+export interface NfeImportadaItem {
+  chave?: string
+  id?: number
+  numero?: string | number
+  [k: string]: unknown
+}
+
+export interface NfeEventoItem {
+  chave_nfe?: string
+  id?: number
+  tipo_evento?: string
+  n_seq_evento?: number
+  [k: string]: unknown
+}
+
+export interface NfeInutilizacaoItem {
+  ano?: number
+  serie?: number
+  n_nf_ini?: number
+  n_nf_fin?: number
+  id?: number
+  [k: string]: unknown
+}
+
+export interface NfeErrorItem {
+  /** Backend uses ``arquivo`` (pt-BR). */
+  arquivo?: string
+  erro?: string
+  /** Legacy fields for robustness. */
+  filename?: string
+  error_message?: string
+  [k: string]: unknown
 }
 
 export interface NfeImportResponse {
-  nfe_count?: number
-  evento_count?: number
-  inutilizacao_count?: number
-  nfe_results?: Array<{
-    filename: string
-    action?: string
-    status?: string
-    data?: Record<string, unknown>
-  }>
-  errors?: Array<{ filename: string; error_message: string }>
+  importadas: NfeImportadaItem[]
+  importados: NfeEventoItem[]
+  importados_inut: NfeInutilizacaoItem[]
+  duplicadas: unknown[]
+  erros: NfeErrorItem[]
+  inventory_triggered?: boolean
+  dry_run?: boolean
 }

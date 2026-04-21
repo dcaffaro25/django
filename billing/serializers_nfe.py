@@ -82,6 +82,11 @@ class NFeUnifiedImportResultSerializer(serializers.Serializer):
         default=False,
         help_text="Whether inventory movement ingestion was triggered for the imported NFs.",
     )
+    dry_run = serializers.BooleanField(
+        default=False,
+        required=False,
+        help_text="True if the request ran in preview mode — no rows were persisted.",
+    )
 
 
 class NFeEventoSerializer(serializers.ModelSerializer):

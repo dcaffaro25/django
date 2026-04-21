@@ -17,7 +17,7 @@ export interface EtlExecuteParams {
   autoCreateJournalEntries?: Record<string, unknown>
 }
 
-export async function etlExecute(params: EtlExecuteParams): Promise<EtlExecuteResponse> {
+function buildEtlFormData(params: EtlExecuteParams): FormData {
   const fd = new FormData()
   fd.append("file", params.file)
   if (params.rowLimit != null) fd.append("row_limit", String(params.rowLimit))
@@ -25,8 +25,21 @@ export async function etlExecute(params: EtlExecuteParams): Promise<EtlExecuteRe
   if (params.autoCreateJournalEntries) {
     fd.append("auto_create_journal_entries", JSON.stringify(params.autoCreateJournalEntries))
   }
-  return api.tenant.post<EtlExecuteResponse>("/api/core/etl/execute/", fd, {
+  return fd
+}
+
+export async function etlExecute(params: EtlExecuteParams): Promise<EtlExecuteResponse> {
+  return api.tenant.post<EtlExecuteResponse>("/api/core/etl/execute/", buildEtlFormData(params), {
     headers: { "Content-Type": "multipart/form-data" },
+  })
+}
+
+/** Dry-run: same payload as execute, but the backend rolls back instead of committing. */
+export async function etlPreview(params: EtlExecuteParams): Promise<EtlExecuteResponse> {
+  return api.tenant.post<EtlExecuteResponse>("/api/core/etl/preview/", buildEtlFormData(params), {
+    headers: { "Content-Type": "multipart/form-data" },
+    // 4xx is expected when validation fails — surface the body rather than throwing.
+    validateStatus: (s) => s < 500,
   })
 }
 
@@ -79,22 +92,43 @@ function readFileAsBase64(file: File): Promise<string> {
   })
 }
 
-export async function ofxImport(files: File[]): Promise<OfxImportResponse> {
-  const payload: OfxImportFile[] = []
+async function buildOfxPayload(files: File[]): Promise<OfxImportFile[]> {
+  const out: OfxImportFile[] = []
   for (const f of files) {
-    payload.push({ name: f.name, base64Data: await readFileAsBase64(f) })
+    out.push({ name: f.name, base64Data: await readFileAsBase64(f) })
   }
+  return out
+}
+
+export async function ofxImport(
+  files: File[],
+  policy: "records" | "files" = "records",
+): Promise<OfxImportResponse> {
+  const payload = await buildOfxPayload(files)
   return api.tenant.post<OfxImportResponse>(
     "/api/bank_transactions/import_ofx_transactions/",
-    { files: payload, policy: "records" },
+    { files: payload, policy },
+  )
+}
+
+/** Scan-only: classify each tx as duplicate/pending without writing to the DB. */
+export async function ofxScan(files: File[]): Promise<OfxImportResponse> {
+  const payload = await buildOfxPayload(files)
+  return api.tenant.post<OfxImportResponse>(
+    "/api/bank_transactions/import_ofx/",
+    { files: payload },
   )
 }
 
 // ---- NFe ---------------------------------------------------------------
 
-export async function nfeImport(files: File[]): Promise<NfeImportResponse> {
+export async function nfeImport(
+  files: File[],
+  opts?: { dryRun?: boolean },
+): Promise<NfeImportResponse> {
   const fd = new FormData()
   for (const f of files) fd.append("files", f)
+  if (opts?.dryRun) fd.append("dry_run", "true")
   return api.tenant.post<NfeImportResponse>("/api/nfe/import/", fd, {
     headers: { "Content-Type": "multipart/form-data" },
   })

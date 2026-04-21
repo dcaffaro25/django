@@ -2,9 +2,11 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useTenant } from "@/providers/TenantProvider"
 import {
   etlExecute,
+  etlPreview,
   importTemplatesApi,
   nfeImport,
   ofxImport,
+  ofxScan,
   substitutionRulesApi,
   type EtlExecuteParams,
 } from "./api"
@@ -27,12 +29,28 @@ export function useEtlExecute() {
   return useMutation({ mutationFn: (p: EtlExecuteParams) => etlExecute(p) })
 }
 
+/** Dry-run against /etl/preview — identical payload, backend rolls back. */
+export function useEtlPreview() {
+  return useMutation({ mutationFn: (p: EtlExecuteParams) => etlPreview(p) })
+}
+
 export function useOfxImport() {
-  return useMutation({ mutationFn: (files: File[]) => ofxImport(files) })
+  return useMutation({
+    mutationFn: (args: { files: File[]; policy?: "records" | "files" }) =>
+      ofxImport(args.files, args.policy),
+  })
+}
+
+/** Scan-only against /import_ofx — reports duplicates without writing to DB. */
+export function useOfxScan() {
+  return useMutation({ mutationFn: (files: File[]) => ofxScan(files) })
 }
 
 export function useNfeImport() {
-  return useMutation({ mutationFn: (files: File[]) => nfeImport(files) })
+  return useMutation({
+    mutationFn: (args: { files: File[]; dryRun?: boolean }) =>
+      nfeImport(args.files, { dryRun: args.dryRun }),
+  })
 }
 
 export function useSubstitutionRules() {

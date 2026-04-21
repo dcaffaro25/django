@@ -629,12 +629,17 @@ def _schedule_inventory_ingest(company_id, nota_fiscal_ids):
     ingest_nf_movements_task.delay(company_id, nota_fiscal_ids=nota_fiscal_ids)
 
 
-def import_nfe_xml_many(files, company):
+def import_nfe_xml_many(files, company, *, dry_run: bool = False):
     """
     Um único ponto de importação: para cada XML detecta o tipo (NFe, evento ou inutilização)
     e processa com o importador correto.
     Atômico: toda a operação roda em uma transação; se qualquer arquivo falhar,
     nada é commitado (rollback completo).
+
+    Quando ``dry_run=True``, o processamento roda normalmente (parsing + validações +
+    inserts) mas o rollback é sempre aplicado no final — útil para pré-visualizar o que
+    *seria* importado sem persistir. ``inventory_triggered`` retorna ``False`` nesse modo.
+
     Retorna: importadas (NFe), importados (eventos), importados_inut (inutilizações),
              duplicadas (chaves/identificadores), erros.
     """
@@ -704,14 +709,21 @@ def import_nfe_xml_many(files, company):
             importados = []
             importados_inut = []
 
-        nf_ids = [nf["id"] for nf in importadas]
-        if nf_ids and _should_auto_ingest(company):
-            transaction.on_commit(
-                lambda ids=nf_ids, cid=company.id: _schedule_inventory_ingest(cid, ids)
-            )
-            inventory_triggered = True
-        else:
+        if dry_run:
+            # Preview mode: never persist, and never fire the Celery inventory task.
+            # We keep the ``importadas`` list populated so the caller can show *what*
+            # would have been imported; the rollback guarantees no rows survive.
+            transaction.set_rollback(True)
             inventory_triggered = False
+        else:
+            nf_ids = [nf["id"] for nf in importadas]
+            if nf_ids and _should_auto_ingest(company):
+                transaction.on_commit(
+                    lambda ids=nf_ids, cid=company.id: _schedule_inventory_ingest(cid, ids)
+                )
+                inventory_triggered = True
+            else:
+                inventory_triggered = False
 
     return {
         "importadas": importadas,
@@ -720,4 +732,5 @@ def import_nfe_xml_many(files, company):
         "duplicadas": duplicadas,
         "erros": erros,
         "inventory_triggered": inventory_triggered,
+        "dry_run": dry_run,
     }
