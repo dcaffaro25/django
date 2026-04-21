@@ -1,9 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useTenant } from "@/providers/TenantProvider"
 import {
+  bulkImport,
   etlExecute,
   etlPreview,
-  importTemplatesApi,
   nfeImport,
   ofxImport,
   ofxScan,
@@ -11,7 +11,6 @@ import {
   type EtlExecuteParams,
 } from "./api"
 import type {
-  ImportTransformationRule,
   SubstitutionRule,
 } from "./types"
 
@@ -22,7 +21,6 @@ function useSub() {
 
 const qk = {
   substRules: (s: string) => ["imports", s, "substitution-rules"] as const,
-  templates: (s: string) => ["imports", s, "templates"] as const,
 }
 
 export function useEtlExecute() {
@@ -50,6 +48,18 @@ export function useNfeImport() {
   return useMutation({
     mutationFn: (args: { files: File[]; dryRun?: boolean }) =>
       nfeImport(args.files, { dryRun: args.dryRun }),
+  })
+}
+
+/**
+ * Upload an Excel workbook to the master bulk-import endpoint. Pass
+ * ``commit=false`` for a preview (backend wraps everything in a transaction
+ * and rolls back) or ``commit=true`` to actually apply the changes.
+ */
+export function useBulkImport() {
+  return useMutation({
+    mutationFn: (args: { file: File; commit?: boolean }) =>
+      bulkImport(args.file, { commit: args.commit }),
   })
 }
 
@@ -81,30 +91,3 @@ export function useDeleteSubstitutionRule() {
   })
 }
 
-export function useImportTemplates() {
-  const sub = useSub()
-  return useQuery({
-    queryKey: qk.templates(sub),
-    queryFn: importTemplatesApi.list,
-    enabled: !!sub,
-  })
-}
-
-export function useSaveImportTemplate() {
-  const qc = useQueryClient()
-  const sub = useSub()
-  return useMutation({
-    mutationFn: ({ id, body }: { id?: number; body: Partial<ImportTransformationRule> }) =>
-      id ? importTemplatesApi.update(id, body) : importTemplatesApi.create(body),
-    onSuccess: () => qc.invalidateQueries({ queryKey: qk.templates(sub) }),
-  })
-}
-
-export function useDeleteImportTemplate() {
-  const qc = useQueryClient()
-  const sub = useSub()
-  return useMutation({
-    mutationFn: (id: number) => importTemplatesApi.remove(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: qk.templates(sub) }),
-  })
-}

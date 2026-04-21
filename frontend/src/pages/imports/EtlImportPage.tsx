@@ -44,7 +44,7 @@ function hintForError(err: EtlError): React.ReactNode {
           <code>{String(err.value ?? "?")}</code> e rode o preview de novo.
         </span>
         <Link
-          to="/imports?tab=substitutions"
+          to="/imports/substitutions"
           className="inline-flex h-6 items-center rounded-md border border-border bg-background px-2 text-[11px] font-medium hover:bg-accent"
         >
           Abrir substituições
