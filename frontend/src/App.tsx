@@ -26,6 +26,7 @@ import { HistoryPage as ReportsHistoryPage } from "@/pages/reports/HistoryPage"
 import { ViewPage as ReportsViewPage } from "@/pages/reports/ViewPage"
 import { AiUsagePage } from "@/pages/settings/AiUsagePage"
 import { AdminHomePage } from "@/pages/admin/AdminHomePage"
+import { UsersPage as AdminUsersPage } from "@/pages/admin/UsersPage"
 import { SuperuserGuard } from "@/pages/admin/SuperuserGuard"
 
 function Protected({ children }: { children: React.ReactNode }) {
@@ -82,6 +83,7 @@ export default function App() {
                       screen for non-superusers; the backend independently
                       enforces IsSuperUser on every /api/admin/* endpoint. */}
                   <Route path="/admin" element={<SuperuserGuard><AdminHomePage /></SuperuserGuard>} />
+                  <Route path="/admin/users" element={<SuperuserGuard><AdminUsersPage /></SuperuserGuard>} />
                   <Route path="/admin/*" element={<SuperuserGuard><AdminHomePage /></SuperuserGuard>} />
                   <Route path="*" element={<Navigate to="/recon" replace />} />
                 </Routes>

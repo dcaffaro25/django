@@ -25,6 +25,67 @@ class CustomUser(AbstractUser):
         self.save(update_fields=["email_last_sent_at"])
     #pass
 
+
+class UserCompanyMembership(models.Model):
+    """Explicit link between a user and a tenant (Company).
+
+    Historically the user↔company relation was implicit: the middleware
+    resolved the tenant from the URL subdomain and queries were
+    tenant-filtered downstream, but no table actually said "user X
+    belongs to tenant Y." That made cross-tenant admin flows — listing
+    every user of a given company, moving a user between companies,
+    assigning a platform accountant to multiple clients — awkward.
+
+    This model makes the relation first-class. Kept small on purpose:
+    the "role" column is a CharField so we can evolve the vocabulary
+    (owner/manager/operator/viewer) without a schema change every
+    time. Superuser access trumps membership, so dcaffaro doesn't need
+    rows in this table to see everything.
+    """
+
+    ROLE_OWNER = "owner"
+    ROLE_MANAGER = "manager"
+    ROLE_OPERATOR = "operator"
+    ROLE_VIEWER = "viewer"
+    ROLE_CHOICES = (
+        (ROLE_OWNER, "Owner"),
+        (ROLE_MANAGER, "Manager"),
+        (ROLE_OPERATOR, "Operator"),
+        (ROLE_VIEWER, "Viewer"),
+    )
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="company_memberships",
+    )
+    company = models.ForeignKey(
+        "multitenancy.Company",
+        on_delete=models.CASCADE,
+        related_name="memberships",
+    )
+    role = models.CharField(max_length=24, choices=ROLE_CHOICES, default=ROLE_OPERATOR)
+    # ``is_primary`` marks the company the user lands on after login if
+    # they belong to more than one. Exactly-one-primary-per-user is
+    # enforced at the application layer (the admin UI flips old primaries
+    # to False when a new one is set) — DB-level UNIQUE INDEX was
+    # considered but deferred; partial indexes are annoying across
+    # backends and this is easy to get right in one place.
+    is_primary = models.BooleanField(default=False)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [("user", "company")]
+        indexes = [
+            models.Index(fields=["user", "company"]),
+            models.Index(fields=["company", "role"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user_id}@{self.company_id}:{self.role}"
+
 def company_icon_upload_path(instance, filename):
     return f'company_icons/{instance.subdomain}/{filename}'
 

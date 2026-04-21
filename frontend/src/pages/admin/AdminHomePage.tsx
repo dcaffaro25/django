@@ -23,7 +23,6 @@ export function AdminHomePage() {
           icon={<Users className="h-4 w-4" />}
           title="Usuários"
           subtitle="Criar, editar, bloquear e associar a empresas."
-          status="Em breve"
         />
         <AdminCard
           to="/admin/activity"

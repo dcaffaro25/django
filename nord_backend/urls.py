@@ -26,6 +26,11 @@ urlpatterns = [
     re_path(r'^admin/?', admin.site.urls),
     re_path(r'^home/?$', views.index, name='index'),
     path('api/meta/', include('api_meta.urls')),
+    # Platform-admin API (NOT the Django /admin/ panel — these are React-
+    # facing DRF endpoints at /api/admin/*, gated by IsSuperUser). No
+    # tenant prefix on purpose: dcaffaro needs to see every user /
+    # company in the fleet.
+    path('api/admin/', include('multitenancy.urls_admin')),
     #re_path(r'^(?P<tenant_id>[^/]+)/', include('multitenancy.urls')),
     path('', include('multitenancy.urls')),
     path('', include('core.urls')),
