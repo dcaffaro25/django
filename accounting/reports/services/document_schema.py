@@ -213,3 +213,55 @@ def validate_document(data: dict) -> TemplateDocument:
 def collect_block_ids(doc: TemplateDocument) -> list[str]:
     """Return every non-spacer block id, in document order."""
     return [getattr(b, "id") for _, b in _walk(doc.blocks) if _block_id(b) is not None]
+
+
+# --- OpenAI Structured Outputs helper --------------------------------------
+
+
+def to_openai_strict_schema(schema: dict | None = None) -> dict:
+    """Convert our pydantic JSON Schema to OpenAI's ``strict: true`` dialect.
+
+    What the transform does:
+
+    1. Marks **every** property as required on every object. OpenAI's strict
+       mode has no concept of "optional" fields — missing fields are invalid.
+       Our schema already expresses nullability via ``anyOf: [{...}, {"type":
+       "null"}]``, so "optional" translates to "required but nullable". This
+       function just makes that explicit by rewriting ``required`` to the
+       full property-key list on each object.
+    2. Leaves ``additionalProperties: false`` alone (pydantic ``extra="forbid"``
+       already set it everywhere).
+    3. Recurses into ``$defs`` so the transform applies to every nested
+       block type.
+
+    What it deliberately does NOT do:
+    - Strip ``default`` (OpenAI ignores defaults under strict mode; keeping
+      them is harmless and they help readability).
+    - Flatten ``anyOf`` block unions — OpenAI strict supports them as-is.
+    - Rewrite recursive ``$ref`` — supported since late 2024.
+
+    Pass ``None`` to start from :class:`TemplateDocument`'s own schema.
+    """
+    if schema is None:
+        schema = TemplateDocument.model_json_schema()
+    out = _walk_and_strict(schema)
+    return out
+
+
+def _walk_and_strict(node: Any) -> Any:
+    """Recursively mark objects as strict: every property becomes required."""
+    if isinstance(node, dict):
+        # Root + every nested object with a "properties" key needs the
+        # required-lists-everything treatment.
+        if node.get("type") == "object" and "properties" in node:
+            node = dict(node)
+            node["required"] = list(node["properties"].keys())
+            # additionalProperties: false is required by OpenAI strict — our
+            # pydantic already sets it, but we belt-and-braces here for
+            # schemas passed in from outside.
+            node.setdefault("additionalProperties", False)
+        # Recurse into every child.
+        return {k: _walk_and_strict(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_walk_and_strict(v) for v in node]
+    return node

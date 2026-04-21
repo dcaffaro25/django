@@ -181,10 +181,24 @@ class ExternalAIClient:
         self,
         prompt: str,
         system_prompt: Optional[str] = None,
+        response_schema: Optional[Dict[str, Any]] = None,
+        schema_name: str = "Response",
     ) -> Dict[str, Any]:
         """Like :meth:`generate_json`, but returns usage metadata alongside the
         parsed content so callers can record per-call token counts for
         attribution / cost estimation.
+
+        When ``response_schema`` is supplied **and** the provider supports
+        structured outputs (OpenAI's ``response_format={"type":"json_schema",
+        "strict": true}``), the provider enforces the schema at token-sampling
+        time — no repair pass needed, enums and required fields are
+        hardware-guaranteed. Pass a schema already converted to the provider's
+        strict dialect (e.g. via
+        :func:`accounting.reports.services.document_schema.to_openai_strict_schema`).
+
+        When the schema is ``None`` or the provider doesn't support it, falls
+        back to JSON mode (``response_format={"type": "json_object"}`` on
+        OpenAI; best-effort prompt-based JSON on Anthropic).
 
         Returns a dict::
 
@@ -195,15 +209,20 @@ class ExternalAIClient:
               "model":   "<actual model used>",
               "provider": "<openai|anthropic>",
             }
-
-        Callers that don't care about usage should keep using ``generate_json``.
         """
         if not self.api_key:
             raise ExternalAIError("No API key configured for external AI client")
 
         if self.provider == self.PROVIDER_OPENAI:
-            return self._call_openai_with_meta(prompt, system_prompt)
+            return self._call_openai_with_meta(
+                prompt, system_prompt,
+                response_schema=response_schema, schema_name=schema_name,
+            )
         elif self.provider == self.PROVIDER_ANTHROPIC:
+            # Anthropic's equivalent is tool-use; we haven't wired that here
+            # yet, so response_schema is ignored on Anthropic for now. The
+            # prompt still carries a JSON contract and we pydantic-validate
+            # the reply.
             return self._call_anthropic_with_meta(prompt, system_prompt)
         else:
             raise ExternalAIError(f"Unsupported provider: {self.provider}")
@@ -324,8 +343,16 @@ class ExternalAIClient:
         self,
         prompt: str,
         system_prompt: Optional[str] = None,
+        response_schema: Optional[Dict[str, Any]] = None,
+        schema_name: str = "Response",
     ) -> Dict[str, Any]:
-        """Same as :meth:`_call_openai` but returns usage metadata alongside."""
+        """Same as :meth:`_call_openai` but returns usage metadata alongside.
+
+        When ``response_schema`` is provided the call uses OpenAI's Structured
+        Outputs (``strict: true``) so the model's output is guaranteed to
+        conform — no post-hoc repair pass required. Falls back to JSON mode
+        when the schema is absent.
+        """
         try:
             from openai import OpenAI
         except ImportError:
@@ -338,12 +365,24 @@ class ExternalAIClient:
                 messages.append({"role": "system", "content": system_prompt})
             messages.append({"role": "user", "content": prompt})
 
+            if response_schema:
+                response_format: Dict[str, Any] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "strict": True,
+                        "schema": response_schema,
+                    },
+                }
+            else:
+                response_format = {"type": "json_object"}
+
             response = client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
-                response_format={"type": "json_object"},
+                response_format=response_format,
             )
             content = response.choices[0].message.content
             if not content:

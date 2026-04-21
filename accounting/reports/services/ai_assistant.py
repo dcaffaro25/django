@@ -32,7 +32,7 @@ from accounting.models import Account
 from accounting.services.external_ai_client import ExternalAIClient, ExternalAIError
 
 from .ai_pricing import estimate_cost_usd
-from .document_schema import TemplateDocument, validate_document
+from .document_schema import TemplateDocument, to_openai_strict_schema, validate_document
 
 
 log = logging.getLogger(__name__)
@@ -115,6 +115,8 @@ def _run_ai_call(
     system_prompt: Optional[str],
     context: Optional[Dict[str, Any]],
     endpoint: str,
+    response_schema: Optional[Dict[str, Any]] = None,
+    schema_name: str = "Response",
 ) -> Dict[str, Any]:
     """Invoke ``client.generate_json_with_meta`` and write an ``AIUsageLog``
     row whether the call succeeds or fails.
@@ -123,10 +125,17 @@ def _run_ai_call(
     ``company_id``); when it's ``None`` (e.g. internal calls, tests) we still
     make the AI call but skip logging. Logging failures never propagate — a
     DB hiccup must never make an otherwise-successful AI call look broken.
+
+    ``response_schema`` (optional): when supplied, OpenAI uses Structured
+    Outputs and we skip the repair pass downstream. Anthropic ignores it
+    and stays on prompt-based JSON for now.
     """
     t0 = time.time()
     try:
-        resp = client.generate_json_with_meta(prompt, system_prompt=system_prompt)
+        resp = client.generate_json_with_meta(
+            prompt, system_prompt=system_prompt,
+            response_schema=response_schema, schema_name=schema_name,
+        )
         duration_ms = int((time.time() - t0) * 1000)
         _record_usage(
             context=context,
@@ -382,26 +391,52 @@ def generate_template(
 
     # Nudge the AI toward our report_type by putting it at the top of the user
     # message even though it's also repeated in the system prompt.
+    # On OpenAI we use Structured Outputs — the model is token-sampled
+    # against our TemplateDocument schema, so the reply is guaranteed to
+    # pass pydantic. No repair pass needed. Anthropic falls back to
+    # prompt-based JSON for now (it ignores response_schema and we
+    # pydantic-validate the reply as before).
+    using_structured_outputs = (provider or "").lower() in ("", "openai")
+    response_schema = (
+        to_openai_strict_schema() if using_structured_outputs else None
+    )
+
     log.info(
-        "ai_assistant.generate_template: report_type=%s, accounts=%s/%s, prefs_len=%s",
+        "ai_assistant.generate_template: report_type=%s, accounts=%s/%s, "
+        "prefs_len=%s, structured_outputs=%s",
         report_type,
         chart["sampled"],
         chart["total_accounts"],
         len(preferences),
+        using_structured_outputs,
     )
 
     try:
         raw = _run_ai_call(
             client=client, prompt=user_prompt, system_prompt=_SYSTEM_PROMPT,
             context=context, endpoint="generate_template",
+            response_schema=response_schema, schema_name="TemplateDocument",
         )
     except ExternalAIError as exc:
         raise AiAssistantError(_humanize_ai_error(exc)) from exc
 
-    # Validate against pydantic; emit a single repair pass if validation fails.
+    # Pydantic pass. Under Structured Outputs the document is already
+    # schema-valid and this is a belt-and-braces check. Under plain JSON
+    # mode (Anthropic) we still allow a single repair retry.
     try:
         doc_model = validate_document(raw)
     except PydanticValidationError as exc:
+        if using_structured_outputs:
+            # Should be unreachable — Structured Outputs guarantees schema
+            # conformance. Log loudly and surface as an error; repairing
+            # here would hide a real regression.
+            log.error(
+                "Structured Outputs produced a schema-invalid doc: %s", exc,
+            )
+            raise AiAssistantError(
+                f"Structured Outputs drift (please report): {exc}"
+            ) from exc
+
         log.warning("AI document failed first-pass validation: %s", exc)
         # Repair prompt: only the failed doc + the validation errors, no
         # chart of accounts. Prevents the retry from blowing past the TPM
