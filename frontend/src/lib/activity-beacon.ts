@@ -104,11 +104,30 @@ export function installActivityBeacon(): Beacon {
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null
   let disabled = false
 
+  // Breadcrumb ring — last N meaningful events on this tab (we
+  // skip heartbeats because they add no signal). Attached to
+  // every error event so the admin dashboard can answer "what
+  // was the user doing just before it broke?"
+  const BREADCRUMB_LIMIT = 20
+  const breadcrumbs: Array<{ ts: number; kind: string; area?: string; path?: string; action?: string }> = []
+  const recordBreadcrumb = (ev: QueuedEvent) => {
+    if (ev.kind === "heartbeat" || ev.kind === "error") return
+    breadcrumbs.push({
+      ts: ev.client_ts,
+      kind: ev.kind,
+      area: ev.area,
+      path: ev.path,
+      action: ev.action,
+    })
+    if (breadcrumbs.length > BREADCRUMB_LIMIT) breadcrumbs.shift()
+  }
+
   // ---- helpers --------------------------------------------------
   const enqueue = (ev: QueuedEvent) => {
     if (disabled) return
     if (queue.length >= MAX_QUEUED_EVENTS) queue.shift()
     queue.push(ev)
+    recordBreadcrumb(ev)
     if (isDebugEnabled()) {
       // eslint-disable-next-line no-console
       console.debug("[beacon] queued", ev)
@@ -280,12 +299,28 @@ export function installActivityBeacon(): Beacon {
     },
 
     logError(error, detail = {}) {
+      // Shape the meta payload so the backend's capture_error can
+      // fingerprint it the same way it fingerprints Python
+      // exceptions: error_class + top-of-stack.
+      const err = error as unknown as { name?: string; message?: string; stack?: string } | null
+      const error_class = (err && typeof err.name === "string" && err.name)
+        || (error instanceof Error ? error.constructor.name : typeof error)
+      const message = (err && typeof err.message === "string" && err.message)
+        || (error instanceof Error ? error.message : String(error))
+      const stack = (err && typeof err.stack === "string" ? err.stack : "").slice(0, 8000)
       enqueue({
         kind: "error",
         area: detail.area ?? currentArea,
         path: currentPath,
         meta: {
-          message: error instanceof Error ? error.message : String(error),
+          error_class,
+          message,
+          stack,
+          // Snapshot of the last ~20 meaningful interactions. The
+          // backend persists this on the occurrence event so the
+          // admin drill-down shows exactly what the user did before
+          // this fired.
+          breadcrumbs: breadcrumbs.slice(),
           ...(detail.meta ?? {}),
         },
         client_ts: Date.now(),

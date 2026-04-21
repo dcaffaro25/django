@@ -48,7 +48,8 @@
     "admin_users": "Usuários",
     "admin_activity": "Atividade",
     "admin_activity_funnels": "Funis",
-    "admin_activity_friction": "Fricção"
+    "admin_activity_friction": "Fricção",
+    "admin_activity_errors": "Erros"
   },
   "actions": {
     "search": "Buscar",

@@ -106,6 +106,26 @@ export const adminApi = {
       filename?: string
       reason?: string
     }>("/api/admin/activity/digest/run/", body),
+
+  /* ---------------- Error reports ---------------- */
+  listErrorReports: (params: {
+    kind?: string
+    resolved?: "true" | "false" | "any"
+    days?: number
+    order?: "last_seen" | "count"
+    limit?: number
+  } = {}) =>
+    api.get<ErrorReportListResponse>("/api/admin/activity/errors/", { params }),
+  getErrorReport: (id: number) =>
+    api.get<ErrorReportDetailResponse>(`/api/admin/activity/errors/${id}/`),
+  resolveErrorReport: (id: number, body: { resolved: boolean; note?: string }) =>
+    api.post<{
+      id: number
+      is_resolved: boolean
+      is_reopened: boolean
+      resolved_at: string | null
+      resolution_note: string
+    }>(`/api/admin/activity/errors/${id}/`, body),
 }
 
 /* ---------------- Activity payload types ---------------- */
@@ -246,4 +266,60 @@ export interface ActivityFrictionResponse {
   long_dwell_no_action: LongDwellRow[]
   repeat_errors: RepeatErrorRow[]
   slow_actions: SlowActionRow[]
+}
+
+/* ---------------- Error reports ---------------- */
+
+export type ErrorReportKind = "frontend" | "backend_drf" | "backend_django" | "celery"
+
+export interface ErrorReport {
+  id: number
+  fingerprint: string
+  kind: ErrorReportKind
+  error_class: string
+  message: string
+  path: string
+  method: string
+  status_code: number | null
+  count: number
+  affected_users: number
+  first_seen_at: string
+  last_seen_at: string
+  is_resolved: boolean
+  is_reopened: boolean
+  resolved_at: string | null
+  resolution_note: string
+}
+
+export interface ErrorReportDetail extends ErrorReport {
+  sample_stack: string
+}
+
+export interface ErrorReportListResponse {
+  days: number
+  count: number
+  errors: ErrorReport[]
+}
+
+export interface ErrorOccurrence {
+  id: number
+  created_at: string
+  user_id: number | null
+  user__username: string | null
+  path: string
+  meta: {
+    error_class?: string
+    message?: string
+    stack?: string
+    status_code?: number | null
+    method?: string
+    breadcrumbs?: Array<{ ts: number; kind: string; area?: string; path?: string; action?: string }>
+    [key: string]: unknown
+  } | null
+}
+
+export interface ErrorReportDetailResponse {
+  report: ErrorReportDetail
+  recent_occurrences: ErrorOccurrence[]
+  by_user: Array<{ user_id: number; user__username: string; n: number }>
 }

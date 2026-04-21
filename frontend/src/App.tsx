@@ -33,6 +33,7 @@ import { ActivityUserDetailPage } from "@/pages/admin/activity/ActivityUserDetai
 import { ActivityAreaDetailPage } from "@/pages/admin/activity/ActivityAreaDetailPage"
 import { ActivityFunnelsPage } from "@/pages/admin/activity/ActivityFunnelsPage"
 import { ActivityFrictionPage } from "@/pages/admin/activity/ActivityFrictionPage"
+import { ErrorsPage as AdminErrorsPage } from "@/pages/admin/activity/ErrorsPage"
 
 function Protected({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuth()
@@ -92,6 +93,7 @@ export default function App() {
                   <Route path="/admin/activity" element={<SuperuserGuard><ActivityHeatmapPage /></SuperuserGuard>} />
                   <Route path="/admin/activity/funnels" element={<SuperuserGuard><ActivityFunnelsPage /></SuperuserGuard>} />
                   <Route path="/admin/activity/friction" element={<SuperuserGuard><ActivityFrictionPage /></SuperuserGuard>} />
+                  <Route path="/admin/activity/errors" element={<SuperuserGuard><AdminErrorsPage /></SuperuserGuard>} />
                   <Route path="/admin/activity/users/:id" element={<SuperuserGuard><ActivityUserDetailPage /></SuperuserGuard>} />
                   <Route path="/admin/activity/areas/:id" element={<SuperuserGuard><ActivityAreaDetailPage /></SuperuserGuard>} />
                   <Route path="/admin/*" element={<SuperuserGuard><AdminHomePage /></SuperuserGuard>} />

@@ -5,6 +5,7 @@ import {
   Scale, Wallet, Receipt, BookOpen, FileBarChart, FileCog, CreditCard, Users, Boxes,
   Settings, ChevronLeft, PanelLeftOpen, Building2, CheckCircle2, Brain, Zap,
   FileSpreadsheet, Shuffle, UploadCloud, ShieldCheck, Activity, GitBranch, AlertTriangle,
+  Bug,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/stores/app-store"
@@ -92,6 +93,7 @@ const GROUPS: NavGroup[] = [
       { key: "admin_activity", path: "/admin/activity", icon: Activity },
       { key: "admin_activity_funnels", path: "/admin/activity/funnels", icon: GitBranch },
       { key: "admin_activity_friction", path: "/admin/activity/friction", icon: AlertTriangle },
+      { key: "admin_activity_errors", path: "/admin/activity/errors", icon: Bug },
     ],
   },
 ]

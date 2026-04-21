@@ -126,6 +126,26 @@ def _collect_windowed(days: int = 7) -> dict[str, Any]:
     funnels = compute_all_funnels(days=days)
     friction = compute_friction(days=days)
 
+    # Error reports: anything new-this-window (first_seen_at inside
+    # the window), plus reopened issues for the header bullets.
+    from core.models import ErrorReport
+    new_errors = list(
+        ErrorReport.objects
+        .filter(first_seen_at__gte=since)
+        .order_by("-count")
+        .values(
+            "id", "fingerprint", "kind", "error_class", "message",
+            "path", "method", "status_code", "count", "affected_users",
+            "first_seen_at", "last_seen_at", "is_resolved", "is_reopened",
+        )[:20]
+    )
+    reopened_errors = list(
+        ErrorReport.objects
+        .filter(is_reopened=True)
+        .order_by("-last_seen_at")
+        .values("id", "error_class", "message", "path", "count", "last_seen_at")[:10]
+    )
+
     # Users: inactive in the last window + new users created
     User = get_user_model()
     active_user_ids = set(
@@ -149,6 +169,8 @@ def _collect_windowed(days: int = 7) -> dict[str, Any]:
         "friction": friction,
         "inactive_users": inactive,
         "new_users": newly_joined,
+        "new_errors": new_errors,
+        "reopened_errors": reopened_errors,
     }
 
 
@@ -163,6 +185,7 @@ def build_digest_workbook(data: dict[str, Any]) -> bytes:
     _build_time_by_area_sheet(wb, data)
     _build_funnels_sheet(wb, data)
     _build_friction_sheet(wb, data)
+    _build_errors_sheet(wb, data)
     _build_users_sheet(wb, data)
 
     buf = BytesIO()
@@ -230,6 +253,14 @@ def _build_summary_sheet(wb: Workbook, data: dict) -> None:
     if fr["long_dwell_no_action"]:
         d = fr["long_dwell_no_action"][0]
         bullets.append(f"Maior travamento: {d['username']} em {d['area']} — {_ms_to_label(d['focused_ms'])}")
+    if data.get("new_errors"):
+        top_err = data["new_errors"][0]
+        bullets.append(
+            f"Novo erro mais frequente: {top_err['error_class']} — {top_err['count']} ocorrências "
+            f"({top_err['affected_users']} usuários)"
+        )
+    if data.get("reopened_errors"):
+        bullets.append(f"{len(data['reopened_errors'])} erro(s) reabertos após resolução")
     if not bullets:
         bullets.append("Sem sinais detectados na janela.")
     for line in bullets:
@@ -338,6 +369,28 @@ def _build_friction_sheet(wb: Workbook, data: dict) -> None:
          for d in fr["long_dwell_no_action"]],
     )
     _autosize(ws, 6)
+
+
+def _build_errors_sheet(wb: Workbook, data: dict) -> None:
+    ws = wb.create_sheet("Erros")
+    _write_header(ws, [
+        "Tipo", "Classe", "Mensagem", "Onde", "Status", "Ocorrências", "Usuários",
+        "Primeira vez", "Última vez", "Status atual",
+    ])
+    rows = data.get("new_errors") or []
+    for i, e in enumerate(rows, start=2):
+        state = "reaberto" if e.get("is_reopened") else ("resolvido" if e.get("is_resolved") else "aberto")
+        ws.cell(row=i, column=1, value=e["kind"])
+        ws.cell(row=i, column=2, value=e["error_class"])
+        ws.cell(row=i, column=3, value=(e["message"] or "")[:200])
+        ws.cell(row=i, column=4, value=f'{e.get("method","")} {e.get("path","")}'.strip())
+        ws.cell(row=i, column=5, value=e.get("status_code"))
+        ws.cell(row=i, column=6, value=e["count"])
+        ws.cell(row=i, column=7, value=e["affected_users"])
+        ws.cell(row=i, column=8, value=e["first_seen_at"].isoformat() if hasattr(e["first_seen_at"], "isoformat") else str(e["first_seen_at"]))
+        ws.cell(row=i, column=9, value=e["last_seen_at"].isoformat() if hasattr(e["last_seen_at"], "isoformat") else str(e["last_seen_at"]))
+        ws.cell(row=i, column=10, value=state)
+    _autosize(ws, 10)
 
 
 def _build_users_sheet(wb: Workbook, data: dict) -> None:

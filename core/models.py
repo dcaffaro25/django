@@ -239,6 +239,86 @@ class UserActivityEvent(models.Model):
         return f"{self.kind}:{self.area or self.path} #{self.id}"
 
 
+class ErrorReport(models.Model):
+    """Grouped error — the "issue" in Sentry terms.
+
+    Every ``UserActivityEvent(kind='error')`` also triggers an upsert
+    here, keyed on a stable fingerprint (hash of error_class +
+    top-of-stack for frontend, or endpoint+status for backend). The
+    goal is to collapse a noisy storm ("500 occurrences of the same
+    bug") into one actionable row with count + first/last seen +
+    distinct affected users.
+
+    Individual occurrences stay in ``UserActivityEvent``; we join
+    back via ``fingerprint`` on the event's ``meta`` blob when we
+    need breadcrumbs. That keeps writes append-only (the report row
+    is the only mutable surface) and lets the raw event retention
+    job prune old noise without losing the issue history.
+    """
+
+    KIND_FRONTEND = "frontend"
+    KIND_BACKEND_DRF = "backend_drf"
+    KIND_BACKEND_DJANGO = "backend_django"
+    KIND_CELERY = "celery"
+    KIND_CHOICES = (
+        (KIND_FRONTEND, "frontend"),
+        (KIND_BACKEND_DRF, "backend_drf"),
+        (KIND_BACKEND_DJANGO, "backend_django"),
+        (KIND_CELERY, "celery"),
+    )
+
+    fingerprint = models.CharField(max_length=64, unique=True, db_index=True)
+    kind = models.CharField(max_length=24, choices=KIND_CHOICES, db_index=True)
+
+    error_class = models.CharField(max_length=128, blank=True, default="")
+    message = models.TextField(blank=True, default="")
+    # Truncated. Full stack can be reconstructed from the latest
+    # occurrence event if we need it. Kept short here so the list
+    # endpoint stays cheap.
+    sample_stack = models.TextField(blank=True, default="")
+
+    # For backend reports: endpoint + method + status make the
+    # "same bug on different routes" case distinguishable. For
+    # frontend: the path where the error first fired.
+    path = models.CharField(max_length=512, blank=True, default="")
+    method = models.CharField(max_length=8, blank=True, default="")
+    status_code = models.PositiveIntegerField(null=True, blank=True)
+
+    # Counts + timestamps are the key dashboard columns.
+    count = models.PositiveIntegerField(default=0)
+    affected_users = models.PositiveIntegerField(default=0)
+    first_seen_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    last_seen_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    # Resolution tracking. ``resolved_at`` + a re-occurrence after
+    # that timestamp → we flip ``is_reopened`` and alert. That's
+    # the "deploy brought it back" story.
+    is_resolved = models.BooleanField(default=False)
+    is_reopened = models.BooleanField(default=False)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    resolved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="resolved_errors",
+    )
+    resolution_note = models.TextField(blank=True, default="")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["kind", "-last_seen_at"]),
+            models.Index(fields=["is_resolved", "-last_seen_at"]),
+            models.Index(fields=["-count"]),
+        ]
+        ordering = ["-last_seen_at"]
+
+    def __str__(self):
+        return f"[{self.kind}] {self.error_class}: {self.message[:60]}"
+
+
 def get_next_n_occurrences(rrule_str: str, dtstart: datetime, n: int, after: Optional[datetime] = None) -> List[datetime]:
     """
     Returns the next 'n' occurrences after the 'after' datetime.

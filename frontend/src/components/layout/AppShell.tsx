@@ -6,7 +6,13 @@ import { CommandPalette } from "./CommandPalette"
 import { ErrorBoundary } from "@/components/ErrorBoundary"
 import { useAppStore } from "@/stores/app-store"
 import { useActivityBeacon } from "@/hooks/useActivityBeacon"
+import { installErrorCapture } from "@/lib/error-capture"
 import { cn } from "@/lib/utils"
+
+// Global error handlers install once — outside the component so
+// HMR-driven re-renders don't re-attach. The helper is idempotent
+// so this is mostly belt-and-braces.
+installErrorCapture()
 
 export function AppShell({ children }: { children: ReactNode }) {
   const toggleSidebar = useAppStore((s) => s.toggleSidebar)

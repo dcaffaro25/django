@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from "react"
+import { logError } from "@/lib/activity-beacon"
 
 interface State { error: Error | null; info: ErrorInfo | null }
 
@@ -12,6 +13,14 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, State> {
   componentDidCatch(error: Error, info: ErrorInfo) {
     this.setState({ info })
     console.error("[ErrorBoundary]", error, info)
+    // Report to the admin dashboard. componentStack is the React
+    // tree trace — more useful for fixing than the JS stack alone
+    // on rendering crashes.
+    try {
+      logError(error, { meta: { source: "react.ErrorBoundary", component_stack: info.componentStack } })
+    } catch {
+      /* never cascade — the fallback render must still happen */
+    }
   }
 
   render() {

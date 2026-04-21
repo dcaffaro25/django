@@ -1,7 +1,7 @@
 import { useState } from "react"
 import { Link } from "react-router-dom"
 import { toast } from "sonner"
-import { Activity, AlertTriangle, GitBranch, Loader2, Mail, ShieldCheck, Users } from "lucide-react"
+import { Activity, AlertTriangle, Bug, GitBranch, Loader2, Mail, ShieldCheck, Users } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { useAuth } from "@/providers/AuthProvider"
 import { adminApi } from "@/features/admin/api"
@@ -89,6 +89,12 @@ export function AdminHomePage() {
           icon={<AlertTriangle className="h-4 w-4" />}
           title="Sinais de fricção"
           subtitle="Ciclos A→B→A, ações lentas, erros repetidos, tempo sem ação."
+        />
+        <AdminCard
+          to="/admin/activity/errors"
+          icon={<Bug className="h-4 w-4" />}
+          title="Erros da aplicação"
+          subtitle="Grupos de erro (frontend + backend), stack, usuários afetados, breadcrumbs."
         />
         <AdminCard
           to="/admin/audit"

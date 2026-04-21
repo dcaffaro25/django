@@ -6,6 +6,8 @@ import type {
   ActivityFunnelsResponse,
   ActivitySummaryResponse,
   ActivityUserDetail,
+  ErrorReportDetailResponse,
+  ErrorReportListResponse,
 } from "./api"
 
 const KEY_USERS = ["admin", "users"] as const
@@ -106,5 +108,35 @@ export function useActivityFriction(days: number = 30) {
     queryKey: ["admin", "activity", "friction", days],
     queryFn: () => adminApi.activityFriction(days),
     staleTime: 60_000,
+  })
+}
+
+/* ---------------- Error reports ---------------- */
+
+export function useErrorReports(params: Parameters<typeof adminApi.listErrorReports>[0] = {}) {
+  return useQuery<ErrorReportListResponse>({
+    queryKey: ["admin", "errors", params],
+    queryFn: () => adminApi.listErrorReports(params),
+    staleTime: 30_000,
+  })
+}
+
+export function useErrorReportDetail(id: number | null) {
+  return useQuery<ErrorReportDetailResponse>({
+    queryKey: ["admin", "errors", "detail", id],
+    queryFn: () => adminApi.getErrorReport(id as number),
+    enabled: id != null,
+    staleTime: 30_000,
+  })
+}
+
+export function useResolveErrorReport() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (args: { id: number; resolved: boolean; note?: string }) =>
+      adminApi.resolveErrorReport(args.id, { resolved: args.resolved, note: args.note }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["admin", "errors"] })
+    },
   })
 }

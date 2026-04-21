@@ -182,6 +182,48 @@ class ActivityBeaconView(APIView):
             if objs:
                 UserActivityEvent.objects.bulk_create(objs, batch_size=200)
 
+            # For every ``kind=error`` event in the batch, upsert
+            # an ErrorReport so the admin dashboard sees the group,
+            # not just the individual occurrence. capture_error
+            # also writes a second occurrence event with the full
+            # stack + breadcrumbs attached — harmless duplication
+            # with the bulk_create above because the report
+            # aggregates on fingerprint either way.
+            try:
+                from core.models import ErrorReport
+                from core.services.error_capture import (
+                    capture_error,
+                    fingerprint_frontend,
+                )
+                for ev in events:
+                    if not isinstance(ev, dict):
+                        continue
+                    if ev.get("kind") != UserActivityEvent.KIND_ERROR:
+                        continue
+                    meta = ev.get("meta") if isinstance(ev.get("meta"), dict) else {}
+                    error_class = str(meta.get("error_class") or "Error")
+                    message = str(meta.get("message") or "")
+                    stack = str(meta.get("stack") or "")
+                    breadcrumbs = meta.get("breadcrumbs") or []
+                    fp = fingerprint_frontend(error_class, stack)
+                    capture_error(
+                        kind=ErrorReport.KIND_FRONTEND,
+                        fingerprint=fp,
+                        error_class=error_class,
+                        message=message,
+                        stack=stack,
+                        path=_clean_str(ev.get("path"), max_len=512),
+                        status_code=_clean_int(meta.get("status_code")),
+                        method=_clean_str(meta.get("method"), max_len=8),
+                        user=user,
+                        company=company,
+                        session=session,
+                        breadcrumbs=breadcrumbs if isinstance(breadcrumbs, list) else None,
+                        raw_meta={"ua": data.get("user_agent", "")[:200]} if data.get("user_agent") else None,
+                    )
+            except Exception:  # pragma: no cover — telemetry is best-effort
+                pass
+
         return Response(
             {"session_id": session.id, "accepted": len(objs)},
             status=status.HTTP_200_OK,
@@ -349,6 +391,161 @@ class AdminActivityUserDetailView(APIView):
             "devices": devices,
             "recent_actions": recent_actions,
             "recent_errors": recent_errors,
+        })
+
+
+class AdminErrorReportsView(APIView):
+    """GET /api/admin/activity/errors/?kind=&resolved=&days=&limit=
+
+    Paginated list of error groups, newest-last-seen first by default
+    (or most-frequent if ``order=count``). Filters:
+
+      * ``kind``     — ``frontend``/``backend_drf``/``backend_django``/``celery``
+      * ``resolved`` — ``true``/``false``/``any``   (default: ``false``)
+      * ``days``     — 1..90 (last-seen within)
+      * ``order``    — ``last_seen`` (default) or ``count``
+    """
+
+    permission_classes = [IsSuperUser]
+
+    def get(self, request, *args, **kwargs):
+        from core.models import ErrorReport
+
+        qs = ErrorReport.objects.all()
+
+        kind = request.query_params.get("kind")
+        if kind in dict(ErrorReport.KIND_CHOICES):
+            qs = qs.filter(kind=kind)
+
+        resolved = (request.query_params.get("resolved") or "false").lower()
+        if resolved == "true":
+            qs = qs.filter(is_resolved=True)
+        elif resolved == "false":
+            qs = qs.filter(is_resolved=False)
+        # "any" → no filter
+
+        try:
+            days = int(request.query_params.get("days", "30"))
+        except (TypeError, ValueError):
+            days = 30
+        days = max(1, min(days, 90))
+        qs = qs.filter(last_seen_at__gte=timezone.now() - timedelta(days=days))
+
+        order = request.query_params.get("order", "last_seen")
+        qs = qs.order_by("-count" if order == "count" else "-last_seen_at")
+
+        try:
+            limit = int(request.query_params.get("limit", "100"))
+        except (TypeError, ValueError):
+            limit = 100
+        limit = max(1, min(limit, 300))
+
+        rows = list(qs[:limit].values(
+            "id", "fingerprint", "kind", "error_class", "message",
+            "path", "method", "status_code",
+            "count", "affected_users",
+            "first_seen_at", "last_seen_at",
+            "is_resolved", "is_reopened", "resolved_at", "resolution_note",
+        ))
+        return Response({"days": days, "count": len(rows), "errors": rows})
+
+
+class AdminErrorReportDetailView(APIView):
+    """GET /api/admin/activity/errors/<id>/
+
+    Deep view: the group row + a sample of the most recent occurrences
+    with their breadcrumbs (last 20 events before each), plus per-user
+    occurrence counts.
+
+    POST toggles resolution: ``{"resolved": true, "note": "..."}``.
+    """
+
+    permission_classes = [IsSuperUser]
+
+    def get(self, request, report_id, *args, **kwargs):
+        from core.models import ErrorReport, UserActivityEvent
+        from django.db.models import Count
+
+        report = ErrorReport.objects.filter(pk=report_id).first()
+        if not report:
+            return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        occurrences_qs = (
+            UserActivityEvent.objects
+            .filter(kind=UserActivityEvent.KIND_ERROR,
+                    meta__fingerprint=report.fingerprint)
+            .select_related("user")
+            .order_by("-id")
+        )
+        recent = list(
+            occurrences_qs[:10].values(
+                "id", "created_at", "user_id", "user__username", "path", "meta"
+            )
+        )
+        by_user = list(
+            occurrences_qs.values("user_id", "user__username")
+                          .annotate(n=Count("id"))
+                          .order_by("-n")[:20]
+        )
+
+        return Response({
+            "report": {
+                "id": report.id,
+                "fingerprint": report.fingerprint,
+                "kind": report.kind,
+                "error_class": report.error_class,
+                "message": report.message,
+                "sample_stack": report.sample_stack,
+                "path": report.path,
+                "method": report.method,
+                "status_code": report.status_code,
+                "count": report.count,
+                "affected_users": report.affected_users,
+                "first_seen_at": report.first_seen_at,
+                "last_seen_at": report.last_seen_at,
+                "is_resolved": report.is_resolved,
+                "is_reopened": report.is_reopened,
+                "resolved_at": report.resolved_at,
+                "resolution_note": report.resolution_note,
+            },
+            "recent_occurrences": recent,
+            "by_user": by_user,
+        })
+
+    def post(self, request, report_id, *args, **kwargs):
+        """Toggle resolution. Body: ``{"resolved": bool, "note": str}``.
+
+        Setting ``resolved=True`` stamps ``resolved_by`` + ``resolved_at``
+        and clears the ``is_reopened`` flag. Setting it back to False
+        reopens the issue without touching history.
+        """
+        from core.models import ErrorReport
+
+        report = ErrorReport.objects.filter(pk=report_id).first()
+        if not report:
+            return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        body = request.data or {}
+        resolved = bool(body.get("resolved"))
+        note = str(body.get("note") or "")[:2000]
+
+        report.is_resolved = resolved
+        report.resolution_note = note
+        if resolved:
+            report.resolved_at = timezone.now()
+            report.resolved_by = request.user
+            report.is_reopened = False
+        else:
+            report.resolved_at = None
+            report.resolved_by = None
+            report.is_reopened = False
+        report.save()
+        return Response({
+            "id": report.id,
+            "is_resolved": report.is_resolved,
+            "is_reopened": report.is_reopened,
+            "resolved_at": report.resolved_at,
+            "resolution_note": report.resolution_note,
         })
 
 
