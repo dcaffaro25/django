@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react"
 import { toast } from "sonner"
 import {
   Save, Play, Download, FileSpreadsheet, FileText, Plus, Copy, Trash2, Layers, Sparkles,
-  MessageSquare,
+  MessageSquare, Code, LayoutGrid,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import {
@@ -28,6 +28,7 @@ import { PeriodStrip } from "./components/PeriodStrip"
 import { AiGenerateModal } from "./components/AiGenerateModal"
 import { AiActionsToolbar } from "./components/AiActionsToolbar"
 import { AiChatDrawer } from "./components/AiChatDrawer"
+import { JsonTextMode } from "./components/JsonTextMode"
 
 const REPORT_TYPES: { value: ReportType; label: string }[] = [
   { value: "income_statement", label: "DRE" },
@@ -71,6 +72,7 @@ export function BuilderPage() {
   const [preview, setPreview] = useState<ReportResult | null>(null)
   const [aiOpen, setAiOpen] = useState(false)
   const [chatOpen, setChatOpen] = useState(false)
+  const [editMode, setEditMode] = useState<"visual" | "json">("visual")
 
   // Load selected template into the editor.
   useEffect(() => {
@@ -338,11 +340,43 @@ export function BuilderPage() {
 
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
         <div className="card-elevated space-y-2 p-3">
-          <h2 className="text-[12px] font-semibold uppercase tracking-wider text-muted-foreground">
-            Estrutura do modelo
-          </h2>
-          <AiActionsToolbar doc={doc} onApply={onDocChange} />
-          <BlockEditor document={doc} onChange={onDocChange} />
+          <div className="flex items-center justify-between">
+            <h2 className="text-[12px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Estrutura do modelo
+            </h2>
+            <div className="inline-flex overflow-hidden rounded-md border border-border bg-background text-[11px]">
+              <button
+                onClick={() => setEditMode("visual")}
+                className={
+                  "inline-flex h-6 items-center gap-1 px-2 transition-colors " +
+                  (editMode === "visual"
+                    ? "bg-primary text-primary-foreground"
+                    : "text-muted-foreground hover:bg-accent")
+                }
+              >
+                <LayoutGrid className="h-3 w-3" /> Visual
+              </button>
+              <button
+                onClick={() => setEditMode("json")}
+                className={
+                  "inline-flex h-6 items-center gap-1 px-2 transition-colors " +
+                  (editMode === "json"
+                    ? "bg-primary text-primary-foreground"
+                    : "text-muted-foreground hover:bg-accent")
+                }
+              >
+                <Code className="h-3 w-3" /> JSON
+              </button>
+            </div>
+          </div>
+          {editMode === "visual" ? (
+            <>
+              <AiActionsToolbar doc={doc} onApply={onDocChange} />
+              <BlockEditor document={doc} onChange={onDocChange} />
+            </>
+          ) : (
+            <JsonTextMode document={doc} onApply={onDocChange} />
+          )}
         </div>
 
         <div className="card-elevated p-3">

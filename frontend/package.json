@@ -39,6 +39,8 @@
     "i18next": "^23.16.8",
     "i18next-browser-languagedetector": "^8.2.1",
     "lucide-react": "^0.294.0",
+    "@monaco-editor/react": "^4.6.0",
+    "monaco-editor": "^0.45.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-hook-form": "^7.48.2",
