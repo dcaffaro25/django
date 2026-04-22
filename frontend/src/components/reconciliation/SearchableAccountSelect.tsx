@@ -186,10 +186,24 @@ export function SearchableAccountSelect({
     ? `${selected.account_code ? `${selected.account_code} · ` : ""}${selected.path ?? selected.name}`
     : ""
 
+  // The popover is portaled to <body>, making it a SIBLING of the Vaul
+  // Drawer.Content (not a descendant). Vaul detects "outside the drawer"
+  // clicks on `document` to auto-dismiss, so clicks inside this popover
+  // would register as outside-drawer events and close the host drawer.
+  // Radix (Dialog.Root from shadcn) behaves the same way. We swallow
+  // pointer + click events at the popover root so those listeners don't
+  // see them — the popover's own ``onMouseDown`` handler on the
+  // document (for its own outside-click detection) still fires because
+  // we check via ``popoverRef.current.contains(target)`` above.
+  const stopPropagation = (e: React.SyntheticEvent) => e.stopPropagation()
+
   const popover = open ? (
     <div
       ref={popoverRef}
       style={popoverStyle}
+      onMouseDown={stopPropagation}
+      onPointerDown={stopPropagation}
+      onClick={stopPropagation}
       // ``z-[60]`` stays above the Vaul drawer overlay (z-50). The
       // portal lives in ``<body>`` so there's no ancestor overflow to
       // fight.
