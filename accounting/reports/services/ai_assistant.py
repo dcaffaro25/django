@@ -32,7 +32,13 @@ from accounting.models import Account
 from accounting.services.external_ai_client import ExternalAIClient, ExternalAIError
 
 from .ai_pricing import estimate_cost_usd
-from .document_schema import TemplateDocument, to_openai_strict_schema, validate_document
+from .document_schema import (
+    SlimTemplateDocument,
+    TemplateDocument,
+    slim_to_canonical,
+    to_openai_strict_schema,
+    validate_document,
+)
 
 
 log = logging.getLogger(__name__)
@@ -298,56 +304,44 @@ accounts.
 
 Respond with ONLY valid JSON — no markdown, no commentary, no preamble.
 
-The JSON must match this schema (a tree of typed blocks):
+The JSON is a FLAT list of blocks (not nested). Every block carries its \
+own ``id``; children reference their parent via ``parent_id``. The server \
+reassembles the tree before persisting. This flat shape is mandatory — \
+do NOT emit ``children: [...]``; emit child blocks as siblings with \
+``parent_id`` pointing to their section.
 
 {
-  "version": 1,
   "name": "string (pt-BR)",
   "report_type": "income_statement" | "balance_sheet" | "cash_flow",
-  "description": "string (optional)",
   "defaults": {
     "calculation_method": "net_movement" | "ending_balance" | ...,
     "sign_policy": "natural" | "invert" | "absolute",
+    "scale": "none" | "K" | "M" | "B",
     "decimal_places": 2
   },
   "blocks": [
-    {
-      "type": "section",
-      "id": "snake_case_id",
-      "label": "Pt-BR label",
-      "defaults": { ... optional overrides ... },
-      "children": [ ...nested blocks... ]
-    },
-    {
-      "type": "line",
-      "id": "snake_case_id",
-      "label": "Pt-BR label",
-      "accounts": { "code_prefix": "4.01", "include_descendants": true }
-    },
-    {
-      "type": "subtotal",
-      "id": "snake_case_id",
-      "label": "Pt-BR label",
-      "formula": "sum(children)"
-    },
-    {
-      "type": "total",
-      "id": "snake_case_id",
-      "label": "Pt-BR label",
-      "bold": true,
-      "formula": "revenue_gross - deductions"
-    },
-    {
-      "type": "header",
-      "id": "snake_case_id",
-      "label": "Pt-BR header label"
-    },
+    { "type": "section",
+      "id": "revenue", "label": "Receita Bruta", "parent_id": null,
+      "defaults": { "calculation_method": "net_movement" } },
+    { "type": "line",
+      "id": "sales", "label": "Vendas", "parent_id": "revenue",
+      "accounts": { "code_prefix": "4.01", "include_descendants": true } },
+    { "type": "subtotal",
+      "id": "revenue_total", "label": "Receita Total", "parent_id": "revenue",
+      "formula": "sum(children)" },
+    { "type": "total",
+      "id": "net_income", "label": "Lucro Líquido", "parent_id": null,
+      "formula": "revenue_total - expenses_total" },
+    { "type": "header",
+      "id": "hdr_results", "label": "Resultado", "parent_id": null },
     { "type": "spacer", "id": "sp_1" }
   ]
 }
 
 Rules (STRICT):
-- Block ids MUST match ^[A-Za-z_][A-Za-z0-9_]*$ and be unique across the tree.
+- Block ids MUST match ^[A-Za-z_][A-Za-z0-9_]*$ and be unique.
+- ``parent_id`` must either be null (root) or reference an existing section's id.
+  Only ``section`` blocks may be parents.
 - Formulas reference other block ids (e.g. "revenue_gross - taxes") or use
   the helpers sum(children) / abs(x) / min(a,b) / max(a,b). The special
   identifier "children" is only valid inside sum/min/max/abs.
@@ -356,10 +350,11 @@ Rules (STRICT):
 - For cash_flow use a mix: opening_balance + net_movement + ending_balance.
 - Prefer accounts.code_prefix (pattern match) over listing explicit ids.
 - Use sections for logical grouping; put a subtotal at the end of each
-  section. Top-level totals (net income, total assets, etc.) go at the root.
+  section (its ``parent_id`` = the section's id). Top-level totals
+  (net income, total assets, etc.) have ``parent_id: null``.
+- Emit blocks in display order — parents first, then their children,
+  then sibling blocks.
 - All labels and the template name MUST be in Brazilian Portuguese (pt-BR).
-- On every non-spacer block, include a short "_ai_explanation" field \
-(<= 160 chars) describing why the block exists / what it aggregates.
 """
 
 
@@ -458,12 +453,24 @@ def generate_template(
         raise AiAssistantError(f"AI client init failed: {exc}") from exc
 
     # On OpenAI we use Structured Outputs — the model is token-sampled
-    # against our TemplateDocument schema, so the reply is guaranteed to
-    # pass pydantic. No repair pass needed. Anthropic falls back to
-    # prompt-based JSON for now (it ignores response_schema and we
-    # pydantic-validate the reply as before).
+    # against the SLIM schema (flat blocks + parent_id + defaults
+    # cascade; no decoration fields). Empirically the canonical
+    # ``TemplateDocument`` schema times out ~100% of the time because
+    # the recursive tree + decorative fields push the SO grammar
+    # compile past the API's per-request budget. The slim variant
+    # finishes with median ~17s and 100% reliability under the SDK's
+    # default 2 retries.
+    #
+    # The slim output is converted back to the canonical shape in
+    # :func:`slim_to_canonical` below, which fills in derivable fields
+    # (``bold`` from block type, ``indent`` from depth) and rebuilds
+    # the ``children`` tree from ``parent_id`` links.
+    #
+    # See ``scripts/bench_schemas.py`` for the empirical data behind
+    # this choice.
     response_schema = (
-        to_openai_strict_schema() if using_structured_outputs else None
+        to_openai_strict_schema(SlimTemplateDocument.model_json_schema())
+        if using_structured_outputs else None
     )
 
     log.info(
@@ -487,21 +494,32 @@ def generate_template(
     except ExternalAIError as exc:
         raise AiAssistantError(_humanize_ai_error(exc)) from exc
 
-    # Pydantic pass. Under Structured Outputs the document is already
-    # schema-valid and this is a belt-and-braces check. Under plain JSON
-    # mode (Anthropic) we still allow a single repair retry.
+    # Under Structured Outputs the AI emits the SLIM shape. Convert it
+    # to canonical before validation — the UI and save pipeline both
+    # expect the full TemplateDocument tree. Under plain JSON mode
+    # (Anthropic) the model was told to emit the slim shape too; if it
+    # hallucinates and emits a ``children`` tree instead we still catch
+    # that via the canonical validation below.
+    if using_structured_outputs:
+        raw = slim_to_canonical(raw, report_type=report_type)
+
+    # Pydantic pass. Under Structured Outputs the slim→canonical converter
+    # produced a well-formed tree; this is a belt-and-braces check for
+    # cross-reference integrity (unique ids, formula block refs). Under
+    # plain JSON mode (Anthropic) we still allow a single repair retry.
     try:
         doc_model = validate_document(raw)
     except PydanticValidationError as exc:
         if using_structured_outputs:
-            # Should be unreachable — Structured Outputs guarantees schema
-            # conformance. Log loudly and surface as an error; repairing
-            # here would hide a real regression.
+            # Reachable only if slim_to_canonical produced a doc that
+            # fails the cross-ref check (e.g. duplicate ids). Log and
+            # surface — repair wouldn't help since the AI is no longer
+            # in the loop.
             log.error(
-                "Structured Outputs produced a schema-invalid doc: %s", exc,
+                "Slim-to-canonical conversion failed cross-ref validation: %s", exc,
             )
             raise AiAssistantError(
-                f"Structured Outputs drift (please report): {exc}"
+                f"Generated template failed validation: {exc}"
             ) from exc
 
         log.warning("AI document failed first-pass validation: %s", exc)
