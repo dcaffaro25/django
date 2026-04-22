@@ -219,46 +219,70 @@ def _build_chart_context(company_id: int, limit: int = 150) -> Dict[str, Any]:
     - Accounts with a non-empty ``account_code`` are preferred; coded
       accounts are more useful for pattern selectors and waste fewer
       tokens than paths.
-    - Flat dicts, not nested — the serializer in the prompt emits one
-      compact line per account regardless.
 
-    ``Account`` is an MPTTModel — there's no ``path`` column; we call
-    ``get_path()`` on each instance instead.
+    Performance (post PR 9):
+      - ``Account.get_path()`` walks ``parent.parent.parent…`` one FK
+        hop at a time, which fires a DB round-trip per step. On Railway
+        latency that's ~300ms × 5-6 levels × 150 accounts ≈ **45s** just
+        to build this context. We now pre-load every active account for
+        the company in ONE query and compute paths in Python from the
+        resulting ``{id → (name, parent_id)}`` map. O(1) queries, not
+        O(N×depth).
     """
     base = Account.objects.filter(company_id=company_id, is_active=True)
     total = base.count()
 
+    # Pre-load the full company chart in one round-trip. For datbaby
+    # (~250 accounts) this is <10KB payload; for the largest realistic
+    # chart (~2k accounts) still well under a second. We use
+    # ``values`` instead of model instances so the ``parent`` FK comes
+    # back as ``parent_id`` — no attribute access triggers a second
+    # query for lazy relations.
+    all_rows = list(
+        base.values("id", "name", "account_code", "account_direction", "level", "parent_id")
+    )
+    by_id = {r["id"]: r for r in all_rows}
+
+    def _path_of(row: Dict[str, Any]) -> str:
+        """Walk the pre-loaded parent map (all in memory)."""
+        parts: List[str] = []
+        current = row
+        # Guard against pathological cycles — shouldn't happen in MPTT
+        # but a bad import could break the invariant.
+        visited: set[int] = set()
+        while current is not None and current["id"] not in visited:
+            parts.insert(0, current["name"])
+            visited.add(current["id"])
+            pid = current.get("parent_id")
+            current = by_id.get(pid) if pid is not None else None
+        return " > ".join(parts)
+
     # Prefer coded accounts; they're shorter + more useful for patterns.
     # Fall back to all active accounts when the chart isn't coded.
-    coded = base.exclude(account_code__isnull=True).exclude(account_code__exact="")
-    primary = coded.order_by("account_code", "name")[:limit]
-    sample_instances = list(primary)
-    if len(sample_instances) < limit:
+    coded = [r for r in all_rows if r["account_code"]]
+    coded.sort(key=lambda r: (r["account_code"] or "", r["name"] or ""))
+    sample_rows = coded[:limit]
+    if len(sample_rows) < limit:
         # Top up with uncoded accounts to fill the budget
-        remaining = limit - len(sample_instances)
-        fillers = (
-            base.filter(account_code__isnull=True).order_by("name")[:remaining]
-        )
-        sample_instances.extend(fillers)
+        uncoded = [r for r in all_rows if not r["account_code"]]
+        uncoded.sort(key=lambda r: r["name"] or "")
+        sample_rows.extend(uncoded[: limit - len(sample_rows)])
 
     accounts: List[Dict[str, Any]] = []
-    for a in sample_instances:
-        try:
-            path = a.get_path() if hasattr(a, "get_path") else ""
-        except Exception:
-            path = ""
+    for r in sample_rows:
+        path = _path_of(r)
         accounts.append({
-            "code": a.account_code or "",
-            "name": a.name,
+            "code": r["account_code"] or "",
+            "name": r["name"],
             # Truncate path — most value is at the top of the hierarchy;
             # we already give the AI the code and direction.
-            "path": (path or "")[:120],
-            "direction": a.account_direction,
-            "level": a.level,
+            "path": path[:120],
+            "direction": r["account_direction"],
+            "level": r["level"],
         })
     return {
         "total_accounts": total,
-        "sampled": len(sample_instances),
+        "sampled": len(sample_rows),
         "accounts": accounts,
     }
 
