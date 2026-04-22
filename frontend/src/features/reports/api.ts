@@ -153,17 +153,38 @@ export const reportsApi = {
     api.tenant.post<Blob>("/api/reports/export/pdf/", body, { responseType: "blob" }),
 
   // --- AI --------------------------------------------------------------
+  // AI endpoints block synchronously on the LLM provider (OpenAI /
+  // Anthropic). Typical round-trip is 5–30s for a full-chart
+  // template generation; repair-pass / large charts / slow
+  // provider weather can easily push past the axios default of 60s.
+  // We give these calls a generous 180s budget — long enough that
+  // the LLM is the bottleneck, short enough that a truly hung
+  // request still surfaces to the operator in a reasonable window.
+  // For longer work we'll move to a Celery + poll pattern; see
+  // ``accounting/reports/views.py::generate_template`` notes.
   aiGenerateTemplate: (body: AiGenerateTemplateRequest) =>
-    api.tenant.post<AiGenerateTemplateResponse>("/api/reports/ai/generate-template/", body),
+    api.tenant.post<AiGenerateTemplateResponse>(
+      "/api/reports/ai/generate-template/", body,
+      { timeout: 180_000 },
+    ),
 
   aiRefine: (body: AiRefineRequest) =>
-    api.tenant.post<AiRefineResponse>("/api/reports/ai/refine/", body),
+    api.tenant.post<AiRefineResponse>(
+      "/api/reports/ai/refine/", body,
+      { timeout: 180_000 },
+    ),
 
   aiChat: (body: AiChatRequest) =>
-    api.tenant.post<AiChatResponse>("/api/reports/ai/chat/", body),
+    api.tenant.post<AiChatResponse>(
+      "/api/reports/ai/chat/", body,
+      { timeout: 180_000 },
+    ),
 
   aiExplain: (body: AiExplainRequest) =>
-    api.tenant.post<AiExplainResponse>("/api/reports/ai/explain/", body),
+    api.tenant.post<AiExplainResponse>(
+      "/api/reports/ai/explain/", body,
+      { timeout: 120_000 },
+    ),
 
   aiUsage: (params?: {
     days?: number
