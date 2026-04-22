@@ -94,6 +94,12 @@ export const adminApi = {
     api.get<ActivityFunnelsResponse>("/api/admin/activity/funnels/", { params: { days } }),
   activityFriction: (days: number = 30) =>
     api.get<ActivityFrictionResponse>("/api/admin/activity/friction/", { params: { days } }),
+  /** GET /api/admin/integrity/ledger/ — how many Transactions have
+   *  ΣDebit ≠ ΣCredit, broken down by company. Canary for PR 8's
+   *  backfill ("missing cash legs") progress. */
+  ledgerIntegrity: () =>
+    api.get<LedgerIntegrityResponse>("/api/admin/integrity/ledger/"),
+
   /** POST /api/admin/activity/digest/run/ — run the weekly digest
    *  synchronously. ``dry_run=true`` returns stats without
    *  emailing; useful for "show me what would be sent". */
@@ -322,4 +328,17 @@ export interface ErrorReportDetailResponse {
   report: ErrorReportDetail
   recent_occurrences: ErrorOccurrence[]
   by_user: Array<{ user_id: number; user__username: string; n: number }>
+}
+
+export interface LedgerIntegrityRow {
+  company_id: number
+  company_name: string
+  count: number
+  imbalance_sum: string  // serialised Decimal
+  sample_tx_ids: number[]
+}
+export interface LedgerIntegrityResponse {
+  total: number
+  imbalance_sum: string
+  by_company: LedgerIntegrityRow[]
 }

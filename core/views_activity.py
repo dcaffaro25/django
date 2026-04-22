@@ -549,6 +549,85 @@ class AdminErrorReportDetailView(APIView):
         })
 
 
+class AdminLedgerIntegrityView(APIView):
+    """GET /api/admin/integrity/ledger/
+
+    Platform-admin read: how many Transactions are in a broken
+    double-entry state (Σdebit ≠ Σcredit) and the aggregate
+    imbalance. Designed to be rendered as a single KPI card on
+    ``/admin`` — a quick "is PR 8's backfill still pending?" signal.
+
+    Deliberately company-scoped grouping: an issue that belongs to
+    one tenant shouldn't hide behind another tenant's clean
+    books. Returns a per-company list plus a grand total.
+    """
+
+    permission_classes = [IsSuperUser]
+
+    def get(self, request, *args, **kwargs):
+        from collections import defaultdict
+        from decimal import Decimal
+
+        from django.db.models import DecimalField, F, Q, Sum, Value
+        from django.db.models.functions import Coalesce
+
+        from accounting.models import Transaction
+
+        # One-shot scan: pull the per-transaction Σd / Σc, filter on
+        # Σd ≠ Σc, group in Python. A single Sum()-of-
+        # CombinedExpression would be ideal but Django 4.x rejects
+        # it ("Cannot compute Sum(…): is an aggregate"), so we
+        # aggregate client-side — at KPI volumes (hundreds of rows)
+        # the extra memory is trivial.
+        broken = list(
+            Transaction.objects
+            .annotate(
+                _d=Coalesce(Sum("journal_entries__debit_amount"),
+                            Value(Decimal("0"), output_field=DecimalField(max_digits=18, decimal_places=2))),
+                _c=Coalesce(Sum("journal_entries__credit_amount"),
+                            Value(Decimal("0"), output_field=DecimalField(max_digits=18, decimal_places=2))),
+            )
+            .filter(~Q(_d=F("_c")))
+            .values("id", "company_id", "company__name", "_d", "_c")
+        )
+
+        by_company: dict[int, dict] = defaultdict(lambda: {
+            "company_id": None, "company_name": "", "count": 0,
+            "imbalance_sum": Decimal("0"), "sample_tx_ids": [],
+        })
+        grand_total = 0
+        grand_imbalance = Decimal("0")
+        for row in broken:
+            imbalance = (row["_d"] or Decimal("0")) - (row["_c"] or Decimal("0"))
+            bucket = by_company[row["company_id"]]
+            bucket["company_id"] = row["company_id"]
+            bucket["company_name"] = row["company__name"] or ""
+            bucket["count"] += 1
+            bucket["imbalance_sum"] += imbalance
+            if len(bucket["sample_tx_ids"]) < 10:
+                bucket["sample_tx_ids"].append(row["id"])
+            grand_total += 1
+            grand_imbalance += imbalance
+
+        return Response({
+            "total": grand_total,
+            "imbalance_sum": str(grand_imbalance),
+            "by_company": sorted(
+                (
+                    {
+                        "company_id": b["company_id"],
+                        "company_name": b["company_name"],
+                        "count": b["count"],
+                        "imbalance_sum": str(b["imbalance_sum"]),
+                        "sample_tx_ids": b["sample_tx_ids"],
+                    }
+                    for b in by_company.values()
+                ),
+                key=lambda r: -r["count"],
+            ),
+        })
+
+
 class AdminActivityDigestRunView(APIView):
     """POST /api/admin/activity/digest/run/
 

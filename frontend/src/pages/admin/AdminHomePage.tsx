@@ -1,10 +1,13 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { Link } from "react-router-dom"
 import { toast } from "sonner"
-import { Activity, AlertTriangle, Bug, GitBranch, Loader2, Mail, ShieldCheck, Users } from "lucide-react"
+import {
+  Activity, AlertTriangle, Bug, GitBranch, Loader2, Mail, Scale, ShieldCheck, Users,
+} from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { useAuth } from "@/providers/AuthProvider"
-import { adminApi } from "@/features/admin/api"
+import { adminApi, type LedgerIntegrityResponse } from "@/features/admin/api"
+import { cn } from "@/lib/utils"
 
 /**
  * Landing page for the platform-admin area. Intentionally bare right now —
@@ -15,6 +18,19 @@ import { adminApi } from "@/features/admin/api"
 export function AdminHomePage() {
   const { user } = useAuth()
   const [digestLoading, setDigestLoading] = useState<null | "dry" | "send">(null)
+  const [integrity, setIntegrity] = useState<LedgerIntegrityResponse | null>(null)
+
+  // Small fire-and-forget fetch on mount — the KPI banner only
+  // renders when the count > 0, so the common "nothing broken"
+  // case stays visually quiet. Failures are silent; this is a
+  // dashboard card, not a critical-path load.
+  useEffect(() => {
+    let cancelled = false
+    void adminApi.ledgerIntegrity()
+      .then((res) => { if (!cancelled) setIntegrity(res) })
+      .catch(() => { /* silent */ })
+    return () => { cancelled = true }
+  }, [])
 
   const runDigest = async (dry: boolean) => {
     setDigestLoading(dry ? "dry" : "send")
@@ -65,6 +81,47 @@ export function AdminHomePage() {
           </>
         }
       />
+      {/* Integrity banner — only renders when the ledger actually has
+          broken transactions, so a healthy platform stays quiet. */}
+      {integrity && integrity.total > 0 && (
+        <div className={cn(
+          "card-elevated rounded-md border border-warning/40 bg-warning/5 p-3",
+        )}>
+          <div className="flex items-start gap-3">
+            <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-warning/15 text-warning">
+              <Scale className="h-4 w-4" />
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-baseline gap-2 text-[13px] font-semibold">
+                <span>Integridade contábil</span>
+                <span className="rounded-full bg-warning/15 px-2 py-0.5 text-[11px] font-medium text-warning">
+                  {integrity.total} descompensada{integrity.total === 1 ? "" : "s"}
+                </span>
+              </div>
+              <p className="mt-0.5 text-[12px] text-muted-foreground">
+                Transações com Σdébito ≠ Σcrédito (legado do fluxo anterior do
+                PR 8). Soma do desequilíbrio: <span className="tabular-nums font-mono">{integrity.imbalance_sum}</span>.
+                Rode <code className="rounded bg-muted px-1 py-0.5 text-[11px]">python manage.py reconcile_missing_cash_legs --dry-run</code> e,
+                quando estiver satisfeito, <code className="rounded bg-muted px-1 py-0.5 text-[11px]">--apply</code>.
+              </p>
+              {integrity.by_company.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1.5 text-[11px]">
+                  {integrity.by_company.slice(0, 6).map((r) => (
+                    <span
+                      key={r.company_id}
+                      className="rounded-md border border-border bg-surface-3 px-2 py-0.5"
+                      title={`Imbalance: ${r.imbalance_sum}`}
+                    >
+                      {r.company_name || `Company #${r.company_id}`}: {r.count}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
         <AdminCard
           to="/admin/users"
