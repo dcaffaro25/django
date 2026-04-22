@@ -10,11 +10,19 @@ import type {
   TemplateDocument,
 } from "./types"
 
+/** Speed/quality knob for OpenAI template generation. ``fast`` routes
+ *  to ``gpt-4o-mini`` (default; 2-5× faster end-to-end, schema-pinned
+ *  output keeps quality ≈ parity for typical templates). ``standard``
+ *  stays on ``gpt-4o`` for unusually complex preferences. Ignored by
+ *  Anthropic — its model choice is env-driven. */
+export type AiTemplateQuality = "fast" | "standard"
+
 export interface AiGenerateTemplateRequest {
   report_type: ReportType
   preferences?: string
   provider?: "openai" | "anthropic"
   model?: string
+  quality?: AiTemplateQuality
 }
 export interface AiGenerateTemplateResponse {
   document: TemplateDocument

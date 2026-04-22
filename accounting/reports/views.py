@@ -298,7 +298,9 @@ class AiStub(viewsets.ViewSet):
               "report_type": "income_statement" | "balance_sheet" | "cash_flow",
               "preferences": "optional free-text",
               "provider": "openai" | "anthropic" (optional),
-              "model": "..." (optional)
+              "model": "..." (optional, explicit override),
+              "quality": "fast" | "standard" (optional; OpenAI only;
+                         default "fast" → gpt-4o-mini)
             }
 
         Returns the draft ``TemplateDocument`` (JSON). Never persists.
@@ -312,6 +314,10 @@ class AiStub(viewsets.ViewSet):
                 {"report_type": "Must be income_statement | balance_sheet | cash_flow"}
             )
 
+        quality = (body.get("quality") or "").strip().lower() or None
+        if quality and quality not in ("fast", "standard"):
+            raise ValidationError({"quality": "Must be fast | standard"})
+
         try:
             doc = generate_template(
                 company_id=tenant.id,
@@ -319,6 +325,7 @@ class AiStub(viewsets.ViewSet):
                 preferences=(body.get("preferences") or ""),
                 provider=body.get("provider"),
                 model=body.get("model"),
+                quality=quality,
                 context=self._ctx(request),
             )
         except AiAssistantError as exc:

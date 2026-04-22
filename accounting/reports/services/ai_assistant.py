@@ -363,6 +363,39 @@ def _build_user_prompt(report_type: str, preferences: str, chart: Dict[str, Any]
 # --- Public entry point ----------------------------------------------------
 
 
+QUALITY_FAST = "fast"
+QUALITY_STANDARD = "standard"
+_VALID_QUALITIES = (QUALITY_FAST, QUALITY_STANDARD)
+
+
+def _resolve_openai_model(
+    quality: Optional[str],
+    explicit_model: Optional[str],
+) -> Optional[str]:
+    """Pick an OpenAI model for ``generate_template`` from the quality
+    knob. Callers can still override with an explicit ``model`` string
+    (used by debugging / experimentation paths), which wins.
+
+    ``fast`` (new default) routes to ``gpt-4o-mini`` — schema-constrained
+    output via Structured Outputs keeps quality ≈ parity with ``gpt-4o``
+    for template generation at ~3× streaming speed. ``standard`` routes
+    to ``gpt-4o`` for the cases where the operator explicitly wants the
+    larger model (unusually complex preferences or new account types
+    the schema-only prompt can't disambiguate).
+
+    Returns ``None`` to mean "let the client pick its default" — the
+    client then falls back to ``TEMPLATE_AI_MODEL`` env var then
+    ``gpt-4o``, preserving the escape hatch.
+    """
+    if explicit_model:
+        return explicit_model
+    q = (quality or QUALITY_FAST).strip().lower()
+    if q == QUALITY_STANDARD:
+        return "gpt-4o"
+    # Anything else (including invalid strings) collapses to fast.
+    return "gpt-4o-mini"
+
+
 def generate_template(
     *,
     company_id: int,
@@ -370,9 +403,15 @@ def generate_template(
     preferences: str = "",
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    quality: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Call the AI and return a validated :class:`TemplateDocument` as a dict.
+
+    ``quality`` (new): ``"fast"`` (default) → ``gpt-4o-mini``;
+    ``"standard"`` → ``gpt-4o``. Ignored when ``model`` is set
+    explicitly or when ``provider`` isn't OpenAI (Anthropic's model
+    choice is still controlled by env var).
 
     Raises
     ------
@@ -384,30 +423,34 @@ def generate_template(
     chart = _build_chart_context(company_id=company_id)
     user_prompt = _build_user_prompt(report_type, preferences, chart)
 
+    using_structured_outputs = (provider or "").lower() in ("", "openai")
+    effective_model = model
+    if using_structured_outputs and not effective_model:
+        effective_model = _resolve_openai_model(quality, explicit_model=None)
+
     try:
-        client = ExternalAIClient(provider=provider, model=model)
+        client = ExternalAIClient(provider=provider, model=effective_model)
     except Exception as exc:
         raise AiAssistantError(f"AI client init failed: {exc}") from exc
 
-    # Nudge the AI toward our report_type by putting it at the top of the user
-    # message even though it's also repeated in the system prompt.
     # On OpenAI we use Structured Outputs — the model is token-sampled
     # against our TemplateDocument schema, so the reply is guaranteed to
     # pass pydantic. No repair pass needed. Anthropic falls back to
     # prompt-based JSON for now (it ignores response_schema and we
     # pydantic-validate the reply as before).
-    using_structured_outputs = (provider or "").lower() in ("", "openai")
     response_schema = (
         to_openai_strict_schema() if using_structured_outputs else None
     )
 
     log.info(
         "ai_assistant.generate_template: report_type=%s, accounts=%s/%s, "
-        "prefs_len=%s, structured_outputs=%s",
+        "prefs_len=%s, quality=%s, model=%s, structured_outputs=%s",
         report_type,
         chart["sampled"],
         chart["total_accounts"],
         len(preferences),
+        quality or QUALITY_FAST,
+        effective_model or "(client default)",
         using_structured_outputs,
     )
 

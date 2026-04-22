@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
-import { Sparkles, X, Loader2 } from "lucide-react"
+import { Sparkles, X, Loader2, Zap } from "lucide-react"
 import { cn } from "@/lib/utils"
-import type { ReportType, TemplateDocument } from "@/features/reports"
+import type { AiTemplateQuality, ReportType, TemplateDocument } from "@/features/reports"
 import { useAiGenerateTemplate } from "@/features/reports"
 
 const REPORT_TYPE_OPTIONS: { value: ReportType; label: string; hint: string }[] = [
@@ -22,6 +22,11 @@ export function AiGenerateModal({
   const [reportType, setReportType] = useState<ReportType>("income_statement")
   const [preferences, setPreferences] = useState("")
   const [provider, setProvider] = useState<"openai" | "anthropic">("openai")
+  // Quality is sent to the backend as "fast" | "standard". Default is
+  // "fast" — schema-pinned output on gpt-4o-mini is 2-5× faster and
+  // quality ≈ parity for typical templates. "standard" falls back to
+  // gpt-4o when the operator explicitly wants the larger model.
+  const [quality, setQuality] = useState<AiTemplateQuality>("fast")
   const [error, setError] = useState<string | null>(null)
   // Elapsed-seconds counter while the LLM is grinding. 1-second tick
   // is cheap, and a running number prevents the "is this hung?"
@@ -57,6 +62,9 @@ export function AiGenerateModal({
         report_type: reportType,
         preferences: preferences.trim() || undefined,
         provider,
+        // Backend ignores quality for Anthropic today — safe to always
+        // send, keeps the request shape uniform.
+        quality,
       })
       onGenerated(res.document)
       onClose()
@@ -133,6 +141,57 @@ export function AiGenerateModal({
               rows={3}
               className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-[12px] outline-none focus:border-ring"
             />
+          </div>
+
+          {/* Quality / speed knob. Only meaningful for OpenAI today —
+              Anthropic ignores it. We still render it when Anthropic is
+              picked but grey it out so the tradeoff concept stays
+              visible; operators switching providers won't wonder where
+              it went. */}
+          <div>
+            <label className="mb-1 block text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+              Qualidade
+              {provider === "anthropic" && (
+                <span className="ml-1 normal-case tracking-normal text-muted-foreground/70">
+                  (Anthropic usa modelo configurado no servidor)
+                </span>
+              )}
+            </label>
+            <div className={cn("grid grid-cols-2 gap-1.5", provider === "anthropic" && "opacity-50")}>
+              <button
+                onClick={() => provider === "openai" && setQuality("fast")}
+                disabled={provider !== "openai"}
+                className={cn(
+                  "flex flex-col items-start gap-0.5 rounded-md border p-2 text-left transition-colors",
+                  quality === "fast"
+                    ? "border-primary bg-primary/10"
+                    : "border-border bg-background hover:bg-accent",
+                )}
+              >
+                <span className="flex items-center gap-1 text-[12px] font-semibold">
+                  <Zap className="h-3 w-3 text-amber-500" />
+                  Rápido (recomendado)
+                </span>
+                <span className="text-[10px] text-muted-foreground">
+                  GPT-4o-mini · ~15–30s · qualidade preservada pelo schema
+                </span>
+              </button>
+              <button
+                onClick={() => provider === "openai" && setQuality("standard")}
+                disabled={provider !== "openai"}
+                className={cn(
+                  "flex flex-col items-start gap-0.5 rounded-md border p-2 text-left transition-colors",
+                  quality === "standard"
+                    ? "border-primary bg-primary/10"
+                    : "border-border bg-background hover:bg-accent",
+                )}
+              >
+                <span className="text-[12px] font-semibold">Completo</span>
+                <span className="text-[10px] text-muted-foreground">
+                  GPT-4o · ~60–120s · para casos incomuns ou preferências densas
+                </span>
+              </button>
+            </div>
           </div>
 
           <div>
