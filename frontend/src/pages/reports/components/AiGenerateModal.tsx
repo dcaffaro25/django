@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { Sparkles, X, Loader2 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import type { ReportType, TemplateDocument } from "@/features/reports"
@@ -23,7 +23,30 @@ export function AiGenerateModal({
   const [preferences, setPreferences] = useState("")
   const [provider, setProvider] = useState<"openai" | "anthropic">("openai")
   const [error, setError] = useState<string | null>(null)
+  // Elapsed-seconds counter while the LLM is grinding. 1-second tick
+  // is cheap, and a running number prevents the "is this hung?"
+  // anxiety during 30-60s AI calls.
+  const [elapsed, setElapsed] = useState(0)
+  const elapsedTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const generate = useAiGenerateTemplate()
+
+  useEffect(() => {
+    if (!generate.isPending) {
+      if (elapsedTimerRef.current) {
+        clearInterval(elapsedTimerRef.current)
+        elapsedTimerRef.current = null
+      }
+      setElapsed(0)
+      return
+    }
+    const startedAt = Date.now()
+    elapsedTimerRef.current = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startedAt) / 1000))
+    }, 1000)
+    return () => {
+      if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current)
+    }
+  }, [generate.isPending])
 
   if (!open) return null
 
@@ -38,8 +61,18 @@ export function AiGenerateModal({
       onGenerated(res.document)
       onClose()
     } catch (err: unknown) {
-      const resp = (err as { response?: { data?: { error?: string } } })?.response?.data
-      const msg = resp?.error ?? (err instanceof Error ? err.message : "Falha na IA")
+      // The client sets a 180s timeout on this endpoint (see
+      // ``features/reports/api.ts``). Axios surfaces timeouts as
+      // ``code === "ECONNABORTED"`` with a message starting with
+      // "timeout of". Rewrite that into actionable operator copy
+      // instead of the raw axios string.
+      const code = (err as { code?: string })?.code
+      const raw = (err as { response?: { data?: { error?: string } } })?.response?.data?.error
+        ?? (err instanceof Error ? err.message : "")
+      const isTimeout = code === "ECONNABORTED" || /timeout of/i.test(raw || "")
+      const msg = isTimeout
+        ? "A IA demorou mais do que o esperado (>3 min). Tente novamente com preferências mais enxutas ou o outro provedor."
+        : raw || "Falha na IA"
       setError(msg)
     }
   }
@@ -148,7 +181,9 @@ export function AiGenerateModal({
             ) : (
               <Sparkles className="h-3.5 w-3.5" />
             )}
-            {generate.isPending ? "Gerando..." : "Gerar"}
+            {generate.isPending
+              ? `Gerando${elapsed > 0 ? ` · ${elapsed}s` : "..."}`
+              : "Gerar"}
           </button>
         </div>
       </div>
