@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useState } from "react"
 import { useTranslation } from "react-i18next"
 import { toast } from "sonner"
 import { Drawer } from "vaul"
@@ -10,9 +10,9 @@ import {
   X,
   XCircle,
 } from "lucide-react"
-import { SearchableAccountSelect } from "@/components/accounts/SearchableAccountSelect"
-import { useAccounts, useCreateSuggestions } from "@/features/reconciliation"
-import type { AccountLite, BankTransaction } from "@/features/reconciliation/types"
+import { useCreateSuggestions, useLeafAccounts } from "@/features/reconciliation"
+import type { BankTransaction } from "@/features/reconciliation/types"
+import { SearchableAccountSelect } from "@/components/reconciliation/SearchableAccountSelect"
 import { logAction, logError } from "@/lib/activity-beacon"
 import { cn, formatCurrency, formatDate } from "@/lib/utils"
 
@@ -50,7 +50,6 @@ function resolveContraSide(bankAmount: number): {
   return { side: "credit", amount: abs }
 }
 
-
 /* ---------------- Drawer ---------------- */
 
 type MassRow = {
@@ -74,25 +73,12 @@ export function MassReconcileDrawer({
   onCreated: () => void
 }) {
   const { t } = useTranslation(["reconciliation", "common"])
-  const { data: accounts = [] } = useAccounts()
   const createSuggestions = useCreateSuggestions()
 
   // Only leaf, active accounts are legitimate posting targets. Mass-match
   // makes this extra important — an operator applying a group account to
   // 20 rows in one click would create 20 invalid journal entries.
-  const leafAccounts = useMemo<AccountLite[]>(() => {
-    const parents = new Set<number>()
-    for (const a of accounts) {
-      if (a.parent != null) parents.add(a.parent)
-    }
-    return (accounts as AccountLite[])
-      .filter((a) => a.is_active !== false && !parents.has(a.id))
-      .sort(
-        (a, b) =>
-          (a.account_code ?? "").localeCompare(b.account_code ?? "", undefined, { numeric: true }) ||
-          (a.path ?? "").localeCompare(b.path ?? "", undefined, { numeric: true }),
-      )
-  }, [accounts])
+  const leafAccounts = useLeafAccounts()
 
   const [rows, setRows] = useState<MassRow[]>([])
   const [headerAccount, setHeaderAccount] = useState<number | null>(null)

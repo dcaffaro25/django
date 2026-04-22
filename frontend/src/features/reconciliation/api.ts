@@ -172,6 +172,29 @@ export const reconApi = {
   deleteJournalEntry: (id: number) => api.tenant.delete<void>(`/api/journal_entries/${id}/`),
 
   /**
+   * Create one or more new JEs on the same Transaction as the template.
+   * Used by the Bancada book-row "Ajustar" action — operators add a
+   * balanced debit/credit pair without touching the existing entries.
+   * Backed by JournalEntryViewSet.derive_from.
+   */
+  deriveJournalEntries: (body: {
+    template_journal_entry_id: number
+    entries: Array<{
+      account_id: number
+      debit_amount?: string | number | null
+      credit_amount?: string | number | null
+      description?: string
+      date?: string
+      cost_center_id?: number | null
+      state?: "pending" | "posted" | "canceled"
+    }>
+  }) =>
+    api.tenant.post<{ transaction_id: number; journal_entries: JournalEntry[] }>(
+      "/api/journal_entries/derive_from/",
+      body,
+    ),
+
+  /**
    * JEs attached to a single transaction. One query per expanded row;
    * backed by TransactionViewSet.journal_entries @action. Returns the
    * detail-serializer shape (id, account, debit/credit, state, …).

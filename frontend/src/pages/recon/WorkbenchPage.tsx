@@ -9,8 +9,8 @@ import { toast } from "sonner"
 import { Drawer } from "vaul"
 import {
   Wallet, BookOpen, Check, X, Sparkles, ArrowLeftRight, AlertCircle, AlertTriangle,
-  Plus, Trash2, CheckCircle2, Search, RotateCcw, Loader2, Wand2,
-  ArrowUp, ArrowDown, ChevronsLeft, ChevronLeft, ChevronRight, ChevronsRight,
+  Plus, Trash2, CheckCircle2, Search, RotateCcw, Loader2, Wand2, RefreshCw, Scale,
+  FileText, ArrowUp, ArrowDown, ChevronsLeft, ChevronLeft, ChevronRight, ChevronsRight,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { StatusBadge } from "@/components/ui/status-badge"
@@ -20,14 +20,16 @@ import { logAction, logError } from "@/lib/activity-beacon"
 import { useColumnVisibility, type ColumnDef } from "@/stores/column-visibility"
 import { RunRuleDrawer } from "@/components/reconciliation/RunRuleDrawer"
 import { MassReconcileDrawer } from "@/components/reconciliation/MassReconcileDrawer"
-import { SearchableAccountSelect } from "@/components/accounts/SearchableAccountSelect"
+import { AdjustmentDrawer } from "@/components/reconciliation/AdjustmentDrawer"
+import { TransactionDetailsDrawer } from "@/components/reconciliation/TransactionDetailsDrawer"
+import { SearchableAccountSelect } from "@/components/reconciliation/SearchableAccountSelect"
 import {
-  useAccounts,
   useBankAccountsList,
   useBankTransactions,
   useCreateSuggestions,
   useEntities,
   useFinalizeMatches,
+  useLeafAccounts,
   useSuggestMatches,
   useUnmatchedJournalEntries,
   workbenchFiltersToStacks,
@@ -281,11 +283,13 @@ export function WorkbenchPage() {
     data: rawBankTxs = [],
     isLoading: bankLoading,
     isFetching: bankFetching,
+    refetch: refetchBank,
   } = useBankTransactions(txParams)
   const {
     data: rawJournalEntries = [],
     isLoading: bookLoading,
     isFetching: bookFetching,
+    refetch: refetchBook,
   } = useUnmatchedJournalEntries(jeParams)
 
   // Client-side filtering: each pane owns its own filters; values below are
@@ -462,6 +466,12 @@ export function WorkbenchPage() {
   const [addOpen, setAddOpen] = useState(false)
   const [massOpen, setMassOpen] = useState(false)
   const [runRuleOpen, setRunRuleOpen] = useState(false)
+  // Per-row adjustment: clicking the "Ajustar" icon on a book row opens
+  // the drawer seeded with that JE as the template. null = closed.
+  const [adjustTemplate, setAdjustTemplate] = useState<JournalEntry | null>(null)
+  // Per-row transaction inspector: shows every JE tied to the clicked
+  // row's Transaction (the cash leg + contras). Read-only view.
+  const [detailsSource, setDetailsSource] = useState<JournalEntry | null>(null)
 
   // Keyboard-driven cursor state
   const [activePane, setActivePane] = useState<"bank" | "book">("bank")
@@ -501,7 +511,14 @@ export function WorkbenchPage() {
   const balanced = Math.abs(delta) < 0.005
   const hasSelection = selectedBank.size > 0 || selectedBook.size > 0
 
-  const [adjustment, setAdjustment] = useState<"none" | "bank" | "journal">("none")
+  // The adjustment-side dropdown ("nenhum / banco / livro") was
+  // removed: letting operators submit unbalanced matches with
+  // adjustment_side=none produced reconciliations in status="open"
+  // (Aberto) — a partial recon nobody intended to create. Conciliar
+  // stays, but it is now only enabled when delta == 0 (exact match).
+  // Unbalanced selections must go through "Completar conciliação com
+  // lançamento" (AddEntriesDrawer), which routes through
+  // create_suggestions and guarantees a balanced adjustment Transaction.
   const finalize = useFinalizeMatches()
   const suggestApi = useSuggestMatches()
   const createSuggestions = useCreateSuggestions()
@@ -511,6 +528,13 @@ export function WorkbenchPage() {
       toast.error("Selecione ao menos 1 bancária e 1 contábil")
       return
     }
+    if (!balanced) {
+      // Defensive: the button is disabled in this state, but the `m`
+      // hotkey could still fire. Block the network call outright so a
+      // partial/Aberto recon never gets persisted by accident.
+      toast.error("Conciliação direta só com diferença zero. Use Completar conciliação com lançamento.")
+      return
+    }
     const t0 = performance.now()
     finalize.mutate(
       {
@@ -518,22 +542,19 @@ export function WorkbenchPage() {
           {
             bank_transaction_ids: Array.from(selectedBank),
             journal_entry_ids: Array.from(selectedBook),
-            adjustment_side: adjustment,
+            adjustment_side: "none",
           },
         ],
-        adjustment_side: adjustment,
+        adjustment_side: "none",
       },
       {
         onSuccess: (res) => {
-          // Telemetry: matching is the primary workbench win-state.
-          // Meta captures the selection shape so the admin funnel
-          // view can distinguish 1:1 from 3:2 matches, etc.
           logAction("recon.match", {
             duration_ms: Math.round(performance.now() - t0),
             meta: {
               num_bank: selectedBank.size,
               num_book: selectedBook.size,
-              adjustment_side: adjustment,
+              adjustment_side: "none",
               created: res.created?.length ?? 0,
               problems: res.problems?.length ?? 0,
             },
@@ -576,7 +597,9 @@ export function WorkbenchPage() {
   useHotkeys("tab", (e) => { e.preventDefault(); setActivePane((p) => (p === "bank" ? "book" : "bank")) }, { enableOnFormTags: false })
   useHotkeys("x, space", (e) => { e.preventDefault(); toggleCursor() }, { enableOnFormTags: false })
   useHotkeys("shift+x", () => { clearSelection() }, { enableOnFormTags: false })
-  useHotkeys("m", () => { if (selectedBank.size && selectedBook.size) onMatch() }, { enableOnFormTags: false })
+  // Only fire the match hotkey when the selection is exact — same rule
+  // the button uses (no partial/Aberto recons via keyboard either).
+  useHotkeys("m", () => { if (selectedBank.size && selectedBook.size && balanced) onMatch() }, { enableOnFormTags: false })
   useHotkeys("s", () => { if (selectedBank.size === 1 && selectedBook.size === 0) onGenerateSuggestion() }, { enableOnFormTags: false })
   useHotkeys("slash", (e) => {
     e.preventDefault()
@@ -670,6 +693,11 @@ export function WorkbenchPage() {
           onFocus={() => setActivePane("bank")}
           headerAction={
             <div className="flex items-center gap-1.5">
+              <RefreshButton
+                onClick={() => refetchBank()}
+                isFetching={bankFetching}
+                title="Atualizar extratos"
+              />
               <SortMenu
                 options={BANK_SORT_OPTIONS}
                 value={bankSort}
@@ -742,6 +770,11 @@ export function WorkbenchPage() {
           onFocus={() => setActivePane("book")}
           headerAction={
             <div className="flex items-center gap-1.5">
+              <RefreshButton
+                onClick={() => refetchBook()}
+                isFetching={bookFetching}
+                title="Atualizar lançamentos"
+              />
               <SortMenu
                 options={BOOK_SORT_OPTIONS}
                 value={bookSort}
@@ -795,6 +828,8 @@ export function WorkbenchPage() {
             items={pagedJournalEntries}
             selected={selectedBook}
             onToggle={toggleBook}
+            onAdjust={(item) => setAdjustTemplate(item)}
+            onInspect={(item) => setDetailsSource(item)}
             cursorIndex={activePane === "book" ? cursorBook : -1}
             isVisible={bookCols.isVisible}
           />
@@ -820,8 +855,6 @@ export function WorkbenchPage() {
             delta={delta}
             balanced={balanced}
             bankAccounts={bankAccounts ?? []}
-            adjustment={adjustment}
-            setAdjustment={setAdjustment}
             onClear={clearSelection}
             onMatch={onMatch}
             onSuggest={onGenerateSuggestion}
@@ -861,6 +894,18 @@ export function WorkbenchPage() {
         onCreated={clearSelection}
       />
 
+      <AdjustmentDrawer
+        open={adjustTemplate != null}
+        onClose={() => setAdjustTemplate(null)}
+        template={adjustTemplate}
+      />
+
+      <TransactionDetailsDrawer
+        open={detailsSource != null}
+        onClose={() => setDetailsSource(null)}
+        source={detailsSource}
+      />
+
       <RunRuleDrawer
         open={runRuleOpen}
         onClose={() => setRunRuleOpen(false)}
@@ -882,7 +927,7 @@ export function WorkbenchPage() {
               { keys: ["Space"], label: "Marcar/desmarcar linha do cursor" },
               { keys: ["X"], label: "Marcar/desmarcar linha do cursor" },
               { keys: ["Shift", "X"], label: "Limpar seleção" },
-              { keys: ["M"], label: "Conciliar seleção atual" },
+              { keys: ["M"], label: "Conciliar seleção (diferença zero)" },
               { keys: ["S"], label: "Sugerir (1 extrato selecionado)" },
               { keys: ["/"], label: "Focar busca de descrição" },
             ],
@@ -978,6 +1023,37 @@ function Pane({
         </div>
       )}
     </div>
+  )
+}
+
+/* ---------------- Refresh button (per pane) ---------------- */
+
+/**
+ * Per-pane refresh button. Triggers the query's refetch and spins the
+ * icon while fetching. Lives next to the sort/column picker in each
+ * pane header so operators can re-pull extract or JE data without
+ * disturbing the other pane's state.
+ */
+function RefreshButton({
+  onClick,
+  isFetching,
+  title,
+}: {
+  onClick: () => void
+  isFetching: boolean
+  title: string
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={isFetching}
+      title={title}
+      aria-label={title}
+      className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-60"
+    >
+      <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} />
+    </button>
   )
 }
 
@@ -1550,11 +1626,16 @@ function BankList({
 }
 
 function BookList({
-  items, selected, onToggle, cursorIndex = -1, isVisible,
+  items, selected, onToggle, onAdjust, onInspect, cursorIndex = -1, isVisible,
 }: {
   items: JournalEntry[]
   selected: Set<number>
   onToggle: (id: number) => void
+  /** Per-row "Ajustar" click — opens the adjustment drawer for this JE. */
+  onAdjust?: (item: JournalEntry) => void
+  /** Per-row "Ver transação" click — opens the details drawer with every
+   *  JE tied to the same Transaction as this row. */
+  onInspect?: (item: JournalEntry) => void
   cursorIndex?: number
   isVisible?: (key: string) => boolean
 }) {
@@ -1581,12 +1662,25 @@ function BookList({
           const acctRef = (item as unknown as { account?: { name?: string; account_code?: string } | null; account_name?: string })
           const acctLabel = acctRef.account?.name ?? acctRef.account_name
           return (
-            <button
+            // Row root is a div (not a button) because we now render a
+            // real <button> inside for the "Ajustar" action — nested
+            // buttons are invalid HTML. We keep the click/keyboard
+            // affordances via role/tabIndex so selection still feels
+            // like a button press.
+            <div
               key={item.id}
+              role="button"
+              tabIndex={0}
               onClick={() => onToggle(item.id)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault()
+                  onToggle(item.id)
+                }
+              }}
               style={{ position: "absolute", top: 0, left: 0, width: "100%", transform: `translateY(${vi.start}px)`, height: vi.size }}
               className={cn(
-                "flex w-full items-center gap-2 border-b border-border/60 px-3 text-left text-[12px] transition-colors",
+                "flex w-full cursor-pointer items-center gap-2 border-b border-border/60 px-3 text-left text-[12px] transition-colors outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-primary/60",
                 isSel ? "bg-primary/10 hover:bg-primary/15" : "hover:bg-accent/50",
                 isCursor && "ring-1 ring-inset ring-primary/60",
               )}
@@ -1621,7 +1715,36 @@ function BookList({
               <div className={cn("shrink-0 text-right tabular-nums font-semibold", amt < 0 ? "text-muted-foreground" : "text-foreground")}>
                 {formatCurrency(amt)}
               </div>
-            </button>
+              {(onInspect || onAdjust) && (
+                // stopPropagation keeps the row from toggling when the
+                // operator clicks an icon — selection, inspection, and
+                // adjustment are independent actions on the same row.
+                <div className="ml-1 flex shrink-0 items-center gap-1">
+                  {onInspect && (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); onInspect(item) }}
+                      title="Ver transação e lançamentos associados"
+                      aria-label="Ver transação"
+                      className="grid h-6 w-6 place-items-center rounded-md border border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground"
+                    >
+                      <FileText className="h-3 w-3" />
+                    </button>
+                  )}
+                  {onAdjust && (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); onAdjust(item) }}
+                      title="Ajustar transação (adicionar par débito/crédito)"
+                      aria-label="Ajustar transação"
+                      className="grid h-6 w-6 place-items-center rounded-md border border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground"
+                    >
+                      <Scale className="h-3 w-3" />
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
           )
         })}
       </div>
@@ -1633,7 +1756,7 @@ function BookList({
 
 function SelectionSummary({
   bankItems, bookItems, bankSum, bookSum, delta, balanced,
-  bankAccounts, adjustment, setAdjustment,
+  bankAccounts,
   onClear, onMatch, onSuggest, onAddEntries, onMassReconcile,
   canSuggest, suggestLoading, matching,
 }: {
@@ -1644,8 +1767,6 @@ function SelectionSummary({
   delta: number
   balanced: boolean
   bankAccounts: Array<{ id: number; name: string; currency?: { code: string } | null }>
-  adjustment: "none" | "bank" | "journal"
-  setAdjustment: (v: "none" | "bank" | "journal") => void
   onClear: () => void
   onMatch: () => void
   onSuggest: () => void
@@ -1719,17 +1840,14 @@ function SelectionSummary({
         )}
 
         <div className="ml-auto flex items-center gap-2">
-          {!balanced && bookItems.length > 0 && (
-            <select
-              value={adjustment}
-              onChange={(e) => setAdjustment(e.target.value as "none" | "bank" | "journal")}
-              className="h-8 rounded-md border border-border bg-background px-2 text-[12px]"
-            >
-              <option value="none">{t("workbench.adjustment.none")}</option>
-              <option value="bank">{t("workbench.adjustment.bank")}</option>
-              <option value="journal">{t("workbench.adjustment.journal")}</option>
-            </select>
-          )}
+          {/* The adjustment-side dropdown ("nenhum/banco/livro") was
+              removed: submitting with adjustment_side="none" on an
+              unbalanced selection persisted partial recons in
+              status="open" (Aberto) that nobody intended to create.
+              Conciliar stays, but is gated on balanced == true; any
+              non-zero delta must now go through "Completar conciliação
+              com lançamento" (AddEntriesDrawer), which routes through
+              create_suggestions and guarantees a balanced Transaction. */}
           <button
             onClick={onSuggest}
             disabled={!canSuggest || suggestLoading}
@@ -1774,9 +1892,22 @@ function SelectionSummary({
             <X className="h-3.5 w-3.5" />
             {t("workbench.selection.clear")}
           </button>
+          {/* Conciliar is enabled only when the selection balances
+              exactly (delta == 0). Unbalanced cases route through
+              "Completar conciliação com lançamento" — the adjustment-
+              side dropdown was removed because adjustment_side=none
+              silently persisted partial ("Aberto") recons nobody
+              intended to create. */}
           <button
             onClick={onMatch}
-            disabled={matching || bookItems.length === 0}
+            disabled={matching || bookItems.length === 0 || bankItems.length === 0 || !balanced}
+            title={
+              bankItems.length === 0 || bookItems.length === 0
+                ? "Selecione ao menos 1 bancária e 1 contábil"
+                : !balanced
+                ? "Conciliação direta só com diferença zero — use Completar conciliação com lançamento para ajustes"
+                : undefined
+            }
             className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             <Check className="h-3.5 w-3.5" />
@@ -1979,23 +2110,13 @@ function AddEntriesDrawer({
   onCreated: () => void
 }) {
   const { t } = useTranslation(["reconciliation", "common"])
-  const { data: accounts = [] } = useAccounts()
   const createSuggestions = useCreateSuggestions()
 
-  // Restrict the dropdown to leaf accounts — journal entries should never
-  // post to a group / parent. We derive leaf-ness client-side by checking
-  // whether any other account has this one as parent (the serializer
-  // doesn't expose is_leaf directly).
-  const leafAccounts = useMemo<AccountLite[]>(() => {
-    const parents = new Set<number>()
-    for (const a of accounts) {
-      if (a.parent != null) parents.add(a.parent)
-    }
-    return (accounts as AccountLite[])
-      .filter((a) => a.is_active !== false && !parents.has(a.id))
-      .sort((a, b) => (a.account_code ?? "").localeCompare(b.account_code ?? "", undefined, { numeric: true })
-        || a.path.localeCompare(b.path, undefined, { numeric: true }))
-  }, [accounts])
+  // Leaf-only posting targets — see useLeafAccounts for the why. Shared
+  // with the mass-match drawer so both surfaces show the same set of
+  // selectable accounts (previously each drawer had its own copy, which
+  // let their behaviours drift).
+  const leafAccounts = useLeafAccounts()
 
   const [rows, setRows] = useState<EntryRow[]>([newEntryRow()])
 
@@ -2045,17 +2166,20 @@ function AddEntriesDrawer({
   const target = -delta  // what Σ(debit - credit) of contras must equal
   const balanceOk = Math.abs(contraRawSum - target) < 0.005
   const hasRows = rows.some((r) => r.account_id && Number(r.amount) > 0)
-  // The backend now enforces Σdebit == Σcredit on the new
-  // adjustment Transaction — no "create anyway" escape hatch.
-  const canSubmit = hasRows && balanceOk
+  // Exact 1:1 matches (delta == 0) need zero contra rows — the drawer
+  // replaces the old "Conciliar" button so this path must work. The
+  // backend accepts empty contras when adjustment_target == 0 (see
+  // create_balanced_adjustment's early return).
+  const isExactMatch = Math.abs(delta) < 0.005
+  const canSubmit = balanceOk && (hasRows || isExactMatch)
 
   const submit = () => {
-    if (!hasRows) {
-      toast.error(t("add_entries.must_have_rows") ?? "Adicione linhas")
-      return
-    }
     if (!balanceOk) {
       toast.error(t("add_entries.must_balance_toast") ?? "Deve fechar")
+      return
+    }
+    if (!hasRows && !isExactMatch) {
+      toast.error(t("add_entries.must_have_rows") ?? "Adicione linhas")
       return
     }
     if (bankItems.length !== 1) {
@@ -2086,7 +2210,13 @@ function AddEntriesDrawer({
         ? {
             suggestion_type: "use_existing_book",
             bank_transaction_id: bank.id,
-            existing_journal_entry_id: bookItems[0].id,
+            // Plural. Sending only `bookItems[0].id` silently dropped
+            // books 2..N — the backend then computed an adjustment target
+            // from the wrong subset, the contra balance check failed, the
+            // atomic block rolled back, and nothing was created. The
+            // backend accepts `existing_journal_entry_ids` directly; see
+            // accounting/views.py create_suggestions (`existing_ids`).
+            existing_journal_entry_ids: bookItems.map((b) => b.id),
             complementing_journal_entries: complementing,
           }
         : {
@@ -2299,17 +2429,14 @@ function EntryRowEditor({
         <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
           {t("add_entries.account")}
         </span>
-        {/* SearchableAccountSelect replaces the old native <select>.
-            Native selects rendered the dropdown at the button's width
-            (~230px in this grid cell), brutally truncating deep
-            account paths. The custom popover gets 720px and renders
-            the full path on a second line — see
-            ``components/accounts/SearchableAccountSelect``. */}
+        {/* Searchable picker — a 400+ account CoA is unusable as a plain
+            <select>. Matches the mass-match drawer so operators get a
+            consistent picker across every Bancada surface. */}
         <SearchableAccountSelect
           accounts={accounts}
           value={typeof row.account_id === "number" ? row.account_id : null}
           onChange={(id) => onChange({ account_id: id ?? "" })}
-          placeholder={t("add_entries.account") ?? "Conta"}
+          placeholder="—"
           compact
         />
       </label>
