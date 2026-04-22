@@ -1923,6 +1923,25 @@ function rowRawAmount(r: EntryRow): number {
 }
 
 /**
+ * The contra row's raw side (debit/credit) is the **mirror** of the
+ * auto-booked cash leg's side, because a balanced Transaction needs
+ * Σdebit == Σcredit. With the standard Ativo-Circulante cash account
+ * (direction=1):
+ *
+ *   delta < 0 (bank outflow) → cash credits |δ| → contra **debits** |δ|
+ *   delta > 0 (bank inflow)  → cash debits  |δ| → contra **credits** |δ|
+ *   delta = 0 → caller shouldn't open the drawer; default debit.
+ *
+ * An earlier version used ``delta >= 0 ? "debit" : "credit"`` — the
+ * PR-C convention where the row itself was the book entry. That was
+ * wrong in the PR-8 world: the row is the *contra*, the cash leg is
+ * auto-booked, and the two sides must net to zero in raw terms.
+ */
+function contraSideForDelta(delta: number): "debit" | "credit" {
+  return delta < 0 ? "debit" : "credit"
+}
+
+/**
  * Build the default first row from the bank transaction + delta. We
  * pre-populate the amount with the remaining difference and pre-fill the
  * description from the bank record so the user starts from a full row they
@@ -1931,13 +1950,9 @@ function rowRawAmount(r: EntryRow): number {
 function seedInitialRows(bank: BankTransaction | undefined, delta: number): EntryRow[] {
   if (!bank) return [newEntryRow()]
   const amt = Math.abs(delta) > 0.005 ? Math.abs(delta).toFixed(2) : ""
-  // If delta > 0 we need a debit to bring the sum up; if delta < 0 a credit.
-  // Note: this pre-seed assumes a direction=1 account. The user can flip
-  // side / pick a credit-natural account and the balance chip re-evaluates.
-  const side: "debit" | "credit" = delta >= 0 ? "debit" : "credit"
   return [newEntryRow({
     amount: amt,
-    side,
+    side: contraSideForDelta(delta),
     description: bank.description ?? "",
     date: bank.date ?? "",
   })]
@@ -1982,31 +1997,31 @@ function AddEntriesDrawer({
   }, [accounts])
 
   const [rows, setRows] = useState<EntryRow[]>([newEntryRow()])
-  // Operator override: by default we block unbalanced submit. Operators can
-  // opt into a partial reconciliation ("create anyway") via this flag.
-  const [allowPartial, setAllowPartial] = useState(false)
 
   useEffect(() => {
     if (open) {
       setRows(seedInitialRows(bankItems[0], delta))
-      setAllowPartial(false)
     }
   }, [open, bankItems, delta])
 
   const updateRow = (i: number, patch: Partial<EntryRow>) => setRows((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)))
   const removeRow = (i: number) => setRows((rs) => rs.filter((_, j) => j !== i))
   const addRow = () => {
-    // New rows inherit the bank description so the user doesn't have to
-    // retype it on every split; the side flips to absorb the remaining delta.
+    // New rows inherit the bank description so the operator doesn't retype
+    // it on every split; the pre-filled side absorbs the *remaining*
+    // gap toward the contra target (= -delta). Same mirror-of-cash rule
+    // as seedInitialRows: a positive remaining means "need more debits".
     const bank = bankItems[0]
     setRows((rs) => {
-      const runningSum = rs.reduce((s, r) => s + rowRawAmount(r), 0)
-      const remaining = delta - runningSum
+      const contraTarget = -delta  // total raw sum contras must hit
+      const contraSoFar = rs.reduce((s, r) => s + rowRawAmount(r), 0)
+      const remaining = contraTarget - contraSoFar
       return [
         ...rs,
         newEntryRow({
           description: bank?.description ?? "",
           date: bank?.date ?? "",
+          // remaining > 0 → need positive raw (debit). remaining < 0 → credit.
           side: remaining >= 0 ? "debit" : "credit",
           amount: Math.abs(remaining) > 0.005 ? Math.abs(remaining).toFixed(2) : "",
         }),
@@ -2029,9 +2044,8 @@ function AddEntriesDrawer({
   const target = -delta  // what Σ(debit - credit) of contras must equal
   const balanceOk = Math.abs(contraRawSum - target) < 0.005
   const hasRows = rows.some((r) => r.account_id && Number(r.amount) > 0)
-  // Note: the backend rejects unbalanced contras outright, so
-  // ``allowPartial`` can't bypass — we keep the flag for the client
-  // warning only, the submit still blocks when ``!balanceOk``.
+  // The backend now enforces Σdebit == Σcredit on the new
+  // adjustment Transaction — no "create anyway" escape hatch.
   const canSubmit = hasRows && balanceOk
 
   const submit = () => {
@@ -2039,7 +2053,7 @@ function AddEntriesDrawer({
       toast.error(t("add_entries.must_have_rows") ?? "Adicione linhas")
       return
     }
-    if (!balanceOk && !allowPartial) {
+    if (!balanceOk) {
       toast.error(t("add_entries.must_balance_toast") ?? "Deve fechar")
       return
     }
@@ -2223,29 +2237,19 @@ function AddEntriesDrawer({
               </div>
             </div>
 
-            {/* Escape hatch: allow unbalanced / partial reconciliation. The
-                server still records the match, but the totals won't zero
-                out — useful for create-anyway scenarios where the operator
-                intentionally wants to keep a residual or short-fund an
-                entry. */}
+            {/* When the contras don't close the Transaction, explain
+                *why* the submit is blocked. The backend (PR 8) refuses
+                unbalanced adjustment Transactions outright — no escape
+                hatch here anymore. */}
             {!balanceOk && (
-              <label className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/5 p-2.5 text-[11px]">
-                <input
-                  type="checkbox"
-                  checked={allowPartial}
-                  onChange={(e) => setAllowPartial(e.target.checked)}
-                  className="mt-0.5 accent-warning"
-                />
-                <div className="flex-1">
-                  <div className="font-medium text-warning">
-                    {t("add_entries.allow_partial_label") ?? "Criar mesmo sem equilibrar"}
-                  </div>
-                  <div className="text-muted-foreground">
-                    {t("add_entries.allow_partial_help") ??
-                      "Cria os lançamentos e concilia com a diferença restante. Use com cuidado — o registro bancário não ficará totalmente compensado."}
-                  </div>
+              <div className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/5 p-2.5 text-[11px]">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" />
+                <div className="flex-1 text-muted-foreground">
+                  Para fechar o lançamento, a soma dos débitos e créditos dos
+                  contras precisa compensar a perna de caixa automática.
+                  Ajuste os valores ou o lado das linhas acima.
                 </div>
-              </label>
+              </div>
             )}
           </div>
 
