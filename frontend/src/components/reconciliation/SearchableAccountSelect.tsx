@@ -1,7 +1,19 @@
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { ChevronDown, Search, X } from "lucide-react"
 import type { AccountLite } from "@/features/reconciliation/types"
 import { cn } from "@/lib/utils"
+
+/** Desired popover width. Large enough to render a 6-level path on one
+ *  line; when the viewport can't spare this much, we clamp to the
+ *  available horizontal space minus a small safety margin. */
+const PREFERRED_POPOVER_WIDTH = 640
+/** Minimum width before we force a clamp — narrower than this looks
+ *  broken, so on extremely cramped sizes we accept overflow rather
+ *  than shrink below this. */
+const MIN_POPOVER_WIDTH = 320
+/** Viewport-edge safety margin — keeps the popover off the literal edge
+ *  of the window so the shadow doesn't get clipped. */
+const EDGE_MARGIN = 8
 
 /**
  * Minimal searchable account picker. Built from scratch (no cmdk) so the
@@ -33,6 +45,14 @@ export function SearchableAccountSelect({
   const [q, setQ] = useState("")
   const containerRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  // Computed popover position + size. Measured on open (and on
+  // scroll/resize while open) so the popover always fits the available
+  // horizontal room. Fixes the AdjustmentDrawer case where the popover
+  // (640px) was wider than its 560px host drawer and got clipped.
+  const [popoverStyle, setPopoverStyle] = useState<React.CSSProperties>({
+    left: 0,
+    width: PREFERRED_POPOVER_WIDTH,
+  })
 
   const selected = value != null ? accounts.find((a) => a.id === value) : null
 
@@ -57,6 +77,53 @@ export function SearchableAccountSelect({
 
   useEffect(() => {
     if (open) inputRef.current?.focus()
+  }, [open])
+
+  // Position the popover so it always fits horizontally. Three cases:
+  //   1. Room to the right of the trigger's left edge: anchor left-0 →
+  //      popover grows rightward (default).
+  //   2. Not enough right-room but room to the left of the trigger's
+  //      right edge: anchor right-0 → popover grows leftward. This is
+  //      the critical case for the AdjustmentDrawer — its left-column
+  //      account picker couldn't fit 640px to the right, but fits
+  //      easily to the left within the drawer.
+  //   3. Neither side fits the preferred width: take the larger side
+  //      and clamp.
+  // Re-runs on scroll/resize so the popover tracks its trigger when
+  // the drawer body scrolls or the viewport changes.
+  useLayoutEffect(() => {
+    if (!open || !containerRef.current) return
+    const place = () => {
+      const el = containerRef.current
+      if (!el) return
+      const rect = el.getBoundingClientRect()
+      const viewportW = window.innerWidth
+      const spaceRight = viewportW - rect.left - EDGE_MARGIN
+      const spaceLeft = rect.right - EDGE_MARGIN
+
+      if (spaceRight >= PREFERRED_POPOVER_WIDTH) {
+        setPopoverStyle({ left: 0, width: PREFERRED_POPOVER_WIDTH })
+      } else if (spaceLeft >= PREFERRED_POPOVER_WIDTH) {
+        setPopoverStyle({ right: 0, width: PREFERRED_POPOVER_WIDTH })
+      } else {
+        // Cramped — pick the larger side and clamp. Keep at least
+        // MIN_POPOVER_WIDTH; if even that won't fit we accept overflow
+        // rather than render a useless 100px popover.
+        const width = Math.max(MIN_POPOVER_WIDTH, Math.max(spaceRight, spaceLeft))
+        if (spaceRight >= spaceLeft) setPopoverStyle({ left: 0, width })
+        else setPopoverStyle({ right: 0, width })
+      }
+    }
+    place()
+    window.addEventListener("resize", place)
+    // ``capture: true`` so we catch scroll on ANY ancestor (the drawer
+    // body's overflow-y-auto, the page itself, etc.) — the popover
+    // needs to re-measure when its trigger moves.
+    window.addEventListener("scroll", place, true)
+    return () => {
+      window.removeEventListener("resize", place)
+      window.removeEventListener("scroll", place, true)
+    }
   }, [open])
 
   const label = selected
@@ -86,10 +153,16 @@ export function SearchableAccountSelect({
         // A deeply-nested CoA path (e.g. "Ativo > Ativo Circulante >
         // Estoques > Matérias-Primas > Matérias-Primas - Produto >
         // Descontos Obtidos Matéria-Prima") blew past the old 480px cap
-        // and had to be truncated. Bumping the max to 640px (capped at
-        // 95vw so it stays on-screen on narrow tablets) plus wrapping
-        // each option lets operators read the whole path before picking.
-        <div className="absolute z-50 mt-1 w-[min(640px,95vw)] rounded-md border border-border bg-popover p-1 shadow-xl">
+        // and had to be truncated. Target width is 640px, but we let
+        // the layout effect above flip the anchor (left-0 vs right-0)
+        // and clamp the width when the host container (e.g. a 560px
+        // AdjustmentDrawer) can't fit the full width on the preferred
+        // side. The computed style wins over the Tailwind class — the
+        // class is kept only as a visual-style scaffold.
+        <div
+          style={popoverStyle}
+          className="absolute z-50 mt-1 max-w-[95vw] rounded-md border border-border bg-popover p-1 shadow-xl"
+        >
           <div className="flex items-center gap-2 rounded-md border border-border bg-background px-2">
             <Search className="h-3.5 w-3.5 text-muted-foreground" />
             <input

@@ -121,7 +121,16 @@ export function AdjustmentDrawer({
     <Drawer.Root open={open} onOpenChange={(o) => !o && onClose()} direction="right">
       <Drawer.Portal>
         <Drawer.Overlay className="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm" />
-        <Drawer.Content className="fixed right-0 top-0 z-50 flex h-full w-full max-w-[560px] flex-col border-l border-border surface-2 outline-none">
+        <Drawer.Content className="fixed right-0 top-0 z-50 flex h-full w-full max-w-[720px] flex-col border-l border-border surface-2 outline-none">
+          {/* Width 720px — this drawer carries TWO SearchableAccountSelect
+              pickers side-by-side (débito / crédito) plus a context card
+              with the origin transaction metadata. At the old 560px the
+              inner 640px popover (shared component) didn't fit: it
+              clipped on the right, pushing CoA codes off the visible
+              area. 720 gives the popover room to open rightward from
+              the left column. The popover also self-clamps + flips to
+              right-anchor if the host is narrower than this (see
+              SearchableAccountSelect.tsx). */}
           <div className="hairline flex h-12 shrink-0 items-center justify-between px-4">
             <Drawer.Title className="flex items-center gap-2 text-[13px] font-semibold">
               <Scale className="h-3.5 w-3.5 text-muted-foreground" />
