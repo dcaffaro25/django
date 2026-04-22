@@ -7,7 +7,7 @@
     "workloads": [
       {
         "name": "web",
-        "startCommand": "python manage.py migrate && python manage.py ensure_superuser && python manage.py collectstatic --noinput && gunicorn nord_backend.wsgi"
+        "startCommand": "python manage.py migrate && python manage.py ensure_superuser && python manage.py collectstatic --noinput && gunicorn nord_backend.wsgi --timeout 300 --graceful-timeout 30"
       },
       {
         "name": "worker",
