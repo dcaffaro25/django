@@ -20,31 +20,35 @@ import { cn, formatCurrency, formatDate } from "@/lib/utils"
 /* ---------------- Helpers ---------------- */
 
 /**
- * For a 1-to-1 match, the complementing journal entry must produce an
- * effective amount equal to the bank transaction amount so the
- * reconciliation's bank_sum − book_sum delta is zero:
+ * For a 1-to-1 mass match, the backend builds a *balanced* adjustment
+ * Transaction: a cash leg on the bank's CoA account (side/amount
+ * chosen so its ``effective = bank.amount``) plus one contra leg
+ * (what the operator picks in the row).
  *
- *   effective = (debit − credit) × direction
- *   ⇒ we need effective == bank.amount
+ * The contra's raw side (debit/credit) is the mirror of the cash
+ * leg so the Transaction's Σdebit == Σcredit invariant holds.
+ * Assuming the cash account has ``direction=1`` (standard for bank
+ * accounts in Brazilian CoAs):
  *
- * Given an account's natural direction, this solves to a single
- * (side, amount) pair:
+ *   bank.amount < 0 → cash credits |b|  → contra must debit |b|
+ *   bank.amount > 0 → cash debits  |b|  → contra must credit |b|
+ *   bank.amount = 0 → zero-amount entry; default to debit.
  *
- *   tilt = bank.amount × direction
- *   side = tilt ≥ 0 ? "debit" : "credit"
- *   amt  = |bank.amount|
- *
- * (For tilt = 0, i.e. bank.amount = 0, we arbitrarily pick debit.)
+ * The contra account's own direction doesn't affect the raw side —
+ * only its *effective amount*, which the backend uses to validate
+ * the recon balance. This function is the single source of truth
+ * the row renderer, the balance badge, and the submit payload all
+ * consult.
  */
-function resolveSide(
-  bankAmount: number,
-  direction: number,
-): { side: "debit" | "credit"; amount: number } {
-  const tilt = Number(bankAmount) * (direction || 1)
-  return {
-    side: tilt >= 0 ? "debit" : "credit",
-    amount: Math.abs(Number(bankAmount)),
-  }
+function resolveContraSide(bankAmount: number): {
+  side: "debit" | "credit"
+  amount: number
+} {
+  const n = Number(bankAmount)
+  const abs = Math.abs(n)
+  if (n < 0) return { side: "debit", amount: abs }
+  // n >= 0 (inflow or zero)
+  return { side: "credit", amount: abs }
 }
 
 /* ---------------- Searchable account dropdown ---------------- */
@@ -222,14 +226,6 @@ export function MassReconcileDrawer({
       )
   }, [accounts])
 
-  const accountDirById = useMemo<Record<number, number>>(() => {
-    const map: Record<number, number> = {}
-    for (const a of accounts) {
-      if (a.account_direction != null) map[a.id] = a.account_direction
-    }
-    return map
-  }, [accounts])
-
   const [rows, setRows] = useState<MassRow[]>([])
   const [headerAccount, setHeaderAccount] = useState<number | null>(null)
   const [submitting, setSubmitting] = useState(false)
@@ -299,8 +295,11 @@ export function MassReconcileDrawer({
     const suggestions = rows
       .filter((r) => rowBalanced(r))
       .map((r) => {
-        const dir = r.account_id != null ? (accountDirById[r.account_id] ?? 1) : 1
-        const { side, amount } = resolveSide(Number(r.bank.amount), dir)
+        // Only the contra leg goes in the payload; the backend
+        // auto-creates the cash leg on the bank's CoA account.
+        // Side is the mirror of the bank's sign so the resulting
+        // Transaction balances raw debits against raw credits.
+        const { side, amount } = resolveContraSide(Number(r.bank.amount))
         return {
           suggestion_type: "create_new" as const,
           bank_transaction_id: r.bank.id,
@@ -406,7 +405,8 @@ export function MassReconcileDrawer({
                   <th className="px-2 py-2 text-left">#</th>
                   <th className="px-2 py-2 text-left">Data</th>
                   <th className="px-2 py-2 text-left">Descrição</th>
-                  <th className="px-2 py-2 text-right">Valor</th>
+                  <th className="px-2 py-2 text-right">Valor (bruto)</th>
+                  <th className="px-2 py-2 text-right">Contra (Débito/Crédito · |R$|)</th>
                   <th className="px-2 py-2 text-left">Conta contábil</th>
                   <th className="w-20 px-2 py-2 text-center">Balanço</th>
                 </tr>
@@ -446,8 +446,33 @@ export function MassReconcileDrawer({
                           {formatDate(r.bank.date)}
                         </div>
                       </td>
-                      <td className="px-2 py-1.5 text-right tabular-nums font-semibold">
-                        {formatCurrency(Number(r.bank.amount))}
+                      <td className="px-2 py-1.5 text-right tabular-nums">
+                        <span className={cn(Number(r.bank.amount) < 0 ? "text-muted-foreground" : "text-foreground", "font-semibold")}>
+                          {formatCurrency(Number(r.bank.amount))}
+                        </span>
+                      </td>
+                      <td className="px-2 py-1.5 text-right tabular-nums">
+                        {(() => {
+                          // The contra side is deterministic from
+                          // bank.amount's sign. We surface it per
+                          // row so the operator sees which side the
+                          // contra account will receive BEFORE they
+                          // click "Aplicar conta".
+                          const { side, amount } = resolveContraSide(Number(r.bank.amount))
+                          return (
+                            <span
+                              className={cn(
+                                "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] font-medium",
+                                side === "debit"
+                                  ? "border-primary/30 bg-primary/5 text-primary"
+                                  : "border-warning/30 bg-warning/5 text-warning",
+                              )}
+                              title={side === "debit" ? "Débito no contra-lançamento" : "Crédito no contra-lançamento"}
+                            >
+                              {side === "debit" ? "Débito" : "Crédito"} · R$ {amount.toFixed(2).replace(".", ",")}
+                            </span>
+                          )
+                        })()}
                       </td>
                       <td className="px-2 py-1.5">
                         <SearchableAccountSelect

@@ -849,6 +849,7 @@ export function WorkbenchPage() {
         bankSum={bankSum}
         bookSum={bookSum}
         delta={delta}
+        bankAccounts={bankAccounts ?? []}
         onCreated={clearSelection}
       />
 
@@ -1903,23 +1904,22 @@ function newEntryRow(partial: Partial<EntryRow> = {}): EntryRow {
 }
 
 /**
- * Signed contribution a row would add to the book side of the reconciliation,
- * matching the backend's ``JournalEntry.get_effective_amount()``:
- *   (debit - credit) * account_direction
+ * Raw ``debit − credit`` for a row, ignoring direction. Used for
+ * the Transaction-balance check: the new adjustment Transaction the
+ * backend builds must satisfy ``Σdebit == Σcredit``, which is a raw-
+ * number invariant, not an effective-amount one.
  *
- * This is what keeps the drawer's "Equilibrado" chip honest. Before, the
- * drawer used raw ``debit - credit`` — which diverges from the engine on
- * credit-natural accounts (direction=-1) and against any baseline derived
- * from ``transaction.amount`` instead of effective amount. The reported
- * symptom was a match that said "balanced" but landed with the book sum
- * moved the wrong way by exactly 2× delta.
+ * (An earlier version of this helper multiplied by account direction
+ * to match the reconciliation-closure check; that was a mistake for
+ * mixed-direction contras — see the test
+ * ``test_case2_mixed_direction_contra_balances`` for the concrete
+ * case where effective-sum ≠ 0 but the transaction is perfectly
+ * balanced.)
  */
-function rowEffectiveAmount(r: EntryRow, accountDirById: Record<number, number>): number {
+function rowRawAmount(r: EntryRow): number {
   const amt = Number(r.amount || 0)
   if (!Number.isFinite(amt)) return 0
-  const dir = (typeof r.account_id === "number" ? accountDirById[r.account_id] : undefined) ?? 1
-  const base = r.side === "debit" ? amt : -amt
-  return base * dir
+  return r.side === "debit" ? amt : -amt
 }
 
 /**
@@ -1944,7 +1944,8 @@ function seedInitialRows(bank: BankTransaction | undefined, delta: number): Entr
 }
 
 function AddEntriesDrawer({
-  open, onClose, bankItems, bookItems, bankSum, bookSum, delta, onCreated,
+  open, onClose, bankItems, bookItems, bankSum, bookSum, delta,
+  bankAccounts, onCreated,
 }: {
   open: boolean
   onClose: () => void
@@ -1957,6 +1958,8 @@ function AddEntriesDrawer({
   bookSum: number
   /** bankSum − bookSum; target the new entries need to close. */
   delta: number
+  /** Ledger of bank accounts — just for the cash-leg preview row. */
+  bankAccounts: Array<{ id: number; name: string }>
   onCreated: () => void
 }) {
   const { t } = useTranslation(["reconciliation", "common"])
@@ -1978,14 +1981,6 @@ function AddEntriesDrawer({
         || a.path.localeCompare(b.path, undefined, { numeric: true }))
   }, [accounts])
 
-  const accountDirById = useMemo<Record<number, number>>(() => {
-    const map: Record<number, number> = {}
-    for (const a of accounts) {
-      if (a.account_direction != null) map[a.id] = a.account_direction
-    }
-    return map
-  }, [accounts])
-
   const [rows, setRows] = useState<EntryRow[]>([newEntryRow()])
   // Operator override: by default we block unbalanced submit. Operators can
   // opt into a partial reconciliation ("create anyway") via this flag.
@@ -2005,7 +2000,7 @@ function AddEntriesDrawer({
     // retype it on every split; the side flips to absorb the remaining delta.
     const bank = bankItems[0]
     setRows((rs) => {
-      const runningSum = rs.reduce((s, r) => s + rowEffectiveAmount(r, accountDirById), 0)
+      const runningSum = rs.reduce((s, r) => s + rowRawAmount(r), 0)
       const remaining = delta - runningSum
       return [
         ...rs,
@@ -2019,15 +2014,25 @@ function AddEntriesDrawer({
     })
   }
 
-  // newSum is now the signed effective amount (matches backend). Until the
-  // user picks an account for a row, we assume direction=1 (inside
-  // rowEffectiveAmount) — which means the chip stays un-green for rows
-  // that haven't been assigned an account yet, reflecting the real risk.
-  const newSum = rows.reduce((s, r) => s + rowEffectiveAmount(r, accountDirById), 0)
-  const target = delta
-  const balanceOk = Math.abs(newSum - target) < 0.005
+  // PR 8 semantic shift: the drawer's contra entries no longer enter
+  // the reconciliation directly. The backend creates a separate,
+  // balanced adjustment Transaction: a cash leg on the bank's CoA
+  // account (effective == delta → recon closes automatically) plus
+  // the contra legs the operator typed here. For the new Transaction
+  // to satisfy Σdebit == Σcredit, the raw contra sum must equal
+  // ``-delta`` (assuming the cash account direction = 1, which is
+  // the standard for Brazilian bank CoA accounts).
+  //
+  //   Bank outflow (delta < 0) → contras must net to a DEBIT of |delta|
+  //   Bank inflow  (delta > 0) → contras must net to a CREDIT of |delta|
+  const contraRawSum = rows.reduce((s, r) => s + rowRawAmount(r), 0)
+  const target = -delta  // what Σ(debit - credit) of contras must equal
+  const balanceOk = Math.abs(contraRawSum - target) < 0.005
   const hasRows = rows.some((r) => r.account_id && Number(r.amount) > 0)
-  const canSubmit = hasRows && (balanceOk || allowPartial)
+  // Note: the backend rejects unbalanced contras outright, so
+  // ``allowPartial`` can't bypass — we keep the flag for the client
+  // warning only, the submit still blocks when ``!balanceOk``.
+  const canSubmit = hasRows && balanceOk
 
   const submit = () => {
     if (!hasRows) {
@@ -2166,25 +2171,55 @@ function AddEntriesDrawer({
               </button>
             </div>
 
-            {/* Balance */}
-            <div className="flex items-center gap-3 rounded-md border border-border bg-surface-3 p-2.5 text-[12px]">
-              <div className="flex-1">
-                <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">{t("add_entries.sum")}</div>
-                <div className="tabular-nums font-semibold">{formatCurrency(newSum)}</div>
+            {/* Cash-leg preview + balance check.
+                The backend auto-books the cash leg on the bank's CoA
+                account; we show what that leg will look like so the
+                operator sees the full double-entry before submit.
+                The balance chip confirms their contra rows will
+                close the Transaction (Σdebit == Σcredit). */}
+            <div className="rounded-md border border-border bg-surface-3 p-2.5 text-[12px]">
+              <div className="mb-1.5 flex items-center justify-between">
+                <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Perna de caixa (automática)
+                </div>
+                <div
+                  className={cn(
+                    "flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] font-medium",
+                    balanceOk ? "bg-success/10 text-success" : "bg-warning/10 text-warning",
+                  )}
+                >
+                  {balanceOk ? <CheckCircle2 className="h-3 w-3" /> : <AlertTriangle className="h-3 w-3" />}
+                  {balanceOk ? "Lançamento equilibrado" : "Desequilibrado"}
+                </div>
               </div>
-              <ArrowLeftRight className="h-4 w-4 text-muted-foreground" />
-              <div className="flex-1">
-                <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">{t("add_entries.target")}</div>
-                <div className="tabular-nums font-semibold">{formatCurrency(target)}</div>
-              </div>
-              <div
-                className={cn(
-                  "flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium",
-                  balanceOk ? "bg-success/10 text-success" : "bg-warning/10 text-warning",
-                )}
-              >
-                {balanceOk ? <CheckCircle2 className="h-3 w-3" /> : <AlertTriangle className="h-3 w-3" />}
-                {balanceOk ? "Equilibrado" : t("add_entries.need_balance")}
+              <div className="grid grid-cols-3 gap-2 text-[11px]">
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Conta caixa</div>
+                  <div className="truncate font-medium">
+                    {/* We don't render the account name without a
+                         round-trip; the bank account's name is close
+                         enough for the preview. The backend resolves
+                         the CoA account at write time. */}
+                    Vinculada a {bankItems[0]
+                      ? (bankAccounts.find((ba) => ba.id === bankItems[0]!.bank_account)?.name ?? `#${bankItems[0]!.bank_account}`)
+                      : "—"}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Lado + valor</div>
+                  <div className="tabular-nums font-semibold">
+                    {delta === 0
+                      ? "—"
+                      : `${delta > 0 ? "Débito" : "Crédito"} ${formatCurrency(Math.abs(delta))}`}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Soma contra (Σd − Σc)</div>
+                  <div className={cn("tabular-nums font-semibold", balanceOk ? "text-success" : "text-warning")}>
+                    {formatCurrency(contraRawSum)}
+                    <span className="ml-1 text-[10px] text-muted-foreground">/ alvo {formatCurrency(target)}</span>
+                  </div>
+                </div>
               </div>
             </div>
 

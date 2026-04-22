@@ -2890,11 +2890,16 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             ]
         }
         """
-        from accounting.services.bank_transaction_suggestion_service import BankTransactionSuggestionService
         from accounting.utils import update_journal_entries_and_transaction_flags
+        from accounting.services.bank_ledger import (
+            BankLedgerError,
+            contra_legs_from_payload,
+            create_balanced_adjustment,
+            sum_existing_cash_legs_for_jes,
+        )
         from decimal import Decimal
         from django.db import transaction as db_transaction
-        
+
         # Get company from tenant
         company = getattr(request, 'tenant', None)
         if not company or company == 'all':
@@ -2903,20 +2908,27 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         company_id = company.id if hasattr(company, 'id') else company
-        
+
         suggestions_data = request.data.get('suggestions', [])
         if not suggestions_data:
             return Response(
                 {'error': 'suggestions is required'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
-        created_transactions = []
-        created_reconciliations = []
-        errors = []
-        
-        service = BankTransactionSuggestionService(company_id=company_id)
-        
+
+        created_transactions: list[dict] = []
+        created_reconciliations: list[dict] = []
+        errors: list[dict] = []
+
+        # Note: the rewrite (PR 8) moved the double-entry construction
+        # into ``accounting.services.bank_ledger.create_balanced_adjustment``.
+        # Every path below produces a **new** balanced Transaction
+        # (cash leg + contra legs, Σdebits = Σcredits). The
+        # ``use_existing_book`` branch no longer mutates the existing
+        # Transaction — it creates a separate *adjustment* Transaction
+        # and the Reconciliation links the original cash leg(s) +
+        # the adjustment's cash leg.
+
         for suggestion_data in suggestions_data:
             try:
                 with db_transaction.atomic():
@@ -2924,8 +2936,7 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     if not bank_transaction_id:
                         errors.append({'suggestion': suggestion_data, 'error': 'bank_transaction_id is required'})
                         continue
-                    
-                    # Get bank transaction
+
                     try:
                         bank_tx = BankTransaction.objects.get(
                             id=bank_transaction_id,
@@ -2937,162 +2948,115 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                             'error': 'Bank transaction not found'
                         })
                         continue
-                    
+
+                    if bank_tx.bank_account_id is None:
+                        errors.append({
+                            'bank_transaction_id': bank_transaction_id,
+                            'error': 'Bank transaction has no bank_account — cannot resolve cash ledger.',
+                        })
+                        continue
+
                     suggestion_type = suggestion_data.get('suggestion_type', 'create_new')
-                    
+
+                    # --------------------- gather existing book legs (case 1 only)
+                    existing_sum = Decimal('0')
+                    existing_cash_legs: list[JournalEntry] = []
                     if suggestion_type == 'use_existing_book':
-                        # Use existing journal entry + create complementing entries
-                        # Get existing journal entry ID from the suggestion structure
-                        existing_je_data = suggestion_data.get('existing_journal_entry', {})
-                        existing_je_id = existing_je_data.get('id') or suggestion_data.get('existing_journal_entry_id')
-                        
-                        if not existing_je_id:
+                        # Accept either a single id (legacy) or a list. The
+                        # frontend still sends a single id today — we read
+                        # both so a later multi-book PR doesn't have to
+                        # touch this branch.
+                        existing_je_data = suggestion_data.get('existing_journal_entry', {}) or {}
+                        existing_ids: list[int] = []
+                        if suggestion_data.get('existing_journal_entry_ids'):
+                            existing_ids = list(suggestion_data['existing_journal_entry_ids'])
+                        elif existing_je_data.get('id') or suggestion_data.get('existing_journal_entry_id'):
+                            existing_ids = [existing_je_data.get('id') or suggestion_data.get('existing_journal_entry_id')]
+                        if not existing_ids:
                             errors.append({
                                 'bank_transaction_id': bank_transaction_id,
-                                'error': 'existing_journal_entry.id or existing_journal_entry_id is required for use_existing_book type'
+                                'error': 'existing_journal_entry.id / existing_journal_entry_id(s) is required for use_existing_book type'
                             })
                             continue
-                        
-                        try:
-                            existing_je = JournalEntry.objects.get(
-                                id=existing_je_id,
-                                company_id=company_id,
-                            )
-                        except JournalEntry.DoesNotExist:
+                        existing_sum, existing_cash_legs = sum_existing_cash_legs_for_jes(existing_ids, company_id)
+                        if not existing_cash_legs:
                             errors.append({
                                 'bank_transaction_id': bank_transaction_id,
-                                'existing_journal_entry_id': existing_je_id,
-                                'error': 'Existing journal entry not found'
+                                'existing_journal_entry_ids': existing_ids,
+                                'error': 'None of the supplied journal entries are cash legs (account with bank_account).',
                             })
                             continue
-                        
-                        # Get the transaction for the existing journal entry
-                        transaction = existing_je.transaction
-                        journal_entries = [existing_je]
-                        
-                        # Create complementing journal entries
-                        complementing_entries = suggestion_data.get('complementing_journal_entries', [])
-                        for je_data in complementing_entries:
-                            # Per-row date override: accept a ``date`` in
-                            # each row (YYYY-MM-DD) so operators can stamp
-                            # individual splits (e.g. a tariff posted on a
-                            # later close) without forking transactions.
-                            # Falls back to the transaction's own date.
-                            row_date = je_data.get('date') or None
-                            if isinstance(row_date, str) and row_date.strip():
-                                try:
-                                    row_date = datetime.strptime(row_date.strip(), '%Y-%m-%d').date()
-                                except ValueError:
-                                    row_date = None
-                            journal_entry = JournalEntry.objects.create(
-                                company_id=company_id,
-                                transaction=transaction,
-                                account_id=je_data.get('account_id'),
-                                cost_center_id=je_data.get('cost_center_id'),
-                                debit_amount=Decimal(str(je_data['debit_amount'])) if je_data.get('debit_amount') else None,
-                                credit_amount=Decimal(str(je_data['credit_amount'])) if je_data.get('credit_amount') else None,
-                                description=je_data.get('description', transaction.description),
-                                date=row_date or transaction.date,
-                                state='pending',
-                            )
-                            journal_entries.append(journal_entry)
-                    
+
+                    # --------------------- compute the adjustment target
+                    # For case 2 there is no prior book contribution; the
+                    # adjustment target is the full bank movement. For
+                    # case 1 we only want to close the gap.
+                    adjustment_target = Decimal(bank_tx.amount) - existing_sum
+
+                    # --------------------- contra rows
+                    if suggestion_type == 'use_existing_book':
+                        contra_rows = suggestion_data.get('complementing_journal_entries', [])
                     else:
-                        # Create new transaction and journal entries
-                        tx_data = suggestion_data.get('transaction', {})
-                        # Parse date string to date object
-                        tx_date = tx_data.get('date')
-                        if isinstance(tx_date, str):
-                            tx_date = datetime.strptime(tx_date, '%Y-%m-%d').date()
-                        transaction = Transaction.objects.create(
-                            company_id=company_id,
-                            date=tx_date,
-                            entity_id=tx_data.get('entity_id'),
-                            description=tx_data.get('description', bank_tx.description),
-                            amount=Decimal(str(tx_data.get('amount', bank_tx.amount))),  # Preserve sign from bank transaction
-                            currency_id=tx_data.get('currency_id', bank_tx.currency_id),
-                            state=tx_data.get('state', 'pending'),
-                        )
-                        
-                        # Add notes metadata
-                        if hasattr(transaction, 'notes'):
-                            from multitenancy.utils import build_notes_metadata
-                            from crum import get_current_user
-                            
-                            current_user = get_current_user()
-                            user_name = current_user.username if current_user and current_user.is_authenticated else None
-                            user_id = current_user.id if current_user and current_user.is_authenticated else None
-                            
-                            transaction.notes = build_notes_metadata(
-                                source='Bank Transaction Suggestion',
-                                function='BankTransactionViewSet.create_suggestions',
-                                user=user_name,
-                                user_id=user_id,
-                                bank_transaction_id=bank_tx.id,
-                                suggestion_type=suggestion_type
-                            )
-                            transaction.save(update_fields=['notes'])
-                        
-                        # Create journal entries
-                        journal_entries = []
-                        je_data_list = suggestion_data.get('journal_entries', [])
-                        
-                        for je_data in je_data_list:
-                            # Per-row date override (same contract as the
-                            # ``use_existing_book`` branch); falls back to
-                            # the transaction date when empty/invalid.
-                            row_date = je_data.get('date') or None
-                            if isinstance(row_date, str) and row_date.strip():
-                                try:
-                                    row_date = datetime.strptime(row_date.strip(), '%Y-%m-%d').date()
-                                except ValueError:
-                                    row_date = None
-                            journal_entry = JournalEntry.objects.create(
-                                company_id=company_id,
-                                transaction=transaction,
-                                account_id=je_data.get('account_id'),
-                                cost_center_id=je_data.get('cost_center_id'),
-                                debit_amount=Decimal(str(je_data['debit_amount'])) if je_data.get('debit_amount') else None,
-                                credit_amount=Decimal(str(je_data['credit_amount'])) if je_data.get('credit_amount') else None,
-                                description=je_data.get('description', transaction.description),
-                                date=row_date or transaction.date,
-                                state='pending',
-                            )
-                            
-                            # Add notes metadata
-                            if hasattr(journal_entry, 'notes'):
-                                from multitenancy.utils import build_notes_metadata
-                                from crum import get_current_user
-                                
-                                current_user = get_current_user()
-                                user_name = current_user.username if current_user and current_user.is_authenticated else None
-                                user_id = current_user.id if current_user and current_user.is_authenticated else None
-                                
-                                journal_entry.notes = build_notes_metadata(
-                                    source='Bank Transaction Suggestion',
-                                    function='BankTransactionViewSet.create_suggestions',
-                                    user=user_name,
-                                    user_id=user_id,
-                                    bank_transaction_id=bank_tx.id,
-                                    transaction_id=transaction.id,
-                                    suggestion_type=suggestion_type
-                                )
-                                journal_entry.save(update_fields=['notes'])
-                            
-                            journal_entries.append(journal_entry)
-                    
-                    # Update transaction and journal entry flags
-                    update_journal_entries_and_transaction_flags(journal_entries)
-                    
-                    # Create reconciliation and match
-                    # Add notes metadata
+                        contra_rows = suggestion_data.get('journal_entries', [])
+                    # Drawer default date — fall back to the bank tx date.
+                    default_date = bank_tx.date
+                    contra_legs = contra_legs_from_payload(contra_rows, default_date=default_date)
+
+                    # --------------------- tx-level metadata from caller
+                    tx_data = suggestion_data.get('transaction', {}) or {}
+                    raw_tx_date = tx_data.get('date') or bank_tx.date
+                    if isinstance(raw_tx_date, str):
+                        try:
+                            raw_tx_date = datetime.strptime(raw_tx_date, '%Y-%m-%d').date()
+                        except ValueError:
+                            raw_tx_date = bank_tx.date
+
+                    # Build notes metadata (preserved from old path so
+                    # audit logs keep working).
                     from multitenancy.utils import build_notes_metadata
                     from crum import get_current_user
-                    
                     current_user = get_current_user()
                     user_name = current_user.username if current_user and current_user.is_authenticated else None
                     user_id = current_user.id if current_user and current_user.is_authenticated else None
-                    
+
+                    tx_notes = build_notes_metadata(
+                        source='Bank Transaction Suggestion',
+                        function='BankTransactionViewSet.create_suggestions',
+                        user=user_name,
+                        user_id=user_id,
+                        bank_transaction_id=bank_tx.id,
+                        suggestion_type=suggestion_type,
+                    )
+
+                    # --------------------- build the balanced adjustment
+                    try:
+                        result = create_balanced_adjustment(
+                            company_id=company_id,
+                            bank_account_id=bank_tx.bank_account_id,
+                            adjustment_target=adjustment_target,
+                            contra_legs=contra_legs,
+                            transaction_date=raw_tx_date,
+                            entity_id=tx_data.get('entity_id') or bank_tx.entity_id,
+                            currency_id=tx_data.get('currency_id') or bank_tx.currency_id,
+                            description=tx_data.get('description') or bank_tx.description,
+                            state=tx_data.get('state', 'pending'),
+                            notes=tx_notes,
+                        )
+                    except BankLedgerError as ble:
+                        errors.append({
+                            'suggestion': suggestion_data,
+                            'error': str(ble),
+                        })
+                        # Atomic block already rolled back any partial writes
+                        # via the raise; we just skip to the next suggestion.
+                        continue
+
+                    transaction = result.transaction
+                    new_journal_entries = [result.cash_leg, *result.contra_legs]
+
+                    update_journal_entries_and_transaction_flags(new_journal_entries)
+
+                    # --------------------- reconciliation
                     reconciliation_notes = build_notes_metadata(
                         source='Bank Transaction Suggestion',
                         function='BankTransactionViewSet.create_suggestions',
@@ -3101,9 +3065,9 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                         bank_transaction_id=bank_tx.id,
                         transaction_id=transaction.id,
                         suggestion_type=suggestion_type,
-                        reconciliation_type='manual_from_suggestion'
+                        reconciliation_type='manual_from_suggestion',
+                        adjustment_target=str(adjustment_target),
                     )
-                    
                     reconciliation = Reconciliation.objects.create(
                         company_id=company_id,
                         status='matched',
@@ -3111,19 +3075,26 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                         notes=reconciliation_notes,
                     )
                     reconciliation.bank_transactions.add(bank_tx)
-                    reconciliation.journal_entries.add(*journal_entries)
-                    
+                    # IMPORTANT: only cash legs go on the reconciliation so
+                    # ``book_sum`` (Σ effective amounts) matches the bank
+                    # statement. Contra legs stay on the transaction but
+                    # out of the reconciliation M2M.
+                    je_recon_targets = [*existing_cash_legs, result.cash_leg]
+                    reconciliation.journal_entries.add(*je_recon_targets)
+
                     created_transactions.append({
                         'transaction_id': transaction.id,
                         'bank_transaction_id': bank_tx.id,
-                        'journal_entry_ids': [je.id for je in journal_entries],
+                        'journal_entry_ids': [je.id for je in new_journal_entries],
+                        'cash_leg_id': result.cash_leg.id,
+                        'adjustment_target': str(adjustment_target),
                     })
                     created_reconciliations.append({
                         'reconciliation_id': reconciliation.id,
                         'bank_transaction_id': bank_tx.id,
                         'transaction_id': transaction.id,
                     })
-            
+
             except Exception as e:
                 import traceback
                 errors.append({
@@ -3132,7 +3103,7 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                     'traceback': traceback.format_exc(),
                 })
                 log.error(f"Error creating suggestion: {e}", exc_info=True)
-        
+
         return Response({
             'created_transactions': created_transactions,
             'created_reconciliations': created_reconciliations,
