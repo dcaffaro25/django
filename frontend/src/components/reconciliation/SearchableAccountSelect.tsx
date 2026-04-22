@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { createPortal } from "react-dom"
 import { ChevronDown, Search, X } from "lucide-react"
+import { DismissableLayerBranch } from "@radix-ui/react-dismissable-layer"
 import type { AccountLite } from "@/features/reconciliation/types"
 import { cn } from "@/lib/utils"
 
@@ -188,25 +189,22 @@ export function SearchableAccountSelect({
 
   // The popover is portaled to <body>, making it a SIBLING of the Vaul
   // Drawer.Content (not a descendant). Vaul detects "outside the drawer"
-  // clicks on `document` to auto-dismiss, so clicks inside this popover
-  // would register as outside-drawer events and close the host drawer.
-  // Radix (Dialog.Root from shadcn) behaves the same way. We swallow
-  // pointer + click events at the popover root so those listeners don't
-  // see them — the popover's own ``onMouseDown`` handler on the
-  // document (for its own outside-click detection) still fires because
-  // we check via ``popoverRef.current.contains(target)`` above.
-  const stopPropagation = (e: React.SyntheticEvent) => e.stopPropagation()
-
+  // pointerdowns via Radix's DismissableLayer — which checks whether
+  // the event target is contained in any registered "branch" DOM node.
+  // Wrapping the portaled popover in <DismissableLayerBranch /> adds
+  // it to that registry, so Radix treats pointerdowns inside the
+  // popover as "inside the layer group" and doesn't fire
+  // onPointerDownOutside. This is the official Radix-blessed way to
+  // have a portaled sub-popover inside a dismissable parent (Vaul
+  // drawer / Radix Dialog / shadcn Sheet).
+  //
+  // React context propagates through portals, so the portaled Branch
+  // still picks up the Vaul drawer's DismissableLayerContext.
   const popover = open ? (
-    <div
+    <DismissableLayerBranch
       ref={popoverRef}
       style={popoverStyle}
-      onMouseDown={stopPropagation}
-      onPointerDown={stopPropagation}
-      onClick={stopPropagation}
-      // ``z-[60]`` stays above the Vaul drawer overlay (z-50). The
-      // portal lives in ``<body>`` so there's no ancestor overflow to
-      // fight.
+      // ``z-[60]`` stays above the Vaul drawer overlay (z-50).
       className="z-[60] rounded-md border border-border bg-popover p-1 shadow-xl"
     >
       <div className="flex items-center gap-2 rounded-md border border-border bg-background px-2">
@@ -273,7 +271,7 @@ export function SearchableAccountSelect({
           </div>
         )}
       </div>
-    </div>
+    </DismissableLayerBranch>
   ) : null
 
   return (
