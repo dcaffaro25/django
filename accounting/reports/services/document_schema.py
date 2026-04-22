@@ -265,3 +265,262 @@ def _walk_and_strict(node: Any) -> Any:
     if isinstance(node, list):
         return [_walk_and_strict(v) for v in node]
     return node
+
+
+# ---------------------------------------------------------------------------
+# Slim schema for OpenAI Structured Outputs
+#
+# Empirical finding (see ``scripts/bench_schemas.py``): OpenAI's Structured
+# Outputs sampler struggles with our canonical :class:`TemplateDocument`:
+# the 9KB schema with recursive :class:`SectionBlock.children` and 8 $defs
+# times out ≥95% of the time at 60s, and even at the SDK's 360s ceiling
+# (120s × 3 retries) we see the "361.8s APITimeoutError" pattern in prod.
+#
+# This slim schema produces an AI output that's:
+#   * **Flat** — blocks reference a ``parent_id`` instead of nesting; the
+#     server rebuilds the tree before validation. Flat schemas sample
+#     ~5× faster because there's no recursive $ref to unroll during
+#     grammar compilation.
+#   * **Decoration-free** — no ``bold``, ``indent``, ``ai_explanation``,
+#     ``description``. All three are *derivable* server-side
+#     (bold = is-a-total, indent = depth, ai_explanation = separate
+#     :func:`explain` endpoint on demand) so we don't waste sampling
+#     budget on them.
+#   * **Feature-complete for the calc engine** — keeps the defaults
+#     cascade (``CalculationMethod`` / ``SignPolicy`` / ``Scale``),
+#     per-line overrides, and all three account-selector fields
+#     (``account_ids`` / ``code_prefix`` / ``path_contains`` /
+#     ``include_descendants``) so selected blocks still resolve correctly
+#     once converted back to canonical.
+#
+# Measured on datbaby (253 accounts, gpt-4o-mini):
+#   * canonical schema A: timeouts ≥95% at 60s; ~100% at 120s.
+#   * slim schema (below): median 17s, p99 ~120s, 100% success with the
+#     SDK's default 2 retries.
+# ---------------------------------------------------------------------------
+
+
+class SlimAccountsSelector(BaseModel):
+    """Same shape as :class:`AccountsSelector` — re-declared here because
+    Pydantic v2 refuses to share a model across two schema roots that both
+    use ``extra="forbid"``. Safe to keep identical.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    account_ids: Optional[List[int]] = None
+    code_prefix: Optional[str] = None
+    path_contains: Optional[str] = None
+    include_descendants: Optional[bool] = None
+
+
+class SlimBlockDefaults(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    calculation_method: Optional[CalculationMethod] = None
+    sign_policy: Optional[SignPolicy] = None
+    scale: Optional[Scale] = None
+    decimal_places: Optional[int] = Field(default=None, ge=0, le=8)
+
+
+class _SlimBlockBase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1, max_length=64,
+                    pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    label: Optional[str] = None
+    # ``parent_id`` replaces ``children``. The server stitches blocks
+    # back into a tree by walking parent_id references; top-level blocks
+    # have ``parent_id = None``.
+    parent_id: Optional[str] = None
+
+
+class SlimSectionBlock(_SlimBlockBase):
+    type: Literal["section"]
+    defaults: Optional[SlimBlockDefaults] = None
+
+
+class SlimLineBlock(_SlimBlockBase):
+    type: Literal["line"]
+    accounts: Optional[SlimAccountsSelector] = None
+    calculation_method: Optional[CalculationMethod] = None
+    sign_policy: Optional[SignPolicy] = None
+    scale: Optional[Scale] = None
+    decimal_places: Optional[int] = Field(default=None, ge=0, le=8)
+
+
+class SlimSubtotalBlock(_SlimBlockBase):
+    type: Literal["subtotal"]
+    formula: Optional[str] = None
+    accounts: Optional[SlimAccountsSelector] = None
+
+
+class SlimTotalBlock(_SlimBlockBase):
+    type: Literal["total"]
+    formula: Optional[str] = None
+
+
+class SlimHeaderBlock(_SlimBlockBase):
+    type: Literal["header"]
+
+
+class SlimSpacerBlock(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    type: Literal["spacer"]
+
+
+SlimBlock = Union[
+    SlimSectionBlock, SlimLineBlock, SlimSubtotalBlock,
+    SlimTotalBlock, SlimHeaderBlock, SlimSpacerBlock,
+]
+
+
+class SlimTemplateDocument(BaseModel):
+    """The shape the AI emits. Gets converted to canonical
+    :class:`TemplateDocument` before persistence (see
+    :func:`slim_to_canonical`).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=200)
+    report_type: ReportType
+    defaults: Optional[SlimBlockDefaults] = None
+    blocks: List[SlimBlock]
+
+
+def slim_to_canonical(slim_doc: dict, *, report_type: Optional[str] = None) -> dict:
+    """Convert a slim AI output into a canonical :class:`TemplateDocument` dict.
+
+    Responsibilities:
+      1. Re-build the ``children`` tree from flat ``parent_id`` links.
+      2. Fill in decorative fields that the slim schema dropped:
+         ``bold`` (subtotal / total are bold by convention) and
+         ``indent`` (depth in the rebuilt tree).
+      3. Coerce the top-level ``report_type`` to the caller-requested
+         value — the AI sometimes echoes the literal from the prompt
+         instead of the exact enum value, and the UI cross-references
+         this field.
+      4. Strip unknown keys so pydantic ``extra="forbid"`` accepts the
+         output.
+
+    The result is a dict (not a model) so callers can still run it
+    through :func:`validate_document` for the cross-ref + unique-id
+    invariants. If any parent_id is dangling the orphaned block is
+    promoted to root; we emit a warning but never raise, because a
+    lossy import is better than failing the whole generation.
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    raw_blocks: list[dict] = list(slim_doc.get("blocks") or [])
+
+    # Strip unknown keys on each block (e.g. ai_explanation if the model
+    # snuck one past the schema — shouldn't happen under strict SO, but
+    # belt-and-braces before we pass to canonical validation).
+    _ALLOWED_PER_TYPE: dict[str, set[str]] = {
+        "section":  {"id", "type", "label", "parent_id", "defaults"},
+        "line":     {"id", "type", "label", "parent_id", "accounts",
+                     "calculation_method", "sign_policy", "scale", "decimal_places"},
+        "subtotal": {"id", "type", "label", "parent_id", "formula", "accounts"},
+        "total":    {"id", "type", "label", "parent_id", "formula"},
+        "header":   {"id", "type", "label", "parent_id"},
+        "spacer":   {"id", "type"},
+    }
+    cleaned: list[dict] = []
+    for b in raw_blocks:
+        if not isinstance(b, dict):
+            continue
+        btype = b.get("type")
+        allowed = _ALLOWED_PER_TYPE.get(btype, {"id", "type", "label", "parent_id"})
+        cleaned.append({k: v for k, v in b.items() if k in allowed or k == "parent_id"})
+
+    # Dedupe ids. Observed AI failure mode (~1/3 of calls): the model
+    # reuses the same id for both a section and its subtotal (e.g. both
+    # are called ``revenue``). The cross-ref validator would reject
+    # this. Auto-rename the second+ occurrence to ``{id}_N`` and
+    # rewrite any ``parent_id`` that pointed at a block whose id we
+    # just renamed. This is recovery-oriented: we log a warning but
+    # keep the generation usable.
+    seen: dict[str, int] = {}
+    id_remap: dict[int, str] = {}  # index in cleaned -> new id
+    original_ids: list[Optional[str]] = [b.get("id") for b in cleaned]
+    for idx, b in enumerate(cleaned):
+        bid = b.get("id")
+        if not bid:
+            continue
+        if bid not in seen:
+            seen[bid] = 1
+            continue
+        seen[bid] += 1
+        new_id = f"{bid}_{seen[bid]}"
+        # Walk forward in case ``new_id`` itself collides.
+        while new_id in seen:
+            seen[bid] += 1
+            new_id = f"{bid}_{seen[bid]}"
+        seen[new_id] = 1
+        _log.warning(
+            "slim_to_canonical: duplicate id %r at index %d — renaming to %r",
+            bid, idx, new_id,
+        )
+        b["id"] = new_id
+        id_remap[idx] = new_id
+    # Rewrite parent_id references. A child that pointed at the ORIGINAL
+    # (pre-rename) id should follow the first occurrence, not the
+    # renamed duplicate — so no remap needed for children of the first
+    # block. However children that explicitly parent under a later
+    # duplicate are indistinguishable from children of the first; we
+    # leave them pointing to the (now first-only) original id. This is
+    # the least-surprising recovery and matches what the AI likely
+    # meant.
+
+    # Bucket by parent_id so the tree walk below is O(N) not O(N²).
+    by_parent: dict[Optional[str], list[dict]] = {}
+    for b in cleaned:
+        pid = b.get("parent_id")
+        by_parent.setdefault(pid, []).append(b)
+
+    # Validate parent references. Orphans with unknown parent_id get
+    # promoted to root to avoid losing them.
+    known_ids = {b["id"] for b in cleaned if b.get("id")}
+    for b in cleaned:
+        pid = b.get("parent_id")
+        if pid is not None and pid not in known_ids:
+            _log.warning(
+                "slim_to_canonical: block %r points to missing parent %r — promoting to root",
+                b.get("id"), pid,
+            )
+            b["parent_id"] = None
+
+    # Re-bucket after orphan promotion
+    by_parent = {}
+    for b in cleaned:
+        by_parent.setdefault(b.get("parent_id"), []).append(b)
+
+    def _build_subtree(parent_id: Optional[str], depth: int) -> list[dict]:
+        out: list[dict] = []
+        for b in by_parent.get(parent_id, []):
+            btype = b.get("type")
+            # Drop the flat-schema-only ``parent_id`` field on the way out
+            new_b: dict = {k: v for k, v in b.items() if k != "parent_id"}
+
+            # Decorate: bold for subtotal/total (convention), indent = depth
+            # for everything except spacers / headers (they render their own
+            # way in the grid).
+            if btype in ("subtotal", "total"):
+                new_b.setdefault("bold", True)
+            if btype not in ("spacer",):
+                new_b.setdefault("indent", depth)
+
+            if btype == "section":
+                new_b["children"] = _build_subtree(b["id"], depth + 1)
+            out.append(new_b)
+        return out
+
+    canonical: dict = {
+        "version": 1,
+        "name": slim_doc.get("name") or "Template",
+        "report_type": report_type or slim_doc.get("report_type") or "income_statement",
+        "defaults": slim_doc.get("defaults") or {},
+        "blocks": _build_subtree(None, 0),
+    }
+    return canonical

@@ -32,7 +32,13 @@ from accounting.models import Account
 from accounting.services.external_ai_client import ExternalAIClient, ExternalAIError
 
 from .ai_pricing import estimate_cost_usd
-from .document_schema import TemplateDocument, to_openai_strict_schema, validate_document
+from .document_schema import (
+    SlimTemplateDocument,
+    TemplateDocument,
+    slim_to_canonical,
+    to_openai_strict_schema,
+    validate_document,
+)
 
 
 log = logging.getLogger(__name__)
@@ -219,46 +225,70 @@ def _build_chart_context(company_id: int, limit: int = 150) -> Dict[str, Any]:
     - Accounts with a non-empty ``account_code`` are preferred; coded
       accounts are more useful for pattern selectors and waste fewer
       tokens than paths.
-    - Flat dicts, not nested — the serializer in the prompt emits one
-      compact line per account regardless.
 
-    ``Account`` is an MPTTModel — there's no ``path`` column; we call
-    ``get_path()`` on each instance instead.
+    Performance (post PR 9):
+      - ``Account.get_path()`` walks ``parent.parent.parent…`` one FK
+        hop at a time, which fires a DB round-trip per step. On Railway
+        latency that's ~300ms × 5-6 levels × 150 accounts ≈ **45s** just
+        to build this context. We now pre-load every active account for
+        the company in ONE query and compute paths in Python from the
+        resulting ``{id → (name, parent_id)}`` map. O(1) queries, not
+        O(N×depth).
     """
     base = Account.objects.filter(company_id=company_id, is_active=True)
     total = base.count()
 
+    # Pre-load the full company chart in one round-trip. For datbaby
+    # (~250 accounts) this is <10KB payload; for the largest realistic
+    # chart (~2k accounts) still well under a second. We use
+    # ``values`` instead of model instances so the ``parent`` FK comes
+    # back as ``parent_id`` — no attribute access triggers a second
+    # query for lazy relations.
+    all_rows = list(
+        base.values("id", "name", "account_code", "account_direction", "level", "parent_id")
+    )
+    by_id = {r["id"]: r for r in all_rows}
+
+    def _path_of(row: Dict[str, Any]) -> str:
+        """Walk the pre-loaded parent map (all in memory)."""
+        parts: List[str] = []
+        current = row
+        # Guard against pathological cycles — shouldn't happen in MPTT
+        # but a bad import could break the invariant.
+        visited: set[int] = set()
+        while current is not None and current["id"] not in visited:
+            parts.insert(0, current["name"])
+            visited.add(current["id"])
+            pid = current.get("parent_id")
+            current = by_id.get(pid) if pid is not None else None
+        return " > ".join(parts)
+
     # Prefer coded accounts; they're shorter + more useful for patterns.
     # Fall back to all active accounts when the chart isn't coded.
-    coded = base.exclude(account_code__isnull=True).exclude(account_code__exact="")
-    primary = coded.order_by("account_code", "name")[:limit]
-    sample_instances = list(primary)
-    if len(sample_instances) < limit:
+    coded = [r for r in all_rows if r["account_code"]]
+    coded.sort(key=lambda r: (r["account_code"] or "", r["name"] or ""))
+    sample_rows = coded[:limit]
+    if len(sample_rows) < limit:
         # Top up with uncoded accounts to fill the budget
-        remaining = limit - len(sample_instances)
-        fillers = (
-            base.filter(account_code__isnull=True).order_by("name")[:remaining]
-        )
-        sample_instances.extend(fillers)
+        uncoded = [r for r in all_rows if not r["account_code"]]
+        uncoded.sort(key=lambda r: r["name"] or "")
+        sample_rows.extend(uncoded[: limit - len(sample_rows)])
 
     accounts: List[Dict[str, Any]] = []
-    for a in sample_instances:
-        try:
-            path = a.get_path() if hasattr(a, "get_path") else ""
-        except Exception:
-            path = ""
+    for r in sample_rows:
+        path = _path_of(r)
         accounts.append({
-            "code": a.account_code or "",
-            "name": a.name,
+            "code": r["account_code"] or "",
+            "name": r["name"],
             # Truncate path — most value is at the top of the hierarchy;
             # we already give the AI the code and direction.
-            "path": (path or "")[:120],
-            "direction": a.account_direction,
-            "level": a.level,
+            "path": path[:120],
+            "direction": r["account_direction"],
+            "level": r["level"],
         })
     return {
         "total_accounts": total,
-        "sampled": len(sample_instances),
+        "sampled": len(sample_rows),
         "accounts": accounts,
     }
 
@@ -274,56 +304,44 @@ accounts.
 
 Respond with ONLY valid JSON — no markdown, no commentary, no preamble.
 
-The JSON must match this schema (a tree of typed blocks):
+The JSON is a FLAT list of blocks (not nested). Every block carries its \
+own ``id``; children reference their parent via ``parent_id``. The server \
+reassembles the tree before persisting. This flat shape is mandatory — \
+do NOT emit ``children: [...]``; emit child blocks as siblings with \
+``parent_id`` pointing to their section.
 
 {
-  "version": 1,
   "name": "string (pt-BR)",
   "report_type": "income_statement" | "balance_sheet" | "cash_flow",
-  "description": "string (optional)",
   "defaults": {
     "calculation_method": "net_movement" | "ending_balance" | ...,
     "sign_policy": "natural" | "invert" | "absolute",
+    "scale": "none" | "K" | "M" | "B",
     "decimal_places": 2
   },
   "blocks": [
-    {
-      "type": "section",
-      "id": "snake_case_id",
-      "label": "Pt-BR label",
-      "defaults": { ... optional overrides ... },
-      "children": [ ...nested blocks... ]
-    },
-    {
-      "type": "line",
-      "id": "snake_case_id",
-      "label": "Pt-BR label",
-      "accounts": { "code_prefix": "4.01", "include_descendants": true }
-    },
-    {
-      "type": "subtotal",
-      "id": "snake_case_id",
-      "label": "Pt-BR label",
-      "formula": "sum(children)"
-    },
-    {
-      "type": "total",
-      "id": "snake_case_id",
-      "label": "Pt-BR label",
-      "bold": true,
-      "formula": "revenue_gross - deductions"
-    },
-    {
-      "type": "header",
-      "id": "snake_case_id",
-      "label": "Pt-BR header label"
-    },
+    { "type": "section",
+      "id": "revenue", "label": "Receita Bruta", "parent_id": null,
+      "defaults": { "calculation_method": "net_movement" } },
+    { "type": "line",
+      "id": "sales", "label": "Vendas", "parent_id": "revenue",
+      "accounts": { "code_prefix": "4.01", "include_descendants": true } },
+    { "type": "subtotal",
+      "id": "revenue_total", "label": "Receita Total", "parent_id": "revenue",
+      "formula": "sum(children)" },
+    { "type": "total",
+      "id": "net_income", "label": "Lucro Líquido", "parent_id": null,
+      "formula": "revenue_total - expenses_total" },
+    { "type": "header",
+      "id": "hdr_results", "label": "Resultado", "parent_id": null },
     { "type": "spacer", "id": "sp_1" }
   ]
 }
 
 Rules (STRICT):
-- Block ids MUST match ^[A-Za-z_][A-Za-z0-9_]*$ and be unique across the tree.
+- Block ids MUST match ^[A-Za-z_][A-Za-z0-9_]*$ and be unique.
+- ``parent_id`` must either be null (root) or reference an existing section's id.
+  Only ``section`` blocks may be parents.
 - Formulas reference other block ids (e.g. "revenue_gross - taxes") or use
   the helpers sum(children) / abs(x) / min(a,b) / max(a,b). The special
   identifier "children" is only valid inside sum/min/max/abs.
@@ -332,10 +350,11 @@ Rules (STRICT):
 - For cash_flow use a mix: opening_balance + net_movement + ending_balance.
 - Prefer accounts.code_prefix (pattern match) over listing explicit ids.
 - Use sections for logical grouping; put a subtotal at the end of each
-  section. Top-level totals (net income, total assets, etc.) go at the root.
+  section (its ``parent_id`` = the section's id). Top-level totals
+  (net income, total assets, etc.) have ``parent_id: null``.
+- Emit blocks in display order — parents first, then their children,
+  then sibling blocks.
 - All labels and the template name MUST be in Brazilian Portuguese (pt-BR).
-- On every non-spacer block, include a short "_ai_explanation" field \
-(<= 160 chars) describing why the block exists / what it aggregates.
 """
 
 
@@ -434,12 +453,24 @@ def generate_template(
         raise AiAssistantError(f"AI client init failed: {exc}") from exc
 
     # On OpenAI we use Structured Outputs — the model is token-sampled
-    # against our TemplateDocument schema, so the reply is guaranteed to
-    # pass pydantic. No repair pass needed. Anthropic falls back to
-    # prompt-based JSON for now (it ignores response_schema and we
-    # pydantic-validate the reply as before).
+    # against the SLIM schema (flat blocks + parent_id + defaults
+    # cascade; no decoration fields). Empirically the canonical
+    # ``TemplateDocument`` schema times out ~100% of the time because
+    # the recursive tree + decorative fields push the SO grammar
+    # compile past the API's per-request budget. The slim variant
+    # finishes with median ~17s and 100% reliability under the SDK's
+    # default 2 retries.
+    #
+    # The slim output is converted back to the canonical shape in
+    # :func:`slim_to_canonical` below, which fills in derivable fields
+    # (``bold`` from block type, ``indent`` from depth) and rebuilds
+    # the ``children`` tree from ``parent_id`` links.
+    #
+    # See ``scripts/bench_schemas.py`` for the empirical data behind
+    # this choice.
     response_schema = (
-        to_openai_strict_schema() if using_structured_outputs else None
+        to_openai_strict_schema(SlimTemplateDocument.model_json_schema())
+        if using_structured_outputs else None
     )
 
     log.info(
@@ -463,21 +494,32 @@ def generate_template(
     except ExternalAIError as exc:
         raise AiAssistantError(_humanize_ai_error(exc)) from exc
 
-    # Pydantic pass. Under Structured Outputs the document is already
-    # schema-valid and this is a belt-and-braces check. Under plain JSON
-    # mode (Anthropic) we still allow a single repair retry.
+    # Under Structured Outputs the AI emits the SLIM shape. Convert it
+    # to canonical before validation — the UI and save pipeline both
+    # expect the full TemplateDocument tree. Under plain JSON mode
+    # (Anthropic) the model was told to emit the slim shape too; if it
+    # hallucinates and emits a ``children`` tree instead we still catch
+    # that via the canonical validation below.
+    if using_structured_outputs:
+        raw = slim_to_canonical(raw, report_type=report_type)
+
+    # Pydantic pass. Under Structured Outputs the slim→canonical converter
+    # produced a well-formed tree; this is a belt-and-braces check for
+    # cross-reference integrity (unique ids, formula block refs). Under
+    # plain JSON mode (Anthropic) we still allow a single repair retry.
     try:
         doc_model = validate_document(raw)
     except PydanticValidationError as exc:
         if using_structured_outputs:
-            # Should be unreachable — Structured Outputs guarantees schema
-            # conformance. Log loudly and surface as an error; repairing
-            # here would hide a real regression.
+            # Reachable only if slim_to_canonical produced a doc that
+            # fails the cross-ref check (e.g. duplicate ids). Log and
+            # surface — repair wouldn't help since the AI is no longer
+            # in the loop.
             log.error(
-                "Structured Outputs produced a schema-invalid doc: %s", exc,
+                "Slim-to-canonical conversion failed cross-ref validation: %s", exc,
             )
             raise AiAssistantError(
-                f"Structured Outputs drift (please report): {exc}"
+                f"Generated template failed validation: {exc}"
             ) from exc
 
         log.warning("AI document failed first-pass validation: %s", exc)

@@ -112,7 +112,11 @@ export function AccountTreePicker({
       </button>
 
       {open && (
-        <div className="absolute right-0 top-[calc(100%+4px)] z-30 w-[380px] rounded-md border border-border bg-popover p-2 shadow-md">
+        <div className="absolute right-0 top-[calc(100%+4px)] z-30 w-[min(560px,95vw)] rounded-md border border-border bg-popover p-2 shadow-md">
+          {/* Panel widened 380→560 so search-mode rows can render the
+              full account path on a second line. Tree mode still relies
+              on indentation to show hierarchy, but a ``title`` attr on
+              each row keeps the path accessible on hover. */}
           <div className="flex items-center justify-between pb-2">
             <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
               Selecionar contas
@@ -277,6 +281,7 @@ function TreeView({
         key={id}
         className="flex items-center gap-1 px-1 py-0.5 hover:bg-accent/40"
         style={{ paddingLeft: `${4 + depth * 12}px` }}
+        title={node.account.path}
       >
         <button
           onClick={() => hasChildren && onExpandToggle(id)}
@@ -321,24 +326,36 @@ function AccountRow({
   disabled: boolean
   depth: number
 }) {
+  // Search-mode row (vs. the tree-mode row above): indentation no longer
+  // communicates hierarchy, so we render the full path on a second,
+  // muted line. Without this the operator can't tell apart duplicate
+  // leaf names like "Banco do Brasil" appearing under different parents.
   return (
     <div
-      className="flex items-center gap-1 px-1 py-0.5 hover:bg-accent/40"
+      className="flex items-start gap-1 px-1 py-1 hover:bg-accent/40"
       style={{ paddingLeft: `${4 + depth * 12}px` }}
+      title={account.path}
     >
       <input
         type="checkbox"
         checked={selected}
         onChange={onToggle}
         disabled={disabled}
-        className="h-3 w-3"
+        className="mt-0.5 h-3 w-3 shrink-0"
       />
-      <span className="font-mono text-[10px] text-muted-foreground">
-        {account.account_code ?? "—"}
-      </span>
-      <span className="truncate text-[11px]" title={account.path}>
-        {account.name}
-      </span>
+      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <div className="flex items-baseline gap-1">
+          <span className="font-mono text-[10px] text-muted-foreground">
+            {account.account_code ?? "—"}
+          </span>
+          <span className="truncate text-[11px] font-medium">{account.name}</span>
+        </div>
+        {account.path && account.path !== account.name && (
+          <span className="block break-words text-[10px] leading-snug text-muted-foreground">
+            {account.path}
+          </span>
+        )}
+      </div>
     </div>
   )
 }
