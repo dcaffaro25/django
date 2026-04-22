@@ -20,6 +20,7 @@ import { logAction, logError } from "@/lib/activity-beacon"
 import { useColumnVisibility, type ColumnDef } from "@/stores/column-visibility"
 import { RunRuleDrawer } from "@/components/reconciliation/RunRuleDrawer"
 import { MassReconcileDrawer } from "@/components/reconciliation/MassReconcileDrawer"
+import { SearchableAccountSelect } from "@/components/accounts/SearchableAccountSelect"
 import {
   useAccounts,
   useBankAccountsList,
@@ -2298,18 +2299,19 @@ function EntryRowEditor({
         <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
           {t("add_entries.account")}
         </span>
-        <select
-          value={row.account_id}
-          onChange={(e) => onChange({ account_id: e.target.value ? Number(e.target.value) : "" })}
-          className="h-8 w-full rounded-md border border-border bg-background px-2 text-[12px] outline-none focus:border-ring"
-        >
-          <option value="">—</option>
-          {accounts.map((a) => (
-            <option key={a.id} value={a.id}>
-              {a.account_code ? `${a.account_code} · ` : ""}{a.path}
-            </option>
-          ))}
-        </select>
+        {/* SearchableAccountSelect replaces the old native <select>.
+            Native selects rendered the dropdown at the button's width
+            (~230px in this grid cell), brutally truncating deep
+            account paths. The custom popover gets 720px and renders
+            the full path on a second line — see
+            ``components/accounts/SearchableAccountSelect``. */}
+        <SearchableAccountSelect
+          accounts={accounts}
+          value={typeof row.account_id === "number" ? row.account_id : null}
+          onChange={(id) => onChange({ account_id: id ?? "" })}
+          placeholder={t("add_entries.account") ?? "Conta"}
+          compact
+        />
       </label>
       <label className="flex flex-col gap-1">
         <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Lado</span>

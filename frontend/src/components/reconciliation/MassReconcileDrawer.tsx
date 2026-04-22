@@ -1,17 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { useTranslation } from "react-i18next"
 import { toast } from "sonner"
 import { Drawer } from "vaul"
 import {
   Check,
   CheckCircle2,
-  ChevronDown,
   Loader2,
-  Search,
   Wand2,
   X,
   XCircle,
 } from "lucide-react"
+import { SearchableAccountSelect } from "@/components/accounts/SearchableAccountSelect"
 import { useAccounts, useCreateSuggestions } from "@/features/reconciliation"
 import type { AccountLite, BankTransaction } from "@/features/reconciliation/types"
 import { logAction, logError } from "@/lib/activity-beacon"
@@ -51,137 +50,6 @@ function resolveContraSide(bankAmount: number): {
   return { side: "credit", amount: abs }
 }
 
-/* ---------------- Searchable account dropdown ---------------- */
-
-/**
- * Minimal searchable select. Intentionally built from scratch (no cmdk)
- * so the accounts list stays rendered inline in a scrollable popup
- * without stealing focus to a command palette. The `value` is the
- * account id; we render `code · path` so operators can find accounts
- * by either column.
- */
-function SearchableAccountSelect({
-  accounts,
-  value,
-  onChange,
-  placeholder = "Conta",
-  compact = false,
-  buttonClassName,
-}: {
-  accounts: AccountLite[]
-  value: number | null
-  onChange: (id: number | null) => void
-  placeholder?: string
-  /** Compact mode is used inside table cells. */
-  compact?: boolean
-  buttonClassName?: string
-}) {
-  const [open, setOpen] = useState(false)
-  const [q, setQ] = useState("")
-  const containerRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLInputElement>(null)
-
-  const selected = value != null ? accounts.find((a) => a.id === value) : null
-
-  const filtered = useMemo(() => {
-    const qq = q.trim().toLowerCase()
-    if (!qq) return accounts
-    return accounts.filter((a) => {
-      const hay = [a.account_code, a.name, a.path].filter(Boolean).join(" ").toLowerCase()
-      return hay.includes(qq)
-    })
-  }, [q, accounts])
-
-  // Close on click-outside
-  useEffect(() => {
-    if (!open) return
-    const onDoc = (e: MouseEvent) => {
-      if (!containerRef.current) return
-      if (!containerRef.current.contains(e.target as Node)) setOpen(false)
-    }
-    document.addEventListener("mousedown", onDoc)
-    return () => document.removeEventListener("mousedown", onDoc)
-  }, [open])
-
-  // Focus search input on open
-  useEffect(() => {
-    if (open) inputRef.current?.focus()
-  }, [open])
-
-  const label = selected
-    ? `${selected.account_code ? `${selected.account_code} · ` : ""}${selected.path ?? selected.name}`
-    : placeholder
-
-  return (
-    <div ref={containerRef} className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className={cn(
-          "inline-flex items-center justify-between gap-2 rounded-md border border-border bg-background px-2 text-[12px] hover:bg-accent",
-          compact ? "h-7 w-full" : "h-8 min-w-[260px]",
-          !selected && "text-muted-foreground",
-          buttonClassName,
-        )}
-      >
-        <span className="truncate">{label}</span>
-        <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
-      </button>
-      {open && (
-        <div className="absolute z-50 mt-1 w-[min(480px,90vw)] rounded-md border border-border bg-popover p-1 shadow-xl">
-          <div className="flex items-center gap-2 rounded-md border border-border bg-background px-2">
-            <Search className="h-3.5 w-3.5 text-muted-foreground" />
-            <input
-              ref={inputRef}
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              placeholder="Buscar por código, nome ou caminho…"
-              className="h-8 flex-1 bg-transparent text-[12px] outline-none"
-            />
-            {q && (
-              <button onClick={() => setQ("")} className="text-muted-foreground hover:text-foreground">
-                <X className="h-3.5 w-3.5" />
-              </button>
-            )}
-          </div>
-          <div className="mt-1 max-h-72 overflow-y-auto">
-            {filtered.length === 0 ? (
-              <div className="px-2 py-3 text-center text-[12px] text-muted-foreground">
-                Nenhuma conta encontrada.
-              </div>
-            ) : (
-              filtered.slice(0, 300).map((a) => (
-                <button
-                  type="button"
-                  key={a.id}
-                  onClick={() => {
-                    onChange(a.id)
-                    setOpen(false)
-                    setQ("")
-                  }}
-                  className={cn(
-                    "flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] hover:bg-accent",
-                    value === a.id && "bg-accent",
-                  )}
-                >
-                  {a.account_code && (
-                    <span className="font-mono text-[11px] text-muted-foreground">{a.account_code}</span>
-                  )}
-                  <span className="truncate">{a.path ?? a.name}</span>
-                </button>
-              ))
-            )}
-            {filtered.length > 300 && (
-              <div className="px-2 py-1 text-center text-[11px] text-muted-foreground">
-                Mostrando 300 de {filtered.length} — refine a busca.
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
 
 /* ---------------- Drawer ---------------- */
 

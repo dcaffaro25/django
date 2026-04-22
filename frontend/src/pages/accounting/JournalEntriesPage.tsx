@@ -4,6 +4,7 @@ import { toast } from "sonner"
 import { Drawer } from "vaul"
 import { Plus, Trash2, Save, X, BookOpen, Copy, Search, Filter, RotateCcw, RefreshCw } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
+import { SearchableAccountSelect } from "@/components/accounts/SearchableAccountSelect"
 import { ColumnMenu } from "@/components/ui/column-menu"
 import { DownloadXlsxButton } from "@/components/ui/download-xlsx-button"
 import { SortableHeader } from "@/components/ui/sortable-header"
@@ -328,15 +329,21 @@ function JournalEntryEditor({
             </Field>
 
             <Field label="Conta">
-              <select value={form.account ?? ""} onChange={(e) => set("account", e.target.value ? Number(e.target.value) : undefined)}
-                className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring">
-                <option value="">—</option>
-                {accounts.map((a) => (
-                  <option key={a.id} value={a.id}>
-                    {a.account_code ? `${a.account_code} · ` : ""}{a.path}
-                  </option>
-                ))}
-              </select>
+              {/* SearchableAccountSelect instead of a native <select>:
+                  journal-entry accounts can be deep (``Ativo >
+                  Circulante > Bancos > BB > CC 12345``) and Chromium's
+                  native dropdown renders options at the button's width,
+                  truncating paths to ~30 chars. The shared component
+                  gets a 720px popover and a two-line row so the full
+                  path is always visible. Search makes picking from
+                  large charts bearable too. */}
+              <SearchableAccountSelect
+                accounts={accounts}
+                value={typeof form.account === "number" ? form.account : null}
+                onChange={(id) => set("account", id ?? undefined)}
+                placeholder="—"
+                compact
+              />
             </Field>
 
             <div className="grid grid-cols-2 gap-3">

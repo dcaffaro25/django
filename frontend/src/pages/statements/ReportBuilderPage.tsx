@@ -668,20 +668,31 @@ function AccountPicker({
         <span className="font-medium tabular-nums">{value.length}</span>
       </button>
       {open && (
-        <div className="absolute right-0 top-[calc(100%+4px)] z-20 w-[360px] rounded-md border border-border bg-popover p-2 shadow-md">
+        <div className="absolute right-0 top-[calc(100%+4px)] z-20 w-[min(560px,95vw)] rounded-md border border-border bg-popover p-2 shadow-md">
+          {/* Widened 360→560 and rows split into two lines so deep
+              account paths render fully. Old single-line + truncate
+              cut off paths like ``Ativo > Circulante > Bancos > BB``
+              mid-hierarchy. */}
           <input
             autoFocus
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            placeholder="Buscar conta..."
+            placeholder="Buscar por código, nome ou caminho..."
             className="mb-2 h-7 w-full rounded-md border border-border bg-background px-2 text-[11px] outline-none focus:border-ring"
           />
-          <div className="max-h-[240px] overflow-y-auto">
+          <div className="max-h-[320px] overflow-y-auto">
             {filtered.map((a) => {
               const checked = value.includes(a.id)
+              // Split path into leaf name + upstream path so we can
+              // render them with different weights. If path is just
+              // ``name`` (e.g. root accounts), we collapse to a single
+              // line to avoid a visually-empty second line.
+              const leaf = a.name ?? a.path
+              const pathLine = a.path && a.path !== a.name ? a.path : ""
               return (
                 <label key={a.id}
-                  className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-[11px] hover:bg-accent">
+                  title={a.path}
+                  className="flex cursor-pointer items-start gap-2 rounded px-1.5 py-1 text-[11px] hover:bg-accent">
                   <input
                     type="checkbox"
                     checked={checked}
@@ -689,9 +700,23 @@ function AccountPicker({
                       if (checked) onChange(value.filter((v) => v !== a.id))
                       else onChange([...value, a.id])
                     }}
+                    className="mt-0.5 shrink-0"
                   />
-                  <span className="font-mono text-muted-foreground">{a.account_code ?? ""}</span>
-                  <span className="truncate">{a.path}</span>
+                  <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                    <div className="flex items-baseline gap-1.5">
+                      {a.account_code && (
+                        <span className="font-mono text-[10px] text-muted-foreground">
+                          {a.account_code}
+                        </span>
+                      )}
+                      <span className="truncate font-medium">{leaf}</span>
+                    </div>
+                    {pathLine && (
+                      <span className="block break-words text-[10px] leading-snug text-muted-foreground">
+                        {pathLine}
+                      </span>
+                    )}
+                  </div>
                 </label>
               )
             })}
