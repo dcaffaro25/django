@@ -562,6 +562,25 @@ export function useSaveJournalEntry() {
   })
 }
 
+/**
+ * Add JE(s) to an existing Transaction by deriving from a template JE.
+ * Invalidates both the generic journal_entries cache and the unmatched
+ * key the Bancada book pane uses (prefix matches don't cover the
+ * latter — same reason useCreateSuggestions invalidates both).
+ */
+export function useDeriveJournalEntries() {
+  const sub = useSub()
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: reconApi.deriveJournalEntries,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["recon", sub, "journal_entries"] })
+      qc.invalidateQueries({ queryKey: ["recon", sub, "journal_entries_unmatched"] })
+      qc.invalidateQueries({ queryKey: ["recon", sub, "transactions"] })
+    },
+  })
+}
+
 export function useDeleteJournalEntry() {
   const sub = useSub()
   const qc = useQueryClient()

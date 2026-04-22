@@ -9,8 +9,8 @@ import { toast } from "sonner"
 import { Drawer } from "vaul"
 import {
   Wallet, BookOpen, Check, X, Sparkles, ArrowLeftRight, AlertCircle, AlertTriangle,
-  Plus, Trash2, CheckCircle2, Search, RotateCcw, Loader2, Wand2, RefreshCw,
-  ArrowUp, ArrowDown, ChevronsLeft, ChevronLeft, ChevronRight, ChevronsRight,
+  Plus, Trash2, CheckCircle2, Search, RotateCcw, Loader2, Wand2, RefreshCw, Scale,
+  FileText, ArrowUp, ArrowDown, ChevronsLeft, ChevronLeft, ChevronRight, ChevronsRight,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { StatusBadge } from "@/components/ui/status-badge"
@@ -20,6 +20,8 @@ import { logAction, logError } from "@/lib/activity-beacon"
 import { useColumnVisibility, type ColumnDef } from "@/stores/column-visibility"
 import { RunRuleDrawer } from "@/components/reconciliation/RunRuleDrawer"
 import { MassReconcileDrawer } from "@/components/reconciliation/MassReconcileDrawer"
+import { AdjustmentDrawer } from "@/components/reconciliation/AdjustmentDrawer"
+import { TransactionDetailsDrawer } from "@/components/reconciliation/TransactionDetailsDrawer"
 import { SearchableAccountSelect } from "@/components/reconciliation/SearchableAccountSelect"
 import {
   useBankAccountsList,
@@ -464,6 +466,12 @@ export function WorkbenchPage() {
   const [addOpen, setAddOpen] = useState(false)
   const [massOpen, setMassOpen] = useState(false)
   const [runRuleOpen, setRunRuleOpen] = useState(false)
+  // Per-row adjustment: clicking the "Ajustar" icon on a book row opens
+  // the drawer seeded with that JE as the template. null = closed.
+  const [adjustTemplate, setAdjustTemplate] = useState<JournalEntry | null>(null)
+  // Per-row transaction inspector: shows every JE tied to the clicked
+  // row's Transaction (the cash leg + contras). Read-only view.
+  const [detailsSource, setDetailsSource] = useState<JournalEntry | null>(null)
 
   // Keyboard-driven cursor state
   const [activePane, setActivePane] = useState<"bank" | "book">("bank")
@@ -820,6 +828,8 @@ export function WorkbenchPage() {
             items={pagedJournalEntries}
             selected={selectedBook}
             onToggle={toggleBook}
+            onAdjust={(item) => setAdjustTemplate(item)}
+            onInspect={(item) => setDetailsSource(item)}
             cursorIndex={activePane === "book" ? cursorBook : -1}
             isVisible={bookCols.isVisible}
           />
@@ -882,6 +892,18 @@ export function WorkbenchPage() {
         onClose={() => setMassOpen(false)}
         bankItems={selectedBankItems}
         onCreated={clearSelection}
+      />
+
+      <AdjustmentDrawer
+        open={adjustTemplate != null}
+        onClose={() => setAdjustTemplate(null)}
+        template={adjustTemplate}
+      />
+
+      <TransactionDetailsDrawer
+        open={detailsSource != null}
+        onClose={() => setDetailsSource(null)}
+        source={detailsSource}
       />
 
       <RunRuleDrawer
@@ -1604,11 +1626,16 @@ function BankList({
 }
 
 function BookList({
-  items, selected, onToggle, cursorIndex = -1, isVisible,
+  items, selected, onToggle, onAdjust, onInspect, cursorIndex = -1, isVisible,
 }: {
   items: JournalEntry[]
   selected: Set<number>
   onToggle: (id: number) => void
+  /** Per-row "Ajustar" click — opens the adjustment drawer for this JE. */
+  onAdjust?: (item: JournalEntry) => void
+  /** Per-row "Ver transação" click — opens the details drawer with every
+   *  JE tied to the same Transaction as this row. */
+  onInspect?: (item: JournalEntry) => void
   cursorIndex?: number
   isVisible?: (key: string) => boolean
 }) {
@@ -1635,12 +1662,25 @@ function BookList({
           const acctRef = (item as unknown as { account?: { name?: string; account_code?: string } | null; account_name?: string })
           const acctLabel = acctRef.account?.name ?? acctRef.account_name
           return (
-            <button
+            // Row root is a div (not a button) because we now render a
+            // real <button> inside for the "Ajustar" action — nested
+            // buttons are invalid HTML. We keep the click/keyboard
+            // affordances via role/tabIndex so selection still feels
+            // like a button press.
+            <div
               key={item.id}
+              role="button"
+              tabIndex={0}
               onClick={() => onToggle(item.id)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault()
+                  onToggle(item.id)
+                }
+              }}
               style={{ position: "absolute", top: 0, left: 0, width: "100%", transform: `translateY(${vi.start}px)`, height: vi.size }}
               className={cn(
-                "flex w-full items-center gap-2 border-b border-border/60 px-3 text-left text-[12px] transition-colors",
+                "flex w-full cursor-pointer items-center gap-2 border-b border-border/60 px-3 text-left text-[12px] transition-colors outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-primary/60",
                 isSel ? "bg-primary/10 hover:bg-primary/15" : "hover:bg-accent/50",
                 isCursor && "ring-1 ring-inset ring-primary/60",
               )}
@@ -1675,7 +1715,36 @@ function BookList({
               <div className={cn("shrink-0 text-right tabular-nums font-semibold", amt < 0 ? "text-muted-foreground" : "text-foreground")}>
                 {formatCurrency(amt)}
               </div>
-            </button>
+              {(onInspect || onAdjust) && (
+                // stopPropagation keeps the row from toggling when the
+                // operator clicks an icon — selection, inspection, and
+                // adjustment are independent actions on the same row.
+                <div className="ml-1 flex shrink-0 items-center gap-1">
+                  {onInspect && (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); onInspect(item) }}
+                      title="Ver transação e lançamentos associados"
+                      aria-label="Ver transação"
+                      className="grid h-6 w-6 place-items-center rounded-md border border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground"
+                    >
+                      <FileText className="h-3 w-3" />
+                    </button>
+                  )}
+                  {onAdjust && (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); onAdjust(item) }}
+                      title="Ajustar transação (adicionar par débito/crédito)"
+                      aria-label="Ajustar transação"
+                      className="grid h-6 w-6 place-items-center rounded-md border border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground"
+                    >
+                      <Scale className="h-3 w-3" />
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
           )
         })}
       </div>
