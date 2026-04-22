@@ -9,7 +9,7 @@ import { toast } from "sonner"
 import { Drawer } from "vaul"
 import {
   Wallet, BookOpen, Check, X, Sparkles, ArrowLeftRight, AlertCircle, AlertTriangle,
-  Plus, Trash2, CheckCircle2, Search, RotateCcw, Loader2, Wand2,
+  Plus, Trash2, CheckCircle2, Search, RotateCcw, Loader2, Wand2, RefreshCw,
   ArrowUp, ArrowDown, ChevronsLeft, ChevronLeft, ChevronRight, ChevronsRight,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
@@ -20,13 +20,14 @@ import { logAction, logError } from "@/lib/activity-beacon"
 import { useColumnVisibility, type ColumnDef } from "@/stores/column-visibility"
 import { RunRuleDrawer } from "@/components/reconciliation/RunRuleDrawer"
 import { MassReconcileDrawer } from "@/components/reconciliation/MassReconcileDrawer"
+import { SearchableAccountSelect } from "@/components/reconciliation/SearchableAccountSelect"
 import {
-  useAccounts,
   useBankAccountsList,
   useBankTransactions,
   useCreateSuggestions,
   useEntities,
   useFinalizeMatches,
+  useLeafAccounts,
   useSuggestMatches,
   useUnmatchedJournalEntries,
   workbenchFiltersToStacks,
@@ -280,11 +281,13 @@ export function WorkbenchPage() {
     data: rawBankTxs = [],
     isLoading: bankLoading,
     isFetching: bankFetching,
+    refetch: refetchBank,
   } = useBankTransactions(txParams)
   const {
     data: rawJournalEntries = [],
     isLoading: bookLoading,
     isFetching: bookFetching,
+    refetch: refetchBook,
   } = useUnmatchedJournalEntries(jeParams)
 
   // Client-side filtering: each pane owns its own filters; values below are
@@ -669,6 +672,11 @@ export function WorkbenchPage() {
           onFocus={() => setActivePane("bank")}
           headerAction={
             <div className="flex items-center gap-1.5">
+              <RefreshButton
+                onClick={() => refetchBank()}
+                isFetching={bankFetching}
+                title="Atualizar extratos"
+              />
               <SortMenu
                 options={BANK_SORT_OPTIONS}
                 value={bankSort}
@@ -741,6 +749,11 @@ export function WorkbenchPage() {
           onFocus={() => setActivePane("book")}
           headerAction={
             <div className="flex items-center gap-1.5">
+              <RefreshButton
+                onClick={() => refetchBook()}
+                isFetching={bookFetching}
+                title="Atualizar lançamentos"
+              />
               <SortMenu
                 options={BOOK_SORT_OPTIONS}
                 value={bookSort}
@@ -977,6 +990,37 @@ function Pane({
         </div>
       )}
     </div>
+  )
+}
+
+/* ---------------- Refresh button (per pane) ---------------- */
+
+/**
+ * Per-pane refresh button. Triggers the query's refetch and spins the
+ * icon while fetching. Lives next to the sort/column picker in each
+ * pane header so operators can re-pull extract or JE data without
+ * disturbing the other pane's state.
+ */
+function RefreshButton({
+  onClick,
+  isFetching,
+  title,
+}: {
+  onClick: () => void
+  isFetching: boolean
+  title: string
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={isFetching}
+      title={title}
+      aria-label={title}
+      className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-60"
+    >
+      <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} />
+    </button>
   )
 }
 
@@ -1978,23 +2022,13 @@ function AddEntriesDrawer({
   onCreated: () => void
 }) {
   const { t } = useTranslation(["reconciliation", "common"])
-  const { data: accounts = [] } = useAccounts()
   const createSuggestions = useCreateSuggestions()
 
-  // Restrict the dropdown to leaf accounts — journal entries should never
-  // post to a group / parent. We derive leaf-ness client-side by checking
-  // whether any other account has this one as parent (the serializer
-  // doesn't expose is_leaf directly).
-  const leafAccounts = useMemo<AccountLite[]>(() => {
-    const parents = new Set<number>()
-    for (const a of accounts) {
-      if (a.parent != null) parents.add(a.parent)
-    }
-    return (accounts as AccountLite[])
-      .filter((a) => a.is_active !== false && !parents.has(a.id))
-      .sort((a, b) => (a.account_code ?? "").localeCompare(b.account_code ?? "", undefined, { numeric: true })
-        || a.path.localeCompare(b.path, undefined, { numeric: true }))
-  }, [accounts])
+  // Leaf-only posting targets — see useLeafAccounts for the why. Shared
+  // with the mass-match drawer so both surfaces show the same set of
+  // selectable accounts (previously each drawer had its own copy, which
+  // let their behaviours drift).
+  const leafAccounts = useLeafAccounts()
 
   const [rows, setRows] = useState<EntryRow[]>([newEntryRow()])
 
@@ -2298,18 +2332,16 @@ function EntryRowEditor({
         <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
           {t("add_entries.account")}
         </span>
-        <select
-          value={row.account_id}
-          onChange={(e) => onChange({ account_id: e.target.value ? Number(e.target.value) : "" })}
-          className="h-8 w-full rounded-md border border-border bg-background px-2 text-[12px] outline-none focus:border-ring"
-        >
-          <option value="">—</option>
-          {accounts.map((a) => (
-            <option key={a.id} value={a.id}>
-              {a.account_code ? `${a.account_code} · ` : ""}{a.path}
-            </option>
-          ))}
-        </select>
+        {/* Searchable picker — a 400+ account CoA is unusable as a plain
+            <select>. Matches the mass-match drawer so operators get a
+            consistent picker across every Bancada surface. */}
+        <SearchableAccountSelect
+          accounts={accounts}
+          value={typeof row.account_id === "number" ? row.account_id : null}
+          onChange={(id) => onChange({ account_id: id ?? "" })}
+          placeholder="—"
+          compact
+        />
       </label>
       <label className="flex flex-col gap-1">
         <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Lado</span>

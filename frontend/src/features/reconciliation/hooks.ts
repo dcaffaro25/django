@@ -360,6 +360,15 @@ export function useCreateSuggestions() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["recon", sub, "bank_transactions"] })
       qc.invalidateQueries({ queryKey: ["recon", sub, "journal_entries"] })
+      // The Bancada book pane is driven by /api/journal_entries/unmatched/,
+      // which is cached under its own key. The generic "journal_entries"
+      // invalidation above does NOT match it (React Query does a prefix
+      // match, and "journal_entries" is not a prefix of
+      // "journal_entries_unmatched"). Without this line the book table
+      // stayed stale until a manual refresh.
+      qc.invalidateQueries({ queryKey: ["recon", sub, "journal_entries_unmatched"] })
+      qc.invalidateQueries({ queryKey: ["recon", sub, "reconciliations"] })
+      qc.invalidateQueries({ queryKey: ["recon", sub, "reconciliation_summaries"] })
     },
   })
 }
@@ -372,6 +381,10 @@ export function useFinalizeMatches() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["recon", sub, "bank_transactions"] })
       qc.invalidateQueries({ queryKey: ["recon", sub, "journal_entries"] })
+      // See useCreateSuggestions — book pane uses a different key.
+      qc.invalidateQueries({ queryKey: ["recon", sub, "journal_entries_unmatched"] })
+      qc.invalidateQueries({ queryKey: ["recon", sub, "reconciliations"] })
+      qc.invalidateQueries({ queryKey: ["recon", sub, "reconciliation_summaries"] })
     },
   })
 }

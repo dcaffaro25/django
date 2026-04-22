@@ -284,7 +284,13 @@ class CostCenterViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
 class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Account.objects.all()
     serializer_class = AccountSerializer
-    
+    # Without this, ?is_active=true was silently ignored by DjangoFilterBackend
+    # and the Bancada dropdown ended up loading inactive accounts too — which
+    # also poisoned the client-side leaf detection (an inactive child was
+    # enough to mask its parent out of the "leaf only" dropdown).
+    filterset_fields = ['is_active', 'parent', 'company']
+    search_fields = ['account_code', 'name']
+
     if settings.AUTH_OFF:
         permission_classes = []
     else:
