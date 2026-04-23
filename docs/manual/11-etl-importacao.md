@@ -542,6 +542,163 @@ Altere a planilha — por exemplo, corrija o valor da conta de luz:
 
 ---
 
+## 11.10c Transações com o mesmo `erp_id` em múltiplas linhas
+
+> **Regra geral:** no universo contábil, `erp_id` identifica **uma** transação econômica (uma nota fiscal, um boleto, uma transferência). Se o mesmo `erp_id` aparece em várias linhas da planilha, o sistema interpreta essas linhas como **pernas da mesma transação** — e não como transações distintas que casualmente compartilham um identificador externo.
+
+O comportamento depende de qual dos dois modos de importação está em uso.
+
+### 11.10c.1 Modo 1 — Abas separadas de `Transaction` + `JournalEntry`
+
+Este é o modo usado em 11.10b: o template tem uma aba `Transaction` (campos da transação) e uma aba `JournalEntry` (campos dos lançamentos), ligadas pelo campo `__transaction_erp_id` na aba `JournalEntry`.
+
+**A aba `Transaction` precisa ter UMA linha por `erp_id`.** Se o mesmo `erp_id` aparecer em mais de uma linha da aba `Transaction`, o sistema:
+
+1. **Compara todos os campos de nível-transação** (`date`, `entity`, `description`, `amount`, `currency`) entre as linhas duplicadas.
+2. Se **todos os campos coincidem** → trata como importação redundante e processa **uma única** transação.
+3. Se **qualquer campo diverge** → rejeita as linhas duplicadas com um erro listando cada conflito encontrado.
+
+**Exemplo — linhas duplicadas com campos idênticos (dedup silencioso):**
+
+| __erp_id | erp_id | date | description | amount | currency_erp_id | entity_erp_id |
+|----------|--------|------|-------------|--------|-----------------|---------------|
+| OMIE-NF-123 | OMIE-NF-123 | 2026-04-10 | Fornecedor ABC | 5000.00 | BRL | FILIAL-01 |
+| OMIE-NF-123 | OMIE-NF-123 | 2026-04-10 | Fornecedor ABC | 5000.00 | BRL | FILIAL-01 |
+
+**Resultado:**
+```json
+{
+  "Transaction": {"created": 1, "updated": 0, "deduped": 1}
+}
+```
+
+**Exemplo — linhas duplicadas com conflito (rejeitadas):**
+
+| __erp_id | erp_id | date | description | amount | currency_erp_id | entity_erp_id |
+|----------|--------|------|-------------|--------|-----------------|---------------|
+| OMIE-NF-123 | OMIE-NF-123 | 2026-04-10 | Fornecedor ABC | 5000.00 | BRL | FILIAL-01 |
+| OMIE-NF-123 | OMIE-NF-123 | 2026-04-11 | Fornecedor ABC | 5500.00 | BRL | FILIAL-01 |
+
+**Resultado:**
+```json
+{
+  "Transaction": {"created": 0, "errors": 2},
+  "errors": [
+    {
+      "erp_id": "OMIE-NF-123",
+      "row_ids": [2, 3],
+      "message": "Linhas compartilham o mesmo erp_id mas divergem em: date (2026-04-10 vs 2026-04-11), amount (5000.00 vs 5500.00)"
+    }
+  ]
+}
+```
+
+> **Por que rejeitar em vez de eleger silenciosamente uma das linhas?** Dedupar silenciosamente transforma um erro de planilha em uma divergência oculta entre o arquivo de origem e o banco — quase sempre pior do que falhar explicitamente e forçar o operador a corrigir a fonte.
+
+**Os vários lançamentos contábeis (JEs) vão na aba `JournalEntry`.** Cada linha ali é uma perna da transação, ligada ao pai via `__transaction_erp_id`:
+
+| __erp_id | transaction_erp_id | account_erp_id | debit_amount | credit_amount |
+|----------|--------------------|----------------|--------------|---------------|
+| JE-NF123-D | OMIE-NF-123 | FORNECEDORES | 5000.00 | 0 |
+| JE-NF123-C | OMIE-NF-123 | BANCO-BB | 0 | 5000.00 |
+
+**Invariante do Modo 1:** na aba `JournalEntry`, a soma de `debit_amount` deve igualar a soma de `credit_amount` para cada `transaction_erp_id` — o sistema valida isso antes de persistir.
+
+---
+
+### 11.10c.2 Modo 2 — ETL com `auto_create_journal_entries` habilitado
+
+Neste modo (ver 11.8), a planilha tem **apenas** uma aba `Transaction` com colunas para conta bancária e conta contraparte (por exemplo, `bank_account_id`, `account_path`, `amount`). O ETL cria automaticamente os lançamentos contábeis a partir de cada linha.
+
+**Quando o mesmo `erp_id` aparece em várias linhas, o sistema agrupa:** produz **1 `Transaction`** + **N lançamentos contraparte** (um por linha) + **1 lançamento bancário agregado** (valor total do grupo).
+
+**Por quê um lançamento bancário agregado?** Porque no mundo real o banco registra **um** movimento. Se um boleto de R$ 10.000,00 foi alocado em duas contas contábeis (R$ 7.000 em Matéria-Prima e R$ 3.000 em Frete), o banco não sabe da divisão — ele só viu R$ 10.000,00 saindo. O lado contábil tem duas pernas contraparte, mas o lado bancário é uma só.
+
+**Exemplo — boleto multi-alocação:**
+
+| __erp_id | bank_account_id | account_path | amount | description |
+|----------|------------------|-------------------------------|--------|-------------|
+| OMIE-BOL-555 | 12 | Despesas > Matéria-Prima | -7000.00 | Boleto fornecedor XYZ — MP |
+| OMIE-BOL-555 | 12 | Despesas > Frete | -3000.00 | Boleto fornecedor XYZ — frete |
+
+**Resultado:**
+```json
+{
+  "Transaction": {"created": 1},
+  "JournalEntry": {"created": 3}
+}
+```
+
+No banco, isso vira:
+
+| Transaction | erp_id | amount |
+|-------------|--------|--------|
+| #10001 | OMIE-BOL-555 | -10000.00 |
+
+| JournalEntry | transaction | account | debit | credit | tipo |
+|--------------|-------------|---------|-------|--------|------|
+| #20001 | #10001 | Despesas > Matéria-Prima | 7000.00 | — | contraparte |
+| #20002 | #10001 | Despesas > Frete | 3000.00 | — | contraparte |
+| #20003 | #10001 | Banco BB | — | 10000.00 | bancária (agregada) |
+
+Soma de débitos = 10.000,00 · Soma de créditos = 10.000,00 — transação balanceada.
+
+**Campos da `Transaction` em modo grupo.** A transação recebe os campos da **primeira linha do grupo** para `date`, `entity`, `description`, `currency`. O campo `amount` é calculado como a **soma** dos `amount` das linhas. Se duas linhas do mesmo grupo divergirem em campos estruturais (data, entidade, moeda, conta bancária), o grupo inteiro é rejeitado com erro listando os conflitos — mesma política do Modo 1.
+
+**Exemplo — grupo rejeitado por divergência de conta bancária:**
+
+| __erp_id | bank_account_id | account_path | amount |
+|----------|------------------|-----------------|--------|
+| OMIE-BOL-555 | 12 | Despesas > MP | -7000.00 |
+| OMIE-BOL-555 | **15** | Despesas > Frete | -3000.00 |
+
+**Resultado:**
+```json
+{
+  "Transaction": {"created": 0, "errors": 1},
+  "errors": [
+    {
+      "erp_id": "OMIE-BOL-555",
+      "row_ids": [2, 3],
+      "message": "Linhas compartilham erp_id mas divergem em: bank_account_id (12 vs 15). Um mesmo erp_id representa um único movimento bancário — escolha uma conta."
+    }
+  ]
+}
+```
+
+**Ordem das linhas importa** apenas para decidir quais valores "ganham" nos campos de nível-transação. Campos opcionais (como `je_bank_date`, `je_book_date`) podem divergir entre linhas de um mesmo grupo — o lançamento contraparte usa o valor da sua própria linha, e o lançamento bancário agregado usa o valor da primeira linha.
+
+---
+
+### 11.10c.3 Quando NÃO usar o mesmo `erp_id` em várias linhas
+
+Em alguns cenários o operador pode ser tentado a reutilizar `erp_id` de formas que o sistema não suporta:
+
+| Cenário | ❌ Não use `erp_id` compartilhado | ✅ Faça assim |
+|---------|-----------------------------------|---------------|
+| Dois pagamentos separados do mesmo fornecedor | Dois `erp_id` distintos (`PAG-001`, `PAG-002`) | — |
+| Parcelas de um mesmo contrato | Um `erp_id` por parcela (`CONTR-123-P01`, `P02`) | — |
+| Estorno que cancela outro movimento | `erp_id` do estorno é diferente do original; o vínculo é por descrição / regra | — |
+| Split de conta bancária — uma transferência em duas contas contábeis | **Aqui SIM compartilhe** `erp_id` no Modo 2 | Ver 11.10c.2 |
+| Fatura com múltiplos itens (várias linhas de despesa sob a mesma nota) | **Aqui SIM compartilhe** `erp_id` | Ver 11.10c.2 |
+
+**Regra de bolso:** se houver **um único `extrato` bancário** que cobre todas as linhas, elas compartilham `erp_id`. Se forem eventos bancários separados, cada um tem seu próprio `erp_id`.
+
+---
+
+### 11.10c.4 Idempotência e re-importação
+
+Em ambos os modos, **re-importar o mesmo arquivo não cria duplicatas**. O sistema:
+
+1. Procura cada `erp_id` no banco (escopo: empresa atual).
+2. Se existe → modo `update`: os campos da transação são sobrescritos pelos valores da planilha.
+3. Se o erp_id é **grupo** no Modo 2 → os lançamentos filhos também são regenerados: os antigos são apagados e os novos criados a partir das linhas atualizadas da planilha. Isso mantém o grupo consistente quando a distribuição entre contas contraparte muda entre importações.
+4. Se não existe → modo `create` normal.
+
+Para **forçar criação** (impedir update sobre uma transação pré-existente), defina `erp_duplicate_behavior: "error"` nas opções da aba. O sistema vai parar na primeira colisão em vez de atualizar.
+
+---
+
 ## 11.11 Dicas e Boas Práticas
 
 ### Preparação da Planilha
@@ -567,6 +724,10 @@ Altere a planilha — por exemplo, corrija o valor da conta de luz:
 | `*_erp_id` não resolve FK | Confirme que o registro relacionado existe e tem o `erp_id` preenchido |
 | `__erp_id` não encontra registro | Confirme que o modelo tem o campo `erp_id` e que o valor corresponde |
 | Duplicatas | Use `__erp_id` ou `__row_id` para atualizar registros existentes em vez de criar novos |
+| `erp_id` compartilhado em linhas com campos divergentes | Veja 11.10c — o sistema rejeita com o campo conflitante no erro. Corrija a planilha ou use `erp_id`s distintos. |
+| Modo 2 criou apenas 1 Tx quando eu esperava várias | Verifique se o `erp_id` está duplicado entre linhas — o agrupamento é intencional (ver 11.10c.2) |
+| Modo 2 — erro "grupo exige 1 conta bancária" | Duas linhas com o mesmo `erp_id` indicaram `bank_account_id` diferentes. Um erp_id = um movimento bancário. Separe em dois `erp_id`s. |
+| Re-importação apagou meus lançamentos customizados | No Modo 2, re-importar com o mesmo `erp_id` regenera os filhos. Edite a planilha de origem em vez do banco, ou use `erp_duplicate_behavior: "error"`. |
 | Timeout | Reduza o tamanho da planilha ou verifique Celery |
 
 ---
