@@ -72,12 +72,26 @@ export function SearchableAccountSelect({
   // Computed popover position + size in viewport coordinates. Populated
   // by the layout effect below and consumed by the portaled popover
   // ``<div>`` as inline style.
+  //
+  // ``pointerEvents: "auto"`` is REQUIRED and not optional: when a Vaul
+  // drawer (or any Radix DismissableLayer with outside pointer events
+  // disabled) is open, Radix sets ``document.body.style.pointerEvents
+  // = "none"`` to guarantee that only the current layer owns pointer
+  // interaction. DismissableLayer itself re-enables pointer-events on
+  // its own Primitive.div. DismissableLayerBranch does NOT — it's a
+  // plain Primitive.div with no pointer-events handling. Without this
+  // explicit override our portaled popover sits on body (which has
+  // pointer-events: none) and clicks pass straight through it to the
+  // drawer body behind. The option button's onClick never fires,
+  // which is exactly the MassReconcileDrawer "click doesn't select"
+  // symptom we hit in production.
   const [popoverStyle, setPopoverStyle] = useState<React.CSSProperties>({
     position: "fixed",
     top: 0,
     left: 0,
     width: PREFERRED_POPOVER_WIDTH,
     visibility: "hidden",
+    pointerEvents: "auto",
   })
 
   const selected = value != null ? accounts.find((a) => a.id === value) : null
@@ -162,6 +176,8 @@ export function SearchableAccountSelect({
         left: leftPx,
         width,
         visibility: "visible",
+        // MUST stay ``auto`` — see the popoverStyle init above for why.
+        pointerEvents: "auto",
       })
     }
     place()
