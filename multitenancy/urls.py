@@ -42,6 +42,10 @@ urlpatterns = [
     
     path('api/core/', include(router.urls)),
     path('api/core/bulk-import/', BulkImportAPIView.as_view(), name='bulk-import'),
+    # v2 interactive import — analyze → resolve → commit flow. Legacy
+    # ``/api/core/bulk-import/`` above stays untouched. See
+    # ``docs/manual/11-etl-importacao.md`` §11.10d for the operator UX.
+    path('api/core/imports/v2/', include('multitenancy.imports_v2.urls')),
     # Make the prefix itself optional-slash:
     re_path(r'^api/core/?', include(router.urls)),
 
