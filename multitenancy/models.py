@@ -717,6 +717,21 @@ class ImportTransformationRule(TenantAwareBaseModel):
         ),
     )
 
+    # PER-COLUMN OPTIONS — parallel hint dict keyed by target field name.
+    # Currently used by the substitution engine to bypass rule lookups
+    # on columns the operator knows don't need substitutions (perf hint).
+    column_options = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "Per-column hints keyed by target field name. "
+            'Example: {"amount": {"skip_substitutions": true}}. '
+            "Supported flags: skip_substitutions (bool) — when true, "
+            "the substitution engine performs zero rule lookups on "
+            "this field."
+        ),
+    )
+
     class Meta:
         ordering = ['execution_order', 'name']
         indexes = [

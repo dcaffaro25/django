@@ -12,7 +12,7 @@ Phase sections for the specific next step.
 
 ## 1. Status summary
 
-All green. 60 tests passing. Seven commits on `main`, in order:
+Six commits on `main`, in order:
 
 | Ref         | What shipped                                                                 |
 |-------------|------------------------------------------------------------------------------|
@@ -21,6 +21,7 @@ All green. 60 tests passing. Seven commits on `main`, in order:
 | `6882a25`   | Phase 1 — `ImportSession` model + `SubstitutionRule.source` field + tests    |
 | `8c56913`   | Phase 2 — Template v2 backend (analyze + commit) + 14 tests                  |
 | `0cc9835`   | Phase 3 — ETL v2 backend (analyze + commit) + 9 tests                        |
+| `<pending>` | Phase 3.6 — Engine perf (pre-compile) + `skip_substitutions` hint + 25 tests |
 
 Nothing uncommitted. Feature branch is `claude/adoring-wing-665ba7`
 and tracks `origin/main` exactly; delete the branch or continue on
@@ -42,6 +43,7 @@ DJANGO_SETTINGS_MODULE=nord_backend.settings \
     multitenancy/tests/test_import_session_model.py \
     multitenancy/tests/test_imports_v2_backend.py \
     multitenancy/tests/test_imports_v2_etl.py \
+    multitenancy/tests/test_substitution_engine_perf.py \
     -v --reuse-db
 ```
 
@@ -55,7 +57,50 @@ many migrations). Second run with `--reuse-db` is ~2–3 min.
 Listed in execution order. Each phase is independently reviewable
 and mergeable.
 
-### Phase 3.6 — Engine perf + per-column "skip substitutions" hint
+### Phase 3.6 — Engine perf + per-column "skip substitutions" hint ✅ SHIPPED
+
+Shipped together with this plan revision. Summary of what actually
+landed:
+
+- `formula_engine._make_filter_fn` pre-walks the `filter_conditions`
+  JSON tree into a closure once per rule (all/any/not/leaf ops).
+- `formula_engine._build_compiled_rule_meta` attaches pre-compiled
+  regex / pre-normalized caseless match_value / pre-parsed filter
+  closure to each rule, keyed by `id(rule)`.
+- Hot loop uses `_apply_compiled_rule` — no re-compile/re-normalize
+  per row.
+- Dead `column_name` / `column_index` rule-grouping branches removed
+  (fields gone since migration 0023); `column_names` kwarg kept as
+  a legacy no-op for backward compat; `apply_substitutions2` deleted
+  (dead helper, would've AttributeError'd on first call).
+- `apply_substitutions(skip_fields=..., stats_out=...)` — new kwargs.
+  `skip_fields` zeroes rule lookups on flagged target-field names
+  (verified via `stats_out['rule_hits']`). Honours both the FK
+  substitution phase and the model-field phase.
+- `ImportTransformationRule.column_options` JSONField + migration
+  `0036_importtransformationrule_column_options`. Shape:
+  `{"amount": {"skip_substitutions": true}}`.
+- `ETLPipelineService._extract_skip_substitution_fields` converts the
+  column_options dict into a set of target-field names; wired into
+  `_apply_substitutions` (FK phase + model phase) and the
+  transaction-pre-analysis call at
+  `etl_service.py:_import_transactions_with_journal_entries`.
+- 25 tests in
+  `multitenancy/tests/test_substitution_engine_perf.py` — covers
+  compiled filter closure ops, regex pre-compile, caseless
+  pre-normalize, stats_out contract, skip_fields bypass (verified
+  via `rule_hits` counter, not just unchanged values), and the
+  `_extract_skip_substitution_fields` helper.
+
+**Known non-goal carried forward:** the per-value substitution cache
+is populated on first successful substitution and reused for later
+rows with the same value regardless of filter_conditions. This is
+unchanged pre-existing behaviour and not in Phase 3.6's scope.
+Documented in the affected test's docstring.
+
+---
+
+### Phase 3.6 — Engine perf + per-column "skip substitutions" hint (historical design notes)
 
 **Why** — the existing substitution engine at
 `multitenancy/formula_engine.py:apply_substitutions()` (line 602)

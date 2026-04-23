@@ -1028,11 +1028,37 @@ class ETLPipelineService:
             )
             self.sheets_failed.append(sheet_name)
     
+    def _extract_skip_substitution_fields(self, rule) -> set:
+        """Return target-field names flagged with ``skip_substitutions=true``
+        in the rule's ``column_options`` dict, or empty set when the rule
+        is absent / malformed.
+
+        The hint lets operators declare known-clean columns so the
+        substitution engine skips them entirely (no rule lookups).
+        """
+        if rule is None:
+            return set()
+        column_options = getattr(rule, 'column_options', None) or {}
+        if not isinstance(column_options, dict):
+            return set()
+        return {
+            field_name
+            for field_name, opts in column_options.items()
+            if isinstance(opts, dict) and opts.get("skip_substitutions") is True
+        }
+
     def _apply_substitutions(self):
         """Apply SubstitutionRules to transformed data."""
         from multitenancy.formula_engine import _passes_conditions
-        
+
         for model_name, rows in self.transformed_data.items():
+            # Respect the per-column ``skip_substitutions`` hint from the
+            # transformation rule. Flagged fields bypass both FK and
+            # model-level substitutions for this model.
+            skip_fields = self._extract_skip_substitution_fields(
+                self.transformation_rules.get(model_name)
+            )
+
             # Get model class to identify FK fields
             app_label = MODEL_APP_MAP.get(model_name)
             model = None
@@ -1056,6 +1082,8 @@ class ETLPipelineService:
                 
                 for row_idx, row in enumerate(rows):
                     for field_name, related_model_name in fk_field_mapping.items():
+                        if field_name in skip_fields:
+                            continue
                         if field_name not in row or row[field_name] is None:
                             continue
                         
@@ -1122,10 +1150,17 @@ class ETLPipelineService:
                 continue
             
             logger.info(f"ETL: Applying {rules.count()} model-level substitution rules to {len(rows)} rows of {model_name}")
-            
+
             for rule in rules:
                 field_name = rule.field_name
-                
+                if field_name in skip_fields:
+                    logger.debug(
+                        f"ETL SUBSTITUTION: Skipping rule {rule.id} for "
+                        f"{model_name}.{field_name} — flagged "
+                        f"skip_substitutions=true on the transformation rule"
+                    )
+                    continue
+
                 for row in rows:
                     if field_name not in row:
                         continue
@@ -2330,12 +2365,17 @@ class ETLPipelineService:
             return value
         
         model = apps.get_model('accounting', 'Transaction')
-        
+
         # Track processed rows for commit substitutions to avoid processing twice
         processed_substitution_rows = set()
         # Cache substitutions: {model_name: {field_name: {original: substituted}}}
         substitution_cache = {}
-        
+
+        # Per-column skip_substitutions hint for Transaction, read once.
+        tx_skip_fields = self._extract_skip_substitution_fields(
+            self.transformation_rules.get('Transaction')
+        )
+
         total_start = time.time()
         logger.info(f"ETL DEBUG: Starting transaction processing for {len(transaction_sheets)} sheet(s)")
 
@@ -2365,6 +2405,7 @@ class ETLPipelineService:
                 processed_row_ids=processed_substitution_rows,
                 sheet_name=sheet_name,
                 substitution_cache=substitution_cache,
+                skip_fields=tx_skip_fields,
             )
             subst_time = time.time() - subst_start
             per_row_ms = (subst_time / len(rows) * 1000) if rows else 0.0

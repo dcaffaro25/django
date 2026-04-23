@@ -599,18 +599,167 @@ def _passes_conditions(row: Dict[str, Any], conditions: Optional[Dict[str, Any]]
         if op == "gte": return a >= b
     return True
 
+# -----------------------------------------------------------------------
+# Compiled filter-condition closures
+# -----------------------------------------------------------------------
+# `_passes_conditions` walks the JSON tree on every row × rule pair.
+# For the hot ETL substitution path we pre-compile the tree into a
+# closure once per rule (at cache-build time) so row evaluation is just
+# a function call.
+
+def _always_true(_row: Dict[str, Any]) -> bool:
+    return True
+
+
+def _always_false(_row: Dict[str, Any]) -> bool:
+    return False
+
+
+def _make_filter_fn(conditions: Optional[Dict[str, Any]]):
+    """Pre-walk a filter_conditions JSON tree into a callable closure.
+
+    Mirrors the semantics of `_passes_conditions` exactly — kept as two
+    implementations because `_passes_conditions` is still used by
+    non-hot paths (e.g. etl_service._apply_substitutions FK phase).
+    """
+    if not conditions:
+        return _always_true
+    if not isinstance(conditions, dict):
+        return _always_true
+    if "all" in conditions:
+        sub_fns = [_make_filter_fn(c) for c in conditions["all"]]
+        return lambda row: all(fn(row) for fn in sub_fns)
+    if "any" in conditions:
+        sub_fns = [_make_filter_fn(c) for c in conditions["any"]]
+        return lambda row: any(fn(row) for fn in sub_fns)
+    if "not" in conditions:
+        sub_fn = _make_filter_fn(conditions["not"])
+        return lambda row: not sub_fn(row)
+    if "field" not in conditions:
+        return _always_true
+    field = conditions.get("field")
+    op = (conditions.get("op") or "eq").lower()
+    target = conditions.get("value")
+
+    if op == "eq":
+        return lambda row: row.get(field) == target
+    if op == "neq":
+        return lambda row: row.get(field) != target
+    if op == "iexact":
+        target_n = _normalize(target)
+        return lambda row: _normalize(row.get(field)) == target_n
+    if op == "in":
+        def _in(row):
+            try:
+                return row.get(field) in target
+            except Exception:
+                return False
+        return _in
+    if op == "nin":
+        def _nin(row):
+            try:
+                return row.get(field) not in target
+            except Exception:
+                return False
+        return _nin
+    if op == "contains":
+        t_str = str(target)
+        return lambda row: t_str in str(row.get(field))
+    if op == "icontains":
+        target_n = _normalize(target)
+        return lambda row: target_n in _normalize(row.get(field))
+    if op == "regex":
+        try:
+            compiled = re.compile(str(target))
+        except re.error:
+            return _always_false
+        return lambda row: compiled.search(str(row.get(field) or "")) is not None
+    if op in {"lt", "lte", "gt", "gte"}:
+        op_fn = {"lt": operator.lt, "lte": operator.le,
+                 "gt": operator.gt, "gte": operator.ge}[op]
+
+        def _num(row):
+            try:
+                a = float(row.get(field))
+                b = float(target)
+            except Exception:
+                return False
+            return op_fn(a, b)
+        return _num
+    return _always_true
+
+
+def _build_compiled_rule_meta(rules_list):
+    """Pre-compile per-rule state so the per-row loop avoids rework.
+
+    Returns a dict keyed by ``id(rule)`` with entries ``{mt, regex,
+    mv_norm, filter_fn}``. Unused keys are absent (e.g. ``regex``
+    only set for regex rules).
+    """
+    meta_by_id: Dict[int, Dict[str, Any]] = {}
+    for rl in rules_list:
+        mt = (rl.match_type or "exact").lower()
+        entry: Dict[str, Any] = {"mt": mt}
+        if mt == "regex":
+            try:
+                entry["regex"] = re.compile(str(rl.match_value))
+            except re.error:
+                entry["regex"] = None
+        elif mt == "caseless":
+            entry["mv_norm"] = _normalize(rl.match_value)
+        fc = getattr(rl, "filter_conditions", None)
+        entry["filter_fn"] = _make_filter_fn(fc)
+        meta_by_id[id(rl)] = entry
+    return meta_by_id
+
+
+def _apply_compiled_rule(
+    rl,
+    meta: Dict[str, Any],
+    row_dict: Dict[str, Any],
+    value: Any,
+) -> Tuple[bool, Any]:
+    """Evaluate one compiled rule against (row, value).
+
+    Returns (matched, new_value). Drop-in replacement for the old
+    `_should_apply_rule` closure but uses precomputed state.
+    """
+    if not meta["filter_fn"](row_dict):
+        return (False, value)
+    mt = meta["mt"]
+    if mt == "exact":
+        if value == rl.match_value:
+            return (True, rl.substitution_value)
+        return (False, value)
+    if mt == "regex":
+        compiled = meta.get("regex")
+        if compiled is None:
+            return (False, value)
+        s = str(value or "")
+        if compiled.search(s):
+            return (True, compiled.sub(str(rl.substitution_value), s))
+        return (False, value)
+    if mt == "caseless":
+        if _normalize(value) == meta["mv_norm"]:
+            return (True, rl.substitution_value)
+        return (False, value)
+    return (False, value)
+
+
 def apply_substitutions(
     payload: List[Union[Dict[str, Any], List[Any]]],
     company_id: int,
     model_name: Optional[str] = None,
     field_names: Optional[List[str]] = None,
-    column_names: Optional[List[str]] = None,
+    column_names: Optional[List[str]] = None,  # legacy kwarg — ignored (fields removed in migration 0023)
     *,
     return_audit: bool = False,
     commit: bool = False,
     processed_row_ids: Optional[set] = None,
     sheet_name: Optional[str] = None,
     substitution_cache: Optional[Dict[str, Dict[str, Dict[Any, Any]]]] = None,
+    skip_fields: Optional[Any] = None,
+    stats_out: Optional[Dict[str, Any]] = None,
 ) -> Union[
     List[Union[Dict[str, Any], List[Any]]],
     Tuple[List[Union[Dict[str, Any], List[Any]]], List[Dict[str, Any]]]
@@ -620,54 +769,67 @@ def apply_substitutions(
     Aceita campo JSON `filter_conditions` em SubstitutionRule para determinar se a regra se aplica.
     Quando `return_audit=True`, retorna também uma auditoria de mudanças por linha.
     Auditoria: lista de dicionários { "__row_id", "field", "old", "new", "rule_id", "rule_name" }.
-    
+
     Quando `commit=True` e `processed_row_ids` é fornecido, rastreia quais linhas já foram processadas
     para evitar processamento duplicado. O set `processed_row_ids` é atualizado in-place com os IDs
     das linhas processadas. Tracking usa (model_name, sheet_name, row_id) para permitir que o mesmo
     row_id apareça em diferentes sheets do mesmo arquivo.
-    
+
     Quando `substitution_cache` é fornecido, armazena mapeamentos de valores originais para valores
     substituídos por modelo e campo: {model_name: {field_name: {original_value: substituted_value}}}.
     Se um valor original já foi substituído anteriormente, reutiliza o resultado em cache em vez de
     reavaliar as regras de substituição.
+
+    Extra kwargs (Phase 3.6):
+      * ``skip_fields``: iterable of target-field names whose substitutions
+        should be skipped entirely (zero rule lookups). Typically derived from
+        ``ImportTransformationRule.column_options[field]['skip_substitutions']``.
+      * ``stats_out``: optional dict populated in-place with profiling info
+        (``{'rule_hits': {rule_id: int}, 'skipped_fields': [...],
+        'rule_time': {rule_id: float}}``). Lets tests assert zero lookups on
+        flagged columns without scraping log output.
     """
     if not company_id:
         raise ValueError("Company ID is required for substitutions.")
     from multitenancy.models import SubstitutionRule  # evitar import circular
-    
+
     # Helper function to normalize row ID (matching tasks.py logic)
     def _norm_row_key(key: Any) -> Any:
         if isinstance(key, str):
             return key.replace("\u00A0", " ").strip().lower()
         return key
-    
+
     # Initialize processed_row_ids set if not provided
     if processed_row_ids is None:
         processed_row_ids = set()
-    
+
     # Initialize substitution_cache if not provided
     # Structure: {model_name: {field_name: {original_value: substituted_value}}}
     if substitution_cache is None:
         substitution_cache = {}
+
+    skip_fields_set = frozenset(skip_fields) if skip_fields else frozenset()
+
     rules_qs = SubstitutionRule.objects.filter(company_id=company_id)
     if model_name:
         rules_qs = rules_qs.filter(model_name=model_name)
     if field_names:
         rules_qs = rules_qs.filter(field_name__in=field_names)
-    if column_names:
-        rules_qs = rules_qs.filter(column_name__in=column_names)
+    # NOTE: column_name / column_index were removed from SubstitutionRule in
+    # migration 0023; the legacy ``column_names`` kwarg is accepted for
+    # back-compat but has no effect. The dead branches that grouped rules
+    # by column were removed here in Phase 3.6.
     # Evaluate queryset once so we can profile and reuse
     rules_list = list(rules_qs)
-    # agrupar regras
-    grouped = {"model_field": {}, "column_name": {}, "column_index": {}}
+    # Pre-compile per-rule state (regex patterns, caseless-normalized
+    # match_value, filter_conditions closure) exactly once. Avoids
+    # recompiling per row × per rule in the hot loop.
+    meta_by_id = _build_compiled_rule_meta(rules_list)
+
+    grouped_by_field: Dict[str, List[Any]] = {}
     for rl in rules_list:
         if rl.model_name and rl.field_name:
-            key = (rl.model_name, rl.field_name)
-            grouped["model_field"].setdefault(key, []).append(rl)
-        elif rl.column_name:
-            grouped["column_name"].setdefault(rl.column_name, []).append(rl)
-        elif rl.column_index is not None:
-            grouped["column_index"].setdefault(rl.column_index, []).append(rl)
+            grouped_by_field.setdefault(rl.field_name, []).append(rl)
     # trabalhar com cópia
     rows = deepcopy(payload)
     audit: List[Dict[str, Any]] = []
@@ -700,6 +862,8 @@ def apply_substitutions(
                     for rec in rows:
                         if isinstance(rec, dict):
                             for field_name, related_model_name in fk_field_mapping.items():
+                                if field_name in skip_fields_set:
+                                    continue
                                 if field_name not in rec or rec[field_name] is None:
                                     continue
                                 
@@ -780,26 +944,6 @@ def apply_substitutions(
             except Exception as e:
                 logger.warning(f"ETL SUBSTITUTION: Error in FK substitution logic: {e}", exc_info=True)
     
-    def _should_apply_rule(row_dict: Dict[str, Any], rl: SubstitutionRule, field: str, value: Any) -> Tuple[bool, Any]:
-        """Avalia condições, tipo de correspondência e retorna (True, novo_valor) se aplicar."""
-        # verifica condições
-        if not _passes_conditions(row_dict, getattr(rl, "filter_conditions", None)):
-            return (False, value)
-        # verifica match
-        mt = (rl.match_type or "exact").lower()
-        mv = rl.match_value
-        sv = rl.substitution_value
-        if mt == "exact":
-            if value == mv: return (True, sv)
-        elif mt == "regex":
-            try:
-                if re.search(str(mv), str(value or "")):
-                    return (True, re.sub(str(mv), str(sv), str(value or "")))
-            except re.error:
-                return (False, value)
-        elif mt == "caseless":
-            if _normalize(value) == _normalize(mv): return (True, sv)
-        return (False, value)
     def _rule_name(rl: SubstitutionRule) -> str:
         """Retorna nome legível da regra, usando campos alternativos se não existir 'name'."""
         return (
@@ -843,155 +987,70 @@ def apply_substitutions(
     # Process only the rows that haven't been processed yet
     rows = rows_to_process
     
+    # Only dicts carry field-named substitutions. Legacy ``column_index``
+    # routing on lists/tuples was removed alongside migration 0023 (see
+    # SubstitutionRule docstring). List/tuple rows are passed through
+    # untouched.
     for rec in rows:
-        # dicionários: usar __row_id e campos nomeados
-        if isinstance(rec, dict):
-            rid = rec.get("__row_id")
-            # regras por model/field
-            for (mdl, fld), rule_list in grouped["model_field"].items():
-                if mdl == model_name and fld in rec:
-                    original = rec[fld]
-                    
-                    # Check cache first - if we've already substituted this value, reuse it
-                    if model_name and fld:
-                        if model_name in substitution_cache and fld in substitution_cache[model_name]:
-                            field_cache = substitution_cache[model_name][fld]
-                            # Check if this original value has been cached (handles None correctly)
-                            if original in field_cache:
-                                cached_value = field_cache[original]
-                                # Found in cache, use cached substitution
-                                if cached_value != original:
-                                    rec[fld] = cached_value
-                                    if return_audit:
-                                        audit.append({
-                                            "__row_id": rid,
-                                            "field": fld,
-                                            "old": original,
-                                            "new": cached_value,
-                                            "rule_id": None,
-                                            "rule_name": "Cached substitution",
-                                        })
-                                continue  # Skip rule evaluation, use cached value
-                    
-                    # Not in cache, apply rules
-                    new_value = original
-                    applied_rule = None
-                    for rl in rule_list:
-                        _t0 = time.perf_counter()
-                        apply, new_value = _should_apply_rule(rec, rl, fld, rec[fld])
-                        rule_time[rl.id] += time.perf_counter() - _t0
-                        rule_hits[rl.id] += 1
-                        if apply:
-                            applied_rule = rl
-                            break
-                    
-                    # Cache the substitution result if it changed
-                    if new_value != original and model_name and fld:
-                        if model_name not in substitution_cache:
-                            substitution_cache[model_name] = {}
-                        if fld not in substitution_cache[model_name]:
-                            substitution_cache[model_name][fld] = {}
-                        substitution_cache[model_name][fld][original] = new_value
-                        logger.debug(f"ETL SUBSTITUTION: Cached substitution for {model_name}.{fld}: '{original}' -> '{new_value}'")
-                    
-                    if new_value != original:
-                        rec[fld] = new_value
+        if not isinstance(rec, dict):
+            continue
+        rid = rec.get("__row_id")
+        for fld, rule_list in grouped_by_field.items():
+            if fld in skip_fields_set:
+                continue
+            if fld not in rec:
+                continue
+            original = rec[fld]
+
+            # Check cache first — avoids rule lookups for values we've
+            # already resolved in this run.
+            if model_name and fld:
+                field_cache_outer = substitution_cache.get(model_name, {}).get(fld)
+                if field_cache_outer is not None and original in field_cache_outer:
+                    cached_value = field_cache_outer[original]
+                    if cached_value != original:
+                        rec[fld] = cached_value
                         if return_audit:
                             audit.append({
                                 "__row_id": rid,
                                 "field": fld,
                                 "old": original,
-                                "new": new_value,
-                                "rule_id": applied_rule.id if applied_rule else None,
-                                "rule_name": _rule_name(applied_rule) if applied_rule else "Unknown",
+                                "new": cached_value,
+                                "rule_id": None,
+                                "rule_name": "Cached substitution",
                             })
-            # regras por column_name
-            for col, rule_list in grouped["column_name"].items():
-                if col in rec:
-                    original = rec[col]
-                    
-                    # Check cache first - if we've already substituted this value, reuse it
-                    if model_name and col:
-                        if model_name in substitution_cache and col in substitution_cache[model_name]:
-                            field_cache = substitution_cache[model_name][col]
-                            # Check if this original value has been cached (handles None correctly)
-                            if original in field_cache:
-                                cached_value = field_cache[original]
-                                # Found in cache, use cached substitution
-                                if cached_value != original:
-                                    rec[col] = cached_value
-                                    if return_audit:
-                                        audit.append({
-                                            "__row_id": rid,
-                                            "field": col,
-                                            "old": original,
-                                            "new": cached_value,
-                                            "rule_id": None,
-                                            "rule_name": "Cached substitution",
-                                        })
-                                continue  # Skip rule evaluation, use cached value
-                    
-                    # Not in cache, apply rules
-                    new_value = original
-                    applied_rule = None
-                    for rl in rule_list:
-                        _t0 = time.perf_counter()
-                        apply, new_value = _should_apply_rule(rec, rl, col, rec[col])
-                        rule_time[rl.id] += time.perf_counter() - _t0
-                        rule_hits[rl.id] += 1
-                        if apply:
-                            applied_rule = rl
-                            break
-                    
-                    # Cache the substitution result if it changed
-                    if new_value != original and model_name and col:
-                        if model_name not in substitution_cache:
-                            substitution_cache[model_name] = {}
-                        if col not in substitution_cache[model_name]:
-                            substitution_cache[model_name][col] = {}
-                        substitution_cache[model_name][col][original] = new_value
-                        logger.debug(f"ETL SUBSTITUTION: Cached substitution for {model_name}.{col}: '{original}' -> '{new_value}'")
-                    
-                    if new_value != original:
-                        rec[col] = new_value
-                        if return_audit:
-                            audit.append({
-                                "__row_id": rid,
-                                "field": col,
-                                "old": original,
-                                "new": new_value,
-                                "rule_id": applied_rule.id if applied_rule else None,
-                                "rule_name": _rule_name(applied_rule) if applied_rule else "Unknown",
-                            })
-        # listas ou tuplas: usar índices
-        elif isinstance(rec, (list, tuple)):
-            # converter tupla para lista para permitir mutação
-            if isinstance(rec, tuple):
-                rec = list(rec)
-                rows[rows.index(rec)] = rec  # atualiza referência
-            for idx, rule_list in grouped["column_index"].items():
-                if idx < len(rec):
-                    original = rec[idx]
-                    for rl in rule_list:
-                        # constrói um dict simplificado para avaliar conditions (campo fictício col_x)
-                        _t0 = time.perf_counter()
-                        row_dict_for_cond = {f"col_{i}": rec[i] for i in range(len(rec))}
-                        apply, new_value = _should_apply_rule(row_dict_for_cond, rl, f"col_{idx}", rec[idx])
-                        rule_time[rl.id] += time.perf_counter() - _t0
-                        rule_hits[rl.id] += 1
-                        if apply:
-                            if new_value != original:
-                                rec[idx] = new_value
-                                if return_audit:
-                                    audit.append({
-                                        "__row_id": None,
-                                        "field": f"col_{idx}",
-                                        "old": original,
-                                        "new": new_value,
-                                        "rule_id": rl.id,
-                                        "rule_name": _rule_name(rl),
-                                    })
-                            break
+                    continue
+
+            new_value = original
+            applied_rule = None
+            for rl in rule_list:
+                meta = meta_by_id[id(rl)]
+                _t0 = time.perf_counter()
+                apply, new_value = _apply_compiled_rule(rl, meta, rec, rec[fld])
+                rule_time[rl.id] += time.perf_counter() - _t0
+                rule_hits[rl.id] += 1
+                if apply:
+                    applied_rule = rl
+                    break
+
+            if new_value != original and model_name and fld:
+                substitution_cache.setdefault(model_name, {}).setdefault(fld, {})[original] = new_value
+                logger.debug(
+                    f"ETL SUBSTITUTION: Cached substitution for {model_name}.{fld}: "
+                    f"'{original}' -> '{new_value}'"
+                )
+
+            if new_value != original:
+                rec[fld] = new_value
+                if return_audit:
+                    audit.append({
+                        "__row_id": rid,
+                        "field": fld,
+                        "old": original,
+                        "new": new_value,
+                        "rule_id": applied_rule.id if applied_rule else None,
+                        "rule_name": _rule_name(applied_rule) if applied_rule else "Unknown",
+                    })
     # Log profiling results if there are any rules
     prof_total = time.perf_counter() - prof_start
     if rule_time and prof_total > 0.01:
@@ -1011,88 +1070,14 @@ def apply_substitutions(
             except:
                 pass
             logger.info(f"ETL SUBSTITUTION PROFILE: Rule {rule_name} (id={rule_id}): {hits} hits, {total_time:.3f}s total, {avg_time*1000:.2f}ms avg")
+    # Expose per-rule stats to callers (tests, profilers) when requested.
+    # ``rule_hits[rule.id] == 0`` for a rule whose field is in skip_fields
+    # proves the engine performed zero lookups on that column.
+    if stats_out is not None:
+        stats_out["rule_hits"] = dict(rule_hits)
+        stats_out["rule_time"] = dict(rule_time)
+        stats_out["skipped_fields"] = sorted(skip_fields_set)
     return (rows, audit) if return_audit else rows
-
-def apply_substitutions2(payload, company_id, model_name=None, field_names=None,
-                        column_names=None):
-    if not company_id:
-        raise ValueError("Company ID is required for substitutions.")
-
-    from multitenancy.models import SubstitutionRule
-    rules = SubstitutionRule.objects.filter(company_id=company_id)
-    
-    if model_name:
-        rules = rules.filter(model_name=model_name)
-    if field_names:
-        rules = rules.filter(field_name__in=field_names)
-    
-    grouped = {
-        "model_field": {},
-        "column_name": {},
-        "column_index": {},
-    }
-    
-    
-    for rule in rules:
-        if rule.model_name and rule.field_name:
-            key = (rule.model_name, rule.field_name)
-            grouped["model_field"].setdefault(key, []).append(rule)
-        elif rule.column_name:
-            grouped["column_name"].setdefault(rule.column_name, []).append(rule)
-        elif rule.column_index is not None:
-            grouped["column_index"].setdefault(rule.column_index, []).append(rule)
-
-    for rec in payload:
-        # Caso dicionário
-        if isinstance(rec, dict):
-            # aplica regras model/field
-            for (mdl, fld), rule_list in grouped["model_field"].items():
-                if model_name == mdl and fld in rec:
-                    value = rec[fld]
-                    for rl in rule_list:
-                        if rl.match_type == 'exact' and value == rl.match_value:
-                            rec[fld] = rl.substitution_value
-                            break
-                        if rl.match_type == 'regex' and re.match(rl.match_value, str(value)):
-                            rec[fld] = re.sub(rl.match_value, rl.substitution_value, str(value))
-                            break
-                        if rl.match_type == 'caseless':
-                            if _normalize(value) == _normalize(rl.match_value):
-                                rec[fld] = rl.substitution_value
-                                break
-            # aplica regras por column_name
-            for col_name, rule_list in grouped["column_name"].items():
-                if col_name in rec:
-                    value = rec[col_name]
-                    for rl in rule_list:
-                        if rl.match_type == 'exact' and value == rl.match_value:
-                            rec[col_name] = rl.substitution_value
-                            break
-                        if rl.match_type == 'regex' and re.match(rl.match_value, str(value)):
-                            rec[col_name] = re.sub(rl.match_value, rl.substitution_value, str(value))
-                            break
-                        if rl.match_type == 'caseless':
-                            if _normalize(value) == _normalize(rl.match_value):
-                                rec[col_name] = rl.substitution_value
-                                break
-        # Caso lista/tupla
-        elif isinstance(rec, (list, tuple)):
-            for idx, rule_list in grouped["column_index"].items():
-                if idx < len(rec):
-                    value = rec[idx]
-                    for rl in rule_list:
-                        if rl.match_type == 'exact' and value == rl.match_value:
-                            rec[idx] = rl.substitution_value
-                            break
-                        if rl.match_type == 'regex' and re.match(rl.match_value, str(value)):
-                            rec[idx] = re.sub(rl.match_value, rl.substitution_value, str(value))
-                            break
-                        if rl.match_type == 'caseless':
-                            if _normalize(value) == _normalize(rl.match_value):
-                                rec[idx] = rl.substitution_value
-                                break
-
-    return payload
 
 SAFE_FUNCTIONS = {
     "debug_log": debug_log,
