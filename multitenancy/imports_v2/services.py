@@ -25,7 +25,8 @@ import pandas as pd
 from django.db import transaction
 from django.utils import timezone
 
-from multitenancy.models import ImportSession
+from multitenancy.etl_service import ETLPipelineService
+from multitenancy.models import ImportSession, ImportTransformationRule
 from multitenancy.tasks import (
     _group_transaction_rows_by_erp_id,
     execute_import_job,
@@ -261,16 +262,19 @@ class CommitNotReady(Exception):
 
 
 def commit_session(session: ImportSession) -> ImportSession:
-    """Run the legacy ``execute_import_job`` against the session's parsed
-    rows and flip status to ``committed`` (or ``error`` if the write
-    fails).
+    """Mode-aware commit: dispatches to the right write backend.
+
+    Template-mode sessions delegate to the legacy ``execute_import_job``;
+    ETL-mode sessions re-run ``ETLPipelineService`` with ``commit=True``
+    on the original file bytes so the commit reproduces exactly what
+    was shown in the analyze step (transformations, substitutions,
+    auto-JE creation).
 
     Requires ``session.status == READY``. Raises ``CommitNotReady``
     otherwise — the view layer translates that into a 409.
 
-    Wraps the whole write in a DB transaction; a half-written session
-    rolls back cleanly and the session is marked ``error`` for audit
-    with no rows written.
+    Write errors flip the session to ``error`` with a diagnostic in
+    ``result`` and re-raise; the view layer returns 500.
     """
     if not session.is_committable():
         raise CommitNotReady(
@@ -284,31 +288,11 @@ def commit_session(session: ImportSession) -> ImportSession:
     session.status = ImportSession.STATUS_COMMITTING
     session.save(update_fields=["status", "updated_at"])
 
-    sheets_dict = (session.parsed_payload or {}).get("sheets", {}) or {}
-    # ``execute_import_job`` expects sheet dicts shaped like
-    # ``{"model": "...", "rows": [...]}``. The parse step above just
-    # stored {sheet_name: [row_dict]}; model name was implicit from the
-    # sheet name (convention used by the legacy endpoint). We reshape
-    # here rather than at parse time so the stored payload stays close
-    # to the raw workbook.
-    sheets_for_job = [
-        {"model": sheet_name, "rows": rows}
-        for sheet_name, rows in sheets_dict.items()
-    ]
-
     try:
-        with transaction.atomic():
-            result = execute_import_job(
-                company_id=session.company_id,
-                sheets=sheets_for_job,
-                commit=True,
-                import_metadata={
-                    "source": "v2_template",
-                    "function": "imports_v2.services.commit_session",
-                    "session_id": session.pk,
-                    "filename": session.file_name,
-                },
-            )
+        if session.mode == ImportSession.MODE_ETL:
+            result = _commit_etl_session(session)
+        else:
+            result = _commit_template_session(session)
     except Exception as exc:  # pragma: no cover - logged via session.result
         session.status = ImportSession.STATUS_ERROR
         session.result = {
@@ -327,6 +311,320 @@ def commit_session(session: ImportSession) -> ImportSession:
     session.file_bytes = None
     session.save(update_fields=[
         "status", "committed_at", "result", "file_bytes", "updated_at",
+    ])
+    return session
+
+
+def _commit_template_session(session: ImportSession) -> Dict[str, Any]:
+    """Template-mode commit: replay parsed rows through
+    ``execute_import_job`` (the legacy entry point). Atomic; rollback
+    on any write failure."""
+    sheets_dict = (session.parsed_payload or {}).get("sheets", {}) or {}
+    # ``execute_import_job`` expects sheet dicts shaped like
+    # ``{"model": "...", "rows": [...]}``. The parse step stored
+    # ``{sheet_name: [row_dict]}`` — model name was implicit from the
+    # sheet name (convention used by the legacy endpoint). Reshape here
+    # rather than at parse time so the stored payload stays close to
+    # the raw workbook.
+    sheets_for_job = [
+        {"model": sheet_name, "rows": rows}
+        for sheet_name, rows in sheets_dict.items()
+    ]
+    with transaction.atomic():
+        return execute_import_job(
+            company_id=session.company_id,
+            sheets=sheets_for_job,
+            commit=True,
+            import_metadata={
+                "source": "v2_template",
+                "function": "imports_v2.services._commit_template_session",
+                "session_id": session.pk,
+                "filename": session.file_name,
+            },
+        )
+
+
+def _commit_etl_session(session: ImportSession) -> Dict[str, Any]:
+    """ETL-mode commit: re-run ``ETLPipelineService`` on the original
+    file bytes with ``commit=True``.
+
+    Why re-run instead of replaying session.parsed_payload through
+    execute_import_job? The ETL pipeline has side-effects (FK
+    resolution via lookup_cache, post-processing for JournalEntry
+    debit/credit, auto_create_journal_entries hook, integration-rule
+    triggers) that aren't reproducible from just the transformed rows.
+    Re-running against the same file bytes + same transformation rule
+    within the 24h session TTL reproduces what we showed in analyze.
+    """
+    file_bytes = session.file_bytes
+    if not file_bytes:
+        raise CommitNotReady(
+            f"session #{session.pk} has no file_bytes (expired?) — re-upload"
+        )
+
+    # Reconstruct an UploadedFile-like object for ETLPipelineService.
+    # The service only reads ``.name`` and pandas-reads the file itself.
+    from django.core.files.uploadedfile import SimpleUploadedFile
+    file_like = SimpleUploadedFile(
+        session.file_name or "import.xlsx",
+        bytes(file_bytes),
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    config = dict(session.config or {})
+    auto_je = config.get("auto_create_journal_entries") or {}
+    row_limit = config.get("row_limit")
+
+    service = ETLPipelineService(
+        company_id=session.company_id,
+        file=file_like,
+        commit=True,
+        auto_create_journal_entries=auto_je,
+        row_limit=row_limit if row_limit is not None else 0,  # 0 = all rows
+    )
+    # ``execute()`` handles its own transaction. On any failure it
+    # raises, which our caller catches to flip session to ``error``.
+    return service.execute()
+
+
+# --- public: ETL analyze ---------------------------------------------------
+
+
+def _detect_missing_etl_parameters(
+    auto_je: Optional[Dict[str, Any]],
+    transformed_data: Dict[str, List[Dict[str, Any]]],
+    *,
+    rule: Optional[ImportTransformationRule] = None,
+) -> List[Dict[str, Any]]:
+    """Check that every column the auto-JE config references is actually
+    present in the transformed data.
+
+    Example: config has ``auto_create_journal_entries.bank_account_field
+    = 'bank_account_id'`` but no Transaction row exposes that key
+    (operator forgot to map it in ``column_mappings``). Without this
+    check the ETL pipeline would silently fail to create bank legs.
+
+    ``auto_je`` is the dict the operator passes per-request (same
+    semantics as the legacy ``/api/core/etl/execute/`` endpoint, which
+    accepts the config in the POST body rather than on the rule). The
+    optional ``rule`` is only used to populate the issue's context for
+    the diagnostics panel.
+
+    Returns zero or more blocking issues. Shown to the operator in the
+    diagnostics panel per manual §11.10e "Parâmetros ausentes".
+    """
+    if not auto_je or not isinstance(auto_je, dict) or not auto_je.get("enabled"):
+        return []
+
+    # Fields that the auto-JE flow reads from each Transaction row.
+    # ``opposing_account_field`` has a default of ``account_path`` in
+    # the service; we treat explicit config as the source of truth.
+    checked_fields = {
+        "bank_account_field": auto_je.get("bank_account_field") or "bank_account_id",
+        "opposing_account_field": auto_je.get("opposing_account_field") or "account_path",
+    }
+    cost_center_field = auto_je.get("cost_center_field")
+    if cost_center_field:
+        checked_fields["cost_center_field"] = cost_center_field
+
+    # Look at the first row of each transformed model's data to inspect
+    # which keys exist. If transformed_data is empty the analyze stage
+    # has other, more fundamental errors — no point emitting missing-
+    # param issues on top.
+    tx_rows = transformed_data.get("Transaction") or []
+    if not tx_rows:
+        return []
+    present_keys = set()
+    for row in tx_rows[:5]:  # sample first few; uniform shape in practice
+        if isinstance(row, dict):
+            present_keys.update(row.keys())
+
+    issues: List[Dict[str, Any]] = []
+    for role, field_name in checked_fields.items():
+        if not field_name:
+            continue
+        if field_name not in present_keys:
+            issues.append(issue_mod.make_issue(
+                type=issue_mod.ISSUE_MISSING_ETL_PARAMETER,
+                severity=issue_mod.SEVERITY_ERROR,
+                location={
+                    "sheet": "Transaction",
+                    "expected_column": field_name,
+                    "role": role,
+                },
+                context={
+                    "rule_id": rule.pk if rule is not None else None,
+                    "rule_name": getattr(rule, "name", None) if rule is not None else None,
+                    "auto_create_journal_entries": auto_je,
+                    "present_columns": sorted(present_keys),
+                },
+                proposed_actions=[issue_mod.ACTION_ABORT],
+                message=(
+                    f"A configuração ``auto_create_journal_entries`` da "
+                    f"regra espera a coluna {field_name!r} ({role}) na aba "
+                    f"Transaction, mas ela não existe nas linhas "
+                    f"transformadas. Ajuste o ``column_mappings`` da regra "
+                    f"para produzir essa coluna, ou desabilite "
+                    f"auto_create_journal_entries."
+                ),
+            ))
+    return issues
+
+
+def analyze_etl(
+    *,
+    company_id: int,
+    user,
+    file_bytes: bytes,
+    file_name: str,
+    transformation_rule_id: Optional[int] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> ImportSession:
+    """Create an ETL-mode ``ImportSession`` and populate it by running
+    ``ETLPipelineService.execute(commit=False)`` under the hood.
+
+    Captures the service's outputs — transformed data, substitutions
+    applied, substitution errors, python/database errors — into the
+    session's ``parsed_payload`` + ``open_issues`` so the operator
+    can review diagnostics without re-uploading.
+
+    Phase 3 issue detection:
+      * ``erp_id_conflict``  — same as template mode, scoped to
+        ``transformed_data['Transaction']``.
+      * ``missing_etl_parameter`` — rule declares auto-JE columns that
+        aren't present in transformed rows.
+      * ETL service errors (python_errors / database_errors /
+        substitution_errors) pass through as ``parsed_payload['etl_errors']``
+        so the frontend's existing error-bucket renderers keep working.
+    """
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+    now = timezone.now()
+    cfg = dict(config or {})
+
+    rule = None
+    if transformation_rule_id is not None:
+        try:
+            rule = ImportTransformationRule.objects.get(
+                pk=transformation_rule_id, company_id=company_id,
+            )
+        except ImportTransformationRule.DoesNotExist:
+            rule = None  # surface as a parse-stage error below
+
+    # Freeze the auto-JE config — passed in ``config`` by the caller
+    # (matches legacy ETL semantics where the config lives in the POST
+    # body, not on the rule). Defaulting to {} means "no auto-JE" which
+    # is the safe default.
+    cfg.setdefault("auto_create_journal_entries", {})
+
+    session = ImportSession.objects.create(
+        company_id=company_id,
+        created_by=user if (user and getattr(user, "is_authenticated", False)) else None,
+        mode=ImportSession.MODE_ETL,
+        status=ImportSession.STATUS_ANALYZING,
+        transformation_rule=rule,
+        file_name=file_name or "upload.xlsx",
+        file_hash=file_hash,
+        file_bytes=file_bytes,
+        config=cfg,
+        expires_at=now + SESSION_TTL,
+    )
+
+    if rule is None and transformation_rule_id is not None:
+        session.status = ImportSession.STATUS_ERROR
+        session.result = {
+            "error": f"transformation rule #{transformation_rule_id} not found for this company",
+            "stage": "lookup",
+        }
+        session.save(update_fields=["status", "result", "updated_at"])
+        return session
+
+    # Build a fresh UploadedFile for ETLPipelineService — it reads the
+    # stream + ``.name``. We don't give it the raw bytes directly.
+    file_like = SimpleUploadedFile(
+        file_name or "upload.xlsx",
+        file_bytes,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    service = ETLPipelineService(
+        company_id=company_id,
+        file=file_like,
+        commit=False,
+        auto_create_journal_entries=cfg.get("auto_create_journal_entries") or {},
+        # row_limit=0 means "process all rows"; cfg can override for
+        # sampled previews.
+        row_limit=cfg.get("row_limit", 0),
+    )
+
+    try:
+        etl_result = service.execute()
+    except Exception as exc:
+        session.status = ImportSession.STATUS_ERROR
+        session.result = {
+            "error": str(exc),
+            "stage": "etl_execute",
+            "type": type(exc).__name__,
+        }
+        session.save(update_fields=["status", "result", "updated_at"])
+        return session
+
+    # ETLPipelineService surfaces a ``transformed_data`` dict shaped as
+    # ``{model_name: {"row_count": N, "rows": [...], "sample_columns": [...]}}``.
+    # Flatten to ``{model_name: [rows]}`` for our own consumption. Keep
+    # the full service result under ``etl_result`` for debugging/audit.
+    transformed_flat: Dict[str, List[Dict[str, Any]]] = {}
+    raw_td = (etl_result or {}).get("transformed_data") or {}
+    for model_name, payload in raw_td.items():
+        if isinstance(payload, dict) and "rows" in payload:
+            transformed_flat[model_name] = list(payload.get("rows") or [])
+        elif isinstance(payload, list):
+            transformed_flat[model_name] = payload
+        else:
+            transformed_flat[model_name] = []
+
+    detected_issues: List[Dict[str, Any]] = []
+    # erp_id_conflict — same detector as template mode, applied to the
+    # transformed Transaction rows (so substitutions have already had a
+    # chance to fix mis-keyed rows).
+    if "Transaction" in transformed_flat:
+        detected_issues.extend(
+            _detect_transaction_erp_id_conflicts(
+                transformed_flat["Transaction"], "Transaction",
+            )
+        )
+    # missing_etl_parameter — config-driven column check. Rule is
+    # passed for diagnostic-panel context only; the actual check runs
+    # against the auto-JE config the caller provided.
+    detected_issues.extend(_detect_missing_etl_parameters(
+        cfg.get("auto_create_journal_entries"),
+        transformed_flat,
+        rule=rule,
+    ))
+
+    # Surface the ETL service's own error buckets as ``parsed_payload['etl_errors']``
+    # (the frontend already renders them; we don't translate each one
+    # into an Issue in Phase 3 — that's Phase 4 when unmatched-reference
+    # resolution ships).
+    session.parsed_payload = {
+        "transformed_data": transformed_flat,
+        "substitutions_applied": etl_result.get("substitutions_applied") or [],
+        "etl_errors": {
+            "python_errors": etl_result.get("python_errors") or [],
+            "database_errors": etl_result.get("database_errors") or [],
+            "substitution_errors": etl_result.get("substitution_errors") or [],
+            "warnings": etl_result.get("warnings") or [],
+        },
+        "sheets_processed": etl_result.get("sheets_processed") or [],
+    }
+    session.open_issues = detected_issues
+    if issue_mod.has_blocking_issues(detected_issues):
+        session.status = ImportSession.STATUS_AWAITING_RESOLVE
+    else:
+        session.status = ImportSession.STATUS_READY
+    session.save(update_fields=[
+        "parsed_payload", "open_issues", "status", "updated_at",
     ])
     return session
 

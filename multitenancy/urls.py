@@ -42,10 +42,15 @@ urlpatterns = [
     
     path('api/core/', include(router.urls)),
     path('api/core/bulk-import/', BulkImportAPIView.as_view(), name='bulk-import'),
-    # v2 interactive import — analyze → resolve → commit flow. Legacy
-    # ``/api/core/bulk-import/`` above stays untouched. See
-    # ``docs/manual/11-etl-importacao.md`` §11.10d for the operator UX.
-    path('api/core/imports/v2/', include('multitenancy.imports_v2.urls')),
+    # v2 interactive imports — analyze → resolve → commit flow. Legacy
+    # ``/api/core/bulk-import/`` and ``/api/core/etl/*`` stay untouched.
+    # Two parallel v2 namespaces share the same backend ``ImportSession``
+    # model, serializer, commit + sessions views; only the analyze
+    # front-half differs between them. See
+    # ``docs/manual/11-etl-importacao.md`` §11.10d (template) and
+    # §11.10e (ETL) for the operator UX.
+    path('api/core/imports/v2/', include('multitenancy.imports_v2.template_urls')),
+    path('api/core/etl/v2/', include('multitenancy.imports_v2.etl_urls')),
     # Make the prefix itself optional-slash:
     re_path(r'^api/core/?', include(router.urls)),
 

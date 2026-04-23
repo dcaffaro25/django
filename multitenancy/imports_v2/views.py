@@ -121,6 +121,109 @@ class AnalyzeTemplateImportView(APIView):
         )
 
 
+class AnalyzeETLImportView(APIView):
+    """``POST /api/core/etl/v2/analyze/``
+
+    Multipart form data:
+      * ``file``                      — XLSX upload (required).
+      * ``transformation_rule_id``    — int (required for v2 ETL).
+      * ``company_id``                — optional, falls back to user's membership.
+      * ``row_limit``                 — int; ``0`` or omitted = all rows.
+
+    Delegates to ``services.analyze_etl`` which re-uses
+    ``ETLPipelineService`` with ``commit=False`` under the hood, then
+    layers on v2 issue detection (erp_id conflicts in Transactions +
+    missing auto-JE parameters). Returns the serialised session.
+    """
+
+    parser_classes = (MultiPartParser, FormParser)
+
+    def get_permissions(self):
+        return _perms()
+
+    def post(self, request, tenant_id: Optional[int] = None, *args, **kwargs) -> Response:
+        file = request.FILES.get("file")
+        if not file:
+            return Response(
+                {"error": "missing file"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        company_id, err = _resolve_bulk_import_company_id(request)
+        if err is not None:
+            return err
+        if not company_id:
+            return Response(
+                {"error": "could not resolve company"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        rule_id_raw = request.POST.get("transformation_rule_id")
+        if not rule_id_raw:
+            return Response(
+                {"error": "transformation_rule_id is required for ETL v2 analyze"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            rule_id = int(rule_id_raw)
+        except (TypeError, ValueError):
+            return Response(
+                {"error": "transformation_rule_id must be an integer"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        file_bytes = file.read()
+        if not file_bytes:
+            return Response(
+                {"error": "uploaded file is empty"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # row_limit knob mirrors the legacy ETL endpoint. ``0`` = all.
+        row_limit_raw = request.POST.get("row_limit")
+        config: dict = {}
+        if row_limit_raw not in (None, ""):
+            try:
+                config["row_limit"] = int(row_limit_raw)
+            except (TypeError, ValueError):
+                return Response(
+                    {"error": "row_limit must be an integer"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # auto_create_journal_entries config. Matches legacy ETL
+        # semantics — config lives in the POST body, not on the rule.
+        # Accept either a JSON string or a pre-parsed dict (DRF gives
+        # us a dict when content-type is multipart with JSON fields;
+        # a string otherwise).
+        auto_je_raw = request.data.get("auto_create_journal_entries")
+        if auto_je_raw:
+            if isinstance(auto_je_raw, str):
+                import json as _json
+                try:
+                    config["auto_create_journal_entries"] = _json.loads(auto_je_raw)
+                except _json.JSONDecodeError:
+                    return Response(
+                        {"error": "auto_create_journal_entries must be valid JSON"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            elif isinstance(auto_je_raw, dict):
+                config["auto_create_journal_entries"] = auto_je_raw
+
+        session = services.analyze_etl(
+            company_id=company_id,
+            user=request.user,
+            file_bytes=file_bytes,
+            file_name=file.name or "upload.xlsx",
+            transformation_rule_id=rule_id,
+            config=config,
+        )
+        return Response(
+            ImportSessionSerializer(session).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
 class ImportSessionDetailView(APIView):
     """``GET /api/core/imports/v2/sessions/<id>`` — fetch session state.
     ``DELETE /api/core/imports/v2/sessions/<id>`` — discard."""
