@@ -12,7 +12,9 @@ Phase sections for the specific next step.
 
 ## 1. Status summary
 
-Six commits on `main`, in order:
+Backend phases 1–4B all shipped to `main`. Full v2 suite: **122 tests
+green**. Remaining work is frontend (Phase 5 / 6) + a small backlog of
+deferred backend items (see below).
 
 | Ref         | What shipped                                                                 |
 |-------------|------------------------------------------------------------------------------|
@@ -23,18 +25,30 @@ Six commits on `main`, in order:
 | `0cc9835`   | Phase 3 — ETL v2 backend (analyze + commit) + 9 tests                        |
 | `b82ab4e`   | Phase 3.6 — Engine perf (pre-compile) + `skip_substitutions` hint + 25 tests |
 | `0bb9332`   | Phase 4A — Resolve endpoint + pick/skip/ignore/abort + staged-rule commit   |
-| `<pending>` | Phase 4B — new detectors (bad_date/negative/unmatched) + map/edit handlers  |
+| `d547670`   | Phase 4B — bad_date/negative/unmatched detectors + map/edit handlers + 24 t  |
 
-Nothing uncommitted. Feature branch is `claude/adoring-wing-665ba7`
-and tracks `origin/main` exactly; delete the branch or continue on
-it, either works.
+Nothing uncommitted on main. When resuming on a new machine:
+
+1. `git pull` on `main`.
+2. Apply migrations against any local/homolog DB (`0036_importtransformationrule_column_options` is the latest).
+3. Run the v2 test suite (command below) — expect 122 green on `--reuse-db`.
+4. Pick up Phase 5 (template frontend) or the backlog in §2.x.
+
+### Production DB unblocked (2026-04-23)
+
+A partial apply of `0035_v2_import_session` left three stray indexes on
+the Railway `switchback:17976` DB without `0035` being recorded in
+`django_migrations` — see `.claude/diag_0035.py` + `.claude/fix_0035.py`
+in this worktree for the exact runbook we ran. Both 0035 and 0036 are
+now applied and recorded on prod. If a future partial-apply happens,
+re-use the same diag+fix pattern.
 
 ### Tests pass live on these paths
 
 Both modes work end-to-end for clean files (no issues → READY →
-commit). Files with issues land in `awaiting_resolve` and commit
-returns 409 — that's intentional until Phase 4 ships the resolve
-endpoint.
+commit). Files with blocking issues land in `awaiting_resolve`;
+Phase 4 resolve endpoint now advances them to `ready` (or `error`
+on abort).
 
 ### Run the full v2 test suite
 
@@ -202,19 +216,28 @@ for the conflict detectors that already exist (``erp_id_conflict``,
   staged rule materialises with the right ``source=import_session``
   FK and ``match_value``/``substitution_value``.
 
-**Known caveats / deferred:**
+**Known caveats / deferred (backend backlog — do one at a time):**
 
-- ``fk_ambiguous`` branch is live but test-unreachable because the
-  only current lookup (``Entity.name``) has ``unique_together=(company,
-  name)`` — ORM can't produce >1 matches. Extending
-  ``_REFERENCE_FIELD_LOOKUPS`` with a non-unique target (e.g. Account
-  by name) would unblock a real test.
-- ``je_balance_mismatch`` detector — not yet shipped. Needs a
-  discriminator tying JournalEntry rows to their parent Transaction
-  (via ``transaction_erp_id`` or similar) before the grouping sum
-  check can land confidently.
-- ``update_staged_rule`` editing semantics for pre-commit tweaks.
-- Celery cleanup beat for expired sessions (optional — still open).
+- **B1. ``je_balance_mismatch`` detector.** Needs a discriminator
+  tying JournalEntry rows to their parent Transaction (via
+  ``transaction_erp_id`` or similar) before the Σdebit vs Σcredit
+  check can land confidently. Template mode: group by the JE sheet's
+  transaction-key column; ETL mode: group by the combined Tx+autoJE
+  rows. Proposed actions on the issue: abort, ignore_row,
+  edit_value. Scope: ~80 LoC + ~100 tests.
+- **B2. Extend ``_REFERENCE_FIELD_LOOKUPS``** — add `account_path →
+  Account.path-ish-lookup`, `cost_center → CostCenter.name`,
+  `bank_account → BankAccount.name`. First one unblocks a real
+  ``fk_ambiguous`` test (Account.name isn't unique per company).
+  Scope: ~60 LoC + ~60 tests.
+- **B3. ``update_staged_rule`` action** — lets the operator tweak a
+  staged rule (match_type, match_value) before commit without having
+  to re-map-to-existing. Params: ``{index, rule: {...}}``. Scope:
+  ~40 LoC + ~40 tests.
+- **B4. Celery cleanup beat** for expired sessions. Model already
+  has ``expires_at``; just needs a periodic task that deletes /
+  clears file_bytes on anything past TTL. Scope: ~30 LoC + one task
+  registration.
 
 ---
 
@@ -305,12 +328,30 @@ if the matrix of issue-detectors is large enough to split
 
 ---
 
-### Phase 5 — Frontend Path A (template v2)
+### Phase 5 — Frontend Path A (template v2) ← NEXT UP
+
+**Why now** — backend is feature-complete for operator-driven resolve
+(Phase 4B). Nothing calls the v2 endpoints yet in the UI, so the
+feature is invisible to users. Phase 5 gates any real-world exercise
+of the detectors + handlers we just shipped.
 
 **What** — extend `frontend/src/pages/imports/ImportTemplatesPage.tsx`
 with a "Modo interativo (v2)" toggle next to the existing form (per
 decision A.3). When ON, the form talks to the v2 endpoints and
 shows a diagnostics panel below the preview.
+
+**Action/issue matrix that the frontend needs to render** (derived
+from the backend that now exists — do not invent new actions, the
+resolve endpoint will 400 on anything not in this table):
+
+| Issue type               | Proposed actions                                  | Card to build |
+|--------------------------|---------------------------------------------------|---------------|
+| `erp_id_conflict`        | `pick_row`, `skip_group`, `abort`                | IssueCardErpIdConflict |
+| `missing_etl_parameter`  | `abort`                                           | IssueCardMissingParam (new) |
+| `unmatched_reference`    | `map_to_existing`, `ignore_row`, `abort`         | IssueCardUnmatchedReference |
+| `fk_ambiguous`           | `map_to_existing`, `ignore_row`, `abort`         | IssueCardFKAmbiguous (reuse above with candidate_ids pre-filled) |
+| `bad_date_format`        | `edit_value`, `ignore_row`, `abort`              | IssueCardEditValue |
+| `negative_amount`        | `edit_value`, `ignore_row`, `abort`              | IssueCardEditValue (reuse) |
 
 **Deliverables**:
 
@@ -582,4 +623,7 @@ new constraints:
 
 ---
 
-*Last updated: alongside Phase 3 ship (commit `0cc9835`).*
+*Last updated: 2026-04-23, after Phase 4B ship (commit `d547670`).
+Backend is feature-complete through Phase 4. Handover for the next
+session: start with §1 status, then either Phase 5 (template frontend,
+next-up) or the backend backlog in §2 (B1–B4).*
