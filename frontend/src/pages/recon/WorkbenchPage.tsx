@@ -2250,7 +2250,15 @@ function AddEntriesDrawer({
     <Drawer.Root open={open} onOpenChange={(o) => !o && onClose()} direction="right">
       <Drawer.Portal>
         <Drawer.Overlay className="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm" />
-        <Drawer.Content className="fixed right-0 top-0 z-50 flex h-full w-full max-w-[640px] flex-col border-l border-border surface-2 outline-none">
+        <Drawer.Content className="fixed right-0 top-0 z-50 flex h-full w-full max-w-[800px] flex-col border-l border-border surface-2 outline-none">
+          {/* 800px because the body carries a 6-column row (CONTA + Lado
+              + Data + Valor + Descrição + ✕) plus a contexto card and
+              a cash-leg preview. At 640 the fixed columns (90+110+120
+              +32 = ~352) plus two 1fr columns left ~128 per 1fr, too
+              tight for a bank account's ``code · name`` label even
+              with truncate. 800 gives each 1fr column ~208px — enough
+              to render ``1.1.01.01 · Banco do Brasil CC 12345``
+              without truncation on the common case. */}
           <div className="hairline flex h-12 shrink-0 items-center justify-between px-4">
             <Drawer.Title className="flex items-center gap-2 text-[13px] font-semibold">
               <Plus className="h-3.5 w-3.5 text-muted-foreground" />
@@ -2424,7 +2432,14 @@ function EntryRowEditor({
 }) {
   const { t } = useTranslation(["reconciliation"])
   return (
-    <div className="grid grid-cols-[1fr_90px_110px_120px_1fr_auto] items-end gap-2 rounded-md border border-border bg-surface-1 p-2">
+    // ``minmax(0,1fr)`` — not plain ``1fr`` — so the CONTA + DESCRIÇÃO
+    // columns can shrink below their content width. A long selected
+    // account (``1.1.01.01 · Banco do Brasil CC 12345``) would
+    // otherwise blow the 1fr column past its fair share and push
+    // every fixed column (Lado / Data / Valor / Descrição / ✕) past
+    // the drawer's right edge. ``truncate`` on the trigger's inner
+    // span only kicks in once the cell is allowed to shrink.
+    <div className="grid grid-cols-[minmax(0,1fr)_90px_110px_120px_minmax(0,1fr)_auto] items-end gap-2 rounded-md border border-border bg-surface-1 p-2">
       <label className="flex flex-col gap-1">
         <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
           {t("add_entries.account")}
