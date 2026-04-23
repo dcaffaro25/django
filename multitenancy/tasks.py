@@ -1241,6 +1241,103 @@ def _collect_transaction_erp_id_counts_for_sheet(
     return counts, set(counts.keys())
 
 
+def _group_transaction_rows_by_erp_id(
+    rows: List[Dict[str, Any]],
+    *,
+    shared_fields: Tuple[str, ...],
+) -> Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]]:
+    """Group Transaction-import rows by ``__erp_id`` and detect field conflicts.
+
+    This is the single grouping helper used by both import modes to implement
+    Option B / 2a (see ``docs/manual/11-etl-importacao.md`` §11.10c):
+
+      * **Mode 1** (``execute_import_job``, manual Transaction + JournalEntry
+        sheets) uses it to reject duplicate Transaction rows that disagree on
+        structural fields, and to dedup duplicates that agree.
+      * **Mode 2** (``_import_transactions_with_journal_entries``, ETL with
+        ``auto_create_journal_entries`` enabled) uses it to build the
+        "1 Transaction + N opposing JEs + 1 aggregated bank JE" shape from
+        N rows sharing an ``erp_id``.
+
+    Semantics:
+
+      * Only rows with a non-empty, non-delete ``__erp_id`` are grouped.
+        Rows without ``__erp_id`` (or with a leading ``-`` marking them
+        as delete-by-erp_id rows) are omitted — caller handles those
+        separately via the existing per-row pipeline.
+      * ``shared_fields`` is the tuple of Transaction-level columns that
+        must agree across every row in a group. The caller picks these
+        per mode: Mode 1 uses ``(date, entity_id, currency_id,
+        description, amount)``; Mode 2 uses ``(date, entity_id,
+        currency_id, bank_account_id)`` because ``amount`` aggregates.
+      * A field where all rows either omit the key or set it to ``None``
+        is not flagged (missing == null == agreement on "absent").
+      * ``erp_id`` values are stripped of leading/trailing whitespace
+        before use; ``"OMIE-1"`` and ``" OMIE-1 "`` land in the same group.
+      * Returned ``groups`` preserves sheet order: the outer dict is
+        ordered by first appearance of each ``erp_id``, and each inner
+        list preserves the order the rows were seen in.
+      * ``conflicts`` contains one entry per conflicted group, shaped as
+        ``{erp_id: str, row_ids: List[...], fields: {field: set of values}}``.
+        The caller turns each entry into a human-readable error message.
+
+    Pure function — no DB access, no logging. Tested in
+    :mod:`multitenancy.tests.test_transaction_erp_id_grouping`.
+    """
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        erp_raw = row.get("__erp_id")
+        if _is_missing(erp_raw):
+            continue
+        erp_str = str(erp_raw).strip()
+        if not erp_str or erp_str.startswith("-"):
+            # Delete markers (``-OMIE-1``) are handled by the per-row loop,
+            # not by grouping.
+            continue
+        groups.setdefault(erp_str, []).append(row)
+
+    conflicts: List[Dict[str, Any]] = []
+    for erp_id, group_rows in groups.items():
+        if len(group_rows) < 2:
+            continue
+        field_values: Dict[str, List[Any]] = {}
+        for fname in shared_fields:
+            seen_values: List[Any] = []
+            for r in group_rows:
+                v = r.get(fname, None)
+                # Normalise "missing" and ``None`` to a sentinel so they
+                # don't read as distinct values. Empty string is treated
+                # as set — operators sometimes put blank strings in
+                # templates where a null would be more correct, and we
+                # don't want to silently accept that as "agreement with
+                # a set field".
+                if v is None:
+                    seen_values.append(None)
+                else:
+                    seen_values.append(v)
+            # Deduplicate while preserving a deterministic order for
+            # error messages.
+            distinct: List[Any] = []
+            for v in seen_values:
+                if v not in distinct:
+                    distinct.append(v)
+            # Strip the all-None case — "all rows lack this field" is
+            # agreement on absence, not a conflict.
+            if distinct == [None]:
+                continue
+            if len(distinct) > 1:
+                field_values[fname] = distinct
+        if field_values:
+            conflicts.append({
+                "erp_id": erp_id,
+                "row_ids": [r.get("__row_id") for r in group_rows],
+                "fields": field_values,
+            })
+    return groups, conflicts
+
+
 def _delete_transactions_for_erp_ids_replace_import(
     model,
     company_id: int,
