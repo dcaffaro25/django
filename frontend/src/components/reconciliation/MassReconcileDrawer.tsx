@@ -202,7 +202,15 @@ export function MassReconcileDrawer({
     <Drawer.Root open={open} onOpenChange={(o) => !o && onClose()} direction="right">
       <Drawer.Portal>
         <Drawer.Overlay className="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm" />
-        <Drawer.Content className="fixed right-0 top-0 z-50 flex h-full w-full max-w-[960px] flex-col border-l border-border surface-2 outline-none">
+        <Drawer.Content className="fixed right-0 top-0 z-50 flex h-full w-full max-w-[1200px] flex-col border-l border-border surface-2 outline-none">
+          {/* Width 1200px. Table has 8 columns — checkbox (32) + # (60) +
+              Data (130) + Descrição (260) + Valor (120) + Contra (160) +
+              Conta contábil (SearchableAccountSelect, needs ~220 for
+              code + name labels) + Balanço (80) = ~1060 of content
+              width, plus ~140 for column padding. 960 was never wide
+              enough after CONTA started rendering ``code · name``
+              instead of plain name. ``w-full`` caps to viewport on
+              narrow screens so this still works on laptops. */}
           <div className="hairline flex h-12 shrink-0 items-center justify-between px-4">
             <Drawer.Title className="flex items-center gap-2 text-[13px] font-semibold">
               <Wand2 className="h-3.5 w-3.5 text-muted-foreground" />
