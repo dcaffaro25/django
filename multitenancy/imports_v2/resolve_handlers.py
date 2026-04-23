@@ -192,6 +192,155 @@ def handle_abort(
     return {"abort": True, "reason": reason, "via_issue_id": issue.get("issue_id")}
 
 
+def handle_edit_value(
+    session: ImportSession,
+    issue: Dict[str, Any],
+    params: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Inline-edit a single row's field. Used by ``bad_date_format`` and
+    ``negative_amount``.
+
+    params: ``{"row_id": <id>, "field": <target field>, "new_value": <any>}``.
+
+    The operator provides the replacement value directly; handler only
+    validates shape, then writes. Re-detection after the batch catches
+    a bad correction (e.g. operator typed another invalid date).
+    """
+    allowed = {
+        issue_mod.ISSUE_BAD_DATE_FORMAT,
+        issue_mod.ISSUE_NEGATIVE_AMOUNT,
+    }
+    if issue.get("type") not in allowed:
+        raise ResolutionError(
+            f"edit_value applies to {sorted(allowed)!r}, not "
+            f"{issue.get('type')!r}"
+        )
+    row_id = params.get("row_id") if isinstance(params, dict) else None
+    field = params.get("field") if isinstance(params, dict) else None
+    if row_id is None:
+        raise ResolutionError("edit_value requires params.row_id")
+    if not field:
+        raise ResolutionError("edit_value requires params.field")
+    if "new_value" not in (params or {}):
+        raise ResolutionError("edit_value requires params.new_value")
+    new_value = params["new_value"]
+
+    location = issue.get("location") or {}
+    sheet = location.get("sheet")
+    if not sheet:
+        raise ResolutionError("edit_value requires issue.location.sheet")
+
+    rows = _get_rows(session, sheet)
+    old_value = None
+    updated = 0
+    for row in rows:
+        if _row_id(row) == row_id:
+            old_value = row.get(field)
+            row[field] = new_value
+            updated += 1
+    if updated == 0:
+        raise ResolutionError(
+            f"no row with row_id={row_id!r} in sheet {sheet!r}"
+        )
+    _set_rows(session, sheet, rows)
+    return {
+        "sheet": sheet,
+        "row_id": row_id,
+        "field": field,
+        "old_value": old_value,
+        "new_value": new_value,
+        "rows_updated": updated,
+    }
+
+
+def handle_map_to_existing(
+    session: ImportSession,
+    issue: Dict[str, Any],
+    params: Dict[str, Any],
+) -> Dict[str, Any]:
+    """``unmatched_reference`` / ``fk_ambiguous``: rewrite every row in
+    the issue's sheet whose ``location.field`` equals the unresolved
+    value so it points at the DB row the operator picked.
+
+    params:
+      * ``target_id`` (required) — the id of the DB row to map to.
+      * ``create_substitution_rule`` (optional bool, default False) —
+        when true, append a staged ``SubstitutionRule`` spec to
+        ``session.staged_substitution_rules`` so commit materialises
+        it for future imports.
+      * ``rule`` (optional dict) — overrides for the staged rule's
+        ``match_type`` / ``match_value`` / ``filter_conditions`` /
+        ``title``. Defaults: exact match on the original value.
+    """
+    allowed = {
+        issue_mod.ISSUE_UNMATCHED_REFERENCE,
+        issue_mod.ISSUE_FK_AMBIGUOUS,
+    }
+    if issue.get("type") not in allowed:
+        raise ResolutionError(
+            f"map_to_existing applies to {sorted(allowed)!r}, not "
+            f"{issue.get('type')!r}"
+        )
+    target_id = params.get("target_id") if isinstance(params, dict) else None
+    if target_id is None:
+        raise ResolutionError("map_to_existing requires params.target_id")
+
+    location = issue.get("location") or {}
+    context = issue.get("context") or {}
+    sheet = location.get("sheet")
+    field = location.get("field")
+    original_value = location.get("value")
+    if original_value is None:
+        original_value = context.get("value")
+    if not sheet or not field:
+        raise ResolutionError(
+            "map_to_existing requires issue.location.sheet + .field"
+        )
+
+    rows = _get_rows(session, sheet)
+    updated = 0
+    for row in rows:
+        if row.get(field) == original_value:
+            row[field] = target_id
+            updated += 1
+    _set_rows(session, sheet, rows)
+
+    staged = False
+    if params.get("create_substitution_rule") is True:
+        rule_spec = params.get("rule") or {}
+        related_model = context.get("related_model")
+        if not related_model:
+            raise ResolutionError(
+                "map_to_existing create_substitution_rule needs "
+                "issue.context.related_model (detector must populate it)"
+            )
+        rule_entry = {
+            "model_name": related_model,
+            "field_name": rule_spec.get("field_name") or "id",
+            "match_type": rule_spec.get("match_type") or "exact",
+            "match_value": rule_spec.get("match_value",
+                                         str(original_value) if original_value is not None else ""),
+            "substitution_value": str(target_id),
+            "filter_conditions": rule_spec.get("filter_conditions"),
+            "title": rule_spec.get("title") or (
+                f"via resolve session #{session.pk}"
+            ),
+        }
+        session.staged_substitution_rules = list(
+            session.staged_substitution_rules or []
+        ) + [rule_entry]
+        staged = True
+
+    return {
+        "sheet": sheet,
+        "field": field,
+        "original_value": original_value,
+        "mapped_to": target_id,
+        "rows_updated": updated,
+        "staged_rule": staged,
+    }
+
+
 # --- dispatcher ------------------------------------------------------------
 
 
@@ -203,6 +352,8 @@ ACTION_HANDLERS = {
     issue_mod.ACTION_SKIP_GROUP: handle_skip_group,
     issue_mod.ACTION_IGNORE_ROW: handle_ignore_row,
     issue_mod.ACTION_ABORT: handle_abort,
+    issue_mod.ACTION_EDIT_VALUE: handle_edit_value,
+    issue_mod.ACTION_MAP_TO_EXISTING: handle_map_to_existing,
 }
 
 

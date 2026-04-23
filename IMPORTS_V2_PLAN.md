@@ -22,7 +22,8 @@ Six commits on `main`, in order:
 | `8c56913`   | Phase 2 — Template v2 backend (analyze + commit) + 14 tests                  |
 | `0cc9835`   | Phase 3 — ETL v2 backend (analyze + commit) + 9 tests                        |
 | `b82ab4e`   | Phase 3.6 — Engine perf (pre-compile) + `skip_substitutions` hint + 25 tests |
-| `<pending>` | Phase 4A — Resolve endpoint + pick/skip/ignore/abort + staged-rule commit   |
+| `0bb9332`   | Phase 4A — Resolve endpoint + pick/skip/ignore/abort + staged-rule commit   |
+| `<pending>` | Phase 4B — new detectors (bad_date/negative/unmatched) + map/edit handlers  |
 
 Nothing uncommitted. Feature branch is `claude/adoring-wing-665ba7`
 and tracks `origin/main` exactly; delete the branch or continue on
@@ -46,6 +47,7 @@ DJANGO_SETTINGS_MODULE=nord_backend.settings \
     multitenancy/tests/test_imports_v2_etl.py \
     multitenancy/tests/test_substitution_engine_perf.py \
     multitenancy/tests/test_imports_v2_resolve.py \
+    multitenancy/tests/test_imports_v2_phase4b.py \
     -v --reuse-db
 ```
 
@@ -179,13 +181,38 @@ for the conflict detectors that already exist (``erp_id_conflict``,
   rollback on malformed entries, empty staged list → empty pks), and
   a full analyze→resolve→commit integration test.
 
-**Not yet shipped (Phase 4B):**
+**Phase 4B shipped (this commit):**
 
-- New detectors: ``unmatched_reference``, ``je_balance_mismatch``,
-  ``bad_date_format``, ``negative_amount``, ``fk_ambiguous``.
-- ``map_to_existing`` action handler (populates
-  ``staged_substitution_rules``).
-- ``edit_value`` action handler (for bad_date_format / negative_amount).
+- Detectors: ``bad_date_format`` (ISO + pt-BR DD/MM/YYYY parsing on
+  common date columns); ``negative_amount`` (driven by
+  ``ImportTransformationRule.column_options[field]['positive_only']``);
+  ``unmatched_reference`` + ``fk_ambiguous`` (tenant-scoped name lookups —
+  currently just ``entity → Entity.name``, extensible via
+  ``_REFERENCE_FIELD_LOOKUPS``).
+- Handler ``edit_value`` (for bad_date_format / negative_amount).
+- Handler ``map_to_existing`` (for unmatched_reference / fk_ambiguous) —
+  rewrites payload rows AND optionally appends a ``SubstitutionRule``
+  spec to ``session.staged_substitution_rules`` so commit materialises
+  it. Requires ``issue.context.related_model`` (detectors populate it).
+- ``resolve_session`` now persists ``staged_substitution_rules`` too
+  (the 4A save forgot that field).
+- 24 new tests in ``test_imports_v2_phase4b.py``: ``_tryparse_date``
+  unit, each detector's happy + edge cases, each handler's happy +
+  guardrails, and a map → commit integration test that verifies the
+  staged rule materialises with the right ``source=import_session``
+  FK and ``match_value``/``substitution_value``.
+
+**Known caveats / deferred:**
+
+- ``fk_ambiguous`` branch is live but test-unreachable because the
+  only current lookup (``Entity.name``) has ``unique_together=(company,
+  name)`` — ORM can't produce >1 matches. Extending
+  ``_REFERENCE_FIELD_LOOKUPS`` with a non-unique target (e.g. Account
+  by name) would unblock a real test.
+- ``je_balance_mismatch`` detector — not yet shipped. Needs a
+  discriminator tying JournalEntry rows to their parent Transaction
+  (via ``transaction_erp_id`` or similar) before the grouping sum
+  check can land confidently.
 - ``update_staged_rule`` editing semantics for pre-commit tweaks.
 - Celery cleanup beat for expired sessions (optional — still open).
 

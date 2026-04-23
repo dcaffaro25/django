@@ -186,6 +186,295 @@ def _detect_transaction_erp_id_conflicts(
     return out
 
 
+# --- Phase 4B detectors: bad_date_format / negative_amount / unmatched_reference -----
+
+# Field names the ``bad_date_format`` detector scans on every sheet. Keeping
+# this list narrow avoids false positives on columns that look like dates
+# but aren't meant to parse (e.g. free-text description columns).
+_DATE_LIKE_FIELDS = ("date", "due_date", "payment_date", "start_date", "end_date")
+
+
+def _tryparse_date(v: Any) -> Optional[datetime.date]:
+    """Best-effort date parse. Returns ``date`` on success, ``None`` on
+    anything it can't interpret (empty, non-date string, garbled input).
+
+    Covers:
+      * Python ``date`` / ``datetime`` / pandas ``Timestamp`` (already
+        normalised to ISO via ``_json_scalar`` during parse, but we
+        still accept the native types for safety).
+      * ISO 8601 date prefixes (``YYYY-MM-DD``).
+      * pt-BR ``DD/MM/YYYY``.
+      * US ``MM/DD/YYYY`` — only when the BR interpretation would fail
+        (heuristic, deliberately conservative).
+
+    Deliberately *not* falling back to ``dateutil.parse`` — that accepts
+    so much garbage that the detector would miss real bad values.
+    """
+    if v is None or v == "":
+        return None
+    if isinstance(v, datetime.datetime):
+        return v.date()
+    if isinstance(v, datetime.date):
+        return v
+    if isinstance(v, pd.Timestamp):
+        return v.date()
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    if not s:
+        return None
+    # ISO 8601 first (matches our own _json_scalar output)
+    try:
+        return datetime.date.fromisoformat(s[:10])
+    except ValueError:
+        pass
+    # DD/MM/YYYY
+    import re as _re
+    m = _re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", s)
+    if m:
+        d, mo, y = (int(x) for x in m.groups())
+        try:
+            return datetime.date(y, mo, d)
+        except ValueError:
+            # BR parse failed; try US ordering as a fallback.
+            try:
+                return datetime.date(y, d, mo)
+            except ValueError:
+                return None
+    return None
+
+
+def _detect_bad_date_format(
+    rows: List[Dict[str, Any]],
+    sheet_name: str,
+) -> List[Dict[str, Any]]:
+    """Emit one ``bad_date_format`` issue per row × date-column with an
+    unparseable value. Skips empty / null values — those are a
+    different problem (required-field validation) handled elsewhere.
+    """
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_id = row.get("__row_id")
+        for field in _DATE_LIKE_FIELDS:
+            if field not in row:
+                continue
+            val = row[field]
+            if val is None or val == "":
+                continue
+            if _tryparse_date(val) is None:
+                out.append(issue_mod.make_issue(
+                    type=issue_mod.ISSUE_BAD_DATE_FORMAT,
+                    severity=issue_mod.SEVERITY_ERROR,
+                    location={"sheet": sheet_name, "row_id": row_id, "field": field},
+                    context={"value": val},
+                    proposed_actions=[
+                        issue_mod.ACTION_EDIT_VALUE,
+                        issue_mod.ACTION_IGNORE_ROW,
+                        issue_mod.ACTION_ABORT,
+                    ],
+                    message=(
+                        f"{sheet_name} row {row_id!r}: value {val!r} in "
+                        f"column {field!r} is not a parseable date (expected "
+                        f"ISO YYYY-MM-DD or DD/MM/YYYY)"
+                    ),
+                ))
+    return out
+
+
+def _detect_negative_amounts(
+    rows: List[Dict[str, Any]],
+    sheet_name: str,
+    *,
+    rule: Optional[ImportTransformationRule] = None,
+) -> List[Dict[str, Any]]:
+    """Emit ``negative_amount`` issues for rows whose value in a column
+    flagged ``positive_only=True`` (via ``ImportTransformationRule.column_options``)
+    is negative.
+
+    Only runs when a rule is passed (ETL mode) — template mode has no
+    column_options to consult. Non-numeric values are skipped silently
+    (they surface as a different issue type, not this one).
+    """
+    if rule is None:
+        return []
+    column_options = getattr(rule, "column_options", None) or {}
+    if not isinstance(column_options, dict):
+        return []
+    positive_only_fields = {
+        name for name, opts in column_options.items()
+        if isinstance(opts, dict) and opts.get("positive_only") is True
+    }
+    if not positive_only_fields:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_id = row.get("__row_id")
+        for field in positive_only_fields:
+            if field not in row:
+                continue
+            val = row[field]
+            if val is None or val == "":
+                continue
+            # Accept BR-style decimals (``1.234,56``) and plain floats.
+            try:
+                num = float(str(val).replace(".", "").replace(",", "."))
+            except (ValueError, TypeError):
+                continue
+            if num < 0:
+                out.append(issue_mod.make_issue(
+                    type=issue_mod.ISSUE_NEGATIVE_AMOUNT,
+                    severity=issue_mod.SEVERITY_ERROR,
+                    location={"sheet": sheet_name, "row_id": row_id, "field": field},
+                    context={"value": val, "parsed": num},
+                    proposed_actions=[
+                        issue_mod.ACTION_EDIT_VALUE,
+                        issue_mod.ACTION_IGNORE_ROW,
+                        issue_mod.ACTION_ABORT,
+                    ],
+                    message=(
+                        f"{sheet_name} row {row_id!r}: column {field!r} is "
+                        f"flagged positive-only but got {val!r} ({num})"
+                    ),
+                ))
+    return out
+
+
+# Mapping of reference field (column name in the import payload) → info
+# needed to look up DB candidates for ``unmatched_reference`` detection.
+# Only the narrow subset we can resolve confidently today: (name-lookup,
+# same company). Account.path lookups and cost-center paths get similar
+# treatment when they cross the "only check-by-name" line.
+_REFERENCE_FIELD_LOOKUPS = (
+    # (sheet-hint, column, app_label, model_name, lookup_field)
+    #
+    # ``sheet-hint`` filters which sheets we scan this column on —
+    # ``None`` means any sheet. Narrow this list if false positives
+    # surface (e.g. a Description column named "entity" in some template).
+    #
+    # Only tenant-scoped models (those with ``company_id``) belong here —
+    # global models like ``Currency`` would FieldError on the company
+    # filter. Extending: add any TenantAwareBaseModel-derived FK target.
+    (None, "entity", "multitenancy", "Entity", "name"),
+)
+
+
+def _detect_unmatched_references(
+    rows: List[Dict[str, Any]],
+    sheet_name: str,
+    *,
+    company_id: int,
+) -> List[Dict[str, Any]]:
+    """For each reference column on the sheet, check that every distinct
+    string value resolves to a DB row in the current company. Unresolved
+    values → ``unmatched_reference`` issue. Ambiguous (>1 match) values
+    → ``fk_ambiguous``. Matching values are ignored.
+
+    Pragmatic scope: two well-known string references (``entity`` →
+    ``Entity.name``, ``currency`` → ``Currency.code``). Extending the
+    lookup table is cheap — add a row to ``_REFERENCE_FIELD_LOOKUPS``
+    and the detector picks it up.
+    """
+    from django.apps import apps as _apps
+
+    issues: List[Dict[str, Any]] = []
+    # Collect distinct (field, value) pairs that actually appear.
+    seen: Dict[str, set] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for _hint, field, _app, _model, _lookup in _REFERENCE_FIELD_LOOKUPS:
+            if _hint is not None and _hint != sheet_name:
+                continue
+            if field not in row:
+                continue
+            val = row[field]
+            if val is None or val == "":
+                continue
+            if not isinstance(val, str):
+                continue
+            seen.setdefault(field, set()).add(val)
+
+    if not seen:
+        return issues
+
+    for hint, field, app, model_name, lookup_field in _REFERENCE_FIELD_LOOKUPS:
+        if hint is not None and hint != sheet_name:
+            continue
+        values = seen.get(field)
+        if not values:
+            continue
+        try:
+            model_cls = _apps.get_model(app, model_name)
+        except LookupError:
+            continue
+
+        for val in values:
+            qs = model_cls.objects.filter(
+                company_id=company_id, **{lookup_field: val},
+            )
+            count = qs.count()
+            if count == 0:
+                issues.append(issue_mod.make_issue(
+                    type=issue_mod.ISSUE_UNMATCHED_REFERENCE,
+                    severity=issue_mod.SEVERITY_ERROR,
+                    location={
+                        "sheet": sheet_name,
+                        "field": field,
+                        "value": val,
+                    },
+                    context={
+                        "value": val,
+                        "related_model": model_name,
+                        "related_app": app,
+                        "lookup_field": lookup_field,
+                    },
+                    proposed_actions=[
+                        issue_mod.ACTION_MAP_TO_EXISTING,
+                        issue_mod.ACTION_IGNORE_ROW,
+                        issue_mod.ACTION_ABORT,
+                    ],
+                    message=(
+                        f"{sheet_name}: {field}={val!r} does not resolve to "
+                        f"any {model_name} row in this company "
+                        f"(lookup by {lookup_field})"
+                    ),
+                ))
+            elif count > 1:
+                issues.append(issue_mod.make_issue(
+                    type=issue_mod.ISSUE_FK_AMBIGUOUS,
+                    severity=issue_mod.SEVERITY_ERROR,
+                    location={
+                        "sheet": sheet_name,
+                        "field": field,
+                        "value": val,
+                    },
+                    context={
+                        "value": val,
+                        "related_model": model_name,
+                        "related_app": app,
+                        "lookup_field": lookup_field,
+                        "candidate_ids": list(qs.values_list("pk", flat=True)[:10]),
+                        "match_count": count,
+                    },
+                    proposed_actions=[
+                        issue_mod.ACTION_MAP_TO_EXISTING,
+                        issue_mod.ACTION_IGNORE_ROW,
+                        issue_mod.ACTION_ABORT,
+                    ],
+                    message=(
+                        f"{sheet_name}: {field}={val!r} matches {count} "
+                        f"{model_name} rows by {lookup_field}; operator must "
+                        f"pick one"
+                    ),
+                ))
+    return issues
+
+
 # --- public: analyze -------------------------------------------------------
 
 
@@ -238,6 +527,11 @@ def analyze_template(
             detected_issues.extend(
                 _detect_transaction_erp_id_conflicts(rows, sheet_name)
             )
+        # Phase 4B detectors — run on every sheet.
+        detected_issues.extend(_detect_bad_date_format(rows, sheet_name))
+        detected_issues.extend(_detect_unmatched_references(
+            rows, sheet_name, company_id=company_id,
+        ))
 
     # Freeze the parsed payload on the session so commit/resolve can read
     # it without re-parsing. The raw bytes stay on ``file_bytes`` too
@@ -658,6 +952,15 @@ def analyze_etl(
         transformed_flat,
         rule=rule,
     ))
+    # Phase 4B detectors — run on every transformed sheet.
+    for model_name, rows in transformed_flat.items():
+        detected_issues.extend(_detect_bad_date_format(rows, model_name))
+        detected_issues.extend(_detect_negative_amounts(
+            rows, model_name, rule=rule,
+        ))
+        detected_issues.extend(_detect_unmatched_references(
+            rows, model_name, company_id=company_id,
+        ))
 
     # Surface the ETL service's own error buckets as ``parsed_payload['etl_errors']``
     # (the frontend already renders them; we don't translate each one
@@ -699,12 +1002,12 @@ def _redetect_issues(session: ImportSession) -> List[Dict[str, Any]]:
     ``parsed_payload``. Called after every resolve-batch so an operator
     who partially resolves a group still sees the remaining issues.
 
-    Template mode: re-check erp_id conflicts on Transaction sheet only.
-    ETL mode: re-check erp_id conflicts on transformed Transaction rows
-    AND re-check missing-etl-parameter (config-driven, payload-independent
-    apart from the row keys).
+    Mirrors the detector calls in ``analyze_template`` / ``analyze_etl``.
+    When a new detector is added, add it here too or the resolve cycle
+    will happily close out a session that an analyze would have blocked.
     """
     detected: List[Dict[str, Any]] = []
+    company_id = session.company_id
     if session.mode == ImportSession.MODE_ETL:
         transformed = (session.parsed_payload or {}).get("transformed_data") or {}
         if "Transaction" in transformed:
@@ -715,11 +1018,24 @@ def _redetect_issues(session: ImportSession) -> List[Dict[str, Any]]:
         detected.extend(_detect_missing_etl_parameters(
             auto_je, transformed, rule=session.transformation_rule,
         ))
+        for model_name, rows in transformed.items():
+            detected.extend(_detect_bad_date_format(rows, model_name))
+            detected.extend(_detect_negative_amounts(
+                rows, model_name, rule=session.transformation_rule,
+            ))
+            detected.extend(_detect_unmatched_references(
+                rows, model_name, company_id=company_id,
+            ))
     else:
         sheets = (session.parsed_payload or {}).get("sheets") or {}
-        if "Transaction" in sheets:
-            detected.extend(_detect_transaction_erp_id_conflicts(
-                sheets["Transaction"], "Transaction",
+        for sheet_name, rows in sheets.items():
+            if sheet_name == "Transaction":
+                detected.extend(_detect_transaction_erp_id_conflicts(
+                    rows, sheet_name,
+                ))
+            detected.extend(_detect_bad_date_format(rows, sheet_name))
+            detected.extend(_detect_unmatched_references(
+                rows, sheet_name, company_id=company_id,
             ))
     return detected
 
@@ -834,7 +1150,8 @@ def resolve_session(
         session.status = ImportSession.STATUS_READY
 
     session.save(update_fields=[
-        "parsed_payload", "open_issues", "resolutions", "status", "updated_at",
+        "parsed_payload", "open_issues", "resolutions",
+        "staged_substitution_rules", "status", "updated_at",
     ])
     return session
 
