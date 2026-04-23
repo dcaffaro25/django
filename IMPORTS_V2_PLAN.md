@@ -21,7 +21,8 @@ Six commits on `main`, in order:
 | `6882a25`   | Phase 1 — `ImportSession` model + `SubstitutionRule.source` field + tests    |
 | `8c56913`   | Phase 2 — Template v2 backend (analyze + commit) + 14 tests                  |
 | `0cc9835`   | Phase 3 — ETL v2 backend (analyze + commit) + 9 tests                        |
-| `<pending>` | Phase 3.6 — Engine perf (pre-compile) + `skip_substitutions` hint + 25 tests |
+| `b82ab4e`   | Phase 3.6 — Engine perf (pre-compile) + `skip_substitutions` hint + 25 tests |
+| `<pending>` | Phase 4A — Resolve endpoint + pick/skip/ignore/abort + staged-rule commit   |
 
 Nothing uncommitted. Feature branch is `claude/adoring-wing-665ba7`
 and tracks `origin/main` exactly; delete the branch or continue on
@@ -44,6 +45,7 @@ DJANGO_SETTINGS_MODULE=nord_backend.settings \
     multitenancy/tests/test_imports_v2_backend.py \
     multitenancy/tests/test_imports_v2_etl.py \
     multitenancy/tests/test_substitution_engine_perf.py \
+    multitenancy/tests/test_imports_v2_resolve.py \
     -v --reuse-db
 ```
 
@@ -143,7 +145,53 @@ already has per-value memoization and pre-grouped rules by
 
 ---
 
-### Phase 4 — Resolve endpoint + `SubstitutionRule` auto-creation
+### Phase 4A — Resolve endpoint skeleton + staged-rule commit ✅ SHIPPED
+
+Shipped with this plan revision. Unblocks awaiting-resolve sessions
+for the conflict detectors that already exist (``erp_id_conflict``,
+``missing_etl_parameter``). Summary of what landed:
+
+- ``multitenancy/imports_v2/resolve_handlers.py`` — per-action
+  handlers for ``pick_row``, ``skip_group``, ``ignore_row``, ``abort``.
+  Handlers mutate ``session.parsed_payload`` in-place (template mode's
+  ``sheets`` dict or ETL mode's ``transformed_data`` dict — abstracted
+  via ``_rows_container``). ``apply_resolution`` dispatches on action
+  and gates via the issue's ``proposed_actions`` whitelist.
+- ``services.resolve_session(session, resolutions)`` — orchestrator.
+  Validates the session is non-terminal + non-committing, walks the
+  batch applying each resolution, appends to ``session.resolutions``,
+  re-detects issues against the mutated payload, and flips status to
+  ``ready`` if no blocking issues remain. ``abort`` short-circuits the
+  batch and flips to ``error``.
+- ``ResolveSessionView`` (both URL namespaces) at
+  ``POST /api/core/imports/v2/resolve/<pk>/`` and
+  ``POST /api/core/etl/v2/resolve/<pk>/``.
+- ``commit_session`` now materialises ``session.staged_substitution_rules``
+  into real ``SubstitutionRule`` rows with ``source=import_session``
+  + ``source_session=FK`` inside the commit's outer atomic block;
+  created pks are returned in the response as
+  ``result.substitution_rules_created``.
+- 28 new tests in
+  ``multitenancy/tests/test_imports_v2_resolve.py``: handler units
+  (happy + guardrails), ``resolve_session`` service (happy, abort,
+  partial, terminal, committing, unknown issue_id, malformed batch),
+  view (400/404/409/200), commit materialisation (creates real rows,
+  rollback on malformed entries, empty staged list → empty pks), and
+  a full analyze→resolve→commit integration test.
+
+**Not yet shipped (Phase 4B):**
+
+- New detectors: ``unmatched_reference``, ``je_balance_mismatch``,
+  ``bad_date_format``, ``negative_amount``, ``fk_ambiguous``.
+- ``map_to_existing`` action handler (populates
+  ``staged_substitution_rules``).
+- ``edit_value`` action handler (for bad_date_format / negative_amount).
+- ``update_staged_rule`` editing semantics for pre-commit tweaks.
+- Celery cleanup beat for expired sessions (optional — still open).
+
+---
+
+### Phase 4 — Resolve endpoint + `SubstitutionRule` auto-creation (historical design notes)
 
 The big one. Unlocks awaiting-resolve sessions for both modes.
 

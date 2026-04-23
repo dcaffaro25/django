@@ -26,13 +26,14 @@ from django.db import transaction
 from django.utils import timezone
 
 from multitenancy.etl_service import ETLPipelineService
-from multitenancy.models import ImportSession, ImportTransformationRule
+from multitenancy.models import ImportSession, ImportTransformationRule, SubstitutionRule
 from multitenancy.tasks import (
     _group_transaction_rows_by_erp_id,
     execute_import_job,
 )
 
 from . import issues as issue_mod
+from . import resolve_handlers as _resolve_handlers
 
 
 # --- session TTL -----------------------------------------------------------
@@ -289,10 +290,16 @@ def commit_session(session: ImportSession) -> ImportSession:
     session.save(update_fields=["status", "updated_at"])
 
     try:
-        if session.mode == ImportSession.MODE_ETL:
-            result = _commit_etl_session(session)
-        else:
-            result = _commit_template_session(session)
+        # Wrap BOTH the staged-rule materialisation AND the write backend
+        # in one outer atomic block so any error (rule clashes, write
+        # failures) rolls both back together. The write backends have
+        # their own inner atomic blocks — Django nests them as savepoints.
+        with transaction.atomic():
+            created_rule_pks = _materialise_staged_rules(session)
+            if session.mode == ImportSession.MODE_ETL:
+                result = _commit_etl_session(session)
+            else:
+                result = _commit_template_session(session)
     except Exception as exc:  # pragma: no cover - logged via session.result
         session.status = ImportSession.STATUS_ERROR
         session.result = {
@@ -302,6 +309,15 @@ def commit_session(session: ImportSession) -> ImportSession:
         }
         session.save(update_fields=["status", "result", "updated_at"])
         raise
+
+    # Surface the created rule pks in the commit response so the
+    # frontend can link to them in the "Regras criadas" panel. Shallow-
+    # copy first so we don't mutate the write-backend's return value.
+    if isinstance(result, dict):
+        result = {**result, "substitution_rules_created": created_rule_pks}
+    else:
+        result = {"write_result": result,
+                  "substitution_rules_created": created_rule_pks}
 
     session.status = ImportSession.STATUS_COMMITTED
     session.committed_at = timezone.now()
@@ -313,6 +329,46 @@ def commit_session(session: ImportSession) -> ImportSession:
         "status", "committed_at", "result", "file_bytes", "updated_at",
     ])
     return session
+
+
+def _materialise_staged_rules(session: ImportSession) -> List[int]:
+    """Create one ``SubstitutionRule`` per entry in
+    ``session.staged_substitution_rules``.
+
+    Each entry is a dict staged by a resolve action (Phase 4B's
+    ``map_to_existing`` populates these — in Phase 4A the list is
+    expected to be empty; this helper is the plumbing both phases need).
+
+    Runs inside the commit's atomic block: if rule creation fails (e.g.
+    ``unique_together`` collision) the entire commit rolls back and the
+    session flips to ``error``.
+
+    Returns the list of created rule pks so the commit response can
+    surface them to the client under ``substitution_rules_created``.
+    """
+    staged = session.staged_substitution_rules or []
+    if not staged:
+        return []
+    created: List[int] = []
+    for entry in staged:
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"malformed entry in staged_substitution_rules: {entry!r}"
+            )
+        rule = SubstitutionRule.objects.create(
+            company_id=session.company_id,
+            model_name=entry["model_name"],
+            field_name=entry["field_name"],
+            match_type=entry.get("match_type", "exact"),
+            match_value=entry["match_value"],
+            substitution_value=entry["substitution_value"],
+            filter_conditions=entry.get("filter_conditions"),
+            title=entry.get("title"),
+            source=SubstitutionRule.SOURCE_IMPORT_SESSION,
+            source_session=session,
+        )
+        created.append(rule.pk)
+    return created
 
 
 def _commit_template_session(session: ImportSession) -> Dict[str, Any]:
@@ -625,6 +681,160 @@ def analyze_etl(
         session.status = ImportSession.STATUS_READY
     session.save(update_fields=[
         "parsed_payload", "open_issues", "status", "updated_at",
+    ])
+    return session
+
+
+# --- public: resolve -------------------------------------------------------
+
+
+class ResolveNotApplicable(Exception):
+    """Raised when ``resolve_session`` is called on a session whose status
+    doesn't accept resolutions. View layer maps to 409.
+    """
+
+
+def _redetect_issues(session: ImportSession) -> List[Dict[str, Any]]:
+    """Re-run the detectors relevant to ``session.mode`` over the current
+    ``parsed_payload``. Called after every resolve-batch so an operator
+    who partially resolves a group still sees the remaining issues.
+
+    Template mode: re-check erp_id conflicts on Transaction sheet only.
+    ETL mode: re-check erp_id conflicts on transformed Transaction rows
+    AND re-check missing-etl-parameter (config-driven, payload-independent
+    apart from the row keys).
+    """
+    detected: List[Dict[str, Any]] = []
+    if session.mode == ImportSession.MODE_ETL:
+        transformed = (session.parsed_payload or {}).get("transformed_data") or {}
+        if "Transaction" in transformed:
+            detected.extend(_detect_transaction_erp_id_conflicts(
+                transformed["Transaction"], "Transaction",
+            ))
+        auto_je = (session.config or {}).get("auto_create_journal_entries")
+        detected.extend(_detect_missing_etl_parameters(
+            auto_je, transformed, rule=session.transformation_rule,
+        ))
+    else:
+        sheets = (session.parsed_payload or {}).get("sheets") or {}
+        if "Transaction" in sheets:
+            detected.extend(_detect_transaction_erp_id_conflicts(
+                sheets["Transaction"], "Transaction",
+            ))
+    return detected
+
+
+def resolve_session(
+    session: ImportSession,
+    resolutions: List[Dict[str, Any]],
+) -> ImportSession:
+    """Apply a batch of operator-provided resolutions to the session.
+
+    Each resolution is ``{issue_id, action, params}``. For each one we:
+      * find the matching issue in ``session.open_issues``,
+      * dispatch to the per-action handler in ``resolve_handlers``,
+      * record the result on ``session.resolutions``,
+      * re-run detection on the (now-mutated) parsed_payload.
+
+    Once all applicable resolutions have run we recompute the session
+    status: ``ready`` if no blocking issues remain, otherwise the
+    session stays in ``awaiting_resolve``. An ``abort`` resolution
+    short-circuits the batch and flips the session to ``error``.
+
+    Raises:
+      * ``ResolveNotApplicable`` — session is terminal/committing.
+      * ``resolve_handlers.ResolutionError`` — malformed params /
+        unknown action / unknown issue_id (view translates to 400).
+    """
+    if session.is_terminal():
+        raise ResolveNotApplicable(
+            f"session #{session.pk} is terminal ({session.status}); "
+            f"cannot resolve"
+        )
+    if session.status == ImportSession.STATUS_COMMITTING:
+        raise ResolveNotApplicable(
+            f"session #{session.pk} is committing; resolve not allowed"
+        )
+
+    if not isinstance(resolutions, list):
+        raise _resolve_handlers.ResolutionError(
+            "`resolutions` must be a list"
+        )
+
+    now_iso = timezone.now().isoformat()
+    open_issues_by_id = {
+        i.get("issue_id"): i for i in (session.open_issues or [])
+    }
+    new_resolutions: List[Dict[str, Any]] = []
+    aborted = False
+    abort_info: Optional[Dict[str, Any]] = None
+
+    for res in resolutions:
+        if not isinstance(res, dict):
+            raise _resolve_handlers.ResolutionError(
+                "each resolution must be an object"
+            )
+        issue_id = res.get("issue_id")
+        action = res.get("action")
+        params = res.get("params") or {}
+        if not issue_id:
+            raise _resolve_handlers.ResolutionError(
+                "resolution is missing issue_id"
+            )
+        if not action:
+            raise _resolve_handlers.ResolutionError(
+                "resolution is missing action"
+            )
+        issue = open_issues_by_id.get(issue_id)
+        if issue is None:
+            raise _resolve_handlers.ResolutionError(
+                f"no open issue with issue_id={issue_id!r}"
+            )
+        result = _resolve_handlers.apply_resolution(
+            session, issue, action, params,
+        )
+        record = {
+            "issue_id": issue_id,
+            "action": action,
+            "params": params,
+            "result": result,
+            "resolved_at": now_iso,
+        }
+        new_resolutions.append(record)
+        if result.get("abort"):
+            aborted = True
+            abort_info = result
+            break
+
+    # Persist the resolution records BEFORE any status transition so the
+    # audit trail is complete even if redetection or save fails.
+    session.resolutions = list(session.resolutions or []) + new_resolutions
+
+    if aborted:
+        session.status = ImportSession.STATUS_ERROR
+        session.result = {
+            "error": "operator aborted",
+            "stage": "resolve",
+            "abort": abort_info,
+        }
+        session.save(update_fields=[
+            "resolutions", "status", "result", "updated_at",
+        ])
+        return session
+
+    # Re-detect issues against the now-mutated parsed_payload. Replaces
+    # the open_issues list wholesale — any issue that's still valid will
+    # be re-emitted; any issue the operator resolved won't re-appear.
+    redetected = _redetect_issues(session)
+    session.open_issues = redetected
+
+    if issue_mod.has_blocking_issues(redetected):
+        session.status = ImportSession.STATUS_AWAITING_RESOLVE
+    else:
+        session.status = ImportSession.STATUS_READY
+
+    session.save(update_fields=[
+        "parsed_payload", "open_issues", "resolutions", "status", "updated_at",
     ])
     return session
 

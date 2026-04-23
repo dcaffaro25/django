@@ -17,5 +17,6 @@ app_name = "imports_v2_etl"
 urlpatterns = [
     path("analyze/", views.AnalyzeETLImportView.as_view(), name="analyze-etl"),
     path("commit/<int:pk>/", views.CommitSessionView.as_view(), name="commit"),
+    path("resolve/<int:pk>/", views.ResolveSessionView.as_view(), name="resolve"),
     path("sessions/<int:pk>/", views.ImportSessionDetailView.as_view(), name="session-detail"),
 ]

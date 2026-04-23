@@ -248,7 +248,10 @@ class V2CommitEndpointTests(TestCase):
         self.assertEqual(resp.status_code, 200, resp.content)
         body = resp.json()
         self.assertEqual(body["status"], ImportSession.STATUS_COMMITTED)
-        self.assertEqual(body["result"], fake_result)
+        # Phase 4A commit wraps the write-backend result with
+        # ``substitution_rules_created`` (empty when no rules were staged).
+        self.assertEqual(body["result"]["imports"], fake_result["imports"])
+        self.assertEqual(body["result"]["substitution_rules_created"], [])
         self.assertIsNotNone(body["committed_at"])
         # And ``execute_import_job`` was called with the session's data.
         call_kwargs = mocked.call_args.kwargs

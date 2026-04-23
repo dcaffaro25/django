@@ -18,5 +18,6 @@ app_name = "imports_v2_template"
 urlpatterns = [
     path("analyze/", views.AnalyzeTemplateImportView.as_view(), name="analyze-template"),
     path("commit/<int:pk>/", views.CommitSessionView.as_view(), name="commit"),
+    path("resolve/<int:pk>/", views.ResolveSessionView.as_view(), name="resolve"),
     path("sessions/<int:pk>/", views.ImportSessionDetailView.as_view(), name="session-detail"),
 ]

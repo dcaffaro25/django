@@ -330,7 +330,12 @@ class ETLv2CommitTests(TestCase):
         self.assertEqual(resp.status_code, 200, resp.content)
         body = resp.json()
         self.assertEqual(body["status"], ImportSession.STATUS_COMMITTED)
-        self.assertEqual(body["result"], fake_result)
+        # Phase 4A commit wraps the write-backend result with
+        # ``substitution_rules_created`` (empty when no rules were staged).
+        self.assertEqual(
+            body["result"]["transformed_data"], fake_result["transformed_data"],
+        )
+        self.assertEqual(body["result"]["substitution_rules_created"], [])
         # Service constructed with commit=True
         _, kwargs = svc_cls.call_args
         self.assertTrue(kwargs["commit"])

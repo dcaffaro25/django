@@ -30,6 +30,7 @@ from multitenancy.models import ImportSession
 from multitenancy.views import _resolve_bulk_import_company_id
 
 from . import services
+from .resolve_handlers import ResolutionError
 from .serializers import ImportSessionSerializer
 
 
@@ -244,6 +245,66 @@ class ImportSessionDetailView(APIView):
             return err
         session = _get_session_or_404(pk, company_id)
         services.discard_session(session)
+        return Response(
+            ImportSessionSerializer(session).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+class ResolveSessionView(APIView):
+    """``POST /api/core/imports/v2/resolve/<pk>/``
+    (and the ``/api/core/etl/v2/resolve/<pk>/`` mirror).
+
+    Body:
+
+        {
+          "resolutions": [
+            {"issue_id": "iss-abc123", "action": "pick_row",
+             "params": {"row_id": "R1"}},
+            ...
+          ]
+        }
+
+    Returns the updated session. ``status`` tells the client what to do
+    next: ``ready`` → commit; ``awaiting_resolve`` → more issues remain;
+    ``error`` → operator aborted.
+    """
+
+    def get_permissions(self):
+        return _perms()
+
+    def post(self, request, pk: int, tenant_id: Optional[int] = None) -> Response:
+        company_id, err = _resolve_bulk_import_company_id(request)
+        if err is not None:
+            return err
+        session = _get_session_or_404(pk, company_id)
+
+        body = request.data if isinstance(request.data, dict) else {}
+        resolutions = body.get("resolutions")
+        if resolutions is None:
+            return Response(
+                {"error": "missing `resolutions` array"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not isinstance(resolutions, list):
+            return Response(
+                {"error": "`resolutions` must be an array"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            session = services.resolve_session(session, resolutions)
+        except services.ResolveNotApplicable as exc:
+            return Response(
+                {"error": str(exc), "status": session.status},
+                status=status.HTTP_409_CONFLICT,
+            )
+        except ResolutionError as exc:
+            return Response(
+                {"error": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         return Response(
             ImportSessionSerializer(session).data,
             status=status.HTTP_200_OK,
