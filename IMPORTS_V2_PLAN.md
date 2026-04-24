@@ -12,9 +12,10 @@ Phase sections for the specific next step.
 
 ## 1. Status summary
 
-Backend phases 1–4B all shipped to `main`. Full v2 suite: **122 tests
-green**. Remaining work is frontend (Phase 5 / 6) + a small backlog of
-deferred backend items (see below).
+Backend phases 1–4B and frontend phases 5–6 all shipped to `main`.
+Full v2 backend suite: **122 tests green**. v2 feature is complete
+end-to-end for both template and ETL paths. Remaining work is the
+Phase 7 cleanup (burn-in gated) + optional follow-ups.
 
 | Ref         | What shipped                                                                 |
 |-------------|------------------------------------------------------------------------------|
@@ -24,10 +25,12 @@ deferred backend items (see below).
 | `8c56913`   | Phase 2 — Template v2 backend (analyze + commit) + 14 tests                  |
 | `0cc9835`   | Phase 3 — ETL v2 backend (analyze + commit) + 9 tests                        |
 | `b82ab4e`   | Phase 3.6 — Engine perf (pre-compile) + `skip_substitutions` hint + 25 tests |
-| `0bb9332`   | Phase 4A — Resolve endpoint + pick/skip/ignore/abort + staged-rule commit   |
+| `0bb9332`   | Phase 4A — Resolve endpoint + pick/skip/ignore/abort + staged-rule commit    |
 | `d547670`   | Phase 4B — bad_date/negative/unmatched detectors + map/edit handlers + 24 t  |
+| `8d44dd4`   | Phase 5 — Template v2 frontend (toggle + DiagnosticsPanel + 6 issue cards)   |
+| (pending)   | Phase 6 — ETL v2 frontend + ErpIdGroupsSection + serializer.transaction_groups |
 
-Nothing uncommitted on main. When resuming on a new machine:
+Nothing uncommitted on main (once Phase 6 lands). When resuming on a new machine:
 
 1. `git pull` on `main`.
 2. Apply migrations against any local/homolog DB (`0036_importtransformationrule_column_options` is the latest).

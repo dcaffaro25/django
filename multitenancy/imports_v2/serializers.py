@@ -27,6 +27,7 @@ class ImportSessionSerializer(serializers.ModelSerializer):
     is_terminal = serializers.SerializerMethodField()
     substitutions_applied = serializers.SerializerMethodField()
     summary = serializers.SerializerMethodField()
+    transaction_groups = serializers.SerializerMethodField()
 
     class Meta:
         model = ImportSession
@@ -50,6 +51,7 @@ class ImportSessionSerializer(serializers.ModelSerializer):
             "is_committable",
             "is_terminal",
             "substitutions_applied",
+            "transaction_groups",
         )
         read_only_fields = fields
 
@@ -72,6 +74,81 @@ class ImportSessionSerializer(serializers.ModelSerializer):
     def get_summary(self, obj):
         """Per-sheet row counts — cheap summary for the diagnostics header."""
         sheets = (obj.parsed_payload or {}).get("sheets", {}) or {}
+        # ETL mode stores under ``transformed_data`` instead of ``sheets``;
+        # use that when present so the header count is non-zero in ETL v2.
+        if not sheets:
+            td = (obj.parsed_payload or {}).get("transformed_data", {}) or {}
+            sheets = td if isinstance(td, dict) else {}
         return {
-            "sheets": {name: len(rows or []) for name, rows in sheets.items()},
+            "sheets": {
+                name: len(rows or []) if isinstance(rows, list) else 0
+                for name, rows in sheets.items()
+            },
         }
+
+    def get_transaction_groups(self, obj):
+        """Compact per-``__erp_id`` grouping of the Transaction rows, used
+        by the ETL v2 "Grupos de erp_id" panel. One entry per distinct
+        erp_id plus a sentinel (``erp_id=None``) bucket for rows that
+        lack one. Each entry carries the full rows so the UI can expand
+        and show them — compact enough because Transaction payloads
+        rarely exceed a few dozen columns.
+
+        Empty for template sessions (grouping is derived at commit time
+        via the backend's Phase-0 ``_group_transaction_rows_by_erp_id``
+        helper). Empty for ETL sessions with no Transaction rows.
+
+        The ``hasConflict`` flag is layered on via open_issues.erp_id_conflict
+        entries — the frontend could derive this itself, but inlining it
+        here avoids N⁺¹ matching work on the client.
+        """
+        payload = obj.parsed_payload or {}
+        # ETL mode: transformed_data.Transaction
+        tx_rows = None
+        td = payload.get("transformed_data")
+        if isinstance(td, dict):
+            candidate = td.get("Transaction")
+            if isinstance(candidate, list):
+                tx_rows = candidate
+        # Fallback: template mode stores under sheets.Transaction. Groups
+        # are less informative there (template rows ARE Transactions 1:1
+        # pre-grouping), but we still surface them for uniformity.
+        if tx_rows is None:
+            sheets = payload.get("sheets")
+            if isinstance(sheets, dict):
+                candidate = sheets.get("Transaction")
+                if isinstance(candidate, list):
+                    tx_rows = candidate
+        if not tx_rows:
+            return []
+
+        conflict_erp_ids = set()
+        for issue in obj.open_issues or []:
+            if (
+                isinstance(issue, dict)
+                and issue.get("type") == "erp_id_conflict"
+            ):
+                loc = issue.get("location") or {}
+                eid = loc.get("erp_id")
+                if eid:
+                    conflict_erp_ids.add(str(eid))
+
+        groups: dict = {}
+        for row in tx_rows:
+            if not isinstance(row, dict):
+                continue
+            erp = row.get("__erp_id")
+            # Canonicalise "missing" / empty string to None so the sentinel
+            # bucket catches all erp_id-less rows in one place.
+            key = erp if (isinstance(erp, str) and erp) else None
+            g = groups.setdefault(key, {
+                "erp_id": key,
+                "row_count": 0,
+                "has_conflict": (
+                    isinstance(key, str) and key in conflict_erp_ids
+                ),
+                "rows": [],
+            })
+            g["row_count"] += 1
+            g["rows"].append(row)
+        return list(groups.values())
