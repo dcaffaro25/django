@@ -9,6 +9,7 @@ import {
   Loader2,
 } from "lucide-react"
 import { AnalyzePreviewPanel } from "./AnalyzePreviewPanel"
+import { ProgressStrip } from "./ProgressStrip"
 import { SubstitutionAppliedBadge } from "./SubstitutionAppliedBadge"
 import { IssueCardErpIdConflict } from "./IssueCardErpIdConflict"
 import { IssueCardUnmatchedReference } from "./IssueCardUnmatchedReference"
@@ -85,6 +86,10 @@ export function DiagnosticsPanel({
 
   return (
     <div className="space-y-4">
+      {/* Live progress strip (Phase 6.z-e) — only visible while the
+          worker is chewing. Renders null on terminal sessions. */}
+      <ProgressStrip progress={session.progress} variant="card" />
+
       {/* Header summary: counts + overall commit state. */}
       <div
         className={cn(

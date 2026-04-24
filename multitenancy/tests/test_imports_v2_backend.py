@@ -834,3 +834,326 @@ class V2SessionsListEndpointTests(TestCase):
         self.assertEqual(body["analyzing"], 0)
         self.assertEqual(body["committing"], 0)
         self.assertEqual(body["awaiting_resolve"], 0)
+
+
+@override_settings(AUTH_OFF=True)
+class V2SubstitutionCacheTests(TestCase):
+    """Phase 6.z-d — pre-substitute at analyze, reuse at commit.
+
+    The service-layer cache reuse is orthogonal to the view — these
+    tests poke the helpers directly and the commit path through
+    mocks so we can assert the ``skip_substitutions`` flag flows or
+    not based on the revision + resolutions invariant.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.company = Company.objects.create(name="Acme Co")
+
+    # --- revision hash -----------------------------------------------------
+
+    def test_revision_hash_is_stable_when_rules_unchanged(self):
+        from multitenancy.imports_v2 import services as svc
+        from multitenancy.models import SubstitutionRule
+
+        SubstitutionRule.objects.create(
+            company_id=self.company.id,
+            model_name="Transaction",
+            field_name="description",
+            match_type="exact",
+            match_value="foo",
+            substitution_value="bar",
+        )
+        a = svc._compute_substitution_revision(self.company.id)
+        b = svc._compute_substitution_revision(self.company.id)
+        self.assertEqual(a, b)
+
+    def test_revision_hash_flips_when_rule_added(self):
+        from multitenancy.imports_v2 import services as svc
+        from multitenancy.models import SubstitutionRule
+
+        before = svc._compute_substitution_revision(self.company.id)
+        SubstitutionRule.objects.create(
+            company_id=self.company.id,
+            model_name="Transaction",
+            field_name="description",
+            match_type="exact",
+            match_value="foo",
+            substitution_value="bar",
+        )
+        after = svc._compute_substitution_revision(self.company.id)
+        self.assertNotEqual(before, after)
+
+    def test_revision_hash_is_tenant_scoped(self):
+        """Rules on another tenant must not perturb this tenant's hash."""
+        from multitenancy.imports_v2 import services as svc
+        from multitenancy.models import SubstitutionRule
+
+        co2 = Company.objects.create(name="Globex Co")
+        before = svc._compute_substitution_revision(self.company.id)
+        SubstitutionRule.objects.create(
+            company_id=co2.id,
+            model_name="Transaction",
+            field_name="description",
+            match_type="exact",
+            match_value="x",
+            substitution_value="y",
+        )
+        after = svc._compute_substitution_revision(self.company.id)
+        self.assertEqual(before, after)
+
+    # --- cache-valid predicate --------------------------------------------
+
+    def _make_session(self, *, rev=None, cached=None, resolutions=None):
+        payload = {"sheets": {"Transaction": [{"x": 1}]}}
+        if rev is not None:
+            payload["substitution_revision"] = rev
+        if cached is not None:
+            payload["sheets_post_substitution"] = cached
+        return ImportSession.objects.create(
+            company_id=self.company.id,
+            mode=ImportSession.MODE_TEMPLATE,
+            status=ImportSession.STATUS_READY,
+            file_name="x.xlsx",
+            parsed_payload=payload,
+            resolutions=resolutions or [],
+        )
+
+    def test_cache_valid_when_rev_matches_and_no_resolutions(self):
+        from multitenancy.imports_v2 import services as svc
+        s = self._make_session(
+            rev="abc123",
+            cached={"Transaction": [{"x": 1}]},
+            resolutions=[],
+        )
+        self.assertTrue(svc._is_substitution_cache_valid(s, "abc123"))
+
+    def test_cache_invalid_when_rev_differs(self):
+        from multitenancy.imports_v2 import services as svc
+        s = self._make_session(
+            rev="abc123",
+            cached={"Transaction": [{"x": 1}]},
+        )
+        self.assertFalse(svc._is_substitution_cache_valid(s, "different"))
+
+    def test_cache_invalid_when_any_resolution_recorded(self):
+        """edit_value resolutions mutate raw sheets — the cached
+        substituted copy wouldn't reflect that, so we must
+        re-substitute at commit."""
+        from multitenancy.imports_v2 import services as svc
+        s = self._make_session(
+            rev="abc123",
+            cached={"Transaction": [{"x": 1}]},
+            resolutions=[{"issue_id": "iss-1", "action": "edit_value"}],
+        )
+        self.assertFalse(svc._is_substitution_cache_valid(s, "abc123"))
+
+    def test_cache_invalid_when_payload_missing_cache_key(self):
+        from multitenancy.imports_v2 import services as svc
+        s = self._make_session()  # no rev, no cache
+        self.assertFalse(svc._is_substitution_cache_valid(s, "anything"))
+
+    # --- commit path integration ------------------------------------------
+
+    def test_commit_passes_skip_substitutions_when_cache_valid(self):
+        """Happy path: analyze cached fresh rows + rules unchanged →
+        commit passes ``skip_substitutions=True`` + the cached rows so
+        the pipeline doesn't double-apply the substitution pass."""
+        from multitenancy.imports_v2 import services as svc
+
+        rev = svc._compute_substitution_revision(self.company.id)
+        cached = {"Transaction": [{"__erp_id": "X", "amount": "100"}]}
+        session = self._make_session(rev=rev, cached=cached, resolutions=[])
+
+        fake_result = {"imports": []}
+        with mock.patch(
+            "multitenancy.imports_v2.services.execute_import_job",
+            return_value=fake_result,
+        ) as job:
+            svc._commit_template_session(session)
+
+        kwargs = job.call_args.kwargs
+        self.assertEqual(
+            kwargs["import_metadata"].get("import_options", {}).get(
+                "skip_substitutions"
+            ),
+            True,
+        )
+        # Sheets passed must be the cached copy, not the raw one.
+        self.assertEqual(
+            [s["model"] for s in kwargs["sheets"]],
+            ["Transaction"],
+        )
+        self.assertEqual(
+            kwargs["sheets"][0]["rows"],
+            cached["Transaction"],
+        )
+
+    def test_write_progress_merges_and_stamps_updated_at(self):
+        """``_write_progress`` merges kwargs into ``session.progress``
+        and stamps a fresh ``updated_at`` on every call. Merge lets
+        callers update one field without clobbering prior ones."""
+        from multitenancy.imports_v2 import services as svc
+
+        session = self._make_session()
+        svc._write_progress(
+            session, stage="detecting", sheets_total=3, sheets_done=0,
+        )
+        session.refresh_from_db()
+        self.assertEqual(session.progress.get("stage"), "detecting")
+        self.assertEqual(session.progress.get("sheets_total"), 3)
+        self.assertEqual(session.progress.get("sheets_done"), 0)
+        self.assertIn("updated_at", session.progress)
+        first_stamp = session.progress["updated_at"]
+
+        svc._write_progress(session, sheets_done=2, errors_so_far=1)
+        session.refresh_from_db()
+        # Merged — stage still there from the earlier call.
+        self.assertEqual(session.progress.get("stage"), "detecting")
+        self.assertEqual(session.progress.get("sheets_done"), 2)
+        self.assertEqual(session.progress.get("errors_so_far"), 1)
+        # New stamp (greater-or-equal — test time resolution is ms).
+        self.assertGreaterEqual(session.progress["updated_at"], first_stamp)
+
+    def test_write_progress_swallows_save_errors(self):
+        """Progress writes must not crash the worker. If the save
+        fails mid-atomic, log and carry on — the main work still
+        proceeds."""
+        from multitenancy.imports_v2 import services as svc
+
+        session = self._make_session()
+        with mock.patch.object(
+            ImportSession, "save", side_effect=RuntimeError("db blew up"),
+        ):
+            # Should not raise.
+            svc._write_progress(session, stage="writing")
+
+    def test_commit_falls_through_when_cache_stale(self):
+        """Rule set changed mid-session → commit must re-substitute
+        (no skip flag) so the new rules actually apply."""
+        from multitenancy.imports_v2 import services as svc
+        from multitenancy.models import SubstitutionRule
+
+        # Cache with a revision that definitely doesn't match current.
+        cached = {"Transaction": [{"x": 1}]}
+        session = self._make_session(
+            rev="stale-hash", cached=cached, resolutions=[],
+        )
+        # Add a rule after analyze → revision flips.
+        SubstitutionRule.objects.create(
+            company_id=self.company.id,
+            model_name="Transaction",
+            field_name="description",
+            match_type="exact",
+            match_value="a",
+            substitution_value="b",
+        )
+
+        fake_result = {"imports": []}
+        with mock.patch(
+            "multitenancy.imports_v2.services.execute_import_job",
+            return_value=fake_result,
+        ) as job:
+            svc._commit_template_session(session)
+
+        kwargs = job.call_args.kwargs
+        self.assertIsNone(
+            kwargs["import_metadata"].get("import_options", {}).get(
+                "skip_substitutions"
+            ),
+        )
+        # Raw sheets passed, not cached — the pipeline will run
+        # substitutions fresh.
+        self.assertEqual(
+            kwargs["sheets"][0]["rows"],
+            [{"x": 1}],  # matches ``self._make_session`` default
+        )
+
+
+@override_settings(AUTH_OFF=True)
+class V2StaleSessionReaperTests(TestCase):
+    """Phase 6.z-f — periodic beat task reaps v2 sessions stuck in
+    ``analyzing`` / ``committing`` past the Celery hard time limit.
+
+    Protects against worker SIGKILL / container restart / broker loss
+    scenarios where the task dies without flipping session status.
+    The frontend polls these sessions indefinitely; the reaper flips
+    them to ``error`` so the operator can discard + retry.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.company = Company.objects.create(name="Acme Co")
+
+    def _make_stale_session(self, status, *, seconds_ago: int):
+        """Create a session whose ``updated_at`` is in the past.
+
+        Django's ``auto_now`` on ``updated_at`` fires on every save,
+        so we bypass the ORM helper and update via ``.filter().update()``
+        to set the timestamp precisely.
+        """
+        from django.utils import timezone as tz
+        from datetime import timedelta
+
+        s = ImportSession.objects.create(
+            company_id=self.company.id,
+            mode=ImportSession.MODE_TEMPLATE,
+            status=status,
+            file_name="stuck.xlsx",
+        )
+        past = tz.now() - timedelta(seconds=seconds_ago)
+        ImportSession.objects.filter(pk=s.pk).update(updated_at=past)
+        s.refresh_from_db()
+        return s
+
+    def test_reaper_flips_stuck_analyzing_session(self):
+        from multitenancy.imports_v2.tasks import reap_stale_sessions_task
+
+        # 30-minute default hard limit + 60s grace = reap at 31+ min old.
+        stuck = self._make_stale_session(
+            ImportSession.STATUS_ANALYZING, seconds_ago=60 * 60,
+        )
+        result = reap_stale_sessions_task()
+        self.assertEqual(result["reaped"], 1)
+        self.assertIn(stuck.pk, result["session_pks"])
+        stuck.refresh_from_db()
+        self.assertEqual(stuck.status, ImportSession.STATUS_ERROR)
+        self.assertEqual(stuck.result["stage"], "timeout")
+        self.assertEqual(stuck.result["prior_status"], "analyzing")
+
+    def test_reaper_flips_stuck_committing_session(self):
+        from multitenancy.imports_v2.tasks import reap_stale_sessions_task
+
+        stuck = self._make_stale_session(
+            ImportSession.STATUS_COMMITTING, seconds_ago=60 * 60,
+        )
+        reap_stale_sessions_task()
+        stuck.refresh_from_db()
+        self.assertEqual(stuck.status, ImportSession.STATUS_ERROR)
+        self.assertEqual(stuck.result["prior_status"], "committing")
+
+    def test_reaper_ignores_fresh_sessions(self):
+        """A session that's only been running 30s must NOT be reaped —
+        that would kill legitimate in-flight work."""
+        from multitenancy.imports_v2.tasks import reap_stale_sessions_task
+
+        fresh = self._make_stale_session(
+            ImportSession.STATUS_ANALYZING, seconds_ago=30,
+        )
+        result = reap_stale_sessions_task()
+        self.assertEqual(result["reaped"], 0)
+        fresh.refresh_from_db()
+        self.assertEqual(fresh.status, ImportSession.STATUS_ANALYZING)
+
+    def test_reaper_ignores_terminal_sessions(self):
+        """Committed / errored / discarded rows stay as-is regardless
+        of age — reaper only touches non-terminal sessions."""
+        from multitenancy.imports_v2.tasks import reap_stale_sessions_task
+
+        old_committed = self._make_stale_session(
+            ImportSession.STATUS_COMMITTED, seconds_ago=60 * 60,
+        )
+        result = reap_stale_sessions_task()
+        self.assertEqual(result["reaped"], 0)
+        old_committed.refresh_from_db()
+        self.assertEqual(old_committed.status, ImportSession.STATUS_COMMITTED)

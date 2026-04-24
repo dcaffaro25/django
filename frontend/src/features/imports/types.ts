@@ -324,6 +324,28 @@ export interface ImportPreview {
   [k: string]: unknown
 }
 
+/**
+ * Live progress snapshot written by the Celery worker (Phase 6.z-e).
+ * ``stage`` maps to a Portuguese label in the UI; fields beyond that
+ * are all optional so the frontend handles partial updates
+ * gracefully. Empty object (``{}``) on non-running sessions.
+ */
+export interface ImportProgress {
+  stage?:
+    | "parsing"
+    | "detecting"
+    | "dry_run"
+    | "materializing_rules"
+    | "writing"
+    | "done"
+    | string
+  sheets_done?: number
+  sheets_total?: number
+  current_sheet?: string
+  errors_so_far?: number
+  updated_at?: string
+}
+
 export interface ImportSession {
   id: number
   company: number
@@ -348,6 +370,8 @@ export interface ImportSession {
   /** Dry-run preview: what commit would write. Empty for template
    *  sessions until the follow-up dry-run commit ships. */
   preview: ImportPreview
+  /** Live progress snapshot written at stage boundaries. */
+  progress: ImportProgress
 }
 
 /** Request body for POST /v2/resolve/<id>/. Each resolution targets one
@@ -379,6 +403,10 @@ export interface ImportSessionSummary {
   open_issue_count: number
   is_terminal: boolean
   transformation_rule_name: string | null
+  /** Same live snapshot as ImportSession.progress, inlined per queue
+   *  row so the list can render "writing · sheet 2/3" without a
+   *  second request. */
+  progress: ImportProgress
 }
 
 /** DRF PageNumberPagination shape. */

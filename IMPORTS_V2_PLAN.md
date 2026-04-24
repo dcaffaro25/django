@@ -32,8 +32,8 @@ Phase 7 cleanup (burn-in gated) + optional follow-ups.
 | `1951ff6`   | Phase 6.x — Rule picker dropdown + ETL preview passthrough + AnalyzePreviewPanel |
 | `8a2e8d9`   | Phase 6.y — Template dry-run at analyze (≤5k rows auto; would_create/update/fail) |
 | `6bf433e`   | Phase 6.z-a — Async analyze + commit via Celery (backend + frontend polling) |
-| (pending)   | Phase 6.z-b — Queue panel + sidebar badge + list/running-count endpoints (9 tests) |
-| (pending)   | Phase 6.z-c — Inline session-detail view on queue row click + ?session deep-link |
+| `c06a013`   | Phase 6.z-b + 6.z-c — Queue panel + sidebar badge + session detail + deep-link |
+| (pending)   | Phase 6.z-d/e/f — Sub-cache reuse, live progress, LookupCache perf, stale-session reaper |
 
 **Resolved follow-up — template dry-run.** Phase 6.y shipped the
 missing piece: template analyze now runs `execute_import_job(commit=False)`
@@ -121,15 +121,91 @@ Deep-linking via `?tab=<tab>&session=<id>` — operators can share the
 URL of an import in triage. Garbage values (non-numeric) are
 ignored so a malformed link doesn't crash the page.
 
-Read-only for this pass: resolve/commit still happen on the upload
-page. A future iteration can lift those handlers into the queue
-detail view so operators drive the full flow from one place.
+**6.z-c update — queue is now fully interactive.** The follow-up
+lift landed: `useSessionActions(sessionPk, session)` hook
+encapsulates resolve + commit + polling + cache invalidation, and
+`SessionDetailView` passes both callbacks to `DiagnosticsPanel`.
+Operators can now drive the full flow from the queue without
+leaving the hub.
+
+**Phase 6.z-d — substitution cache reuse at commit.** Analyze now
+pre-substitutes each sheet once and stashes the result in
+`parsed_payload["sheets_post_substitution"]` along with a
+fingerprint of the active `SubstitutionRule` set
+(`substitution_revision`). At commit, `_commit_template_session`
+checks the invariant (hash matches + no resolutions recorded
+since) and, when valid, reuses the cached rows while passing a new
+`import_options.skip_substitutions` flag to `execute_import_job`
+so the pipeline skips the second pass. Idempotent by construction:
+`apply_substitutions` matches against `match_value` not the
+substituted value, so even if the cache check misses a staleness
+signal the output is still correct (we just paid for a redundant
+pass). 6 new tests cover the hash stability, tenant scoping, and
+the cache-valid predicate.
+
+**Phase 6.z-e — live progress feedback.** Adds
+`ImportSession.progress` (migration 0037) — a JSON snapshot the
+worker writes at stage boundaries so the polling frontend can
+render a live "Analisando…" / "Escrevendo no banco…" strip with
+percentage + error count.
+
+Analyze gets genuine real-time progress — detectors loop outside
+any atomic block so per-sheet writes stream through
+(`sheets_done` / `sheets_total` update live). Commit gets
+coarser "starting write → done" because the write loop runs
+inside `transaction.atomic()` — any `session.save` from inside
+isn't visible to the polling frontend until the block commits.
+Intra-commit row-level progress needs a separate DB connection
+or Redis progress store (future iteration); the panel strip is
+honest about this and shows an indeterminate spinner for the
+write phase.
+
+Frontend `ProgressStrip` component renders two variants: `card`
+(DiagnosticsPanel header) and `inline` (per queue row, next to
+the status chip). Reads `session.progress.stage` for the label,
+`sheets_done/sheets_total` for the bar, `errors_so_far` for the
+amber badge.
+
+**Phase 6.z-f — perf fix + stale-session reaper.** Diagnosing a
+report of "3.5k rows taking 10+ min" exposed two interacting bugs:
+
+1. **`LookupCache` was never wired into v2** (`_template_dry_run_preview`
+   + `_commit_template_session` called `execute_import_job` without
+   `lookup_cache=...`). ETL mode had been doing this since day one via
+   `ETLPipelineService.__init__`. Every FK reference in every row
+   was hitting the DB — thousands of extra round-trips to Railway's
+   remote Postgres (10-50ms each). **Fixed**: v2 now instantiates
+   `LookupCache(company_id)` + `.load()` before both dry-run and
+   commit, mirroring the ETL pattern.
+
+2. **Celery hard time-limit was 10 min, labeled 15.** Settings said
+   `CELERY_TASK_TIME_LIMIT = T_LIMIT*60  # 15 minutes` but the
+   math produced 600s (10 min) on the default `T_LIMIT=10`. A commit
+   that took >10 min got SIGKILL'd by Celery without the exception
+   handler running, leaving the session stuck in `committing`
+   forever. **Fixed**: default raised to 30 min (`T_LIMIT=30`),
+   comments rewritten to match the actual seconds value.
+
+3. **No safety net for stuck sessions.** Even with the two fixes
+   above, a worker SIGKILL / container restart / broker loss could
+   still leave a session orphaned. **Fixed**: new
+   `reap_stale_sessions_task` Celery beat task runs every 5 min
+   and flips sessions in `analyzing`/`committing` past the hard
+   limit + 60s grace to `error` with a timeout diagnostic.
+   `SoftTimeLimitExceeded` handlers in `analyze_session_task` +
+   `commit_session_task` also flip to error pre-kill on genuine
+   runaways.
+
+4 new tests in `V2StaleSessionReaperTests` cover the reaper's
+happy paths (analyzing + committing) plus the two negative cases
+(fresh sessions must not be touched; terminal sessions must not
+be re-reaped).
 
 Nothing uncommitted on main. When resuming on a new machine:
 
 1. `git pull` on `main`.
-2. Apply migrations against any local/homolog DB (`0036_importtransformationrule_column_options` is the latest).
-3. Run the v2 test suite (command below) — expect 122 green on `--reuse-db`.
+2. Apply migrations against any local/homolog DB (`0037_importsession_progress` is the latest).
+3. Run the v2 test suite (command below) — expect 51+ green on the v2_backend module alone.
 4. Pick up Phase 5 (template frontend) or the backlog in §2.x.
 
 ### Production DB unblocked (2026-04-23)

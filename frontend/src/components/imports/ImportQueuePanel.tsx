@@ -13,6 +13,7 @@ import type {
   ImportSessionStatus,
   ImportSessionSummary,
 } from "@/features/imports/types"
+import { ProgressStrip } from "./ProgressStrip"
 import { cn } from "@/lib/utils"
 
 /**
@@ -236,6 +237,11 @@ export function ImportQueuePanel({
                           {r.open_issue_count === 1 ? "" : "s"}
                         </span>
                       )}
+                      {/* Phase 6.z-e: inline progress percentage for
+                          running rows. ProgressStrip renders null on
+                          terminal sessions so the badge disappears
+                          once the worker finishes. */}
+                      <ProgressStrip progress={r.progress} variant="inline" />
                     </div>
                   </div>
                   <StatusChip status={r.status} />

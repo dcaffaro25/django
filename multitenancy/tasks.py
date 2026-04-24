@@ -1573,33 +1573,51 @@ def execute_import_job(
             model = apps.get_model(app_label, model_name)
             raw_rows: List[Dict[str, Any]] = sheet.get("rows") or []
 
+            # Resolve merged import_options for THIS sheet (sheet-level
+            # opts override metadata-level opts). Consumed by downstream
+            # erp-key handling; also consulted here for the new
+            # ``skip_substitutions`` job-level flag (Phase 6.z-d) that
+            # lets the v2 analyze step pre-substitute once and reuse the
+            # result at commit without a second pass. Default False.
+            _sub_sheet_opts = _merge_sheet_import_options(import_metadata, sheet)
+            skip_substitutions = bool(_sub_sheet_opts.get("skip_substitutions"))
+
             # 1) substitutions + audit
             # Use a savepoint to isolate substitution queries from transaction errors
-            try:
-                sid = transaction.savepoint()
-                try:
-                    rows, audit = apply_substitutions(
-                        raw_rows,
-                        company_id=company_id,
-                        model_name=model_name,
-                        return_audit=True,
-                        commit=commit,
-                        processed_row_ids=processed_substitution_rows,
-                        sheet_name=sheet_name,
-                        substitution_cache=substitution_cache
-                    )
-                except Exception as e:
-                    # Rollback the savepoint if substitution fails
-                    transaction.savepoint_rollback(sid)
-                    logger.exception(f"Error applying substitutions for {model_name}: {e}")
-                    # Continue with raw rows if substitutions fail
-                    rows = raw_rows
-                    audit = []
-            except Exception as e:
-                # If savepoint creation fails (transaction already aborted), use raw rows
-                logger.warning(f"Transaction in failed state, skipping substitutions for {model_name}: {e}")
+            if skip_substitutions:
+                # Rows were already substituted at analyze time + stashed on
+                # the session (v2 flow). Skip the re-pass so we don't double
+                # the substitution cost on medium-sized imports. Audit stays
+                # empty here — analyze kept its own copy of the audit for
+                # the diagnostics panel.
                 rows = raw_rows
                 audit = []
+            else:
+                try:
+                    sid = transaction.savepoint()
+                    try:
+                        rows, audit = apply_substitutions(
+                            raw_rows,
+                            company_id=company_id,
+                            model_name=model_name,
+                            return_audit=True,
+                            commit=commit,
+                            processed_row_ids=processed_substitution_rows,
+                            sheet_name=sheet_name,
+                            substitution_cache=substitution_cache
+                        )
+                    except Exception as e:
+                        # Rollback the savepoint if substitution fails
+                        transaction.savepoint_rollback(sid)
+                        logger.exception(f"Error applying substitutions for {model_name}: {e}")
+                        # Continue with raw rows if substitutions fail
+                        rows = raw_rows
+                        audit = []
+                except Exception as e:
+                    # If savepoint creation fails (transaction already aborted), use raw rows
+                    logger.warning(f"Transaction in failed state, skipping substitutions for {model_name}: {e}")
+                    rows = raw_rows
+                    audit = []
             audit_by_rowid: Dict[Any, List[dict]] = {}
             for ch in (audit or []):
                 key_norm = _norm_row_key(ch.get("__row_id"))

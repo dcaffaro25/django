@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react"
 import { useQuery } from "@tanstack/react-query"
+import { toast } from "sonner"
 import {
   ChevronDown,
   ChevronRight,
@@ -11,6 +12,7 @@ import {
   X,
 } from "lucide-react"
 import { DiagnosticsPanel } from "./DiagnosticsPanel"
+import { useSessionActions } from "@/features/imports"
 import { importsV2 } from "@/features/imports/api"
 import type { ImportSession } from "@/features/imports/types"
 import { cn } from "@/lib/utils"
@@ -49,6 +51,45 @@ export function SessionDetailView({
     },
     staleTime: 0,
   })
+
+  // Phase 6.z-c follow-up — interactive resolve + commit straight from
+  // the queue detail view. Until this landed, the panel was read-only
+  // (the upload page still owned the handlers). Now the queue is a
+  // full workspace: open any session, resolve its issues, and commit
+  // without leaving the hub.
+  const { resolve, commit, isResolving, isCommitting } = useSessionActions(
+    sessionId,
+    data,
+  )
+
+  const onResolve = async (
+    resolutions: Parameters<typeof resolve>[0],
+  ) => {
+    try {
+      await resolve(resolutions)
+    } catch (err: unknown) {
+      toast.error(
+        `Falha ao resolver: ${
+          (err as { response?: { data?: { error?: string } } })?.response?.data
+            ?.error ?? (err instanceof Error ? err.message : "erro")
+        }`,
+      )
+    }
+  }
+
+  const onCommit = async () => {
+    try {
+      await commit()
+      toast.success("Importação concluída.")
+    } catch (err: unknown) {
+      toast.error(
+        `Commit falhou: ${
+          (err as { response?: { data?: { error?: string } } })?.response?.data
+            ?.error ?? (err instanceof Error ? err.message : "erro")
+        }`,
+      )
+    }
+  }
 
   return (
     <section className="card-elevated">
@@ -121,15 +162,17 @@ export function SessionDetailView({
         )}
         {data && (
           <div className="space-y-4">
-            {/* Interactive handlers (resolve/commit) are wired by the
-                upload page today — the queue detail view renders the
-                session read-only. Future iteration can lift those
-                handlers here so operators resolve directly from the
-                queue. */}
+            {/* Full interactive panel — resolve + commit land the
+                mutations directly from the queue via
+                ``useSessionActions``. Cache invalidation keeps the
+                queue row + badge count in sync without a page
+                reload. */}
             <DiagnosticsPanel
               session={data}
-              onResolve={noopResolve}
-              isResolving={false}
+              onResolve={onResolve}
+              isResolving={isResolving}
+              onCommit={data.is_committable ? onCommit : undefined}
+              isCommitting={isCommitting}
             />
             {data.result && Object.keys(data.result).length > 0 && (
               <RawResultJson result={data.result} />
@@ -196,11 +239,6 @@ function RawResultJson({ result }: { result: Record<string, unknown> }) {
       )}
     </div>
   )
-}
-
-/** No-op resolve — the queue detail view is read-only for now. */
-async function noopResolve(): Promise<void> {
-  // Intentional: queue detail doesn't expose resolve/commit yet.
 }
 
 /**
