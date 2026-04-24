@@ -104,7 +104,7 @@ class V2AnalyzeEndpointTests(TestCase):
             {"file": _upload_file(b"not a real xlsx", "bad.xlsx")},
             format="multipart",
         )
-        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.status_code, 202, resp.content)
         body = resp.json()
         self.assertEqual(body["status"], ImportSession.STATUS_ERROR)
         self.assertEqual(body["is_terminal"], True)
@@ -125,7 +125,7 @@ class V2AnalyzeEndpointTests(TestCase):
             {"file": _upload_file(xlsx)},
             format="multipart",
         )
-        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.status_code, 202, resp.content)
         body = resp.json()
         self.assertEqual(body["status"], ImportSession.STATUS_READY)
         self.assertEqual(body["is_committable"], True)
@@ -152,7 +152,7 @@ class V2AnalyzeEndpointTests(TestCase):
             {"file": _upload_file(xlsx)},
             format="multipart",
         )
-        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.status_code, 202, resp.content)
         body = resp.json()
         self.assertEqual(body["status"], ImportSession.STATUS_AWAITING_RESOLVE)
         self.assertEqual(body["is_committable"], False)
@@ -180,7 +180,7 @@ class V2AnalyzeEndpointTests(TestCase):
             {"file": _upload_file(xlsx)},
             format="multipart",
         )
-        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.status_code, 202, resp.content)
         body = resp.json()
         self.assertEqual(body["status"], ImportSession.STATUS_READY)
         self.assertEqual(body["open_issues"], [])
@@ -405,7 +405,7 @@ class V2CommitEndpointTests(TestCase):
             resp = self.client.post(
                 _url_commit(self.company.id, session.pk), {}, format="json",
             )
-        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.status_code, 202, resp.content)
         body = resp.json()
         self.assertEqual(body["status"], ImportSession.STATUS_COMMITTED)
         # Phase 4A commit wraps the write-backend result with
@@ -446,7 +446,14 @@ class V2CommitEndpointTests(TestCase):
 
     def test_commit_failure_marks_session_error(self):
         """When ``execute_import_job`` raises, the session should end up
-        in ``error`` status with the traceback captured on ``result``."""
+        in ``error`` status with the diagnostic captured on ``result``.
+
+        Phase 6.z: commit is async + runs in a Celery worker. The view
+        returns 202 regardless of commit outcome — the frontend polls
+        the detail endpoint for the final status. In eager mode the
+        worker has already run by the time this returns, so the
+        response body already reflects the terminal ``error`` status.
+        """
         session = self._create_ready_session()
         with mock.patch(
             "multitenancy.imports_v2.services.execute_import_job",
@@ -455,7 +462,10 @@ class V2CommitEndpointTests(TestCase):
             resp = self.client.post(
                 _url_commit(self.company.id, session.pk), {}, format="json",
             )
-        self.assertEqual(resp.status_code, 500, resp.content)
+        self.assertEqual(resp.status_code, 202, resp.content)
+        body = resp.json()
+        self.assertEqual(body["status"], ImportSession.STATUS_ERROR)
+        self.assertEqual(body["result"].get("error"), "boom")
         session.refresh_from_db()
         self.assertEqual(session.status, ImportSession.STATUS_ERROR)
         self.assertEqual(session.result.get("error"), "boom")
@@ -516,3 +526,157 @@ class V2SessionDetailTests(TestCase):
         # Terminal sessions don't change state — still committed.
         self.assertEqual(resp.status_code, 200, resp.content)
         self.assertEqual(resp.json()["status"], ImportSession.STATUS_COMMITTED)
+
+
+@override_settings(AUTH_OFF=True)
+class V2AsyncTaskTests(TestCase):
+    """Phase 6.z — analyze and commit run through Celery.
+
+    These tests hit the task functions directly (no HTTP) to verify
+    the worker-only branches: status-gating on re-entry, missing
+    session id, and terminal-status translation on unhandled
+    exceptions. The happy path is covered by the endpoint tests
+    above — in eager mode every endpoint test already goes through
+    ``.delay()`` → task body.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.company = Company.objects.create(name="Acme Co")
+
+    def _make_session(self, status: str) -> ImportSession:
+        return ImportSession.objects.create(
+            company_id=self.company.id,
+            mode=ImportSession.MODE_TEMPLATE,
+            status=status,
+            file_name="x.xlsx",
+            parsed_payload={"sheets": {"Transaction": []}},
+        )
+
+    # --- analyze_session_task ------------------------------------------------
+
+    def test_analyze_task_bails_when_session_missing(self):
+        """Missing session → warn + return, no crash."""
+        from multitenancy.imports_v2.tasks import analyze_session_task
+        # No exception; nothing to assert on — if this raises, the
+        # worker would crashloop in production.
+        analyze_session_task(9_999_999)
+
+    def test_analyze_task_bails_when_session_not_in_analyzing(self):
+        """If the session was discarded / is already terminal, the
+        worker must not re-run analyze (would corrupt parsed_payload).
+        """
+        from multitenancy.imports_v2.tasks import analyze_session_task
+        session = self._make_session(ImportSession.STATUS_DISCARDED)
+        with mock.patch(
+            "multitenancy.imports_v2.services._run_analyze_template"
+        ) as body_mock:
+            analyze_session_task(session.pk)
+        body_mock.assert_not_called()
+
+    def test_analyze_task_marks_error_on_unhandled_exception(self):
+        """If the analyze body crashes with something other than the
+        ValueError it handles itself, the task wrapper must flip the
+        session to ``error`` with a traceback — otherwise the frontend
+        poll would hang forever on ``analyzing``."""
+        from multitenancy.imports_v2.tasks import analyze_session_task
+        session = self._make_session(ImportSession.STATUS_ANALYZING)
+        with mock.patch(
+            "multitenancy.imports_v2.services._run_analyze_template",
+            side_effect=RuntimeError("kaboom"),
+        ):
+            analyze_session_task(session.pk)
+        session.refresh_from_db()
+        self.assertEqual(session.status, ImportSession.STATUS_ERROR)
+        self.assertEqual(session.result["stage"], "analyze")
+        self.assertEqual(session.result["error"], "kaboom")
+        self.assertEqual(session.result["type"], "RuntimeError")
+        self.assertIn("traceback", session.result)
+
+    def test_analyze_task_dispatches_by_mode(self):
+        """ETL-mode session → ``_run_analyze_etl``; template-mode →
+        ``_run_analyze_template``. Dispatching on ``session.mode``
+        instead of task kwargs keeps the task signature narrow
+        (just the pk)."""
+        from multitenancy.imports_v2.tasks import analyze_session_task
+        etl_session = ImportSession.objects.create(
+            company_id=self.company.id,
+            mode=ImportSession.MODE_ETL,
+            status=ImportSession.STATUS_ANALYZING,
+            file_name="x.xlsx",
+        )
+        with mock.patch(
+            "multitenancy.imports_v2.services._run_analyze_etl"
+        ) as etl_mock, mock.patch(
+            "multitenancy.imports_v2.services._run_analyze_template"
+        ) as tpl_mock:
+            analyze_session_task(etl_session.pk)
+        etl_mock.assert_called_once()
+        tpl_mock.assert_not_called()
+
+    # --- commit_session_task -------------------------------------------------
+
+    def test_commit_task_bails_when_session_missing(self):
+        from multitenancy.imports_v2.tasks import commit_session_task
+        commit_session_task(9_999_999)  # no raise → pass
+
+    def test_commit_task_bails_when_session_not_in_committing(self):
+        """If the session was moved back to awaiting_resolve (rare but
+        possible via concurrent discard), skip the commit body."""
+        from multitenancy.imports_v2.tasks import commit_session_task
+        session = self._make_session(ImportSession.STATUS_READY)
+        with mock.patch(
+            "multitenancy.imports_v2.services._run_commit"
+        ) as body_mock:
+            commit_session_task(session.pk)
+        body_mock.assert_not_called()
+
+    def test_commit_task_safety_net_on_unexpected_exception(self):
+        """_run_commit already flips to ``error`` on known exceptions.
+        This test patches _run_commit to raise WITHOUT flipping status
+        (simulating a bug in the body) and verifies the task wrapper
+        catches it and writes the error status as a safety net."""
+        from multitenancy.imports_v2.tasks import commit_session_task
+        session = self._make_session(ImportSession.STATUS_COMMITTING)
+
+        def raise_without_status_flip(session_arg):
+            raise RuntimeError("bug in body")
+
+        with mock.patch(
+            "multitenancy.imports_v2.services._run_commit",
+            side_effect=raise_without_status_flip,
+        ):
+            commit_session_task(session.pk)
+        session.refresh_from_db()
+        self.assertEqual(session.status, ImportSession.STATUS_ERROR)
+        self.assertEqual(session.result["stage"], "commit")
+        self.assertEqual(session.result["error"], "bug in body")
+
+    def test_commit_task_does_not_overwrite_error_from_body(self):
+        """If ``_run_commit`` already wrote a precise error (its own
+        diagnostic from execute_import_job failing), the task wrapper
+        must NOT clobber it with a generic traceback."""
+        from multitenancy.imports_v2.tasks import commit_session_task
+        session = self._make_session(ImportSession.STATUS_COMMITTING)
+
+        def simulate_body_writing_error(session_arg):
+            session_arg.status = ImportSession.STATUS_ERROR
+            session_arg.result = {
+                "error": "precise diagnostic",
+                "stage": "commit",
+                "type": "IntegrityError",
+            }
+            session_arg.save(update_fields=["status", "result"])
+            raise RuntimeError("re-raised after writing status")
+
+        with mock.patch(
+            "multitenancy.imports_v2.services._run_commit",
+            side_effect=simulate_body_writing_error,
+        ):
+            commit_session_task(session.pk)
+        session.refresh_from_db()
+        self.assertEqual(session.status, ImportSession.STATUS_ERROR)
+        self.assertEqual(session.result["error"], "precise diagnostic")
+        self.assertEqual(session.result["type"], "IntegrityError")
+        # The wrapper's generic 'traceback' field must not be present.
+        self.assertNotIn("traceback", session.result)

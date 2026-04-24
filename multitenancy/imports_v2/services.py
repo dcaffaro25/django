@@ -567,7 +567,7 @@ def _template_dry_run_preview(
     }
 
 
-def analyze_template(
+def _create_template_session(
     *,
     company_id: int,
     user,
@@ -575,19 +575,16 @@ def analyze_template(
     file_name: str,
     config: Optional[Dict[str, Any]] = None,
 ) -> ImportSession:
-    """Create a new ``ImportSession`` for template mode and populate it.
+    """Persist a fresh template-mode session in ``ANALYZING`` state.
 
-    Always persists the uploaded bytes so Phase 4's resolve can re-parse
-    without re-upload. The session transitions to ``ready`` if no
-    blocking issues were detected; otherwise ``awaiting_resolve``.
-
-    Errors during parse itself become a terminal ``error`` session —
-    the operator can inspect the reason via GET and discard.
+    No parsing, no detectors — just the row creation so the caller can
+    either run the analyze body inline (sync) or enqueue it via Celery
+    (async, Phase 6.z). File bytes + config are stored so the worker
+    has everything it needs from just the session pk.
     """
     file_hash = hashlib.sha256(file_bytes).hexdigest()
     now = timezone.now()
-
-    session = ImportSession.objects.create(
+    return ImportSession.objects.create(
         company_id=company_id,
         created_by=user if (user and getattr(user, "is_authenticated", False)) else None,
         mode=ImportSession.MODE_TEMPLATE,
@@ -599,6 +596,23 @@ def analyze_template(
         expires_at=now + SESSION_TTL,
     )
 
+
+def _run_analyze_template(session: ImportSession) -> ImportSession:
+    """Analyze body for a template-mode session already in ``ANALYZING``.
+
+    Reads ``session.file_bytes`` + ``session.company_id``, runs detectors
+    and the dry-run preview, then flips the session to its terminal
+    analyze status (``ready``, ``awaiting_resolve``, or ``error`` on a
+    parse failure). Callable from either the sync entry point or from
+    a Celery worker — the contract is the same.
+
+    Unexpected exceptions propagate so the caller (worker wrapper) can
+    flip the session to ``error`` with a traceback; ``ValueError`` from
+    the parser is handled inline since that's a known-bad-file signal,
+    not a crash.
+    """
+    company_id = session.company_id
+    file_bytes = bytes(session.file_bytes or b"")
     try:
         sheets = _parse_template_file(file_bytes)
     except ValueError as exc:
@@ -659,6 +673,59 @@ def analyze_template(
     return session
 
 
+def analyze_template(
+    *,
+    company_id: int,
+    user,
+    file_bytes: bytes,
+    file_name: str,
+    config: Optional[Dict[str, Any]] = None,
+) -> ImportSession:
+    """Create a new ``ImportSession`` for template mode and populate it.
+
+    Synchronous entry point — runs parse, detectors, and dry-run preview
+    in-process and returns the fully-populated session. Still used by
+    tests and by the async wrapper as its "do the work" callee.
+
+    The v2 HTTP views use :func:`analyze_template_async` instead, which
+    persists the session and hands the body off to Celery so gunicorn's
+    timeout ceiling can't bite on large files.
+    """
+    session = _create_template_session(
+        company_id=company_id, user=user, file_bytes=file_bytes,
+        file_name=file_name, config=config,
+    )
+    return _run_analyze_template(session)
+
+
+def analyze_template_async(
+    *,
+    company_id: int,
+    user,
+    file_bytes: bytes,
+    file_name: str,
+    config: Optional[Dict[str, Any]] = None,
+) -> ImportSession:
+    """Create the session in ``ANALYZING`` state and enqueue the worker.
+
+    Returns immediately with the session still in ``analyzing``. The
+    frontend polls ``GET /sessions/<id>/`` until ``status`` leaves that
+    state. In eager mode (no ``REDIS_URL`` — tests + dev) the worker
+    runs inline so the returned session is already terminal; production
+    always goes through the broker.
+    """
+    session = _create_template_session(
+        company_id=company_id, user=user, file_bytes=file_bytes,
+        file_name=file_name, config=config,
+    )
+    # Local import to avoid a circular import at module load: tasks.py
+    # imports this module to call ``_run_analyze_template``.
+    from .tasks import analyze_session_task
+    analyze_session_task.delay(session.pk)
+    session.refresh_from_db()
+    return session
+
+
 # --- public: commit --------------------------------------------------------
 
 
@@ -666,20 +733,13 @@ class CommitNotReady(Exception):
     """Raised when ``commit_session`` is called on a non-ready session."""
 
 
-def commit_session(session: ImportSession) -> ImportSession:
-    """Mode-aware commit: dispatches to the right write backend.
+def _check_commit_gate(session: ImportSession) -> None:
+    """Raise ``CommitNotReady`` unless the session is in ``READY`` state.
 
-    Template-mode sessions delegate to the legacy ``execute_import_job``;
-    ETL-mode sessions re-run ``ETLPipelineService`` with ``commit=True``
-    on the original file bytes so the commit reproduces exactly what
-    was shown in the analyze step (transformations, substitutions,
-    auto-JE creation).
-
-    Requires ``session.status == READY``. Raises ``CommitNotReady``
-    otherwise — the view layer translates that into a 409.
-
-    Write errors flip the session to ``error`` with a diagnostic in
-    ``result`` and re-raise; the view layer returns 500.
+    Factored out so the sync and async entry points share exactly the
+    same gate — callers that want to enqueue still need to fail fast
+    on a non-ready session (409) rather than enqueueing and
+    disappointing the operator via an error status.
     """
     if not session.is_committable():
         raise CommitNotReady(
@@ -690,9 +750,19 @@ def commit_session(session: ImportSession) -> ImportSession:
             f"session #{session.pk} is already terminal ({session.status})"
         )
 
-    session.status = ImportSession.STATUS_COMMITTING
-    session.save(update_fields=["status", "updated_at"])
 
+def _run_commit(session: ImportSession) -> ImportSession:
+    """Commit body for a session already in ``COMMITTING`` state.
+
+    Materialises staged substitution rules, dispatches to the mode's
+    write backend, and sets the final ``committed`` / ``error`` status.
+    Callable from either the sync entry point or a Celery worker.
+
+    Write errors flip the session to ``error`` with a diagnostic and
+    re-raise so the caller can decide how to report back (sync view
+    returns 500; worker just logs since the UI already polls the
+    status).
+    """
     try:
         # Wrap BOTH the staged-rule materialisation AND the write backend
         # in one outer atomic block so any error (rule clashes, write
@@ -732,6 +802,47 @@ def commit_session(session: ImportSession) -> ImportSession:
     session.save(update_fields=[
         "status", "committed_at", "result", "file_bytes", "updated_at",
     ])
+    return session
+
+
+def commit_session(session: ImportSession) -> ImportSession:
+    """Mode-aware commit: dispatches to the right write backend.
+
+    Template-mode sessions delegate to the legacy ``execute_import_job``;
+    ETL-mode sessions re-run ``ETLPipelineService`` with ``commit=True``
+    on the original file bytes so the commit reproduces exactly what
+    was shown in the analyze step (transformations, substitutions,
+    auto-JE creation).
+
+    Synchronous — runs the commit body in-process. The v2 HTTP views
+    use :func:`commit_session_async` instead so the 300s gunicorn
+    timeout can't bite on large imports.
+
+    Requires ``session.status == READY``. Raises ``CommitNotReady``
+    otherwise — the view layer translates that into a 409.
+
+    Write errors flip the session to ``error`` with a diagnostic in
+    ``result`` and re-raise; the view layer returns 500.
+    """
+    _check_commit_gate(session)
+    session.status = ImportSession.STATUS_COMMITTING
+    session.save(update_fields=["status", "updated_at"])
+    return _run_commit(session)
+
+
+def commit_session_async(session: ImportSession) -> ImportSession:
+    """Flip the session to ``COMMITTING`` and enqueue the worker.
+
+    Gate check happens before the flip so a non-ready session never
+    leaves ``READY``. In eager mode (tests / dev without Redis) the
+    worker runs inline so the returned session is already terminal.
+    """
+    _check_commit_gate(session)
+    session.status = ImportSession.STATUS_COMMITTING
+    session.save(update_fields=["status", "updated_at"])
+    from .tasks import commit_session_task
+    commit_session_task.delay(session.pk)
+    session.refresh_from_db()
     return session
 
 
@@ -931,7 +1042,7 @@ def _detect_missing_etl_parameters(
     return issues
 
 
-def analyze_etl(
+def _create_etl_session(
     *,
     company_id: int,
     user,
@@ -940,28 +1051,22 @@ def analyze_etl(
     transformation_rule_id: Optional[int] = None,
     config: Optional[Dict[str, Any]] = None,
 ) -> ImportSession:
-    """Create an ETL-mode ``ImportSession`` and populate it by running
-    ``ETLPipelineService.execute(commit=False)`` under the hood.
+    """Persist a fresh ETL-mode session in ``ANALYZING`` state.
 
-    Captures the service's outputs — transformed data, substitutions
-    applied, substitution errors, python/database errors — into the
-    session's ``parsed_payload`` + ``open_issues`` so the operator
-    can review diagnostics without re-uploading.
-
-    Phase 3 issue detection:
-      * ``erp_id_conflict``  — same as template mode, scoped to
-        ``transformed_data['Transaction']``.
-      * ``missing_etl_parameter`` — rule declares auto-JE columns that
-        aren't present in transformed rows.
-      * ETL service errors (python_errors / database_errors /
-        substitution_errors) pass through as ``parsed_payload['etl_errors']``
-        so the frontend's existing error-bucket renderers keep working.
+    Resolves the transformation rule FK (or stores ``None`` if the id
+    doesn't match — the body function will surface that as a terminal
+    ``error``). The rule is persisted on the session so the worker can
+    load it without re-passing ``transformation_rule_id`` through the
+    task signature.
     """
-    from django.core.files.uploadedfile import SimpleUploadedFile
-
     file_hash = hashlib.sha256(file_bytes).hexdigest()
     now = timezone.now()
     cfg = dict(config or {})
+    # Freeze the auto-JE config — passed in ``config`` by the caller
+    # (matches legacy ETL semantics where the config lives in the POST
+    # body, not on the rule). Defaulting to {} means "no auto-JE" which
+    # is the safe default.
+    cfg.setdefault("auto_create_journal_entries", {})
 
     rule = None
     if transformation_rule_id is not None:
@@ -970,13 +1075,7 @@ def analyze_etl(
                 pk=transformation_rule_id, company_id=company_id,
             )
         except ImportTransformationRule.DoesNotExist:
-            rule = None  # surface as a parse-stage error below
-
-    # Freeze the auto-JE config — passed in ``config`` by the caller
-    # (matches legacy ETL semantics where the config lives in the POST
-    # body, not on the rule). Defaulting to {} means "no auto-JE" which
-    # is the safe default.
-    cfg.setdefault("auto_create_journal_entries", {})
+            rule = None  # surface as a lookup-stage error below
 
     session = ImportSession.objects.create(
         company_id=company_id,
@@ -990,20 +1089,50 @@ def analyze_etl(
         config=cfg,
         expires_at=now + SESSION_TTL,
     )
+    # Remember the operator-supplied rule id so the body can distinguish
+    # "rule not found" (terminal error) from "no rule requested" (legal
+    # in some test paths). Stashed in config so it roundtrips through
+    # the Celery worker.
+    if transformation_rule_id is not None and rule is None:
+        session.config = {**cfg, "_requested_rule_id": transformation_rule_id}
+        session.save(update_fields=["config", "updated_at"])
+    return session
 
-    if rule is None and transformation_rule_id is not None:
+
+def _run_analyze_etl(session: ImportSession) -> ImportSession:
+    """Analyze body for an ETL-mode session already in ``ANALYZING``.
+
+    Runs ``ETLPipelineService.execute(commit=False)`` against the
+    persisted file bytes + rule, then layers on the v2 issue detectors
+    and persists the result. Sync and worker callers share this path.
+
+    Unexpected exceptions propagate so the worker wrapper can mark the
+    session as ``error``; known failure modes (rule-not-found, ETL
+    service error) are handled inline.
+    """
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    company_id = session.company_id
+    file_bytes = bytes(session.file_bytes or b"")
+    file_name = session.file_name or "upload.xlsx"
+    cfg = dict(session.config or {})
+
+    rule = session.transformation_rule
+    requested_rule_id = cfg.pop("_requested_rule_id", None)
+    if rule is None and requested_rule_id is not None:
         session.status = ImportSession.STATUS_ERROR
         session.result = {
-            "error": f"transformation rule #{transformation_rule_id} not found for this company",
+            "error": f"transformation rule #{requested_rule_id} not found for this company",
             "stage": "lookup",
         }
-        session.save(update_fields=["status", "result", "updated_at"])
+        session.config = cfg  # strip the internal marker on the persisted config
+        session.save(update_fields=["status", "result", "config", "updated_at"])
         return session
 
     # Build a fresh UploadedFile for ETLPipelineService — it reads the
     # stream + ``.name``. We don't give it the raw bytes directly.
     file_like = SimpleUploadedFile(
-        file_name or "upload.xlsx",
+        file_name,
         file_bytes,
         content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
@@ -1104,9 +1233,78 @@ def analyze_etl(
         session.status = ImportSession.STATUS_AWAITING_RESOLVE
     else:
         session.status = ImportSession.STATUS_READY
+    # Clear the internal requested_rule_id marker if it was still there
+    # (lookup succeeded path).
+    if "_requested_rule_id" in (session.config or {}):
+        session.config = {
+            k: v for k, v in (session.config or {}).items()
+            if k != "_requested_rule_id"
+        }
     session.save(update_fields=[
-        "parsed_payload", "open_issues", "status", "updated_at",
+        "parsed_payload", "open_issues", "status", "config", "updated_at",
     ])
+    return session
+
+
+def analyze_etl(
+    *,
+    company_id: int,
+    user,
+    file_bytes: bytes,
+    file_name: str,
+    transformation_rule_id: Optional[int] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> ImportSession:
+    """Create an ETL-mode ``ImportSession`` and populate it by running
+    ``ETLPipelineService.execute(commit=False)`` under the hood.
+
+    Captures the service's outputs — transformed data, substitutions
+    applied, substitution errors, python/database errors — into the
+    session's ``parsed_payload`` + ``open_issues`` so the operator
+    can review diagnostics without re-uploading.
+
+    Synchronous — runs in-process. The v2 HTTP views use
+    :func:`analyze_etl_async` which hands the body off to Celery.
+
+    Phase 3 issue detection:
+      * ``erp_id_conflict``  — same as template mode, scoped to
+        ``transformed_data['Transaction']``.
+      * ``missing_etl_parameter`` — rule declares auto-JE columns that
+        aren't present in transformed rows.
+      * ETL service errors (python_errors / database_errors /
+        substitution_errors) pass through as ``parsed_payload['etl_errors']``
+        so the frontend's existing error-bucket renderers keep working.
+    """
+    session = _create_etl_session(
+        company_id=company_id, user=user, file_bytes=file_bytes,
+        file_name=file_name, transformation_rule_id=transformation_rule_id,
+        config=config,
+    )
+    return _run_analyze_etl(session)
+
+
+def analyze_etl_async(
+    *,
+    company_id: int,
+    user,
+    file_bytes: bytes,
+    file_name: str,
+    transformation_rule_id: Optional[int] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> ImportSession:
+    """Create the ETL session in ``ANALYZING`` state and enqueue the worker.
+
+    Returns immediately; the frontend polls ``GET /sessions/<id>/``
+    until the session leaves ``analyzing``. Eager mode runs inline.
+    """
+    session = _create_etl_session(
+        company_id=company_id, user=user, file_bytes=file_bytes,
+        file_name=file_name, transformation_rule_id=transformation_rule_id,
+        config=config,
+    )
+    from .tasks import analyze_session_task
+    analyze_session_task.delay(session.pk)
+    session.refresh_from_db()
     return session
 
 

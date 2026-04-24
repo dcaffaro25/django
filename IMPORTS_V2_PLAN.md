@@ -30,7 +30,8 @@ Phase 7 cleanup (burn-in gated) + optional follow-ups.
 | `8d44dd4`   | Phase 5 — Template v2 frontend (toggle + DiagnosticsPanel + 6 issue cards)   |
 | `f253e0f`   | Phase 6 — ETL v2 frontend + ErpIdGroupsSection + serializer.transaction_groups |
 | `1951ff6`   | Phase 6.x — Rule picker dropdown + ETL preview passthrough + AnalyzePreviewPanel |
-| (pending)   | Phase 6.y — Template dry-run at analyze (≤5k rows auto; would_create/update/fail) |
+| `8a2e8d9`   | Phase 6.y — Template dry-run at analyze (≤5k rows auto; would_create/update/fail) |
+| (pending)   | Phase 6.z-a — Async analyze + commit via Celery (24 tests) — **backend shipped** |
 
 **Resolved follow-up — template dry-run.** Phase 6.y shipped the
 missing piece: template analyze now runs `execute_import_job(commit=False)`
@@ -42,6 +43,33 @@ skipped (would double analyze cost on huge imports); operators still
 see sheet-level counts + full diagnostics, just not the bottom-line
 tallies. An explicit "Ver prévia detalhada" button for big files is
 the obvious next iteration if anyone asks for it.
+
+**Phase 6.z-a — async analyze + commit (backend).** Both analyze and
+commit are now handed off to Celery via `.delay()` so gunicorn's 300s
+timeout can't bite on 3-5k-row imports. Split architecture:
+
+  * `services._create_template_session` / `_create_etl_session` — persist
+    the session row in `analyzing` state with `file_bytes` + `config`
+    inlined, so the worker has everything it needs from just the pk.
+  * `services._run_analyze_template` / `_run_analyze_etl` / `_run_commit` —
+    the heavy bodies, moved out of the top-level public functions and
+    callable from either the sync entry point or a Celery worker.
+  * `services.analyze_template_async` / `analyze_etl_async` /
+    `commit_session_async` — create/flip + enqueue + `refresh_from_db`.
+    Views use these.
+  * `multitenancy/imports_v2/tasks.py` — `@shared_task analyze_session_task`
+    + `commit_session_task`. Both bail out if the session left the
+    non-terminal state (dedup on retry) and flip to `error` on
+    unhandled exceptions.
+
+Views return **202 Accepted** now (not 201/200). In eager mode
+(`REDIS_URL` unset — tests + dev) `.delay()` runs inline so the
+returned session is already terminal; production goes through the
+broker and the frontend polls `GET /sessions/<id>/` until status
+leaves `analyzing`/`committing`. The existing 19 regression tests
+plus 8 new `V2AsyncTaskTests` cover task-level edge cases (missing
+pk, status-gating, error translation, mode dispatch). Frontend
+polling hook ships in 6.z-b.
 
 Nothing uncommitted on main. When resuming on a new machine:
 
