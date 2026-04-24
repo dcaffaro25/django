@@ -367,6 +367,76 @@ Upgrade path: if the schedule becomes too dynamic to live in
 definitions into a model. No code changes required on the
 producer/consumer side.
 
+## Editing `railway.json` — safety checklist
+
+⚠️ **Learned the hard way on 2026-04-24.** Railway treats
+`railway.json` as authoritative: whatever `startCommand` you put in
+the file overrides anything set via the dashboard. The repo version
+can silently drift from what's actually deployed if someone tunes
+the command in the dashboard without committing the change back.
+When you merge a `railway.json` edit, Railway re-deploys the
+service with the file's exact command — so a missing flag becomes
+a production regression.
+
+**Before editing any `startCommand` in `railway.json`:**
+
+1. **Copy the current live command from Railway dashboard first.**
+   Services → `<service>` → Settings → Deploy → Start Command. Paste
+   it into the file verbatim, THEN add/remove flags. Never rewrite
+   from memory.
+
+2. **Compare diffs as whole lines, not flag-by-flag.** A dropped
+   `-Q celery,recon_legacy,recon_fast` silently mutes 2 of 3 task
+   queues; a dropped `--autoscale=20,4` caps throughput at default
+   concurrency; a dropped `--timeout 600` on gunicorn cuts HTTP
+   request budget in half.
+
+3. **Flags the current production `web` command includes** (2026-04-24
+   snapshot — verify in dashboard if in doubt):
+   ```
+   python -u manage.py migrate
+     && python -u manage.py ensure_superuser
+     && python -u manage.py collectstatic --noinput
+     && gunicorn nord_backend.wsgi:application
+       --bind 0.0.0.0:$PORT
+       --access-logfile - --error-logfile -
+       --log-level info --capture-output
+       --timeout 600 --keep-alive 30
+       --workers 2 --worker-class gthread --threads 4
+       --max-requests 500 --max-requests-jitter 50
+   ```
+   Key invariants: `python -u` (unbuffered logs), `--bind
+   0.0.0.0:$PORT` (Railway injects `$PORT`), `gthread` worker
+   class + `--threads 4` (8 concurrent requests with 2 workers),
+   `--max-requests 500` (worker recycles before memory bloats).
+
+4. **Flags the current production `worker` command includes**:
+   ```
+   celery -A nord_backend worker --loglevel=INFO
+     -Q celery,recon_legacy,recon_fast
+     --autoscale=20,4
+     -Ofair
+     --prefetch-multiplier=1
+   ```
+   Key invariants: multi-queue consumption (don't drop any of the
+   three), autoscale 4-20, fair scheduling. The prefetch=1 CLI flag
+   is redundant with `nord_backend/celery.py`'s config-level
+   `worker_prefetch_multiplier=1`, but both say 1 so no conflict.
+
+5. **Additive changes are safer than rewrites.** Adding a new
+   service (like Phase 6.z-h's `beat`) doesn't touch the others —
+   leave the existing `startCommand` values byte-identical.
+
+6. **After deploy, verify.** Open the service → Logs and watch the
+   first minute of output to confirm the expected flags loaded
+   (gunicorn prints its worker/thread config, Celery prints its
+   queue subscription). If anything looks different from what you
+   expected, roll back before operator-visible damage accrues.
+
+If you need to *change* a startCommand intentionally (not restore —
+actually modify), take a screenshot of the dashboard field first so
+there's an unambiguous record of the pre-edit state.
+
 Nothing uncommitted on main. When resuming on a new machine:
 
 1. `git pull` on `main`.

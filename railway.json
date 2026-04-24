@@ -7,7 +7,7 @@
     "workloads": [
       {
         "name": "web",
-        "startCommand": "python manage.py migrate && python manage.py ensure_superuser && python manage.py collectstatic --noinput && gunicorn nord_backend.wsgi --timeout 300 --graceful-timeout 30"
+        "startCommand": "python -u manage.py migrate && python -u manage.py ensure_superuser && python -u manage.py collectstatic --noinput && gunicorn nord_backend.wsgi:application --bind 0.0.0.0:$PORT --access-logfile - --error-logfile - --log-level info --capture-output --timeout 600 --keep-alive 30 --workers 2 --worker-class gthread --threads 4 --max-requests 500 --max-requests-jitter 50"
       },
       {
         "name": "worker",
