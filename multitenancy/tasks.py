@@ -47,12 +47,35 @@ logger.setLevel(
 # Email helpers (kept)
 # --------------------------------------------------------------------------------------
 
-@shared_task(bind=True, autoretry_for=(smtplib.SMTPException, ConnectionError), retry_backoff=True, max_retries=5)
+# Retry policy notes (Phase 6.z-h):
+#
+# Transient errors (SMTP temp failure, DNS hiccup, TCP reset) → retry
+# with bounded backoff. Permanent errors (auth failure, malformed
+# recipient, encoding issues) should NOT retry — 5 retries × backoff
+# of bare Exception used to tie up workers for 30+ minutes per
+# bad email during an outage.
+#
+# ``retry_backoff`` takes a seconds value now (was ``True`` = 1, which
+# multiplied to 1,2,4,8,16s — too fast for SMTP). ``retry_backoff_max``
+# caps the wait. ``retry_jitter`` randomises slightly so 100 emails
+# failing at once don't all retry in lockstep.
+_EMAIL_RETRY_KWARGS = dict(
+    autoretry_for=(smtplib.SMTPException, ConnectionError, TimeoutError, OSError),
+    retry_backoff=60,
+    retry_backoff_max=600,
+    retry_jitter=True,
+    max_retries=3,
+    time_limit=120,        # kill an email task after 2 min
+    soft_time_limit=90,    # let the send() see the timeout first
+)
+
+
+@shared_task(bind=True, **_EMAIL_RETRY_KWARGS)
 def send_user_invite_email(self, subject: str, message: str, to_email: str):
     send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, [to_email], fail_silently=False)
 
 
-@shared_task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=5)
+@shared_task(bind=True, **_EMAIL_RETRY_KWARGS)
 def send_user_email(self, subject: str, message: str, to_email: str):
     send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, [to_email], fail_silently=False)
 

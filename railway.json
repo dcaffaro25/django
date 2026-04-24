@@ -11,7 +11,11 @@
       },
       {
         "name": "worker",
-        "startCommand": "celery -A nord_backend worker --loglevel=INFO --concurrency=2"
+        "startCommand": "celery -A nord_backend worker --loglevel=INFO --concurrency=2 -Ofair"
+      },
+      {
+        "name": "beat",
+        "startCommand": "celery -A nord_backend beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule"
       }
     ]
   }
