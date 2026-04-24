@@ -26,6 +26,7 @@ import type {
 } from "@/features/imports/types"
 import { DiagnosticsPanel } from "@/components/imports/DiagnosticsPanel"
 import { ErpIdGroupsSection } from "@/components/imports/ErpIdGroupsSection"
+import { TransformationRuleSelect } from "@/components/imports/TransformationRuleSelect"
 import { cn } from "@/lib/utils"
 
 type Bucket = "python" | "database" | "substitution" | "warnings"
@@ -548,20 +549,17 @@ export function EtlImportPage() {
           </div>
         ) : (
           <div className="space-y-3">
+            <label className="flex flex-col gap-1">
+              <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                Regra de transformação
+              </span>
+              <TransformationRuleSelect
+                value={v2RuleId}
+                onChange={setV2RuleId}
+                disabled={v2Pending != null || (v2Session != null && !v2Session.is_terminal)}
+              />
+            </label>
             <div className="flex flex-wrap items-end gap-3">
-              <label className="flex flex-col gap-1">
-                <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                  transformation_rule_id
-                </span>
-                <input
-                  type="number"
-                  min={1}
-                  placeholder="ex. 12"
-                  value={v2RuleId}
-                  onChange={(e) => setV2RuleId(e.target.value)}
-                  className="h-8 w-28 rounded-md border border-border bg-background px-2 text-[13px] outline-none focus:border-ring"
-                />
-              </label>
               <label className="flex flex-col gap-1">
                 <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
                   Row limit (0 = todas)
@@ -575,13 +573,6 @@ export function EtlImportPage() {
                   className="h-8 w-28 rounded-md border border-border bg-background px-2 text-[13px] outline-none focus:border-ring"
                 />
               </label>
-              <Link
-                to="/imports/etl-rules"
-                className="inline-flex h-8 items-center gap-1 self-end rounded-md border border-border bg-background px-2.5 text-[11px] font-medium text-muted-foreground hover:bg-accent"
-                title="Abre a tela de regras de transformação para descobrir o ID."
-              >
-                Ver regras
-              </Link>
             </div>
             <label className="flex flex-col gap-1">
               <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">

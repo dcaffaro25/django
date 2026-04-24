@@ -7,6 +7,7 @@ import {
   ChevronRight,
   Info,
 } from "lucide-react"
+import { AnalyzePreviewPanel } from "./AnalyzePreviewPanel"
 import { SubstitutionAppliedBadge } from "./SubstitutionAppliedBadge"
 import { IssueCardErpIdConflict } from "./IssueCardErpIdConflict"
 import { IssueCardUnmatchedReference } from "./IssueCardUnmatchedReference"
@@ -118,6 +119,13 @@ export function DiagnosticsPanel({
           </button>
         )}
       </div>
+
+      {/* Import preview — what commit will write. Renders null when
+          the backend didn't populate preview counts (template mode
+          today; ETL mode always has them after Phase 6.x). Placed
+          before substitutions so the operator sees the bottom line
+          first. */}
+      <AnalyzePreviewPanel preview={session.preview} />
 
       {/* Substitutions applied — only shown if any. */}
       {subs.length > 0 && (

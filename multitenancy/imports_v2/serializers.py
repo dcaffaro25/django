@@ -28,6 +28,7 @@ class ImportSessionSerializer(serializers.ModelSerializer):
     substitutions_applied = serializers.SerializerMethodField()
     summary = serializers.SerializerMethodField()
     transaction_groups = serializers.SerializerMethodField()
+    preview = serializers.SerializerMethodField()
 
     class Meta:
         model = ImportSession
@@ -52,6 +53,7 @@ class ImportSessionSerializer(serializers.ModelSerializer):
             "is_terminal",
             "substitutions_applied",
             "transaction_groups",
+            "preview",
         )
         read_only_fields = fields
 
@@ -152,3 +154,24 @@ class ImportSessionSerializer(serializers.ModelSerializer):
             g["row_count"] += 1
             g["rows"].append(row)
         return list(groups.values())
+
+    def get_preview(self, obj):
+        """Dry-run counts from the analyze phase.
+
+        For ETL sessions: ``ETLPipelineService.execute(commit=False)``
+        already computes ``would_create`` / ``would_fail`` /
+        ``total_rows`` — we surface them here for the frontend's
+        "Prévia da importação" panel.
+
+        For template sessions: empty dict (we don't run a commit=False
+        dry-run at analyze yet — that's a follow-up commit; running
+        execute_import_job twice per session doubles analyze cost on
+        large imports, so it needs its own design pass).
+
+        Backward compatible: a session created before this field existed
+        reads as an empty dict.
+        """
+        preview = (obj.parsed_payload or {}).get("preview")
+        if isinstance(preview, dict):
+            return preview
+        return {}
