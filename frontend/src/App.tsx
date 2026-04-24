@@ -27,6 +27,7 @@ import { ViewPage as ReportsViewPage } from "@/pages/reports/ViewPage"
 import { AiUsagePage } from "@/pages/settings/AiUsagePage"
 import { AdminHomePage } from "@/pages/admin/AdminHomePage"
 import { UsersPage as AdminUsersPage } from "@/pages/admin/UsersPage"
+import { RuntimePage as AdminRuntimePage } from "@/pages/admin/RuntimePage"
 import { SuperuserGuard } from "@/pages/admin/SuperuserGuard"
 import { ActivityHeatmapPage } from "@/pages/admin/activity/ActivityHeatmapPage"
 import { ActivityUserDetailPage } from "@/pages/admin/activity/ActivityUserDetailPage"
@@ -96,6 +97,7 @@ export default function App() {
                   <Route path="/admin/activity/errors" element={<SuperuserGuard><AdminErrorsPage /></SuperuserGuard>} />
                   <Route path="/admin/activity/users/:id" element={<SuperuserGuard><ActivityUserDetailPage /></SuperuserGuard>} />
                   <Route path="/admin/activity/areas/:id" element={<SuperuserGuard><ActivityAreaDetailPage /></SuperuserGuard>} />
+                  <Route path="/admin/runtime" element={<SuperuserGuard><AdminRuntimePage /></SuperuserGuard>} />
                   <Route path="/admin/*" element={<SuperuserGuard><AdminHomePage /></SuperuserGuard>} />
                   <Route path="*" element={<Navigate to="/recon" replace />} />
                 </Routes>

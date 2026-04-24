@@ -107,17 +107,31 @@ def _collect_report(*, queues: List[str], inspect_timeout: float) -> Dict[str, A
     active: Dict[str, Any] = {}
     reserved: Dict[str, Any] = {}
     scheduled: Dict[str, Any] = {}
+    # Phase 6.z-h+: also pull the worker's queue subscription + pool
+    # stats so operators can confirm the running process matches the
+    # expected startCommand flags (e.g. ``-Q celery,recon_legacy,recon_fast
+    # --autoscale=20,4``).
+    active_queues_by_worker: Dict[str, Any] = {}
+    stats_by_worker: Dict[str, Any] = {}
     try:
         inspect = celery_app.control.inspect(timeout=inspect_timeout)
         active = inspect.active() or {}
         reserved = inspect.reserved() or {}
         scheduled = inspect.scheduled() or {}
+        active_queues_by_worker = inspect.active_queues() or {}
+        stats_by_worker = inspect.stats() or {}
     except Exception as exc:
         report["warnings"].append(
             f"worker inspect failed (broker unreachable?): {exc}"
         )
 
-    worker_names = set(active) | set(reserved) | set(scheduled)
+    worker_names = (
+        set(active)
+        | set(reserved)
+        | set(scheduled)
+        | set(active_queues_by_worker)
+        | set(stats_by_worker)
+    )
     if not worker_names:
         report["warnings"].append(
             "no workers responded within timeout - either none are running "
@@ -128,10 +142,24 @@ def _collect_report(*, queues: List[str], inspect_timeout: float) -> Dict[str, A
         w_active = active.get(name, []) or []
         w_reserved = reserved.get(name, []) or []
         w_scheduled = scheduled.get(name, []) or []
+        queues = active_queues_by_worker.get(name, []) or []
+        stats = stats_by_worker.get(name, {}) or {}
+        pool = stats.get("pool", {}) or {}
         report["workers"][name] = {
             "active": [_task_brief(t) for t in w_active],
             "reserved": [_task_brief(t) for t in w_reserved],
             "scheduled": [_task_brief(t) for t in w_scheduled],
+            # Startup flags reflected at runtime — use these to verify
+            # the worker's -Q, --autoscale, --prefetch-multiplier match
+            # your railway.json / dashboard expectations.
+            "queues_subscribed": [
+                q.get("name") for q in queues if isinstance(q, dict)
+            ],
+            "pool_max_concurrency": pool.get("max-concurrency"),
+            "pool_processes": pool.get("processes"),
+            "prefetch_count": stats.get("prefetch_count"),
+            "uptime_seconds": stats.get("uptime"),
+            "total_tasks_processed": stats.get("total"),
         }
         report["totals"]["active"] += len(w_active)
         report["totals"]["reserved"] += len(w_reserved)
@@ -205,6 +233,22 @@ def _render_human(stdout, report: Dict[str, Any]) -> None:
 
     for name, lanes in (report["workers"] or {}).items():
         stdout.write(f"\n  * {name}")
+        # Runtime flag reflection — verify what's actually running.
+        queues = lanes.get("queues_subscribed") or []
+        pool_max = lanes.get("pool_max_concurrency")
+        prefetch = lanes.get("prefetch_count")
+        uptime = lanes.get("uptime_seconds")
+        total = lanes.get("total_tasks_processed")
+        if queues:
+            stdout.write(f"      queues:       {','.join(queues)}")
+        if pool_max is not None:
+            stdout.write(f"      pool_max:     {pool_max}")
+        if prefetch is not None:
+            stdout.write(f"      prefetch:     {prefetch}")
+        if uptime is not None:
+            stdout.write(f"      uptime_s:     {uptime}")
+        if total is not None:
+            stdout.write(f"      total_tasks:  {total}")
         for lane in ("active", "reserved", "scheduled"):
             tasks = lanes.get(lane) or []
             if not tasks:
@@ -215,7 +259,7 @@ def _render_human(stdout, report: Dict[str, Any]) -> None:
                     f"        - {t.get('name')} id={t.get('id')} pid={t.get('worker_pid')}"
                 )
             if len(tasks) > 10:
-                stdout.write(f"        … and {len(tasks) - 10} more")
+                stdout.write(f"        ... and {len(tasks) - 10} more")
 
     h("Stale v2 import sessions (non-terminal past hard limit)")
     stale = report.get("stale_import_sessions") or {}
