@@ -11,12 +11,19 @@ import {
   ofxScan,
   substitutionRulesApi,
   type EtlExecuteParams,
+  type ImportsV2ListParams,
 } from "./api"
 import type {
   ImportSession,
   ImportSessionStatus,
+  ImportSessionSummary,
+  Paginated,
   SubstitutionRule,
 } from "./types"
+
+// Re-export the list-params type so pages can import it from
+// ``@/features/imports`` without reaching into ``./api``.
+export type { ImportsV2ListParams } from "./api"
 
 function useSub() {
   const { tenant } = useTenant()
@@ -93,6 +100,93 @@ export function useDeleteSubstitutionRule() {
     mutationFn: (id: number) => substitutionRulesApi.remove(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.substRules(sub) }),
   })
+}
+
+// ---- v2 queue + badge (Phase 6.z-b) ------------------------------------
+
+const qkQueue = {
+  runningCount: (s: string) => ["imports", s, "v2", "running-count"] as const,
+  sessionsList: (s: string, params: ImportsV2ListParams) =>
+    ["imports", s, "v2", "sessions-list", params] as const,
+}
+
+/**
+ * Poll the ``running-count`` aggregate for the sidebar badge.
+ *
+ * Mounted globally by the sidebar — one timer for the whole app, so
+ * we stay kind to the server. Polls every 10s by default; React
+ * Query pauses the interval when the tab is backgrounded (``refetchIntervalInBackground: false``).
+ *
+ * The count covers all non-terminal sessions: ``analyzing`` +
+ * ``committing`` + ``awaiting_resolve``. Separate buckets let the
+ * sidebar switch dot colour (red when any row wants resolution,
+ * amber when only background work is pending).
+ */
+export function useRunningImportCount(options?: { intervalMs?: number }) {
+  const sub = useSub()
+  const intervalMs = options?.intervalMs ?? 10_000
+  return useQuery({
+    queryKey: qkQueue.runningCount(sub),
+    // Either namespace returns the same aggregate; template is the
+    // arbitrary canonical choice.
+    queryFn: () => importsV2.template.runningCount(),
+    enabled: !!sub,
+    refetchInterval: intervalMs,
+    refetchIntervalInBackground: false,
+    // Cheap enough that staleness doesn't matter — always trust the
+    // latest tick.
+    staleTime: 0,
+  })
+}
+
+/**
+ * Paginated queue list for the Imports hub panel.
+ *
+ * Auto-refreshes every ``activeIntervalMs`` while any row is still
+ * running (``analyzing`` / ``committing`` / ``awaiting_resolve``).
+ * When all rows are terminal, backs off to ``idleIntervalMs`` so we
+ * don't thrash the API. The dynamic interval is computed from the
+ * data itself — no separate "is anything running" query.
+ */
+export function useImportSessionsList(
+  params: ImportsV2ListParams = {},
+  options?: { activeIntervalMs?: number; idleIntervalMs?: number },
+) {
+  const sub = useSub()
+  const activeIntervalMs = options?.activeIntervalMs ?? 3_000
+  const idleIntervalMs = options?.idleIntervalMs ?? 15_000
+
+  return useQuery<Paginated<ImportSessionSummary>>({
+    queryKey: qkQueue.sessionsList(sub, params),
+    queryFn: () => importsV2.template.listSessions(params),
+    enabled: !!sub,
+    refetchInterval: (query) => {
+      const data = query.state.data
+      if (!data) return activeIntervalMs
+      const hasRunning = data.results.some(
+        (r) =>
+          r.status === "analyzing" ||
+          r.status === "committing" ||
+          r.status === "awaiting_resolve",
+      )
+      return hasRunning ? activeIntervalMs : idleIntervalMs
+    },
+    refetchIntervalInBackground: false,
+    staleTime: 0,
+  })
+}
+
+/**
+ * Helper for host pages that just mutated queue state (e.g. "user
+ * uploaded a new file"). Invalidates both the list and the badge
+ * count so the UI updates before the next tick.
+ */
+export function useInvalidateImportQueue() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useCallback(() => {
+    qc.invalidateQueries({ queryKey: ["imports", sub, "v2"] })
+  }, [qc, sub])
 }
 
 // ---- v2 async session polling ------------------------------------------

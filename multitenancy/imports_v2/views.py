@@ -25,8 +25,10 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from django.conf import settings
+from django.db.models import Count
 from django.shortcuts import get_object_or_404
 from rest_framework import permissions, status
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -36,7 +38,7 @@ from multitenancy.views import _resolve_bulk_import_company_id
 
 from . import services
 from .resolve_handlers import ResolutionError
-from .serializers import ImportSessionSerializer
+from .serializers import ImportSessionListSerializer, ImportSessionSerializer
 
 
 def _perms():
@@ -364,3 +366,112 @@ class CommitSessionView(APIView):
             ImportSessionSerializer(session).data,
             status=status.HTTP_202_ACCEPTED,
         )
+
+
+class _ImportSessionListPagination(PageNumberPagination):
+    """Default page_size 25, clamp to 100 so the queue doesn't pull a
+    huge slab into memory on badly-behaved clients."""
+    page_size = 25
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
+class ImportSessionListView(APIView):
+    """``GET /api/core/imports/v2/sessions/`` (and ``/api/core/etl/v2/sessions/``)
+
+    Paginated list of v2 sessions scoped to the request's tenant.
+    Drives the queue panel on the Imports hub page (Phase 6.z-b).
+
+    Query params:
+      * ``status=analyzing,committing`` — comma-separated whitelist.
+      * ``mode=template|etl`` — filter by mode.
+      * ``page_size=N`` — up to ``_ImportSessionListPagination.max_page_size``.
+
+    Returns the DRF-paginated shape: ``{count, next, previous, results}``.
+    Each result is shaped by :class:`ImportSessionListSerializer` —
+    deliberately lightweight (no ``parsed_payload`` / ``open_issues``
+    / ``result``, which can be multi-MB per row).
+
+    Cross-tenant sessions are invisible (not 403) — matches the detail
+    endpoint's contract.
+    """
+
+    def get_permissions(self):
+        return _perms()
+
+    def get(self, request, tenant_id: Optional[int] = None) -> Response:
+        company_id, err = _resolve_bulk_import_company_id(request)
+        if err is not None:
+            return err
+
+        qs = ImportSession.objects.all().select_related(
+            "created_by", "transformation_rule",
+        )
+        if company_id is not None:
+            qs = qs.filter(company_id=company_id)
+
+        status_raw = request.GET.get("status")
+        if status_raw:
+            valid = {s for s, _ in ImportSession.STATUS_CHOICES}
+            requested = [
+                s.strip() for s in status_raw.split(",") if s.strip() in valid
+            ]
+            if requested:
+                qs = qs.filter(status__in=requested)
+
+        mode = request.GET.get("mode")
+        if mode in {ImportSession.MODE_TEMPLATE, ImportSession.MODE_ETL}:
+            qs = qs.filter(mode=mode)
+
+        # Newest first — that's the interesting end for the queue.
+        qs = qs.order_by("-created_at")
+
+        paginator = _ImportSessionListPagination()
+        page = paginator.paginate_queryset(qs, request, view=self)
+        serializer = ImportSessionListSerializer(page, many=True)
+        return paginator.get_paginated_response(serializer.data)
+
+
+class ImportSessionRunningCountView(APIView):
+    """``GET /api/core/imports/v2/sessions/running-count/``
+
+    Single aggregate used by the sidebar badge — polls this every
+    ~10s while the sidebar is mounted. Returns per-status counts of
+    non-terminal sessions (``analyzing``, ``committing``,
+    ``awaiting_resolve``) plus a ``total`` convenience field.
+
+    One ``GROUP BY status`` query, index-backed by
+    ``company,status,-created_at``. Stays fast with tens of thousands
+    of historical sessions because the filter+index keep the scan
+    bounded to the few dozen non-terminal rows.
+    """
+
+    def get_permissions(self):
+        return _perms()
+
+    def get(self, request, tenant_id: Optional[int] = None) -> Response:
+        company_id, err = _resolve_bulk_import_company_id(request)
+        if err is not None:
+            return err
+
+        qs = ImportSession.objects.all()
+        if company_id is not None:
+            qs = qs.filter(company_id=company_id)
+
+        running_statuses = [
+            ImportSession.STATUS_ANALYZING,
+            ImportSession.STATUS_COMMITTING,
+            ImportSession.STATUS_AWAITING_RESOLVE,
+        ]
+        qs = qs.filter(status__in=running_statuses)
+
+        buckets = dict(
+            qs.values("status").annotate(n=Count("id")).values_list("status", "n")
+        )
+        payload = {
+            "analyzing": buckets.get(ImportSession.STATUS_ANALYZING, 0),
+            "committing": buckets.get(ImportSession.STATUS_COMMITTING, 0),
+            "awaiting_resolve": buckets.get(ImportSession.STATUS_AWAITING_RESOLVE, 0),
+        }
+        payload["total"] = sum(payload.values())
+        return Response(payload)

@@ -19,5 +19,10 @@ urlpatterns = [
     path("analyze/", views.AnalyzeTemplateImportView.as_view(), name="analyze-template"),
     path("commit/<int:pk>/", views.CommitSessionView.as_view(), name="commit"),
     path("resolve/<int:pk>/", views.ResolveSessionView.as_view(), name="resolve"),
+    # Static routes BEFORE the pk route so /running-count/ isn't swallowed.
+    # ``<int:pk>`` wouldn't match a string anyway, but order-first makes
+    # intent obvious to anyone reading the file.
+    path("sessions/running-count/", views.ImportSessionRunningCountView.as_view(), name="sessions-running-count"),
+    path("sessions/", views.ImportSessionListView.as_view(), name="sessions-list"),
     path("sessions/<int:pk>/", views.ImportSessionDetailView.as_view(), name="session-detail"),
 ]

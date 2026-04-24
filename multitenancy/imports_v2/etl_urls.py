@@ -18,5 +18,8 @@ urlpatterns = [
     path("analyze/", views.AnalyzeETLImportView.as_view(), name="analyze-etl"),
     path("commit/<int:pk>/", views.CommitSessionView.as_view(), name="commit"),
     path("resolve/<int:pk>/", views.ResolveSessionView.as_view(), name="resolve"),
+    # Static routes BEFORE the pk route — see template_urls.py for why.
+    path("sessions/running-count/", views.ImportSessionRunningCountView.as_view(), name="sessions-running-count"),
+    path("sessions/", views.ImportSessionListView.as_view(), name="sessions-list"),
     path("sessions/<int:pk>/", views.ImportSessionDetailView.as_view(), name="session-detail"),
 ]

@@ -357,3 +357,47 @@ export interface ImportResolutionInput {
   action: ImportResolveAction | string
   params?: Record<string, unknown>
 }
+
+/**
+ * Lightweight session row returned by GET /v2/sessions/ (Phase 6.z-b).
+ * Backend's ImportSessionListSerializer deliberately omits
+ * parsed_payload / open_issues / result — the queue table only needs
+ * identification + a status chip + the operator name. Clicking a
+ * row to expand it fetches the full ImportSession via the detail
+ * endpoint.
+ */
+export interface ImportSessionSummary {
+  id: number
+  mode: ImportSessionMode
+  status: ImportSessionStatus
+  file_name: string
+  file_hash: string | null
+  created_at: string
+  updated_at: string
+  committed_at: string | null
+  operator_name: string | null
+  open_issue_count: number
+  is_terminal: boolean
+  transformation_rule_name: string | null
+}
+
+/** DRF PageNumberPagination shape. */
+export interface Paginated<T> {
+  count: number
+  next: string | null
+  previous: string | null
+  results: T[]
+}
+
+/**
+ * Counts of non-terminal sessions, driving the sidebar badge. ``total``
+ * is the sum of the three buckets — exposed separately so the frontend
+ * can switch the dot colour (red when any ``awaiting_resolve`` wants
+ * attention, amber when only background work is in flight).
+ */
+export interface ImportSessionRunningCount {
+  analyzing: number
+  committing: number
+  awaiting_resolve: number
+  total: number
+}

@@ -31,7 +31,9 @@ Phase 7 cleanup (burn-in gated) + optional follow-ups.
 | `f253e0f`   | Phase 6 — ETL v2 frontend + ErpIdGroupsSection + serializer.transaction_groups |
 | `1951ff6`   | Phase 6.x — Rule picker dropdown + ETL preview passthrough + AnalyzePreviewPanel |
 | `8a2e8d9`   | Phase 6.y — Template dry-run at analyze (≤5k rows auto; would_create/update/fail) |
-| (pending)   | Phase 6.z-a — Async analyze + commit via Celery (24 tests) — **backend shipped** |
+| `6bf433e`   | Phase 6.z-a — Async analyze + commit via Celery (backend + frontend polling) |
+| (pending)   | Phase 6.z-b — Queue panel + sidebar badge + list/running-count endpoints (9 tests) |
+| (pending)   | Phase 6.z-c — Inline session-detail view on queue row click + ?session deep-link |
 
 **Resolved follow-up — template dry-run.** Phase 6.y shipped the
 missing piece: template analyze now runs `execute_import_job(commit=False)`
@@ -70,6 +72,58 @@ leaves `analyzing`/`committing`. The existing 19 regression tests
 plus 8 new `V2AsyncTaskTests` cover task-level edge cases (missing
 pk, status-gating, error translation, mode dispatch). Frontend
 polling hook ships in 6.z-b.
+
+**Phase 6.z-b — queue panel + sidebar badge.** The Imports hub page
+now renders a live queue panel below the upload tabs showing the
+last N sessions for the current tenant. Two new backend endpoints
+back it:
+
+  * `GET /api/core/imports/v2/sessions/` — paginated lightweight list
+    (`ImportSessionListSerializer` — no `parsed_payload`/`open_issues`
+    /`result` in the payload so a queue of 25 stays tiny). Filters:
+    `?status=analyzing,committing` (comma-separated whitelist),
+    `?mode=template|etl`, `?page_size=N` (≤100).
+  * `GET /api/core/imports/v2/sessions/running-count/` — single
+    `GROUP BY status` aggregate for the sidebar badge. Returns
+    `{analyzing, committing, awaiting_resolve, total}`.
+
+Frontend pieces:
+
+  * `useImportSessionsList` — TanStack Query hook with dynamic
+    refetch interval (3s while any row is running; 15s when all
+    terminal).
+  * `useRunningImportCount` — polls every 10s globally; pauses when
+    the tab is backgrounded.
+  * `ImportQueuePanel` — table with status chip, relative timestamp,
+    operator name, issue count. Rows are clickable (wired for 6.z-c).
+  * `ImportsRunningBadge` — sidebar pill next to "Importar arquivos"
+    and "Templates". Red dot when `awaiting_resolve > 0`, amber
+    otherwise. Collapsed sidebar shows a dot on the icon instead of
+    the number.
+
+9 new tests in `V2SessionsListEndpointTests` cover tenant scoping,
+filter parsing, ordering, the lightweight payload shape, and the
+bucketed count. All green.
+
+**Phase 6.z-c — inline session-detail view.** Clicking a queue row
+expands it into a read-only `SessionDetailView` rendered below the
+queue:
+
+  * Auto-refetches every 2s while the session is non-terminal so an
+    operator opening a mid-run session sees progress live.
+  * Reuses the existing `DiagnosticsPanel` (showing the worker-busy
+    state for in-flight sessions, diagnostics for awaiting_resolve,
+    results for committed).
+  * Adds a `Resultado bruto (JSON)` collapsible for troubleshooting.
+  * Close button clears the URL query param.
+
+Deep-linking via `?tab=<tab>&session=<id>` — operators can share the
+URL of an import in triage. Garbage values (non-numeric) are
+ignored so a malformed link doesn't crash the page.
+
+Read-only for this pass: resolve/commit still happen on the upload
+page. A future iteration can lift those handlers into the queue
+detail view so operators drive the full flow from one place.
 
 Nothing uncommitted on main. When resuming on a new machine:
 
