@@ -47,6 +47,11 @@ urlpatterns = [
     # username/password SPA login flow. The client sends it back as
     # Authorization: Token <key>, which DRF TokenAuthentication parses.
     re_path(r'^api/token/?$', obtain_auth_token, name='obtain_auth_token'),
+    # GET /api/auth/me/ → authenticated user's profile. The SPA's
+    # AuthProvider calls this after login and on reload. Without it
+    # the frontend fell back to a ``{username: "dev"}`` placeholder
+    # and the superuser gate broke for real admins.
+    re_path(r'^api/auth/me/?$', views.CurrentUserView.as_view(), name='current_user'),
     # SimpleJWT endpoints retained but not used by the SPA (other clients may).
     re_path(r'^api/jwt/?$', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     re_path(r'^api/jwt/refresh/?$', TokenRefreshView.as_view(), name='token_refresh'),

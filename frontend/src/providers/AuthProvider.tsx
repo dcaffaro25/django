@@ -4,7 +4,13 @@ import { api, getStoredToken, setStoredToken } from "@/lib/api-client"
 export interface User {
   id: number
   username: string
-  email?: string
+  email?: string | null
+  first_name?: string
+  last_name?: string
+  /** Server-provided "display name" — full name if set, else username.
+   *  Falls back to ``username`` when the backend is older and doesn't
+   *  return it. */
+  display_name?: string
   is_superuser?: boolean
   is_staff?: boolean
 }
@@ -35,25 +41,50 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const fetchProfile = useCallback(async () => {
     try {
-      // Preferred: DRF auth/me endpoint is common; fall back to inspecting token.
+      // /api/auth/me/ is the canonical profile source (backend
+      // CurrentUserView). A null result here means the token is
+      // invalid, the endpoint is down, or the network failed —
+      // either way we CANNOT grant a synthetic identity because
+      // that broke ``SuperuserGuard`` (the old ``{username: "dev"}``
+      // placeholder had no ``is_superuser`` field, so real admins
+      // hit "Área restrita" while unauth'd users saw "dev" in the
+      // header). If we can't confirm who we are, log the user out
+      // so the login screen handles re-auth deterministically.
       const me = await api.get<User>("/api/auth/me/").catch(() => null)
-      if (me) {
+      if (me && me.id) {
         setUser(me)
         localStorage.setItem(USER_KEY, JSON.stringify(me))
         return
       }
-      // If /api/auth/me/ not available, stash a placeholder so the UI can render.
-      const placeholder: User = { id: 0, username: "dev" }
-      setUser(placeholder)
-      localStorage.setItem(USER_KEY, JSON.stringify(placeholder))
+      // Couldn't confirm identity → clear token so the UI routes
+      // to /login. Prevents a ghost session with no real user.
+      setStoredToken(null)
+      setToken(null)
+      setUser(null)
+      localStorage.removeItem(USER_KEY)
     } catch {
-      // Silent — UI handles unauthenticated state via token presence.
+      setStoredToken(null)
+      setToken(null)
+      setUser(null)
+      localStorage.removeItem(USER_KEY)
     }
   }, [])
 
   useEffect(() => {
-    if (token && !user) void fetchProfile()
-  }, [token, user, fetchProfile])
+    // Always re-verify against ``/api/auth/me/`` on mount when a
+    // token is present, even if we have a cached ``user``. Rationale:
+    //   1. The cached payload may be stale if the backend's User
+    //      model gained new fields (e.g. ``is_superuser`` landing on
+    //      an already-logged-in session).
+    //   2. An earlier build shipped a bogus ``{username: "dev"}``
+    //      placeholder when /api/auth/me/ 404s; those stale blobs
+    //      are still in user localStorage. Re-verifying on every
+    //      mount pulls the real user + self-heals the cache.
+    //   3. If the token was revoked server-side, the refetch 401s
+    //      and ``fetchProfile`` logs us out — deterministic.
+    if (token) void fetchProfile()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token])
 
   const loginWithToken = useCallback(async (t: string) => {
     setStoredToken(t)
