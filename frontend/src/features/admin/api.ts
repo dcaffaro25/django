@@ -100,6 +100,16 @@ export const adminApi = {
   ledgerIntegrity: () =>
     api.get<LedgerIntegrityResponse>("/api/admin/integrity/ledger/"),
 
+  /** GET /api/admin/runtime/ — snapshot of what the web service
+   *  picked up at boot + remote-inspect of every live Celery
+   *  worker. Powers /admin/runtime. */
+  runtimeConfig: (extras?: { queues?: string[]; inspectTimeout?: number }) => {
+    const params: Record<string, string | number | string[]> = {}
+    if (extras?.queues?.length) params.queue = extras.queues
+    if (extras?.inspectTimeout != null) params.inspect_timeout = extras.inspectTimeout
+    return api.get<RuntimeConfigResponse>("/api/admin/runtime/", { params })
+  },
+
   /** POST /api/admin/activity/digest/run/ — run the weekly digest
    *  synchronously. ``dry_run=true`` returns stats without
    *  emailing; useful for "show me what would be sent". */
@@ -341,4 +351,87 @@ export interface LedgerIntegrityResponse {
   total: number
   imbalance_sum: string
   by_company: LedgerIntegrityRow[]
+}
+
+
+// ---- Runtime config (GET /api/admin/runtime/) ----------------------------
+
+export interface RuntimeProcessInfo {
+  pid: number
+  hostname: string
+  python_version: string
+  django_version: string
+  celery_version: string | null
+  argv: string[]
+  parent_argv?: string[]
+  executable: string
+  env: Record<string, string>
+}
+
+export interface RuntimeDjangoInfo {
+  settings_module: string | null
+  DEBUG: boolean
+  ALLOWED_HOSTS: string[]
+  TIME_ZONE: string | null
+  USE_TZ: boolean | null
+  LANGUAGE_CODE: string | null
+  DATABASES: Record<
+    string,
+    { ENGINE?: string; NAME?: string; HOST?: string; PORT?: string | number }
+  >
+  CELERY_BROKER_URL: string
+  CELERY_RESULT_BACKEND: string
+  CELERY_TASK_TIME_LIMIT: number | null
+  CELERY_TASK_SOFT_TIME_LIMIT: number | null
+  CELERY_TASK_ALWAYS_EAGER: boolean
+}
+
+export interface RuntimeCeleryLocal {
+  [key: string]: unknown
+}
+
+export interface RuntimeBeatEntry {
+  task: string
+  schedule: string
+  options?: Record<string, unknown>
+  kwargs?: Record<string, unknown>
+}
+
+export interface RuntimeWorkerInfo {
+  queues_subscribed: string[]
+  pool_processes?: number | null
+  pool_size_min?: number | null
+  prefetch_count?: number | null
+  total_tasks?: number | null
+  uptime_seconds?: number | null
+  broker_connect_timeout?: number | null
+  rusage?: Record<string, unknown>
+}
+
+export interface RuntimeCeleryWorkers {
+  workers: Record<string, RuntimeWorkerInfo>
+  warnings: string[]
+  error?: string
+}
+
+export interface RuntimeRedisQueues {
+  depths: Record<string, number | null>
+  error: string | null
+}
+
+export interface RuntimeStaleImportSessions {
+  count: number | null
+  oldest_pks: number[]
+  hard_limit_seconds?: number
+  error?: string
+}
+
+export interface RuntimeConfigResponse {
+  process: RuntimeProcessInfo
+  django: RuntimeDjangoInfo
+  celery_local: RuntimeCeleryLocal
+  beat_schedule: Record<string, RuntimeBeatEntry>
+  celery_workers: RuntimeCeleryWorkers
+  redis_queues: RuntimeRedisQueues
+  stale_import_sessions: RuntimeStaleImportSessions
 }

@@ -24,6 +24,7 @@ from core.views_activity import (
     AdminErrorReportDetailView,
     AdminLedgerIntegrityView,
 )
+from core.views_runtime import AdminRuntimeConfigView
 from .views import JobStatusView, JobListView, JobCancelView, TutorialView
 from .task_views import (
     TaskListView, TaskDetailView, TaskStopView,
@@ -65,6 +66,10 @@ urlpatterns = [
     # Accounting integrity: PR 8's canary. Surfaces how many
     # Transactions still have the pre-PR-8 missing-cash-leg bug.
     path("api/admin/integrity/ledger/", AdminLedgerIntegrityView.as_view(), name="admin-ledger-integrity"),
+    # Runtime config inspection (Phase 6.z-h+). Reads what the web
+    # service picked up at boot + remote-inspects live Celery workers.
+    # Superuser-only. Powers the /admin/runtime frontend page.
+    path("api/admin/runtime/", AdminRuntimeConfigView.as_view(), name="admin-runtime-config"),
     path("api/celery/queues/", CeleryQueuesView.as_view(), name="celery-queues"),
     path("api/celery/results/", CeleryResultsView.as_view(), name="celery-results"),
     path("api/celery/tasks/<uuid:task_id>/<str:action>/", CeleryTaskControlView.as_view(), name="celery-task-control"),
