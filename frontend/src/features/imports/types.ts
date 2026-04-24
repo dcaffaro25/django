@@ -341,7 +341,13 @@ export interface ImportProgress {
     | string
   sheets_done?: number
   sheets_total?: number
+  /** During commit: index of the sheet currently being written. */
+  sheet_index?: number
   current_sheet?: string
+  /** Phase 6.z-g — row-level progress during write (commit). Published
+   *  every 100 rows via Redis so it's visible during the atomic block. */
+  rows_processed?: number
+  rows_total?: number
   errors_so_far?: number
   updated_at?: string
 }

@@ -46,18 +46,43 @@ export function ProgressStrip({
   if (!progress || !progress.stage || progress.stage === "done") return null
 
   const label = STAGE_LABELS[progress.stage] ?? progress.stage
-  const total = progress.sheets_total ?? 0
-  const done = progress.sheets_done ?? 0
-  const hasBar = total > 0
-  const pct = hasBar ? Math.min(100, Math.round((done / total) * 100)) : null
+  // Phase 6.z-g — prefer row-level progress when available (published
+  // from Redis during the commit write loop). Falls back to
+  // sheet-level progress (from the DB snapshot written at stage
+  // boundaries). Falls back to an indeterminate label + no bar when
+  // neither is present.
+  const rowsTotal = progress.rows_total ?? 0
+  const rowsDone = progress.rows_processed ?? 0
+  const hasRowBar = rowsTotal > 0
+  const sheetsTotal = progress.sheets_total ?? 0
+  const sheetsDone = progress.sheets_done ?? 0
+  const hasSheetBar = sheetsTotal > 0
+  const hasBar = hasRowBar || hasSheetBar
+  const pct = hasRowBar
+    ? Math.min(100, Math.round((rowsDone / rowsTotal) * 100))
+    : hasSheetBar
+      ? Math.min(100, Math.round((sheetsDone / sheetsTotal) * 100))
+      : null
   const errors = progress.errors_so_far ?? 0
 
   const sheetCaption = (() => {
-    if (!hasBar) return null
-    if (progress.current_sheet) {
-      return `${progress.current_sheet} · ${done} / ${total} abas`
+    if (hasRowBar) {
+      // Row-level detail takes precedence — "Transaction · 1,847 /
+      // 5,000 linhas" tells the operator exactly where the worker is.
+      const where = progress.current_sheet
+        ? `${progress.current_sheet} · `
+        : ""
+      const rowsFmt = rowsTotal.toLocaleString("pt-BR")
+      const doneFmt = rowsDone.toLocaleString("pt-BR")
+      return `${where}${doneFmt} / ${rowsFmt} linhas`
     }
-    return `${done} / ${total} abas`
+    if (hasSheetBar) {
+      if (progress.current_sheet) {
+        return `${progress.current_sheet} · ${sheetsDone} / ${sheetsTotal} abas`
+      }
+      return `${sheetsDone} / ${sheetsTotal} abas`
+    }
+    return null
   })()
 
   if (variant === "inline") {

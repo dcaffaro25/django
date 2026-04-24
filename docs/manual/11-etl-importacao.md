@@ -850,14 +850,17 @@ Campos observados:
 - `errors_so_far`: erros detectados até o momento (surfacia em âmbar)
 - `updated_at`: timestamp ISO; o strip mostra "atualizado há 3s" etc.
 
-Limitação conhecida: o loop de escrita do `commit` está dentro de
-`transaction.atomic()`, então qualquer `session.save` de dentro dele
-só é visível ao frontend quando o bloco commita. Em termos práticos:
-o analyze mostra progresso real por aba (os detectores rodam fora do
-bloco atômico), mas o commit só mostra "escrevendo no banco…" e
-depois salta direto para "concluído". Granularidade por linha
-durante o commit exige uma segunda conexão ao banco ou um store
-externo (Redis) — marcado como iteração futura.
+A partir da fase 6.z-g, o commit **também** mostra progresso por
+linha ao vivo. O worker publica atualizações a cada 100 linhas em um
+canal Redis (o mesmo broker do Celery) que contorna a transação do
+banco. A faixa mostra, por exemplo, `Transaction · 1.847 / 5.000
+linhas · 34%` enquanto o worker está escrevendo.
+
+Quando o Redis **não** está disponível (dev sem `REDIS_URL`,
+problemas de rede), o canal falha silenciosamente e a UI volta ao
+comportamento da 6.z-e — apenas progresso em nível de estágio
+("Escrevendo no banco…" sem detalhe por linha). Isso é por design:
+o progresso é best-effort, a importação sempre ganha.
 
 ### Performance de importações grandes
 

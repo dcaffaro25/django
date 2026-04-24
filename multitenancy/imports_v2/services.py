@@ -1208,6 +1208,25 @@ def _commit_template_session(session: ImportSession) -> Dict[str, Any]:
     from multitenancy.lookup_cache import LookupCache
     lookup_cache = LookupCache(session.company_id)
     lookup_cache.load()
+
+    # Phase 6.z-g — intra-atomic row-level progress via Redis. The
+    # Redis write bypasses the DB transaction so the polling
+    # frontend sees per-batch updates while the atomic block is
+    # still open. Falls back to a no-op when REDIS_URL is absent
+    # (dev/tests) — in that case the stage-level DB progress from
+    # 6.z-e is still the only signal the UI gets.
+    from . import progress_channel
+    session_pk = session.pk
+
+    def _on_progress(fields: Dict[str, Any]) -> None:
+        # Caller-side enrichment: add stage + pass through everything
+        # the importer published. Stage is hard-coded to ``writing``
+        # because that's the only window this callback fires from.
+        progress_channel.publish(
+            session_pk,
+            {"stage": "writing", **fields},
+        )
+
     with transaction.atomic():
         return execute_import_job(
             company_id=session.company_id,
@@ -1215,6 +1234,7 @@ def _commit_template_session(session: ImportSession) -> Dict[str, Any]:
             commit=True,
             import_metadata=import_metadata,
             lookup_cache=lookup_cache,
+            progress_callback=_on_progress,
         )
 
 
