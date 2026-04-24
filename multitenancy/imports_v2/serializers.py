@@ -54,6 +54,9 @@ class ImportSessionSerializer(serializers.ModelSerializer):
             "substitutions_applied",
             "transaction_groups",
             "preview",
+            # Phase 6.z-e — live progress snapshot. Empty dict for
+            # non-running sessions.
+            "progress",
         )
         read_only_fields = fields
 
@@ -211,6 +214,10 @@ class ImportSessionListSerializer(serializers.ModelSerializer):
             "open_issue_count",
             "is_terminal",
             "transformation_rule_name",
+            # Phase 6.z-e — small enough to inline per queue row so
+            # running sessions show their stage + sheets_done/_total
+            # without a second request.
+            "progress",
         )
         read_only_fields = fields
 

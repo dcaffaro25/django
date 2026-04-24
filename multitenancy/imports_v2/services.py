@@ -522,6 +522,14 @@ def _template_dry_run_preview(
         return {}
 
     try:
+        # PERF (Phase 6.z-f): pre-load FK caches so the dry-run doesn't
+        # fire one DB query per FK per row. Pattern mirrors
+        # ``ETLPipelineService.__init__`` where the cache gets shared
+        # across the run. Typical 3-5k row file with 3-5 FK fields per
+        # row goes from thousands of queries to dozens.
+        from multitenancy.lookup_cache import LookupCache
+        lookup_cache = LookupCache(company_id)
+        lookup_cache.load()
         with transaction.atomic():
             result = execute_import_job(
                 company_id=company_id,
@@ -533,6 +541,7 @@ def _template_dry_run_preview(
                     "session_id": session_pk,
                     "filename": filename,
                 },
+                lookup_cache=lookup_cache,
             )
     except Exception:  # pragma: no cover - defensive; see docstring
         return {}
@@ -565,6 +574,167 @@ def _template_dry_run_preview(
         "would_fail": would_fail,
         "total_rows": total_rows,
     }
+
+
+# --- Phase 6.z-e: live progress writes -------------------------------------
+
+# Stage keys — kept short + string-y so the frontend can map them to
+# Portuguese labels without negotiating an enum. Any stage that isn't
+# in this list renders as the raw key (so future additions don't break
+# the UI — they just display verbatim until the label map is updated).
+PROGRESS_STAGE_PARSING = "parsing"
+PROGRESS_STAGE_DETECTING = "detecting"
+PROGRESS_STAGE_DRY_RUN = "dry_run"
+PROGRESS_STAGE_MATERIALIZING_RULES = "materializing_rules"
+PROGRESS_STAGE_WRITING = "writing"
+PROGRESS_STAGE_DONE = "done"
+
+
+def _write_progress(session: ImportSession, **fields: Any) -> None:
+    """Merge ``fields`` into ``session.progress`` and persist just that column.
+
+    Called at stage boundaries OUTSIDE any ``transaction.atomic()`` block
+    so the polling frontend can observe updates before the session
+    commit fires. The function tolerates being called inside an atomic
+    block too — the save still happens, it just won't be externally
+    visible until the block commits.
+
+    Always stamps ``updated_at`` on the progress dict (ISO-8601 UTC)
+    so the frontend can show "atualizado há 3s" style staleness cues
+    without needing a separate field.
+
+    Keeps ``update_fields=["progress", "updated_at"]`` so we don't
+    accidentally race with other fields the worker is updating in a
+    different scope.
+    """
+    current = dict(session.progress or {})
+    current.update(fields)
+    current["updated_at"] = timezone.now().isoformat()
+    session.progress = current
+    try:
+        session.save(update_fields=["progress", "updated_at"])
+    except Exception:
+        # Progress writes must not crash the worker. If the save fails
+        # (e.g. connection blew up mid-atomic), log and carry on — the
+        # main work is what matters.
+        import logging
+        logging.getLogger(__name__).warning(
+            "progress write failed for session #%s", session.pk,
+            exc_info=True,
+        )
+
+
+# --- Phase 6.z-d: substitution cache reuse ---------------------------------
+
+
+def _compute_substitution_revision(company_id: int) -> str:
+    """Stable fingerprint of the active substitution rules for a company.
+
+    Used to detect whether the cached ``sheets_post_substitution`` a
+    session stashed at analyze is still valid at commit time. Any
+    change — rule added, edited, deactivated — flips the hash and
+    forces the commit to re-run the substitution pass.
+
+    Keeps the hash space small: only fields that actually drive
+    ``apply_substitutions`` output (match_type, match_value,
+    substitution_value, filter_conditions, field_name, model_name)
+    feed in. Re-ordering rules doesn't change the hash because the
+    iteration is sorted by pk.
+
+    Returns a hex digest (16 chars — SHA256 truncated is fine for
+    invalidation; collisions are harmless, they just trigger a
+    safe re-substitute).
+    """
+    from multitenancy.models import SubstitutionRule
+
+    rows = (
+        SubstitutionRule.objects.filter(company_id=company_id)
+        .order_by("pk")
+        .values_list(
+            "pk",
+            "model_name",
+            "field_name",
+            "match_type",
+            "match_value",
+            "substitution_value",
+            "filter_conditions",
+        )
+    )
+    # Serialize deterministically — ``str`` on the tuple is enough
+    # because the fields are primitive (+ filter_conditions may be
+    # dict/None; dicts aren't deterministic across insertion order
+    # but our rules create filter_conditions once and never mutate,
+    # and Django's JSONField round-trips preserve insertion order
+    # in practice). Hashing the full list of tuples.
+    h = hashlib.sha256()
+    for row in rows:
+        h.update(repr(row).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _apply_sheets_substitutions(
+    company_id: int,
+    sheets: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Run ``apply_substitutions`` on each sheet + return the result.
+
+    Scoped per model_name so rules match their target sheet only —
+    same scoping ``execute_import_job`` uses internally. Idempotent
+    on its own output (rules match against ``match_value``, not the
+    substituted value), so running it twice is safe; we just don't
+    want to pay the cost twice.
+    """
+    from multitenancy.formula_engine import apply_substitutions
+
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for sheet_name, rows in sheets.items():
+        if not isinstance(rows, list):
+            out[sheet_name] = rows  # shouldn't happen; pass through
+            continue
+        try:
+            substituted = apply_substitutions(
+                rows,
+                company_id=company_id,
+                model_name=sheet_name,
+                return_audit=False,
+            )
+            out[sheet_name] = list(substituted)
+        except Exception:
+            # Mirror execute_import_job's behaviour — on failure use
+            # the raw rows. Commit will re-try (without skip flag) so
+            # the real error surfaces in the session result if it
+            # genuinely breaks the import.
+            out[sheet_name] = rows
+    return out
+
+
+def _is_substitution_cache_valid(
+    session: ImportSession, current_revision: str,
+) -> bool:
+    """True if the cached ``sheets_post_substitution`` is safe to reuse.
+
+    Two invariants:
+      1. The substitution-rule set hasn't changed since analyze
+         (``current_revision`` matches the cached one).
+      2. No resolutions have mutated individual rows (``edit_value``
+         resolutions overwrite ``parsed_payload['sheets']`` — the
+         pre-substituted copy wouldn't reflect that).
+
+    When either breaks, commit falls through to the raw sheets + a
+    fresh substitution pass. Correct by construction.
+    """
+    payload = session.parsed_payload or {}
+    cached_rev = payload.get("substitution_revision")
+    cached_sheets = payload.get("sheets_post_substitution")
+    if not cached_rev or not isinstance(cached_sheets, dict):
+        return False
+    if cached_rev != current_revision:
+        return False
+    # Any resolution implies the operator may have edited a row
+    # value. Safest to re-substitute.
+    if session.resolutions:
+        return False
+    return True
 
 
 def _create_template_session(
@@ -613,6 +783,11 @@ def _run_analyze_template(session: ImportSession) -> ImportSession:
     """
     company_id = session.company_id
     file_bytes = bytes(session.file_bytes or b"")
+
+    # Phase 6.z-e — stage progress. Writes happen outside the dry-run's
+    # atomic block so the polling frontend sees them live.
+    _write_progress(session, stage=PROGRESS_STAGE_PARSING)
+
     try:
         sheets = _parse_template_file(file_bytes)
     except ValueError as exc:
@@ -621,8 +796,28 @@ def _run_analyze_template(session: ImportSession) -> ImportSession:
         session.save(update_fields=["status", "result", "updated_at"])
         return session
 
+    sheet_names = list(sheets.keys())
+    sheets_total = len(sheet_names)
     detected_issues: List[Dict[str, Any]] = []
-    for sheet_name, rows in sheets.items():
+    _write_progress(
+        session,
+        stage=PROGRESS_STAGE_DETECTING,
+        sheets_total=sheets_total,
+        sheets_done=0,
+        errors_so_far=0,
+    )
+    for idx, sheet_name in enumerate(sheet_names):
+        rows = sheets[sheet_name]
+        # Per-sheet progress — detectors don't wrap in atomic, so these
+        # writes are visible to the polling frontend in real time.
+        _write_progress(
+            session,
+            stage=PROGRESS_STAGE_DETECTING,
+            current_sheet=sheet_name,
+            sheets_done=idx,
+            sheets_total=sheets_total,
+            errors_so_far=len(detected_issues),
+        )
         # Only Transaction sheets carry the grouping semantics in Phase 2.
         # Other sheets (JournalEntry, BankTransaction, etc.) are passed
         # through to the commit step unchanged.
@@ -635,6 +830,13 @@ def _run_analyze_template(session: ImportSession) -> ImportSession:
         detected_issues.extend(_detect_unmatched_references(
             rows, sheet_name, company_id=company_id,
         ))
+    _write_progress(
+        session,
+        stage=PROGRESS_STAGE_DETECTING,
+        sheets_done=sheets_total,
+        sheets_total=sheets_total,
+        errors_so_far=len(detected_issues),
+    )
 
     # Dry-run preview — gated on row count to keep analyze cheap on big
     # imports. For files under the threshold, runs
@@ -650,6 +852,12 @@ def _run_analyze_template(session: ImportSession) -> ImportSession:
     )
     preview: Dict[str, Any] = {}
     if 0 < total_rows <= TEMPLATE_DRY_RUN_ROW_THRESHOLD:
+        _write_progress(
+            session,
+            stage=PROGRESS_STAGE_DRY_RUN,
+            sheets_total=sheets_total,
+            errors_so_far=len(detected_issues),
+        )
         preview = _template_dry_run_preview(
             company_id=company_id,
             sheets_dict=sheets,
@@ -657,11 +865,29 @@ def _run_analyze_template(session: ImportSession) -> ImportSession:
             filename=session.file_name,
         )
 
+    # Phase 6.z-d — pre-substitute once at analyze and stash the result
+    # plus a hash of the active substitution-rule set. Commit will check
+    # the hash + resolutions; if both still match, it reuses the cached
+    # rows with ``import_options.skip_substitutions`` so the pipeline
+    # doesn't pay the substitution cost a second time.
+    #
+    # ``apply_substitutions`` is idempotent on its own output so even if
+    # this cache becomes stale in a way the invariant check misses, the
+    # downstream commit re-runs it without harm — worst case we waste a
+    # pass, not corrupt data.
+    substitution_revision = _compute_substitution_revision(company_id)
+    sheets_post_substitution = _apply_sheets_substitutions(company_id, sheets)
+
     # Freeze the parsed payload on the session so commit/resolve can read
     # it without re-parsing. The raw bytes stay on ``file_bytes`` too
     # (redundant but intentional — resolve may re-parse with different
     # config and we want both versions available).
-    session.parsed_payload = {"sheets": sheets, "preview": preview}
+    session.parsed_payload = {
+        "sheets": sheets,
+        "sheets_post_substitution": sheets_post_substitution,
+        "substitution_revision": substitution_revision,
+        "preview": preview,
+    }
     session.open_issues = detected_issues
     if issue_mod.has_blocking_issues(detected_issues):
         session.status = ImportSession.STATUS_AWAITING_RESOLVE
@@ -670,6 +896,15 @@ def _run_analyze_template(session: ImportSession) -> ImportSession:
     session.save(update_fields=[
         "parsed_payload", "open_issues", "status", "updated_at",
     ])
+    # Final progress mark — frontend strip flips to "concluído" then
+    # fades out once status leaves "analyzing".
+    _write_progress(
+        session,
+        stage=PROGRESS_STAGE_DONE,
+        sheets_done=sheets_total,
+        sheets_total=sheets_total,
+        errors_so_far=len(detected_issues),
+    )
     return session
 
 
@@ -773,6 +1008,24 @@ def _run_commit(session: ImportSession) -> ImportSession:
     returns 500; worker just logs since the UI already polls the
     status).
     """
+    # Phase 6.z-e — stage progress before the atomic block. Intra-write
+    # row-level progress isn't observable from here (the atomic wraps
+    # everything); a follow-up with a separate DB connection or Redis
+    # progress store can deliver that.
+    payload = session.parsed_payload or {}
+    sheets_total = 0
+    if isinstance(payload, dict):
+        for key in ("sheets", "transformed_data"):
+            candidate = payload.get(key)
+            if isinstance(candidate, dict):
+                sheets_total = len(candidate)
+                break
+    _write_progress(
+        session,
+        stage=PROGRESS_STAGE_MATERIALIZING_RULES,
+        sheets_total=sheets_total,
+    )
+
     try:
         # Wrap BOTH the staged-rule materialisation AND the write backend
         # in one outer atomic block so any error (rule clashes, write
@@ -780,6 +1033,14 @@ def _run_commit(session: ImportSession) -> ImportSession:
         # their own inner atomic blocks — Django nests them as savepoints.
         with transaction.atomic():
             created_rule_pks = _materialise_staged_rules(session)
+            # Progress update inside atomic — visible externally only
+            # after commit, but useful for post-mortem debugging via
+            # the audit panel.
+            _write_progress(
+                session,
+                stage=PROGRESS_STAGE_WRITING,
+                sheets_total=sheets_total,
+            )
             if session.mode == ImportSession.MODE_ETL:
                 result = _commit_etl_session(session)
             else:
@@ -812,6 +1073,9 @@ def _run_commit(session: ImportSession) -> ImportSession:
     session.save(update_fields=[
         "status", "committed_at", "result", "file_bytes", "updated_at",
     ])
+    # Final progress marker — frontend strip flips to "concluído" and
+    # fades out once status leaves "committing".
+    _write_progress(session, stage=PROGRESS_STAGE_DONE)
     return session
 
 
@@ -899,8 +1163,25 @@ def _materialise_staged_rules(session: ImportSession) -> List[int]:
 def _commit_template_session(session: ImportSession) -> Dict[str, Any]:
     """Template-mode commit: replay parsed rows through
     ``execute_import_job`` (the legacy entry point). Atomic; rollback
-    on any write failure."""
-    sheets_dict = (session.parsed_payload or {}).get("sheets", {}) or {}
+    on any write failure.
+
+    Phase 6.z-d: if the session's ``sheets_post_substitution`` cache
+    is still valid (rule set unchanged + no resolutions), commit reuses
+    those pre-substituted rows and tells ``execute_import_job`` to skip
+    the substitution pass via ``import_options.skip_substitutions``.
+    Falls through to raw sheets + fresh substitution on any cache miss —
+    correct by construction.
+    """
+    payload = session.parsed_payload or {}
+    raw_sheets: Dict[str, List[Dict[str, Any]]] = payload.get("sheets", {}) or {}
+
+    current_rev = _compute_substitution_revision(session.company_id)
+    cache_hit = _is_substitution_cache_valid(session, current_rev)
+    if cache_hit:
+        sheets_dict = payload.get("sheets_post_substitution") or raw_sheets
+    else:
+        sheets_dict = raw_sheets
+
     # ``execute_import_job`` expects sheet dicts shaped like
     # ``{"model": "...", "rows": [...]}``. The parse step stored
     # ``{sheet_name: [row_dict]}`` — model name was implicit from the
@@ -911,17 +1192,29 @@ def _commit_template_session(session: ImportSession) -> Dict[str, Any]:
         {"model": sheet_name, "rows": rows}
         for sheet_name, rows in sheets_dict.items()
     ]
+    import_metadata: Dict[str, Any] = {
+        "source": "v2_template",
+        "function": "imports_v2.services._commit_template_session",
+        "session_id": session.pk,
+        "filename": session.file_name,
+    }
+    if cache_hit:
+        import_metadata["import_options"] = {"skip_substitutions": True}
+    # PERF (Phase 6.z-f): pre-load FK caches so the commit doesn't fire
+    # one DB query per FK per row. A 3-5k row template commit without
+    # this was doing 10k+ round-trips to Postgres and hitting the
+    # 10 min Celery hard-kill on remote DBs (Railway). ETL mode has
+    # been doing this since day one via ETLPipelineService.
+    from multitenancy.lookup_cache import LookupCache
+    lookup_cache = LookupCache(session.company_id)
+    lookup_cache.load()
     with transaction.atomic():
         return execute_import_job(
             company_id=session.company_id,
             sheets=sheets_for_job,
             commit=True,
-            import_metadata={
-                "source": "v2_template",
-                "function": "imports_v2.services._commit_template_session",
-                "session_id": session.pk,
-                "filename": session.file_name,
-            },
+            import_metadata=import_metadata,
+            lookup_cache=lookup_cache,
         )
 
 

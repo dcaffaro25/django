@@ -80,53 +80,88 @@ export function ImportsHubPage() {
   const showQueue = tab === "etl" || tab === "templates"
 
   return (
-    <div className="space-y-4">
+    <div className="flex flex-col gap-4">
       <SectionHeader
         title="Importações"
         subtitle="Envie arquivos; o backend faz o parse, validação e commit"
       />
 
-      <div className="flex items-center gap-1 rounded-md border border-border bg-surface-2 p-1">
-        {TABS.map((t) => {
-          const Icon = t.icon
-          const active = tab === t.id
-          return (
-            <button
-              key={t.id}
-              onClick={() => setTab(t.id)}
-              title={t.hint}
-              className={cn(
-                "flex flex-1 items-center justify-center gap-2 rounded-sm px-3 py-1.5 text-[12px] font-medium transition-colors",
-                active
-                  ? "bg-background text-foreground shadow-soft"
-                  : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
-              )}
-            >
-              <Icon className="h-3.5 w-3.5" /> {t.label}
-            </button>
-          )
-        })}
-      </div>
+      {/* Two-column layout when the queue is visible (ETL + Templates
+          tabs): upload flow on the left, live queue on the right as a
+          vertical card. OFX / NF-e fall back to full-width because
+          they don't use ImportSession yet. */}
+      <div
+        className={cn(
+          "flex gap-4",
+          showQueue ? "flex-col lg:flex-row lg:items-start" : "flex-col",
+        )}
+      >
+        <div
+          className={cn(
+            "flex flex-1 flex-col gap-4",
+            showQueue && "lg:min-w-0",
+          )}
+        >
+          <div className="flex items-center gap-1 rounded-md border border-border bg-surface-2 p-1">
+            {TABS.map((t) => {
+              const Icon = t.icon
+              const active = tab === t.id
+              return (
+                <button
+                  key={t.id}
+                  onClick={() => setTab(t.id)}
+                  title={t.hint}
+                  className={cn(
+                    "flex flex-1 items-center justify-center gap-2 rounded-sm px-3 py-1.5 text-[12px] font-medium transition-colors",
+                    active
+                      ? "bg-background text-foreground shadow-soft"
+                      : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+                  )}
+                >
+                  <Icon className="h-3.5 w-3.5" /> {t.label}
+                </button>
+              )
+            })}
+          </div>
 
-      {tab === "etl" && <EtlImportPage />}
-      {tab === "ofx" && <OfxImportPage />}
-      {tab === "nf" && <NfImportPage />}
-      {tab === "templates" && <ImportTemplatesPage />}
+          {tab === "etl" && <EtlImportPage />}
+          {tab === "ofx" && <OfxImportPage />}
+          {tab === "nf" && <NfImportPage />}
+          {tab === "templates" && <ImportTemplatesPage />}
 
-      {showQueue && (
-        <>
-          <ImportQueuePanel
-            selectedSessionId={selectedSessionId}
-            onSelectSession={setSelectedSessionId}
-          />
-          {selectedSessionId != null && (
+          {/* Selected session detail — stays below the upload flow in
+              the left column. Rendered here (not in the right card)
+              because it can grow large and the right column is
+              narrow. The queue highlights the selected row so the
+              relationship stays obvious. */}
+          {showQueue && selectedSessionId != null && (
             <SessionDetailView
               sessionId={selectedSessionId}
               onClose={() => setSelectedSessionId(null)}
             />
           )}
-        </>
-      )}
+        </div>
+
+        {showQueue && (
+          <aside
+            className={cn(
+              "w-full lg:w-80 lg:shrink-0",
+              // Stretch from the tabs down to the bottom of the viewport
+              // on wide screens, with its own scroll so the upload
+              // column doesn't push it off-screen.
+              "lg:sticky lg:top-4 lg:max-h-[calc(100vh-2rem)]",
+            )}
+          >
+            <div className="lg:max-h-[calc(100vh-2rem)] lg:overflow-y-auto">
+              <ImportQueuePanel
+                selectedSessionId={selectedSessionId}
+                onSelectSession={setSelectedSessionId}
+                pageSize={25}
+              />
+            </div>
+          </aside>
+        )}
+      </div>
     </div>
   )
 }

@@ -980,6 +980,20 @@ class ImportSession(TenantAwareBaseModel):
             "code can render it without branching."
         ),
     )
+    progress = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "Phase 6.z-e — live progress snapshot written at stage "
+            "boundaries outside the commit atomic block. Keys: "
+            "``stage`` (parsing / detecting / dry_run / "
+            "materializing_rules / writing / done), ``sheets_done`` / "
+            "``sheets_total``, ``current_sheet``, ``errors_so_far``, "
+            "``updated_at``. Empty dict on non-running sessions. "
+            "Intra-commit row-level progress requires a separate DB "
+            "connection (future iteration)."
+        ),
+    )
 
     expires_at = models.DateTimeField(
         null=True,

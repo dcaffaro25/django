@@ -293,3 +293,95 @@ export function useImportSessionPolling(
 
   return { pollUntilDone, pollingId }
 }
+
+// ---- interactive session actions (Phase 6.z-c follow-up) ----------------
+
+/**
+ * Resolve + commit actions scoped to a single session — lets the queue's
+ * inline detail panel drive the full interactive flow without the host
+ * page owning the plumbing.
+ *
+ * Consumes the current ``session`` (so the namespace picker has
+ * ``session.mode`` to dispatch on) and the session pk as a fallback when
+ * ``session`` is still loading. Returns ``{resolve, commit, isResolving,
+ * isCommitting}`` shaped for ``DiagnosticsPanel``'s props.
+ *
+ * Both callbacks:
+ *   * invalidate the queue list + running-count + the detail query so
+ *     the UI reflects the new status within one tick,
+ *   * drive the async Celery path through ``pollUntilDone`` so the
+ *     commit button doesn't stop spinning until the worker finishes.
+ *
+ * Errors propagate via toast-ready rejections — the caller (the panel
+ * wrapper) shows a message; we keep this hook close to the data and
+ * out of the UI concern.
+ */
+export function useSessionActions(
+  sessionPk: number,
+  session: ImportSession | undefined,
+) {
+  const qc = useQueryClient()
+  const sub = useSub()
+  const namespace: "template" | "etl" =
+    session?.mode === "etl" ? "etl" : "template"
+  const { pollUntilDone } = useImportSessionPolling(namespace)
+  const [pending, setPending] = useState<"resolve" | "commit" | null>(null)
+
+  const invalidate = useCallback(() => {
+    // Queue list + badge count + this session's detail all go stale
+    // together. Single prefix invalidation covers the list/count/
+    // per-session detail cache keys.
+    qc.invalidateQueries({ queryKey: ["imports", sub, "v2"] })
+    qc.invalidateQueries({
+      queryKey: ["imports", "v2", "session-detail", sessionPk],
+    })
+  }, [qc, sub, sessionPk])
+
+  const resolve = useCallback(
+    async (resolutions: Parameters<
+      typeof importsV2["template"]["resolve"]
+    >[1]["resolutions"]) => {
+      setPending("resolve")
+      try {
+        const next = await importsV2[namespace].resolve(sessionPk, {
+          resolutions,
+        })
+        // Resolve is synchronous on the backend — returned session is
+        // already the post-resolve state. Wake up any cached views.
+        qc.setQueryData(
+          ["imports", "v2", "session-detail", sessionPk],
+          next,
+        )
+        invalidate()
+      } finally {
+        setPending(null)
+      }
+    },
+    [namespace, sessionPk, qc, invalidate],
+  )
+
+  const commit = useCallback(async () => {
+    setPending("commit")
+    try {
+      const initial = await importsV2[namespace].commit(sessionPk)
+      // Commit is async (Phase 6.z-a). Initial body may still be in
+      // ``committing``; poll until terminal so the button state
+      // mirrors the worker.
+      const final = await pollUntilDone(initial)
+      qc.setQueryData(
+        ["imports", "v2", "session-detail", sessionPk],
+        final,
+      )
+      invalidate()
+    } finally {
+      setPending(null)
+    }
+  }, [namespace, sessionPk, pollUntilDone, qc, invalidate])
+
+  return {
+    resolve,
+    commit,
+    isResolving: pending === "resolve",
+    isCommitting: pending === "commit",
+  }
+}

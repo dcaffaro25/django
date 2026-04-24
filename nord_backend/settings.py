@@ -331,10 +331,19 @@ CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = "UTC"
 
-# Optional task time limits (protects against runaway jobs)
-CELERY_TASK_T_LIMIT = int(os.getenv("CELERY_TASK_TIME_LIMIT", 10))  # minutes
-CELERY_TASK_SOFT_TIME_LIMIT = (CELERY_TASK_T_LIMIT-3)*60  # 12 minutes
-CELERY_TASK_TIME_LIMIT = CELERY_TASK_T_LIMIT*60       # 15 minutes
+# Optional task time limits (protects against runaway jobs).
+#
+# Default raised to 30 minutes after the Phase 6.z-f perf fix: most
+# v2 imports now finish in <60s thanks to LookupCache, but a huge
+# template (10k+ rows with many FKs) can still push past 10. The
+# cap guards against genuine runaways.
+#
+# Historical bug: the original comments claimed 12/15 min, but the
+# math was (T-3)*60 = 7 min soft + T*60 = 10 min hard. Rewritten to
+# be explicit and correct.
+CELERY_TASK_T_LIMIT = int(os.getenv("CELERY_TASK_TIME_LIMIT", 30))  # minutes
+CELERY_TASK_SOFT_TIME_LIMIT = max(60, (CELERY_TASK_T_LIMIT - 5) * 60)  # 25 min default
+CELERY_TASK_TIME_LIMIT = CELERY_TASK_T_LIMIT * 60                      # 30 min default
 
 # Celery Beat: periodic tasks
 from celery.schedules import crontab
@@ -348,6 +357,17 @@ CELERY_BEAT_SCHEDULE = {
     "erp-sync-scheduled-jobs": {
         "task": "erp_integrations.tasks.run_all_due_syncs",
         "schedule": crontab(minute="*/15"),
+        "options": {"queue": "celery"},
+    },
+    # Phase 6.z-f — reap v2 sessions stuck in analyzing / committing past
+    # the Celery hard time limit. The worker could have been SIGKILL'd,
+    # container restarted, or broker hung — any of which leaves the row
+    # in a non-terminal status the frontend polls forever. Runs every
+    # 5 minutes; sessions older than CELERY_TASK_TIME_LIMIT flip to
+    # ``error`` with a "timeout" stage in result.
+    "imports-v2-reap-stale-sessions": {
+        "task": "imports_v2.reap_stale_sessions",
+        "schedule": crontab(minute="*/5"),
         "options": {"queue": "celery"},
     },
     # Weekly activity digest for the platform admin. Mondays 11:00 UTC

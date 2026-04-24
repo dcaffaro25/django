@@ -824,15 +824,77 @@ com a sessão em `analyzing` (ou `committing` no caso do commit); o
 frontend faz polling em `GET /sessions/<id>/` até o status sair do
 estado não-terminal.
 
-- Não há mais teto de 300s (timeout do gunicorn). Um arquivo de 5k
-  linhas que demoraria minutos agora roda tranquilo no worker.
+- Não há mais teto de 300s (timeout do gunicorn). O limite é o
+  `CELERY_TASK_TIME_LIMIT`, que por padrão é **30 minutos** (fase
+  6.z-f — era 10 min, insuficiente para importações grandes).
 - Em dev/testes sem `REDIS_URL`, o Celery roda em modo `eager` —
   `.delay()` vira chamada inline, então o comportamento é
   indistinguível do modo síncrono antigo.
-- Se o worker cair no meio, a sessão fica em `analyzing` /
-  `committing`. O operador pode descartar e recomeçar; há uma
-  tarefa futura (6.z-c) para detectar sessões órfãs via TTL e
-  marcá-las automaticamente como `error`.
+- **Sessões órfãs** (worker morreu, container reiniciou): a partir
+  da fase 6.z-f, uma tarefa periódica (`imports_v2.reap_stale_sessions`,
+  roda a cada 5 min) flipa sessões paradas em `analyzing` /
+  `committing` por mais que o limite + 60s para `error` com
+  `result.stage = "timeout"`. O operador pode descartar e reiniciar.
+
+### Feedback de progresso ao vivo (fase 6.z-e)
+
+O worker escreve um snapshot em `session.progress` nas transições de
+estágio, e o frontend renderiza uma faixa com barra + contador de
+erros no topo do painel de diagnóstico.
+
+Campos observados:
+
+- `stage`: `parsing` → `detecting` → `dry_run` → `materializing_rules` → `writing` → `done`
+- `sheets_done` / `sheets_total`: percentual de abas processadas
+- `current_sheet`: nome da aba que o worker está lendo/escrevendo agora
+- `errors_so_far`: erros detectados até o momento (surfacia em âmbar)
+- `updated_at`: timestamp ISO; o strip mostra "atualizado há 3s" etc.
+
+Limitação conhecida: o loop de escrita do `commit` está dentro de
+`transaction.atomic()`, então qualquer `session.save` de dentro dele
+só é visível ao frontend quando o bloco commita. Em termos práticos:
+o analyze mostra progresso real por aba (os detectores rodam fora do
+bloco atômico), mas o commit só mostra "escrevendo no banco…" e
+depois salta direto para "concluído". Granularidade por linha
+durante o commit exige uma segunda conexão ao banco ou um store
+externo (Redis) — marcado como iteração futura.
+
+### Performance de importações grandes
+
+Fase 6.z-f resolveu um bug de performance: a versão v2 não estava
+passando o `LookupCache` para o `execute_import_job`, causando uma
+consulta de banco por FK por linha (milhares de round-trips em
+planilhas grandes). Agora o cache é carregado uma vez por commit
+(Account / Entity / Currency indexados em memória), o que
+normalmente reduz o tempo de importação de minutos para segundos.
+
+Para arquivos muito grandes (10k+ linhas):
+
+- Acompanhe o painel de progresso — se o `stage` ficar em
+  `materializing_rules` ou `writing` por mais que um minuto sem
+  mudança em `updated_at`, algo travou e a próxima rodada do reaper
+  vai limpar a sessão.
+- Se o commit consistently demora mais que 30 min, aumente
+  `CELERY_TASK_TIME_LIMIT` via variável de ambiente
+  (`CELERY_TASK_TIME_LIMIT=60` sobe para 1h).
+
+### Reuso de substituições (fase 6.z-d)
+
+Na fase analyze, o backend aplica as regras de substituição uma vez
+e salva o resultado em `parsed_payload["sheets_post_substitution"]`
+junto com um hash das regras ativas (`substitution_revision`). No
+commit, se (a) o hash ainda bate e (b) nenhuma resolução foi
+registrada, o backend pula a segunda passada de substituições (a
+`apply_substitutions` é idempotente sobre sua própria saída, então
+mesmo que o cache fique stale em um cenário imprevisto o resultado
+é o mesmo — só pagamos uma passada a mais).
+
+Quando o cache NÃO é reutilizado:
+
+- Operador adicionou/editou uma regra de substituição entre analyze
+  e commit (hash muda → cache invalidado).
+- Operador aplicou alguma resolução na sessão (edit_value em
+  particular pode mutar linhas; cache invalidado por segurança).
 
 ### Idempotência
 
@@ -1110,7 +1172,9 @@ Além das listadas em §11.10d:
 | Modo 2 criou apenas 1 Tx quando eu esperava várias | Verifique se o `erp_id` está duplicado entre linhas — o agrupamento é intencional (ver 11.10c.2) |
 | Modo 2 — erro "grupo exige 1 conta bancária" | Duas linhas com o mesmo `erp_id` indicaram `bank_account_id` diferentes. Um erp_id = um movimento bancário. Separe em dois `erp_id`s. |
 | Re-importação apagou meus lançamentos customizados | No Modo 2, re-importar com o mesmo `erp_id` regenera os filhos. Edite a planilha de origem em vez do banco, ou use `erp_duplicate_behavior: "error"`. |
-| Timeout | Reduza o tamanho da planilha ou verifique Celery |
+| Timeout | Para arquivos grandes, `CELERY_TASK_TIME_LIMIT` (default 30min) pode ser excedido — aumente via env var, ou divida o arquivo. |
+| Sessão parada em `analyzing` / `committing` por muito tempo | Worker pode ter morrido. Espere ~5 min — o reaper `imports_v2.reap_stale_sessions` flipa para `error`. Ou descarte a sessão manualmente. |
+| Importação anormalmente lenta (minutos para poucos milhares de linhas) | Se a versão do backend for anterior a 6.z-f, o `LookupCache` pode não estar carregado. Atualize o backend. |
 
 ---
 

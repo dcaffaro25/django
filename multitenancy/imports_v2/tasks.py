@@ -30,6 +30,7 @@ import logging
 import traceback
 
 from celery import shared_task
+from celery.exceptions import SoftTimeLimitExceeded
 from django.db import transaction
 
 from multitenancy.models import ImportSession
@@ -80,6 +81,17 @@ def analyze_session_task(self, session_pk: int) -> None:
             services._run_analyze_etl(session)
         else:
             services._run_analyze_template(session)
+    except SoftTimeLimitExceeded as exc:
+        # Celery flagged the task for termination — soft limit fires
+        # before the hard SIGKILL, giving us a last chance to mark
+        # the session as error. Without this, the session would stay
+        # in ``analyzing`` forever (the hard-kill cuts exception
+        # handlers).
+        logger.error(
+            "analyze_session_task #%s hit soft time limit", session.pk,
+        )
+        _mark_session_error(session, exc, stage="analyze_timeout")
+        raise
     except Exception as exc:
         logger.exception(
             "analyze_session_task #%s failed: %s", session.pk, exc,
@@ -119,6 +131,17 @@ def commit_session_task(self, session_pk: int) -> None:
 
     try:
         services._run_commit(session)
+    except SoftTimeLimitExceeded as exc:
+        # Same deal as analyze — soft limit fires first so we can
+        # flip the session to error before the hard SIGKILL lands.
+        # Keeps stuck sessions out of ``committing`` purgatory.
+        logger.error(
+            "commit_session_task #%s hit soft time limit", session.pk,
+        )
+        session.refresh_from_db()
+        if session.status == ImportSession.STATUS_COMMITTING:
+            _mark_session_error(session, exc, stage="commit_timeout")
+        raise
     except Exception as exc:
         logger.exception(
             "commit_session_task #%s failed: %s", session.pk, exc,
@@ -128,6 +151,76 @@ def commit_session_task(self, session_pk: int) -> None:
         session.refresh_from_db()
         if session.status == ImportSession.STATUS_COMMITTING:
             _mark_session_error(session, exc, stage="commit")
+
+
+@shared_task(
+    name="imports_v2.reap_stale_sessions",
+    ignore_result=True,
+)
+def reap_stale_sessions_task() -> dict:
+    """Periodic beat task — flip non-terminal sessions older than the
+    Celery hard time limit to ``error`` with a ``stage=timeout``
+    diagnostic (Phase 6.z-f).
+
+    Why: if a worker was SIGKILL'd, the container restarted, or the
+    broker dropped a task mid-flight, the session stays in
+    ``analyzing`` / ``committing`` forever — the frontend polls
+    indefinitely and the operator has no recourse short of the
+    discard endpoint.
+
+    Cutoff = ``CELERY_TASK_TIME_LIMIT`` seconds past ``updated_at``
+    plus a 60s grace buffer. The buffer means a task that's chewing
+    right up to the limit doesn't get reaped on a second race
+    condition.
+
+    Returns a summary dict so the task log shows how many sessions
+    were reaped on each tick.
+    """
+    from datetime import timedelta
+    from django.conf import settings as dj_settings
+    from django.utils import timezone
+
+    hard_limit_s = int(
+        getattr(dj_settings, "CELERY_TASK_TIME_LIMIT", 600) or 600
+    )
+    cutoff = timezone.now() - timedelta(seconds=hard_limit_s + 60)
+
+    non_terminal = [
+        ImportSession.STATUS_ANALYZING,
+        ImportSession.STATUS_COMMITTING,
+    ]
+    stale = ImportSession.objects.filter(
+        status__in=non_terminal, updated_at__lt=cutoff,
+    )
+    reaped_pks = list(stale.values_list("pk", flat=True))
+    if not reaped_pks:
+        return {"reaped": 0}
+
+    with transaction.atomic():
+        for session in ImportSession.objects.filter(pk__in=reaped_pks):
+            # Re-check inside the transaction — the worker might have
+            # finished between the query and the save.
+            if session.status not in non_terminal:
+                continue
+            prior_status = session.status
+            session.status = ImportSession.STATUS_ERROR
+            session.result = {
+                "error": (
+                    f"Session stuck in {prior_status} past the task "
+                    f"time limit ({hard_limit_s}s). Worker likely "
+                    "crashed or restarted. Descarte e reinicie."
+                ),
+                "stage": "timeout",
+                "type": "StaleSessionReaped",
+                "prior_status": prior_status,
+            }
+            session.save(update_fields=["status", "result", "updated_at"])
+
+    logger.warning(
+        "reap_stale_sessions_task: reaped %d session(s): %s",
+        len(reaped_pks), reaped_pks,
+    )
+    return {"reaped": len(reaped_pks), "session_pks": reaped_pks}
 
 
 def _mark_session_error(
