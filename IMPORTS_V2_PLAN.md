@@ -12,10 +12,15 @@ Phase sections for the specific next step.
 
 ## 1. Status summary
 
-Backend phases 1–4B and frontend phases 5–6 all shipped to `main`.
-Full v2 backend suite: **122 tests green**. v2 feature is complete
-end-to-end for both template and ETL paths. Remaining work is the
-Phase 7 cleanup (burn-in gated) + optional follow-ups.
+Backend phases 1–4B, frontend phases 5–6, and ops/reliability phase
+6.z-h are all shipped to `main`. Full v2 backend suite: **122 tests
+green** (last measured 2026-04-23; post-6.z-h the frontend tests grew
+but the backend-only count is unchanged).
+
+v2 is feature-complete end-to-end for both template and ETL paths
+and running on Railway prod with Celery Beat + stale-session reaper
+live. Remaining work is Phase 7 cleanup (**gated on production
+burn-in**) + the B1–B4 backend backlog (optional follow-ups).
 
 | Ref         | What shipped                                                                 |
 |-------------|------------------------------------------------------------------------------|
@@ -35,7 +40,14 @@ Phase 7 cleanup (burn-in gated) + optional follow-ups.
 | `c06a013`   | Phase 6.z-b + 6.z-c — Queue panel + sidebar badge + session detail + deep-link |
 | `1863041`   | Phase 6.z-d/e/f — Sub-cache reuse, live progress, LookupCache perf, stale-session reaper |
 | `789e82e`   | Phase 6.z-g — Intra-atomic row-level progress via Redis channel |
-| (pending)   | Phase 6.z-h — Celery Beat service + reliability knobs + queue diagnostics |
+| `c58de9c`   | Phase 6.z-h — Celery Beat service + reliability knobs + email retry + queue diagnostics |
+| `ce39344`   | Ops hotfix — restore production worker startCommand after railway.json drift |
+| `73e9cbf`   | Ops hotfix #2 — restore production web startCommand + railway.json safety checklist |
+| `8a07ace`   | Admin — runtime config inspection (CLI + HTTP endpoint + /admin/runtime page) |
+| `5bfd606`   | Auth fix — `/api/auth/me/` endpoint so SuperuserGuard actually works |
+| `96e796c`   | Admin UX — platform-admin links moved from sidebar to user dropdown |
+| `e651918`   | Admin — RuntimePage renderer polish (total_tasks dict, uptime, prefetch label) |
+| `296735f`   | Ops — strip unused `workloads[]` from railway.json + correct the docs (head of main) |
 
 **Resolved follow-up — template dry-run.** Phase 6.y shipped the
 missing piece: template analyze now runs `execute_import_job(commit=False)`
@@ -458,8 +470,20 @@ Nothing uncommitted on main. When resuming on a new machine:
 
 1. `git pull` on `main`.
 2. Apply migrations against any local/homolog DB (`0037_importsession_progress` is the latest).
-3. Run the v2 test suite (command below) — expect 51+ green on the v2_backend module alone.
-4. Pick up Phase 5 (template frontend) or the backlog in §2.x.
+3. Run the v2 test suite (command below) — expect ~122 green on the
+   seven v2 backend modules combined. Full project suite is larger.
+4. Pick one of:
+   - **Phase 7** — legacy split-delete removal. **Gated**: requires at
+     least one month of production burn-in where v2 is the dominant
+     import path. Check prod metrics (sessions created per week,
+     % of imports hitting v2 vs legacy) before merging.
+   - **Backend backlog** — B1 (`je_balance_mismatch` detector), B2
+     (extend `_REFERENCE_FIELD_LOOKUPS`), B3 (`update_staged_rule`
+     action), B4 (Celery TTL sweep). B4 partially superseded by the
+     stale-session reaper in 6.z-f — re-assess scope before starting.
+   - **Ops** — any observed prod issue from the 6.z-h queue
+     diagnostics (`python manage.py celery_queue_stats`) or from
+     `/admin/runtime` inspection.
 
 ### Production DB unblocked (2026-04-23)
 
@@ -755,7 +779,12 @@ if the matrix of issue-detectors is large enough to split
 
 ---
 
-### Phase 5 — Frontend Path A (template v2) ← NEXT UP
+### Phase 5 — Frontend Path A (template v2) ✅ SHIPPED (commit `8d44dd4`)
+
+Original design notes below preserved for reference. Shipped
+deliverables: the toggle, `DiagnosticsPanel`, all six issue cards,
+`SubstitutionAppliedBadge`, typed API client. Manual §11.10d also
+landed alongside.
 
 **Why now** — backend is feature-complete for operator-driven resolve
 (Phase 4B). Nothing calls the v2 endpoints yet in the UI, so the
@@ -827,7 +856,16 @@ tests + ~100 lines of manual. One commit.
 
 ---
 
-### Phase 6 — Frontend Path B (ETL v2)
+### Phase 6 — Frontend Path B (ETL v2) ✅ SHIPPED (commit `f253e0f`)
+
+Shipped with `transaction_groups` serializer field, ErpIdGroupsSection,
+and the ETL-side reuse of Phase 5 components. Follow-ups 6.x / 6.y /
+6.z-a through 6.z-h added rule dropdown, dry-run preview, async
+analyze+commit, queue panel, session detail, cache reuse, live
+progress, LookupCache perf, stale-session reaper, intra-atomic row
+progress, and Celery Beat. See §1 status table for each commit ref.
+
+Original design notes preserved below for reference.
 
 **What** — mirror Phase 5 on `frontend/src/pages/imports/EtlImportPage.tsx`.
 Same toggle pattern, same DiagnosticsPanel component reused.
@@ -863,7 +901,13 @@ Phase 5) + ~200 LoC tests + manual section. One commit.
 
 ---
 
-### Phase 7 — Remove legacy split-delete code
+### Phase 7 — Remove legacy split-delete code ← next code task (when burn-in clears)
+
+**Status**: gated on burn-in. v2 has been in prod since the 6.z-h
+deploy (2026-04-24 window); do not start Phase 7 until the operator
+team confirms they've run at least one month of real imports through
+v2 without falling back to the legacy endpoints. Until then, keep the
+legacy code paths as a safety net.
 
 Once Phases 4–6 are in production and stable, delete the old split
 handling in `multitenancy/tasks.py` and `multitenancy/etl_service.py`:
@@ -1050,7 +1094,7 @@ new constraints:
 
 ---
 
-*Last updated: 2026-04-23, after Phase 4B ship (commit `d547670`).
-Backend is feature-complete through Phase 4. Handover for the next
-session: start with §1 status, then either Phase 5 (template frontend,
-next-up) or the backend backlog in §2 (B1–B4).*
+*Last updated: 2026-04-24, after the 6.z-h ops follow-ups
+(head of main `296735f`). All coded phases 1–6.z-h are in prod.
+Next session: start with §1 status, then either wait on Phase 7
+burn-in or pick up the B1–B4 backend backlog.*
