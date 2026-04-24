@@ -62,6 +62,12 @@ app.conf.update(
     # the other is sitting idle with 4 reserved tasks it hasn't
     # touched. Setting to 1 makes the broker round-robin tasks to
     # whichever worker is free RIGHT NOW.
+    #
+    # Note: the production ``worker`` service in railway.json also
+    # sets ``--prefetch-multiplier=1`` on the CLI. Both say 1, so
+    # there's no conflict; keeping the config-level setting here for
+    # dev (``celery worker`` invocations without the flag) and for
+    # anyone running the worker outside Railway.
     worker_prefetch_multiplier=1,
 
     # --- recycle workers to contain memory leaks --------------------------

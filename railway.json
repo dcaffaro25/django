@@ -11,7 +11,7 @@
       },
       {
         "name": "worker",
-        "startCommand": "celery -A nord_backend worker --loglevel=INFO --concurrency=2 -Ofair"
+        "startCommand": "celery -A nord_backend worker --loglevel=INFO -Q celery,recon_legacy,recon_fast --autoscale=20,4 -Ofair --prefetch-multiplier=1"
       },
       {
         "name": "beat",
