@@ -187,6 +187,166 @@ class V2AnalyzeEndpointTests(TestCase):
 
 
 @override_settings(AUTH_OFF=True)
+class V2TemplateDryRunPreviewTests(TestCase):
+    """Template analyze dry-run preview (gated on row count).
+
+    Tests the service-layer behaviour, not the endpoint — patches
+    ``execute_import_job`` so we're testing the tally logic +
+    threshold gate, not the real write pipeline (which has its own
+    tests elsewhere).
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.company = Company.objects.create(name="Acme Co")
+        cls.user = User.objects.create_user(username="op", password="x")
+
+    def _build_file(self, row_count: int) -> bytes:
+        """Build a Transaction-only workbook with N identical-ish rows —
+        only the ``__erp_id`` varies so we don't trigger erp_id_conflict."""
+        rows = [
+            {
+                "__erp_id": f"OMIE-{i}",
+                "date": "2026-01-01",
+                "description": "x",
+                "amount": "100.00",
+            }
+            for i in range(row_count)
+        ]
+        return _build_xlsx({"Transaction": rows})
+
+    def test_small_file_populates_preview_counts(self):
+        """Under the threshold → ``execute_import_job`` is called with
+        ``commit=False`` and the result is tallied into the preview
+        counts the serializer exposes."""
+        from multitenancy.imports_v2 import services as svc
+
+        xlsx = self._build_file(3)
+        fake_imports = {
+            "imports": [
+                {
+                    "model": "Transaction",
+                    "result": [
+                        {"__row_id": "r1", "action": "create", "status": "success"},
+                        {"__row_id": "r2", "action": "create", "status": "success"},
+                        {"__row_id": "r3", "action": "update", "status": "success"},
+                    ],
+                }
+            ]
+        }
+        with mock.patch.object(svc, "execute_import_job", return_value=fake_imports) as ej:
+            session = svc.analyze_template(
+                company_id=self.company.id,
+                user=self.user,
+                file_bytes=xlsx,
+                file_name="t.xlsx",
+            )
+        # execute_import_job was called with commit=False (the dry-run)
+        self.assertTrue(ej.called)
+        _, kwargs = ej.call_args
+        self.assertFalse(kwargs["commit"])
+        # Preview counts stored on parsed_payload and mirrored through
+        # the serializer via ``session.preview`` (checked through
+        # ``parsed_payload['preview']`` directly since this is a
+        # service-layer test).
+        preview = (session.parsed_payload or {}).get("preview") or {}
+        self.assertEqual(preview.get("would_create"), {"Transaction": 2})
+        self.assertEqual(preview.get("would_update"), {"Transaction": 1})
+        self.assertEqual(preview.get("would_fail", {}), {})
+        self.assertEqual(preview.get("total_rows"), 3)
+
+    def test_error_rows_bucket_into_would_fail(self):
+        """Rows with ``status=error`` → ``would_fail``, NOT ``would_create``."""
+        from multitenancy.imports_v2 import services as svc
+
+        xlsx = self._build_file(2)
+        fake_imports = {
+            "imports": [
+                {
+                    "model": "Transaction",
+                    "result": [
+                        {"__row_id": "r1", "action": "create", "status": "success"},
+                        {"__row_id": "r2", "action": "create", "status": "error",
+                         "message": "something bad"},
+                    ],
+                }
+            ]
+        }
+        with mock.patch.object(svc, "execute_import_job", return_value=fake_imports):
+            session = svc.analyze_template(
+                company_id=self.company.id,
+                user=self.user,
+                file_bytes=xlsx,
+                file_name="t.xlsx",
+            )
+        preview = (session.parsed_payload or {}).get("preview") or {}
+        self.assertEqual(preview.get("would_create"), {"Transaction": 1})
+        self.assertEqual(preview.get("would_fail"), {"Transaction": 1})
+
+    def test_above_threshold_skips_dry_run(self):
+        """When the file's row count exceeds
+        ``TEMPLATE_DRY_RUN_ROW_THRESHOLD`` the dry-run is skipped —
+        ``execute_import_job`` is NOT called during analyze. The
+        session still lands in ready; preview stays empty."""
+        from multitenancy.imports_v2 import services as svc
+
+        # Temporarily lower the threshold so we don't have to build a
+        # 5001-row workbook.
+        with (
+            mock.patch.object(svc, "TEMPLATE_DRY_RUN_ROW_THRESHOLD", 2),
+            mock.patch.object(svc, "execute_import_job") as ej,
+        ):
+            xlsx = self._build_file(5)
+            session = svc.analyze_template(
+                company_id=self.company.id,
+                user=self.user,
+                file_bytes=xlsx,
+                file_name="t.xlsx",
+            )
+        ej.assert_not_called()
+        self.assertEqual(session.status, ImportSession.STATUS_READY)
+        self.assertEqual(
+            (session.parsed_payload or {}).get("preview"), {},
+        )
+
+    def test_dry_run_exception_swallowed(self):
+        """If the dry-run raises, analyze doesn't fail — preview is
+        simply empty. The real commit will re-surface the same error
+        if it's a genuine data problem."""
+        from multitenancy.imports_v2 import services as svc
+
+        xlsx = self._build_file(2)
+        with mock.patch.object(
+            svc, "execute_import_job", side_effect=RuntimeError("unexpected")
+        ):
+            session = svc.analyze_template(
+                company_id=self.company.id,
+                user=self.user,
+                file_bytes=xlsx,
+                file_name="t.xlsx",
+            )
+        self.assertEqual(session.status, ImportSession.STATUS_READY)
+        self.assertEqual(
+            (session.parsed_payload or {}).get("preview"), {},
+        )
+
+    def test_empty_sheets_skip_dry_run(self):
+        """Parse returned nothing → preview stays empty, no call."""
+        from multitenancy.imports_v2 import services as svc
+
+        xlsx = _build_xlsx({"Transaction": []})
+        with mock.patch.object(svc, "execute_import_job") as ej:
+            session = svc.analyze_template(
+                company_id=self.company.id,
+                user=self.user,
+                file_bytes=xlsx,
+                file_name="t.xlsx",
+            )
+        ej.assert_not_called()
+        self.assertEqual(session.status, ImportSession.STATUS_READY)
+
+
+@override_settings(AUTH_OFF=True)
 class V2CommitEndpointTests(TestCase):
     """commit/ — session-lifecycle transitions."""
 
