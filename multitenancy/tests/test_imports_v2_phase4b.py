@@ -471,7 +471,10 @@ class MapCommitEndToEndTests(TestCase):
                 f"/{self.company.id}/api/core/imports/v2/commit/{session.pk}/",
                 {}, format="json",
             )
-        self.assertEqual(resp.status_code, 200, resp.content)
+        # Commit is async (Phase 6.z-a) — returns 202. In eager mode
+        # (no REDIS_URL) the work runs inline so the response already
+        # contains the terminal result payload we inspect below.
+        self.assertEqual(resp.status_code, 202, resp.content)
         created_pks = resp.json()["result"]["substitution_rules_created"]
         self.assertEqual(len(created_pks), 1)
         rule = SubstitutionRule.objects.get(pk=created_pks[0])
