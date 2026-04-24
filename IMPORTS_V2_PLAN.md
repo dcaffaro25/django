@@ -34,7 +34,8 @@ Phase 7 cleanup (burn-in gated) + optional follow-ups.
 | `6bf433e`   | Phase 6.z-a — Async analyze + commit via Celery (backend + frontend polling) |
 | `c06a013`   | Phase 6.z-b + 6.z-c — Queue panel + sidebar badge + session detail + deep-link |
 | `1863041`   | Phase 6.z-d/e/f — Sub-cache reuse, live progress, LookupCache perf, stale-session reaper |
-| (pending)   | Phase 6.z-g — Intra-atomic row-level progress via Redis channel |
+| `789e82e`   | Phase 6.z-g — Intra-atomic row-level progress via Redis channel |
+| (pending)   | Phase 6.z-h — Celery Beat service + reliability knobs + queue diagnostics |
 
 **Resolved follow-up — template dry-run.** Phase 6.y shipped the
 missing piece: template analyze now runs `execute_import_job(commit=False)`
@@ -258,6 +259,113 @@ Frontend `ProgressStrip` prefers row-level data when available:
     entirely (doesn't even call `read`).
   * `V2ProgressChannelTests` — the module itself degrades cleanly
     when `REDIS_URL` is absent (all three verbs no-op).
+
+**Phase 6.z-h — Celery Beat + reliability knobs + diagnostics.**
+Audit triggered by a "tasks are stuck" report uncovered four
+production issues that all compound:
+
+  1. **Celery Beat was never deployed.** `railway.json` had only
+     `web` + `worker` — no `beat`. Every periodic task in the
+     `CELERY_BEAT_SCHEDULE` (including the stale-session reaper
+     shipped in 6.z-f) was a paper tiger. **Fixed:** added a third
+     Railway workload running `celery -A nord_backend beat`. See
+     §X.x below for the wiring walkthrough.
+  2. **`broker_connection_retry_on_startup`** was declared as a
+     free-floating module variable at the top of `celery.py` —
+     never actually applied to `app.conf`. Workers crashed on
+     startup if Redis had a transient hiccup. **Fixed:** moved
+     into `app.conf.update(...)`.
+  3. **Default `acks_late=False` + `task_reject_on_worker_lost=False`**
+     meant tasks SIGKILL'd by Railway container restarts or OOM
+     were silently lost (not re-queued). That's what "stuck" looked
+     like to the operator — the queue empties but the session
+     polling never finishes. **Fixed:** both set to `True` in
+     `celery.py`. Imports v2 tasks are idempotent (status-gated),
+     so re-run is safe.
+  4. **`worker_prefetch_multiplier` default = 4** on a 2-worker
+     concurrency meant up to 8 tasks were reserved but not
+     executing. **Fixed:** set to 1 for fair scheduling. Plus
+     `worker_max_tasks_per_child = 200` to contain memory leaks
+     from pandas/numpy caches across ETL imports.
+
+Also tightened `send_user_email` retry policy: bare
+`autoretry_for=(Exception,)` retried 5 times with backoff on a
+permanent auth error, tying up workers for 30+ min per bad email
+during an SMTP outage. Now narrowed to transient exceptions
+(SMTP temp failures, TCP resets) with `max_retries=3` and hard
+`time_limit=120s`.
+
+Two new management commands for ops:
+
+  * `python manage.py celery_queue_stats` — read-only snapshot of
+    Redis queue depth, active/reserved/scheduled tasks per worker,
+    and count of stuck v2 ImportSessions. `--json` for tooling.
+  * `python manage.py celery_purge_stuck` — emergency tool. Can
+    (a) purge a Redis queue, (b) revoke+terminate active tasks,
+    (c) run the stale-session reaper synchronously. Always
+    `--dry-run` first.
+
+## Railway Beat service — step-by-step wiring
+
+When this change deploys, Railway will automatically create the
+new ``beat`` workload from `railway.json`. For the first time
+**only** (or if you want to verify it's up), follow this sequence:
+
+1. **Push the commit containing the updated `railway.json`** to
+   `main`. Railway auto-detects the new `workloads[]` entry and
+   starts the service on the next deploy.
+
+2. **Open the Railway dashboard** → the project → the service
+   tab. You should see three services: `web`, `worker`, `beat`.
+   If `beat` is missing, the schema parse failed — check the
+   deploy logs for a JSON error.
+
+3. **Click `beat` → Settings → Environment.** Verify it has the
+   same `REDIS_URL` as `worker` and `web`. The broker URL is the
+   most critical variable; a mismatch means Beat queues tasks
+   onto one Redis while workers pick up from another. If you use
+   Railway's Redis plugin via reference variables, this should
+   automatically cascade from the same source.
+
+4. **Check replicas.** Beat MUST be a single instance —
+   replicas=1, no autoscale, no restart-storm behaviour. Two
+   Beat processes would fire every periodic task twice (every
+   embedding backfill, every reaper tick, every weekly digest).
+   Railway default for custom workloads is 1 replica, but if
+   you've enabled autoscale for any reason, disable it for
+   `beat`.
+
+5. **Inspect the logs.** Click `beat` → Logs. You should see
+   lines like:
+   ```
+   [INFO/MainProcess] beat: Starting...
+   [INFO/MainProcess] Scheduler: Sending due task imports-v2-reap-stale-sessions
+   [INFO/MainProcess] Scheduler: Sending due task erp-sync-scheduled-jobs
+   ```
+   If you only see "Starting..." and then silence, the scheduler
+   loaded but no tasks are due yet — that's fine. Wait up to
+   5 minutes (our shortest period) to see the first tick.
+
+6. **Verify from the app side.** Open a session stuck in
+   `committing` for >35 min. Within 5 minutes of Beat's first
+   reaper tick, its status should flip to `error` with
+   `result.stage == "timeout"`. You can also run
+   `python manage.py celery_queue_stats` from a Railway shell and
+   watch `stale_import_sessions.count` drop.
+
+7. **If Beat dies / the container restarts:** the `--schedule=/tmp/celerybeat-schedule`
+   path is ephemeral. That's intentional for simplicity — Beat
+   reads `CELERY_BEAT_SCHEDULE` from Django settings on every
+   boot, so we don't need to persist the file across restarts.
+   The only cost is that a long-delayed one-off task (if we ever
+   add one) would re-fire on restart, which is fine for the
+   current schedule of crontab-pattern periodic tasks.
+
+Upgrade path: if the schedule becomes too dynamic to live in
+`settings.py` (e.g. per-tenant schedules set via admin UI), add
+`django-celery-beat` with the `DatabaseScheduler` and migrate the
+definitions into a model. No code changes required on the
+producer/consumer side.
 
 Nothing uncommitted on main. When resuming on a new machine:
 
