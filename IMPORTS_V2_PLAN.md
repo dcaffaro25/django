@@ -28,9 +28,21 @@ Phase 7 cleanup (burn-in gated) + optional follow-ups.
 | `0bb9332`   | Phase 4A — Resolve endpoint + pick/skip/ignore/abort + staged-rule commit    |
 | `d547670`   | Phase 4B — bad_date/negative/unmatched detectors + map/edit handlers + 24 t  |
 | `8d44dd4`   | Phase 5 — Template v2 frontend (toggle + DiagnosticsPanel + 6 issue cards)   |
-| (pending)   | Phase 6 — ETL v2 frontend + ErpIdGroupsSection + serializer.transaction_groups |
+| `f253e0f`   | Phase 6 — ETL v2 frontend + ErpIdGroupsSection + serializer.transaction_groups |
+| (pending)   | Phase 6.x — Rule picker dropdown + ETL preview passthrough + AnalyzePreviewPanel |
 
-Nothing uncommitted on main (once Phase 6 lands). When resuming on a new machine:
+**Open follow-up — template dry-run at analyze.** The `AnalyzePreviewPanel`
+shipped in Phase 6.x surfaces `would_create` / `would_fail` counts from
+`ETLPipelineService.execute(commit=False)` for ETL sessions. Template
+sessions leave the panel empty because we don't yet run
+`execute_import_job(commit=False)` at analyze time — doing so would
+double the analyze cost on large imports (a 10k-row template would
+roll-back-write all 10k rows just to count them). Pick up as its own
+commit with a decision on: (a) always run it and accept the cost,
+(b) gate on row count, or (c) skip and show counts from the
+parsed_payload's per-sheet row totals only.
+
+Nothing uncommitted on main. When resuming on a new machine:
 
 1. `git pull` on `main`.
 2. Apply migrations against any local/homolog DB (`0036_importtransformationrule_column_options` is the latest).

@@ -288,6 +288,42 @@ export interface ImportTransactionGroup {
   rows: Record<string, unknown>[]
 }
 
+/**
+ * Saved transformation rule (subset of ``ImportTransformationRule``
+ * fields the UI needs). Used by the ETL v2 rule picker.
+ */
+export interface ImportTransformationRuleSummary {
+  id: number
+  name: string
+  description?: string | null
+  source_sheet_name: string
+  target_model: string
+  /** Present in detail-level fetches; list endpoints may omit. */
+  column_mappings?: Record<string, string>
+  erp_duplicate_behavior?: "update" | "skip" | "error"
+  is_active?: boolean
+}
+
+/**
+ * Compact preview of what commit would write. Populated by the
+ * backend at analyze time for ETL sessions (stops dropping
+ * ``would_create`` / ``would_fail`` from ``ETLPipelineService.execute
+ * (commit=False)``). Template sessions leave it empty until we wire
+ * a ``commit=False`` dry-run in a follow-up commit.
+ */
+export interface ImportPreview {
+  /** Per-model expected-create counts. Example: {"Transaction": 12}. */
+  would_create?: Record<string, number>
+  /** Per-model expected-update counts (when the pipeline knows). */
+  would_update?: Record<string, number>
+  /** Per-model rows that would fail with a reason. */
+  would_fail?: Record<string, number>
+  /** Total rows that would be imported across all models. */
+  total_rows?: number
+  /** Anything else the write backend surfaces; forward-compatible. */
+  [k: string]: unknown
+}
+
 export interface ImportSession {
   id: number
   company: number
@@ -309,6 +345,9 @@ export interface ImportSession {
   is_terminal: boolean
   substitutions_applied: SubstitutionApplied[]
   transaction_groups: ImportTransactionGroup[]
+  /** Dry-run preview: what commit would write. Empty for template
+   *  sessions until the follow-up dry-run commit ships. */
+  preview: ImportPreview
 }
 
 /** Request body for POST /v2/resolve/<id>/. Each resolution targets one

@@ -899,11 +899,14 @@ Exemplo mínimo do JSON:
 │ Modo: ( Clássico )  ( ✨ Modo interativo (v2) )                │
 ├────────────────────────────────────────────────────────────────┤
 │ [file input]                                                   │
-│ transformation_rule_id: [ 12   ]  Row limit: [ 0 ]  [Ver regras]│
-│ auto_create_journal_entries (JSON, opcional):                  │
-│ ┌────────────────────────────────────────────────────────────┐ │
-│ │ {"enabled": true, "bank_account_field": ... }              │ │
-│ └────────────────────────────────────────────────────────────┘ │
+│ Regra de transformação:                                        │
+│  ( Extrato BB C/C — Movimentos → Transaction   #12       ▼ )   │
+│  ┌─ #12 · Extrato BB C/C ──────────────────────── dup: update ┐│
+│  │ Aba origem: Movimentos  Modelo alvo: Transaction           ││
+│  │ Mapeamentos: [Data → date] [Valor → amount] [Desc → desc…] ││
+│  └─────────────────────────────────────────────────────────────┘│
+│ Row limit: [ 0 ]                                               │
+│ auto_create_journal_entries (JSON, opcional): [...]            │
 │ [ Analisar ]                                                   │
 └────────────────────────────────────────────────────────────────┘
     │
@@ -1018,17 +1021,40 @@ em "criar regra", e grava tudo dentro de uma transação atômica.
 | Parâmetros faltantes da config ETL | Silenciosamente ignorados (lançamento sai errado) | Bloqueia o commit com `missing_etl_parameter` |
 | Auditoria de regras criadas | N/A (regras só criadas manualmente) | `SubstitutionRule.source="import_session"` + `source_session` FK |
 
+### Painel "Prévia da importação"
+
+Acima dos diagnósticos, o v2 mostra uma tabela "Prévia da importação"
+com o que o `commit` vai escrever:
+
+| Coluna     | Significado                                                      |
+|------------|------------------------------------------------------------------|
+| Criar      | Quantas linhas novas cada modelo receberia.                      |
+| Atualizar  | Quantas linhas existentes seriam atualizadas (lookup por `erp_id`). |
+| Falharia   | Quantas linhas estão marcadas para falhar no commit (erro já surfaceado como pendência acima). |
+
+Os valores vêm do dry-run do `ETLPipelineService.execute(commit=False)`
+— o mesmo que a pré-visualização clássica usa. Se uma linha estiver
+na coluna "Falharia", há uma pendência correspondente no painel de
+diagnósticos que você pode resolver antes de commitar.
+
+> **Nota:** para sessões de **template** (não-ETL) o painel fica
+> oculto por enquanto — o modo template ainda não roda o dry-run no
+> `analyze` (faria o passo ficar duas vezes mais caro em arquivos
+> grandes; fica como commit de follow-up).
+
 ### Limitações conhecidas (v1 do modo interativo)
 
 Além das listadas em §11.10d:
 
-- `transformation_rule_id` é digitado manualmente — ainda não temos um
-  seletor com busca. Use o link "Ver regras" para descobrir o ID.
 - `auto_create_journal_entries` é um campo de texto livre (JSON). Um
   formulário guiado (campo a campo) fica para iteração futura.
 - O painel "Grupos de `erp_id`" não oferece ação para dividir um grupo
   em dois — se dois boletos realmente têm o mesmo `erp_id` por engano
   do ERP, corrija na fonte e reimporte.
+- O seletor de regras mostra as regras ativas (`is_active != false`).
+  Para gerenciar as regras em si (criar, editar, desativar) ainda
+  não há uma tela dedicada — use o endpoint REST
+  `/api/core/etl/transformation-rules/` diretamente (GET/POST/PATCH/DELETE).
 
 ---
 

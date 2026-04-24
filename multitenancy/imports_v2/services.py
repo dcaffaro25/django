@@ -966,6 +966,13 @@ def analyze_etl(
     # (the frontend already renders them; we don't translate each one
     # into an Issue in Phase 3 — that's Phase 4 when unmatched-reference
     # resolution ships).
+    #
+    # ``would_create`` / ``would_fail`` / ``total_rows`` come from
+    # ``ETLPipelineService.execute(commit=False)`` — they're the dry-run
+    # counts legacy ETL preview already exposes. We pass them through
+    # as ``parsed_payload["preview"]`` so the serializer's ``preview``
+    # field can surface them to the frontend's "Prévia da importação"
+    # panel on a clean analyze.
     session.parsed_payload = {
         "transformed_data": transformed_flat,
         "substitutions_applied": etl_result.get("substitutions_applied") or [],
@@ -976,6 +983,11 @@ def analyze_etl(
             "warnings": etl_result.get("warnings") or [],
         },
         "sheets_processed": etl_result.get("sheets_processed") or [],
+        "preview": {
+            "would_create": etl_result.get("would_create") or {},
+            "would_fail": etl_result.get("would_fail") or {},
+            "total_rows": etl_result.get("total_rows") or 0,
+        },
     }
     session.open_issues = detected_issues
     if issue_mod.has_blocking_issues(detected_issues):

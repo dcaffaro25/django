@@ -4,6 +4,7 @@ import type {
   EtlExecuteResponse,
   ImportResolutionInput,
   ImportSession,
+  ImportTransformationRuleSummary,
   NfeImportResponse,
   OfxImportFile,
   OfxImportResponse,
@@ -169,6 +170,25 @@ function makeSharedOps(prefix: string) {
         validateStatus: (s) => s < 500,
       }),
   }
+}
+
+/** Read-only view of the operator's transformation rules. Used by the
+ *  ETL v2 rule picker; the legacy CRUD (create/edit/delete) still
+ *  happens via ``/api/core/etl/transformation-rules/`` + a future
+ *  dedicated rule-manager page. */
+export const transformationRulesApi = {
+  list: () =>
+    api.tenant
+      .get<
+        | ImportTransformationRuleSummary[]
+        | { results: ImportTransformationRuleSummary[] }
+      >("/api/core/etl/transformation-rules/")
+      .then(unwrapList<ImportTransformationRuleSummary>),
+
+  get: (id: number) =>
+    api.tenant.get<ImportTransformationRuleSummary>(
+      `/api/core/etl/transformation-rules/${id}/`,
+    ),
 }
 
 export const importsV2 = {
