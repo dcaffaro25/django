@@ -699,6 +699,157 @@ Para **forçar criação** (impedir update sobre uma transação pré-existente)
 
 ---
 
+## 11.10d Modo interativo (v2) — template
+
+O modo interativo é uma alternativa opcional ao fluxo clássico
+"Pré-visualizar → Executar" descrito em 11.10b. A operação é a mesma
+(plano de contas e regras não mudam), mas o backend mantém uma
+**sessão** no servidor onde as pendências podem ser resolvidas uma por
+uma antes da importação acontecer.
+
+**Quando usar:**
+- Há linhas com o mesmo `erp_id` que divergem em campos (ver 11.10c) —
+  o modo clássico rejeita a importação inteira; o interativo deixa o
+  operador decidir qual linha manter.
+- Há colunas com valores (conta, entidade, centro de custo) que o
+  banco não reconhece — o interativo permite mapear para o registro
+  existente **e opcionalmente gerar uma `SubstitutionRule`** para
+  próximas importações.
+- Há datas inválidas ou valores inesperados em linhas específicas —
+  correção inline sem mexer no arquivo fonte.
+
+**Como ativar:** na tela `/imports/templates`, clique em **Modo
+interativo (v2)** logo acima do upload. O botão "Executar para valer"
+some; no seu lugar aparece **Analisar**.
+
+### Fluxo de tela
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ Modo: ( Clássico )  ( ✨ Modo interativo (v2) )                │
+├────────────────────────────────────────────────────────────────┤
+│ [file input]                                                   │
+│ [ Analisar ]                                                   │
+└────────────────────────────────────────────────────────────────┘
+    │
+    ▼  (sessão criada, sem pendências)
+┌────────────────────────────────────────────────────────────────┐
+│ ✓ Pronto para importar.                                        │
+│   Transaction: 12 linhas · JournalEntry: 24 linhas             │
+│                                                [ Importar ]   │
+└────────────────────────────────────────────────────────────────┘
+
+    │  (sessão criada, COM pendências)
+    ▼
+┌────────────────────────────────────────────────────────────────┐
+│ ⚠ Existem problemas que precisam ser resolvidos…               │
+│                                                [ Importar ]   │
+│                                                (desabilitado) │
+│                                                                │
+│ ℹ Substituições aplicadas                                      │
+│   [entity: "ACME" → "ACME LTDA"]  [account: "X" → "Y"]         │
+│                                                                │
+│ ⚠ Conflitos de erp_id (1)                                      │
+│   ┌────────────────────────────────────────────────────────┐   │
+│   │ OMIE-NF-123 em Transaction, 2 linhas.                  │   │
+│   │ Campos em conflito: date (2026-04-10 vs 2026-04-11)    │   │
+│   │ Manter apenas uma linha: ( row_id=r1 ) ( row_id=r2 )   │   │
+│   │ [ Manter esta linha ] [ Ignorar grupo ] [ Abortar ]   │   │
+│   └────────────────────────────────────────────────────────┘   │
+│                                                                │
+│ ⚠ Referências não mapeadas (1)                                 │
+│   ┌────────────────────────────────────────────────────────┐   │
+│   │ "Fornecedor ABC" em JournalEntry.entity_name —         │   │
+│   │ nenhum Entity correspondente.                          │   │
+│   │ Mapear para: [ Entity #42 ▼ ]                          │   │
+│   │ ☑ Criar regra de substituição                          │   │
+│   │   Tipo: [ Exato ▼ ] Padrão: [ Fornecedor ABC ]         │   │
+│   │ [ Mapear ] [ Ignorar linha ] [ Abortar ]               │   │
+│   └────────────────────────────────────────────────────────┘   │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Tipos de pendência suportados
+
+| Tipo                       | Cartão / ações                                          |
+|----------------------------|---------------------------------------------------------|
+| `erp_id_conflict`          | Manter linha X / Ignorar grupo / Abortar                |
+| `unmatched_reference`      | Mapear para existente + criar regra / Ignorar linha / Abortar |
+| `fk_ambiguous`             | Mesma UX, candidatos pré-preenchidos no dropdown       |
+| `bad_date_format`          | Corrigir inline (date picker) / Ignorar linha / Abortar |
+| `negative_amount`          | Corrigir inline (número) / Ignorar linha / Abortar     |
+| `missing_etl_parameter`    | Só "Editar regra" (deep-link) + "Abortar"               |
+
+Cada cartão oferece apenas os botões declarados em `proposed_actions`
+pela detecção correspondente no backend — se o tipo não aceita
+"ignore_row" (ex.: `missing_etl_parameter` exige que a regra seja
+corrigida upstream), o cartão não oferece essa ação.
+
+### Passo a passo
+
+**1. Ative o modo interativo** no toggle do topo.
+
+**2. Selecione o arquivo** e clique **Analisar**. O backend cria uma
+`ImportSession` no servidor e retorna-a com status:
+- `ready` — nenhuma pendência, pode importar direto.
+- `awaiting_resolve` — há diagnósticos abertos; o botão "Importar"
+  fica desabilitado até você resolvê-los (ou descartá-los explicitamente).
+- `error` — o arquivo não pôde ser lido (XLSX inválido, por exemplo).
+
+**3. Resolva cada cartão.** Os cartões são independentes — você
+pode resolver na ordem que quiser. Cada resolução é um POST ao
+backend que **re-roda a detecção** sobre a nova versão do payload;
+uma pendência pode desaparecer após resolver outra (ex.: mapear uma
+conta pode eliminar todas as outras não-mapeadas que dependiam dela).
+
+**4. Clique "Importar"** quando o cabeçalho da sessão estiver verde
+("Pronto para importar"). O backend:
+- Materializa qualquer `SubstitutionRule` marcada em "criar regra"
+  (uma linha real em `substitution_rules`, marcada com
+  `source="import_session"` para auditoria).
+- Grava todos os registros no banco, dentro de uma transação
+  atômica — se qualquer erro ocorrer no meio, nada é persistido e a
+  sessão passa a status `error` com o motivo no campo `result`.
+
+**5. (Opcional) Descartar** se mudar de ideia: botão "Descartar
+sessão" limpa os bytes armazenados no servidor e invalida o
+`session_id`. Faça isso se a pendência for grande demais para resolver
+interativamente — corrija na planilha e comece uma nova análise.
+
+### Idempotência
+
+Re-analisar o mesmo arquivo cria **uma sessão nova** (o backend não
+dedupa por `file_hash` — ainda). Sessões antigas do mesmo arquivo
+ficam em `awaiting_resolve` até a TTL de 24h ou até serem descartadas
+manualmente.
+
+### Recuperação em caso de erro
+
+- **Browser fechado no meio da resolução**: a sessão permanece no
+  servidor por até 24h. Basta abrir `/imports/templates`, ativar o
+  modo interativo, e — isso ainda é um TODO do frontend para uma
+  versão futura — carregar o `session_id` anterior. Por ora, reanalise.
+- **Servidor reiniciou**: sessões sobrevivem (ficam no Postgres).
+- **Erro no commit**: a sessão fica em `error` com o motivo. Nenhuma
+  linha foi importada (rollback). Você pode descartar e recomeçar, ou
+  — se for algo que dê para editar na própria sessão — clicar em
+  "Importar" de novo depois de resolver as pendências adicionais que
+  a re-detecção surfaceou.
+
+### Limitações conhecidas (v1 do modo interativo)
+
+- Sem deep-link de sessão na URL ainda; fechar o navegador perde o
+  contexto visual (a sessão persiste no servidor, mas a UI precisa ser
+  re-estabelecida manualmente).
+- Tipos de pendência não previstos caem no cartão genérico (apenas
+  "Abortar").
+- Mapeamento de FK requer que o operador saiba o ID numérico do
+  registro-alvo — ainda não temos um picker com busca aqui. O cartão
+  oferece um seletor pré-preenchido quando o detector surfaceia
+  candidatos (para `fk_ambiguous`, por exemplo).
+
+---
+
 ## 11.11 Dicas e Boas Práticas
 
 ### Preparação da Planilha

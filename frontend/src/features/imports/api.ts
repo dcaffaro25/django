@@ -2,6 +2,8 @@ import { api, unwrapList } from "@/lib/api-client"
 import type {
   BulkImportResponse,
   EtlExecuteResponse,
+  ImportResolutionInput,
+  ImportSession,
   NfeImportResponse,
   OfxImportFile,
   OfxImportResponse,
@@ -80,6 +82,116 @@ export async function downloadBulkImportTemplate(): Promise<void> {
   a.download = `bulk_import_template_${stamp}.xlsx`
   a.click()
   URL.revokeObjectURL(url)
+}
+
+// ---- v2 interactive import ---------------------------------------------
+//
+// Two parallel URL namespaces share one ``ImportSession`` on the backend:
+//
+//   * ``/api/core/imports/v2/*``   → template flow (no transformation rule)
+//   * ``/api/core/etl/v2/*``       → ETL flow (with transformation rule)
+//
+// The ``commit`` / ``sessions/<id>`` / ``resolve`` endpoints are identical
+// across both namespaces (mode-dispatched on the server). We keep them in
+// two objects anyway so call sites read naturally — ``importsV2.template
+// .analyze(...)`` vs ``importsV2.etl.analyze(...)``.
+
+export interface ImportsV2AnalyzeTemplateParams {
+  file: File
+  companyId?: number
+  erpDuplicateBehavior?: "update" | "skip" | "error"
+}
+
+export interface ImportsV2AnalyzeEtlParams {
+  file: File
+  transformationRuleId: number
+  companyId?: number
+  rowLimit?: number
+  autoCreateJournalEntries?: Record<string, unknown>
+}
+
+export interface ImportsV2ResolvePayload {
+  resolutions: ImportResolutionInput[]
+}
+
+function buildTemplateAnalyzeFormData(p: ImportsV2AnalyzeTemplateParams): FormData {
+  const fd = new FormData()
+  fd.append("file", p.file)
+  if (p.companyId != null) fd.append("company_id", String(p.companyId))
+  if (p.erpDuplicateBehavior)
+    fd.append("erp_duplicate_behavior", p.erpDuplicateBehavior)
+  return fd
+}
+
+function buildEtlAnalyzeFormData(p: ImportsV2AnalyzeEtlParams): FormData {
+  const fd = new FormData()
+  fd.append("file", p.file)
+  fd.append("transformation_rule_id", String(p.transformationRuleId))
+  if (p.companyId != null) fd.append("company_id", String(p.companyId))
+  if (p.rowLimit != null) fd.append("row_limit", String(p.rowLimit))
+  if (p.autoCreateJournalEntries)
+    fd.append(
+      "auto_create_journal_entries",
+      JSON.stringify(p.autoCreateJournalEntries),
+    )
+  return fd
+}
+
+// Shared endpoints — factored as free helpers so both namespace objects
+// below can reference them without duplicating logic. The URL prefix is
+// the only thing that differs between namespaces.
+function makeSharedOps(prefix: string) {
+  return {
+    getSession: async (id: number): Promise<ImportSession> =>
+      api.tenant.get<ImportSession>(`${prefix}/sessions/${id}/`),
+
+    discardSession: async (id: number): Promise<ImportSession> =>
+      api.tenant.delete<ImportSession>(`${prefix}/sessions/${id}/`),
+
+    // Resolve returns the freshly-serialised session with mutated
+    // open_issues / resolutions / status. A session that cleared all
+    // its blocking issues will have is_committable === true.
+    resolve: async (
+      id: number,
+      payload: ImportsV2ResolvePayload,
+    ): Promise<ImportSession> =>
+      api.tenant.post<ImportSession>(`${prefix}/resolve/${id}/`, payload, {
+        // 409 / 400 are expected responses when the session can't
+        // accept the resolution batch — surface the body, don't throw.
+        validateStatus: (s) => s < 500,
+      }),
+
+    // Commit writes through to the DB. Server wraps the write in an
+    // atomic transaction + materialises any staged_substitution_rules
+    // with ``source=import_session`` + ``source_session=FK``.
+    commit: async (id: number): Promise<ImportSession> =>
+      api.tenant.post<ImportSession>(`${prefix}/commit/${id}/`, null, {
+        validateStatus: (s) => s < 500,
+      }),
+  }
+}
+
+export const importsV2 = {
+  template: {
+    analyze: async (
+      p: ImportsV2AnalyzeTemplateParams,
+    ): Promise<ImportSession> =>
+      api.tenant.post<ImportSession>(
+        "/api/core/imports/v2/analyze/",
+        buildTemplateAnalyzeFormData(p),
+        { headers: { "Content-Type": "multipart/form-data" } },
+      ),
+    ...makeSharedOps("/api/core/imports/v2"),
+  },
+  etl: {
+    analyze: async (p: ImportsV2AnalyzeEtlParams): Promise<ImportSession> =>
+      api.tenant.post<ImportSession>(
+        "/api/core/etl/v2/analyze/",
+        buildEtlAnalyzeFormData(p),
+        { headers: { "Content-Type": "multipart/form-data" } },
+      ),
+    ...makeSharedOps("/api/core/etl/v2"),
+  },
 }
 
 // ---- Substitution rules ------------------------------------------------
