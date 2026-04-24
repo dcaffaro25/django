@@ -189,3 +189,118 @@ export interface NfeImportResponse {
   inventory_triggered?: boolean
   dry_run?: boolean
 }
+
+// ---- v2 interactive import -----------------------------------------------
+//
+// These types mirror the backend payloads documented in
+// ``docs/manual/11-etl-importacao.md`` §11.10c. The session is the root
+// object everything else hangs off — analyze returns it, resolve mutates
+// it in place, commit finalises it.
+//
+// Every field is optional-ish: the backend will never send a partial
+// session, but a session in ``STATUS_ERROR`` may be missing
+// ``parsed_payload`` / ``open_issues``, and a fresh ``STATUS_READY``
+// session won't have a ``result`` yet.
+
+export type ImportSessionMode = "template" | "etl"
+
+export type ImportSessionStatus =
+  | "analyzing"
+  | "awaiting_resolve"
+  | "ready"
+  | "committing"
+  | "committed"
+  | "error"
+  | "discarded"
+
+export type ImportIssueType =
+  | "erp_id_conflict"
+  | "unmatched_reference"
+  | "je_balance_mismatch"
+  | "bad_date_format"
+  | "negative_amount"
+  | "fk_ambiguous"
+  | "missing_etl_parameter"
+
+export type ImportIssueSeverity = "error" | "warning"
+
+/**
+ * An action name the v2 resolve endpoint accepts. Each issue type exposes
+ * a subset in ``proposed_actions``; the frontend picks the matching card
+ * renderer off ``issue.type`` and only renders buttons whose action name
+ * appears in ``proposed_actions``.
+ */
+export type ImportResolveAction =
+  | "pick_row"
+  | "skip_group"
+  | "abort"
+  | "map_to_existing"
+  | "edit_value"
+  | "ignore_row"
+
+/**
+ * The issue payload is intentionally loose on the wire — backend dicts,
+ * not a tagged union — so callers can handle unknown types gracefully.
+ * ``context`` and ``location`` carry per-type fields; renderers pick
+ * them apart.
+ */
+export interface ImportIssue {
+  issue_id: string
+  type: ImportIssueType | string // tolerate unknown types
+  severity: ImportIssueSeverity
+  location: Record<string, unknown>
+  context: Record<string, unknown>
+  proposed_actions: string[]
+  message?: string | null
+}
+
+/** One "badge" in the "Substituições aplicadas" panel: X → Y on field F. */
+export interface SubstitutionApplied {
+  field?: string
+  from?: unknown
+  to?: unknown
+  [k: string]: unknown // backend may attach model/rule_id/etc.
+}
+
+/** Staged SubstitutionRule shown in the pre-commit editable summary. */
+export interface StagedSubstitutionRule {
+  model_name: string
+  field_name: string
+  match_type: "exact" | "regex" | "caseless" | string
+  match_value: string
+  substitution_value: string
+  filter_conditions?: Record<string, unknown> | null
+  title?: string | null
+  /** Derived/source: which issue_id staged this rule. */
+  source_issue_id?: string | null
+}
+
+export interface ImportSession {
+  id: number
+  company: number
+  mode: ImportSessionMode
+  status: ImportSessionStatus
+  file_name: string
+  file_hash?: string | null
+  created_at?: string
+  updated_at?: string
+  expires_at?: string | null
+  committed_at?: string | null
+  open_issues: ImportIssue[]
+  resolutions: unknown[]
+  staged_substitution_rules: StagedSubstitutionRule[]
+  result: Record<string, unknown>
+  summary: { sheets?: Record<string, number> }
+  issue_counts: Partial<Record<ImportIssueType, number>>
+  is_committable: boolean
+  is_terminal: boolean
+  substitutions_applied: SubstitutionApplied[]
+}
+
+/** Request body for POST /v2/resolve/<id>/. Each resolution targets one
+ *  issue by id, picks an action, and supplies per-action params. */
+export interface ImportResolutionInput {
+  issue_id: string
+  action: ImportResolveAction | string
+  params?: Record<string, unknown>
+}

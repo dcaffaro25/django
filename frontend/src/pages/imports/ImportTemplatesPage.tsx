@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react"
+import { useCallback, useMemo, useState } from "react"
 import { toast } from "sonner"
 import {
   AlertTriangle,
@@ -9,17 +9,21 @@ import {
   Eye,
   FileSpreadsheet,
   Play,
+  Sparkles,
   Upload,
   XCircle,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { useBulkImport } from "@/features/imports"
-import { downloadBulkImportTemplate } from "@/features/imports/api"
+import { downloadBulkImportTemplate, importsV2 } from "@/features/imports/api"
 import type {
   BulkImportResponse,
   BulkImportRowResult,
   BulkImportSheetResult,
+  ImportResolutionInput,
+  ImportSession,
 } from "@/features/imports/types"
+import { DiagnosticsPanel } from "@/components/imports/DiagnosticsPanel"
 import { cn } from "@/lib/utils"
 
 interface SheetStats {
@@ -167,6 +171,102 @@ export function ImportTemplatesPage() {
   const [isPreview, setIsPreview] = useState(false)
   const [openSheets, setOpenSheets] = useState<Set<string>>(new Set())
 
+  // v2 interactive mode — separate state so the legacy flow stays
+  // byte-identical. Toggle defaults to OFF; operators who want the
+  // diagnostics panel flip it on explicitly.
+  const [mode, setMode] = useState<"v1" | "v2">("v1")
+  const [v2Session, setV2Session] = useState<ImportSession | null>(null)
+  const [v2Pending, setV2Pending] = useState<"analyze" | "resolve" | "commit" | null>(
+    null,
+  )
+
+  const runV2Analyze = useCallback(async () => {
+    if (!file) {
+      toast.error("Selecione um arquivo .xlsx.")
+      return
+    }
+    setV2Pending("analyze")
+    try {
+      const session = await importsV2.template.analyze({ file })
+      setV2Session(session)
+      if (session.status === "ready") {
+        toast.success("Pronto para importar — nenhuma pendência encontrada.")
+      } else if (session.status === "awaiting_resolve") {
+        const n = session.open_issues?.length ?? 0
+        toast.message(
+          `Sessão criada — ${n} pendência${n === 1 ? "" : "s"} aguardando resolução.`,
+        )
+      } else if (session.status === "error") {
+        toast.error(
+          `Falha ao analisar: ${
+            (session.result as { error?: string })?.error ?? "erro desconhecido"
+          }`,
+        )
+      }
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { detail?: string; error?: string } } })
+          ?.response?.data?.error ?? (err instanceof Error ? err.message : "erro")
+      toast.error(`Análise falhou: ${msg}`)
+    } finally {
+      setV2Pending(null)
+    }
+  }, [file])
+
+  const runV2Resolve = useCallback(
+    async (resolutions: ImportResolutionInput[]) => {
+      if (!v2Session) return
+      setV2Pending("resolve")
+      try {
+        const updated = await importsV2.template.resolve(v2Session.id, {
+          resolutions,
+        })
+        setV2Session(updated)
+        if (updated.status === "ready") {
+          toast.success("Pendências resolvidas — pronto para importar.")
+        }
+      } catch (err: unknown) {
+        const msg =
+          (err as { response?: { data?: { detail?: string; error?: string } } })
+            ?.response?.data?.error ?? (err instanceof Error ? err.message : "erro")
+        toast.error(`Falha ao resolver: ${msg}`)
+      } finally {
+        setV2Pending(null)
+      }
+    },
+    [v2Session],
+  )
+
+  const runV2Commit = useCallback(async () => {
+    if (!v2Session) return
+    setV2Pending("commit")
+    try {
+      const finalised = await importsV2.template.commit(v2Session.id)
+      setV2Session(finalised)
+      if (finalised.status === "committed") {
+        toast.success("Importação concluída.")
+      } else if (finalised.status === "error") {
+        toast.error(
+          `Falha no commit: ${
+            (finalised.result as { error?: string })?.error ?? "erro"
+          }`,
+        )
+      }
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { detail?: string; error?: string } } })
+          ?.response?.data?.error ?? (err instanceof Error ? err.message : "erro")
+      toast.error(`Commit falhou: ${msg}`)
+    } finally {
+      setV2Pending(null)
+    }
+  }, [v2Session])
+
+  const resetV2 = useCallback(() => {
+    setV2Session(null)
+    setV2Pending(null)
+  }, [])
+
   const totals = useMemo(() => {
     if (!res) return { total: 0, success: 0, errors: 0 }
     let total = 0
@@ -276,6 +376,51 @@ export function ImportTemplatesPage() {
         }
       />
 
+      {/* Mode toggle: v1 is the legacy preview/execute flow (default);
+          v2 swaps in the analyze → resolve → commit session-based flow.
+          Switching modes resets both flows' state so there's no
+          ambiguity about which payload the result panel is showing. */}
+      <div className="card-elevated flex items-center gap-3 p-3 text-[12px]">
+        <span className="text-muted-foreground">Modo:</span>
+        <div className="inline-flex overflow-hidden rounded-md border border-border">
+          <button
+            onClick={() => {
+              setMode("v1")
+              resetV2()
+            }}
+            className={cn(
+              "h-7 px-3 text-[12px] font-medium",
+              mode === "v1"
+                ? "bg-primary text-primary-foreground"
+                : "bg-background hover:bg-accent",
+            )}
+          >
+            Clássico
+          </button>
+          <button
+            onClick={() => {
+              setMode("v2")
+              mut.reset()
+              setOpenSheets(new Set())
+            }}
+            className={cn(
+              "inline-flex h-7 items-center gap-1.5 px-3 text-[12px] font-medium",
+              mode === "v2"
+                ? "bg-primary text-primary-foreground"
+                : "bg-background hover:bg-accent",
+            )}
+          >
+            <Sparkles className="h-3.5 w-3.5" />
+            Modo interativo (v2)
+          </button>
+        </div>
+        {mode === "v2" && (
+          <span className="text-[11px] text-muted-foreground">
+            Analisa o arquivo, mostra pendências em cards e permite resolvê-las antes de importar.
+          </span>
+        )}
+      </div>
+
       <div className="card-elevated space-y-3 p-4">
         <input
           type="file"
@@ -284,6 +429,7 @@ export function ImportTemplatesPage() {
             setFile(e.target.files?.[0] ?? null)
             mut.reset()
             setOpenSheets(new Set())
+            resetV2()
           }}
           className="block w-full text-[12px] file:mr-3 file:rounded-md file:border file:border-border file:bg-background file:px-3 file:py-1.5 file:text-[12px] file:font-medium hover:file:bg-accent"
         />
@@ -296,42 +442,84 @@ export function ImportTemplatesPage() {
           </div>
         )}
 
-        <div className="flex flex-wrap items-end gap-3">
-          <button
-            onClick={() => run(false)}
-            disabled={!file || mut.isPending}
-            className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent disabled:opacity-50"
-            title="Dry-run: tudo roda, mas nada é commitado."
-          >
-            {mut.isPending && isPreview ? (
-              <Upload className="h-3.5 w-3.5 animate-pulse" />
-            ) : (
-              <Eye className="h-3.5 w-3.5" />
-            )}
-            {mut.isPending && isPreview ? "Simulando…" : "Pré-visualizar"}
-          </button>
+        {mode === "v1" ? (
+          <div className="flex flex-wrap items-end gap-3">
+            <button
+              onClick={() => run(false)}
+              disabled={!file || mut.isPending}
+              className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent disabled:opacity-50"
+              title="Dry-run: tudo roda, mas nada é commitado."
+            >
+              {mut.isPending && isPreview ? (
+                <Upload className="h-3.5 w-3.5 animate-pulse" />
+              ) : (
+                <Eye className="h-3.5 w-3.5" />
+              )}
+              {mut.isPending && isPreview ? "Simulando…" : "Pré-visualizar"}
+            </button>
 
-          <button
-            onClick={() => run(true)}
-            disabled={!file || mut.isPending || !canExecute}
-            className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-            title={
-              canExecute
-                ? "Reenvia o arquivo com commit=true."
-                : "Rode uma pré-visualização sem erros antes de executar."
-            }
-          >
-            {mut.isPending && !isPreview ? (
-              <Upload className="h-3.5 w-3.5 animate-pulse" />
-            ) : (
-              <Play className="h-3.5 w-3.5" />
+            <button
+              onClick={() => run(true)}
+              disabled={!file || mut.isPending || !canExecute}
+              className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              title={
+                canExecute
+                  ? "Reenvia o arquivo com commit=true."
+                  : "Rode uma pré-visualização sem erros antes de executar."
+              }
+            >
+              {mut.isPending && !isPreview ? (
+                <Upload className="h-3.5 w-3.5 animate-pulse" />
+              ) : (
+                <Play className="h-3.5 w-3.5" />
+              )}
+              {mut.isPending && !isPreview ? "Executando…" : "Executar para valer"}
+            </button>
+          </div>
+        ) : (
+          <div className="flex flex-wrap items-end gap-3">
+            <button
+              onClick={runV2Analyze}
+              disabled={!file || v2Pending != null || (v2Session != null && !v2Session.is_terminal)}
+              className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              title={
+                v2Session != null && !v2Session.is_terminal
+                  ? "Sessão já em andamento — descarte-a antes de reanalisar."
+                  : "Analisa o arquivo, cria uma sessão e surfaces pendências."
+              }
+            >
+              {v2Pending === "analyze" ? (
+                <Upload className="h-3.5 w-3.5 animate-pulse" />
+              ) : (
+                <Sparkles className="h-3.5 w-3.5" />
+              )}
+              {v2Pending === "analyze" ? "Analisando…" : "Analisar"}
+            </button>
+            {v2Session && !v2Session.is_terminal && (
+              <button
+                onClick={resetV2}
+                disabled={v2Pending != null}
+                className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent disabled:opacity-50"
+                title="Descarta a sessão e começa uma nova análise."
+              >
+                Descartar sessão
+              </button>
             )}
-            {mut.isPending && !isPreview ? "Executando…" : "Executar para valer"}
-          </button>
-        </div>
+          </div>
+        )}
       </div>
 
-      {res && (
+      {mode === "v2" && v2Session && (
+        <DiagnosticsPanel
+          session={v2Session}
+          onResolve={runV2Resolve}
+          isResolving={v2Pending === "resolve"}
+          onCommit={runV2Commit}
+          isCommitting={v2Pending === "commit"}
+        />
+      )}
+
+      {mode === "v1" && res && (
         <div className="space-y-3">
           <div
             className={cn(
