@@ -1,5 +1,9 @@
 import { useTranslation } from "react-i18next"
-import { Search, Moon, Sun, LogOut, Building2, ChevronsUpDown, Check } from "lucide-react"
+import { Link } from "react-router-dom"
+import {
+  Activity, AlertTriangle, Bug, Building2, Check, ChevronsUpDown,
+  GitBranch, LogOut, Moon, Search, Server, ShieldCheck, Sun, Users,
+} from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/stores/app-store"
 import { useAuth } from "@/providers/AuthProvider"
@@ -12,9 +16,27 @@ import { Breadcrumbs } from "./Breadcrumbs"
 import { NotificationBell } from "./NotificationBell"
 import { ThemePicker } from "./ThemePicker"
 
+/**
+ * Platform-admin entries. Rendered inside the user dropdown — not
+ * the sidebar — because they're operator-tooling for superusers,
+ * not part of the day-to-day tenant workflow. Visibility is
+ * gated on ``isSuperuser`` at the menu level; each route is also
+ * protected by ``SuperuserGuard`` + the backend's ``IsSuperUser``
+ * permission class, so this is UX gating, not authorization.
+ */
+const ADMIN_LINKS = [
+  { to: "/admin", label: "Administração", icon: ShieldCheck },
+  { to: "/admin/users", label: "Usuários", icon: Users },
+  { to: "/admin/activity", label: "Atividade", icon: Activity },
+  { to: "/admin/activity/funnels", label: "Funis", icon: GitBranch },
+  { to: "/admin/activity/friction", label: "Fricção", icon: AlertTriangle },
+  { to: "/admin/activity/errors", label: "Erros", icon: Bug },
+  { to: "/admin/runtime", label: "Runtime", icon: Server },
+] as const
+
 export function Topbar() {
   const { t } = useTranslation()
-  const { user, logout } = useAuth()
+  const { user, logout, isSuperuser } = useAuth()
   const { tenant, tenants, switchTenant } = useTenant()
   const setCommandOpen = useAppStore((s) => s.setCommandOpen)
   const theme = useAppStore((s) => s.theme)
@@ -96,10 +118,31 @@ export function Topbar() {
           <DropdownMenuContent align="end" className="w-56">
             <DropdownMenuLabel>
               <div className="flex flex-col">
-                <span className="text-sm font-medium">{user?.username ?? "—"}</span>
+                <span className="text-sm font-medium">
+                  {user?.display_name ?? user?.username ?? "—"}
+                </span>
                 {user?.email && <span className="text-xs text-muted-foreground">{user.email}</span>}
               </div>
             </DropdownMenuLabel>
+            {/* Admin entries — superuser only. Non-superusers don't
+                see the group at all (not just disabled), matching the
+                backend's "hide, don't tease" policy on admin routes. */}
+            {isSuperuser && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuLabel className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Administração da plataforma
+                </DropdownMenuLabel>
+                {ADMIN_LINKS.map(({ to, label, icon: Icon }) => (
+                  <DropdownMenuItem key={to} asChild className="cursor-pointer">
+                    <Link to={to} className="flex items-center">
+                      <Icon className="mr-2 h-4 w-4" />
+                      {label}
+                    </Link>
+                  </DropdownMenuItem>
+                ))}
+              </>
+            )}
             <DropdownMenuSeparator />
             <DropdownMenuItem onClick={logout} className="cursor-pointer text-destructive focus:text-destructive">
               <LogOut className="mr-2 h-4 w-4" />

@@ -1,11 +1,12 @@
 import { NavLink } from "react-router-dom"
 import { useTranslation } from "react-i18next"
 import {
+  // Admin icons (ShieldCheck, Activity, GitBranch, AlertTriangle, Bug,
+  // Server) moved to Topbar.tsx when the admin group left the sidebar.
   LayoutDashboard, ArrowLeftRight, ListChecks, Sparkles, SlidersHorizontal, Workflow,
   Scale, Wallet, Receipt, BookOpen, FileBarChart, FileCog, CreditCard, Users, Boxes,
   Settings, ChevronLeft, PanelLeftOpen, Building2, CheckCircle2, Brain, Zap,
-  FileSpreadsheet, Shuffle, UploadCloud, ShieldCheck, Activity, GitBranch, AlertTriangle,
-  Bug, Server,
+  FileSpreadsheet, Shuffle, UploadCloud,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/stores/app-store"
@@ -82,22 +83,9 @@ const GROUPS: NavGroup[] = [
       { key: "imports_substitutions", path: "/imports/substitutions", icon: Shuffle },
     ],
   },
-  // Platform-admin area. Hidden entirely from non-superusers — no
-  // "coming soon" teasing, no 403 click — matching the backend's
-  // IsSuperUser check on /api/admin/*.
-  {
-    key: "admin",
-    visible: ({ isSuperuser }) => isSuperuser,
-    items: [
-      { key: "admin_home", path: "/admin", icon: ShieldCheck },
-      { key: "admin_users", path: "/admin/users", icon: Users },
-      { key: "admin_activity", path: "/admin/activity", icon: Activity },
-      { key: "admin_activity_funnels", path: "/admin/activity/funnels", icon: GitBranch },
-      { key: "admin_activity_friction", path: "/admin/activity/friction", icon: AlertTriangle },
-      { key: "admin_activity_errors", path: "/admin/activity/errors", icon: Bug },
-      { key: "admin_runtime", path: "/admin/runtime", icon: Server },
-    ],
-  },
+  // Platform-admin links used to live here behind an isSuperuser
+  // predicate. Moved to the user-avatar dropdown in Topbar.tsx —
+  // operator-tooling doesn't belong in the day-to-day sidebar.
 ]
 
 export function Sidebar() {
