@@ -367,75 +367,92 @@ Upgrade path: if the schedule becomes too dynamic to live in
 definitions into a model. No code changes required on the
 producer/consumer side.
 
-## Editing `railway.json` — safety checklist
+## Railway wiring — what this repo actually controls
 
-⚠️ **Learned the hard way on 2026-04-24.** Railway treats
-`railway.json` as authoritative: whatever `startCommand` you put in
-the file overrides anything set via the dashboard. The repo version
-can silently drift from what's actually deployed if someone tunes
-the command in the dashboard without committing the change back.
-When you merge a `railway.json` edit, Railway re-deploys the
-service with the file's exact command — so a missing flag becomes
-a production regression.
+**Corrected on 2026-04-24 after a false alarm.** Our Railway project
+runs three services from this repo — `Main Server` (gunicorn),
+`Celery` (worker), `Beat` (beat scheduler, added Phase 6.z-h) —
+each as a separate Railway service with its own `startCommand` set
+**in the dashboard**, NOT in `railway.json`.
 
-**Before editing any `startCommand` in `railway.json`:**
+That means:
 
-1. **Copy the current live command from Railway dashboard first.**
-   Services → `<service>` → Settings → Deploy → Start Command. Paste
-   it into the file verbatim, THEN add/remove flags. Never rewrite
-   from memory.
+- `railway.json` in this repo only declares the **builder** (Railpack)
+  and shared build hints. It does NOT carry `startCommand` values.
+- Editing `railway.json` never changes what any service runs.
+- If someone tries to add a `deploy.workloads[]` block, Railway
+  ignores it for our multi-service setup. The workloads schema is
+  for single-service multi-process deployments — not us.
 
-2. **Compare diffs as whole lines, not flag-by-flag.** A dropped
-   `-Q celery,recon_legacy,recon_fast` silently mutes 2 of 3 task
-   queues; a dropped `--autoscale=20,4` caps throughput at default
-   concurrency; a dropped `--timeout 600` on gunicorn cuts HTTP
-   request budget in half.
+**The authoritative source for each service's start command is the
+Railway dashboard.** To verify or change what a service runs:
+Services → `<service>` → Settings → Deploy → Start Command.
 
-3. **Flags the current production `web` command includes** (2026-04-24
-   snapshot — verify in dashboard if in doubt):
-   ```
-   python -u manage.py migrate
-     && python -u manage.py ensure_superuser
-     && python -u manage.py collectstatic --noinput
-     && gunicorn nord_backend.wsgi:application
-       --bind 0.0.0.0:$PORT
-       --access-logfile - --error-logfile -
-       --log-level info --capture-output
-       --timeout 600 --keep-alive 30
-       --workers 2 --worker-class gthread --threads 4
-       --max-requests 500 --max-requests-jitter 50
-   ```
-   Key invariants: `python -u` (unbuffered logs), `--bind
-   0.0.0.0:$PORT` (Railway injects `$PORT`), `gthread` worker
-   class + `--threads 4` (8 concurrent requests with 2 workers),
-   `--max-requests 500` (worker recycles before memory bloats).
+### Current production start commands (2026-04-24)
 
-4. **Flags the current production `worker` command includes**:
-   ```
-   celery -A nord_backend worker --loglevel=INFO
-     -Q celery,recon_legacy,recon_fast
-     --autoscale=20,4
-     -Ofair
-     --prefetch-multiplier=1
-   ```
-   Key invariants: multi-queue consumption (don't drop any of the
-   three), autoscale 4-20, fair scheduling. The prefetch=1 CLI flag
-   is redundant with `nord_backend/celery.py`'s config-level
-   `worker_prefetch_multiplier=1`, but both say 1 so no conflict.
+Recorded here for reference only. Any change must happen in the
+Railway dashboard; this file just documents what's there.
 
-5. **Additive changes are safer than rewrites.** Adding a new
-   service (like Phase 6.z-h's `beat`) doesn't touch the others —
-   leave the existing `startCommand` values byte-identical.
+**Main Server** (web):
+```
+python -u manage.py migrate
+  && python -u manage.py ensure_superuser
+  && python -u manage.py collectstatic --noinput
+  && gunicorn nord_backend.wsgi:application
+    --bind 0.0.0.0:$PORT
+    --access-logfile - --error-logfile -
+    --log-level info --capture-output
+    --timeout 600 --keep-alive 30
+    --workers 2 --worker-class gthread --threads 4
+    --max-requests 500 --max-requests-jitter 50
+```
+Key invariants: `python -u` (unbuffered logs), `--bind 0.0.0.0:$PORT`
+(Railway injects `$PORT`), `gthread` worker class + `--threads 4`
+(8 concurrent requests with 2 workers), `--max-requests 500`
+(worker recycles before memory bloats).
 
-6. **After deploy, verify.** Open the service → Logs and watch the
-   first minute of output to confirm the expected flags loaded
-   (gunicorn prints its worker/thread config, Celery prints its
-   queue subscription). If anything looks different from what you
-   expected, roll back before operator-visible damage accrues.
+**Celery** (worker):
+```
+celery -A nord_backend worker --loglevel=INFO
+  -Q celery,recon_legacy,recon_fast
+  --autoscale=20,4
+  -Ofair
+  --prefetch-multiplier=1
+```
+Key invariants: multi-queue consumption (don't drop any of the
+three), autoscale 4-20, fair scheduling. The CLI `--prefetch-multiplier=1`
+matches the config-level `worker_prefetch_multiplier=1` in
+`nord_backend/celery.py`.
 
-If you need to *change* a startCommand intentionally (not restore —
-actually modify), take a screenshot of the dashboard field first so
-there's an unambiguous record of the pre-edit state.
+**Beat** (scheduler, added Phase 6.z-h):
+```
+celery -A nord_backend beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule
+```
+Key invariants: **single replica only** (two Beats = every scheduled
+task fires twice), no health check (doesn't listen on a port),
+`--schedule=/tmp/celerybeat-schedule` is fine as ephemeral state
+because all our schedules are crontab-based (see "Where does the
+Beat schedule live?" below for the full explanation).
+
+### If a service's command needs to change
+
+1. Open Railway dashboard → `<service>` → Settings → Deploy.
+2. Take a screenshot of the current Start Command before editing.
+3. Change it, redeploy, and watch the service's logs for the first
+   minute to confirm the expected flags loaded (gunicorn prints its
+   worker/thread config; Celery prints its queue subscription).
+4. Update the "Current production start commands" section above
+   so the next person looking here sees the current truth.
+
+### Source of the earlier hotfix scare
+
+I'd assumed `railway.json` `workloads[]` drove the startCommands
+and committed replacements that DIDN'T match what the dashboard
+had. Two back-to-back hotfixes chased the drift (restoring the
+real commands). If Railway's `workloads[]` feature does apply to
+our setup in some future evolution, we can reintroduce it
+deliberately then — with the dashboard values copied into the
+file verbatim first.
 
 Nothing uncommitted on main. When resuming on a new machine:
 
