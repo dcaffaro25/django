@@ -2,21 +2,5 @@
   "$schema": "https://railway.app/railway.schema.json",
   "build": {
     "builder": "RAILPACK"
-  },
-  "deploy": {
-    "workloads": [
-      {
-        "name": "web",
-        "startCommand": "python -u manage.py migrate && python -u manage.py ensure_superuser && python -u manage.py collectstatic --noinput && gunicorn nord_backend.wsgi:application --bind 0.0.0.0:$PORT --access-logfile - --error-logfile - --log-level info --capture-output --timeout 600 --keep-alive 30 --workers 2 --worker-class gthread --threads 4 --max-requests 500 --max-requests-jitter 50"
-      },
-      {
-        "name": "worker",
-        "startCommand": "celery -A nord_backend worker --loglevel=INFO -Q celery,recon_legacy,recon_fast --autoscale=20,4 -Ofair --prefetch-multiplier=1"
-      },
-      {
-        "name": "beat",
-        "startCommand": "celery -A nord_backend beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule"
-      }
-    ]
   }
 }
