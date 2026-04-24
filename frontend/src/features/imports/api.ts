@@ -4,10 +4,13 @@ import type {
   EtlExecuteResponse,
   ImportResolutionInput,
   ImportSession,
+  ImportSessionRunningCount,
+  ImportSessionSummary,
   ImportTransformationRuleSummary,
   NfeImportResponse,
   OfxImportFile,
   OfxImportResponse,
+  Paginated,
   SubstitutionRule,
 } from "./types"
 
@@ -138,6 +141,15 @@ function buildEtlAnalyzeFormData(p: ImportsV2AnalyzeEtlParams): FormData {
   return fd
 }
 
+export interface ImportsV2ListParams {
+  /** Comma-separated whitelist. Empty / undefined → backend returns
+   *  all statuses (including terminals). */
+  status?: string
+  mode?: "template" | "etl"
+  page?: number
+  pageSize?: number
+}
+
 // Shared endpoints — factored as free helpers so both namespace objects
 // below can reference them without duplicating logic. The URL prefix is
 // the only thing that differs between namespaces.
@@ -148,6 +160,27 @@ function makeSharedOps(prefix: string) {
 
     discardSession: async (id: number): Promise<ImportSession> =>
       api.tenant.delete<ImportSession>(`${prefix}/sessions/${id}/`),
+
+    /** Paginated lightweight list — drives the queue panel. */
+    listSessions: async (
+      params: ImportsV2ListParams = {},
+    ): Promise<Paginated<ImportSessionSummary>> => {
+      const qs = new URLSearchParams()
+      if (params.status) qs.set("status", params.status)
+      if (params.mode) qs.set("mode", params.mode)
+      if (params.page) qs.set("page", String(params.page))
+      if (params.pageSize) qs.set("page_size", String(params.pageSize))
+      const suffix = qs.toString() ? `?${qs.toString()}` : ""
+      return api.tenant.get<Paginated<ImportSessionSummary>>(
+        `${prefix}/sessions/${suffix}`,
+      )
+    },
+
+    /** Cheap aggregate for the sidebar badge. */
+    runningCount: async (): Promise<ImportSessionRunningCount> =>
+      api.tenant.get<ImportSessionRunningCount>(
+        `${prefix}/sessions/running-count/`,
+      ),
 
     // Resolve returns the freshly-serialised session with mutated
     // open_issues / resolutions / status. A session that cleared all

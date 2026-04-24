@@ -175,3 +175,66 @@ class ImportSessionSerializer(serializers.ModelSerializer):
         if isinstance(preview, dict):
             return preview
         return {}
+
+
+class ImportSessionListSerializer(serializers.ModelSerializer):
+    """Lightweight session view for the queue list endpoint (Phase 6.z-b).
+
+    Intentionally excludes ``parsed_payload``, ``open_issues`` (full
+    entries), ``result``, ``staged_substitution_rules`` — those are
+    multi-MB on a large import. The queue UI only needs filename,
+    mode, status, timestamps, operator, and an issue-count badge.
+
+    ``operator_name`` resolves the ``created_by`` FK inline so the
+    queue doesn't need a second request to render rows. A missing
+    user (deleted, never set) renders as ``None`` — the frontend
+    shows "—".
+    """
+
+    is_terminal = serializers.SerializerMethodField()
+    operator_name = serializers.SerializerMethodField()
+    open_issue_count = serializers.SerializerMethodField()
+    transformation_rule_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ImportSession
+        fields = (
+            "id",
+            "mode",
+            "status",
+            "file_name",
+            "file_hash",
+            "created_at",
+            "updated_at",
+            "committed_at",
+            "operator_name",
+            "open_issue_count",
+            "is_terminal",
+            "transformation_rule_name",
+        )
+        read_only_fields = fields
+
+    def get_is_terminal(self, obj):
+        return obj.is_terminal()
+
+    def get_operator_name(self, obj):
+        """Prefer full name, fall back to username. Returns ``None`` when
+        the FK is missing so the frontend can render a dash."""
+        if not obj.created_by_id:
+            return None
+        user = getattr(obj, "created_by", None)
+        if user is None:
+            return None
+        full = (user.get_full_name() or "").strip()
+        return full or user.username or None
+
+    def get_open_issue_count(self, obj):
+        issues = obj.open_issues or []
+        return len(issues) if isinstance(issues, list) else 0
+
+    def get_transformation_rule_name(self, obj):
+        """ETL-mode rows show the rule name in the queue so operators
+        can tell two imports of the same file apart. Template rows
+        return ``None``."""
+        rule = getattr(obj, "transformation_rule", None)
+        return getattr(rule, "name", None) if rule else None

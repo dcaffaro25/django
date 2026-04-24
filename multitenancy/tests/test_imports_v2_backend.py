@@ -67,6 +67,14 @@ def _url_session(tenant_id, pk):
     return f"/{tenant_id}/api/core/imports/v2/sessions/{pk}/"
 
 
+def _url_sessions_list(tenant_id):
+    return f"/{tenant_id}/api/core/imports/v2/sessions/"
+
+
+def _url_sessions_running_count(tenant_id):
+    return f"/{tenant_id}/api/core/imports/v2/sessions/running-count/"
+
+
 @override_settings(AUTH_OFF=True)  # sidestep token auth for these tests
 class V2AnalyzeEndpointTests(TestCase):
     """analyze/ — file-to-session transitions."""
@@ -680,3 +688,149 @@ class V2AsyncTaskTests(TestCase):
         self.assertEqual(session.result["type"], "IntegrityError")
         # The wrapper's generic 'traceback' field must not be present.
         self.assertNotIn("traceback", session.result)
+
+
+@override_settings(AUTH_OFF=True)
+class V2SessionsListEndpointTests(TestCase):
+    """Phase 6.z-b — GET /sessions/ and /sessions/running-count/.
+
+    Covers tenant scoping, filters, pagination shape, the
+    lightweight serializer's payload, and the cheap count aggregate.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.co1 = Company.objects.create(name="Acme Co")
+        cls.co2 = Company.objects.create(name="Globex Co")
+        cls.user = User.objects.create_user(
+            username="op",
+            password="x",
+            first_name="Olivia",
+            last_name="Operator",
+        )
+
+    def _make(self, company, status, *, mode="template"):
+        return ImportSession.objects.create(
+            company_id=company.id,
+            created_by=self.user,
+            mode=mode,
+            status=status,
+            file_name=f"{status}.xlsx",
+            parsed_payload={"sheets": {"Transaction": [{"x": 1}, {"x": 2}]}},
+            open_issues=[] if status in (
+                ImportSession.STATUS_READY, ImportSession.STATUS_COMMITTED,
+            ) else [{"severity": "error", "type": "erp_id_conflict"}],
+        )
+
+    # --- list --------------------------------------------------------------
+
+    def test_list_scopes_to_tenant(self):
+        """Sessions in another company must not appear — even without a
+        403; just invisible rows."""
+        own = self._make(self.co1, ImportSession.STATUS_READY)
+        other = self._make(self.co2, ImportSession.STATUS_READY)
+        resp = self.client.get(_url_sessions_list(self.co1.id))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = resp.json()
+        ids = [r["id"] for r in body["results"]]
+        self.assertIn(own.pk, ids)
+        self.assertNotIn(other.pk, ids)
+
+    def test_list_payload_is_lightweight(self):
+        """The list serializer excludes the heavy blobs — if a future
+        dev re-adds parsed_payload / open_issues to the list response,
+        this test flags it early."""
+        self._make(self.co1, ImportSession.STATUS_READY)
+        resp = self.client.get(_url_sessions_list(self.co1.id))
+        row = resp.json()["results"][0]
+        self.assertIn("id", row)
+        self.assertIn("mode", row)
+        self.assertIn("status", row)
+        self.assertIn("file_name", row)
+        self.assertIn("operator_name", row)
+        self.assertIn("open_issue_count", row)
+        self.assertIn("is_terminal", row)
+        # Heavy fields MUST NOT be present — the queue would be slow +
+        # memory-hungry with multi-MB payloads per row.
+        self.assertNotIn("parsed_payload", row)
+        self.assertNotIn("open_issues", row)
+        self.assertNotIn("result", row)
+        self.assertNotIn("staged_substitution_rules", row)
+
+    def test_list_orders_by_newest_first(self):
+        older = self._make(self.co1, ImportSession.STATUS_READY)
+        newer = self._make(self.co1, ImportSession.STATUS_AWAITING_RESOLVE)
+        resp = self.client.get(_url_sessions_list(self.co1.id))
+        ids = [r["id"] for r in resp.json()["results"]]
+        self.assertEqual(ids[0], newer.pk)
+        self.assertEqual(ids[1], older.pk)
+
+    def test_list_filters_by_status(self):
+        analyzing = self._make(self.co1, ImportSession.STATUS_ANALYZING)
+        committing = self._make(self.co1, ImportSession.STATUS_COMMITTING)
+        committed = self._make(self.co1, ImportSession.STATUS_COMMITTED)
+        resp = self.client.get(
+            _url_sessions_list(self.co1.id) + "?status=analyzing,committing",
+        )
+        ids = {r["id"] for r in resp.json()["results"]}
+        self.assertIn(analyzing.pk, ids)
+        self.assertIn(committing.pk, ids)
+        self.assertNotIn(committed.pk, ids)
+
+    def test_list_filters_by_mode(self):
+        tmpl = self._make(self.co1, ImportSession.STATUS_READY, mode="template")
+        etl = self._make(self.co1, ImportSession.STATUS_READY, mode="etl")
+        resp = self.client.get(_url_sessions_list(self.co1.id) + "?mode=etl")
+        ids = {r["id"] for r in resp.json()["results"]}
+        self.assertIn(etl.pk, ids)
+        self.assertNotIn(tmpl.pk, ids)
+
+    def test_list_exposes_operator_and_issue_count(self):
+        s = self._make(self.co1, ImportSession.STATUS_AWAITING_RESOLVE)
+        resp = self.client.get(_url_sessions_list(self.co1.id))
+        row = next(r for r in resp.json()["results"] if r["id"] == s.pk)
+        self.assertEqual(row["operator_name"], "Olivia Operator")
+        self.assertEqual(row["open_issue_count"], 1)
+
+    def test_list_rejects_invalid_status_silently(self):
+        """An unknown ``status=foo`` filter drops to no filter (serving
+        all rows) rather than 400 — keeps the frontend resilient to typos
+        without throwing the whole queue."""
+        self._make(self.co1, ImportSession.STATUS_READY)
+        resp = self.client.get(
+            _url_sessions_list(self.co1.id) + "?status=bogus",
+        )
+        self.assertEqual(resp.status_code, 200)
+        # All own-tenant rows still present.
+        self.assertGreaterEqual(len(resp.json()["results"]), 1)
+
+    # --- running-count -----------------------------------------------------
+
+    def test_running_count_buckets(self):
+        self._make(self.co1, ImportSession.STATUS_ANALYZING)
+        self._make(self.co1, ImportSession.STATUS_ANALYZING)
+        self._make(self.co1, ImportSession.STATUS_COMMITTING)
+        self._make(self.co1, ImportSession.STATUS_AWAITING_RESOLVE)
+        # Terminal sessions must not count.
+        self._make(self.co1, ImportSession.STATUS_COMMITTED)
+        self._make(self.co1, ImportSession.STATUS_ERROR)
+        self._make(self.co1, ImportSession.STATUS_DISCARDED)
+        # A session in another tenant must not count.
+        self._make(self.co2, ImportSession.STATUS_ANALYZING)
+
+        resp = self.client.get(_url_sessions_running_count(self.co1.id))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = resp.json()
+        self.assertEqual(body["analyzing"], 2)
+        self.assertEqual(body["committing"], 1)
+        self.assertEqual(body["awaiting_resolve"], 1)
+        self.assertEqual(body["total"], 4)
+
+    def test_running_count_zero_when_idle(self):
+        self._make(self.co1, ImportSession.STATUS_COMMITTED)
+        resp = self.client.get(_url_sessions_running_count(self.co1.id))
+        body = resp.json()
+        self.assertEqual(body["total"], 0)
+        self.assertEqual(body["analyzing"], 0)
+        self.assertEqual(body["committing"], 0)
+        self.assertEqual(body["awaiting_resolve"], 0)
