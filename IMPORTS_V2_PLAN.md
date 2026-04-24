@@ -33,7 +33,8 @@ Phase 7 cleanup (burn-in gated) + optional follow-ups.
 | `8a2e8d9`   | Phase 6.y — Template dry-run at analyze (≤5k rows auto; would_create/update/fail) |
 | `6bf433e`   | Phase 6.z-a — Async analyze + commit via Celery (backend + frontend polling) |
 | `c06a013`   | Phase 6.z-b + 6.z-c — Queue panel + sidebar badge + session detail + deep-link |
-| (pending)   | Phase 6.z-d/e/f — Sub-cache reuse, live progress, LookupCache perf, stale-session reaper |
+| `1863041`   | Phase 6.z-d/e/f — Sub-cache reuse, live progress, LookupCache perf, stale-session reaper |
+| (pending)   | Phase 6.z-g — Intra-atomic row-level progress via Redis channel |
 
 **Resolved follow-up — template dry-run.** Phase 6.y shipped the
 missing piece: template analyze now runs `execute_import_job(commit=False)`
@@ -200,6 +201,63 @@ report of "3.5k rows taking 10+ min" exposed two interacting bugs:
 happy paths (analyzing + committing) plus the two negative cases
 (fresh sessions must not be touched; terminal sessions must not
 be re-reaped).
+
+**Phase 6.z-g — intra-atomic row-level progress via Redis.** Closes
+the gap 6.z-e was honest about. The problem: the commit write loop
+runs inside `transaction.atomic()`, so any `session.save` from
+within is invisible to the polling frontend until the block
+commits. 6.z-e gave us stage-level progress at the boundaries; 6.z-g
+publishes row-level progress during the write via Redis (which
+is already in the stack as the Celery broker).
+
+Architecture (dual channel):
+
+  * `ImportSession.progress` JSONField — durable DB snapshot, written
+    at stage boundaries outside the atomic block. Canonical post-commit.
+  * Redis `imports_v2:progress:<session_pk>` — live channel, written
+    every 100 rows during the write loop. Bypasses the DB transaction
+    entirely. TTL = `CELERY_TASK_TIME_LIMIT + 120s`; explicit
+    `progress_channel.clear(pk)` from the Celery task's `finally` block
+    on terminal.
+
+Plumbing:
+
+  * `execute_import_job(progress_callback=...)` — new optional kwarg.
+    Fires at every sheet start + every `PROGRESS_ROW_INTERVAL` (100)
+    rows during the per-row loop. Throttled by modulo so a 10k-row
+    file generates ~100 writes instead of 10k. Callback errors are
+    swallowed — progress publishing can never block the import.
+  * `multitenancy/imports_v2/progress_channel.py` — lazy-imported
+    `redis` client, `publish(pk, fields)` merges into the existing
+    blob and bumps `updated_at`, `read(pk)` returns the current
+    snapshot or None, `clear(pk)` deletes the key. Degrades to
+    no-ops when `REDIS_URL` is absent (tests + dev), so the stack
+    keeps working without a broker.
+  * `services._commit_template_session` creates a closure
+    `_on_progress(fields)` that publishes to Redis with
+    `stage="writing"`; passes it via `progress_callback`.
+  * `ImportSessionSerializer.get_progress` (and the list variant)
+    merge: for non-terminal sessions, Redis fields override DB
+    fields (Redis is fresher for row-level work); for terminal
+    sessions, read DB only (Redis might still have a stale key for
+    a few seconds while the clear propagates).
+
+Frontend `ProgressStrip` prefers row-level data when available:
+
+  * `rows_processed / rows_total` → real percentage bar, "Transaction
+    · 1.847 / 5.000 linhas" caption.
+  * Falls back to `sheets_done / sheets_total` from the DB snapshot.
+  * Falls back to an indeterminate spinner when neither is present.
+
+10 new tests cover:
+
+  * `V2ProgressCallbackTests` — sheet-boundary firing, 100-row
+    throttling, callback errors don't block import.
+  * `V2ProgressSerializerMergeTests` — non-terminal prefers Redis,
+    falls back to DB when Redis empty, terminal ignores Redis
+    entirely (doesn't even call `read`).
+  * `V2ProgressChannelTests` — the module itself degrades cleanly
+    when `REDIS_URL` is absent (all three verbs no-op).
 
 Nothing uncommitted on main. When resuming on a new machine:
 

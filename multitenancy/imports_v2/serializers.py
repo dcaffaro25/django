@@ -29,6 +29,7 @@ class ImportSessionSerializer(serializers.ModelSerializer):
     summary = serializers.SerializerMethodField()
     transaction_groups = serializers.SerializerMethodField()
     preview = serializers.SerializerMethodField()
+    progress = serializers.SerializerMethodField()
 
     class Meta:
         model = ImportSession
@@ -158,6 +159,36 @@ class ImportSessionSerializer(serializers.ModelSerializer):
             g["rows"].append(row)
         return list(groups.values())
 
+    def get_progress(self, obj):
+        """Merge DB progress snapshot with live Redis data (Phase 6.z-g).
+
+        For non-terminal sessions, Redis holds the freshest intra-atomic
+        row-level state (rows_processed, current_sheet, etc.); the DB
+        snapshot only updates at stage boundaries outside the commit
+        atomic block. Merge policy: start with the DB snapshot, let
+        Redis fields override where they exist. That way stage-level
+        fields published pre-atomic still show up, and row-level
+        fields published during the write overwrite the generic
+        ``stage=writing`` placeholder.
+
+        Terminal sessions read only the DB value — Redis should be
+        cleared by the worker on terminal, but we don't trust that
+        to be instantaneous.
+        """
+        db_progress = obj.progress or {}
+        if obj.is_terminal():
+            return db_progress
+        # Lazy import — keeps this module import-safe in environments
+        # without the redis package (it's optional at runtime, not
+        # build time).
+        from . import progress_channel
+        live = progress_channel.read(obj.pk)
+        if not live:
+            return db_progress
+        if not isinstance(db_progress, dict):
+            return live
+        return {**db_progress, **live}
+
     def get_preview(self, obj):
         """Dry-run counts from the analyze phase.
 
@@ -198,6 +229,7 @@ class ImportSessionListSerializer(serializers.ModelSerializer):
     operator_name = serializers.SerializerMethodField()
     open_issue_count = serializers.SerializerMethodField()
     transformation_rule_name = serializers.SerializerMethodField()
+    progress = serializers.SerializerMethodField()
 
     class Meta:
         model = ImportSession
@@ -245,3 +277,20 @@ class ImportSessionListSerializer(serializers.ModelSerializer):
         return ``None``."""
         rule = getattr(obj, "transformation_rule", None)
         return getattr(rule, "name", None) if rule else None
+
+    def get_progress(self, obj):
+        """Merge DB snapshot with Redis live data — same policy as the
+        full-session serializer. The queue refreshes every 3s while
+        any row is running, so per-row Redis updates show up as
+        inline progress badges (``75%`` etc.) within seconds of the
+        worker publishing them."""
+        db_progress = obj.progress or {}
+        if obj.is_terminal():
+            return db_progress
+        from . import progress_channel
+        live = progress_channel.read(obj.pk)
+        if not live:
+            return db_progress
+        if not isinstance(db_progress, dict):
+            return live
+        return {**db_progress, **live}

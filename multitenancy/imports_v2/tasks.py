@@ -97,6 +97,13 @@ def analyze_session_task(self, session_pk: int) -> None:
             "analyze_session_task #%s failed: %s", session.pk, exc,
         )
         _mark_session_error(session, exc, stage="analyze")
+    finally:
+        # Phase 6.z-g — clear the Redis live-progress key on terminal.
+        # TTL would reap it eventually but explicit clear keeps the
+        # key space tidy and avoids a stale read a fraction of a
+        # second after the DB snapshot flips to ``done``.
+        from . import progress_channel
+        progress_channel.clear(session.pk)
 
 
 @shared_task(
@@ -151,6 +158,11 @@ def commit_session_task(self, session_pk: int) -> None:
         session.refresh_from_db()
         if session.status == ImportSession.STATUS_COMMITTING:
             _mark_session_error(session, exc, stage="commit")
+    finally:
+        # Phase 6.z-g — clear the Redis live-progress key. Same
+        # reasoning as analyze_session_task above.
+        from . import progress_channel
+        progress_channel.clear(session.pk)
 
 
 @shared_task(

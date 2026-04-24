@@ -1157,3 +1157,238 @@ class V2StaleSessionReaperTests(TestCase):
         self.assertEqual(result["reaped"], 0)
         old_committed.refresh_from_db()
         self.assertEqual(old_committed.status, ImportSession.STATUS_COMMITTED)
+
+
+@override_settings(AUTH_OFF=True)
+class V2ProgressCallbackTests(TestCase):
+    """Phase 6.z-g — intra-atomic row-level progress via Redis channel.
+
+    The import job's ``progress_callback`` fires at sheet boundaries +
+    every N rows so the v2 service can publish row-level updates to
+    Redis (outside the DB transaction). Tests here exercise the
+    callback invocation pattern — the Redis integration is tested
+    via the serializer merge tests below with a mocked channel.
+    """
+
+    def test_callback_fires_at_sheet_boundary(self):
+        """``execute_import_job`` must call the callback at the start
+        of each sheet with ``stage=writing``, ``sheet_index``,
+        ``current_sheet``, and ``rows_total``."""
+        from multitenancy.tasks import execute_import_job
+
+        calls: list = []
+
+        def cb(fields):
+            calls.append(dict(fields))
+
+        # Minimal sheets — model must be in MODEL_APP_MAP or the loop
+        # short-circuits. Transaction is registered (accounting app).
+        # We don't actually care about success here; we care about the
+        # callback firing before any per-row work.
+        sheets = [
+            {"model": "Transaction", "rows": [{"x": 1}, {"x": 2}]},
+        ]
+        try:
+            execute_import_job(
+                company_id=1,
+                sheets=sheets,
+                commit=False,
+                progress_callback=cb,
+            )
+        except Exception:
+            # execute_import_job will likely error on a made-up row —
+            # that's fine, we just need the sheet-start callback.
+            pass
+
+        self.assertTrue(calls, "callback never fired")
+        first = calls[0]
+        self.assertEqual(first.get("stage"), "writing")
+        self.assertEqual(first.get("sheet_index"), 0)
+        self.assertEqual(first.get("current_sheet"), "Transaction")
+        self.assertEqual(first.get("rows_total"), 2)
+        self.assertEqual(first.get("rows_processed"), 0)
+
+    def test_callback_fires_every_100_rows(self):
+        """With a 250-row sheet the callback should fire at least at
+        rows 0, 100, and 200 (sheet-start + 2 throttled row updates)."""
+        from multitenancy.tasks import execute_import_job
+
+        calls: list = []
+
+        def cb(fields):
+            calls.append(dict(fields))
+
+        sheets = [
+            {"model": "Transaction", "rows": [{"x": i} for i in range(250)]},
+        ]
+        try:
+            execute_import_job(
+                company_id=1,
+                sheets=sheets,
+                commit=False,
+                progress_callback=cb,
+            )
+        except Exception:
+            pass
+
+        # Find rows_processed values from calls — should include at
+        # least 0, 100, 200.
+        processed_values = sorted({
+            c.get("rows_processed")
+            for c in calls
+            if c.get("rows_processed") is not None
+        })
+        self.assertIn(0, processed_values)
+        self.assertIn(100, processed_values)
+        self.assertIn(200, processed_values)
+
+    def test_callback_errors_dont_block_import(self):
+        """A misbehaving callback must not crash the worker — progress
+        is best-effort, the real work always wins."""
+        from multitenancy.tasks import execute_import_job
+
+        def cb(fields):
+            raise RuntimeError("callback exploded")
+
+        sheets = [
+            {"model": "Transaction", "rows": [{"x": 1}]},
+        ]
+        # Should NOT raise RuntimeError from the callback — it should
+        # be swallowed. The ``try/except`` below is just to ignore
+        # unrelated errors from the import itself.
+        try:
+            execute_import_job(
+                company_id=1,
+                sheets=sheets,
+                commit=False,
+                progress_callback=cb,
+            )
+        except RuntimeError as exc:
+            self.assertNotIn("callback exploded", str(exc))
+
+
+@override_settings(AUTH_OFF=True)
+class V2ProgressSerializerMergeTests(TestCase):
+    """Phase 6.z-g — serializer merges Redis live progress with DB
+    snapshot so the frontend sees the freshest data for non-terminal
+    sessions and the durable record for terminal ones.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.company = Company.objects.create(name="Acme Co")
+
+    def _make_session(self, status, db_progress=None):
+        return ImportSession.objects.create(
+            company_id=self.company.id,
+            mode=ImportSession.MODE_TEMPLATE,
+            status=status,
+            file_name="x.xlsx",
+            progress=db_progress or {},
+        )
+
+    def test_non_terminal_prefers_redis_live(self):
+        """Live row-level data from Redis overrides the DB stage
+        snapshot when the session is still running."""
+        from multitenancy.imports_v2.serializers import ImportSessionSerializer
+
+        session = self._make_session(
+            ImportSession.STATUS_COMMITTING,
+            db_progress={"stage": "writing", "sheets_total": 3},
+        )
+        live = {
+            "stage": "writing",
+            "current_sheet": "Transaction",
+            "rows_processed": 1500,
+            "rows_total": 5000,
+        }
+        with mock.patch(
+            "multitenancy.imports_v2.progress_channel.read",
+            return_value=live,
+        ):
+            data = ImportSessionSerializer(session).data
+        # DB field (sheets_total=3) preserved — not in live.
+        self.assertEqual(data["progress"]["sheets_total"], 3)
+        # Live fields override — row-level detail surfaces.
+        self.assertEqual(data["progress"]["rows_processed"], 1500)
+        self.assertEqual(data["progress"]["rows_total"], 5000)
+        self.assertEqual(data["progress"]["current_sheet"], "Transaction")
+
+    def test_non_terminal_falls_back_to_db_when_redis_empty(self):
+        """If Redis has no key (channel disabled, key TTL'd), return
+        the DB snapshot verbatim. Graceful degradation to 6.z-e
+        behavior."""
+        from multitenancy.imports_v2.serializers import ImportSessionSerializer
+
+        session = self._make_session(
+            ImportSession.STATUS_COMMITTING,
+            db_progress={"stage": "writing", "sheets_total": 3},
+        )
+        with mock.patch(
+            "multitenancy.imports_v2.progress_channel.read",
+            return_value=None,
+        ):
+            data = ImportSessionSerializer(session).data
+        self.assertEqual(data["progress"]["stage"], "writing")
+        self.assertEqual(data["progress"]["sheets_total"], 3)
+
+    def test_terminal_ignores_redis(self):
+        """Terminal sessions read only from the DB — Redis might
+        still have a stale key if the worker hasn't cleared it yet,
+        but the DB value is canonical once the session is terminal."""
+        from multitenancy.imports_v2.serializers import ImportSessionSerializer
+
+        session = self._make_session(
+            ImportSession.STATUS_COMMITTED,
+            db_progress={"stage": "done"},
+        )
+        stale_redis = {
+            "stage": "writing",
+            "rows_processed": 999,
+            "rows_total": 1000,
+        }
+        with mock.patch(
+            "multitenancy.imports_v2.progress_channel.read",
+            return_value=stale_redis,
+        ) as read_mock:
+            data = ImportSessionSerializer(session).data
+        # Terminal → serializer must not even ask Redis.
+        read_mock.assert_not_called()
+        self.assertEqual(data["progress"]["stage"], "done")
+        self.assertNotIn("rows_processed", data["progress"])
+
+
+@override_settings(AUTH_OFF=True)
+class V2ProgressChannelTests(TestCase):
+    """Phase 6.z-g — progress_channel module itself. Tests the
+    degradation behavior (no REDIS_URL) and the lazy-import pattern.
+    """
+
+    def test_publish_noop_when_redis_url_absent(self):
+        """If the settings lookup returns no Redis URL, publish should
+        silently do nothing. Dev without a broker → v2 still works,
+        just with coarse (stage-only) progress from 6.z-e."""
+        from multitenancy.imports_v2 import progress_channel
+
+        with mock.patch.object(
+            progress_channel, "_redis_client", return_value=None,
+        ):
+            # Must not raise.
+            progress_channel.publish(999, {"stage": "writing"})
+
+    def test_read_returns_none_when_redis_url_absent(self):
+        from multitenancy.imports_v2 import progress_channel
+
+        with mock.patch.object(
+            progress_channel, "_redis_client", return_value=None,
+        ):
+            self.assertIsNone(progress_channel.read(999))
+
+    def test_clear_noop_when_redis_url_absent(self):
+        from multitenancy.imports_v2 import progress_channel
+
+        with mock.patch.object(
+            progress_channel, "_redis_client", return_value=None,
+        ):
+            # Must not raise.
+            progress_channel.clear(999)

@@ -1486,12 +1486,29 @@ def run_import_job(self, company_id: int, sheets: List[Dict[str, Any]], commit: 
     )
 
 
+def _count_errors_so_far(outputs_by_model: Dict[str, List[Dict[str, Any]]]) -> int:
+    """Running total of error rows across every sheet processed so far.
+
+    Fed to the progress callback so the frontend's "N erros até agora"
+    badge stays live during the write loop. Counts any row whose
+    ``status`` == ``error`` — same definition the per-sheet report
+    uses in the import response.
+    """
+    total = 0
+    for rows in outputs_by_model.values():
+        for r in rows or []:
+            if (r or {}).get("status") == "error":
+                total += 1
+    return total
+
+
 def execute_import_job(
-    company_id: int, 
-    sheets: List[Dict[str, Any]], 
+    company_id: int,
+    sheets: List[Dict[str, Any]],
     commit: bool,
     import_metadata: Dict[str, Any] = None,
-    lookup_cache: Optional[Any] = None
+    lookup_cache: Optional[Any] = None,
+    progress_callback: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Importer with token->id mapping for FK resolution and a single atomic transaction.
@@ -1514,13 +1531,19 @@ def execute_import_job(
       - For each row: substitutions -> filter -> company context -> MPTT path -> *_fk resolution to *_id
       - Save; register token->id only for new rows (alphanumeric __row_id)
       - On preview (commit=False): rollback entire transaction at the end
-    
+
     Args:
         company_id: Company ID for the import
         sheets: List of sheet dictionaries with model and rows
         commit: Whether to commit (True) or preview (False)
         import_metadata: Optional metadata dict for notes (source, filename, function, etc.)
         lookup_cache: Optional LookupCache instance for efficient FK resolution (ETL context)
+        progress_callback: Optional callable invoked at sheet boundaries + every
+            PROGRESS_ROW_INTERVAL rows. Receives a dict:
+            ``{stage, sheet_index, sheets_total, current_sheet, rows_processed,
+            rows_total, errors_so_far}``. Phase 6.z-g — lets the v2 flow publish
+            intra-atomic row-level progress to an external channel (Redis)
+            that isn't held hostage by the transaction.
     """
     run_id = uuid.uuid4().hex[:8]
     logger.info("import_start run_id=%s commit=%s sheet_count=%d", run_id, bool(commit), len(sheets))
@@ -1542,12 +1565,44 @@ def execute_import_job(
     processed_substitution_rows: set = set()  # Track processed rows for commit substitutions
     substitution_cache: Dict[str, Dict[str, Dict[Any, Any]]] = {}  # Cache substitutions: {model_name: {field_name: {original: substituted}}}
 
+    # Phase 6.z-g — progress callback wiring. Throttles updates to every
+    # PROGRESS_ROW_INTERVAL rows so a 10k-row file produces ~40 Redis
+    # writes instead of 10k. Errors in the callback never bubble —
+    # progress publishing failures can't block the actual import.
+    PROGRESS_ROW_INTERVAL = 100
+    sheets_total_for_progress = len(sheets)
+
+    def _publish_progress(**fields: Any) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback({
+                "sheets_total": sheets_total_for_progress,
+                **fields,
+            })
+        except Exception:  # pragma: no cover - never blocks import
+            logger.debug("progress_callback raised; ignoring", exc_info=True)
+
     t0 = time.monotonic()
     with transaction.atomic():
         # One big atomic block; in preview, we'll mark rollback at the end
-        for sheet in sheets:
+        for sheet_index, sheet in enumerate(sheets):
             model_name = sheet.get("model")
             outputs_by_model.setdefault(model_name or "Unknown", [])
+
+            # Phase 6.z-g — publish "starting this sheet" so the
+            # frontend updates the current_sheet label + resets the
+            # row bar. Safe inside the atomic block: progress_callback
+            # writes to an external channel (Redis) outside the DB
+            # transaction.
+            _publish_progress(
+                stage="writing",
+                sheet_index=sheet_index,
+                current_sheet=model_name,
+                rows_total=len(sheet.get("rows") or []),
+                rows_processed=0,
+                errors_so_far=_count_errors_so_far(outputs_by_model),
+            )
             
             # Get sheet-specific metadata (e.g., sheet_name from ETL)
             sheet_metadata = import_metadata.copy() if import_metadata else {}
@@ -1634,7 +1689,21 @@ def execute_import_job(
             # Reuse resolved parent chains across rows (same prefix = one DB path walk).
             mptt_parent_path_cache: Dict[Tuple[Any, str, Tuple[str, ...]], Any] = {}
 
-            for row in rows:
+            rows_total_in_sheet = len(rows)
+            for row_index, row in enumerate(rows):
+                # Phase 6.z-g — publish throttled row-level progress
+                # every PROGRESS_ROW_INTERVAL rows. Progress writes
+                # hit Redis (not the DB), so they're visible to the
+                # polling frontend even from inside this atomic block.
+                if row_index and row_index % PROGRESS_ROW_INTERVAL == 0:
+                    _publish_progress(
+                        stage="writing",
+                        sheet_index=sheet_index,
+                        current_sheet=model_name,
+                        rows_total=rows_total_in_sheet,
+                        rows_processed=row_index,
+                        errors_so_far=_count_errors_so_far(outputs_by_model),
+                    )
                 raw = dict(row or {})
                 rid_raw = raw.pop("__row_id", None)
                 popped_erp = raw.pop("__erp_id", None)
