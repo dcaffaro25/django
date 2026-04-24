@@ -1,15 +1,20 @@
 """DRF views for the v2 template-import flow.
 
-Phase 2 endpoints (mounted at ``/api/core/imports/v2/...``):
+Endpoints mounted at ``/api/core/imports/v2/...``:
 
-  * ``POST /analyze``            — upload file, create session.
-  * ``GET /sessions/<id>``       — fetch session state.
+  * ``POST /analyze``            — upload file, enqueue analyze.
+  * ``POST /resolve/<id>``       — apply resolutions, re-detect issues.
+  * ``POST /commit/<id>``        — enqueue commit for a ready session.
+  * ``GET /sessions/<id>``       — fetch session state (used for polling).
   * ``DELETE /sessions/<id>``    — discard.
-  * ``POST /commit/<id>``        — commit a ready session.
 
-The ``/resolve/<id>`` endpoint ships in Phase 4. Until then a session
-with blocking issues is stuck in ``awaiting_resolve`` and commit
-returns 409.
+Analyze and commit both return 202 Accepted (not 201/200): the heavy
+work runs in a Celery worker (Phase 6.z) and the frontend polls the
+detail endpoint until the session leaves its non-terminal status. In
+eager mode (dev / tests without ``REDIS_URL``) the worker runs inline
+so the returned session is already terminal, and tests that assert
+``status in {"ready", "awaiting_resolve", "committed", ...}``
+immediately after the response continue to work.
 
 All endpoints are tenant-scoped: the session's ``company_id`` must
 match the request's resolved tenant. Cross-tenant access returns 404
@@ -109,16 +114,19 @@ class AnalyzeTemplateImportView(APIView):
             ).lower(),
         }
 
-        session = services.analyze_template(
+        session = services.analyze_template_async(
             company_id=company_id,
             user=request.user,
             file_bytes=file_bytes,
             file_name=file.name or "upload.xlsx",
             config=config,
         )
+        # 202 Accepted — the worker may still be running when this
+        # returns (in production). Frontend polls GET /sessions/<id>/
+        # until ``status`` leaves ``analyzing``.
         return Response(
             ImportSessionSerializer(session).data,
-            status=status.HTTP_201_CREATED,
+            status=status.HTTP_202_ACCEPTED,
         )
 
 
@@ -211,7 +219,7 @@ class AnalyzeETLImportView(APIView):
             elif isinstance(auto_je_raw, dict):
                 config["auto_create_journal_entries"] = auto_je_raw
 
-        session = services.analyze_etl(
+        session = services.analyze_etl_async(
             company_id=company_id,
             user=request.user,
             file_bytes=file_bytes,
@@ -219,9 +227,11 @@ class AnalyzeETLImportView(APIView):
             transformation_rule_id=rule_id,
             config=config,
         )
+        # 202 Accepted — see AnalyzeTemplateImportView.post for the
+        # polling contract.
         return Response(
             ImportSessionSerializer(session).data,
-            status=status.HTTP_201_CREATED,
+            status=status.HTTP_202_ACCEPTED,
         )
 
 
@@ -332,7 +342,7 @@ class CommitSessionView(APIView):
         session = _get_session_or_404(pk, company_id)
 
         try:
-            session = services.commit_session(session)
+            session = services.commit_session_async(session)
         except services.CommitNotReady as exc:
             return Response(
                 {
@@ -345,15 +355,12 @@ class CommitSessionView(APIView):
                 },
                 status=status.HTTP_409_CONFLICT,
             )
-        except Exception as exc:  # pragma: no cover - delegated
-            # Session was moved to ``error`` inside the service; surface
-            # the reason to the client.
-            return Response(
-                {"error": str(exc), "type": type(exc).__name__},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
 
+        # 202 Accepted — the worker may still be running when this
+        # returns (in production). In eager mode the worker ran inline,
+        # so the returned session is already ``committed`` or ``error``.
+        # Either way, frontend polls GET /sessions/<id>/ for status.
         return Response(
             ImportSessionSerializer(session).data,
-            status=status.HTTP_200_OK,
+            status=status.HTTP_202_ACCEPTED,
         )

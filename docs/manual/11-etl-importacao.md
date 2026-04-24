@@ -816,6 +816,24 @@ sessão" limpa os bytes armazenados no servidor e invalida o
 `session_id`. Faça isso se a pendência for grande demais para resolver
 interativamente — corrija na planilha e comece uma nova análise.
 
+### Processamento assíncrono (Celery)
+
+Tanto `analyze` quanto `commit` são executados em **workers Celery**
+(fase 6.z-a). O request HTTP responde `202 Accepted` imediatamente
+com a sessão em `analyzing` (ou `committing` no caso do commit); o
+frontend faz polling em `GET /sessions/<id>/` até o status sair do
+estado não-terminal.
+
+- Não há mais teto de 300s (timeout do gunicorn). Um arquivo de 5k
+  linhas que demoraria minutos agora roda tranquilo no worker.
+- Em dev/testes sem `REDIS_URL`, o Celery roda em modo `eager` —
+  `.delay()` vira chamada inline, então o comportamento é
+  indistinguível do modo síncrono antigo.
+- Se o worker cair no meio, a sessão fica em `analyzing` /
+  `committing`. O operador pode descartar e recomeçar; há uma
+  tarefa futura (6.z-c) para detectar sessões órfãs via TTL e
+  marcá-las automaticamente como `error`.
+
 ### Idempotência
 
 Re-analisar o mesmo arquivo cria **uma sessão nova** (o backend não
