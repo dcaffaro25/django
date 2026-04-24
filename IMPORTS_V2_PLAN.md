@@ -29,18 +29,19 @@ Phase 7 cleanup (burn-in gated) + optional follow-ups.
 | `d547670`   | Phase 4B — bad_date/negative/unmatched detectors + map/edit handlers + 24 t  |
 | `8d44dd4`   | Phase 5 — Template v2 frontend (toggle + DiagnosticsPanel + 6 issue cards)   |
 | `f253e0f`   | Phase 6 — ETL v2 frontend + ErpIdGroupsSection + serializer.transaction_groups |
-| (pending)   | Phase 6.x — Rule picker dropdown + ETL preview passthrough + AnalyzePreviewPanel |
+| `1951ff6`   | Phase 6.x — Rule picker dropdown + ETL preview passthrough + AnalyzePreviewPanel |
+| (pending)   | Phase 6.y — Template dry-run at analyze (≤5k rows auto; would_create/update/fail) |
 
-**Open follow-up — template dry-run at analyze.** The `AnalyzePreviewPanel`
-shipped in Phase 6.x surfaces `would_create` / `would_fail` counts from
-`ETLPipelineService.execute(commit=False)` for ETL sessions. Template
-sessions leave the panel empty because we don't yet run
-`execute_import_job(commit=False)` at analyze time — doing so would
-double the analyze cost on large imports (a 10k-row template would
-roll-back-write all 10k rows just to count them). Pick up as its own
-commit with a decision on: (a) always run it and accept the cost,
-(b) gate on row count, or (c) skip and show counts from the
-parsed_payload's per-sheet row totals only.
+**Resolved follow-up — template dry-run.** Phase 6.y shipped the
+missing piece: template analyze now runs `execute_import_job(commit=False)`
+when the total row count is under `TEMPLATE_DRY_RUN_ROW_THRESHOLD`
+(5000), tallies per-model create/update/fail counts, and stashes
+them on `parsed_payload["preview"]`. The `AnalyzePreviewPanel` now
+lights up for both modes. Above the threshold the dry-run is
+skipped (would double analyze cost on huge imports); operators still
+see sheet-level counts + full diagnostics, just not the bottom-line
+tallies. An explicit "Ver prévia detalhada" button for big files is
+the obvious next iteration if anyone asks for it.
 
 Nothing uncommitted on main. When resuming on a new machine:
 

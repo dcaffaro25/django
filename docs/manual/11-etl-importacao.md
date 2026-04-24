@@ -1032,15 +1032,20 @@ com o que o `commit` vai escrever:
 | Atualizar  | Quantas linhas existentes seriam atualizadas (lookup por `erp_id`). |
 | Falharia   | Quantas linhas estão marcadas para falhar no commit (erro já surfaceado como pendência acima). |
 
-Os valores vêm do dry-run do `ETLPipelineService.execute(commit=False)`
-— o mesmo que a pré-visualização clássica usa. Se uma linha estiver
-na coluna "Falharia", há uma pendência correspondente no painel de
-diagnósticos que você pode resolver antes de commitar.
+Os valores vêm de um dry-run do pipeline de importação
+(`commit=False`):
 
-> **Nota:** para sessões de **template** (não-ETL) o painel fica
-> oculto por enquanto — o modo template ainda não roda o dry-run no
-> `analyze` (faria o passo ficar duas vezes mais caro em arquivos
-> grandes; fica como commit de follow-up).
+- **Modo ETL:** sempre roda — `ETLPipelineService.execute(commit=False)`
+  já acontece na análise; as contagens são passadas adiante.
+- **Modo template:** roda automaticamente quando o total de linhas
+  do arquivo é ≤ 5000. Acima disso o passo é pulado (custaria
+  reescrever + rollback de milhares de linhas só pra contar) e o
+  painel fica oculto. O operador ainda vê o total por aba em
+  "Pronto para importar" e a lista de pendências.
+
+Se uma linha estiver na coluna "Falharia", há uma pendência
+correspondente no painel de diagnósticos que você pode resolver
+antes de commitar.
 
 ### Limitações conhecidas (v1 do modo interativo)
 

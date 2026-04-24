@@ -478,6 +478,95 @@ def _detect_unmatched_references(
 # --- public: analyze -------------------------------------------------------
 
 
+# --- template dry-run at analyze -------------------------------------------
+
+# Above this total row count the template analyze skips the dry-run step —
+# running ``execute_import_job(commit=False)`` on a 10k-row file means
+# rolling-back-writing 10k rows just to count them, which roughly doubles
+# analyze cost. The operator still gets the per-sheet row counts in
+# ``summary.sheets`` and full diagnostics; they just don't get
+# ``would_create`` / ``would_update`` / ``would_fail`` counts on the
+# preview panel.
+#
+# Threshold is deliberately conservative (5000). A follow-up can expose
+# this as a per-session knob (e.g. "rodar prévia detalhada" explicit
+# button) if operators want counts on bigger files.
+TEMPLATE_DRY_RUN_ROW_THRESHOLD = 5000
+
+
+def _template_dry_run_preview(
+    company_id: int,
+    sheets_dict: Dict[str, List[Dict[str, Any]]],
+    session_pk: int,
+    filename: str,
+) -> Dict[str, Any]:
+    """Run ``execute_import_job(commit=False)`` against the analyzed rows
+    and tally per-model would_create / would_update / would_fail counts
+    for the ``AnalyzePreviewPanel``.
+
+    Exceptions from the underlying import job are swallowed and logged —
+    analyze should never fail just because the preview step hit trouble.
+    The real commit will re-raise the same issue with full context if
+    it's a genuine bug in the input.
+
+    Returns a dict compatible with ``parsed_payload['preview']``:
+    ``{would_create, would_update, would_fail, total_rows}`` — keys the
+    serializer already exposes via the ``preview`` field.
+    """
+    sheets_for_job = [
+        {"model": sheet_name, "rows": rows}
+        for sheet_name, rows in sheets_dict.items()
+        if isinstance(rows, list)
+    ]
+    if not sheets_for_job:
+        return {}
+
+    try:
+        with transaction.atomic():
+            result = execute_import_job(
+                company_id=company_id,
+                sheets=sheets_for_job,
+                commit=False,
+                import_metadata={
+                    "source": "v2_template_dry_run",
+                    "function": "imports_v2.services.analyze_template",
+                    "session_id": session_pk,
+                    "filename": filename,
+                },
+            )
+    except Exception:  # pragma: no cover - defensive; see docstring
+        return {}
+
+    would_create: Dict[str, int] = {}
+    would_update: Dict[str, int] = {}
+    would_fail: Dict[str, int] = {}
+    total_rows = 0
+    for sheet_result in (result or {}).get("imports", []) or []:
+        model = sheet_result.get("model")
+        if not model:
+            continue
+        for row in sheet_result.get("result", []) or []:
+            total_rows += 1
+            status_val = (row.get("status") or "").lower()
+            action_val = (row.get("action") or "").lower()
+            if status_val == "error":
+                would_fail[model] = would_fail.get(model, 0) + 1
+                continue
+            if action_val == "create":
+                would_create[model] = would_create.get(model, 0) + 1
+            elif action_val == "update":
+                would_update[model] = would_update.get(model, 0) + 1
+            # rows with action="delete" or "skipped_duplicate" etc. are
+            # not counted in any bucket — the panel only reports the
+            # three write intents.
+    return {
+        "would_create": would_create,
+        "would_update": would_update,
+        "would_fail": would_fail,
+        "total_rows": total_rows,
+    }
+
+
 def analyze_template(
     *,
     company_id: int,
@@ -533,11 +622,32 @@ def analyze_template(
             rows, sheet_name, company_id=company_id,
         ))
 
+    # Dry-run preview — gated on row count to keep analyze cheap on big
+    # imports. For files under the threshold, runs
+    # ``execute_import_job(commit=False)`` and tallies per-model
+    # would_create / would_update / would_fail so the
+    # ``AnalyzePreviewPanel`` can render "what commit would write".
+    # Above the threshold we skip — operator still sees sheet-level row
+    # counts via ``summary.sheets`` plus the open_issues list, just not
+    # the bottom-line create/update/fail tallies.
+    total_rows = sum(
+        len(rows) if isinstance(rows, list) else 0
+        for rows in sheets.values()
+    )
+    preview: Dict[str, Any] = {}
+    if 0 < total_rows <= TEMPLATE_DRY_RUN_ROW_THRESHOLD:
+        preview = _template_dry_run_preview(
+            company_id=company_id,
+            sheets_dict=sheets,
+            session_pk=session.pk,
+            filename=session.file_name,
+        )
+
     # Freeze the parsed payload on the session so commit/resolve can read
     # it without re-parsing. The raw bytes stay on ``file_bytes`` too
     # (redundant but intentional — resolve may re-parse with different
     # config and we want both versions available).
-    session.parsed_payload = {"sheets": sheets}
+    session.parsed_payload = {"sheets": sheets, "preview": preview}
     session.open_issues = detected_issues
     if issue_mod.has_blocking_issues(detected_issues):
         session.status = ImportSession.STATUS_AWAITING_RESOLVE
