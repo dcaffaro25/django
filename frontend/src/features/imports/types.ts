@@ -275,6 +275,19 @@ export interface StagedSubstitutionRule {
   source_issue_id?: string | null
 }
 
+/**
+ * Compact view of how the parsed rows cluster by ``__erp_id``. Populated
+ * server-side by the serializer (keeps ``parsed_payload`` internal) so
+ * the UI can render the ETL v2 "Grupos de erp_id" panel without another
+ * round-trip.
+ */
+export interface ImportTransactionGroup {
+  erp_id: string | null
+  row_count: number
+  has_conflict: boolean
+  rows: Record<string, unknown>[]
+}
+
 export interface ImportSession {
   id: number
   company: number
@@ -295,6 +308,7 @@ export interface ImportSession {
   is_committable: boolean
   is_terminal: boolean
   substitutions_applied: SubstitutionApplied[]
+  transaction_groups: ImportTransactionGroup[]
 }
 
 /** Request body for POST /v2/resolve/<id>/. Each resolution targets one

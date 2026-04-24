@@ -850,6 +850,188 @@ manualmente.
 
 ---
 
+## 11.10e Modo interativo (v2) — ETL
+
+Versão interativa do pipeline ETL documentado em 11.3 – 11.9. Mantém
+a mesma semântica de transformação + substituição + validação, mas
+**quebra o `execute` em duas fases** — `analyze` cria uma sessão no
+servidor com o plano calculado; `commit` grava. Entre as duas, o
+operador pode:
+
+- ver **como as linhas foram agrupadas** por `erp_id` (para rotas com
+  `auto_create_journal_entries` habilitado, uma `Transaction` agrega
+  N `JournalEntry`s — ver 11.10c.2);
+- revisar **cada substituição aplicada** como `campo: antigo → novo`
+  (antes de gravar);
+- resolver pendências (conta não mapeada, data inválida, coluna
+  esperada ausente, conflito de `erp_id`, etc.) — inclusive criando
+  `SubstitutionRule`s automaticamente a partir dos mapeamentos que
+  fizer na tela.
+
+### Ativação
+
+Tela: `/imports` (aba **Importação ETL**) · botão **Modo interativo
+(v2)** no topo.
+
+Parâmetros adicionais que só existem no modo v2:
+
+- `transformation_rule_id` (obrigatório) — qual regra de transformação
+  aplicar. O link "Ver regras" leva à página `/imports/etl-rules`
+  onde você pode copiar o ID.
+- `auto_create_journal_entries` (opcional) — JSON idêntico ao aceito
+  pelo endpoint legado `/api/core/etl/execute/`. Deixe em branco para
+  importar sem contra-partida automática.
+
+Exemplo mínimo do JSON:
+
+```json
+{
+  "enabled": true,
+  "bank_account_field": "bank_account_id",
+  "opposing_account_field": "account_path"
+}
+```
+
+### Fluxo de tela
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ Modo: ( Clássico )  ( ✨ Modo interativo (v2) )                │
+├────────────────────────────────────────────────────────────────┤
+│ [file input]                                                   │
+│ transformation_rule_id: [ 12   ]  Row limit: [ 0 ]  [Ver regras]│
+│ auto_create_journal_entries (JSON, opcional):                  │
+│ ┌────────────────────────────────────────────────────────────┐ │
+│ │ {"enabled": true, "bank_account_field": ... }              │ │
+│ └────────────────────────────────────────────────────────────┘ │
+│ [ Analisar ]                                                   │
+└────────────────────────────────────────────────────────────────┘
+    │
+    ▼  (sessão criada)
+┌────────────────────────────────────────────────────────────────┐
+│ ▾ Grupos de erp_id · 3 grupos · 1 com linhas múltiplas         │
+│   ▸ OMIE-NF-123    5 linhas   [GRUPO]   Será 1 Tx + N JEs      │
+│   ▸ OMIE-NF-124    1 linha    [OK]      Transaction simples    │
+│   ▸ (sem erp_id)   2 linhas   [OK]      ...                    │
+│                                                                │
+│ ⚠ Existem problemas que precisam ser resolvidos…               │
+│                                          [ Importar ] (off)   │
+│                                                                │
+│ ℹ Substituições aplicadas                                      │
+│   [account_path: "Aluguel" → "Despesas > Aluguel"]             │
+│                                                                │
+│ ⚠ Parâmetros ausentes (1) — ETL                                │
+│   ┌────────────────────────────────────────────────────────┐   │
+│   │ Coluna esperada ``bank_account_id`` não está em        │   │
+│   │ Transaction. Ajuste o mapeamento da regra ou desabilite│   │
+│   │ auto_create_journal_entries.                           │   │
+│   │ [ Editar regra ]  [ Abortar ]                          │   │
+│   └────────────────────────────────────────────────────────┘   │
+│                                                                │
+│ ⚠ Referências não mapeadas (2)                                 │
+│   ... (mesmos cartões de 11.10d)                               │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### Pendências esperadas apenas no ETL
+
+Além de todos os tipos descritos em 11.10d
+(`erp_id_conflict`, `unmatched_reference`, `fk_ambiguous`,
+`bad_date_format`, `negative_amount`), o modo ETL também detecta:
+
+**`missing_etl_parameter`** — a regra de transformação (ou a config
+em `auto_create_journal_entries`) espera uma coluna nas linhas
+transformadas, mas ela não existe. Por exemplo: o JSON diz
+`"bank_account_field": "bank_account_id"` mas nenhuma linha expõe
+`bank_account_id`. Causa comum: o `column_mappings` da regra não
+produz essa coluna a partir do arquivo fonte.
+
+Ação disponível: **Editar regra** (deep-link para o editor) +
+**Abortar**. Não há fix inline — corrija a regra e reimporte.
+
+### Panel "Grupos de `erp_id`"
+
+Uma seção exclusiva do modo ETL, surfaceada acima da lista de
+pendências. Lista cada `erp_id` distinto em
+`transformed_data.Transaction`:
+
+| Status   | Significado                                           |
+|----------|-------------------------------------------------------|
+| OK       | 1 linha, sem conflito. Vira 1 `Transaction`.          |
+| GRUPO    | N>1 linhas, sem conflito. Vira 1 `Transaction` + N `JournalEntry`s (perna agregada no banco, §11.10c.2). |
+| CONFLITO | Linhas do mesmo `erp_id` divergem em campos-chave. Há um cartão `erp_id_conflict` abaixo esperando resolução. |
+
+Cada linha da tabela expande para mostrar as linhas transformadas
+cruas (JSON compacto) — útil para confirmar o que o pipeline produziu
+antes de gravar.
+
+**Observação importante:** no modo ETL o agrupamento acontece sobre
+as linhas **pós-substituição/transformação**, não sobre o arquivo
+original. Substituições de `erp_id` (raras, mas possíveis) já estão
+aplicadas quando os grupos são montados.
+
+### Panel "Substituições aplicadas"
+
+Populado a partir de `session.substitutions_applied` — cada
+substituição que o `ETLPipelineService` aplicou aparece como um
+badge `campo: valor antigo → valor novo`. Use isto para confirmar
+que o pipeline reescreveu os campos como esperado antes de commitar.
+
+Exemplo comum: `account_path: "Aluguel" → "Despesas > Aluguel"` (uma
+regra de substituição existente canonicalizou o caminho da conta).
+
+### Passo a passo
+
+**1. Ative o modo interativo.**
+
+**2. Informe `transformation_rule_id`** e (opcional)
+`auto_create_journal_entries`. Clique **Analisar**.
+
+**3. Revise o painel "Grupos de `erp_id`"** — confirme se as linhas
+agruparam como você esperava. Se um grupo não deveria existir (dois
+boletos diferentes com o mesmo `erp_id` por engano na planilha),
+corrija a fonte e reimporte; o modo interativo não tem ação para
+"dividir um grupo em dois".
+
+**4. Revise "Substituições aplicadas"** — todas as substituições
+feitas pelo engine estão listadas. Se alguma não fizer sentido,
+ajuste a `SubstitutionRule` correspondente em
+`/imports/substitutions` e reimporte.
+
+**5. Resolva pendências** (igual ao §11.10d) — cada cartão oferece
+as ações que o detector declarou em `proposed_actions`.
+
+**6. Clique Importar.** O backend roda `ETLPipelineService.execute`
+com `commit=True` usando os mesmos bytes do arquivo + a config que
+você passou, materializa qualquer `SubstitutionRule` que você marcou
+em "criar regra", e grava tudo dentro de uma transação atômica.
+
+### Diferenças em relação ao ETL clássico
+
+| | Clássico (v1)              | Interativo (v2)                           |
+|--------------------|-----------------------------|-------------------------------------------|
+| Passos             | Preview → Execute          | Analyze → (Resolve)* → Commit             |
+| Estado             | Sem persistência intermediária | Sessão no servidor, TTL 24h            |
+| Substituições      | Só listadas se falharem    | Listadas todas, com `antigo → novo`       |
+| Referências não encontradas | Erro por linha, operator corrige planilha | Cartão na tela, mapeia para registro existente + cria regra em um clique |
+| Linhas com mesmo `erp_id` | Agrupa automaticamente (11.10c.2) — sem validação extra | Igual, mas com visualização + detecção de conflitos de campos |
+| Parâmetros faltantes da config ETL | Silenciosamente ignorados (lançamento sai errado) | Bloqueia o commit com `missing_etl_parameter` |
+| Auditoria de regras criadas | N/A (regras só criadas manualmente) | `SubstitutionRule.source="import_session"` + `source_session` FK |
+
+### Limitações conhecidas (v1 do modo interativo)
+
+Além das listadas em §11.10d:
+
+- `transformation_rule_id` é digitado manualmente — ainda não temos um
+  seletor com busca. Use o link "Ver regras" para descobrir o ID.
+- `auto_create_journal_entries` é um campo de texto livre (JSON). Um
+  formulário guiado (campo a campo) fica para iteração futura.
+- O painel "Grupos de `erp_id`" não oferece ação para dividir um grupo
+  em dois — se dois boletos realmente têm o mesmo `erp_id` por engano
+  do ERP, corrija na fonte e reimporte.
+
+---
+
 ## 11.11 Dicas e Boas Práticas
 
 ### Preparação da Planilha

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react"
+import { useCallback, useMemo, useState } from "react"
 import { Link } from "react-router-dom"
 import { toast } from "sonner"
 import {
@@ -10,12 +10,22 @@ import {
   Eye,
   FileSpreadsheet,
   Play,
+  Sparkles,
   Upload,
   XCircle,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { useEtlExecute, useEtlPreview } from "@/features/imports"
-import type { EtlError, EtlExecuteResponse, EtlWarning } from "@/features/imports/types"
+import { importsV2 } from "@/features/imports/api"
+import type {
+  EtlError,
+  EtlExecuteResponse,
+  EtlWarning,
+  ImportResolutionInput,
+  ImportSession,
+} from "@/features/imports/types"
+import { DiagnosticsPanel } from "@/components/imports/DiagnosticsPanel"
+import { ErpIdGroupsSection } from "@/components/imports/ErpIdGroupsSection"
 import { cn } from "@/lib/utils"
 
 type Bucket = "python" | "database" | "substitution" | "warnings"
@@ -215,6 +225,130 @@ export function EtlImportPage() {
   const isPreviewResult = !!preview.data && !execute.data
   const isPending = preview.isPending || execute.isPending
 
+  // v2 interactive mode — see ImportTemplatesPage for the symmetric
+  // template-side setup. ETL requires a ``transformation_rule_id`` at
+  // analyze-time and optionally accepts an ``auto_create_journal_entries``
+  // JSON config (matching the legacy POST-body semantics).
+  const [mode, setMode] = useState<"v1" | "v2">("v1")
+  const [v2RuleId, setV2RuleId] = useState<string>("")
+  const [v2AutoJeJson, setV2AutoJeJson] = useState<string>("")
+  const [v2Session, setV2Session] = useState<ImportSession | null>(null)
+  const [v2Pending, setV2Pending] = useState<"analyze" | "resolve" | "commit" | null>(
+    null,
+  )
+
+  const runV2Analyze = useCallback(async () => {
+    if (!file) {
+      toast.error("Selecione um arquivo .xlsx.")
+      return
+    }
+    const ruleId = Number(v2RuleId)
+    if (!Number.isFinite(ruleId) || ruleId <= 0) {
+      toast.error("Informe um transformation_rule_id válido.")
+      return
+    }
+    let autoJe: Record<string, unknown> | undefined
+    if (v2AutoJeJson.trim()) {
+      try {
+        const parsed = JSON.parse(v2AutoJeJson)
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          autoJe = parsed as Record<string, unknown>
+        } else {
+          toast.error("auto_create_journal_entries deve ser um objeto JSON.")
+          return
+        }
+      } catch {
+        toast.error("auto_create_journal_entries: JSON inválido.")
+        return
+      }
+    }
+    setV2Pending("analyze")
+    try {
+      const session = await importsV2.etl.analyze({
+        file,
+        transformationRuleId: ruleId,
+        rowLimit: rowLimit === 0 ? undefined : rowLimit,
+        autoCreateJournalEntries: autoJe,
+      })
+      setV2Session(session)
+      if (session.status === "ready") {
+        toast.success("Pronto para importar — nenhuma pendência encontrada.")
+      } else if (session.status === "awaiting_resolve") {
+        const n = session.open_issues?.length ?? 0
+        toast.message(
+          `Sessão criada — ${n} pendência${n === 1 ? "" : "s"} aguardando resolução.`,
+        )
+      } else if (session.status === "error") {
+        toast.error(
+          `Falha ao analisar: ${
+            (session.result as { error?: string })?.error ?? "erro desconhecido"
+          }`,
+        )
+      }
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { detail?: string; error?: string } } })
+          ?.response?.data?.error ?? (err instanceof Error ? err.message : "erro")
+      toast.error(`Análise falhou: ${msg}`)
+    } finally {
+      setV2Pending(null)
+    }
+  }, [file, rowLimit, v2AutoJeJson, v2RuleId])
+
+  const runV2Resolve = useCallback(
+    async (resolutions: ImportResolutionInput[]) => {
+      if (!v2Session) return
+      setV2Pending("resolve")
+      try {
+        const updated = await importsV2.etl.resolve(v2Session.id, {
+          resolutions,
+        })
+        setV2Session(updated)
+        if (updated.status === "ready") {
+          toast.success("Pendências resolvidas — pronto para importar.")
+        }
+      } catch (err: unknown) {
+        const msg =
+          (err as { response?: { data?: { detail?: string; error?: string } } })
+            ?.response?.data?.error ?? (err instanceof Error ? err.message : "erro")
+        toast.error(`Falha ao resolver: ${msg}`)
+      } finally {
+        setV2Pending(null)
+      }
+    },
+    [v2Session],
+  )
+
+  const runV2Commit = useCallback(async () => {
+    if (!v2Session) return
+    setV2Pending("commit")
+    try {
+      const finalised = await importsV2.etl.commit(v2Session.id)
+      setV2Session(finalised)
+      if (finalised.status === "committed") {
+        toast.success("Importação concluída.")
+      } else if (finalised.status === "error") {
+        toast.error(
+          `Falha no commit: ${
+            (finalised.result as { error?: string })?.error ?? "erro"
+          }`,
+        )
+      }
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { detail?: string; error?: string } } })
+          ?.response?.data?.error ?? (err instanceof Error ? err.message : "erro")
+      toast.error(`Commit falhou: ${msg}`)
+    } finally {
+      setV2Pending(null)
+    }
+  }, [v2Session])
+
+  const resetV2 = useCallback(() => {
+    setV2Session(null)
+    setV2Pending(null)
+  }, [])
+
   const [open, setOpen] = useState<Record<Bucket, boolean>>({
     python: true,
     database: true,
@@ -296,6 +430,51 @@ export function EtlImportPage() {
         subtitle="Pré-visualize o efeito do arquivo antes de commitar. Usa __row_id para criar/editar/deletar."
       />
 
+      {/* Mode toggle mirrors ImportTemplatesPage — ``v1`` keeps the
+          legacy preview/execute flow byte-identical; ``v2`` swaps in
+          the analyze → resolve → commit session-based flow with the
+          diagnostics panel + erp_id groups visualisation. */}
+      <div className="card-elevated flex items-center gap-3 p-3 text-[12px]">
+        <span className="text-muted-foreground">Modo:</span>
+        <div className="inline-flex overflow-hidden rounded-md border border-border">
+          <button
+            onClick={() => {
+              setMode("v1")
+              resetV2()
+            }}
+            className={cn(
+              "h-7 px-3 text-[12px] font-medium",
+              mode === "v1"
+                ? "bg-primary text-primary-foreground"
+                : "bg-background hover:bg-accent",
+            )}
+          >
+            Clássico
+          </button>
+          <button
+            onClick={() => {
+              setMode("v2")
+              preview.reset()
+              execute.reset()
+            }}
+            className={cn(
+              "inline-flex h-7 items-center gap-1.5 px-3 text-[12px] font-medium",
+              mode === "v2"
+                ? "bg-primary text-primary-foreground"
+                : "bg-background hover:bg-accent",
+            )}
+          >
+            <Sparkles className="h-3.5 w-3.5" />
+            Modo interativo (v2)
+          </button>
+        </div>
+        {mode === "v2" && (
+          <span className="text-[11px] text-muted-foreground">
+            Analisa o arquivo, mostra grupos de <code className="font-mono">erp_id</code>, substituições aplicadas e pendências antes de importar.
+          </span>
+        )}
+      </div>
+
       <div className="card-elevated space-y-3 p-4">
         <label className="flex items-center gap-3">
           <input
@@ -305,6 +484,7 @@ export function EtlImportPage() {
               setFile(e.target.files?.[0] ?? null)
               preview.reset()
               execute.reset()
+              resetV2()
             }}
             className="block w-full text-[12px] file:mr-3 file:rounded-md file:border file:border-border file:bg-background file:px-3 file:py-1.5 file:text-[12px] file:font-medium hover:file:bg-accent"
           />
@@ -318,56 +498,157 @@ export function EtlImportPage() {
           </div>
         )}
 
-        <div className="flex flex-wrap items-end gap-3">
-          <label className="flex flex-col gap-1">
-            <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-              Row limit (0 = todas)
-            </span>
-            <input
-              type="number"
-              min={0}
-              max={100000}
-              value={rowLimit}
-              onChange={(e) => setRowLimit(Math.max(0, Number(e.target.value) || 0))}
-              className="h-8 w-28 rounded-md border border-border bg-background px-2 text-[13px] outline-none focus:border-ring"
-            />
-          </label>
+        {mode === "v1" ? (
+          <div className="flex flex-wrap items-end gap-3">
+            <label className="flex flex-col gap-1">
+              <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                Row limit (0 = todas)
+              </span>
+              <input
+                type="number"
+                min={0}
+                max={100000}
+                value={rowLimit}
+                onChange={(e) => setRowLimit(Math.max(0, Number(e.target.value) || 0))}
+                className="h-8 w-28 rounded-md border border-border bg-background px-2 text-[13px] outline-none focus:border-ring"
+              />
+            </label>
 
-          <button
-            onClick={onPreview}
-            disabled={!file || isPending}
-            className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent disabled:opacity-50"
-            title="Dry-run: valida e simula sem gravar no banco."
-          >
-            {preview.isPending ? (
-              <Upload className="h-3.5 w-3.5 animate-pulse" />
-            ) : (
-              <Eye className="h-3.5 w-3.5" />
-            )}
-            {preview.isPending ? "Simulando…" : "Pré-visualizar"}
-          </button>
+            <button
+              onClick={onPreview}
+              disabled={!file || isPending}
+              className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent disabled:opacity-50"
+              title="Dry-run: valida e simula sem gravar no banco."
+            >
+              {preview.isPending ? (
+                <Upload className="h-3.5 w-3.5 animate-pulse" />
+              ) : (
+                <Eye className="h-3.5 w-3.5" />
+              )}
+              {preview.isPending ? "Simulando…" : "Pré-visualizar"}
+            </button>
 
-          <button
-            onClick={onExecute}
-            disabled={!file || isPending || !canExecute}
-            className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-            title={
-              canExecute
-                ? "Roda novamente e commita no banco."
-                : "Rode um preview sem erros antes de executar."
-            }
-          >
-            {execute.isPending ? (
-              <Upload className="h-3.5 w-3.5 animate-pulse" />
-            ) : (
-              <Play className="h-3.5 w-3.5" />
-            )}
-            {execute.isPending ? "Executando…" : "Executar para valer"}
-          </button>
-        </div>
+            <button
+              onClick={onExecute}
+              disabled={!file || isPending || !canExecute}
+              className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              title={
+                canExecute
+                  ? "Roda novamente e commita no banco."
+                  : "Rode um preview sem erros antes de executar."
+              }
+            >
+              {execute.isPending ? (
+                <Upload className="h-3.5 w-3.5 animate-pulse" />
+              ) : (
+                <Play className="h-3.5 w-3.5" />
+              )}
+              {execute.isPending ? "Executando…" : "Executar para valer"}
+            </button>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-end gap-3">
+              <label className="flex flex-col gap-1">
+                <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                  transformation_rule_id
+                </span>
+                <input
+                  type="number"
+                  min={1}
+                  placeholder="ex. 12"
+                  value={v2RuleId}
+                  onChange={(e) => setV2RuleId(e.target.value)}
+                  className="h-8 w-28 rounded-md border border-border bg-background px-2 text-[13px] outline-none focus:border-ring"
+                />
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Row limit (0 = todas)
+                </span>
+                <input
+                  type="number"
+                  min={0}
+                  max={100000}
+                  value={rowLimit}
+                  onChange={(e) => setRowLimit(Math.max(0, Number(e.target.value) || 0))}
+                  className="h-8 w-28 rounded-md border border-border bg-background px-2 text-[13px] outline-none focus:border-ring"
+                />
+              </label>
+              <Link
+                to="/imports/etl-rules"
+                className="inline-flex h-8 items-center gap-1 self-end rounded-md border border-border bg-background px-2.5 text-[11px] font-medium text-muted-foreground hover:bg-accent"
+                title="Abre a tela de regras de transformação para descobrir o ID."
+              >
+                Ver regras
+              </Link>
+            </div>
+            <label className="flex flex-col gap-1">
+              <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                auto_create_journal_entries (JSON, opcional)
+              </span>
+              <textarea
+                value={v2AutoJeJson}
+                onChange={(e) => setV2AutoJeJson(e.target.value)}
+                placeholder='{"enabled": true, "bank_account_field": "bank_account_id", "opposing_account_field": "account_path"}'
+                rows={3}
+                className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-[11px] font-mono outline-none focus:border-ring"
+              />
+              <span className="text-[10px] text-muted-foreground">
+                Deixe em branco para importar sem geração automática de lançamentos contra-partida.
+              </span>
+            </label>
+            <div className="flex flex-wrap items-end gap-3">
+              <button
+                onClick={runV2Analyze}
+                disabled={
+                  !file ||
+                  v2Pending != null ||
+                  (v2Session != null && !v2Session.is_terminal)
+                }
+                className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                title={
+                  v2Session != null && !v2Session.is_terminal
+                    ? "Sessão já em andamento — descarte-a antes de reanalisar."
+                    : "Analisa o arquivo com a regra informada e cria uma sessão."
+                }
+              >
+                {v2Pending === "analyze" ? (
+                  <Upload className="h-3.5 w-3.5 animate-pulse" />
+                ) : (
+                  <Sparkles className="h-3.5 w-3.5" />
+                )}
+                {v2Pending === "analyze" ? "Analisando…" : "Analisar"}
+              </button>
+              {v2Session && !v2Session.is_terminal && (
+                <button
+                  onClick={resetV2}
+                  disabled={v2Pending != null}
+                  className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent disabled:opacity-50"
+                  title="Descarta a sessão e começa uma nova análise."
+                >
+                  Descartar sessão
+                </button>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
-      {res && (
+      {mode === "v2" && v2Session && (
+        <div className="space-y-3">
+          <ErpIdGroupsSection session={v2Session} />
+          <DiagnosticsPanel
+            session={v2Session}
+            onResolve={runV2Resolve}
+            isResolving={v2Pending === "resolve"}
+            onCommit={runV2Commit}
+            isCommitting={v2Pending === "commit"}
+          />
+        </div>
+      )}
+
+      {mode === "v1" && res && (
         <div className="space-y-3">
           {/* Verdict strip */}
           <div
