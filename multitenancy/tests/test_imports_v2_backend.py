@@ -1159,6 +1159,56 @@ class V2StaleSessionReaperTests(TestCase):
         self.assertEqual(old_committed.status, ImportSession.STATUS_COMMITTED)
 
 
+class V2TaskRegistrationTests(TestCase):
+    """Regression: ensure the v2 ``@shared_task``s land in the worker's
+    global Celery registry at boot.
+
+    Why this test exists — the three v2 tasks live at
+    ``multitenancy/imports_v2/tasks.py``, a nested module that Celery's
+    default ``autodiscover_tasks()`` (scans only each app's top-level
+    ``tasks.py``) does NOT reach. Without a transitive import from
+    ``multitenancy/tasks.py``, the **web** process registers them
+    (via URLConf → views → services → tasks) but the **worker**
+    process does not — producing the silent production failure where
+    ``.delay()`` and Beat-scheduled tasks are dropped on the worker
+    side with a ``Received unregistered task`` log and nothing ever
+    runs.
+    """
+
+    def test_multitenancy_tasks_transitively_imports_v2_tasks(self):
+        """The top-level task module must keep the nested module as an
+        attribute so a linter / future refactor can't quietly drop the
+        import."""
+        import multitenancy.tasks as top_tasks
+        from multitenancy.imports_v2 import tasks as nested_tasks
+
+        self.assertIs(
+            top_tasks._imports_v2_tasks_register, nested_tasks,
+            "multitenancy/tasks.py must import "
+            "multitenancy.imports_v2.tasks so Celery autodiscover "
+            "reaches it on the worker. See module-level comment for "
+            "the full symptom.",
+        )
+
+    def test_v2_task_names_registered_on_celery_app(self):
+        """The three v2 @shared_task names must be present in the
+        global Celery registry so the worker can dispatch them."""
+        from nord_backend.celery import app
+
+        required_names = (
+            "imports_v2.analyze_session",
+            "imports_v2.commit_session",
+            "imports_v2.reap_stale_sessions",
+        )
+        missing = [n for n in required_names if n not in app.tasks]
+        self.assertEqual(
+            missing, [],
+            f"These v2 task names are missing from app.tasks: {missing}. "
+            "The worker process cannot execute them — Beat schedules "
+            "and .delay() calls will be silently dropped.",
+        )
+
+
 @override_settings(AUTH_OFF=True)
 class V2ProgressCallbackTests(TestCase):
     """Phase 6.z-g — intra-atomic row-level progress via Redis channel.

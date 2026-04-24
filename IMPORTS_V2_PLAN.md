@@ -47,7 +47,8 @@ burn-in**) + the B1–B4 backend backlog (optional follow-ups).
 | `5bfd606`   | Auth fix — `/api/auth/me/` endpoint so SuperuserGuard actually works |
 | `96e796c`   | Admin UX — platform-admin links moved from sidebar to user dropdown |
 | `e651918`   | Admin — RuntimePage renderer polish (total_tasks dict, uptime, prefetch label) |
-| `296735f`   | Ops — strip unused `workloads[]` from railway.json + correct the docs (head of main) |
+| `296735f`   | Ops — strip unused `workloads[]` from railway.json + correct the docs |
+| `<pending>` | Fix — register v2 nested @shared_tasks with autodiscover (worker-side bug; sessions 4/5/6 in prod) |
 
 **Resolved follow-up — template dry-run.** Phase 6.y shipped the
 missing piece: template analyze now runs `execute_import_job(commit=False)`
@@ -493,6 +494,49 @@ the Railway `switchback:17976` DB without `0035` being recorded in
 in this worktree for the exact runbook we ran. Both 0035 and 0036 are
 now applied and recorded on prod. If a future partial-apply happens,
 re-use the same diag+fix pattern.
+
+### Worker task-registry bug — nested tasks + autodiscover (2026-04-24)
+
+**Symptom**: `/admin/runtime` reported 3 stale v2 sessions (pks 4, 5,
+6). Beat logs showed the `imports-v2-reap-stale-sessions` task firing
+on its 5-min schedule, but the sessions never flipped to `error`.
+
+**Root cause**: `nord_backend.celery.app.autodiscover_tasks()` with no
+args scans each `INSTALLED_APPS` entry's top-level `tasks.py` / `tasks/`
+package. It **does not recurse** into subpackages. The v2 tasks live at
+`multitenancy/imports_v2/tasks.py` — a nested module. Nothing on the
+worker boot path imported it, so the three `@shared_task`s
+(`imports_v2.analyze_session`, `imports_v2.commit_session`,
+`imports_v2.reap_stale_sessions`) were **absent** from the worker
+process's registry. The **web** process had them (via URLConf → views →
+services → tasks) and could enqueue via `.delay()`, but the worker
+silently rejected every message with `Received unregistered task`.
+
+Sessions 4/5/6 got stuck in `analyzing`/`committing` because their
+analyze/commit tasks were dropped. The reaper was supposed to clean
+them — but the reaper was unregistered too, so Beat ticked forever
+without effect.
+
+**Fix**: one-line transitive import at the top of
+`multitenancy/tasks.py`:
+
+```python
+from multitenancy.imports_v2 import tasks as _imports_v2_tasks_register  # noqa: F401
+```
+
+This forces Python to load the nested module when Celery autodiscovers
+`multitenancy.tasks`. Each `@shared_task` on it self-registers on
+import, so the worker registry ends up populated on boot.
+
+**Regression test**: `V2TaskRegistrationTests` in
+`test_imports_v2_backend.py` — asserts the transitive import attribute
+is preserved AND the three task names land in `app.tasks`.
+
+**Lesson for future nested tasks**: any `@shared_task` placed in a
+subpackage (`app/subpkg/tasks.py`) must be transitively imported by
+the app's top-level `tasks.py`, OR the subpackage must be promoted to
+its own `INSTALLED_APPS` entry, OR `autodiscover_tasks()` must be
+called with an explicit list. Default behaviour does NOT cover them.
 
 ### Tests pass live on these paths
 
@@ -1094,7 +1138,7 @@ new constraints:
 
 ---
 
-*Last updated: 2026-04-24, after the 6.z-h ops follow-ups
-(head of main `296735f`). All coded phases 1–6.z-h are in prod.
-Next session: start with §1 status, then either wait on Phase 7
-burn-in or pick up the B1–B4 backend backlog.*
+*Last updated: 2026-04-24, after the autodiscover-nested-tasks fix
+(the diag note above). All coded phases 1–6.z-h are in prod, plus the
+task-registration fix. Next session: start with §1 status, then either
+wait on Phase 7 burn-in or pick up the B1–B4 backend backlog.*

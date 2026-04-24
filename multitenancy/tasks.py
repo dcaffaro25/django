@@ -27,6 +27,30 @@ from django.forms.models import model_to_dict
 # Substitutions engine (kept local; no api_utils dependency)
 from multitenancy.formula_engine import apply_substitutions
 
+# --- Celery task registration for nested subpackage ------------------------
+# ``nord_backend.celery.app.autodiscover_tasks()`` with no args scans only
+# each INSTALLED_APP's top-level ``tasks`` module — it does NOT recurse
+# into subpackages. The v2 imports tasks live at
+# ``multitenancy/imports_v2/tasks.py`` and were therefore absent from the
+# **worker** process's task registry even though the **web** process had
+# them (web loads them transitively via URLConf → views → services →
+# tasks).
+#
+# Symptom before this fix: Beat published
+# ``imports_v2.reap_stale_sessions`` to the ``celery`` queue on schedule;
+# the worker received the message, failed to resolve it, logged
+# ``Received unregistered task of type '...'`` and dropped it. Same fate
+# for ``.delay()`` of ``analyze_session`` and ``commit_session`` — which
+# is why production accumulated sessions stuck in ``analyzing`` /
+# ``committing`` that the reaper could never clear (the reaper itself
+# was unregistered).
+#
+# The import below forces the nested module to load when autodiscover
+# pulls in this top-level ``multitenancy.tasks`` — registering all three
+# ``@shared_task``s on the worker process at boot. Keep the ``noqa`` so
+# linters don't remove the "unused" import.
+from multitenancy.imports_v2 import tasks as _imports_v2_tasks_register  # noqa: F401
+
 
 # --------------------------------------------------------------------------------------
 # Minimal logging
