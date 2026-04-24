@@ -740,6 +740,12 @@ def _check_commit_gate(session: ImportSession) -> None:
     same gate — callers that want to enqueue still need to fail fast
     on a non-ready session (409) rather than enqueueing and
     disappointing the operator via an error status.
+
+    ETL mode additionally requires ``file_bytes`` because the commit
+    re-runs ``ETLPipelineService`` against the original upload. A
+    session whose bytes were cleared (committed / discarded / TTL
+    swept) can't be committed — catch that here so the view returns
+    a 409 instead of enqueueing a doomed task.
     """
     if not session.is_committable():
         raise CommitNotReady(
@@ -748,6 +754,10 @@ def _check_commit_gate(session: ImportSession) -> None:
     if session.is_terminal():
         raise CommitNotReady(
             f"session #{session.pk} is already terminal ({session.status})"
+        )
+    if session.mode == ImportSession.MODE_ETL and not session.file_bytes:
+        raise CommitNotReady(
+            f"session #{session.pk} has no file_bytes (expired?) — re-upload"
         )
 
 

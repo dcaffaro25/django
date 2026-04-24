@@ -426,7 +426,10 @@ class CommitMaterialisesStagedRulesTests(TestCase):
             resp = self.client.post(
                 _url_commit(self.company.id, session.pk), {}, format="json",
             )
-        self.assertEqual(resp.status_code, 200, resp.content)
+        # Phase 6.z-a: commit is async. In eager mode the worker has
+        # already run so the 202 body already carries the committed
+        # session — including the created_pks we want to inspect.
+        self.assertEqual(resp.status_code, 202, resp.content)
         created_pks = resp.json()["result"]["substitution_rules_created"]
         self.assertEqual(len(created_pks), 1)
         rule = SubstitutionRule.objects.get(pk=created_pks[0])
@@ -451,7 +454,12 @@ class CommitMaterialisesStagedRulesTests(TestCase):
             resp = self.client.post(
                 _url_commit(self.company.id, session.pk), {}, format="json",
             )
-        self.assertEqual(resp.status_code, 500, resp.content)
+        # Phase 6.z-a: commit failures no longer return 500 — the view
+        # returns 202 and the worker writes the ``error`` status on the
+        # session. Frontend reads the final state via polling. In eager
+        # mode the 202 body already reflects the terminal error state.
+        self.assertEqual(resp.status_code, 202, resp.content)
+        self.assertEqual(resp.json()["status"], ImportSession.STATUS_ERROR)
         session.refresh_from_db()
         self.assertEqual(session.status, ImportSession.STATUS_ERROR)
         # Rollback: no rule was created.
@@ -467,7 +475,9 @@ class CommitMaterialisesStagedRulesTests(TestCase):
             resp = self.client.post(
                 _url_commit(self.company.id, session.pk), {}, format="json",
             )
-        self.assertEqual(resp.status_code, 200, resp.content)
+        # Phase 6.z-a: async commit → 202. Eager-mode body already
+        # carries the committed session.
+        self.assertEqual(resp.status_code, 202, resp.content)
         self.assertEqual(
             resp.json()["result"]["substitution_rules_created"], [],
         )
@@ -519,7 +529,8 @@ class AnalyzeResolveCommitFlowTests(TestCase):
             f"/{self.company.id}/api/core/imports/v2/analyze/",
             {"file": file}, format="multipart",
         )
-        self.assertEqual(resp.status_code, 201, resp.content)
+        # Phase 6.z-a: analyze is async, view returns 202 Accepted.
+        self.assertEqual(resp.status_code, 202, resp.content)
         analyze_body = resp.json()
         self.assertEqual(
             analyze_body["status"], ImportSession.STATUS_AWAITING_RESOLVE,
@@ -554,7 +565,9 @@ class AnalyzeResolveCommitFlowTests(TestCase):
                 f"/{self.company.id}/api/core/imports/v2/commit/{session_id}/",
                 {}, format="json",
             )
-        self.assertEqual(resp.status_code, 200, resp.content)
+        # Phase 6.z-a: async commit → 202. Eager-mode body carries the
+        # committed session.
+        self.assertEqual(resp.status_code, 202, resp.content)
         body = resp.json()
         self.assertEqual(body["status"], ImportSession.STATUS_COMMITTED)
         self.assertEqual(body["result"]["substitution_rules_created"], [])

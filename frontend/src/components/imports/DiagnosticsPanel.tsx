@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronRight,
   Info,
+  Loader2,
 } from "lucide-react"
 import { AnalyzePreviewPanel } from "./AnalyzePreviewPanel"
 import { SubstitutionAppliedBadge } from "./SubstitutionAppliedBadge"
@@ -74,6 +75,13 @@ export function DiagnosticsPanel({
   const subs = session.substitutions_applied ?? []
   const blocking = session.open_issues?.some((i) => i.severity === "error") ?? false
   const totalIssues = session.open_issues?.length ?? 0
+  // Phase 6.z-a — analyze/commit run in a Celery worker. While the
+  // worker is still chewing the file, the session status is
+  // ``analyzing`` (first pass) or ``committing`` (during write). The
+  // host page polls and re-renders; we just flag the state here so
+  // the header shows "Analisando no servidor…" instead of a
+  // misleading "Pronto para importar".
+  const workerBusy = session.status === "analyzing" || session.status === "committing"
 
   return (
     <div className="space-y-4">
@@ -81,32 +89,48 @@ export function DiagnosticsPanel({
       <div
         className={cn(
           "card-elevated flex items-center gap-3 px-4 py-3 text-[12px]",
-          blocking ? "border-l-4 border-l-destructive" : "border-l-4 border-l-emerald-500",
+          workerBusy
+            ? "border-l-4 border-l-blue-500"
+            : blocking
+              ? "border-l-4 border-l-destructive"
+              : "border-l-4 border-l-emerald-500",
         )}
       >
-        {blocking ? (
+        {workerBusy ? (
+          <Loader2 className="h-5 w-5 shrink-0 animate-spin text-blue-500" />
+        ) : blocking ? (
           <AlertTriangle className="h-5 w-5 shrink-0 text-destructive" />
         ) : (
           <CheckCircle2 className="h-5 w-5 shrink-0 text-emerald-600" />
         )}
         <div className="flex-1">
           <div className="font-semibold">
-            {blocking
-              ? "Existem problemas que precisam ser resolvidos antes de importar."
-              : "Pronto para importar."}
+            {workerBusy
+              ? session.status === "committing"
+                ? "Importando no servidor…"
+                : "Analisando no servidor…"
+              : blocking
+                ? "Existem problemas que precisam ser resolvidos antes de importar."
+                : "Pronto para importar."}
           </div>
           <div className="text-[11px] text-muted-foreground">
-            {totalIssues > 0
-              ? `${totalIssues} diagnóstico${totalIssues === 1 ? "" : "s"} aberto${totalIssues === 1 ? "" : "s"} · `
-              : ""}
-            {session.summary?.sheets
-              ? `${Object.entries(session.summary.sheets)
-                  .map(([name, n]) => `${name}: ${n} linha${n === 1 ? "" : "s"}`)
-                  .join(" · ")}`
-              : ""}
+            {workerBusy
+              ? "Isso roda em um worker Celery. Você pode acompanhar aqui ou voltar depois — a sessão não se perde."
+              : (
+                <>
+                  {totalIssues > 0
+                    ? `${totalIssues} diagnóstico${totalIssues === 1 ? "" : "s"} aberto${totalIssues === 1 ? "" : "s"} · `
+                    : ""}
+                  {session.summary?.sheets
+                    ? `${Object.entries(session.summary.sheets)
+                        .map(([name, n]) => `${name}: ${n} linha${n === 1 ? "" : "s"}`)
+                        .join(" · ")}`
+                    : ""}
+                </>
+              )}
           </div>
         </div>
-        {onCommit && (
+        {onCommit && !workerBusy && (
           <button
             onClick={onCommit}
             disabled={!session.is_committable || isCommitting}
