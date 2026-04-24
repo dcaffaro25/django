@@ -122,7 +122,7 @@ class ETLv2AnalyzeEndpointTests(TestCase):
                 },
                 format="multipart",
             )
-        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.status_code, 202, resp.content)
         body = resp.json()
         self.assertEqual(body["status"], ImportSession.STATUS_ERROR)
         self.assertIn("not found", body.get("result", {}).get("error", ""))
@@ -168,7 +168,7 @@ class ETLv2AnalyzeEndpointTests(TestCase):
                 },
                 format="multipart",
             )
-        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.status_code, 202, resp.content)
         body = resp.json()
         self.assertEqual(body["mode"], "etl")
         self.assertEqual(body["status"], ImportSession.STATUS_READY)
@@ -327,7 +327,10 @@ class ETLv2CommitTests(TestCase):
             resp = self.client.post(
                 _url_etl_commit(self.company.id, session.pk), {}, format="json",
             )
-        self.assertEqual(resp.status_code, 200, resp.content)
+        # Phase 6.z-a: commit is async, view returns 202. In eager mode
+        # the worker has already run, so the response body already
+        # reflects the terminal ``committed`` status.
+        self.assertEqual(resp.status_code, 202, resp.content)
         body = resp.json()
         self.assertEqual(body["status"], ImportSession.STATUS_COMMITTED)
         # Phase 4A commit wraps the write-backend result with

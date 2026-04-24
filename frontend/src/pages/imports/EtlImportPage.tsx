@@ -15,7 +15,7 @@ import {
   XCircle,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
-import { useEtlExecute, useEtlPreview } from "@/features/imports"
+import { useEtlExecute, useEtlPreview, useImportSessionPolling } from "@/features/imports"
 import { importsV2 } from "@/features/imports/api"
 import type {
   EtlError,
@@ -238,6 +238,11 @@ export function EtlImportPage() {
     null,
   )
 
+  // Phase 6.z-a — both analyze and commit return 202 with the session
+  // in ``analyzing`` / ``committing``; poll the detail endpoint until
+  // it lands in a terminal/ready state.
+  const { pollUntilDone: pollV2 } = useImportSessionPolling("etl")
+
   const runV2Analyze = useCallback(async () => {
     if (!file) {
       toast.error("Selecione um arquivo .xlsx.")
@@ -265,12 +270,14 @@ export function EtlImportPage() {
     }
     setV2Pending("analyze")
     try {
-      const session = await importsV2.etl.analyze({
+      const initial = await importsV2.etl.analyze({
         file,
         transformationRuleId: ruleId,
         rowLimit: rowLimit === 0 ? undefined : rowLimit,
         autoCreateJournalEntries: autoJe,
       })
+      setV2Session(initial)
+      const session = await pollV2(initial)
       setV2Session(session)
       if (session.status === "ready") {
         toast.success("Pronto para importar — nenhuma pendência encontrada.")
@@ -294,7 +301,7 @@ export function EtlImportPage() {
     } finally {
       setV2Pending(null)
     }
-  }, [file, rowLimit, v2AutoJeJson, v2RuleId])
+  }, [file, rowLimit, v2AutoJeJson, v2RuleId, pollV2])
 
   const runV2Resolve = useCallback(
     async (resolutions: ImportResolutionInput[]) => {
@@ -324,7 +331,9 @@ export function EtlImportPage() {
     if (!v2Session) return
     setV2Pending("commit")
     try {
-      const finalised = await importsV2.etl.commit(v2Session.id)
+      const initial = await importsV2.etl.commit(v2Session.id)
+      setV2Session(initial)
+      const finalised = await pollV2(initial)
       setV2Session(finalised)
       if (finalised.status === "committed") {
         toast.success("Importação concluída.")
@@ -343,7 +352,7 @@ export function EtlImportPage() {
     } finally {
       setV2Pending(null)
     }
-  }, [v2Session])
+  }, [v2Session, pollV2])
 
   const resetV2 = useCallback(() => {
     setV2Session(null)

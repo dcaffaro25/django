@@ -1,9 +1,11 @@
+import { useCallback, useEffect, useRef, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useTenant } from "@/providers/TenantProvider"
 import {
   bulkImport,
   etlExecute,
   etlPreview,
+  importsV2,
   nfeImport,
   ofxImport,
   ofxScan,
@@ -11,6 +13,8 @@ import {
   type EtlExecuteParams,
 } from "./api"
 import type {
+  ImportSession,
+  ImportSessionStatus,
   SubstitutionRule,
 } from "./types"
 
@@ -91,3 +95,107 @@ export function useDeleteSubstitutionRule() {
   })
 }
 
+// ---- v2 async session polling ------------------------------------------
+
+/**
+ * Terminal-status guard. A session in one of these states is done — the
+ * poller can resolve and the UI can render whatever the backend wrote
+ * to it (open_issues, preview, result).
+ *
+ * ``committed`` / ``error`` / ``discarded`` are the genuine terminals;
+ * ``awaiting_resolve`` and ``ready`` are analyze outputs that mean
+ * "the worker is done, hand control back to the operator".
+ */
+const NON_TERMINAL: ReadonlySet<ImportSessionStatus> = new Set([
+  "analyzing",
+  "committing",
+])
+
+/**
+ * Poll ``GET /sessions/<id>/`` until the session leaves ``analyzing`` /
+ * ``committing`` (Phase 6.z-a). The backend returns 202 for analyze +
+ * commit now; the worker finishes in the background and the frontend
+ * catches the final state here.
+ *
+ * ``namespace`` picks the URL prefix — ``"template"`` →
+ * ``/api/core/imports/v2/...`` and ``"etl"`` → ``/api/core/etl/v2/...``.
+ * Both share the same detail endpoint shape, so the hook is symmetric.
+ *
+ * ``intervalMs`` defaults to 2000 — fast enough to feel responsive for
+ * a 30s analyze, slow enough to not hammer the server at the small-file
+ * end. Callers tuning for big files can bump to 5000.
+ *
+ * Returns:
+ *   * ``pollUntilDone(session)`` — a thenable that resolves with the
+ *     final session. If ``session.status`` is already terminal when
+ *     called, resolves immediately (zero network round-trips — eager
+ *     mode + small-file path land here).
+ *   * ``pollingId`` — the pk currently being polled, or null. Host
+ *     pages can use it to render an "analisando…" spinner.
+ *
+ * Aborts cleanly on unmount: the in-flight promise resolves with the
+ * last-seen session (not rejected — the UI doesn't care, it's going
+ * away).
+ */
+export function useImportSessionPolling(
+  namespace: "template" | "etl",
+  options?: { intervalMs?: number },
+) {
+  const intervalMs = options?.intervalMs ?? 2000
+  const [pollingId, setPollingId] = useState<number | null>(null)
+
+  // ``activeTimer`` survives across renders so we can cancel a
+  // pending setTimeout on unmount (stops the setState-after-unmount
+  // warning and stops wasting bandwidth polling a page that's gone).
+  const activeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const cancelledRef = useRef(false)
+
+  useEffect(() => {
+    return () => {
+      cancelledRef.current = true
+      if (activeTimer.current) {
+        clearTimeout(activeTimer.current)
+        activeTimer.current = null
+      }
+    }
+  }, [])
+
+  const pollUntilDone = useCallback(
+    (session: ImportSession): Promise<ImportSession> => {
+      if (!NON_TERMINAL.has(session.status)) {
+        // Eager mode / already-terminal fast path. No polling, no tick.
+        return Promise.resolve(session)
+      }
+      setPollingId(session.id)
+      return new Promise<ImportSession>((resolve, reject) => {
+        let lastSeen = session
+        const tick = async () => {
+          if (cancelledRef.current) {
+            // Component unmounted mid-poll. Resolve with the last
+            // session we saw so any `await` call sites don't hang,
+            // but don't touch state.
+            resolve(lastSeen)
+            return
+          }
+          try {
+            const fresh = await importsV2[namespace].getSession(session.id)
+            lastSeen = fresh
+            if (!NON_TERMINAL.has(fresh.status)) {
+              if (!cancelledRef.current) setPollingId(null)
+              resolve(fresh)
+              return
+            }
+            activeTimer.current = setTimeout(tick, intervalMs)
+          } catch (err) {
+            if (!cancelledRef.current) setPollingId(null)
+            reject(err)
+          }
+        }
+        activeTimer.current = setTimeout(tick, intervalMs)
+      })
+    },
+    [namespace, intervalMs],
+  )
+
+  return { pollUntilDone, pollingId }
+}
