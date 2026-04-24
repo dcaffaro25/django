@@ -288,16 +288,17 @@ function CeleryWorkersCard({ data }: { data: RuntimeConfigResponse }) {
             />
             <KV
               k="prefetch"
-              v={info.prefetch_count != null ? String(info.prefetch_count) : "—"}
+              v={
+                info.prefetch_count != null
+                  ? `${info.prefetch_count} (= multiplier × pool)`
+                  : "—"
+              }
             />
             <KV
               k="uptime_s"
-              v={info.uptime_seconds != null ? String(info.uptime_seconds) : "—"}
+              v={info.uptime_seconds != null ? formatUptime(info.uptime_seconds) : "—"}
             />
-            <KV
-              k="total_tasks"
-              v={info.total_tasks != null ? String(info.total_tasks) : "—"}
-            />
+            <KV k="total_tasks" v={formatTotalTasks(info.total_tasks)} wrap />
           </div>
         </div>
       ))}
@@ -348,6 +349,48 @@ function BeatScheduleCard({ data }: { data: RuntimeConfigResponse }) {
       ))}
     </Card>
   )
+}
+
+/**
+ * Celery's ``stats().total`` is a dict of ``{task_name: count}``, not
+ * an integer (worker-lifetime totals per task name). Older code
+ * ``String(...)`` rendered ``[object Object]``. Render the sum so
+ * operators see a single "how many tasks has this worker handled
+ * total" number, plus the top 3 tasks in a title tooltip.
+ */
+function formatTotalTasks(total: unknown): string {
+  if (total == null) return "—"
+  if (typeof total === "number") return String(total)
+  if (typeof total === "object" && total !== null) {
+    const entries = Object.entries(total as Record<string, unknown>)
+      .filter(([, v]) => typeof v === "number")
+      .map(([k, v]) => [k, v as number] as const)
+    if (entries.length === 0) return "0"
+    const sum = entries.reduce((acc, [, v]) => acc + v, 0)
+    // Top 3 by count for the hover, so operators can spot which
+    // task dominates the worker's lifetime without opening raw JSON.
+    const top = entries
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([name, count]) => `${name}: ${count}`)
+      .join(" · ")
+    return top ? `${sum}  (${top})` : String(sum)
+  }
+  return String(total)
+}
+
+/**
+ * Seconds → "Nh Mm" / "Nm Ss" / "Ns" for worker uptime. 942s is
+ * ``15m 42s`` instead of a raw number — more scannable at a glance.
+ */
+function formatUptime(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`
+  const m = Math.floor(seconds / 60)
+  const s = seconds % 60
+  if (m < 60) return `${m}m ${s}s`
+  const h = Math.floor(m / 60)
+  const mm = m % 60
+  return `${h}h ${mm}m`
 }
 
 function RedisAndStaleCard({ data }: { data: RuntimeConfigResponse }) {
