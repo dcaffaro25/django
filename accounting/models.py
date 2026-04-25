@@ -25,6 +25,30 @@ from django.utils.dateparse import parse_date  # only needed if you keep saves w
 
 from django.contrib.postgres.fields import ArrayField  # Postgres
 
+import re
+
+# CNPJ punctuation-stripping helper. Used in ``clean_fields`` of every
+# model that stores a CNPJ as 14 raw digits — operators frequently
+# paste the formatted ``XX.XXX.XXX/XXXX-XX`` form (18 chars) from
+# spreadsheets and the field's ``max_length=14`` would otherwise
+# reject it. Storing the digit-only form keeps look-ups + joins
+# trivial; the formatted string can be reconstructed at display time.
+_CNPJ_STRIP_RE = re.compile(r"\D+")
+
+
+def _normalize_cnpj(value):
+    """Return the 14-digit form of a CNPJ, stripping ``. / -`` etc.
+
+    ``None`` / empty / non-string values pass through unchanged so the
+    field's blank-or-null behaviour is preserved. Strings that contain
+    no digits collapse to ``""`` — we leave that to Django's own
+    blank/required validation rather than swallowing it here.
+    """
+    if value is None or not isinstance(value, str):
+        return value
+    stripped = _CNPJ_STRIP_RE.sub("", value)
+    return stripped
+
 
 class Currency(BaseModel):
     erp_id = models.CharField(
@@ -210,7 +234,7 @@ class Account(TenantAwareBaseModel, MPTTModel):
 
     
     class MPTTMeta:
-        order_insertion_by = ['account_code']    
+        order_insertion_by = ['account_code']
 
     class Meta:
         unique_together = ('company', 'account_code', 'parent', 'name')
@@ -224,6 +248,18 @@ class Account(TenantAwareBaseModel, MPTTModel):
             ),
             models.Index(fields=['company', 'erp_id']),
             ]
+
+    def clean_fields(self, exclude=None):
+        # Skip clean for the pgvector embedding column. Same workaround
+        # as ``Transaction.clean_fields`` — Django's default does
+        # ``raw_value in f.empty_values`` which numpy-backed pgvector
+        # values turn into "truth value of an array is ambiguous".
+        # Triggers any time we ``full_clean()`` an existing Account
+        # whose embedding was populated by a prior backfill run.
+        exclude = set(exclude or [])
+        exclude.add('account_description_embedding')
+        super().clean_fields(exclude=exclude)
+
     def __str__(self):
         return f'({self.id}) {self.company} - {self.account_code} - {self.get_path()}'
     
@@ -443,7 +479,11 @@ class Transaction(TenantAwareBaseModel):
         blank=True,
         null=True,
         db_index=True,
-        help_text="CNPJ da contraparte para conciliação.",
+        help_text=(
+            "CNPJ da contraparte para conciliação. Aceita os formatos "
+            "puro (14 dígitos) ou pontuado (XX.XXX.XXX/XXXX-XX); "
+            "``clean_fields`` normaliza para 14 dígitos no banco."
+        ),
     )
     
     class Meta:
@@ -471,11 +511,35 @@ class Transaction(TenantAwareBaseModel):
         if 'amount' not in exclude and self.amount is not None:
             # go through str() to kill binary float artifacts; then force 2dp
             self.amount = Decimal(str(self.amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        # Normalise CNPJ — operators paste the formatted
+        # ``XX.XXX.XXX/XXXX-XX`` form (18 chars) from ERP exports and
+        # the 14-char ``max_length`` would otherwise reject it. Strip
+        # all non-digit characters before validation so storage stays
+        # consistent.
+        if 'cnpj' not in exclude and self.cnpj is not None:
+            self.cnpj = _normalize_cnpj(self.cnpj)
+        # Skip clean for the pgvector embedding column. Django's default
+        # ``clean_fields`` does ``raw_value in f.empty_values`` for every
+        # blank-allowed field; for a numpy-backed pgvector value that
+        # call goes through numpy's element-wise __eq__ and then
+        # ``bool(array)`` raises "truth value of an array is ambiguous".
+        # We hit this any time the import pipeline does an UPDATE on an
+        # existing Transaction (the loaded instance carries its
+        # embedding from a prior backfill run). Excluding the field
+        # here is safe — pgvector validation happens at write time and
+        # the embedding is populated by ``generate_missing_embeddings``,
+        # not by user-facing forms.
+        exclude.add('description_embedding')
         super().clean_fields(exclude=exclude)
-    
+
     def save(self, *args, **kwargs):
         if self.amount is not None:
             self.amount = Decimal(str(self.amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        # Mirror cnpj normalisation in ``save()`` so direct ``.save()``
+        # calls (bypassing ``full_clean()``) still get the digit-only
+        # form on disk.
+        if self.cnpj is not None:
+            self.cnpj = _normalize_cnpj(self.cnpj)
         return super().save(*args, **kwargs)
     
     def check_balance(self) -> dict:
@@ -802,7 +866,11 @@ class BankTransaction(TenantAwareBaseModel):
         blank=True,
         null=True,
         db_index=True,
-        help_text="CNPJ da contraparte para conciliação.",
+        help_text=(
+            "CNPJ da contraparte para conciliação. Aceita os formatos "
+            "puro (14 dígitos) ou pontuado (XX.XXX.XXX/XXXX-XX); "
+            "``clean_fields`` normaliza para 14 dígitos no banco."
+        ),
     )
 
     tag = models.CharField(
@@ -835,11 +903,20 @@ class BankTransaction(TenantAwareBaseModel):
         exclude = set(exclude or [])
         if 'amount' not in exclude and self.amount is not None:
             self.amount = Decimal(str(self.amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        # Same CNPJ normalisation as ``Transaction.clean_fields`` — see
+        # the long comment there for why.
+        if 'cnpj' not in exclude and self.cnpj is not None:
+            self.cnpj = _normalize_cnpj(self.cnpj)
+        # Same pgvector vs ``raw_value in f.empty_values`` workaround as
+        # ``Transaction.clean_fields`` — see the long comment there.
+        exclude.add('description_embedding')
         super().clean_fields(exclude=exclude)
 
     def save(self, *args, **kwargs):
         if self.amount is not None:
             self.amount = Decimal(str(self.amount)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        if self.cnpj is not None:
+            self.cnpj = _normalize_cnpj(self.cnpj)
         super().save(*args, **kwargs)
 
     class Meta:
