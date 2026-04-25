@@ -221,6 +221,15 @@ export type ImportIssueType =
   | "negative_amount"
   | "fk_ambiguous"
   | "missing_etl_parameter"
+  /**
+   * Per-sheet blocking issue emitted when the dry-run reports any rows
+   * would fail to commit. ``context.fail_count`` is the per-sheet count;
+   * ``context.sample_messages`` carries up to N most-frequent distinct
+   * error messages so the operator gets a quick read on the failure
+   * mode without scrolling the per-row table. Only proposed action is
+   * ``abort`` — the operator fixes the source file offline and reuploads.
+   */
+  | "dry_run_failure"
 
 export type ImportIssueSeverity = "error" | "warning"
 
@@ -305,11 +314,39 @@ export interface ImportTransformationRuleSummary {
 }
 
 /**
+ * One row in the dry-run preview, as exposed by the backend on
+ * ``preview.row_results`` for the on-screen table. ``data`` is null
+ * on sampled-success rows (the serializer drops it to keep the
+ * polling JSON small); error rows always carry the original input
+ * data for context. The complete list (with ``data`` always
+ * populated) lives in the xlsx download (``preview.has_full_download``).
+ */
+export interface PreviewRowResult {
+  __row_id?: string | number | null
+  model: string
+  /** Lowercased on the wire: "ok" / "error" / "skipped" / "" / etc. */
+  status: string
+  /** Lowercased on the wire: "create" / "update" / "delete" / null. */
+  action: string | null
+  message: string | null
+  data: Record<string, unknown> | null
+}
+
+/**
  * Compact preview of what commit would write. Populated by the
- * backend at analyze time for ETL sessions (stops dropping
- * ``would_create`` / ``would_fail`` from ``ETLPipelineService.execute
- * (commit=False)``). Template sessions leave it empty until we wire
- * a ``commit=False`` dry-run in a follow-up commit.
+ * backend at analyze time:
+ *
+ *   * ETL sessions: from ``ETLPipelineService.execute(commit=False)``.
+ *   * Template sessions: from a ``execute_import_job(commit=False)``
+ *     pass that runs when the file is under ~5k rows. Above that the
+ *     dry-run is skipped and only the per-sheet counts in
+ *     ``ImportSession.summary.sheets`` are populated.
+ *
+ * Per-row detail lives on ``row_results`` (display subset = every
+ * error + up to 100 sampled successes per sheet). The complete list
+ * is NOT served on this endpoint — fetch the xlsx download via
+ * ``importsV2[ns].downloadPreviewXlsx(sessionId)`` when
+ * ``has_full_download`` is true.
  */
 export interface ImportPreview {
   /** Per-model expected-create counts. Example: {"Transaction": 12}. */
@@ -320,6 +357,22 @@ export interface ImportPreview {
   would_fail?: Record<string, number>
   /** Total rows that would be imported across all models. */
   total_rows?: number
+  /** Display subset of per-row results — every error + up to N
+   *  sampled successes per sheet. Empty for ETL-mode sessions and
+   *  for template sessions that skipped the dry-run. */
+  row_results?: PreviewRowResult[]
+  /** Total rows in the FULL list (xlsx download). 0 means there's
+   *  nothing to download for this session. */
+  full_row_count?: number
+  /** Whether ``GET /sessions/<pk>/preview.xlsx`` will return a body
+   *  vs 404. Convenience flag — equivalent to
+   *  ``full_row_count > 0`` for template sessions; ETL sessions get
+   *  this true whenever ``etl_errors`` has any non-empty bucket. */
+  has_full_download?: boolean
+  /** True when ``row_results`` is a strict subset of the full list
+   *  (i.e. successes were sampled). The frontend uses this to nudge
+   *  the operator toward the xlsx download for the complete picture. */
+  display_truncated?: boolean
   /** Anything else the write backend surfaces; forward-compatible. */
   [k: string]: unknown
 }

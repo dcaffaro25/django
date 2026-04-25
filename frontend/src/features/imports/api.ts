@@ -202,6 +202,37 @@ function makeSharedOps(prefix: string) {
       api.tenant.post<ImportSession>(`${prefix}/commit/${id}/`, null, {
         validateStatus: (s) => s < 500,
       }),
+
+    /**
+     * Download the full per-row dry-run results as a multi-sheet xlsx.
+     * Streams via ``GET ${prefix}/sessions/<id>/preview.xlsx``. We
+     * fetch as ``blob`` (responseType) so axios doesn't try to JSON-
+     * parse the binary body, then trigger a save dialog by creating a
+     * temporary anchor with a blob URL. Returns nothing useful — the
+     * side effect IS the operator's download.
+     *
+     * Throws on 404 (no preview data — session was discarded, file
+     * was above the dry-run row threshold, or analyze didn't get far
+     * enough). Caller should catch + surface a friendly message.
+     */
+    downloadPreviewXlsx: async (
+      id: number,
+      filename?: string,
+    ): Promise<void> => {
+      const blob = await api.tenant.get<Blob>(
+        `${prefix}/sessions/${id}/preview.xlsx`,
+        { responseType: "blob" },
+      )
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement("a")
+      a.href = url
+      a.download = filename ?? `session-${id}-preview.xlsx`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      // Defer revoke so Safari has time to start the download.
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    },
   }
 }
 

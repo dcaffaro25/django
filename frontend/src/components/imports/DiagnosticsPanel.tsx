@@ -15,6 +15,7 @@ import { IssueCardErpIdConflict } from "./IssueCardErpIdConflict"
 import { IssueCardUnmatchedReference } from "./IssueCardUnmatchedReference"
 import { IssueCardEditValue } from "./IssueCardEditValue"
 import { IssueCardMissingParam } from "./IssueCardMissingParam"
+import { IssueCardDryRunFailure } from "./IssueCardDryRunFailure"
 import { IssueCardGeneric } from "./IssueCardGeneric"
 import type { ImportIssue, ImportSession, ImportResolutionInput } from "@/features/imports/types"
 import { cn } from "@/lib/utils"
@@ -44,6 +45,7 @@ const ISSUE_LABELS: Record<string, string> = {
   negative_amount: "Valores negativos",
   je_balance_mismatch: "Lançamentos desequilibrados",
   missing_etl_parameter: "Parâmetros ausentes (ETL)",
+  dry_run_failure: "Falhas detectadas no pipeline",
 }
 
 function groupByType(issues: ImportIssue[]): Map<string, ImportIssue[]> {
@@ -150,11 +152,15 @@ export function DiagnosticsPanel({
       </div>
 
       {/* Import preview — what commit will write. Renders null when
-          the backend didn't populate preview counts (template mode
-          today; ETL mode always has them after Phase 6.x). Placed
-          before substitutions so the operator sees the bottom line
-          first. */}
-      <AnalyzePreviewPanel preview={session.preview} />
+          the backend didn't populate preview counts. ``sessionId`` /
+          ``mode`` are passed through so the panel can drive the xlsx
+          download endpoint when the dry-run preserved per-row data. */}
+      <AnalyzePreviewPanel
+        preview={session.preview}
+        sessionId={session.id}
+        sessionFilename={session.file_name}
+        mode={session.mode}
+      />
 
       {/* Substitutions applied — only shown if any. */}
       {subs.length > 0 && (
@@ -300,6 +306,8 @@ function IssueCard({
       return <IssueCardEditValue issue={issue} onResolve={onResolve} isResolving={isResolving} />
     case "missing_etl_parameter":
       return <IssueCardMissingParam issue={issue} onResolve={onResolve} isResolving={isResolving} />
+    case "dry_run_failure":
+      return <IssueCardDryRunFailure issue={issue} onResolve={onResolve} isResolving={isResolving} />
     default:
       return <IssueCardGeneric issue={issue} onResolve={onResolve} isResolving={isResolving} />
   }
