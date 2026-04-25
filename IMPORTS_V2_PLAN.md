@@ -12,10 +12,10 @@ Phase sections for the specific next step.
 
 ## 1. Status summary
 
-Backend phases 1–4B, frontend phases 5–6, and ops/reliability phase
-6.z-h are all shipped to `main`. Full v2 backend suite: **122 tests
-green** (last measured 2026-04-23; post-6.z-h the frontend tests grew
-but the backend-only count is unchanged).
+Backend phases 1–4B, frontend phases 5–6, ops/reliability phase 6.z-h,
+and the dry-run row-preservation hotfix series (2026-04-25) are all
+shipped to `main`. Full v2 backend suite: **145 tests green**
+(2026-04-25; +6 vs pre-hotfix from new `JsonScalarTests`).
 
 v2 is feature-complete end-to-end for both template and ETL paths
 and running on Railway prod with Celery Beat + stale-session reaper
@@ -48,7 +48,12 @@ burn-in**) + the B1–B4 backend backlog (optional follow-ups).
 | `96e796c`   | Admin UX — platform-admin links moved from sidebar to user dropdown |
 | `e651918`   | Admin — RuntimePage renderer polish (total_tasks dict, uptime, prefetch label) |
 | `296735f`   | Ops — strip unused `workloads[]` from railway.json + correct the docs |
-| `<pending>` | Fix — register v2 nested @shared_tasks with autodiscover (worker-side bug; sessions 4/5/6 in prod) |
+| `b5bf61b`   | Fix — register v2 nested `@shared_tasks` with autodiscover (worker-side bug; sessions 4/5/6 in prod) |
+| `17949b8`   | Test — phase4b commit assertion 200 → 202 (post-6.z-a regression) |
+| `7254c9d`   | Per-row dry-run preservation + `dry_run_failure` blocking issue + `preview.xlsx` download endpoint + 8 tests |
+| `37fec0d`   | Frontend — row-level dry-run table + xlsx download button + `IssueCardDryRunFailure` |
+| `8da1b0e`   | Accounting — pgvector `clean_fields` compat + CNPJ punctuation normalisation (surfaced by per-row preview) |
+| `360719f`   | Imports — `_json_scalar` emits `YYYY-MM-DD` for midnight Timestamps (fixes Excel-imported date cells) + 6 tests |
 
 **Resolved follow-up — template dry-run.** Phase 6.y shipped the
 missing piece: template analyze now runs `execute_import_job(commit=False)`
@@ -537,6 +542,113 @@ subpackage (`app/subpkg/tasks.py`) must be transitively imported by
 the app's top-level `tasks.py`, OR the subpackage must be promoted to
 its own `INSTALLED_APPS` entry, OR `autodiscover_tasks()` must be
 called with an explicit list. Default behaviour does NOT cover them.
+
+### Per-row dry-run preview hotfix series (2026-04-25)
+
+**Origin**: operator analyzed a 408-row Transaction file (`entuba_erp
+id_franjan.xlsx`) and the UI showed the green "Pronto para importar"
+banner next to a "409 falhariam · 409 linhas no total" preview tally.
+Two states could not be true simultaneously, AND the operator had no
+way to see WHY each row failed.
+
+**Round 1 — preserve + block** (commit `7254c9d`, frontend `37fec0d`):
+
+  * `_template_dry_run_preview` rewritten to keep every per-row dict
+    (`__row_id`, `model`, `status`, `action`, `message`, `data`)
+    instead of collapsing to int counts. Display subset: every error
+    + up to 100 sampled successes per sheet
+    (`TEMPLATE_DRY_RUN_DISPLAY_SUCCESS_SAMPLE`). Full list (every
+    row) lives on `preview.full_row_results` for the xlsx download.
+  * New `dry_run_failure` issue type emitted whenever
+    `would_fail > 0`. Status flips to `awaiting_resolve`,
+    `is_committable=false`. Only `abort` action — operator fixes the
+    source file and reuploads.
+  * `GET /sessions/<pk>/preview.xlsx` endpoint streams the full
+    dry-run as a multi-sheet workbook (template: one sheet per
+    model; ETL: one flat "ETL errors" sheet flattening the four
+    error buckets).
+  * Serializer strips `full_row_results` from the polling JSON
+    (would balloon every 2s GET); exposes `full_row_count` +
+    `has_full_download` flags.
+  * Frontend `AnalyzePreviewPanel` renders a per-row table from
+    `row_results` with status icons, sticky headers, max-height
+    scroll. "Baixar prévia (Excel)" button hits the download
+    endpoint via blob fetch + temporary `<a>` save dialog.
+  * New `IssueCardDryRunFailure` card surfaces fail_count, sample
+    messages, and the abort button. ETL extras (python/database/
+    substitution counts) shown when present.
+
+**Round 2 — surface real bugs the new preview made visible** (commit
+`8da1b0e`):
+
+The per-row preserve uncovered three bugs that had been silently
+masked by the previous tally-only approach. All in
+`accounting/models.py`:
+
+  * **pgvector vs `clean_fields`** — Django's
+    `Model.clean_fields` does `raw_value in f.empty_values` for
+    every blank-allowed field. For a numpy-backed pgvector
+    embedding, `arr in [None, '']` ends up calling `bool(array)`
+    which raises "truth value of an array is ambiguous". Fires on
+    every UPDATE of an existing row (the loaded instance carries
+    its embedding from a prior `generate_missing_embeddings`
+    backfill). Fix: `clean_fields` overrides on `Account`,
+    `Transaction`, `BankTransaction` add the embedding field to
+    `exclude` before calling super.
+  * **CNPJ punctuation rejection** — operators paste the formatted
+    `XX.XXX.XXX/XXXX-XX` (18 chars) form straight from ERP exports;
+    field's `max_length=14` was the digit-only form. Fix:
+    `_normalize_cnpj` helper strips non-digit characters in
+    `clean_fields` AND `save()` (so direct `.save()` paths get the
+    digit-only form too). Storage stays consistent (14 digits).
+
+**Round 3 — `_json_scalar` date emission** (commit `360719f`):
+
+Excel stores date-only cells as `pd.Timestamp` at midnight; the old
+`_json_scalar` emitted `v.isoformat()` -> `'YYYY-MM-DDT00:00:00'`,
+which Django's DateField parser rejected. Fix: when a
+`datetime.datetime` / `pd.Timestamp` has no time component AND no
+tzinfo, emit `v.date().isoformat()` -> `'YYYY-MM-DD'`. Real
+datetimes (any non-zero time component, or tz-aware) keep the full
+ISO so DateTimeField columns roundtrip without losing precision.
+Six new `JsonScalarTests` lock both branches.
+
+**Round 4 — defense-in-depth date coercion + JSON-safe row data**
+(commit `<pending>`):
+
+Even with `_json_scalar` fixed for the v2 path, the legacy
+bulk-import endpoint feeds `execute_import_job` raw values without
+that pre-pass. New `_coerce_date_fields` helper (modelled after
+`_coerce_boolean_fields` / `_quantize_decimal_fields`) catches
+`'YYYY-MM-DDT...'` strings AND `datetime.datetime` instances on any
+DateField column, regardless of caller. `DateTimeField` columns
+left untouched (full precision wanted there). Seven
+`CoerceDateFieldsTests` pin every branch.
+
+Also fixes a JSON-safety leak the new full row preservation exposed:
+`_safe_model_dict(instance)` returns raw datetime/date/Decimal
+objects which work in memory but break the JSONField encoder.
+`_template_dry_run_preview` now walks each per-row `data` blob
+through `_json_scalar` before stashing on `parsed_payload`.
+Without this fix, dry-run sessions with success rows
+(typical case once the import is correctable) hit
+`TypeError: Object of type datetime is not JSON serializable` at
+session save time.
+
+**End-to-end verification on the operator's xlsx**:
+
+| Round | After fix | What surfaced next |
+|-------|-----------|--------------------|
+| 0 (pre) | `409 falhariam` masked everything | numpy ambiguous-truth-value (cryptic) |
+| 1 | preserve enabled | numpy/pgvector still blocking |
+| 2 | pgvector excluded | CNPJ length 18 > 14 |
+| 2 (cnpj) | CNPJ normalised | `'2025-09-16T00:00:00'` not a date |
+| 3 | `_json_scalar` date-only for midnight | save crash on datetime in `data` |
+| 4 | row data normalised | clean import (`5/5 success`, `408/408` after) |
+
+**Tests**: full v2 backend suite up to **152 passed** post-round-4
+(122 pre-hotfix + 8 dry-run + 6 JsonScalar + 7 CoerceDateFields +
+incremental).
 
 ### Tests pass live on these paths
 

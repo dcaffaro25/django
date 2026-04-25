@@ -621,13 +621,26 @@ def _template_dry_run_preview(
             total_rows += 1
             status_val = (row.get("status") or "").lower()
             action_val = (row.get("action") or "").lower()
+            # The success-row ``data`` blob comes from
+            # ``_safe_model_dict(instance)`` which carries raw datetime
+            # / date / Decimal objects -- fine for in-memory use but
+            # NOT JSON-safe. ``parsed_payload`` is a JSONField, so
+            # walk every cell through ``_json_scalar`` (the same
+            # normaliser ``_parse_template_file`` already uses for
+            # input cells). Without this, sessions with success rows
+            # in the dry-run hit ``TypeError: Object of type datetime
+            # is not JSON serializable`` at save time.
+            raw_data = row.get("data") or {}
+            data = {
+                k: _json_scalar(v) for k, v in raw_data.items()
+            } if isinstance(raw_data, dict) else raw_data
             normalised = {
                 "__row_id": row.get("__row_id"),
                 "model": model,
                 "status": status_val or "ok",
                 "action": action_val or None,
                 "message": row.get("message"),
-                "data": row.get("data") or {},
+                "data": data,
             }
             if status_val == "error":
                 would_fail[model] = would_fail.get(model, 0) + 1

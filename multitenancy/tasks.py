@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import logging
 import math
 import os
@@ -884,6 +885,64 @@ def _quantize_decimal_fields(model, payload: dict) -> dict:
                 dp = int(getattr(f, "decimal_places", 0) or 0)
                 q = Decimal("1").scaleb(-dp)
                 out[name] = Decimal(str(out[name])).quantize(q, rounding=ROUND_HALF_UP)
+    return out
+
+
+def _coerce_date_fields(model, payload: dict) -> dict:
+    """Defense-in-depth: coerce ISO-datetime-shaped values into proper
+    dates when the target field is a ``DateField`` (not ``DateTimeField``).
+
+    Operators import xlsx files via several paths (v2 template,
+    v2 ETL, legacy bulk-import, raw API). In v2 ``_json_scalar`` already
+    emits ``YYYY-MM-DD`` for midnight Timestamps (commit 360719f), but
+    other paths feed ``execute_import_job`` strings like
+    ``'2025-09-16T00:00:00'`` directly. Django's ``DateField`` parser
+    only accepts ``YYYY-MM-DD`` — so without this coercion the row
+    fails with
+
+        '2025-09-16T00:00:00' value has an invalid date format.
+        It must be in YYYY-MM-DD format.
+
+    Rules:
+
+      * If the field is a ``DateTimeField`` (not a plain ``DateField``),
+        leave the value alone — full datetime is wanted there.
+      * For ``DateField``:
+          - ``datetime.datetime`` (incl. ``pd.Timestamp``) → ``.date()``.
+            Strips the time component regardless of whether it's
+            midnight or not (a real datetime in a date column was
+            already going to lose info; better to land cleanly than
+            to error).
+          - ``str`` matching ``YYYY-MM-DDT...`` → take the first 10
+            chars (``YYYY-MM-DD``). Tolerates the operator's accidental
+            datetime form.
+          - Anything else (already a ``date``, ``None``, or unknown
+            shape) passes through; Django's own validation will catch
+            real garbage.
+    """
+    out = dict(payload)
+    for f in model._meta.get_fields():
+        # DateTimeField extends DateField, so check the more specific
+        # subclass first and skip — we only want plain DateFields here.
+        if isinstance(f, dj_models.DateTimeField):
+            continue
+        if not isinstance(f, dj_models.DateField):
+            continue
+        name = getattr(f, "attname", f.name)
+        if name not in out:
+            continue
+        v = out[name]
+        if v is None or v == "":
+            continue
+        if isinstance(v, datetime.datetime):
+            # Catches pandas Timestamps too — Timestamp is a datetime
+            # subclass.
+            out[name] = v.date()
+            continue
+        if isinstance(v, str) and len(v) >= 10 and v[10:11] == "T":
+            # ``2025-09-16T00:00:00`` and friends — slice to the date.
+            out[name] = v[:10]
+            continue
     return out
 
 
@@ -1947,6 +2006,7 @@ def execute_import_job(
                     # 7) coercions
                     filtered = _coerce_boolean_fields(model, filtered)
                     filtered = _quantize_decimal_fields(model, filtered)
+                    filtered = _coerce_date_fields(model, filtered)
 
                     # 8) create/update (__row_id positive int or legacy id column)
                     action = "create"

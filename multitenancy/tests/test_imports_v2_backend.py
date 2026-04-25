@@ -147,6 +147,84 @@ class JsonScalarTests(TestCase):
         self.assertIn("2025-09-16T00:00:00", out)
 
 
+class CoerceDateFieldsTests(TestCase):
+    """Coverage for ``multitenancy.tasks._coerce_date_fields`` -- the
+    defense-in-depth layer that catches any ``execute_import_job``
+    input where a DateField column receives an ISO datetime string or
+    a datetime object. Complements the v2-only ``_json_scalar`` fix
+    so legacy bulk-import / raw API calls don't fail with the
+    'invalid date format' error any more.
+    """
+
+    def test_datetime_string_with_T_truncates_to_date(self):
+        """The case the operator hit: a value like
+        ``'2025-09-16T00:00:00'`` arriving on a DateField gets sliced
+        to ``'2025-09-16'`` so Django's ``parse_date`` accepts it."""
+        from multitenancy.tasks import _coerce_date_fields
+        from accounting.models import Transaction  # has a ``date`` DateField
+
+        out = _coerce_date_fields(Transaction, {"date": "2025-09-16T00:00:00"})
+        self.assertEqual(out["date"], "2025-09-16")
+
+    def test_datetime_string_without_T_passes_through(self):
+        """A pristine ``YYYY-MM-DD`` is left alone."""
+        from multitenancy.tasks import _coerce_date_fields
+        from accounting.models import Transaction
+
+        out = _coerce_date_fields(Transaction, {"date": "2025-09-16"})
+        self.assertEqual(out["date"], "2025-09-16")
+
+    def test_datetime_instance_collapses_to_date(self):
+        """Bare ``datetime.datetime`` objects (incl. pd.Timestamp via
+        subclassing) get ``.date()``-ed."""
+        import datetime as dt
+        from multitenancy.tasks import _coerce_date_fields
+        from accounting.models import Transaction
+
+        out = _coerce_date_fields(
+            Transaction, {"date": dt.datetime(2025, 9, 16, 14, 30)},
+        )
+        self.assertEqual(out["date"], dt.date(2025, 9, 16))
+
+    def test_pandas_timestamp_collapses_to_date(self):
+        import datetime as dt
+        import pandas as pd
+        from multitenancy.tasks import _coerce_date_fields
+        from accounting.models import Transaction
+
+        ts = pd.Timestamp("2025-09-16 14:30:00")
+        out = _coerce_date_fields(Transaction, {"date": ts})
+        self.assertEqual(out["date"], dt.date(2025, 9, 16))
+
+    def test_unknown_field_passes_through(self):
+        """A non-date column with a string value isn't touched."""
+        from multitenancy.tasks import _coerce_date_fields
+        from accounting.models import Transaction
+
+        out = _coerce_date_fields(Transaction, {"description": "anything"})
+        self.assertEqual(out["description"], "anything")
+
+    def test_none_value_passes_through(self):
+        from multitenancy.tasks import _coerce_date_fields
+        from accounting.models import Transaction
+
+        out = _coerce_date_fields(Transaction, {"date": None})
+        self.assertIsNone(out["date"])
+
+    def test_datetime_field_left_alone(self):
+        """``DateTimeField`` columns (a subclass of DateField) preserve
+        full precision — only plain DateFields get the truncation."""
+        from multitenancy.tasks import _coerce_date_fields
+        from multitenancy.models import ImportSession
+
+        # ImportSession.created_at is auto_now_add but a normal
+        # DateTimeField; the helper must NOT touch it.
+        out = _coerce_date_fields(
+            ImportSession, {"created_at": "2025-09-16T14:30:00"},
+        )
+        self.assertEqual(out["created_at"], "2025-09-16T14:30:00")
+
+
 @override_settings(AUTH_OFF=True)  # sidestep token auth for these tests
 class V2AnalyzeEndpointTests(TestCase):
     """analyze/ — file-to-session transitions."""
