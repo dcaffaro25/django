@@ -41,6 +41,12 @@ ISSUE_NEGATIVE_AMOUNT = "negative_amount"
 ISSUE_FK_AMBIGUOUS = "fk_ambiguous"
 # ETL-only (Phase 3):
 ISSUE_MISSING_ETL_PARAMETER = "missing_etl_parameter"
+# Per-sheet issue emitted when the dry-run step reports any rows would
+# fail to commit. Context carries ``fail_count`` and a capped list of
+# sample error messages (``sample_messages``). Only ``abort`` is accepted
+# — the operator fixes the source file offline and re-uploads. See
+# ``services._emit_dry_run_failure_issues``.
+ISSUE_DRY_RUN_FAILURE = "dry_run_failure"
 
 ISSUE_TYPES = frozenset({
     ISSUE_ERP_ID_CONFLICT,
@@ -50,6 +56,7 @@ ISSUE_TYPES = frozenset({
     ISSUE_NEGATIVE_AMOUNT,
     ISSUE_FK_AMBIGUOUS,
     ISSUE_MISSING_ETL_PARAMETER,
+    ISSUE_DRY_RUN_FAILURE,
 })
 
 

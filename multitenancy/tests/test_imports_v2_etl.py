@@ -260,6 +260,57 @@ class ETLv2AnalyzeEndpointTests(TestCase):
         self.assertEqual(len(conflicts), 1)
         self.assertEqual(conflicts[0]["location"]["erp_id"], "SHARED")
 
+    def test_etl_errors_emit_blocking_dry_run_failure_issue(self):
+        """If the ETL pipeline reports any python / database /
+        substitution errors, analyze emits a ``dry_run_failure`` issue
+        and the session flips to ``awaiting_resolve`` so commit is
+        blocked. Mirror of the template-path behaviour."""
+        etl_return = {
+            "transformed_data": {
+                "Transaction": {
+                    "row_count": 1,
+                    "rows": [{"__erp_id": "OMIE-1", "date": "2026-01-01"}],
+                    "sample_columns": [],
+                },
+            },
+            "substitutions_applied": [],
+            "python_errors": [
+                {"message": "TypeError: bad thing", "row": 3},
+                {"message": "ValueError: other thing", "row": 7},
+            ],
+            "database_errors": [
+                {"message": "violates unique constraint", "row": 5},
+            ],
+            "substitution_errors": [],
+            "warnings": [],
+            "sheets_processed": ["Transaction"],
+        }
+        with mock.patch("multitenancy.imports_v2.services.ETLPipelineService") as svc_cls:
+            svc_cls.return_value.execute.return_value = etl_return
+            resp = self.client.post(
+                _url_etl_analyze(self.company.id),
+                {
+                    "file": _upload_file(_build_xlsx({"Transaction": [{"date": "2026-01-01"}]})),
+                    "transformation_rule_id": str(self.rule.pk),
+                    "auto_create_journal_entries": _json_dump(self.AUTO_JE_CONFIG),
+                },
+                format="multipart",
+            )
+        self.assertEqual(resp.status_code, 202, resp.content)
+        body = resp.json()
+        self.assertEqual(body["status"], ImportSession.STATUS_AWAITING_RESOLVE)
+        self.assertFalse(body["is_committable"])
+        dry_run_issues = [
+            i for i in body["open_issues"] if i["type"] == "dry_run_failure"
+        ]
+        self.assertEqual(len(dry_run_issues), 1)
+        ctx = dry_run_issues[0]["context"]
+        self.assertEqual(ctx["fail_count"], 3)
+        self.assertEqual(ctx["python_errors"], 2)
+        self.assertEqual(ctx["database_errors"], 1)
+        self.assertIn("violates unique constraint", ctx["sample_messages"])
+        self.assertEqual(dry_run_issues[0]["proposed_actions"], ["abort"])
+
     def test_etl_service_exception_marks_session_error(self):
         with mock.patch("multitenancy.imports_v2.services.ETLPipelineService") as svc_cls:
             svc_cls.return_value.execute.side_effect = RuntimeError("boom")

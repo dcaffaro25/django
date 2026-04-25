@@ -22,4 +22,5 @@ urlpatterns = [
     path("sessions/running-count/", views.ImportSessionRunningCountView.as_view(), name="sessions-running-count"),
     path("sessions/", views.ImportSessionListView.as_view(), name="sessions-list"),
     path("sessions/<int:pk>/", views.ImportSessionDetailView.as_view(), name="session-detail"),
+    path("sessions/<int:pk>/preview.xlsx", views.PreviewDownloadView.as_view(), name="session-preview-xlsx"),
 ]

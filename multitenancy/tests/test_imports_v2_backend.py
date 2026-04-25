@@ -119,7 +119,15 @@ class V2AnalyzeEndpointTests(TestCase):
         self.assertIn("error", body.get("result") or {})
 
     def test_clean_file_transitions_to_ready(self):
-        """A file with no transaction-sheet conflicts → ready, no issues."""
+        """A file with no transaction-sheet conflicts → ready, no issues.
+
+        Mocks the dry-run with a clean success payload so this test
+        stays focused on the analyze-flow contract and doesn't depend
+        on the test DB having every FK fixture the real
+        ``execute_import_job`` would resolve. Dry-run failures
+        (introduced 2026-04-24) translate to ``dry_run_failure``
+        blocking issues; we don't want those firing here.
+        """
         xlsx = _build_xlsx({
             "Transaction": [
                 {"__erp_id": "OMIE-1", "date": "2026-01-01",
@@ -128,11 +136,24 @@ class V2AnalyzeEndpointTests(TestCase):
                  "description": "y", "amount": "200.00"},
             ],
         })
-        resp = self.client.post(
-            _url_analyze(self.company.id),
-            {"file": _upload_file(xlsx)},
-            format="multipart",
-        )
+        clean_imports = {
+            "imports": [{
+                "model": "Transaction",
+                "result": [
+                    {"__row_id": "r1", "action": "create", "status": "success"},
+                    {"__row_id": "r2", "action": "create", "status": "success"},
+                ],
+            }],
+        }
+        with mock.patch(
+            "multitenancy.imports_v2.services.execute_import_job",
+            return_value=clean_imports,
+        ):
+            resp = self.client.post(
+                _url_analyze(self.company.id),
+                {"file": _upload_file(xlsx)},
+                format="multipart",
+            )
         self.assertEqual(resp.status_code, 202, resp.content)
         body = resp.json()
         self.assertEqual(body["status"], ImportSession.STATUS_READY)
@@ -145,8 +166,10 @@ class V2AnalyzeEndpointTests(TestCase):
 
     def test_erp_id_conflict_transitions_to_awaiting_resolve(self):
         """Two rows sharing an erp_id but disagreeing on date → one
-        blocking issue; session stays in ``awaiting_resolve`` and
-        is not committable."""
+        blocking ``erp_id_conflict`` issue; session stays in
+        ``awaiting_resolve``. Mocks the dry-run with a clean payload
+        so the assertion can pin exactly one issue (the conflict)
+        rather than two (conflict + dry_run_failure)."""
         xlsx = _build_xlsx({
             "Transaction": [
                 {"__erp_id": "OMIE-1", "date": "2026-01-01",
@@ -155,11 +178,24 @@ class V2AnalyzeEndpointTests(TestCase):
                  "description": "x", "amount": "100.00"},
             ],
         })
-        resp = self.client.post(
-            _url_analyze(self.company.id),
-            {"file": _upload_file(xlsx)},
-            format="multipart",
-        )
+        clean_imports = {
+            "imports": [{
+                "model": "Transaction",
+                "result": [
+                    {"__row_id": "r1", "action": "create", "status": "success"},
+                    {"__row_id": "r2", "action": "create", "status": "success"},
+                ],
+            }],
+        }
+        with mock.patch(
+            "multitenancy.imports_v2.services.execute_import_job",
+            return_value=clean_imports,
+        ):
+            resp = self.client.post(
+                _url_analyze(self.company.id),
+                {"file": _upload_file(xlsx)},
+                format="multipart",
+            )
         self.assertEqual(resp.status_code, 202, resp.content)
         body = resp.json()
         self.assertEqual(body["status"], ImportSession.STATUS_AWAITING_RESOLVE)
@@ -176,18 +212,32 @@ class V2AnalyzeEndpointTests(TestCase):
     def test_non_transaction_sheets_do_not_trigger_erp_id_conflict_detection(self):
         """Journal entry or bank sheets can have shared erp_ids without
         the Phase 2 conflict detector firing (manual §11.10c scopes
-        grouping to Transactions only)."""
+        grouping to Transactions only). Mocks the dry-run clean so
+        ``dry_run_failure`` doesn't sneak in either."""
         xlsx = _build_xlsx({
             "JournalEntry": [
                 {"__erp_id": "SHARED", "debit_amount": "100", "credit_amount": 0},
                 {"__erp_id": "SHARED", "debit_amount": 0, "credit_amount": "100"},
             ],
         })
-        resp = self.client.post(
-            _url_analyze(self.company.id),
-            {"file": _upload_file(xlsx)},
-            format="multipart",
-        )
+        clean_imports = {
+            "imports": [{
+                "model": "JournalEntry",
+                "result": [
+                    {"__row_id": "r1", "action": "create", "status": "success"},
+                    {"__row_id": "r2", "action": "create", "status": "success"},
+                ],
+            }],
+        }
+        with mock.patch(
+            "multitenancy.imports_v2.services.execute_import_job",
+            return_value=clean_imports,
+        ):
+            resp = self.client.post(
+                _url_analyze(self.company.id),
+                {"file": _upload_file(xlsx)},
+                format="multipart",
+            )
         self.assertEqual(resp.status_code, 202, resp.content)
         body = resp.json()
         self.assertEqual(body["status"], ImportSession.STATUS_READY)
@@ -352,6 +402,220 @@ class V2TemplateDryRunPreviewTests(TestCase):
             )
         ej.assert_not_called()
         self.assertEqual(session.status, ImportSession.STATUS_READY)
+
+    # --- row-level preservation + dry_run_failure issue (2026-04-24) ------
+
+    def test_error_rows_preserve_full_messages(self):
+        """``row_results`` and ``full_row_results`` must carry the
+        per-row ``message`` so the operator can see WHY each row would
+        fail. Pre-fix the dry-run discarded everything except the int
+        counts — see ``_template_dry_run_preview`` rewrite."""
+        from multitenancy.imports_v2 import services as svc
+
+        xlsx = self._build_file(2)
+        fake_imports = {
+            "imports": [{
+                "model": "Transaction",
+                "result": [
+                    {"__row_id": "r1", "action": "create", "status": "success"},
+                    {"__row_id": "r2", "action": "create", "status": "error",
+                     "message": "FK entity not found: 'Acme'",
+                     "data": {"entity": "Acme"}},
+                ],
+            }]
+        }
+        with mock.patch.object(svc, "execute_import_job", return_value=fake_imports):
+            session = svc.analyze_template(
+                company_id=self.company.id, user=self.user,
+                file_bytes=xlsx, file_name="t.xlsx",
+            )
+        preview = (session.parsed_payload or {}).get("preview") or {}
+        row_results = preview.get("row_results") or []
+        full_rows = preview.get("full_row_results") or []
+
+        error_rows = [r for r in row_results if r.get("status") == "error"]
+        self.assertEqual(len(error_rows), 1)
+        self.assertEqual(
+            error_rows[0]["message"], "FK entity not found: 'Acme'",
+        )
+        self.assertEqual(error_rows[0]["__row_id"], "r2")
+        # Small input: full list mirrors the display subset row-count.
+        self.assertEqual(len(full_rows), 2)
+
+    def test_success_rows_sampled_at_cap(self):
+        """When a sheet has more than
+        ``TEMPLATE_DRY_RUN_DISPLAY_SUCCESS_SAMPLE`` successful rows the
+        display subset caps successes at the sample size while
+        ``full_row_results`` still contains every row (for the xlsx
+        download)."""
+        from multitenancy.imports_v2 import services as svc
+
+        with mock.patch.object(
+            svc, "TEMPLATE_DRY_RUN_DISPLAY_SUCCESS_SAMPLE", 5,
+        ):
+            xlsx = self._build_file(20)
+            fake_imports = {
+                "imports": [{
+                    "model": "Transaction",
+                    "result": [
+                        {"__row_id": f"r{i}", "action": "create", "status": "success"}
+                        for i in range(20)
+                    ],
+                }]
+            }
+            with mock.patch.object(
+                svc, "execute_import_job", return_value=fake_imports,
+            ):
+                session = svc.analyze_template(
+                    company_id=self.company.id, user=self.user,
+                    file_bytes=xlsx, file_name="t.xlsx",
+                )
+        preview = (session.parsed_payload or {}).get("preview") or {}
+        row_results = preview.get("row_results") or []
+        full_rows = preview.get("full_row_results") or []
+        self.assertEqual(len(row_results), 5)
+        self.assertEqual(len(full_rows), 20)
+        self.assertTrue(preview.get("display_truncated"))
+
+    def test_would_fail_blocks_commit_via_open_issue(self):
+        """Any ``would_fail`` row emits a ``dry_run_failure`` issue and
+        flips the session to ``awaiting_resolve`` so commit is blocked.
+        Pre-fix: green 'Pronto para importar' coexisted with a
+        '409 falhariam' preview — those two states cannot be both
+        true at once."""
+        from multitenancy.imports_v2 import services as svc
+        from multitenancy.imports_v2 import issues as issue_mod
+
+        xlsx = self._build_file(3)
+        fake_imports = {
+            "imports": [{
+                "model": "Transaction",
+                "result": [
+                    {"__row_id": "r1", "action": "create", "status": "error",
+                     "message": "boom-a"},
+                    {"__row_id": "r2", "action": "create", "status": "error",
+                     "message": "boom-a"},
+                    {"__row_id": "r3", "action": "create", "status": "error",
+                     "message": "boom-b"},
+                ],
+            }]
+        }
+        with mock.patch.object(svc, "execute_import_job", return_value=fake_imports):
+            session = svc.analyze_template(
+                company_id=self.company.id, user=self.user,
+                file_bytes=xlsx, file_name="t.xlsx",
+            )
+        self.assertEqual(session.status, ImportSession.STATUS_AWAITING_RESOLVE)
+        self.assertFalse(session.is_committable())
+
+        dry_run_issues = [
+            i for i in (session.open_issues or [])
+            if i.get("type") == issue_mod.ISSUE_DRY_RUN_FAILURE
+        ]
+        self.assertEqual(len(dry_run_issues), 1)
+        issue = dry_run_issues[0]
+        self.assertEqual(issue["severity"], "error")
+        self.assertEqual(issue["context"]["fail_count"], 3)
+        self.assertEqual(issue["context"]["model"], "Transaction")
+        self.assertEqual(issue["proposed_actions"], ["abort"])
+        # Most-frequent distinct message comes first.
+        self.assertEqual(issue["context"]["sample_messages"][0], "boom-a")
+        self.assertIn("boom-b", issue["context"]["sample_messages"])
+
+    def test_serializer_strips_full_row_results(self):
+        """``full_row_results`` is large (up to 5k rows) and must NOT
+        ride on the polling GET response. The serializer instead
+        exposes ``full_row_count`` + ``has_full_download`` flags so the
+        frontend can render 'Baixar Excel completo'."""
+        from multitenancy.imports_v2 import services as svc
+        from multitenancy.imports_v2.serializers import ImportSessionSerializer
+
+        xlsx = self._build_file(2)
+        fake_imports = {
+            "imports": [{
+                "model": "Transaction",
+                "result": [
+                    {"__row_id": "r1", "action": "create", "status": "success"},
+                    {"__row_id": "r2", "action": "create", "status": "error",
+                     "message": "bad"},
+                ],
+            }]
+        }
+        with mock.patch.object(svc, "execute_import_job", return_value=fake_imports):
+            session = svc.analyze_template(
+                company_id=self.company.id, user=self.user,
+                file_bytes=xlsx, file_name="t.xlsx",
+            )
+        data = ImportSessionSerializer(session).data
+        self.assertNotIn("full_row_results", data["preview"])
+        self.assertEqual(data["preview"]["full_row_count"], 2)
+        self.assertTrue(data["preview"]["has_full_download"])
+        # The display subset IS served for the on-screen table.
+        self.assertEqual(len(data["preview"]["row_results"]), 2)
+
+    def test_preview_download_returns_xlsx(self):
+        """Endpoint returns a real .xlsx with one sheet per model + one
+        row per dry-run row."""
+        from multitenancy.imports_v2 import services as svc
+        import openpyxl, io
+
+        xlsx = self._build_file(2)
+        fake_imports = {
+            "imports": [{
+                "model": "Transaction",
+                "result": [
+                    {"__row_id": "r1", "action": "create", "status": "success",
+                     "data": {"amount": "100"}},
+                    {"__row_id": "r2", "action": "create", "status": "error",
+                     "message": "bad", "data": {"amount": "-5"}},
+                ],
+            }]
+        }
+        with mock.patch.object(svc, "execute_import_job", return_value=fake_imports):
+            session = svc.analyze_template(
+                company_id=self.company.id, user=self.user,
+                file_bytes=xlsx, file_name="t.xlsx",
+            )
+
+        client = APIClient()
+        with override_settings(AUTH_OFF=True):
+            resp = client.get(
+                f"/{self.company.id}/api/core/imports/v2/sessions/{session.pk}/preview.xlsx"
+            )
+        self.assertEqual(resp.status_code, 200, resp.content[:200])
+        self.assertTrue(resp["Content-Type"].startswith(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml"
+        ))
+        self.assertIn("attachment", resp["Content-Disposition"])
+
+        wb = openpyxl.load_workbook(io.BytesIO(resp.content))
+        self.assertIn("Transaction", wb.sheetnames)
+        ws = wb["Transaction"]
+        header = [c.value for c in ws[1]]
+        self.assertIn("__row_id", header)
+        self.assertIn("status", header)
+        self.assertIn("message", header)
+        # Header + 2 data rows.
+        self.assertEqual(ws.max_row, 3)
+
+    def test_preview_download_404_when_no_preview(self):
+        """Session with no preview data returns 404."""
+        from multitenancy.imports_v2 import services as svc
+
+        xlsx = _build_xlsx({"Transaction": []})
+        with mock.patch.object(svc, "execute_import_job") as ej:
+            session = svc.analyze_template(
+                company_id=self.company.id, user=self.user,
+                file_bytes=xlsx, file_name="t.xlsx",
+            )
+        ej.assert_not_called()
+
+        client = APIClient()
+        with override_settings(AUTH_OFF=True):
+            resp = client.get(
+                f"/{self.company.id}/api/core/imports/v2/sessions/{session.pk}/preview.xlsx"
+            )
+        self.assertEqual(resp.status_code, 404)
 
 
 @override_settings(AUTH_OFF=True)

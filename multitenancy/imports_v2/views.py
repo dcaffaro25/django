@@ -263,6 +263,60 @@ class ImportSessionDetailView(APIView):
         )
 
 
+class PreviewDownloadView(APIView):
+    """``GET /api/core/imports/v2/sessions/<id>/preview.xlsx``
+    (and the ``/api/core/etl/v2/sessions/<id>/preview.xlsx`` mirror).
+
+    Streams the complete dry-run per-row results as a multi-sheet
+    .xlsx so the operator can audit every row's status / action /
+    message alongside the original input data — useful when the
+    on-screen sample shows only 100 successes per sheet but the
+    operator wants to grep the full file.
+
+    Template mode: one sheet per model. ETL mode: one flat
+    ``ETL errors`` sheet flattening python / database / substitution
+    / warning buckets.
+
+    Returns 404 when the session has no preview data — parse failure,
+    file too big to dry-run (above ``TEMPLATE_DRY_RUN_ROW_THRESHOLD``),
+    or discarded before analyze finished.
+    """
+
+    def get_permissions(self):
+        return _perms()
+
+    def get(
+        self, request, pk: int, tenant_id: Optional[int] = None,
+    ) -> Response:
+        company_id, err = _resolve_bulk_import_company_id(request)
+        if err is not None:
+            return err
+        session = _get_session_or_404(pk, company_id)
+
+        xlsx_bytes = services.build_preview_xlsx(session)
+        if xlsx_bytes is None:
+            return Response(
+                {"detail": "No preview data available for this session."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Use Django HttpResponse rather than DRF Response so the binary
+        # body doesn't get mangled by the JSON renderer.
+        from django.http import HttpResponse
+        safe_name = (session.file_name or f"session-{pk}").rsplit(".", 1)[0]
+        resp = HttpResponse(
+            xlsx_bytes,
+            content_type=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+        )
+        resp["Content-Disposition"] = (
+            f'attachment; filename="{safe_name}-preview.xlsx"'
+        )
+        return resp
+
+
 class ResolveSessionView(APIView):
     """``POST /api/core/imports/v2/resolve/<pk>/``
     (and the ``/api/core/etl/v2/resolve/<pk>/`` mirror).

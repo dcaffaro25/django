@@ -190,25 +190,39 @@ class ImportSessionSerializer(serializers.ModelSerializer):
         return {**db_progress, **live}
 
     def get_preview(self, obj):
-        """Dry-run counts from the analyze phase.
+        """Dry-run counts + on-screen row sample from the analyze phase.
 
         For ETL sessions: ``ETLPipelineService.execute(commit=False)``
-        already computes ``would_create`` / ``would_fail`` /
-        ``total_rows`` — we surface them here for the frontend's
-        "Prévia da importação" panel.
+        computes ``would_create`` / ``would_fail`` / ``total_rows`` —
+        we surface them here for the "Prévia da importação" panel.
 
-        For template sessions: empty dict (we don't run a commit=False
-        dry-run at analyze yet — that's a follow-up commit; running
-        execute_import_job twice per session doubles analyze cost on
-        large imports, so it needs its own design pass).
+        For template sessions: ``_template_dry_run_preview`` adds
+        ``row_results`` (display subset = all errors + up to 100
+        sampled successes per sheet) and ``full_row_results`` (the
+        complete list, for the xlsx download). We **strip**
+        ``full_row_results`` here because the polling frontend hits
+        this endpoint every 2s on active sessions and 5k rows × ~200B
+        would blow up every response. Operators who want the full
+        list hit ``GET /sessions/<pk>/preview.xlsx`` — see
+        ``PreviewDownloadView``.
 
-        Backward compatible: a session created before this field existed
-        reads as an empty dict.
+        Two derived flags help the frontend render a
+        "Mostrando X de Y linhas — baixar Excel completo" hint:
+          * ``full_row_count`` — len of ``full_row_results``.
+          * ``has_full_download`` — truthy when the xlsx download
+            endpoint will return a body (vs 404).
+
+        Backward compatible: a session created before this field
+        existed reads as an empty dict.
         """
         preview = (obj.parsed_payload or {}).get("preview")
-        if isinstance(preview, dict):
-            return preview
-        return {}
+        if not isinstance(preview, dict):
+            return {}
+        out = {k: v for k, v in preview.items() if k != "full_row_results"}
+        full = preview.get("full_row_results") or []
+        out["full_row_count"] = len(full) if isinstance(full, list) else 0
+        out["has_full_download"] = bool(full)
+        return out
 
 
 class ImportSessionListSerializer(serializers.ModelSerializer):

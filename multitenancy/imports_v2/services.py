@@ -493,6 +493,32 @@ def _detect_unmatched_references(
 # button) if operators want counts on bigger files.
 TEMPLATE_DRY_RUN_ROW_THRESHOLD = 5000
 
+# Display subset: how many SUCCESS rows per model the on-screen preview
+# table includes. All errors are always shown regardless of count; the
+# successes are sampled at evenly-spaced indices so the preview shows
+# variety rather than the first 100. The complete row list lives in
+# ``full_row_results`` (xlsx download only — too big for the polling
+# JSON response, see ``ImportSessionSerializer.get_preview``).
+TEMPLATE_DRY_RUN_DISPLAY_SUCCESS_SAMPLE = 100
+
+# How many distinct error messages to surface in the open_issue context
+# so the operator gets a quick read on what's wrong without bloating
+# the issues list.
+TEMPLATE_DRY_RUN_ISSUE_SAMPLE_MESSAGES = 5
+
+
+def _sample_evenly(items: List[Any], k: int) -> List[Any]:
+    """Pick up to ``k`` items at evenly-spaced indices (no randomness —
+    deterministic for snapshot tests). ``k >= len(items)`` returns the
+    whole list. The first and last items are always included so the
+    sample spans the full range."""
+    n = len(items)
+    if k <= 0 or n == 0:
+        return []
+    if k >= n:
+        return list(items)
+    return [items[int(i * (n - 1) / (k - 1))] for i in range(k)]
+
 
 def _template_dry_run_preview(
     company_id: int,
@@ -509,9 +535,15 @@ def _template_dry_run_preview(
     The real commit will re-raise the same issue with full context if
     it's a genuine bug in the input.
 
-    Returns a dict compatible with ``parsed_payload['preview']``:
-    ``{would_create, would_update, would_fail, total_rows}`` — keys the
-    serializer already exposes via the ``preview`` field.
+    Returns a dict on ``parsed_payload['preview']``:
+    ``{would_create, would_update, would_fail, total_rows, row_results,
+    full_row_results, display_truncated}``.
+
+    ``row_results`` is the on-screen subset (every error + a sample of
+    up to ``TEMPLATE_DRY_RUN_DISPLAY_SUCCESS_SAMPLE`` successes per
+    model). ``full_row_results`` is the complete list, consumed only by
+    the xlsx download endpoint. Both share the same per-row schema:
+    ``{__row_id, model, status, action, message, data}``.
     """
     sheets_for_job = [
         {"model": sheet_name, "rows": rows}
@@ -550,6 +582,12 @@ def _template_dry_run_preview(
     would_update: Dict[str, int] = {}
     would_fail: Dict[str, int] = {}
     total_rows = 0
+    # Per-sheet buckets so the success sampling is even WITHIN each
+    # model. Merging into one flat list would oversample big sheets and
+    # hide small ones.
+    errors_by_model: Dict[str, List[Dict[str, Any]]] = {}
+    successes_by_model: Dict[str, List[Dict[str, Any]]] = {}
+
     for sheet_result in (result or {}).get("imports", []) or []:
         model = sheet_result.get("model")
         if not model:
@@ -558,22 +596,290 @@ def _template_dry_run_preview(
             total_rows += 1
             status_val = (row.get("status") or "").lower()
             action_val = (row.get("action") or "").lower()
+            normalised = {
+                "__row_id": row.get("__row_id"),
+                "model": model,
+                "status": status_val or "ok",
+                "action": action_val or None,
+                "message": row.get("message"),
+                "data": row.get("data") or {},
+            }
             if status_val == "error":
                 would_fail[model] = would_fail.get(model, 0) + 1
+                errors_by_model.setdefault(model, []).append(normalised)
                 continue
             if action_val == "create":
                 would_create[model] = would_create.get(model, 0) + 1
             elif action_val == "update":
                 would_update[model] = would_update.get(model, 0) + 1
-            # rows with action="delete" or "skipped_duplicate" etc. are
-            # not counted in any bucket — the panel only reports the
-            # three write intents.
+            # rows with action="delete" / "skipped_duplicate" / etc. are
+            # not counted in any bucket but still kept in the success
+            # sample so the operator sees them in the preview table.
+            successes_by_model.setdefault(model, []).append(normalised)
+
+    # Full list (xlsx download): every row, errors before successes
+    # within each model so an operator scanning the file sees failures
+    # first.
+    ordered_models = list(errors_by_model.keys()) + [
+        m for m in successes_by_model if m not in errors_by_model
+    ]
+    full_row_results: List[Dict[str, Any]] = []
+    for model in ordered_models:
+        full_row_results.extend(errors_by_model.get(model, []))
+        full_row_results.extend(successes_by_model.get(model, []))
+
+    # Display subset (on-screen): all errors + up to N evenly-sampled
+    # successes per sheet. ``data`` is dropped from displayed successes
+    # to keep the JSON small — the xlsx still has the full row.
+    row_results: List[Dict[str, Any]] = []
+    total_successes = 0
+    displayed_successes = 0
+    for model in ordered_models:
+        row_results.extend(errors_by_model.get(model, []))
+        success_rows = successes_by_model.get(model, [])
+        total_successes += len(success_rows)
+        sampled = _sample_evenly(
+            success_rows, TEMPLATE_DRY_RUN_DISPLAY_SUCCESS_SAMPLE,
+        )
+        displayed_successes += len(sampled)
+        for r in sampled:
+            row_results.append({**r, "data": None})
+    display_truncated = displayed_successes < total_successes
+
     return {
         "would_create": would_create,
         "would_update": would_update,
         "would_fail": would_fail,
         "total_rows": total_rows,
+        "row_results": row_results,
+        "full_row_results": full_row_results,
+        "display_truncated": display_truncated,
     }
+
+
+def _emit_dry_run_failure_issues(
+    preview: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Translate ``would_fail`` per-model counts into one
+    ``dry_run_failure`` Issue per affected sheet. Operators can only
+    abort on these (no inline fix — the error is in the source file,
+    not in row-level metadata we can rewrite via resolve handlers).
+    """
+    would_fail = (preview or {}).get("would_fail") or {}
+    if not would_fail:
+        return []
+
+    # Group error messages by model so the open_issue context can carry
+    # a sample of the most common ones for that sheet.
+    from collections import Counter
+    errors_by_model: Dict[str, List[str]] = {}
+    for row in (preview.get("full_row_results") or []):
+        if (row.get("status") or "").lower() != "error":
+            continue
+        model = row.get("model") or "?"
+        msg = row.get("message") or "(sem mensagem)"
+        errors_by_model.setdefault(model, []).append(msg)
+
+    issues: List[Dict[str, Any]] = []
+    for model, fail_count in would_fail.items():
+        if not fail_count:
+            continue
+        freq = Counter(errors_by_model.get(model, []))
+        sample_messages = [m for m, _ in freq.most_common(
+            TEMPLATE_DRY_RUN_ISSUE_SAMPLE_MESSAGES,
+        )]
+        issues.append(issue_mod.make_issue(
+            type=issue_mod.ISSUE_DRY_RUN_FAILURE,
+            severity=issue_mod.SEVERITY_ERROR,
+            location={"sheet": model},
+            context={
+                "model": model,
+                "fail_count": fail_count,
+                "sample_messages": sample_messages,
+            },
+            proposed_actions=[issue_mod.ACTION_ABORT],
+            message=(
+                f"{fail_count} linha(s) falhariam ao importar em "
+                f"'{model}'. Corrija o arquivo e reenvie."
+            ),
+        ))
+    return issues
+
+
+def _emit_etl_dry_run_failure_issues(
+    etl_errors: Dict[str, List[Any]],
+) -> List[Dict[str, Any]]:
+    """ETL-mode equivalent of ``_emit_dry_run_failure_issues``.
+
+    The ETL pipeline already exposes errors in four buckets
+    (``python_errors``, ``database_errors``, ``substitution_errors``,
+    ``warnings``); this helper collapses the first three into a single
+    blocking issue so commit is gated until the operator aborts and
+    reuploads a corrected file. Warnings are advisory and don't block.
+    """
+    python_errors = etl_errors.get("python_errors") or []
+    database_errors = etl_errors.get("database_errors") or []
+    substitution_errors = etl_errors.get("substitution_errors") or []
+    total = len(python_errors) + len(database_errors) + len(substitution_errors)
+    if total == 0:
+        return []
+
+    sample_messages: List[str] = []
+    # Database errors first (most actionable — usually a constraint
+    # violation tied to a specific row), then python, then substitution.
+    for bucket in (database_errors, python_errors, substitution_errors):
+        for err in bucket:
+            if not isinstance(err, dict):
+                continue
+            msg = (
+                err.get("message")
+                or err.get("error")
+                or err.get("detail")
+                or str(err)
+            )
+            if msg and msg not in sample_messages:
+                sample_messages.append(msg)
+            if len(sample_messages) >= TEMPLATE_DRY_RUN_ISSUE_SAMPLE_MESSAGES:
+                break
+        if len(sample_messages) >= TEMPLATE_DRY_RUN_ISSUE_SAMPLE_MESSAGES:
+            break
+
+    return [issue_mod.make_issue(
+        type=issue_mod.ISSUE_DRY_RUN_FAILURE,
+        severity=issue_mod.SEVERITY_ERROR,
+        location={"sheet": None},  # ETL errors span the whole pipeline
+        context={
+            "model": None,
+            "fail_count": total,
+            "python_errors": len(python_errors),
+            "database_errors": len(database_errors),
+            "substitution_errors": len(substitution_errors),
+            "sample_messages": sample_messages,
+        },
+        proposed_actions=[issue_mod.ACTION_ABORT],
+        message=(
+            f"{total} erro(s) reportados pela pipeline de ETL. "
+            "Veja 'Erros da ETL' abaixo, corrija o arquivo e reenvie."
+        ),
+    )]
+
+
+def build_preview_xlsx(session: ImportSession) -> Optional[bytes]:
+    """Render the full dry-run row results to a multi-sheet .xlsx.
+
+    Template mode: one sheet per model, columns =
+    ``__row_id, status, action, message`` plus one column per data
+    field observed across that sheet's rows (preserving the original
+    input verbatim so an operator can grep for the failing row in the
+    source file).
+
+    ETL mode: one flat ``ETL errors`` sheet flattening the four
+    pipeline error buckets with a ``bucket`` discriminator column.
+
+    Returns ``None`` when the session has no preview data — the view
+    translates that to a 404.
+    """
+    from io import BytesIO
+    from openpyxl import Workbook
+
+    payload = session.parsed_payload or {}
+    preview = payload.get("preview") or {}
+    full_rows = preview.get("full_row_results") or []
+
+    # ETL fallback: no template-style row_results → flatten etl_errors.
+    if not full_rows:
+        etl_errors = payload.get("etl_errors") or {}
+        if not any(
+            etl_errors.get(k)
+            for k in ("python_errors", "database_errors",
+                      "substitution_errors", "warnings")
+        ):
+            return None
+        wb = Workbook()
+        _populate_etl_errors_sheet(wb, etl_errors)
+        buf = BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    wb = Workbook()
+    wb.remove(wb.active)  # ditch default blank sheet
+
+    # Group rows by model preserving insertion order.
+    rows_by_model: Dict[str, List[Dict[str, Any]]] = {}
+    for r in full_rows:
+        rows_by_model.setdefault(r.get("model") or "?", []).append(r)
+
+    for model, rows in rows_by_model.items():
+        # Excel sheet names: 31-char max, can't contain a few punctuation
+        # characters. Defensive sanitise.
+        safe_name = str(model)[:31].replace("/", "_").replace("\\", "_")
+        ws = wb.create_sheet(title=safe_name or "sheet")
+
+        # Union of data keys in first-seen order.
+        data_keys: List[str] = []
+        seen = set()
+        for r in rows:
+            for k in (r.get("data") or {}).keys():
+                if k not in seen:
+                    seen.add(k)
+                    data_keys.append(k)
+
+        header = ["__row_id", "status", "action", "message"] + data_keys
+        ws.append(header)
+        for r in rows:
+            data = r.get("data") or {}
+            ws.append([
+                r.get("__row_id"),
+                r.get("status"),
+                r.get("action"),
+                r.get("message"),
+            ] + [
+                _excel_cell_value(data.get(k)) for k in data_keys
+            ])
+
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _excel_cell_value(v: Any) -> Any:
+    """Normalise a value for openpyxl: dicts/lists → JSON repr, primitives
+    pass through. Nested structures would otherwise raise."""
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    import json
+    try:
+        return json.dumps(v, ensure_ascii=False, default=str)
+    except Exception:
+        return str(v)
+
+
+def _populate_etl_errors_sheet(wb, etl_errors: Dict[str, List[Any]]) -> None:
+    """Helper for ``build_preview_xlsx``: flatten the four ETL error
+    buckets into one sheet with a ``bucket`` discriminator column."""
+    ws = wb.active
+    ws.title = "ETL errors"
+    all_keys: List[str] = []
+    seen = set()
+    flat: List[Dict[str, Any]] = []
+    for bucket in ("python_errors", "database_errors",
+                   "substitution_errors", "warnings"):
+        for err in etl_errors.get(bucket, []) or []:
+            row = {"bucket": bucket}
+            if isinstance(err, dict):
+                row.update(err)
+            else:
+                row["message"] = str(err)
+            for k in row.keys():
+                if k not in seen:
+                    seen.add(k)
+                    all_keys.append(k)
+            flat.append(row)
+
+    header = ["bucket"] + [k for k in all_keys if k != "bucket"]
+    ws.append(header)
+    for row in flat:
+        ws.append([_excel_cell_value(row.get(k)) for k in header])
 
 
 # --- Phase 6.z-e: live progress writes -------------------------------------
@@ -864,6 +1170,12 @@ def _run_analyze_template(session: ImportSession) -> ImportSession:
             session_pk=session.pk,
             filename=session.file_name,
         )
+        # Translate any per-row failures from the dry-run into blocking
+        # ``dry_run_failure`` issues so commit stops on
+        # ``awaiting_resolve`` instead of marching forward to write
+        # known-bad rows. Pre-fix the UI showed "Pronto para importar"
+        # next to "409 falhariam" — those two states cannot coexist.
+        detected_issues.extend(_emit_dry_run_failure_issues(preview))
 
     # Phase 6.z-d — pre-substitute once at analyze and stash the result
     # plus a hash of the active substitution-rule set. Commit will check
@@ -1535,15 +1847,16 @@ def _run_analyze_etl(session: ImportSession) -> ImportSession:
     # as ``parsed_payload["preview"]`` so the serializer's ``preview``
     # field can surface them to the frontend's "Prévia da importação"
     # panel on a clean analyze.
+    etl_errors_payload = {
+        "python_errors": etl_result.get("python_errors") or [],
+        "database_errors": etl_result.get("database_errors") or [],
+        "substitution_errors": etl_result.get("substitution_errors") or [],
+        "warnings": etl_result.get("warnings") or [],
+    }
     session.parsed_payload = {
         "transformed_data": transformed_flat,
         "substitutions_applied": etl_result.get("substitutions_applied") or [],
-        "etl_errors": {
-            "python_errors": etl_result.get("python_errors") or [],
-            "database_errors": etl_result.get("database_errors") or [],
-            "substitution_errors": etl_result.get("substitution_errors") or [],
-            "warnings": etl_result.get("warnings") or [],
-        },
+        "etl_errors": etl_errors_payload,
         "sheets_processed": etl_result.get("sheets_processed") or [],
         "preview": {
             "would_create": etl_result.get("would_create") or {},
@@ -1551,6 +1864,11 @@ def _run_analyze_etl(session: ImportSession) -> ImportSession:
             "total_rows": etl_result.get("total_rows") or 0,
         },
     }
+    # ETL mirror of the template dry-run gate: any python / database /
+    # substitution error flips commit to ``awaiting_resolve`` so the
+    # operator has to abort + reupload. The frontend already renders
+    # the per-row detail from ``etl_errors``.
+    detected_issues.extend(_emit_etl_dry_run_failure_issues(etl_errors_payload))
     session.open_issues = detected_issues
     if issue_mod.has_blocking_issues(detected_issues):
         session.status = ImportSession.STATUS_AWAITING_RESOLVE
