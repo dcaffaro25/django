@@ -75,6 +75,78 @@ def _url_sessions_running_count(tenant_id):
     return f"/{tenant_id}/api/core/imports/v2/sessions/running-count/"
 
 
+class JsonScalarTests(TestCase):
+    """Coverage for ``_json_scalar`` -- the per-cell normaliser that
+    runs on every Excel cell during template parse. The midnight-only
+    branch was added (2026-04-25) after operators reported every
+    Transaction row failing with
+
+        '2025-09-16T00:00:00' value has an invalid date format.
+        It must be in YYYY-MM-DD format.
+
+    Excel stores date-only cells as ``pd.Timestamp`` at midnight; we
+    used to emit them as full ISO datetimes which Django's DateField
+    parser rejected. Tests below pin both branches.
+    """
+
+    def test_pure_date_emits_yyyy_mm_dd(self):
+        import datetime as dt
+        from multitenancy.imports_v2.services import _json_scalar
+        self.assertEqual(_json_scalar(dt.date(2025, 9, 16)), "2025-09-16")
+
+    def test_midnight_datetime_emits_date_only(self):
+        """The bug fix's primary case: an Excel-imported date cell
+        arrives as a midnight ``datetime`` and must emit YYYY-MM-DD."""
+        import datetime as dt
+        from multitenancy.imports_v2.services import _json_scalar
+        self.assertEqual(
+            _json_scalar(dt.datetime(2025, 9, 16, 0, 0, 0)),
+            "2025-09-16",
+        )
+
+    def test_midnight_pandas_timestamp_emits_date_only(self):
+        """Same as above but for the ``pd.Timestamp`` form pandas
+        produces from ``read_excel``."""
+        import pandas as pd
+        from multitenancy.imports_v2.services import _json_scalar
+        self.assertEqual(
+            _json_scalar(pd.Timestamp("2025-09-16")),
+            "2025-09-16",
+        )
+
+    def test_non_midnight_datetime_keeps_full_iso(self):
+        """Real datetimes (any non-zero time component) keep the full
+        ISO so DateTimeField columns roundtrip without losing time."""
+        import datetime as dt
+        from multitenancy.imports_v2.services import _json_scalar
+        self.assertEqual(
+            _json_scalar(dt.datetime(2025, 9, 16, 14, 30, 5)),
+            "2025-09-16T14:30:05",
+        )
+
+    def test_non_midnight_pandas_timestamp_keeps_full_iso(self):
+        import pandas as pd
+        from multitenancy.imports_v2.services import _json_scalar
+        ts = pd.Timestamp("2025-09-16 14:30:05")
+        # pandas' Timestamp.isoformat() may include nanosecond precision;
+        # we just need to confirm the time component is preserved.
+        out = _json_scalar(ts)
+        self.assertTrue(out.startswith("2025-09-16T14:30:05"), out)
+
+    def test_tz_aware_midnight_keeps_full_iso(self):
+        """A tz-aware midnight Timestamp could be a different day in the
+        local zone, so we conservatively keep the full ISO. Operators
+        importing tz-aware data should target a DateTimeField column."""
+        import datetime as dt
+        from multitenancy.imports_v2.services import _json_scalar
+        v = dt.datetime(2025, 9, 16, 0, 0, 0, tzinfo=dt.timezone.utc)
+        out = _json_scalar(v)
+        # Anything with a tz suffix is fine; the assertion is just that
+        # we DIDN'T collapse to date-only.
+        self.assertNotEqual(out, "2025-09-16")
+        self.assertIn("2025-09-16T00:00:00", out)
+
+
 @override_settings(AUTH_OFF=True)  # sidestep token auth for these tests
 class V2AnalyzeEndpointTests(TestCase):
     """analyze/ — file-to-session transitions."""

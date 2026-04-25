@@ -56,7 +56,14 @@ def _json_scalar(v: Any) -> Any:
     columns to ``numpy.int64`` / ``numpy.float64``; none of those
     serialize through Django's JSONField without help. Normalise to:
       * ``None`` for NaN / None
-      * ISO string for date/datetime/Timestamp
+      * ``YYYY-MM-DD`` (date-only ISO) for ``datetime.date`` AND for
+        ``datetime.datetime`` / ``pd.Timestamp`` whose time component
+        is exactly midnight (00:00:00.000000). Excel stores date-only
+        cells as Timestamps at midnight; emitting the full
+        ``YYYY-MM-DDTHH:MM:SS`` form for those tripped Django's
+        ``DateField`` parser (it only accepts the date-only form).
+        Real datetimes (any non-midnight time component) keep the
+        full ISO so DateTimeFields receive their full precision.
       * ``str`` for Decimal (preserving precision)
       * ``int`` for numpy ints; ``float`` for numpy floats (with NaN →
         None)
@@ -68,7 +75,25 @@ def _json_scalar(v: Any) -> Any:
     # catches both without importing math.isnan).
     if isinstance(v, float) and v != v:
         return None
-    if isinstance(v, (datetime.date, datetime.datetime, pd.Timestamp)):
+    # Pure date (no time component on the type itself) → date-only ISO.
+    # NB: must be checked BEFORE datetime/Timestamp because
+    # ``isinstance(date_obj, datetime)`` is False but ``isinstance(dt,
+    # date)`` is True — the type hierarchy goes date <- datetime, so
+    # we reach this branch only for actual ``datetime.date`` instances.
+    if isinstance(v, datetime.date) and not isinstance(v, datetime.datetime):
+        return v.isoformat()
+    if isinstance(v, (datetime.datetime, pd.Timestamp)):
+        # Midnight-only Timestamps come from Excel cells formatted as
+        # date (no time entered). Emit YYYY-MM-DD so DateField parsers
+        # accept the value. Anything with a real time component keeps
+        # the full ISO form so DateTimeField roundtrips work.
+        if (
+            v.hour == 0 and v.minute == 0
+            and v.second == 0 and v.microsecond == 0
+            and getattr(v, "tzinfo", None) is None
+        ):
+            # ``v.date()`` works for both pd.Timestamp and datetime.
+            return v.date().isoformat()
         return v.isoformat()
     if isinstance(v, decimal.Decimal):
         return str(v)
