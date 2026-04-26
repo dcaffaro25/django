@@ -174,13 +174,16 @@ class PasswordResetForceView(generics.GenericAPIView):
             f"Please log in and change it immediately."
         )
 
-        send_user_email.delay(
-            subject,
-            message,
-            settings.DEFAULT_FROM_EMAIL,
-            [user.email],
-            fail_silently=False,
-        )
+        # The Celery task signature is ``(subject, message, to_email)``;
+        # it hardcodes ``settings.DEFAULT_FROM_EMAIL`` and
+        # ``fail_silently=False`` internally. Passing extra positional
+        # args + ``fail_silently`` here used to crash the task with
+        # ``TypeError: got an unexpected keyword argument
+        # 'fail_silently'`` — silently in production (Celery worker
+        # logs only), so operators saw a green 200 + cooldown set but
+        # no email ever arrived. Regression test:
+        # ``test_auth.PasswordResetForceViewTests.test_happy_path_resets_password_and_sends_email``.
+        send_user_email.delay(subject, message, user.email)
 
         # ✅ Track email sent
         user.mark_email_sent()
