@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { createPortal } from "react-dom"
 import { ChevronDown, Search, X } from "lucide-react"
 import { DismissableLayerBranch } from "@radix-ui/react-dismissable-layer"
+import { FocusScope } from "@radix-ui/react-focus-scope"
 import type { AccountLite } from "@/features/reconciliation/types"
 import { cn } from "@/lib/utils"
 
@@ -216,7 +217,22 @@ export function SearchableAccountSelect({
   //
   // React context propagates through portals, so the portaled Branch
   // still picks up the Vaul drawer's DismissableLayerContext.
+  //
+  // **FocusScope wrap is REQUIRED for the search input to be typeable.**
+  // Vaul's Drawer.Content wraps its children in Radix's <FocusScope
+  // trapped>, which adds a global focusin listener: any focus moving
+  // OUTSIDE the scope's DOM container is yanked back to the last
+  // in-scope element. Our portaled popover sits in <body>, OUTSIDE the
+  // drawer's container, so when ``inputRef.current?.focus()`` ran on
+  // open, the parent FocusScope immediately stole focus back to the
+  // drawer — the input never received keystrokes and users reported
+  // "the searchbox does nothing." Mounting our own <FocusScope trapped>
+  // pushes onto Radix's focus-scope stack, which **pauses** the parent
+  // scope while ours is active (the stack only honours the topmost
+  // trapped scope). On unmount, the parent scope resumes. ``loop``
+  // makes Tab cycle within the popover.
   const popover = open ? (
+    <FocusScope asChild trapped loop>
     <DismissableLayerBranch
       ref={popoverRef}
       style={popoverStyle}
@@ -288,6 +304,7 @@ export function SearchableAccountSelect({
         )}
       </div>
     </DismissableLayerBranch>
+    </FocusScope>
   ) : null
 
   return (

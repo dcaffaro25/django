@@ -11,6 +11,7 @@ import {
   Wallet, BookOpen, Check, X, Sparkles, ArrowLeftRight, AlertCircle, AlertTriangle,
   Plus, Trash2, CheckCircle2, Search, RotateCcw, Loader2, Wand2, RefreshCw, Scale,
   FileText, ArrowUp, ArrowDown, ChevronsLeft, ChevronLeft, ChevronRight, ChevronsRight,
+  CheckSquare, Square, CircleDashed,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { StatusBadge } from "@/components/ui/status-badge"
@@ -502,6 +503,21 @@ export function WorkbenchPage() {
     setSuggestion(null)
   }
 
+  // Per-pane "select all across the entire filtered set" toggle. Bound
+  // to ``bankTxs`` / ``journalEntries`` (post-filter, pre-paging) so a
+  // single click selects every row that matches the current filters,
+  // including rows on pages the operator hasn't visited. We toggle on
+  // ``size > 0`` (not equality with the source length) so the button
+  // also acts as a "clear" when the operator has a partial selection.
+  const toggleSelectAllBank = () => {
+    setSuggestion(null)
+    setSelectedBank((prev) => (prev.size > 0 ? new Set() : new Set(bankTxs.map((b) => b.id))))
+  }
+  const toggleSelectAllBook = () => {
+    setSuggestion(null)
+    setSelectedBook((prev) => (prev.size > 0 ? new Set() : new Set(journalEntries.map((j) => j.id))))
+  }
+
   const selectedBankItems = useMemo(() => bankTxs.filter((x) => selectedBank.has(x.id)), [bankTxs, selectedBank])
   const selectedBookItems = useMemo(() => journalEntries.filter((x) => selectedBook.has(x.id)), [journalEntries, selectedBook])
 
@@ -531,8 +547,10 @@ export function WorkbenchPage() {
     if (!balanced) {
       // Defensive: the button is disabled in this state, but the `m`
       // hotkey could still fire. Block the network call outright so a
-      // partial/Aberto recon never gets persisted by accident.
-      toast.error("Conciliação direta só com diferença zero. Use Completar conciliação com lançamento.")
+      // partial/Aberto recon never gets persisted by accident — partial
+      // recons are now created via the explicit ``onMatchPartial`` flow,
+      // not silently from this entry point.
+      toast.error("Conciliação direta só com diferença zero. Use \"Conciliar parcial\" para deixar em Aberto, ou \"Completar com lançamento\" para fechar.")
       return
     }
     const t0 = performance.now()
@@ -565,6 +583,78 @@ export function WorkbenchPage() {
         },
         onError: (err: unknown) => {
           logError(err, { meta: { action: "recon.match", num_bank: selectedBank.size, num_book: selectedBook.size } })
+          toast.error(err instanceof Error ? err.message : "Erro")
+        },
+      },
+    )
+  }
+
+  /**
+   * Explicit partial reconciliation — persists an unbalanced match as
+   * a recon in ``status="open"`` (Aberto), to be completed later.
+   *
+   * Background: an earlier ``adjustment_side`` dropdown silently
+   * routed unbalanced selections through this same code path with
+   * ``adjustment_side="none"``, which created Open recons that
+   * operators didn't realise they were creating. The dropdown was
+   * removed, and the only way to settle a non-zero delta became
+   * "Completar com lançamento" (which closes the recon).
+   *
+   * Operators asked us to bring back deliberate partial recons —
+   * common when a single bank deposit needs to be matched against
+   * invoices that arrive over multiple days, and they want to mark
+   * the partial linkage *now* and finish later. So this handler:
+   *
+   *   - is wired to a separate, clearly-labelled button (not a
+   *     dropdown that could be left at the "wrong" value),
+   *   - is gated on ``!balanced`` (when delta == 0, the regular
+   *     Conciliar already produces a closed recon — partial would
+   *     be redundant), and
+   *   - logs ``recon.match_partial`` so we can monitor adoption
+   *     and confirm we're not back to the silent-partial regression.
+   */
+  const onMatchPartial = () => {
+    if (selectedBank.size === 0 || selectedBook.size === 0) {
+      toast.error("Selecione ao menos 1 bancária e 1 contábil")
+      return
+    }
+    if (balanced) {
+      toast.error("A diferença é zero — use Conciliar para fechar a conciliação.")
+      return
+    }
+    const t0 = performance.now()
+    finalize.mutate(
+      {
+        matches: [
+          {
+            bank_transaction_ids: Array.from(selectedBank),
+            journal_entry_ids: Array.from(selectedBook),
+            adjustment_side: "none",
+          },
+        ],
+        adjustment_side: "none",
+      },
+      {
+        onSuccess: (res) => {
+          logAction("recon.match_partial", {
+            duration_ms: Math.round(performance.now() - t0),
+            meta: {
+              num_bank: selectedBank.size,
+              num_book: selectedBook.size,
+              delta,
+              created: res.created?.length ?? 0,
+              problems: res.problems?.length ?? 0,
+            },
+          })
+          if (res.problems?.length) {
+            toast.warning(`${res.created.length} criados em Aberto, ${res.problems.length} com problemas`)
+          } else {
+            toast.success(`Conciliação parcial criada em Aberto (Δ ${formatCurrency(delta)})`)
+          }
+          clearSelection()
+        },
+        onError: (err: unknown) => {
+          logError(err, { meta: { action: "recon.match_partial", num_bank: selectedBank.size, num_book: selectedBook.size, delta } })
           toast.error(err instanceof Error ? err.message : "Erro")
         },
       },
@@ -686,6 +776,7 @@ export function WorkbenchPage() {
           count={bankTxs.length}
           rawCount={rawBankTxs.length}
           selectedCount={selectedBank.size}
+          onToggleSelectAll={toggleSelectAllBank}
           isLoading={bankLoading}
           isFetching={bankFetching}
           empty={t("workbench.empty")}
@@ -763,6 +854,7 @@ export function WorkbenchPage() {
           count={journalEntries.length}
           rawCount={rawJournalEntries.length}
           selectedCount={selectedBook.size}
+          onToggleSelectAll={toggleSelectAllBook}
           isLoading={bookLoading}
           isFetching={bookFetching}
           empty={t("workbench.empty")}
@@ -857,6 +949,7 @@ export function WorkbenchPage() {
             bankAccounts={bankAccounts ?? []}
             onClear={clearSelection}
             onMatch={onMatch}
+            onMatchPartial={onMatchPartial}
             onSuggest={onGenerateSuggestion}
             onAddEntries={() => setAddOpen(true)}
             onMassReconcile={() => setMassOpen(true)}
@@ -942,6 +1035,7 @@ export function WorkbenchPage() {
 
 function Pane({
   title, icon, count, rawCount, selectedCount, isLoading, isFetching, empty, children, active, onFocus, filters, headerAction, footer,
+  onToggleSelectAll,
 }: {
   title: string
   icon: React.ReactNode
@@ -961,6 +1055,11 @@ function Pane({
    *  scrolling/virtualised body so it's always visible and doesn't move
    *  with the rows. */
   footer?: React.ReactNode
+  /** Toggle selection across the entire filtered set (all pages). When
+   *  ``selectedCount === 0`` the button selects every filtered row;
+   *  otherwise it clears. ``count`` represents the post-filter total
+   *  the button operates on, so the label can communicate scope. */
+  onToggleSelectAll?: () => void
 }) {
   const isFiltered = rawCount != null && rawCount !== count
   const showRefreshSpinner = !!isFetching && !isLoading
@@ -985,6 +1084,33 @@ function Pane({
           </span>
         </div>
         <div className="flex items-center gap-2">
+          {/* Bulk select toggle. Operates on the *entire filtered set*
+              across pages, not just the current page — operators
+              reconciling a wide month-end window need to mark
+              everything matching their filters in one click without
+              tab-stepping through pages. selectedCount may exceed
+              ``count`` when a previous selection holds rows that no
+              longer match (e.g. a filter was tightened); in that case
+              we still surface the toggle so they can clear. */}
+          {onToggleSelectAll && count > 0 && (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onToggleSelectAll() }}
+              title={
+                selectedCount > 0
+                  ? "Limpar seleção"
+                  : `Selecionar todos os ${count.toLocaleString("pt-BR")} resultados (todas as páginas)`
+              }
+              className="inline-flex h-7 items-center gap-1 rounded-md border border-border bg-background px-2 text-[11px] font-medium hover:bg-accent"
+            >
+              {selectedCount > 0 ? (
+                <CheckSquare className="h-3.5 w-3.5 text-primary" />
+              ) : (
+                <Square className="h-3.5 w-3.5" />
+              )}
+              {selectedCount > 0 ? "Limpar" : "Selecionar todos"}
+            </button>
+          )}
           {selectedCount > 0 && (
             <span className="rounded-full border border-primary/40 bg-primary/10 px-2 py-0.5 text-[11px] text-primary">
               {selectedCount} selecionados
@@ -1757,7 +1883,7 @@ function BookList({
 function SelectionSummary({
   bankItems, bookItems, bankSum, bookSum, delta, balanced,
   bankAccounts,
-  onClear, onMatch, onSuggest, onAddEntries, onMassReconcile,
+  onClear, onMatch, onMatchPartial, onSuggest, onAddEntries, onMassReconcile,
   canSuggest, suggestLoading, matching,
 }: {
   bankItems: BankTransaction[]
@@ -1769,6 +1895,10 @@ function SelectionSummary({
   bankAccounts: Array<{ id: number; name: string; currency?: { code: string } | null }>
   onClear: () => void
   onMatch: () => void
+  /** Persist the selection as an unbalanced ``status="open"`` recon —
+   *  meaningful only when ``!balanced``. See ``onMatchPartial`` in
+   *  WorkbenchPage for the full rationale. */
+  onMatchPartial: () => void
   onSuggest: () => void
   onAddEntries: () => void
   onMassReconcile: () => void
@@ -1842,12 +1972,14 @@ function SelectionSummary({
         <div className="ml-auto flex items-center gap-2">
           {/* The adjustment-side dropdown ("nenhum/banco/livro") was
               removed: submitting with adjustment_side="none" on an
-              unbalanced selection persisted partial recons in
+              unbalanced selection silently persisted partial recons in
               status="open" (Aberto) that nobody intended to create.
-              Conciliar stays, but is gated on balanced == true; any
-              non-zero delta must now go through "Completar conciliação
-              com lançamento" (AddEntriesDrawer), which routes through
-              create_suggestions and guarantees a balanced Transaction. */}
+              Conciliar is gated on ``balanced == true``; non-zero delta
+              now has TWO explicit, separately-labelled paths:
+                • "Conciliar parcial" (below) — leaves the recon Aberto
+                • "Completar com lançamento" (AddEntriesDrawer) — closes
+              The split keeps the silent-partial regression dead while
+              giving operators back the deliberate-partial workflow. */}
           <button
             onClick={onSuggest}
             disabled={!canSuggest || suggestLoading}
@@ -1892,12 +2024,38 @@ function SelectionSummary({
             <X className="h-3.5 w-3.5" />
             {t("workbench.selection.clear")}
           </button>
+          {/* Partial / Open reconciliation. Surfaces ONLY when the
+              selection is unbalanced (delta != 0) — the regular
+              Conciliar already produces a closed recon for balanced
+              selections, so a partial path there would be dead UI.
+              The button persists the match as ``status="open"`` (Aberto)
+              so operators can iteratively complete it later. This is
+              the explicit return of the ``adjustment_side=none``
+              behaviour that was previously silent in a dropdown — now
+              it's its own labelled button so a partial recon can never
+              be created by accident. */}
+          {!balanced && (
+            <button
+              onClick={onMatchPartial}
+              disabled={matching || bookItems.length === 0 || bankItems.length === 0 || balanced}
+              title={
+                bankItems.length === 0 || bookItems.length === 0
+                  ? "Selecione ao menos 1 bancária e 1 contábil"
+                  : "Vincular as linhas selecionadas como conciliação parcial — fica em Aberto até ser completada"
+              }
+              className="inline-flex h-8 items-center gap-1.5 rounded-md border border-warning/40 bg-warning/10 px-3 text-[12px] font-medium text-warning hover:bg-warning/20 disabled:opacity-50"
+            >
+              <CircleDashed className="h-3.5 w-3.5" />
+              Conciliar parcial
+            </button>
+          )}
           {/* Conciliar is enabled only when the selection balances
               exactly (delta == 0). Unbalanced cases route through
-              "Completar conciliação com lançamento" — the adjustment-
-              side dropdown was removed because adjustment_side=none
-              silently persisted partial ("Aberto") recons nobody
-              intended to create. */}
+              "Completar conciliação com lançamento" (closes) or the
+              new "Conciliar parcial" button above (leaves Aberto).
+              The old adjustment_side dropdown was removed because
+              ``adjustment_side=none`` silently persisted partial
+              recons nobody intended to create. */}
           <button
             onClick={onMatch}
             disabled={matching || bookItems.length === 0 || bankItems.length === 0 || !balanced}
@@ -1905,7 +2063,7 @@ function SelectionSummary({
               bankItems.length === 0 || bookItems.length === 0
                 ? "Selecione ao menos 1 bancária e 1 contábil"
                 : !balanced
-                ? "Conciliação direta só com diferença zero — use Completar conciliação com lançamento para ajustes"
+                ? "Conciliação direta só com diferença zero — use Conciliar parcial (Aberto) ou Completar com lançamento"
                 : undefined
             }
             className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
