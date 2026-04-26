@@ -312,13 +312,59 @@ try:
 except Exception:
     pass
 
-EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
-EMAIL_HOST = "smtp.office365.com"
-EMAIL_PORT = 587
-EMAIL_USE_TLS = True
+# Email config — env-driven so the SMTP relay can be swapped without
+# a code deploy. Defaults preserve the historical Office 365 setup
+# (smtp.office365.com:587 + TLS) so any environment that doesn't set
+# these explicitly keeps working.
+#
+# Common provider configs:
+#
+#   * Office 365 (default):
+#       EMAIL_HOST            = smtp.office365.com
+#       EMAIL_PORT            = 587
+#       EMAIL_USE_TLS         = true
+#       EMAIL_HOST_USER       = <real mailbox address>
+#       EMAIL_HOST_PASSWORD   = <password or app password>
+#       DEFAULT_FROM_EMAIL    = <usually = EMAIL_HOST_USER>
+#
+#     Note: M365 disables SmtpClientAuthentication tenant-wide by
+#     default since 2020. Either enable per-mailbox SMTP AUTH in the
+#     M365 admin centre or use a transactional provider instead.
+#
+#   * Resend (recommended for transactional):
+#       EMAIL_HOST            = smtp.resend.com
+#       EMAIL_PORT            = 587
+#       EMAIL_USE_TLS         = true
+#       EMAIL_HOST_USER       = resend
+#       EMAIL_HOST_PASSWORD   = <Resend API key, "re_..." prefix>
+#       DEFAULT_FROM_EMAIL    = noreply@yourverifieddomain.com
+#
+#     With Resend, ``EMAIL_HOST_USER`` is the literal string "resend"
+#     -- not an email address. ``DEFAULT_FROM_EMAIL`` MUST be set
+#     explicitly to a verified-domain address; the previous fallback
+#     ``DEFAULT_FROM_EMAIL = EMAIL_HOST_USER`` would have produced
+#     "From: resend" which Resend rejects.
+EMAIL_BACKEND = os.getenv(
+    "EMAIL_BACKEND", "django.core.mail.backends.smtp.EmailBackend",
+)
+EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.office365.com")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
+EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", "true").strip().lower() in (
+    "true", "1", "yes",
+)
+# SSL is mutually exclusive with TLS in Django's SMTP backend; set only
+# one. Most modern providers use TLS on 587 (STARTTLS). Enable SSL for
+# port-465 setups.
+EMAIL_USE_SSL = os.getenv("EMAIL_USE_SSL", "false").strip().lower() in (
+    "true", "1", "yes",
+)
 EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER")
 EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD")
-DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
+# Independent env var so providers like Resend/SendGrid (where
+# EMAIL_HOST_USER is a vendor token, not an address) work without a
+# code change. Falls back to EMAIL_HOST_USER for the Office 365 / Gmail
+# style setup where the SMTP user IS the sender address.
+DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", EMAIL_HOST_USER)
 PASSWORD_RESET_EMAIL_COOLDOWN = int(os.getenv("PASSWORD_RESET_EMAIL_COOLDOWN", 5))  # minutes
 TEMP_PASSWORD = os.getenv("TEMP_PASSWORD", 'NordTemp123')
 # Celery / Redis

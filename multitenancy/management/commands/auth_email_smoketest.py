@@ -20,8 +20,23 @@ Examples:
   python manage.py auth_email_smoketest --recipient ops@nv.br
   python manage.py auth_email_smoketest --scenario both --no-celery   # bypass Celery, send synchronously
 
-Environment vars required (already set on Railway):
+Environment vars (set on each Railway service that calls send_mail —
+typically Main Server + Celery worker; Beat optional):
   EMAIL_HOST_USER, EMAIL_HOST_PASSWORD
+
+Optional env vars (defaults preserve the historical Office 365 setup):
+  EMAIL_HOST           default smtp.office365.com
+  EMAIL_PORT           default 587
+  EMAIL_USE_TLS        default true
+  EMAIL_USE_SSL        default false (mutually exclusive with TLS)
+  DEFAULT_FROM_EMAIL   default = EMAIL_HOST_USER
+
+For Resend (recommended transactional provider):
+  EMAIL_HOST           = smtp.resend.com
+  EMAIL_HOST_USER      = resend          (literal string, not an email)
+  EMAIL_HOST_PASSWORD  = re_xxxxxxxx     (your Resend API key)
+  DEFAULT_FROM_EMAIL   = noreply@<your verified Resend domain>
+  (port 587 + TLS=true defaults work as-is)
 
 Notes:
   * By default the Celery task path is exercised. If ``REDIS_URL`` is
