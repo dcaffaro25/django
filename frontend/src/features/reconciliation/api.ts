@@ -110,7 +110,20 @@ export const reconApi = {
       )
       .then(unwrapList<BankTransactionLite>),
 
-  dailyBalances: (params: { date_from: string; date_to: string; bank_account_id?: number }) =>
+  dailyBalances: (params: {
+    date_from: string
+    date_to: string
+    bank_account_id?: number
+    /** When true, the book line includes JEs in ``state="pending"`` —
+     *  the only state most operators see in the workbench, since
+     *  pending IS the meaningful reconciliation state (posted JEs
+     *  have already been finalized in the GL). Defaults to ``true``
+     *  on the dashboard call site so a tenant whose JEs are
+     *  exclusively pending (e.g. Evolat) doesn't see a flat book
+     *  line. The backend default is still ``false`` to preserve
+     *  behavior for any other client. */
+    include_pending_book?: boolean
+  }) =>
     api.tenant.get<BankBookBalancesAggregate>("/api/bank-book-daily-balances/", { params }),
 
   getKPIs: (params?: { date_from?: string; date_to?: string; lookback_days?: number; trend_days?: number }) =>

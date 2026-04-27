@@ -87,11 +87,23 @@ export function useReconPipeline(id: number | null) {
   })
 }
 
-export function useDailyBalances(params: { date_from: string; date_to: string; bank_account_id?: number }) {
+export function useDailyBalances(params: {
+  date_from: string
+  date_to: string
+  bank_account_id?: number
+  /** Include pending JEs on the book line. See the equivalent param
+   *  on ``reconApi.dailyBalances``. Defaults to ``true`` for callers
+   *  that don't pass it — the dashboard's purpose is to show what
+   *  exists in the GL today, including the pending entries the
+   *  workbench is built to reconcile. Tenants whose JEs are entirely
+   *  pending (e.g. Evolat) used to see a permanently flat book line. */
+  include_pending_book?: boolean
+}) {
   const sub = useSub()
+  const effective = { include_pending_book: true, ...params }
   return useQuery({
-    queryKey: qk.balances(sub, params),
-    queryFn: () => reconApi.dailyBalances(params),
+    queryKey: qk.balances(sub, effective),
+    queryFn: () => reconApi.dailyBalances(effective),
     enabled: !!sub && !!params.date_from && !!params.date_to,
   })
 }
