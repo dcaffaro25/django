@@ -11,6 +11,7 @@ import { ConfigsPage } from "@/pages/recon/ConfigsPage"
 import { PipelinesPage } from "@/pages/recon/PipelinesPage"
 import { EmbeddingsPage } from "@/pages/recon/EmbeddingsPage"
 import { BankAccountsPage } from "@/pages/accounting/BankAccountsPage"
+import { BankAccountDetailPage } from "@/pages/accounting/BankAccountDetailPage"
 import { ChartOfAccountsPage } from "@/pages/accounting/ChartOfAccountsPage"
 import { TransactionsPage } from "@/pages/accounting/TransactionsPage"
 import { JournalEntriesPage } from "@/pages/accounting/JournalEntriesPage"
@@ -63,6 +64,7 @@ export default function App() {
                   <Route path="/recon/embeddings" element={<EmbeddingsPage />} />
                   <Route path="/recon/balances" element={<PlaceholderPage title="Saldos" subtitle="Banco vs. livro" />} />
                   <Route path="/accounting/bank-accounts" element={<BankAccountsPage />} />
+                  <Route path="/accounting/bank-accounts/:id" element={<BankAccountDetailPage />} />
                   <Route path="/accounting/accounts" element={<ChartOfAccountsPage />} />
                   <Route path="/accounting/transactions" element={<TransactionsPage />} />
                   <Route path="/accounting/journal-entries" element={<JournalEntriesPage />} />

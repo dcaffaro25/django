@@ -166,6 +166,75 @@ export interface TransactionWrite {
 }
 
 /**
+ * Optional knobs for both the dashboard + per-account KPI endpoints.
+ * Backend defaults (stale_days=30, recon_window_days=30) match the
+ * v1 operator-sensible thresholds; pass explicit values to override
+ * (e.g. a 90-day stale window for a slower-moving account).
+ */
+export interface BankAccountKpiParams {
+  stale_days?: number
+  recon_window_days?: number
+}
+
+/**
+ * Org-wide aggregate KPIs from
+ * ``GET /api/bank_accounts/dashboard-kpis/``.
+ *
+ * All amount-shaped values are strings (Decimal -> str) for
+ * precision; the frontend formats with ``formatCurrency`` per
+ * currency code.
+ */
+export interface BankAccountsDashboardKpis {
+  account_count: number
+  active_account_count: number
+  /** Map currency code -> total balance string. */
+  balance_by_currency: Record<string, string>
+  stale_unreconciled_count: number
+  /** 0..100, count-basis over ``recon_window_days``. */
+  reconciliation_rate_pct: number
+  inflow_mtd_by_currency: Record<string, string>
+  outflow_mtd_by_currency: Record<string, string>
+  inflow_window_by_currency: Record<string, string>
+  outflow_window_by_currency: Record<string, string>
+  currency_codes: string[]
+  stale_days: number
+  recon_window_days: number
+}
+
+/** Per-account header strip from ``GET /api/bank_accounts/<id>/kpis/``. */
+export interface BankAccountKpis {
+  id: number
+  name: string
+  currency_code: string | null
+  current_balance: string
+  transaction_count: number
+  last_transaction_at: string | null
+  last_reconciliation_at: string | null
+  stale_unreconciled_count: number
+  reconciliation_rate_pct: number
+  inflow_mtd: string
+  outflow_mtd: string
+  inflow_window: string
+  outflow_window: string
+  stale_days: number
+  recon_window_days: number
+}
+
+/**
+ * One bar in the per-account 12-month inflow/outflow chart. Months
+ * with no activity still appear with zeros so the chart x-axis is
+ * continuous; backend handles the zero-fill.
+ */
+export interface MonthlyFlowEntry {
+  /** ISO year-month, e.g. "2026-04". */
+  month: string
+  /** Absolute value as string (sum of positive amounts). */
+  inflow: string
+  /** Absolute value as string (abs of sum of negative amounts). */
+  outflow: string
+}
+
+/**
  * One row in the per-bank-tx reconciliation history (audit drawer).
  * Returned by ``GET /api/bank_transactions/<id>/reconciliation-history/``.
  * Totals + discrepancy are stringified Decimals so the frontend can

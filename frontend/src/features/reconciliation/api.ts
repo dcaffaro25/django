@@ -1,10 +1,14 @@
 import { api, unwrapList } from "@/lib/api-client"
 import type {
   BankAccountFull,
+  BankAccountKpiParams,
+  BankAccountKpis,
+  BankAccountsDashboardKpis,
   BankBookBalancesAggregate,
   BankTransaction,
   BankTransactionLite,
   BankTxReconciliationHistoryEntry,
+  MonthlyFlowEntry,
   EmbeddingBackfillAck,
   EmbeddingBackfillInput,
   EmbeddingHealth,
@@ -283,6 +287,41 @@ export const reconApi = {
   updateBankAccount: (id: number, body: Partial<import("./types").BankAccountWrite>) =>
     api.tenant.patch<BankAccountFull>(`/api/bank_accounts/${id}/`, body),
   deleteBankAccount: (id: number) => api.tenant.delete<void>(`/api/bank_accounts/${id}/`),
+
+  /**
+   * Org-wide aggregate KPIs powering the Bank Accounts Dashboard
+   * (page 1). See ``accounting/services/bank_account_kpis.py``.
+   */
+  bankAccountsDashboardKpis: (params?: BankAccountKpiParams) =>
+    api.tenant.get<BankAccountsDashboardKpis>(
+      "/api/bank_accounts/dashboard-kpis/",
+      { params },
+    ),
+
+  /** Per-account header strip for the Bank Account Detail page (page 2). */
+  bankAccountKpis: (id: number, params?: BankAccountKpiParams) =>
+    api.tenant.get<BankAccountKpis>(
+      `/api/bank_accounts/${id}/kpis/`,
+      { params },
+    ),
+
+  /**
+   * 12-month inflow/outflow series for the per-account bar chart.
+   * Backend zero-fills gaps so the chart x-axis stays continuous;
+   * frontend doesn't need to fill in missing months.
+   */
+  bankAccountMonthlyFlows: (id: number, months: number = 12) =>
+    api.tenant.get<MonthlyFlowEntry[]>(
+      `/api/bank_accounts/${id}/monthly-flows/`,
+      { params: { months } },
+    ),
+
+  /**
+   * Single bank account detail. Used by the Bank Account Detail
+   * page header. ``BankAccountFull`` covers the read shape.
+   */
+  getBankAccount: (id: number) =>
+    api.tenant.get<BankAccountFull>(`/api/bank_accounts/${id}/`),
 
   listBanks: () =>
     api.tenant

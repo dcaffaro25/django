@@ -354,6 +354,71 @@ export function useBankTxReconciliationHistory(
 }
 
 /**
+ * Org-wide bank-account KPIs powering the Dashboard. ``params``
+ * lets the page pass operator-tuned thresholds (stale_days,
+ * recon_window_days). 60s staleTime; the dashboard isn't
+ * something operators stare at expecting real-time updates, but
+ * the data is cheap enough to refresh on focus.
+ */
+export function useBankAccountsDashboardKpis(
+  params?: import("./types").BankAccountKpiParams,
+) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["recon", sub, "bank_accounts", "dashboard_kpis", params ?? {}],
+    queryFn: () => reconApi.bankAccountsDashboardKpis(params),
+    enabled: !!sub,
+    staleTime: 60 * 1000,
+  })
+}
+
+/**
+ * Per-account KPIs powering the Bank Account Detail page header.
+ */
+export function useBankAccountKpis(
+  bankAccountId: number | null | undefined,
+  params?: import("./types").BankAccountKpiParams,
+) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["recon", sub, "bank_account", bankAccountId, "kpis", params ?? {}],
+    queryFn: () => reconApi.bankAccountKpis(bankAccountId as number, params),
+    enabled: !!sub && bankAccountId != null,
+    staleTime: 60 * 1000,
+  })
+}
+
+/**
+ * 12-month inflow/outflow series for the per-account bar chart.
+ * Default is 12 months; the backend clamps to 1..60 so passing
+ * any reasonable integer is safe.
+ */
+export function useBankAccountMonthlyFlows(
+  bankAccountId: number | null | undefined,
+  months: number = 12,
+) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["recon", sub, "bank_account", bankAccountId, "monthly_flows", months],
+    queryFn: () => reconApi.bankAccountMonthlyFlows(bankAccountId as number, months),
+    enabled: !!sub && bankAccountId != null,
+    staleTime: 5 * 60 * 1000,
+  })
+}
+
+/** Single bank account record. Powers the Bank Account Detail
+ *  page's identity (name, bank, entity, currency, etc.). */
+export function useBankAccount(bankAccountId: number | null | undefined) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["recon", sub, "bank_account", bankAccountId, "detail"],
+    queryFn: () => reconApi.getBankAccount(bankAccountId as number),
+    enabled: !!sub && bankAccountId != null,
+    staleTime: 60 * 1000,
+  })
+}
+
+/**
  * Probe whether an account has any journal entries. Used to lock fields
  * that would be destructive to change after activity (e.g. account_direction
  * flipping signs on historical reports). Returns true/false; undefined while
