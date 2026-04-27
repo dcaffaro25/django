@@ -2349,6 +2349,117 @@ class BankAccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             "results": results
         }, status=status.HTTP_200_OK)
     
+    # ------------------------------------------------------------------
+    # Dashboard / KPI surface (used by the Bank Account Dashboard +
+    # the per-account Detail page). Defined here on the viewset so
+    # the actions inherit ``ScopedQuerysetMixin`` -> automatic
+    # tenant filtering + the same auth policy as the rest of the
+    # ViewSet. See accounting/services/bank_account_kpis.py for the
+    # actual aggregation; views just wire the URL.
+    # ------------------------------------------------------------------
+
+    @action(methods=['get'], detail=False, url_path='dashboard-kpis')
+    def dashboard_kpis(self, request, *args, **kwargs):
+        """Org-wide aggregate KPIs powering the Bank Accounts
+        Dashboard's top strip + currency-grouped balance summary.
+
+        ``GET /<tenant>/api/bank_accounts/dashboard-kpis/?stale_days=30&recon_window_days=30``
+
+        Optional query params (defaults match the operator-sensible
+        thresholds discussed at planning time):
+
+          * ``stale_days``        — int, default 30. Bank txs older
+            than this many days that aren't matched/approved are
+            counted as "stale".
+          * ``recon_window_days`` — int, default 30. The reconciliation-
+            rate KPI is computed over bank txs dated within this many
+            days of today.
+
+        Returns a dict with org-level aggregates (no per-account
+        breakdown -- use ``listSerializer`` + ``current_balance`` for
+        the per-row card grid).
+        """
+        from accounting.services.bank_account_kpis import compute_dashboard_kpis
+        try:
+            stale_days = int(request.query_params.get('stale_days', 30))
+            recon_window_days = int(request.query_params.get('recon_window_days', 30))
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "stale_days and recon_window_days must be integers."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # The dashboard scopes by tenant via ScopedQuerysetMixin, but
+        # ``compute_dashboard_kpis`` works on a queryset so we hand it
+        # the already-scoped one.
+        qs = self.filter_queryset(self.get_queryset())
+        kpis = compute_dashboard_kpis(
+            bank_account_qs=qs,
+            stale_days=stale_days,
+            recon_window_days=recon_window_days,
+        )
+        return Response(kpis)
+
+    @action(methods=['get'], detail=True, url_path='kpis')
+    def kpis(self, request, pk=None, *args, **kwargs):
+        """Per-account KPIs for the Bank Account Detail header strip.
+
+        ``GET /<tenant>/api/bank_accounts/<id>/kpis/?stale_days=30&recon_window_days=30``
+
+        Same query params as ``dashboard-kpis``. Returns:
+
+          * ``current_balance`` (str)
+          * ``last_transaction_at`` (date | null)
+          * ``last_reconciliation_at`` (datetime | null)
+          * ``transaction_count`` (int — total)
+          * ``stale_unreconciled_count`` (int)
+          * ``reconciliation_rate_pct`` (int 0..100, count-basis over
+            the recon window)
+          * ``inflow_mtd`` / ``outflow_mtd`` (str — abs values)
+          * ``inflow_window`` / ``outflow_window`` (str — over
+            ``recon_window_days``)
+        """
+        from accounting.services.bank_account_kpis import compute_account_kpis
+        ba = self.get_object()
+        try:
+            stale_days = int(request.query_params.get('stale_days', 30))
+            recon_window_days = int(request.query_params.get('recon_window_days', 30))
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "stale_days and recon_window_days must be integers."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(compute_account_kpis(
+            bank_account=ba,
+            stale_days=stale_days,
+            recon_window_days=recon_window_days,
+        ))
+
+    @action(methods=['get'], detail=True, url_path='monthly-flows')
+    def monthly_flows(self, request, pk=None, *args, **kwargs):
+        """12-month inflow/outflow series for the per-account bar chart.
+
+        ``GET /<tenant>/api/bank_accounts/<id>/monthly-flows/?months=12``
+
+        Returns ``[{month: 'YYYY-MM', inflow: '<abs>', outflow: '<abs>'}]``
+        ordered chronologically (oldest -> newest). Months with no
+        activity still appear with zeros so the chart x-axis stays
+        continuous (frontend doesn't have to fill gaps).
+        """
+        from accounting.services.bank_account_kpis import compute_monthly_flows
+        ba = self.get_object()
+        try:
+            months = int(request.query_params.get('months', 12))
+        except (TypeError, ValueError):
+            return Response(
+                {"detail": "months must be an integer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # Bound to a sensible range so a malicious / typo'd value
+        # doesn't trigger huge SQL aggregates.
+        months = max(1, min(months, 60))
+        return Response(compute_monthly_flows(bank_account=ba, months=months))
+
+
 # BankTransaction ViewSet
 class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     if settings.AUTH_OFF:
