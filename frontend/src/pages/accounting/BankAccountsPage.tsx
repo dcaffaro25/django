@@ -1,8 +1,32 @@
 import { useEffect, useMemo, useState } from "react"
+import { Link } from "react-router-dom"
 import { useTranslation } from "react-i18next"
 import { toast } from "sonner"
 import { Drawer } from "vaul"
-import { Plus, Trash2, Save, X, Wallet, Copy, RefreshCw } from "lucide-react"
+import {
+  AlertCircle,
+  ArrowDown,
+  ArrowUp,
+  Copy,
+  ExternalLink,
+  Plus,
+  RefreshCw,
+  Save,
+  Trash2,
+  TrendingUp,
+  Wallet,
+  X,
+} from "lucide-react"
+import {
+  Area,
+  AreaChart,
+  CartesianGrid,
+  Legend,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts"
 import { SectionHeader } from "@/components/ui/section-header"
 import { ColumnMenu } from "@/components/ui/column-menu"
 import { DownloadXlsxButton } from "@/components/ui/download-xlsx-button"
@@ -13,15 +37,21 @@ import { useColumnVisibility, type ColumnDef } from "@/stores/column-visibility"
 import { useSortable } from "@/lib/use-sortable"
 import { useRowSelection } from "@/lib/use-row-selection"
 import {
+  useBankAccountsDashboardKpis,
   useBanks,
   useBankAccountsList,
   useCurrencies,
+  useDailyBalances,
   useDeleteBankAccount,
   useEntities,
   useSaveBankAccount,
 } from "@/features/reconciliation"
-import type { BankAccountFull, BankAccountWrite } from "@/features/reconciliation/types"
-import { cn, formatCurrency } from "@/lib/utils"
+import type {
+  BankAccountFull,
+  BankAccountsDashboardKpis,
+  BankAccountWrite,
+} from "@/features/reconciliation/types"
+import { cn, formatCurrency, formatDate } from "@/lib/utils"
 
 export function BankAccountsPage() {
   const { t } = useTranslation(["reconciliation", "common"])
@@ -123,6 +153,12 @@ export function BankAccountsPage() {
         <BulkAction icon={<Trash2 className="h-3 w-3" />} label={`Excluir ${selection.count}`} variant="danger" onClick={onBulkDelete} />
       </BulkActionsBar>
 
+      {/* Dashboard section -- KPI strip + currency-grouped totals +
+          cross-account daily balance chart. Sits above the
+          management table so the operator sees the org-wide health
+          before drilling into a specific row. */}
+      <BankAccountsDashboardSection />
+
       <div className="card-elevated overflow-hidden">
         <table className="w-full text-[12px]">
           <thead className="bg-surface-3 text-left text-[10px] uppercase tracking-wider text-muted-foreground">
@@ -165,7 +201,23 @@ export function BankAccountsPage() {
                   <td className="h-10 px-3">
                     <RowCheckbox checked={selection.isSelected(a.id)} onToggle={() => selection.toggle(a.id)} />
                   </td>
-                  <td className="h-10 px-3 font-medium">{a.name}</td>
+                  <td className="h-10 px-3 font-medium">
+                    {/* The row click still opens the edit drawer
+                        (preserves the existing CRUD workflow), but
+                        the name itself is now a link to the per-
+                        account Detail page. ``stopPropagation``
+                        keeps the two paths from triggering each
+                        other. */}
+                    <Link
+                      to={`/accounting/bank-accounts/${a.id}`}
+                      onClick={(e) => e.stopPropagation()}
+                      className="inline-flex items-center gap-1 hover:text-primary hover:underline"
+                      title="Abrir painel da conta"
+                    >
+                      {a.name}
+                      <ExternalLink className="h-3 w-3 opacity-60" />
+                    </Link>
+                  </td>
                   {col.isVisible("bank") && <td className="h-10 px-3 text-muted-foreground">{a.bank?.name ?? "—"}</td>}
                   {col.isVisible("entity") && <td className="h-10 px-3 text-muted-foreground">{a.entity?.name ?? "—"}</td>}
                   {col.isVisible("currency") && <td className="h-10 px-3 text-muted-foreground">{a.currency?.code ?? "—"}</td>}
@@ -360,5 +412,258 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">{label}</span>
       {children}
     </label>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard section (Page 1 of the Bank Accounts series). Lives in the same
+// file as the management table so operators get a single ``/accounting/bank-
+// accounts`` URL with overview-on-top + management-below, rather than a
+// separate route for each. The component lazy-fetches its own data and
+// renders nothing until the org-wide KPI endpoint responds.
+// ---------------------------------------------------------------------------
+
+function BankAccountsDashboardSection() {
+  const { data: kpis, isLoading } = useBankAccountsDashboardKpis()
+
+  // Cross-account daily balance: 90-day window. Skipping the
+  // ``bank_account_id`` param triggers the aggregate-by-currency
+  // path of the existing endpoint. Re-uses the same hook the recon
+  // DashboardPage already trusts in production.
+  const today = new Date()
+  const ninetyDaysAgo = new Date(today.getTime() - 90 * 24 * 60 * 60 * 1000)
+  const dateRange = useMemo(
+    () => ({
+      date_from: ninetyDaysAgo.toISOString().slice(0, 10),
+      date_to: today.toISOString().slice(0, 10),
+    }),
+    // Fixed at mount; if operators want fresher windows they hit
+    // refresh on the page header.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  )
+  const { data: balanceData } = useDailyBalances({
+    date_from: dateRange.date_from,
+    date_to: dateRange.date_to,
+    include_pending_book: true,
+  })
+
+  if (isLoading) {
+    return (
+      <div className="card-elevated p-3 text-[12px] text-muted-foreground">
+        Carregando indicadores…
+      </div>
+    )
+  }
+  if (!kpis) return null
+
+  return (
+    <div className="space-y-3">
+      <DashboardKpiStrip kpis={kpis} />
+      <div className="grid gap-3 md:grid-cols-2">
+        <CurrencyTotalsCard kpis={kpis} />
+        <AggregateBalanceChart data={balanceData} />
+      </div>
+    </div>
+  )
+}
+
+function DashboardKpiStrip({ kpis }: { kpis: BankAccountsDashboardKpis }) {
+  const recRate = kpis.reconciliation_rate_pct
+  const recColor =
+    recRate >= 90 ? "text-emerald-600" : recRate >= 50 ? "text-amber-600" : "text-destructive"
+  // First currency wins for the inflow/outflow strip cards. Multi-currency
+  // tenants get the per-currency breakdown in the totals card below;
+  // here we keep the strip compact.
+  const primaryCurrency = kpis.currency_codes[0] ?? "BRL"
+  const inflowMtd = kpis.inflow_mtd_by_currency[primaryCurrency] ?? "0"
+  const outflowMtd = kpis.outflow_mtd_by_currency[primaryCurrency] ?? "0"
+
+  return (
+    <div className="grid grid-cols-2 gap-2 md:grid-cols-3 lg:grid-cols-5">
+      <DashboardKpiCard
+        icon={<Wallet className="h-3.5 w-3.5" />}
+        label="Contas"
+        value={kpis.account_count.toString()}
+      />
+      <DashboardKpiCard
+        icon={<TrendingUp className="h-3.5 w-3.5" />}
+        label={`% conciliado · ${kpis.recon_window_days}d`}
+        value={`${recRate}%`}
+        valueClassName={recColor}
+      />
+      <DashboardKpiCard
+        icon={<AlertCircle className="h-3.5 w-3.5" />}
+        label={`Pendentes > ${kpis.stale_days}d`}
+        value={kpis.stale_unreconciled_count.toString()}
+        valueClassName={kpis.stale_unreconciled_count > 0 ? "text-amber-600" : "text-emerald-600"}
+      />
+      <DashboardKpiCard
+        icon={<ArrowUp className="h-3.5 w-3.5" />}
+        label={`Entradas (mês) · ${primaryCurrency}`}
+        value={formatCurrency(inflowMtd, primaryCurrency)}
+        valueClassName="text-emerald-600"
+      />
+      <DashboardKpiCard
+        icon={<ArrowDown className="h-3.5 w-3.5" />}
+        label={`Saídas (mês) · ${primaryCurrency}`}
+        value={formatCurrency(outflowMtd, primaryCurrency)}
+        valueClassName="text-amber-600"
+      />
+    </div>
+  )
+}
+
+function DashboardKpiCard({
+  icon,
+  label,
+  value,
+  valueClassName,
+}: {
+  icon: React.ReactNode
+  label: string
+  value: string
+  valueClassName?: string
+}) {
+  return (
+    <div className="card-elevated p-3">
+      <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-muted-foreground">
+        {icon}
+        {label}
+      </div>
+      <div className={cn("mt-1 text-[15px] font-semibold tabular-nums", valueClassName)}>
+        {value}
+      </div>
+    </div>
+  )
+}
+
+function CurrencyTotalsCard({ kpis }: { kpis: BankAccountsDashboardKpis }) {
+  const codes = kpis.currency_codes.length > 0 ? kpis.currency_codes : ["BRL"]
+  return (
+    <div className="card-elevated p-3">
+      <div className="mb-2 flex items-center gap-1.5 text-[12px] font-semibold">
+        <Wallet className="h-3.5 w-3.5 text-primary" />
+        Saldos por moeda
+      </div>
+      <table className="w-full text-[12px]">
+        <thead className="text-left text-[10px] uppercase tracking-wider text-muted-foreground">
+          <tr>
+            <th className="h-7 px-2">Moeda</th>
+            <th className="h-7 px-2 text-right">Saldo</th>
+            <th className="h-7 px-2 text-right">Entradas (mês)</th>
+            <th className="h-7 px-2 text-right">Saídas (mês)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {codes.map((code) => {
+            const balance = kpis.balance_by_currency[code] ?? "0"
+            const inflow = kpis.inflow_mtd_by_currency[code] ?? "0"
+            const outflow = kpis.outflow_mtd_by_currency[code] ?? "0"
+            return (
+              <tr key={code} className="border-t border-border/60">
+                <td className="px-2 py-1.5 font-mono text-[11px]">{code}</td>
+                <td className="px-2 py-1.5 text-right tabular-nums font-semibold">
+                  {formatCurrency(balance, code)}
+                </td>
+                <td className="px-2 py-1.5 text-right tabular-nums text-emerald-600">
+                  {formatCurrency(inflow, code)}
+                </td>
+                <td className="px-2 py-1.5 text-right tabular-nums text-amber-600">
+                  {formatCurrency(outflow, code)}
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function AggregateBalanceChart({
+  data,
+}: {
+  data: ReturnType<typeof useDailyBalances>["data"]
+}) {
+  // The aggregate (no bank_account_id) branch returns per-currency
+  // bank vs book daily lines under ``aggregate.by_currency[code]``.
+  // For v1 we render the FIRST currency's lines as the "primary" view
+  // and let the Currency Totals card above carry multi-currency
+  // detail. A future commit can add a currency picker here.
+  const series = useMemo(() => {
+    const agg = (data as { aggregate?: { by_currency?: Record<string, { bank?: Array<{ date: string; balance: number }>; book?: Array<{ date: string; balance: number }> }> } } | undefined)?.aggregate
+    const byCurr = agg?.by_currency ?? {}
+    const codes = Object.keys(byCurr)
+    if (codes.length === 0) return { rows: [], code: null as string | null }
+    const code = codes[0]
+    const bankArr = byCurr[code]?.bank ?? []
+    const bookArr = byCurr[code]?.book ?? []
+    const byDate = new Map<string, { date: string; bank: number | null; book: number | null }>()
+    for (const r of bankArr)
+      byDate.set(r.date, { date: r.date, bank: Number(r.balance ?? 0), book: null })
+    for (const r of bookArr) {
+      const prev = byDate.get(r.date) ?? { date: r.date, bank: null, book: null }
+      byDate.set(r.date, { ...prev, book: Number(r.balance ?? 0) })
+    }
+    return {
+      rows: Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date)),
+      code,
+    }
+  }, [data])
+
+  return (
+    <div className="card-elevated p-3">
+      <div className="mb-2 flex items-center justify-between">
+        <div className="flex items-center gap-1.5 text-[12px] font-semibold">
+          <TrendingUp className="h-3.5 w-3.5 text-primary" />
+          Saldo consolidado · {series.code ?? "—"} (90 dias)
+        </div>
+      </div>
+      {series.rows.length === 0 ? (
+        <div className="flex h-48 items-center justify-center text-[12px] text-muted-foreground">
+          Sem dados de saldo no período.
+        </div>
+      ) : (
+        <div className="h-48">
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={series.rows} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
+              <XAxis
+                dataKey="date"
+                tick={{ fontSize: 10 }}
+                tickFormatter={(d) => d.slice(5)}
+                minTickGap={20}
+              />
+              <YAxis
+                tick={{ fontSize: 10 }}
+                tickFormatter={(v) => formatCurrency(v, series.code ?? "BRL")}
+                width={80}
+              />
+              <Tooltip
+                formatter={(v: number) => formatCurrency(v, series.code ?? "BRL")}
+                labelFormatter={(d: string) => formatDate(d)}
+                contentStyle={{ fontSize: "11px" }}
+              />
+              <Legend wrapperStyle={{ fontSize: "11px" }} />
+              <Area
+                type="monotone"
+                dataKey="bank"
+                name="Banco"
+                stroke="hsl(var(--primary))"
+                fill="hsl(var(--primary) / 0.15)"
+              />
+              <Area
+                type="monotone"
+                dataKey="book"
+                name="Livro"
+                stroke="hsl(142 71% 45%)"
+                fill="hsl(142 71% 45% / 0.15)"
+              />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </div>
   )
 }
