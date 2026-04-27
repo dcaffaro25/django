@@ -219,12 +219,64 @@ class AccountResolver:
         self.company_id = company_id
         self._pattern_cache: Dict[Tuple[Any, ...], List[Account]] = {}
         self._leaves_cache: Dict[int, List[Account]] = {}
+        # In-memory parent map for ``path_contains`` matching. Lazily
+        # populated on first path query. The Account model has a
+        # ``get_path()`` METHOD (not a stored field), so ``Q(path__…)``
+        # blows up with "Cannot resolve keyword 'path' into field" —
+        # we compute the path in Python instead, the same way
+        # ``_build_chart_context`` does for the AI prompt.
+        self._path_cache: Optional[Dict[int, str]] = None
+
+    def _build_path_cache(self) -> Dict[int, str]:
+        """One-shot build of ``{account_id → computed_path}`` for every
+        active account in the company. Mirrors the parent walk in
+        :func:`accounting.reports.services.ai_assistant._build_chart_context`
+        so the resolver and the AI prompt use the same path strings —
+        a code_prefix-less template that the AI generates against
+        ``path_contains: "Caixa"`` resolves to the same accounts the
+        AI saw at generate-time.
+
+        Cycle-safe via a ``visited`` set per row, in case a bad import
+        breaks the MPTT invariant.
+        """
+        if self._path_cache is not None:
+            return self._path_cache
+        rows = list(
+            Account.objects.filter(company_id=self.company_id, is_active=True)
+            .values("id", "name", "parent_id")
+        )
+        by_id = {r["id"]: r for r in rows}
+
+        def _path_of(row: Dict[str, Any]) -> str:
+            parts: List[str] = []
+            current: Optional[Dict[str, Any]] = row
+            visited: set[int] = set()
+            while current is not None and current["id"] not in visited:
+                parts.insert(0, current["name"])
+                visited.add(current["id"])
+                pid = current.get("parent_id")
+                current = by_id.get(pid) if pid is not None else None
+            return " > ".join(parts)
+
+        self._path_cache = {r["id"]: _path_of(r) for r in rows}
+        return self._path_cache
 
     def resolve(self, selector: Optional[AccountsSelector]) -> List[Account]:
         """Return the concrete account list a selector matches.
 
         Empty selector (or no selector) → empty list. Callers that treat that
         as zero and emit a warning stay consistent with the legacy behavior.
+
+        Path matching note: ``path_contains`` is evaluated against the
+        in-Python computed path (parent chain joined with ``" > "``)
+        because :class:`Account` exposes ``get_path()`` as a method, not
+        a stored field. The previous implementation used
+        ``Q(path__icontains=...)`` which raised
+        ``FieldError: Cannot resolve keyword 'path'`` and produced an
+        empty result with a silent stack trace — observable in
+        :func:`ai_assistant._hydrate_account_ids` for codeless tenants
+        like Evolat where path_contains is the only selector that has
+        any chance of working.
         """
         if selector is None:
             return []
@@ -242,6 +294,7 @@ class AccountResolver:
         qs = Account.objects.filter(company_id=self.company_id, is_active=True)
         filters = Q()
         any_filter = False
+        path_match_ids: Optional[set[int]] = None
 
         if selector.account_ids:
             filters |= Q(id__in=selector.account_ids)
@@ -250,7 +303,24 @@ class AccountResolver:
             filters |= Q(account_code__startswith=selector.code_prefix)
             any_filter = True
         if selector.path_contains:
-            filters |= Q(path__icontains=selector.path_contains)
+            # Compute paths in memory and collect the ids whose path
+            # contains the substring. We then OR these into the SQL
+            # query as ``id__in=...`` so the result composes with the
+            # other selector fields.
+            #
+            # CAVEAT: when ``path_match_ids`` is empty we MUST still
+            # OR in ``Q(id__in=[])`` rather than skipping the union.
+            # Skipping leaves the path branch as a no-op ``Q()`` which
+            # is the identity in Django ORM — the resulting
+            # ``qs.filter(Q())`` matches EVERY active account, the
+            # exact opposite of "no match." Empty ``id__in`` correctly
+            # contributes "no rows" to the OR.
+            needle = selector.path_contains.lower()
+            path_map = self._build_path_cache()
+            path_match_ids = {
+                aid for aid, path in path_map.items() if needle in path.lower()
+            }
+            filters |= Q(id__in=path_match_ids)
             any_filter = True
 
         if not any_filter:
