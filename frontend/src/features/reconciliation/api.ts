@@ -4,6 +4,7 @@ import type {
   BankBookBalancesAggregate,
   BankTransaction,
   BankTransactionLite,
+  BankTxReconciliationHistoryEntry,
   EmbeddingBackfillAck,
   EmbeddingBackfillInput,
   EmbeddingHealth,
@@ -379,6 +380,17 @@ export const reconApi = {
 
   getReconciliation: (id: number) =>
     api.tenant.get<Reconciliation>(`/api/reconciliation/${id}/`),
+
+  /**
+   * Per-bank-tx audit history. Returns every Reconciliation group
+   * the bank tx has ever been part of, most-recent first, with
+   * status / totals / discrepancy / member counts. Powers the
+   * Workbench's history drawer.
+   */
+  listBankTxReconciliationHistory: (bankTxId: number) =>
+    api.tenant.get<BankTxReconciliationHistoryEntry[]>(
+      `/api/bank_transactions/${bankTxId}/reconciliation-history/`,
+    ),
 
   /** Undo a reconciliation. Passing {delete:true} soft-deletes the record. */
   unmatchReconciliation: (id: number, body?: { reason?: string; delete?: boolean }) =>

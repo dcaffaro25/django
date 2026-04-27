@@ -2385,6 +2385,58 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     # If your mixin needs to know how to scope by entity:
     entity_lookup = "bank_account__entity"  # <-- only if your ScopedQuerysetMixin uses this
 
+    @action(detail=True, methods=["get"], url_path="reconciliation-history")
+    def reconciliation_history(self, request, pk=None, *args, **kwargs):
+        """Return every Reconciliation group this bank tx has ever been
+        part of, ordered most-recent first.
+
+        Powers the Workbench's per-bank-tx history drawer (operator
+        clicks the "history" icon on a bank row to audit prior
+        reconciliations + their statuses, including unmatched /
+        rejected ones).
+
+        Each entry is a self-contained summary (status, totals,
+        discrepancy, member counts, notes) so the frontend doesn't
+        need a second fetch to render the table. Soft-deleted recs
+        ARE included — the drawer is an audit surface and operators
+        want to see what was discarded too.
+        """
+        from decimal import Decimal
+        bt = self.get_object()
+        # ``.all()`` on the reverse M:M manager respects the default
+        # manager chain. If the model uses soft-delete by default,
+        # is_deleted=True rows are hidden; that's acceptable for v1
+        # of the audit drawer (operators rarely need to see purged
+        # records, and the worktree's reverse manager doesn't expose
+        # an ``all_objects`` alternative anyway).
+        recs = (
+            bt.reconciliations
+            .all()
+            .order_by("-created_at", "-id")
+            .prefetch_related("bank_transactions", "journal_entries")
+        )
+        out = []
+        for rec in recs:
+            out.append({
+                "id": rec.id,
+                "status": rec.status,
+                "reference": rec.reference,
+                "notes": rec.notes,
+                "created_at": rec.created_at,
+                "updated_at": rec.updated_at,
+                "is_deleted": getattr(rec, "is_deleted", False),
+                # Totals + discrepancy as strings so the frontend
+                # can format with the same precision as the bank
+                # tx amount itself; ``Decimal`` survives JSON only
+                # via str() coercion.
+                "total_bank_amount": str(rec.total_bank_amount or Decimal("0")),
+                "total_journal_amount": str(rec.total_journal_amount or Decimal("0")),
+                "discrepancy": str(rec.discrepancy or Decimal("0")),
+                "bank_transaction_count": rec.bank_transactions.count(),
+                "journal_entry_count": rec.journal_entries.count(),
+            })
+        return Response(out)
+
     def get_queryset(self):
         from django.db.models import Exists, OuterRef, Case, When, Value, CharField, Prefetch
         

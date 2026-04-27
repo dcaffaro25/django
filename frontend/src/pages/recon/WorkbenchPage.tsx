@@ -10,7 +10,7 @@ import { Drawer } from "vaul"
 import {
   Wallet, BookOpen, Check, X, Sparkles, ArrowLeftRight, AlertCircle, AlertTriangle,
   Plus, Trash2, CheckCircle2, Search, RotateCcw, Loader2, Wand2, RefreshCw, Scale,
-  FileText, ArrowUp, ArrowDown, ChevronsLeft, ChevronLeft, ChevronRight, ChevronsRight,
+  FileText, History, ArrowUp, ArrowDown, ChevronsLeft, ChevronLeft, ChevronRight, ChevronsRight,
   CheckSquare, Square, CircleDashed, Filter, FilterX,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
@@ -23,6 +23,7 @@ import { RunRuleDrawer } from "@/components/reconciliation/RunRuleDrawer"
 import { MassReconcileDrawer } from "@/components/reconciliation/MassReconcileDrawer"
 import { AdjustmentDrawer } from "@/components/reconciliation/AdjustmentDrawer"
 import { TransactionDetailsDrawer } from "@/components/reconciliation/TransactionDetailsDrawer"
+import { BankTxReconciliationHistoryDrawer } from "@/components/reconciliation/BankTxReconciliationHistoryDrawer"
 import { SearchableAccountSelect } from "@/components/reconciliation/SearchableAccountSelect"
 import {
   useBankAccountsList,
@@ -506,6 +507,10 @@ export function WorkbenchPage() {
   // Per-row transaction inspector: shows every JE tied to the clicked
   // row's Transaction (the cash leg + contras). Read-only view.
   const [detailsSource, setDetailsSource] = useState<JournalEntry | null>(null)
+  // Per-bank-tx reconciliation history audit drawer. Operator clicks
+  // the "history" icon on a bank row to see every Reconciliation
+  // group it has been part of (incl. soft-deleted ones).
+  const [bankHistorySource, setBankHistorySource] = useState<BankTransaction | null>(null)
 
   // Keyboard-driven cursor state
   const [activePane, setActivePane] = useState<"bank" | "book">("bank")
@@ -878,6 +883,7 @@ export function WorkbenchPage() {
             items={pagedBankTxs}
             selected={selectedBank}
             onToggle={toggleBank}
+            onShowHistory={(item) => setBankHistorySource(item)}
             cursorIndex={activePane === "bank" ? cursorBank : -1}
             isVisible={bankCols.isVisible}
             bankAccounts={bankAccounts ?? []}
@@ -1034,6 +1040,12 @@ export function WorkbenchPage() {
         open={detailsSource != null}
         onClose={() => setDetailsSource(null)}
         source={detailsSource}
+      />
+
+      <BankTxReconciliationHistoryDrawer
+        open={bankHistorySource != null}
+        onClose={() => setBankHistorySource(null)}
+        source={bankHistorySource}
       />
 
       <RunRuleDrawer
@@ -1746,11 +1758,16 @@ function BookPaneFilters({
 }
 
 function BankList({
-  items, selected, onToggle, cursorIndex = -1, isVisible, bankAccounts = [],
+  items, selected, onToggle, onShowHistory, cursorIndex = -1, isVisible, bankAccounts = [],
 }: {
   items: BankTransaction[]
   selected: Set<number>
   onToggle: (id: number) => void
+  /** Per-row "history" click — opens the reconciliation history
+   *  drawer so operators can audit prior matches/unmatches for this
+   *  bank tx. Optional so existing call sites without the wiring
+   *  keep working. */
+  onShowHistory?: (item: BankTransaction) => void
   cursorIndex?: number
   isVisible?: (key: string) => boolean
   bankAccounts?: Array<{ id: number; name: string }>
@@ -1864,6 +1881,19 @@ function BankList({
                   )
                 })()}
               </div>
+              {onShowHistory && (
+                <div className="ml-1 flex shrink-0 items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); onShowHistory(item) }}
+                    title="Histórico de conciliações desta transação"
+                    aria-label="Histórico de conciliações"
+                    className="grid h-6 w-6 place-items-center rounded-md border border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground"
+                  >
+                    <History className="h-3 w-3" />
+                  </button>
+                </div>
+              )}
             </button>
           )
         })}

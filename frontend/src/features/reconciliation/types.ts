@@ -165,6 +165,27 @@ export interface TransactionWrite {
   state?: string
 }
 
+/**
+ * One row in the per-bank-tx reconciliation history (audit drawer).
+ * Returned by ``GET /api/bank_transactions/<id>/reconciliation-history/``.
+ * Totals + discrepancy are stringified Decimals so the frontend can
+ * format with the same precision as the bank tx amount itself.
+ */
+export interface BankTxReconciliationHistoryEntry {
+  id: number
+  status: string
+  reference?: string | null
+  notes?: string | null
+  created_at: string
+  updated_at: string
+  is_deleted: boolean
+  total_bank_amount: string
+  total_journal_amount: string
+  discrepancy: string
+  bank_transaction_count: number
+  journal_entry_count: number
+}
+
 export interface BankTransaction {
   id: number
   company: number

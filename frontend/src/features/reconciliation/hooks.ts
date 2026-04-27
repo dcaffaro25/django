@@ -335,6 +335,25 @@ export function useTransactionJournalEntries(txId: number | null | undefined) {
 }
 
 /**
+ * Per-bank-tx reconciliation history (audit drawer). Fires only when
+ * a bank tx id is present so the drawer's "closed" state doesn't
+ * trigger a wasted fetch. 30s staleTime mirrors the journal-entries
+ * hook above — recon history changes only when the operator
+ * matches/unmatches, which already invalidates broader queries.
+ */
+export function useBankTxReconciliationHistory(
+  bankTxId: number | null | undefined,
+) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["recon", sub, "bank_transaction", bankTxId, "reconciliation_history"],
+    queryFn: () => reconApi.listBankTxReconciliationHistory(bankTxId as number),
+    enabled: !!sub && bankTxId != null,
+    staleTime: 30 * 1000,
+  })
+}
+
+/**
  * Probe whether an account has any journal entries. Used to lock fields
  * that would be destructive to change after activity (e.g. account_direction
  * flipping signs on historical reports). Returns true/false; undefined while

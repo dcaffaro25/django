@@ -222,3 +222,103 @@ class BankTxMatchMetricsTests(TestCase):
         self.assertEqual(data["amount_reconciled"], "250.00")
         self.assertEqual(data["amount_remaining"], "750.00")
         self.assertEqual(data["match_progress_pct"], 25)
+
+
+class BankTxReconciliationHistoryEndpointTests(TestCase):
+    """Coverage for the new audit endpoint
+    ``GET /<tenant>/api/bank_transactions/<id>/reconciliation-history/``
+    that powers the Workbench's per-bank-tx history drawer.
+
+    These tests use the HTTP layer (APIClient) so they exercise the
+    full URL routing, ScopedQuerysetMixin, prefetch, serialization,
+    and ordering pipeline -- not just the inner method.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        from rest_framework.authtoken.models import Token
+        cls.company = Company.objects.create(name="HistoryCo", subdomain="historyco")
+        cls.entity = Entity.objects.create(company=cls.company, name="Acme")
+        cls.currency = Currency.objects.create(code="USD", name="Dollar")
+        cls.account = Account.objects.create(
+            company=cls.company, account_code="2.0", name="Receita",
+            account_direction=1, balance=Decimal("0.00"),
+            balance_date=dt.date(2026, 1, 1), currency=cls.currency,
+        )
+        cls.bank = Bank.objects.create(
+            name="HistoryBank", country="BR", bank_code="HIST001",
+        )
+        cls.bank_account = BankAccount.objects.create(
+            company=cls.company, entity=cls.entity, bank=cls.bank,
+            currency=cls.currency, name="HistAccount", account_number="555-1",
+            account_type="checking", balance=Decimal("0.00"),
+            balance_date=dt.date(2026, 1, 1),
+        )
+        cls.user = User.objects.create_user(username="histuser", password="x")
+
+    def setUp(self):
+        from rest_framework.test import APIClient
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def _bank_tx(self, amount: str):
+        return BankTransaction.objects.create(
+            company=self.company, bank_account=self.bank_account,
+            currency=self.currency, date=dt.date(2026, 4, 27),
+            amount=Decimal(amount), description="hist tx",
+        )
+
+    def _journal_entry(self, debit: str):
+        tx = Transaction.objects.create(
+            company=self.company, entity=self.entity, currency=self.currency,
+            date=dt.date(2026, 4, 27), amount=Decimal(debit), description="hist parent",
+        )
+        return JournalEntry.objects.create(
+            company=self.company, transaction=tx, account=self.account,
+            date=dt.date(2026, 4, 27), debit_amount=Decimal(debit),
+        )
+
+    def _url(self, bank_tx_id: int) -> str:
+        return f"/{self.company.id}/api/bank_transactions/{bank_tx_id}/reconciliation-history/"
+
+    def test_no_history_returns_empty_array(self):
+        bt = self._bank_tx("100.00")
+        resp = self.client.get(self._url(bt.id))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json(), [])
+
+    def test_returns_one_entry_per_reconciliation(self):
+        bt = self._bank_tx("1000.00")
+        je1 = self._journal_entry(debit="600.00")
+        je2 = self._journal_entry(debit="400.00")
+        rec1 = Reconciliation.objects.create(
+            company=self.company, status="open", reference="first attempt",
+        )
+        rec1.bank_transactions.set([bt])
+        rec1.journal_entries.set([je1])
+
+        rec2 = Reconciliation.objects.create(
+            company=self.company, status="matched", reference="closed",
+        )
+        rec2.bank_transactions.set([bt])
+        rec2.journal_entries.set([je2])
+
+        resp = self.client.get(self._url(bt.id))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = resp.json()
+        self.assertEqual(len(body), 2)
+        # Most-recent first ordering: rec2 was created last, expect index 0.
+        self.assertEqual(body[0]["id"], rec2.id)
+        self.assertEqual(body[0]["status"], "matched")
+        self.assertEqual(body[0]["reference"], "closed")
+        self.assertEqual(body[0]["total_bank_amount"], "1000.00")
+        self.assertEqual(body[0]["total_journal_amount"], "400.00")
+        self.assertEqual(body[0]["discrepancy"], "600.00")
+        self.assertEqual(body[0]["bank_transaction_count"], 1)
+        self.assertEqual(body[0]["journal_entry_count"], 1)
+        self.assertEqual(body[1]["id"], rec1.id)
+        self.assertEqual(body[1]["status"], "open")
+
+    def test_404_on_unknown_bank_tx(self):
+        resp = self.client.get(self._url(999_999))
+        self.assertEqual(resp.status_code, 404)
