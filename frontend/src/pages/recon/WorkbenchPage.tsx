@@ -1841,8 +1841,28 @@ function BankList({
                   {vis("status") && <StatusBadge status={item.reconciliation_status} className="h-4" />}
                 </div>
               </div>
-              <div className={cn("shrink-0 text-right tabular-nums font-semibold", Number(item.amount) < 0 ? "text-muted-foreground" : "text-foreground")}>
-                {formatCurrency(Number(item.amount))}
+              <div className={cn("shrink-0 text-right tabular-nums", Number(item.amount) < 0 ? "text-muted-foreground" : "text-foreground")}>
+                <div className="font-semibold">{formatCurrency(Number(item.amount))}</div>
+                {/* Partial-match chip — surfaces "X% · R$ Y restante"
+                    when the bank tx is in an ``open`` reconciliation
+                    that hasn't fully matched yet. The serializer
+                    apportions JE value to each bank tx by its share
+                    of the rec's total bank amount; see
+                    ``_bank_tx_match_metrics`` for the formula. We
+                    show only when 0 < pct < 100 — fully-matched and
+                    fully-unmatched rows already convey that via the
+                    StatusBadge above. Older backends without the
+                    fields render nothing (defensive). */}
+                {(() => {
+                  const pct = item.match_progress_pct
+                  const remaining = item.amount_remaining
+                  if (pct === undefined || pct <= 0 || pct >= 100) return null
+                  return (
+                    <div className="mt-0.5 text-[10px] font-medium text-amber-600">
+                      {pct}% · {formatCurrency(remaining ?? "0")} restante
+                    </div>
+                  )
+                })()}
               </div>
             </button>
           )

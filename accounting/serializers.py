@@ -589,11 +589,89 @@ class RuleSerializer(serializers.ModelSerializer):
     
 
 
+def _bank_tx_match_metrics(instance):
+    """Compute (amount_reconciled, amount_remaining, match_progress_pct)
+    for a single ``BankTransaction``.
+
+    The reconciliation surface is M:M (one Reconciliation can link
+    multiple bank txs to multiple journal entries). We apportion the
+    matched journal-entry value to each bank tx by its share of the
+    rec's total bank amount: ::
+
+        share        = |bank_tx.amount| / |rec.total_bank_amount|
+        bank_matched = share * |rec.total_journal_amount|
+
+    Summed across every active reconciliation (statuses
+    ``matched`` / ``approved`` / ``open``) gives the total matched
+    magnitude for this bank tx. Remaining is clamped at 0 so rows
+    where the operator linked extra JEs (rare but legal) don't
+    surface as negative.
+
+    Costs O(R * (J + B)) where R is the rec count for this bank tx
+    and J/B are the JE/bank-tx counts inside each rec. The
+    ``BankTransactionViewSet`` prefetches the M:M tables to keep this
+    in-memory; without prefetch, this is N+1 by design (only callers
+    that need the metrics pay).
+
+    Returns a 3-tuple ``(Decimal, Decimal, int)``. ``int`` is rounded
+    0..100. Values returned as Decimal so the serializer can quantize
+    + render as strings consistently with ``amount`` itself.
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+
+    bank_amt_abs = abs(instance.amount or Decimal('0'))
+    if bank_amt_abs == 0:
+        return Decimal('0'), Decimal('0'), 0
+
+    matched = Decimal('0')
+    active_statuses = {'matched', 'approved', 'open'}
+
+    # Prefer the prefetched ``recon_list`` (set by
+    # ``BankTransactionViewSet.get_queryset``); fall back to the M:M
+    # manager otherwise so callers without the prefetch still get
+    # correct (slow) numbers rather than zeros.
+    recs = getattr(instance, 'recon_list', None)
+    if recs is None:
+        recs = list(instance.reconciliations.all())
+
+    for rec in recs:
+        if rec.status not in active_statuses:
+            continue
+        rec_bank_total = abs(rec.total_bank_amount or Decimal('0'))
+        rec_je_total = abs(rec.total_journal_amount or Decimal('0'))
+        if rec_bank_total == 0:
+            continue
+        share = bank_amt_abs / rec_bank_total
+        matched += share * rec_je_total
+
+    if matched > bank_amt_abs:
+        matched = bank_amt_abs
+    remaining = bank_amt_abs - matched
+
+    # Quantize for display consistency with ``amount`` (2 decimal
+    # places). The percent stays an int for cheaper frontend
+    # comparisons / chip rendering.
+    q = Decimal('0.01')
+    matched_q = matched.quantize(q, rounding=ROUND_HALF_UP)
+    remaining_q = remaining.quantize(q, rounding=ROUND_HALF_UP)
+    pct = int((matched / bank_amt_abs * 100).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+    pct = max(0, min(100, pct))
+    return matched_q, remaining_q, pct
+
+
 class BankTransactionSerializer(serializers.ModelSerializer):
     # Use annotated field if available, otherwise fall back to method
     reconciliation_status = serializers.CharField(read_only=True, required=False)
     entity = serializers.IntegerField(source='bank_account.entity_id', read_only=True)
     entity_name = serializers.CharField(source='bank_account.entity.name', read_only=True)
+    # Per-bank-tx reconciliation progress. Surfaces partial-match
+    # state to the Workbench / list pages so operators see "this row
+    # is 60% reconciled, R$ 400 remaining" without drilling into the
+    # reconciliation group. Computed lazily; see
+    # ``_bank_tx_match_metrics`` for the apportionment rule.
+    amount_reconciled = serializers.SerializerMethodField()
+    amount_remaining = serializers.SerializerMethodField()
+    match_progress_pct = serializers.SerializerMethodField()
 
     class Meta:
         model = BankTransaction
@@ -602,15 +680,38 @@ class BankTransactionSerializer(serializers.ModelSerializer):
             'description', 'amount', 'status', 'erp_id',
             'is_deleted', 'updated_at', 'updated_by', 'reconciliation_status', 'notes',
             'numeros_boleto', 'cnpj', 'tag',
+            'amount_reconciled', 'amount_remaining', 'match_progress_pct',
         ]
         extra_kwargs = {
             "bank_account": {"queryset": BankAccount.objects.all()},
         }
-    
+
+    def _ensure_match_metrics(self, obj):
+        """Compute the match metrics once per instance per
+        serialization. Caches on the instance so the three field
+        getters share a single pass over ``obj.recon_list``."""
+        cache = getattr(obj, '_bank_tx_match_metrics_cache', None)
+        if cache is None:
+            cache = _bank_tx_match_metrics(obj)
+            obj._bank_tx_match_metrics_cache = cache
+        return cache
+
+    def get_amount_reconciled(self, obj):
+        matched, _remaining, _pct = self._ensure_match_metrics(obj)
+        return str(matched)
+
+    def get_amount_remaining(self, obj):
+        _matched, remaining, _pct = self._ensure_match_metrics(obj)
+        return str(remaining)
+
+    def get_match_progress_pct(self, obj):
+        _matched, _remaining, pct = self._ensure_match_metrics(obj)
+        return pct
+
     def to_representation(self, instance):
         """Override to use annotated field if available, otherwise compute it."""
         data = super().to_representation(instance)
-        
+
         # If reconciliation_status annotation exists, use it (from queryset annotation)
         # Otherwise, compute it the old way (for backward compatibility)
         if hasattr(instance, 'reconciliation_status'):
@@ -630,7 +731,7 @@ class BankTransactionSerializer(serializers.ModelSerializer):
                         data['reconciliation_status'] = 'mixed'
                 else:
                     data['reconciliation_status'] = 'open'
-        
+
         return data
     
     def create(self, validated_data):

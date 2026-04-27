@@ -2409,7 +2409,18 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         ).prefetch_related(
             Prefetch(
                 'reconciliations',
-                queryset=Reconciliation.objects.only('id', 'status'),
+                # Pre-walk the M2M tables on each reconciliation so the
+                # serializer's match-progress computation
+                # (``amount_reconciled`` / ``amount_remaining`` /
+                # ``match_progress_pct``) doesn't fire N+1 queries when
+                # iterating ``rec.journal_entries`` and
+                # ``rec.bank_transactions`` for the totals. Without
+                # ``.only(...)`` so JE.amount and BankTx.amount are
+                # available in cache.
+                queryset=Reconciliation.objects.prefetch_related(
+                    'journal_entries',
+                    'bank_transactions',
+                ),
                 to_attr='recon_list'
             )
         )

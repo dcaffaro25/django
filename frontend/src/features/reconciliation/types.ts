@@ -181,6 +181,17 @@ export interface BankTransaction {
   numeros_boleto?: string[]
   cnpj?: string | null
   erp_id?: string | null
+  /**
+   * Per-bank-tx match-progress fields surfaced by
+   * ``BankTransactionSerializer._bank_tx_match_metrics`` so the
+   * Workbench / list pages can show "X% reconciled, R$ Y remaining"
+   * for partial reconciliations. Optional because legacy backends
+   * before this change won't emit them — frontend renders defensively
+   * (treats missing as "not partial" → no chip).
+   */
+  amount_reconciled?: string
+  amount_remaining?: string
+  match_progress_pct?: number
 }
 
 export interface JournalEntry {
