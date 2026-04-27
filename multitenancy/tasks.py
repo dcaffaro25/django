@@ -939,10 +939,20 @@ def _coerce_date_fields(model, payload: dict) -> dict:
             # subclass.
             out[name] = v.date()
             continue
-        if isinstance(v, str) and len(v) >= 10 and v[10:11] == "T":
-            # ``2025-09-16T00:00:00`` and friends — slice to the date.
-            out[name] = v[:10]
-            continue
+        if isinstance(v, str) and len(v) >= 10:
+            # Match anything that *starts* with a YYYY-MM-DD prefix and
+            # has either nothing, a ``T`` (ISO-8601), or a space (the
+            # PostgreSQL/SQL Server style). Tolerates trailing
+            # microseconds, ``Z``, or ``+HH:MM`` offsets — we never want
+            # them on a DateField anyway and Django's parser would reject
+            # them. We don't try to validate the digits here; if the
+            # prefix isn't a real date Django's DateField parser will
+            # raise on save with its own message.
+            head = v[:10]
+            sep = v[10:11]
+            if sep in ("", "T", "t", " ") and head[4] == "-" and head[7] == "-":
+                out[name] = head
+                continue
     return out
 
 

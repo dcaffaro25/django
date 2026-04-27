@@ -2098,7 +2098,7 @@ class ETLPipelineService:
         from accounting.models import Account, BankAccount, Transaction, JournalEntry
         from accounting.serializers import TransactionSerializer, JournalEntrySerializer
         from multitenancy.tasks import apply_substitutions, _filter_unknown, _attach_company_context
-        from multitenancy.tasks import _apply_path_inputs, _apply_erp_id_inputs, _apply_fk_inputs, _coerce_boolean_fields, _quantize_decimal_fields
+        from multitenancy.tasks import _apply_path_inputs, _apply_erp_id_inputs, _apply_fk_inputs, _coerce_boolean_fields, _quantize_decimal_fields, _coerce_date_fields
         from multitenancy.tasks import _safe_model_dict, _row_observations, _norm_row_key
         from multitenancy.tasks import (
             _parse_import_row_id,
@@ -2634,9 +2634,20 @@ class ETLPipelineService:
                     if 'entity_id' in filtered:
                         logger.info(f"ETL DEBUG: Row {row_idx + 1} BEFORE save - entity_id: '{filtered.get('entity_id')}' (type: {type(filtered.get('entity_id')).__name__})")
                     
-                    # Coercions
+                    # Coercions. ``_coerce_date_fields`` is critical here:
+                    # this method bypasses ``execute_import_job`` (which
+                    # applies the same coercion at multitenancy/tasks.py:2009)
+                    # and instantiates Transaction directly via
+                    # ``model(**filtered)`` below. Without it, ISO-datetime
+                    # strings like ``'2025-11-03T00:00:00'`` (from
+                    # ``_json_scalar`` for non-midnight Timestamps, or from
+                    # operators sending pre-formatted datetimes through the
+                    # raw API) reach Django's DateField parser unchanged
+                    # and trip ``"value has an invalid date format. It
+                    # must be in YYYY-MM-DD format."`` on save.
                     filtered = _coerce_boolean_fields(model, filtered)
                     filtered = _quantize_decimal_fields(model, filtered)
+                    filtered = _coerce_date_fields(model, filtered)
                     filter_time = time.time() - filter_start
                     if filter_time > 0.1:
                         logger.debug(f"ETL DEBUG: Row {row_idx + 1} filtering/processing took {filter_time:.3f}s")

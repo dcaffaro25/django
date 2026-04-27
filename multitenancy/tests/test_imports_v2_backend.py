@@ -224,6 +224,84 @@ class CoerceDateFieldsTests(TestCase):
         )
         self.assertEqual(out["created_at"], "2025-09-16T14:30:00")
 
+    def test_space_separated_datetime_string_truncates(self):
+        """SQL-style ``2025-09-16 14:30:00`` (space separator instead of
+        the ISO ``T``) is a common shape from PostgreSQL ``::text`` casts
+        and SQL Server queries — the operator copy-pasting one of those
+        into the import tool used to hit the same 'invalid date format'
+        wall as the T-form. Slice to YYYY-MM-DD."""
+        from multitenancy.tasks import _coerce_date_fields
+        from accounting.models import Transaction
+
+        out = _coerce_date_fields(Transaction, {"date": "2025-09-16 14:30:00"})
+        self.assertEqual(out["date"], "2025-09-16")
+
+    def test_lowercase_t_separator_truncates(self):
+        """Some clients lowercase the ISO ``T`` separator (``2025-09-16t00:00:00``).
+        Tolerated."""
+        from multitenancy.tasks import _coerce_date_fields
+        from accounting.models import Transaction
+
+        out = _coerce_date_fields(Transaction, {"date": "2025-09-16t00:00:00"})
+        self.assertEqual(out["date"], "2025-09-16")
+
+    def test_iso_datetime_with_tz_offset_truncates(self):
+        """``2025-09-16T00:00:00+03:00`` etc. — anything past the date
+        prefix gets dropped on the way to a DateField (the offset is
+        meaningless without a time anyway)."""
+        from multitenancy.tasks import _coerce_date_fields
+        from accounting.models import Transaction
+
+        out = _coerce_date_fields(Transaction, {"date": "2025-09-16T00:00:00+03:00"})
+        self.assertEqual(out["date"], "2025-09-16")
+
+    def test_garbage_string_passes_through_unchanged(self):
+        """A string that doesn't even look like ``YYYY-MM-DD...`` is left
+        alone — ``_coerce_date_fields`` is defensive but not magical;
+        Django's own DateField parser will reject it with its standard
+        message, which is the better signal for the operator."""
+        from multitenancy.tasks import _coerce_date_fields
+        from accounting.models import Transaction
+
+        out = _coerce_date_fields(Transaction, {"date": "not-a-date-at-all"})
+        self.assertEqual(out["date"], "not-a-date-at-all")
+
+    def test_etl_je_path_imports_coerce_date_fields(self):
+        """Smoke-test for commit cb73c13's regression fix:
+        ``_import_transactions_with_journal_entries`` (the ETL fast-path
+        that bypasses ``execute_import_job`` when auto_create_journal_entries
+        is enabled) used to omit ``_coerce_date_fields`` from its imports
+        block, leaving Transaction rows with ISO-datetime ``date`` values
+        to fail Django's DateField parser at save time. This test just
+        confirms the symbol is available in the module's runtime imports
+        list — a regression here would mean the fix was reverted."""
+        # If the helper isn't importable from the same module the ETL
+        # path uses, the ETL-time import inside _import_transactions_…
+        # would explode with ImportError on first call. Cheap canary.
+        from multitenancy.tasks import _coerce_date_fields  # noqa: F401
+        # Directly inspect the source for the call site so the test
+        # fails LOUDLY if a future refactor drops it again.
+        # ``_import_transactions_with_journal_entries`` is a method on
+        # ``ETLPipelineService`` (not a module-level function), so we
+        # grab the source through the class.
+        import inspect
+        from multitenancy.etl_service import ETLPipelineService
+        src = inspect.getsource(
+            ETLPipelineService._import_transactions_with_journal_entries
+        )
+        self.assertIn(
+            "_coerce_date_fields(model, filtered)",
+            src,
+            "ETL+JE write path must apply _coerce_date_fields before "
+            "instantiating Transaction, or ISO datetime strings will "
+            "trip DateField parsing on save.",
+        )
+        # Also assert the helper is among the imports — the call site
+        # uses a function-local ``from multitenancy.tasks import ...``
+        # block, so the symbol must be in the import line above the
+        # method body.
+        self.assertIn("_coerce_date_fields", src)
+
 
 @override_settings(AUTH_OFF=True)  # sidestep token auth for these tests
 class V2AnalyzeEndpointTests(TestCase):
