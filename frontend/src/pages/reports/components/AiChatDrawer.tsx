@@ -148,7 +148,11 @@ export function AiChatDrawer({
     <Drawer.Root open={open} onOpenChange={(o) => !o && onClose()} direction="right">
       <Drawer.Portal>
         <Drawer.Overlay className="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm" />
-        <Drawer.Content className="fixed right-0 top-0 z-50 flex h-full w-full max-w-[520px] flex-col border-l border-border surface-2 outline-none">
+        {/* Width: 520px was clipping operation cards + form inputs at
+            common laptop sizes. ``min(820px, 92vw)`` lets the drawer
+            grow on wide displays while still leaving the report
+            content visible behind it on narrow ones. */}
+        <Drawer.Content className="fixed right-0 top-0 z-50 flex h-full w-full max-w-[min(820px,92vw)] flex-col border-l border-border surface-2 outline-none">
           <div className="hairline flex h-12 shrink-0 items-center justify-between border-b border-border px-4">
             <Drawer.Title className="flex items-center gap-2 text-[13px] font-semibold">
               <Sparkles className="h-4 w-4 text-amber-500" />

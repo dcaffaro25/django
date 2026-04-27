@@ -87,7 +87,7 @@ export function AiGenerateModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-      <div className="w-full max-w-[520px] rounded-lg border border-border bg-surface-1 shadow-xl">
+      <div className="w-full max-w-[min(720px,92vw)] rounded-lg border border-border bg-surface-1 shadow-xl">
         <div className="flex items-center justify-between border-b border-border px-4 py-3">
           <h2 className="flex items-center gap-2 text-[13px] font-semibold">
             <Sparkles className="h-4 w-4 text-amber-500" />

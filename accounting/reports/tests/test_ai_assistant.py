@@ -332,11 +332,56 @@ class BuildUserPromptCodelessHintTests(SimpleTestCase):
         self.assertNotIn("no usable account codes", prompt)
         self.assertNotIn("DO NOT emit ``code_prefix``", prompt)
 
-    def test_mixed_real_and_empty_codes_skips_hint(self):
-        """A chart that has SOME coded accounts is still useful for
-        ``code_prefix`` matching — the hint only fires when EVERY code
-        is empty/placeholder."""
+    def test_mixed_real_and_empty_codes_skips_hint_when_above_threshold(self):
+        """When the fraction of real codes is meaningful (>=20% in v2),
+        ``code_prefix`` matching is still useful for the AI. 1 of 3
+        coded = 33% > 20% so the hint stays out."""
         prompt = _build_user_prompt(
             "income_statement", "", self._ctx(["4.01", None, "0"]),
         )
         self.assertNotIn("no usable account codes", prompt)
+
+    def test_mostly_uncoded_chart_emits_hint(self):
+        """v2 codeless detection: when most accounts are uncoded a few
+        real codes don't rescue the chart. 1 real code among 100 = 1%
+        is below the 20% threshold and the hint must fire — otherwise
+        the AI emits ``code_prefix`` patterns the resolver can't match.
+        Reproduces the original Evolat-mostly-codeless failure mode in
+        a controlled fixture (no DB required)."""
+        codes = ["4.01"] + [None] * 99
+        prompt = _build_user_prompt(
+            "income_statement", "", self._ctx(codes),
+        )
+        self.assertIn("no usable account codes", prompt)
+        self.assertIn("path_contains", prompt)
+
+    def test_bank_artifact_codes_do_not_count_as_real(self):
+        """Bank-account links auto-generate codes like
+        ``1.1.1.BANK.27`` that aren't real CoA codes. Those must NOT
+        rescue an otherwise-codeless chart — this was the exact
+        failure on Evolat: 3 BANK-pseudo codes among 353 uncoded
+        accounts kept ``useless_codes`` False under the old
+        ``distinct_codes <= {"", "0"}`` check, the AI got no hint, and
+        every line resolved to zero accounts."""
+        codes = ["1.1.1.BANK.27", "1.1.1.BANK.209", "1.2.1.BANK.5"] + [None] * 50
+        prompt = _build_user_prompt(
+            "income_statement", "", self._ctx(codes),
+        )
+        self.assertIn("no usable account codes", prompt)
+        self.assertIn("path_contains", prompt)
+        self.assertIn("BANK.27", prompt.lower() if False else prompt)  # hint mentions the artifact pattern
+
+    def test_prompt_includes_account_id_column(self):
+        """The chart shown to the AI now includes each account's id so
+        ``account_ids`` selectors can reference real ids instead of
+        the AI hallucinating numbers. Regression guard for the
+        codeless tenants where ``account_ids`` is the most reliable
+        selector."""
+        ctx = self._ctx([None, None])
+        # Simulate ``_build_chart_context`` which adds the id field.
+        for i, a in enumerate(ctx["accounts"]):
+            a["id"] = 100 + i
+        prompt = _build_user_prompt("income_statement", "", ctx)
+        self.assertIn("#  100", prompt)
+        self.assertIn("#  101", prompt)
+        self.assertIn("id | code | level | path", prompt)

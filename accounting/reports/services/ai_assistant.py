@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -266,20 +267,51 @@ def _build_chart_context(company_id: int, limit: int = 150) -> Dict[str, Any]:
 
     # Prefer coded accounts; they're shorter + more useful for patterns.
     # Fall back to all active accounts when the chart isn't coded.
-    coded = [r for r in all_rows if r["account_code"]]
+    #
+    # Filter out auto-generated artifact codes from the "coded" pool.
+    # Two patterns observed on Evolat's chart:
+    #   * ``1.1.1.BANK.27`` — bank-account integration auto-fills
+    #     these when a BankAccount is linked to a leaf GL row.
+    #   * ``1.1.1.PENDING`` — the "Bank Clearing (Pending)" sentinel
+    #     account uses a similar non-numeric tail.
+    # General rule: real CoA codes are numeric segments separated by
+    # dots (e.g. ``4.01``, ``1.1.1``); ANY segment containing a
+    # non-digit means the code was auto-generated. Including such
+    # codes in the sample tricked the AI into emitting
+    # ``code_prefix: "1.1.1.BANK"`` style selectors that can't
+    # disambiguate operator-meaningful categories.
+    _REAL_CODE_RE = re.compile(r"^\d+(?:\.\d+)*$")
+
+    def _is_meaningful_code(c: Optional[str]) -> bool:
+        c = (c or "").strip()
+        if not c or c == "0":
+            return False
+        return bool(_REAL_CODE_RE.match(c))
+
+    coded = [r for r in all_rows if _is_meaningful_code(r["account_code"])]
     coded.sort(key=lambda r: (r["account_code"] or "", r["name"] or ""))
     sample_rows = coded[:limit]
     if len(sample_rows) < limit:
-        # Top up with uncoded accounts to fill the budget
-        uncoded = [r for r in all_rows if not r["account_code"]]
+        # Top up with uncoded (incl. artifact-coded) accounts to fill
+        # the budget. The path/name still carries the operator-facing
+        # meaning even when no real code exists.
+        uncoded = [r for r in all_rows if not _is_meaningful_code(r["account_code"])]
         uncoded.sort(key=lambda r: r["name"] or "")
         sample_rows.extend(uncoded[: limit - len(sample_rows)])
 
     accounts: List[Dict[str, Any]] = []
     for r in sample_rows:
         path = _path_of(r)
+        # Hide artifact codes from the prompt entirely. Showing the
+        # numeric id would also leak through ``account_ids``, but the
+        # path stays meaningful, so we just blank the code column
+        # instead. Keeps real codes (when present) intact.
+        code = r["account_code"] or ""
+        if not _is_meaningful_code(code):
+            code = ""
         accounts.append({
-            "code": r["account_code"] or "",
+            "id": r["id"],  # required for path_contains-failed fallbacks + account_ids selectors
+            "code": code,
             "name": r["name"],
             # Truncate path — most value is at the top of the hierarchy;
             # we already give the AI the code and direction.
@@ -354,14 +386,24 @@ ACCOUNT WIRING (CRITICAL — operators rely on this for real numbers):
 - Every ``line`` block MUST set ``accounts`` to a selector that matches
   at least one account in the chart provided below. Lines without
   account wiring produce zero — operators will reject the template.
-- Prefer ``accounts.code_prefix`` set to a code that EXISTS in the
-  chart (e.g. if the chart contains ``4.01.01`` and ``4.01.02``,
-  ``code_prefix: "4.01"`` is valid; ``code_prefix: "4"`` is fine if
-  ``4.x`` codes exist). DO NOT invent codes the chart doesn't show.
-- When a line's scope spans disjoint code groups (e.g. "Outras
-  Receitas" pulling from both ``4.05`` and ``4.99``), emit
-  ``account_ids`` listing the explicit ids from the chart instead of
-  a too-loose prefix.
+- The ``accounts`` selector accepts THREE alternative fields. Pick ONE
+  per line based on the chart's coding state:
+  1. ``code_prefix: "<code>"`` — when the chart has real numeric codes
+     (e.g. ``4.01``). Match a code prefix that EXISTS verbatim in the
+     ``code`` column below; ``include_descendants`` defaults to true so
+     deeper accounts are picked up automatically.
+  2. ``path_contains: "<substring>"`` — when the chart has no real
+     codes (column shows ``—``) or your line's scope crosses code
+     groups. Match a stable substring of the ``path`` column (e.g.
+     ``path_contains: "Despesas Comerciais"``). Substring is matched
+     against the ``parent > child > grandchild`` chain.
+  3. ``account_ids: [<id>, ...]`` — explicit list of ids from the
+     ``#<id>`` column. Use this when neither prefix nor path can
+     express the line's scope cleanly (e.g. "Outras Receitas" pulling
+     from disjoint sub-trees).
+- Choose the most stable selector available. NEVER invent codes that
+  don't appear verbatim in the chart's code column. NEVER invent
+  account ids that aren't shown.
 - ``subtotal`` blocks usually use a formula (``sum(children)``) and
   can omit ``accounts``. ``total`` blocks always use a formula.
 - The line's ``label`` should describe the BUSINESS CATEGORY (not
@@ -379,8 +421,12 @@ STRUCTURE:
 
 
 def _build_user_prompt(report_type: str, preferences: str, chart: Dict[str, Any]) -> str:
+    # ``id`` is included so the AI can emit ``account_ids`` selectors
+    # when ``code_prefix`` and ``path_contains`` aren't a good fit. Old
+    # format dropped the id, forcing the AI to invent codes that don't
+    # exist on codeless tenants.
     accounts_repr = "\n".join(
-        f"  {a['code'] or '—':<12} | L{a['level']} | {a['path'] or a['name']}"
+        f"  #{a.get('id', '?'):>5}  {a['code'] or '—':<12} | L{a['level']} | {a['path'] or a['name']}"
         for a in chart["accounts"]
     )
     pref_line = f"\nUser preferences: {preferences.strip()}" if preferences.strip() else ""
@@ -392,31 +438,56 @@ def _build_user_prompt(report_type: str, preferences: str, chart: Dict[str, Any]
             "selectors so unseen accounts still match."
         )
 
-    # Detect "useless code" tenants (Evolat-style charts where every
-    # account_code is null, empty, or a placeholder like "0"). For
-    # those, code_prefix selectors can't disambiguate — push the AI
-    # toward path_contains (matched against the computed parent chain)
-    # or explicit account_ids instead. This is a hint based on the
-    # sampled rows; the post-process resolver still tolerates whichever
-    # selector type the AI chooses.
-    distinct_codes = {(a.get("code") or "").strip() for a in chart["accounts"]}
-    useless_codes = distinct_codes <= {"", "0"}
+    # Detect "useless code" tenants (Evolat-style charts where the
+    # operator never coded the CoA but a few auto-generated artifact
+    # codes leak in -- e.g. "1.1.1.BANK.27" rows that the bank-account
+    # linker creates). Old ``distinct_codes <= {"", "0"}`` check failed
+    # for those tenants because the BANK-pseudo codes broke the subset
+    # match, so the AI got no hint and emitted ``code_prefix`` against
+    # codes that don't exist as real prefixes -- every line resolved
+    # to zero accounts.
+    #
+    # New rule: count rows that have a *real* code (non-empty,
+    # non-placeholder, not a BANK link artifact) and call the chart
+    # codeless if that's < 20% of the sample. The 20% threshold is
+    # generous on purpose -- a chart with one or two real codes among
+    # hundreds of uncoded rows is operationally codeless.
+    # Real CoA codes are numeric segments separated by dots
+    # (e.g. ``4.01`` or ``1.1.1``). Any non-numeric segment marks the
+    # code as auto-generated (BANK link, PENDING sentinel, etc.) — see
+    # ``_build_chart_context`` for the same filter applied to sampling.
+    _REAL_CODE_PROMPT_RE = re.compile(r"^\d+(?:\.\d+)*$")
+
+    def _is_real_code(c: str) -> bool:
+        c = (c or "").strip()
+        if not c or c == "0":
+            return False
+        return bool(_REAL_CODE_PROMPT_RE.match(c))
+
+    real_coded = sum(1 for a in chart["accounts"] if _is_real_code(a.get("code") or ""))
+    sample_size = max(1, len(chart["accounts"]))
+    useless_codes = (real_coded / sample_size) < 0.20
     coding_hint = ""
     if useless_codes:
         coding_hint = (
             "\nIMPORTANT — this company's chart has no usable account "
-            "codes (every code is empty or a placeholder). DO NOT emit "
-            "``code_prefix`` selectors. Use ``path_contains`` matched "
-            "against a stable substring of the path shown above (e.g. "
-            "``path_contains: \"Despesas Comerciais\"``), or list "
-            "specific ``account_ids`` from the chart, for every line."
+            "codes (most accounts are uncoded or only carry "
+            "auto-generated artifact codes like ``1.1.1.BANK.27``). DO "
+            "NOT emit ``code_prefix`` selectors. Use either:\n"
+            "  * ``path_contains: \"<substring>\"`` — substring match "
+            "against the parent-chain path shown in the chart below "
+            "(e.g. ``path_contains: \"Despesas Comerciais\"``), OR\n"
+            "  * ``account_ids: [<id>, ...]`` — explicit list of "
+            "account ids from the chart.\n"
+            "Never emit a code that doesn't appear verbatim in the "
+            "chart's code column."
         )
 
     return (
         f"Generate a {report_type} template for the following company.\n"
         f"{pref_line}\n"
         f"{note}{coding_hint}\n\n"
-        f"Chart of accounts (code | level | path):\n{accounts_repr}"
+        f"Chart of accounts (id | code | level | path):\n{accounts_repr}"
     )
 
 
