@@ -11,7 +11,7 @@ import {
   Wallet, BookOpen, Check, X, Sparkles, ArrowLeftRight, AlertCircle, AlertTriangle,
   Plus, Trash2, CheckCircle2, Search, RotateCcw, Loader2, Wand2, RefreshCw, Scale,
   FileText, ArrowUp, ArrowDown, ChevronsLeft, ChevronLeft, ChevronRight, ChevronsRight,
-  CheckSquare, Square, CircleDashed,
+  CheckSquare, Square, CircleDashed, Filter, FilterX,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { StatusBadge } from "@/components/ui/status-badge"
@@ -293,6 +293,20 @@ export function WorkbenchPage() {
     refetch: refetchBook,
   } = useUnmatchedJournalEntries(jeParams)
 
+  // Selection state lives here (rather than after the data-derivation
+  // memos below) because the show-selected-only toggle folds into the
+  // filter pass — ``bankTxs`` / ``journalEntries`` need ``selectedBank``
+  // / ``selectedBook`` in scope at memo-factory time, otherwise we hit a
+  // TDZ ReferenceError on first render.
+  const [selectedBank, setSelectedBank] = useState<Set<number>>(new Set())
+  const [selectedBook, setSelectedBook] = useState<Set<number>>(new Set())
+  // Per-pane "show only selected rows" filter. Folded into the
+  // filter useMemos below so count, sums, sort, and paging all
+  // naturally reflect the narrowed view. Defaults to off — operators
+  // open the workbench expecting to *see* candidates, not their picks.
+  const [bankShowSelectedOnly, setBankShowSelectedOnly] = useState(false)
+  const [bookShowSelectedOnly, setBookShowSelectedOnly] = useState(false)
+
   // Client-side filtering: each pane owns its own filters; values below are
   // applied on top of the server-side filters (amount/search/status/entity
   // run client-side for instant feedback).
@@ -303,6 +317,7 @@ export function WorkbenchPage() {
     const entId = filters.bankEntity || null
     const status = filters.bankStatus
     return rawBankTxs.filter((b) => {
+      if (bankShowSelectedOnly && !selectedBank.has(b.id)) return false
       if (entId && b.entity !== entId) return false
       if (status && b.reconciliation_status !== status) return false
       const n = Number(b.amount)
@@ -319,6 +334,8 @@ export function WorkbenchPage() {
     filters.bankEntity,
     filters.bankStatus,
     bankAccNameById,
+    bankShowSelectedOnly,
+    selectedBank,
   ])
 
   const journalEntries = useMemo(() => {
@@ -327,6 +344,7 @@ export function WorkbenchPage() {
     const q = filters.bookSearch.trim().toLowerCase()
     const status = filters.bookStatus
     return rawJournalEntries.filter((je) => {
+      if (bookShowSelectedOnly && !selectedBook.has(je.id)) return false
       if (status && je.reconciliation_status !== status) return false
       const n = Number(je.transaction_value)
       if (min != null && n < min) return false
@@ -340,7 +358,22 @@ export function WorkbenchPage() {
     filters.bookAmountMax,
     filters.bookSearch,
     filters.bookStatus,
+    bookShowSelectedOnly,
+    selectedBook,
   ])
+
+  // Auto-disable show-selected-only when the selection empties — without
+  // this, the operator can land in a confusing "filter is on but the
+  // pane is empty AND the toggle button has nothing visible to anchor"
+  // state. Tying the auto-reset to ``size === 0`` keeps the operator's
+  // intent (the toggle stays on across normal selection edits) without
+  // letting them get stuck.
+  useEffect(() => {
+    if (selectedBank.size === 0) setBankShowSelectedOnly(false)
+  }, [selectedBank.size])
+  useEffect(() => {
+    if (selectedBook.size === 0) setBookShowSelectedOnly(false)
+  }, [selectedBook.size])
 
   // Per-pane sort state (client-side, applied after filtering).
   // Default to newest-first by date — matches the server ordering previously
@@ -461,8 +494,8 @@ export function WorkbenchPage() {
     [rawJournalEntries],
   )
 
-  const [selectedBank, setSelectedBank] = useState<Set<number>>(new Set())
-  const [selectedBook, setSelectedBook] = useState<Set<number>>(new Set())
+  // (selectedBank/selectedBook are declared above the filter memos — see
+  // the comment block on the show-selected-only toggle for why.)
   const [suggestion, setSuggestion] = useState<SuggestMatchResponse["suggestions"][number] | null>(null)
   const [addOpen, setAddOpen] = useState(false)
   const [massOpen, setMassOpen] = useState(false)
@@ -777,6 +810,8 @@ export function WorkbenchPage() {
           rawCount={rawBankTxs.length}
           selectedCount={selectedBank.size}
           onToggleSelectAll={toggleSelectAllBank}
+          showSelectedOnly={bankShowSelectedOnly}
+          onToggleShowSelectedOnly={() => setBankShowSelectedOnly((v) => !v)}
           isLoading={bankLoading}
           isFetching={bankFetching}
           empty={t("workbench.empty")}
@@ -855,6 +890,8 @@ export function WorkbenchPage() {
           rawCount={rawJournalEntries.length}
           selectedCount={selectedBook.size}
           onToggleSelectAll={toggleSelectAllBook}
+          showSelectedOnly={bookShowSelectedOnly}
+          onToggleShowSelectedOnly={() => setBookShowSelectedOnly((v) => !v)}
           isLoading={bookLoading}
           isFetching={bookFetching}
           empty={t("workbench.empty")}
@@ -1035,7 +1072,7 @@ export function WorkbenchPage() {
 
 function Pane({
   title, icon, count, rawCount, selectedCount, isLoading, isFetching, empty, children, active, onFocus, filters, headerAction, footer,
-  onToggleSelectAll,
+  onToggleSelectAll, showSelectedOnly, onToggleShowSelectedOnly,
 }: {
   title: string
   icon: React.ReactNode
@@ -1060,6 +1097,12 @@ function Pane({
    *  otherwise it clears. ``count`` represents the post-filter total
    *  the button operates on, so the label can communicate scope. */
   onToggleSelectAll?: () => void
+  /** When true, the pane is currently filtered to show only the rows
+   *  that are selected. Drives the visual state of the toggle button. */
+  showSelectedOnly?: boolean
+  /** Flips ``showSelectedOnly``. Wired only on panes that support the
+   *  filter (both bank + book, in practice). */
+  onToggleShowSelectedOnly?: () => void
 }) {
   const isFiltered = rawCount != null && rawCount !== count
   const showRefreshSpinner = !!isFetching && !isLoading
@@ -1109,6 +1152,37 @@ function Pane({
                 <Square className="h-3.5 w-3.5" />
               )}
               {selectedCount > 0 ? "Limpar" : "Selecionar todos"}
+            </button>
+          )}
+          {/* Show-selected-only toggle. Surfaces only when there's a
+              non-empty selection — there's nothing meaningful to filter
+              to otherwise, and an always-visible toggle in the empty
+              state would invite the operator to click into a stuck
+              "filter on, list empty" hole (which we additionally
+              guard against with an auto-reset effect upstream). */}
+          {onToggleShowSelectedOnly && selectedCount > 0 && (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onToggleShowSelectedOnly() }}
+              title={
+                showSelectedOnly
+                  ? "Mostrar todos os resultados (atualmente filtrando para os selecionados)"
+                  : `Mostrar apenas os ${selectedCount} selecionados`
+              }
+              aria-pressed={showSelectedOnly}
+              className={cn(
+                "inline-flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] font-medium",
+                showSelectedOnly
+                  ? "border-primary/50 bg-primary/15 text-primary hover:bg-primary/25"
+                  : "border-border bg-background hover:bg-accent",
+              )}
+            >
+              {showSelectedOnly ? (
+                <FilterX className="h-3.5 w-3.5" />
+              ) : (
+                <Filter className="h-3.5 w-3.5" />
+              )}
+              {showSelectedOnly ? "Mostrar todos" : "Apenas selecionados"}
             </button>
           )}
           {selectedCount > 0 && (
