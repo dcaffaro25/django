@@ -100,12 +100,14 @@ export function BankAccountDetailPage() {
   )
   const { data: txPage, isLoading: txLoading } = useBankTransactions(txParams)
   const transactions: BankTransaction[] = useMemo(() => {
-    // ``useBankTransactionsList`` may return an array or paginated
+    // ``useBankTransactions`` may return an array or paginated
     // object depending on the param shape. Defensive unwrap.
     const raw = txPage as unknown
     if (Array.isArray(raw)) return raw as BankTransaction[]
-    if (raw && typeof raw === "object" && "results" in raw)
-      return (raw as { results: BankTransaction[] }).results ?? []
+    if (raw && typeof raw === "object" && "results" in raw) {
+      const results = (raw as { results: unknown }).results
+      return Array.isArray(results) ? (results as BankTransaction[]) : []
+    }
     return []
   }, [txPage])
 
@@ -297,13 +299,20 @@ function BalanceChart({
   // returns parallel ``bank`` + ``book`` arrays of ``{date, balance}``
   // rows. Merge into one chart-ready array indexed by date.
   const series = useMemo(() => {
-    const bankArr = (data as { bank?: Array<{ date: string; balance: number }> } | undefined)?.bank ?? []
-    const bookArr = (data as { book?: Array<{ date: string; balance: number }> } | undefined)?.book ?? []
+    // Defensive: see BankAccountsPage.AggregateBalanceChart for the
+    // rationale -- guards against shape drift on
+    // ``/api/bank-book-daily-balances/``.
+    const rawBank = (data as { bank?: Array<{ date: string; balance: number }> } | undefined)?.bank
+    const rawBook = (data as { book?: Array<{ date: string; balance: number }> } | undefined)?.book
+    const bankArr = Array.isArray(rawBank) ? rawBank : []
+    const bookArr = Array.isArray(rawBook) ? rawBook : []
     const byDate = new Map<string, { date: string; bank: number | null; book: number | null }>()
     for (const r of bankArr) {
+      if (!r || typeof r !== "object") continue
       byDate.set(r.date, { date: r.date, bank: Number(r.balance ?? 0), book: null })
     }
     for (const r of bookArr) {
+      if (!r || typeof r !== "object") continue
       const prev = byDate.get(r.date) ?? { date: r.date, bank: null, book: null }
       byDate.set(r.date, { ...prev, book: Number(r.balance ?? 0) })
     }
@@ -376,15 +385,19 @@ function FlowsChart({
   flows: Array<{ month: string; inflow: string; outflow: string }>
   currencyCode: string | null
 }) {
-  const data = useMemo(
-    () =>
-      flows.map((f) => ({
-        month: f.month,
-        Entradas: Number(f.inflow),
-        Saídas: -Number(f.outflow), // render outflow as negative bar so the chart is signed
-      })),
-    [flows],
-  )
+  const data = useMemo(() => {
+    // Defensive: useQuery's data prop can momentarily be undefined
+    // even with a `= []` destructuring default in some scenarios
+    // (e.g. typed at the call site as the query's data type, which
+    // is technically `T | undefined`). Guard against non-array.
+    const arr = Array.isArray(flows) ? flows : []
+    return arr.map((f) => ({
+      month: f.month,
+      Entradas: Number(f.inflow),
+      // render outflow as a negative bar so the chart is signed.
+      Saídas: -Number(f.outflow),
+    }))
+  }, [flows])
   return (
     <div className="card-elevated p-3">
       <div className="mb-2 flex items-center justify-between">

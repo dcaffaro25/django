@@ -469,15 +469,19 @@ function BankAccountsDashboardSection() {
 }
 
 function DashboardKpiStrip({ kpis }: { kpis: BankAccountsDashboardKpis }) {
-  const recRate = kpis.reconciliation_rate_pct
+  const recRate = kpis.reconciliation_rate_pct ?? 0
   const recColor =
     recRate >= 90 ? "text-emerald-600" : recRate >= 50 ? "text-amber-600" : "text-destructive"
   // First currency wins for the inflow/outflow strip cards. Multi-currency
   // tenants get the per-currency breakdown in the totals card below;
-  // here we keep the strip compact.
-  const primaryCurrency = kpis.currency_codes[0] ?? "BRL"
-  const inflowMtd = kpis.inflow_mtd_by_currency[primaryCurrency] ?? "0"
-  const outflowMtd = kpis.outflow_mtd_by_currency[primaryCurrency] ?? "0"
+  // here we keep the strip compact. Defensive on every record access
+  // so a missing/non-array currency_codes doesn't blow up the strip.
+  const codes = Array.isArray(kpis.currency_codes) ? kpis.currency_codes : []
+  const primaryCurrency = codes[0] ?? "BRL"
+  const inflowByCurr = (kpis.inflow_mtd_by_currency && typeof kpis.inflow_mtd_by_currency === "object") ? kpis.inflow_mtd_by_currency : {}
+  const outflowByCurr = (kpis.outflow_mtd_by_currency && typeof kpis.outflow_mtd_by_currency === "object") ? kpis.outflow_mtd_by_currency : {}
+  const inflowMtd = inflowByCurr[primaryCurrency] ?? "0"
+  const outflowMtd = outflowByCurr[primaryCurrency] ?? "0"
 
   return (
     <div className="grid grid-cols-2 gap-2 md:grid-cols-3 lg:grid-cols-5">
@@ -539,7 +543,15 @@ function DashboardKpiCard({
 }
 
 function CurrencyTotalsCard({ kpis }: { kpis: BankAccountsDashboardKpis }) {
-  const codes = kpis.currency_codes.length > 0 ? kpis.currency_codes : ["BRL"]
+  // Defensive: backend SHOULD always return an array + dict shapes
+  // here, but if any field drifts (e.g. paginated list, null,
+  // single string) we don't want the whole page to crash. Each
+  // dict access is guarded too.
+  const rawCodes = Array.isArray(kpis.currency_codes) ? kpis.currency_codes : []
+  const codes = rawCodes.length > 0 ? rawCodes : ["BRL"]
+  const balanceMap = (kpis.balance_by_currency && typeof kpis.balance_by_currency === "object") ? kpis.balance_by_currency : {}
+  const inflowMap = (kpis.inflow_mtd_by_currency && typeof kpis.inflow_mtd_by_currency === "object") ? kpis.inflow_mtd_by_currency : {}
+  const outflowMap = (kpis.outflow_mtd_by_currency && typeof kpis.outflow_mtd_by_currency === "object") ? kpis.outflow_mtd_by_currency : {}
   return (
     <div className="card-elevated p-3">
       <div className="mb-2 flex items-center gap-1.5 text-[12px] font-semibold">
@@ -557,9 +569,9 @@ function CurrencyTotalsCard({ kpis }: { kpis: BankAccountsDashboardKpis }) {
         </thead>
         <tbody>
           {codes.map((code) => {
-            const balance = kpis.balance_by_currency[code] ?? "0"
-            const inflow = kpis.inflow_mtd_by_currency[code] ?? "0"
-            const outflow = kpis.outflow_mtd_by_currency[code] ?? "0"
+            const balance = balanceMap[code] ?? "0"
+            const inflow = inflowMap[code] ?? "0"
+            const outflow = outflowMap[code] ?? "0"
             return (
               <tr key={code} className="border-t border-border/60">
                 <td className="px-2 py-1.5 font-mono text-[11px]">{code}</td>
@@ -593,16 +605,24 @@ function AggregateBalanceChart({
   // detail. A future commit can add a currency picker here.
   const series = useMemo(() => {
     const agg = (data as { aggregate?: { by_currency?: Record<string, { bank?: Array<{ date: string; balance: number }>; book?: Array<{ date: string; balance: number }> }> } } | undefined)?.aggregate
-    const byCurr = agg?.by_currency ?? {}
+    const byCurr = (agg && typeof agg.by_currency === "object" && agg.by_currency) || {}
     const codes = Object.keys(byCurr)
     if (codes.length === 0) return { rows: [], code: null as string | null }
     const code = codes[0]
-    const bankArr = byCurr[code]?.bank ?? []
-    const bookArr = byCurr[code]?.book ?? []
+    // Defensive: the backend ``bank`` / ``book`` keys are arrays in
+    // production, but the recon dashboard has historically seen
+    // shape drift (paginated wrappers, single objects). Guard with
+    // ``Array.isArray`` so this useMemo can't throw "X is not
+    // iterable" and crash the whole page.
+    const bankArr = Array.isArray(byCurr[code]?.bank) ? byCurr[code]!.bank! : []
+    const bookArr = Array.isArray(byCurr[code]?.book) ? byCurr[code]!.book! : []
     const byDate = new Map<string, { date: string; bank: number | null; book: number | null }>()
-    for (const r of bankArr)
+    for (const r of bankArr) {
+      if (!r || typeof r !== "object") continue
       byDate.set(r.date, { date: r.date, bank: Number(r.balance ?? 0), book: null })
+    }
     for (const r of bookArr) {
+      if (!r || typeof r !== "object") continue
       const prev = byDate.get(r.date) ?? { date: r.date, bank: null, book: null }
       byDate.set(r.date, { ...prev, book: Number(r.balance ?? 0) })
     }
