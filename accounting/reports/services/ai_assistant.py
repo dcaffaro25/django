@@ -33,6 +33,7 @@ from accounting.services.external_ai_client import ExternalAIClient, ExternalAIE
 
 from .ai_pricing import estimate_cost_usd
 from .document_schema import (
+    AccountsSelector,
     SlimTemplateDocument,
     TemplateDocument,
     slim_to_canonical,
@@ -348,7 +349,26 @@ Rules (STRICT):
 - For income_statement use defaults.calculation_method = "net_movement".
 - For balance_sheet use defaults.calculation_method = "ending_balance".
 - For cash_flow use a mix: opening_balance + net_movement + ending_balance.
-- Prefer accounts.code_prefix (pattern match) over listing explicit ids.
+
+ACCOUNT WIRING (CRITICAL — operators rely on this for real numbers):
+- Every ``line`` block MUST set ``accounts`` to a selector that matches
+  at least one account in the chart provided below. Lines without
+  account wiring produce zero — operators will reject the template.
+- Prefer ``accounts.code_prefix`` set to a code that EXISTS in the
+  chart (e.g. if the chart contains ``4.01.01`` and ``4.01.02``,
+  ``code_prefix: "4.01"`` is valid; ``code_prefix: "4"`` is fine if
+  ``4.x`` codes exist). DO NOT invent codes the chart doesn't show.
+- When a line's scope spans disjoint code groups (e.g. "Outras
+  Receitas" pulling from both ``4.05`` and ``4.99``), emit
+  ``account_ids`` listing the explicit ids from the chart instead of
+  a too-loose prefix.
+- ``subtotal`` blocks usually use a formula (``sum(children)``) and
+  can omit ``accounts``. ``total`` blocks always use a formula.
+- The line's ``label`` should describe the BUSINESS CATEGORY (not
+  necessarily the account name). The wiring carries the technical
+  link; the label carries the operator-facing meaning.
+
+STRUCTURE:
 - Use sections for logical grouping; put a subtotal at the end of each
   section (its ``parent_id`` = the section's id). Top-level totals
   (net income, total assets, etc.) have ``parent_id: null``.
@@ -371,12 +391,137 @@ def _build_user_prompt(report_type: str, preferences: str, chart: Dict[str, Any]
             f"{chart['total_accounts']} accounts are shown — prefer code_prefix "
             "selectors so unseen accounts still match."
         )
+
+    # Detect "useless code" tenants (Evolat-style charts where every
+    # account_code is null, empty, or a placeholder like "0"). For
+    # those, code_prefix selectors can't disambiguate — push the AI
+    # toward path_contains (matched against the computed parent chain)
+    # or explicit account_ids instead. This is a hint based on the
+    # sampled rows; the post-process resolver still tolerates whichever
+    # selector type the AI chooses.
+    distinct_codes = {(a.get("code") or "").strip() for a in chart["accounts"]}
+    useless_codes = distinct_codes <= {"", "0"}
+    coding_hint = ""
+    if useless_codes:
+        coding_hint = (
+            "\nIMPORTANT — this company's chart has no usable account "
+            "codes (every code is empty or a placeholder). DO NOT emit "
+            "``code_prefix`` selectors. Use ``path_contains`` matched "
+            "against a stable substring of the path shown above (e.g. "
+            "``path_contains: \"Despesas Comerciais\"``), or list "
+            "specific ``account_ids`` from the chart, for every line."
+        )
+
     return (
         f"Generate a {report_type} template for the following company.\n"
         f"{pref_line}\n"
-        f"{note}\n\n"
+        f"{note}{coding_hint}\n\n"
         f"Chart of accounts (code | level | path):\n{accounts_repr}"
     )
+
+
+# --- Account-id hydration --------------------------------------------------
+
+
+def _hydrate_account_ids(
+    doc_dict: Dict[str, Any], *, company_id: int,
+) -> tuple[Dict[str, Any], List[str]]:
+    """Walk every line / subtotal block and pin ``accounts.account_ids`` to
+    the concrete list of accounts the selector currently matches against
+    the company's chart of accounts.
+
+    Why
+    ===
+    Without this pass, an AI-generated line carries only a coarse
+    selector — e.g. ``code_prefix: "4.01"`` — and the operator has no
+    visibility into WHICH accounts will feed it until they actually
+    run the report. Worse: a hallucinated prefix the AI invented
+    (``"5.99"``) doesn't match any real account, and the line silently
+    produces zeros instead of failing loudly.
+
+    Hydrating ``account_ids`` at generate-time:
+      * **Auditability** — operators can see exactly which CoA accounts
+        will be summed under each line of the draft, *before* saving.
+      * **Surfaces empty matches** — the returned ``unmapped`` list
+        names every line whose selector resolved to zero accounts so
+        callers can warn / log / retry.
+      * **Forward-compatible** — :class:`AccountResolver` ORs
+        ``account_ids`` with ``code_prefix`` / ``path_contains``, so a
+        new account added later that matches the prefix still flows
+        into the line on the next calc. The hydrated list is a
+        snapshot, not a hard cap.
+
+    The dict is mutated in place AND returned (alongside the unmapped
+    list) so callers can chain. We never overwrite an explicit
+    ``account_ids`` the AI itself emitted — if the model already
+    listed concrete accounts, that's its preferred wiring and the
+    code_prefix is just a complementary hint.
+
+    Notes
+    -----
+    Sections recursively contain children, so the walk is depth-first.
+    Resolution failures (malformed selector, transient DB error) log
+    and continue — a partial hydration is more useful than aborting
+    the whole generation.
+    """
+    # Local import to avoid pulling the resolver — and its Q-builder
+    # plus MPTT walks — at module load time. ``generate_template`` is
+    # the only caller; the cost is paid only when the AI flow runs.
+    from .intelligence import AccountResolver
+
+    resolver = AccountResolver(company_id=company_id)
+    unmapped: List[str] = []
+    hydrated_count = 0
+
+    def _walk(blocks: Any) -> None:
+        nonlocal hydrated_count
+        if not isinstance(blocks, list):
+            return
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            sel = b.get("accounts")
+            if (
+                isinstance(sel, dict)
+                and (sel.get("code_prefix") or sel.get("path_contains") or sel.get("account_ids"))
+            ):
+                # Only re-resolve when account_ids is empty — preserves
+                # any explicit list the AI (or a downstream refine)
+                # already produced. ``[]`` and ``None`` both count as
+                # "needs hydration".
+                if not sel.get("account_ids"):
+                    try:
+                        selector_obj = AccountsSelector(**sel)
+                        accounts = resolver.resolve(selector_obj)
+                        ids = sorted({a.id for a in accounts})
+                        if ids:
+                            sel["account_ids"] = ids
+                            hydrated_count += 1
+                        else:
+                            unmapped.append(b.get("id") or "<unknown>")
+                    except Exception as exc:  # noqa: BLE001 — log+skip
+                        log.warning(
+                            "ai_assistant._hydrate_account_ids: failed for block %r: %s",
+                            b.get("id"), exc,
+                        )
+            # Sections own a ``children`` list — recurse so nested
+            # lines also get hydrated.
+            children = b.get("children")
+            if children:
+                _walk(children)
+
+    _walk(doc_dict.get("blocks"))
+
+    log.info(
+        "ai_assistant: hydrated account_ids on %d line(s); %d unmapped",
+        hydrated_count, len(unmapped),
+    )
+    if unmapped:
+        log.warning(
+            "ai_assistant: %d line(s) have no matching CoA accounts: %s",
+            len(unmapped), ", ".join(unmapped[:10]),
+        )
+    return doc_dict, unmapped
 
 
 # --- Public entry point ----------------------------------------------------
@@ -549,7 +694,23 @@ def generate_template(
     # different one — the UI expects it to match.
     doc_dict = doc_model.model_dump(mode="json")
     doc_dict["report_type"] = report_type
-    return doc_dict
+
+    # Hydrate ``accounts.account_ids`` against the live CoA so each
+    # generated line carries the explicit list of accounts it covers
+    # (instead of just an opaque code_prefix or path_contains). See
+    # ``_hydrate_account_ids`` for the full rationale.
+    #
+    # ``unmapped`` lists block ids whose selector resolved to ZERO
+    # accounts — the operator should review those before saving. We
+    # attach it as a top-level dict alongside the document below so
+    # the canonical TemplateDocument stays clean (``extra="forbid"``
+    # would reject any embedded annotation, which would then trip
+    # the save endpoint's pydantic validation).
+    doc_dict, unmapped = _hydrate_account_ids(doc_dict, company_id=company_id)
+    return {
+        "document": doc_dict,
+        "warnings": {"unmapped_lines": unmapped} if unmapped else {},
+    }
 
 
 # ---------------------------------------------------------------------------

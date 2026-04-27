@@ -26,6 +26,15 @@ export interface AiGenerateTemplateRequest {
 }
 export interface AiGenerateTemplateResponse {
   document: TemplateDocument
+  /** Optional generation warnings keyed by category. Present when the
+   *  AI's account selectors couldn't be resolved against the live CoA
+   *  — e.g. ``unmapped_lines`` lists block ids whose ``code_prefix`` /
+   *  ``path_contains`` matched zero accounts. The UI uses this to
+   *  surface a "review these lines" banner before save. Empty (or
+   *  missing) when every line wired cleanly. */
+  warnings?: {
+    unmapped_lines?: string[]
+  }
 }
 
 export type AiRefineAction =

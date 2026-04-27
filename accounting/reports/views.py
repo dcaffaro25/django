@@ -319,7 +319,15 @@ class AiStub(viewsets.ViewSet):
             raise ValidationError({"quality": "Must be fast | standard"})
 
         try:
-            doc = generate_template(
+            # As of the CoA-hydration change ``generate_template``
+            # returns ``{"document": ..., "warnings": {...}}`` instead
+            # of just the bare document. ``warnings.unmapped_lines``
+            # lists block ids whose accounts selector resolved to no
+            # CoA accounts — the UI should surface a "review these
+            # lines" banner. Returning the dict as-is keeps the
+            # response shape stable for clients that only consumed
+            # ``document`` previously (additive change).
+            result = generate_template(
                 company_id=tenant.id,
                 report_type=report_type,
                 preferences=(body.get("preferences") or ""),
@@ -337,7 +345,7 @@ class AiStub(viewsets.ViewSet):
                 {"error": str(exc), "error_type": "ai_error"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        return Response({"document": doc}, status=status.HTTP_200_OK)
+        return Response(result, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=["post"])
     def refine(self, request, tenant_id=None):
