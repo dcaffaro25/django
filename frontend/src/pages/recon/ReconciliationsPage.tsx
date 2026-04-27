@@ -274,6 +274,12 @@ export function ReconciliationsPage() {
                 status: STATUS_SCOPE_PARAM[statusScope],
                 ordering: "-id",
                 export: "xlsx",
+                // Pass the operator's free-text search to the
+                // server so the downloaded xlsx mirrors what's
+                // visible on screen. Backend ``ReconciliationViewSet``
+                // wires DRF SearchFilter across reference / notes /
+                // bank+book descriptions; empty string is a no-op.
+                ...(search.trim() ? { search: search.trim() } : {}),
               }}
               filename="conciliacoes.xlsx"
             />

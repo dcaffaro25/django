@@ -366,6 +366,21 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     # opt into pagination with ?page=, ?page_size=, or ?paginate=true.
     pagination_class = OptInPageNumberPagination
 
+    # Search across the operator-visible text fields so the
+    # ``ReconciliationsPage`` free-text input has a server-side
+    # equivalent. Important for the ``?export=xlsx`` download path
+    # to respect the same filter the operator sees on screen --
+    # without this, the export grabs every row in the status scope
+    # regardless of what the search box says.
+    filter_backends = [drf_filters.SearchFilter]
+    search_fields = [
+        "reference",
+        "notes",
+        "bank_transactions__description",
+        "journal_entries__description",
+        "journal_entries__transaction__description",
+    ]
+
     if settings.AUTH_OFF:
         permission_classes = []
     else:
