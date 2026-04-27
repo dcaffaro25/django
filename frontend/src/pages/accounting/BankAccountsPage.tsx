@@ -56,6 +56,13 @@ import { cn, formatCurrency, formatDate } from "@/lib/utils"
 export function BankAccountsPage() {
   const { t } = useTranslation(["reconciliation", "common"])
   const { data: accounts = [], isLoading, isFetching, refetch } = useBankAccountsList()
+  // ``dashboard-kpis`` carries a per-account block we merge into the
+  // table by id. React Query dedupes — the dashboard section above
+  // also calls this hook with the same key, so this is one network
+  // round-trip total.
+  const { data: kpis } = useBankAccountsDashboardKpis()
+  const accountKpis = kpis?.accounts ?? {}
+  const kpiOf = (id: number) => accountKpis[String(id)]
   const [editing, setEditing] = useState<BankAccountFull | "new" | null>(null)
 
   const { sort, sorted, toggle: toggleSort } = useSortable(accounts, {
@@ -68,6 +75,14 @@ export function BankAccountsPage() {
       currency: (r) => r.currency?.code ?? "",
       account_number: (r) => r.account_number ?? "",
       current_balance: (r) => r.current_balance ?? 0,
+      // Per-account KPI accessors. Missing rows (no activity) sort
+      // to the bottom by treating null as -1 for percentages and 0
+      // for amounts -- consistent with how the cell renders "—".
+      recon_lifetime: (r) => kpiOf(r.id)?.reconciliation_rate_pct_lifetime ?? -1,
+      recon_window: (r) => kpiOf(r.id)?.reconciliation_rate_pct_window ?? -1,
+      amount_remaining: (r) => Number(kpiOf(r.id)?.amount_remaining ?? 0),
+      net_window: (r) => Number(kpiOf(r.id)?.net_window ?? 0),
+      burn_3m: (r) => Number(kpiOf(r.id)?.burn_avg_monthly ?? 0),
     },
   })
 
@@ -80,6 +95,11 @@ export function BankAccountsPage() {
       { key: "account_number", label: "Conta" },
       { key: "branch_id", label: "Agência", defaultVisible: false },
       { key: "current_balance", label: "Saldo atual" },
+      { key: "recon_lifetime", label: "% conc. (total)" },
+      { key: "recon_window", label: "% conc. (30d)" },
+      { key: "amount_remaining", label: "Restante a conciliar" },
+      { key: "net_window", label: "Net 30d" },
+      { key: "burn_3m", label: "Burn 3m/mês", defaultVisible: false },
     ],
     [],
   )
@@ -177,6 +197,11 @@ export function BankAccountsPage() {
               {col.isVisible("account_number") && <th className="h-9 px-3"><SortableHeader columnKey="account_number" label="Conta" sort={sort} onToggle={toggleSort} /></th>}
               {col.isVisible("branch_id") && <th className="h-9 px-3">Agência</th>}
               {col.isVisible("current_balance") && <th className="h-9 px-3 text-right"><SortableHeader columnKey="current_balance" align="right" label="Saldo atual" sort={sort} onToggle={toggleSort} /></th>}
+              {col.isVisible("recon_lifetime") && <th className="h-9 px-3 text-right"><SortableHeader columnKey="recon_lifetime" align="right" label="% conc. (total)" sort={sort} onToggle={toggleSort} /></th>}
+              {col.isVisible("recon_window") && <th className="h-9 px-3 text-right"><SortableHeader columnKey="recon_window" align="right" label="% conc. (30d)" sort={sort} onToggle={toggleSort} /></th>}
+              {col.isVisible("amount_remaining") && <th className="h-9 px-3 text-right"><SortableHeader columnKey="amount_remaining" align="right" label="Restante a conciliar" sort={sort} onToggle={toggleSort} /></th>}
+              {col.isVisible("net_window") && <th className="h-9 px-3 text-right"><SortableHeader columnKey="net_window" align="right" label="Net 30d" sort={sort} onToggle={toggleSort} /></th>}
+              {col.isVisible("burn_3m") && <th className="h-9 px-3 text-right"><SortableHeader columnKey="burn_3m" align="right" label="Burn 3m/mês" sort={sort} onToggle={toggleSort} /></th>}
               <th className="h-9 w-px px-3"></th>
             </tr>
           </thead>
@@ -184,12 +209,12 @@ export function BankAccountsPage() {
             {isLoading ? (
               Array.from({ length: 4 }).map((_, i) => (
                 <tr key={i} className="border-t border-border">
-                  <td colSpan={9} className="h-10 px-3"><div className="h-4 animate-pulse rounded bg-muted/60" /></td>
+                  <td colSpan={14} className="h-10 px-3"><div className="h-4 animate-pulse rounded bg-muted/60" /></td>
                 </tr>
               ))
             ) : sorted.length === 0 ? (
               <tr>
-                <td colSpan={9} className="h-24 px-3 text-center text-muted-foreground">Nenhuma conta cadastrada</td>
+                <td colSpan={14} className="h-24 px-3 text-center text-muted-foreground">Nenhuma conta cadastrada</td>
               </tr>
             ) : (
               sorted.map((a) => (
@@ -225,6 +250,31 @@ export function BankAccountsPage() {
                   {col.isVisible("branch_id") && <td className="h-10 px-3 font-mono text-muted-foreground">{a.branch_id ?? "—"}</td>}
                   {col.isVisible("current_balance") && (
                     <td className="h-10 px-3 text-right tabular-nums">{formatCurrency(a.current_balance ?? 0, a.currency?.code ?? "BRL")}</td>
+                  )}
+                  {col.isVisible("recon_lifetime") && (
+                    <td className="h-10 px-3 text-right tabular-nums">
+                      <ReconRateCell pct={kpiOf(a.id)?.reconciliation_rate_pct_lifetime} />
+                    </td>
+                  )}
+                  {col.isVisible("recon_window") && (
+                    <td className="h-10 px-3 text-right tabular-nums">
+                      <ReconRateCell pct={kpiOf(a.id)?.reconciliation_rate_pct_window} />
+                    </td>
+                  )}
+                  {col.isVisible("amount_remaining") && (
+                    <td className="h-10 px-3 text-right tabular-nums">
+                      {kpiOf(a.id) ? formatCurrency(Number(kpiOf(a.id)!.amount_remaining), a.currency?.code ?? "BRL") : "—"}
+                    </td>
+                  )}
+                  {col.isVisible("net_window") && (
+                    <td className="h-10 px-3 text-right tabular-nums">
+                      <SignedAmountCell amount={kpiOf(a.id)?.net_window} currency={a.currency?.code ?? "BRL"} />
+                    </td>
+                  )}
+                  {col.isVisible("burn_3m") && (
+                    <td className="h-10 px-3 text-right tabular-nums">
+                      <BurnCell amount={kpiOf(a.id)?.burn_avg_monthly} currency={a.currency?.code ?? "BRL"} />
+                    </td>
                   )}
                   <RowActionsCell>
                     <RowAction icon={<Copy className="h-3.5 w-3.5" />} label="Duplicar" onClick={(e) => onDuplicate(a, e)} />
@@ -406,6 +456,45 @@ function BankAccountEditor({
   )
 }
 
+/** Compact percent badge: >=90 green, >=50 amber, else red. ``—`` for
+ *  accounts with no data. Used both for the lifetime and window
+ *  reconciliation columns. */
+function ReconRateCell({ pct }: { pct?: number }) {
+  if (pct == null || pct < 0) return <span className="text-muted-foreground">—</span>
+  const color =
+    pct >= 90 ? "text-emerald-600" : pct >= 50 ? "text-amber-600" : "text-destructive"
+  return <span className={cn("font-medium", color)}>{pct}%</span>
+}
+
+/** Net flow over a window. Positive = green (inflow exceeds outflow),
+ *  negative = red. Hides ``—`` for accounts with no activity. */
+function SignedAmountCell({ amount, currency }: { amount?: string; currency: string }) {
+  if (amount == null) return <span className="text-muted-foreground">—</span>
+  const n = Number(amount)
+  if (!Number.isFinite(n)) return <span className="text-muted-foreground">—</span>
+  if (n === 0) return <span className="text-muted-foreground">{formatCurrency(0, currency)}</span>
+  return (
+    <span className={n > 0 ? "text-emerald-600" : "text-destructive"}>
+      {formatCurrency(n, currency)}
+    </span>
+  )
+}
+
+/** Burn rate column. The KPI is signed at the source — positive = burning
+ *  cash, negative = accumulating. Render as |amount| (operators read this
+ *  as a "monthly burn" magnitude) and color red when burning, green when
+ *  accumulating. */
+function BurnCell({ amount, currency }: { amount?: string; currency: string }) {
+  if (amount == null) return <span className="text-muted-foreground">—</span>
+  const n = Number(amount)
+  if (!Number.isFinite(n) || n === 0) return <span className="text-muted-foreground">—</span>
+  return (
+    <span className={n > 0 ? "text-destructive" : "text-emerald-600"}>
+      {formatCurrency(Math.abs(n), currency)}/mês
+    </span>
+  )
+}
+
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="flex flex-col gap-1">
@@ -462,7 +551,7 @@ function BankAccountsDashboardSection() {
       <DashboardKpiStrip kpis={kpis} />
       <div className="grid gap-3 md:grid-cols-2">
         <CurrencyTotalsCard kpis={kpis} />
-        <AggregateBalanceChart data={balanceData} />
+        <AggregateBalanceChart data={balanceData} kpis={kpis} />
       </div>
     </div>
   )
@@ -595,27 +684,33 @@ function CurrencyTotalsCard({ kpis }: { kpis: BankAccountsDashboardKpis }) {
 
 function AggregateBalanceChart({
   data,
+  kpis,
 }: {
   data: ReturnType<typeof useDailyBalances>["data"]
+  kpis: BankAccountsDashboardKpis
 }) {
   // The aggregate (no bank_account_id) branch returns per-currency
-  // bank vs book daily lines under ``aggregate.by_currency[code]``.
-  // For v1 we render the FIRST currency's lines as the "primary" view
-  // and let the Currency Totals card above carry multi-currency
-  // detail. A future commit can add a currency picker here.
+  // bank vs book daily lines under ``aggregate.by_currency[<id>]``.
+  // The map key is the currency *id* (e.g. "12"), not the code, so
+  // we fall back to the first ISO code from the dashboard KPIs for
+  // axis/legend formatting.
   const series = useMemo(() => {
-    const agg = (data as { aggregate?: { by_currency?: Record<string, { bank?: Array<{ date: string; balance: number }>; book?: Array<{ date: string; balance: number }> }> } } | undefined)?.aggregate
+    type Row = { date: string; balance: number }
+    type Side = { line?: Row[] } | Row[] | undefined
+    const pickLine = (side: Side): Row[] => {
+      if (Array.isArray(side)) return side
+      if (side && Array.isArray(side.line)) return side.line
+      return []
+    }
+    const agg = (data as {
+      aggregate?: { by_currency?: Record<string, { bank?: Side; book?: Side }> }
+    } | undefined)?.aggregate
     const byCurr = (agg && typeof agg.by_currency === "object" && agg.by_currency) || {}
-    const codes = Object.keys(byCurr)
-    if (codes.length === 0) return { rows: [], code: null as string | null }
-    const code = codes[0]
-    // Defensive: the backend ``bank`` / ``book`` keys are arrays in
-    // production, but the recon dashboard has historically seen
-    // shape drift (paginated wrappers, single objects). Guard with
-    // ``Array.isArray`` so this useMemo can't throw "X is not
-    // iterable" and crash the whole page.
-    const bankArr = Array.isArray(byCurr[code]?.bank) ? byCurr[code]!.bank! : []
-    const bookArr = Array.isArray(byCurr[code]?.book) ? byCurr[code]!.book! : []
+    const keys = Object.keys(byCurr)
+    if (keys.length === 0) return { rows: [], code: null as string | null }
+    const key = keys[0]
+    const bankArr = pickLine(byCurr[key]?.bank)
+    const bookArr = pickLine(byCurr[key]?.book)
     const byDate = new Map<string, { date: string; bank: number | null; book: number | null }>()
     for (const r of bankArr) {
       if (!r || typeof r !== "object") continue
@@ -626,11 +721,12 @@ function AggregateBalanceChart({
       const prev = byDate.get(r.date) ?? { date: r.date, bank: null, book: null }
       byDate.set(r.date, { ...prev, book: Number(r.balance ?? 0) })
     }
+    const codes = Array.isArray(kpis.currency_codes) ? kpis.currency_codes : []
     return {
       rows: Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date)),
-      code,
+      code: codes[0] ?? null,
     }
-  }, [data])
+  }, [data, kpis])
 
   return (
     <div className="card-elevated p-3">

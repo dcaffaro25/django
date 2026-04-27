@@ -288,3 +288,140 @@ class ComputeMonthlyFlowsTests(_BankAccountKpisFixtureMixin, TestCase):
             )
         self.assertEqual(flows[0]["outflow"], "500.00")
         self.assertEqual(flows[0]["inflow"], "0")
+
+
+class DashboardKpisAccountsBlockTests(_BankAccountKpisFixtureMixin, TestCase):
+    """Tests for the per-account block hydrated alongside dashboard
+    aggregates (powers the bank-accounts table + the recon dashboard
+    snapshot table). FIXED_TODAY = 2026-05-15."""
+
+    def setUp(self):
+        BankTransaction.objects.filter(company=self.company).delete()
+        Reconciliation.objects.filter(company=self.company).delete()
+
+    def _accounts_block(self):
+        with _patch_today():
+            kpis = compute_dashboard_kpis(
+                bank_account_qs=BankAccount.objects.filter(company=self.company),
+                recon_window_days=30,
+            )
+        return kpis["accounts"]
+
+    def test_accounts_block_keyed_by_string_id(self):
+        accs = self._accounts_block()
+        # Every BankAccount in scope must be present, even with no
+        # activity. Keys are stringified ids so the JSON survives.
+        self.assertEqual(set(accs.keys()), {
+            str(self.ba_brl_a.id), str(self.ba_brl_b.id), str(self.ba_usd.id),
+        })
+
+    def test_hydrated_fields_present(self):
+        """name / currency_code / current_balance need to come back so
+        the recon-dashboard snapshot table can render without a second
+        BankAccount list call."""
+        accs = self._accounts_block()
+        row = accs[str(self.ba_brl_a.id)]
+        self.assertEqual(row["name"], "BRL-A")
+        self.assertEqual(row["currency_code"], "BRL")
+        self.assertIn("current_balance", row)
+
+    def test_lifetime_recon_rate_count_basis(self):
+        # 4 bank txs total on ba_brl_a, 3 matched/approved -> 75%.
+        bts = [
+            self._bank_tx(self.ba_brl_a, "100.00", dt.date(2025, 9, 1)),
+            self._bank_tx(self.ba_brl_a, "200.00", dt.date(2025, 10, 1)),
+            self._bank_tx(self.ba_brl_a, "300.00", dt.date(2026, 1, 1)),
+            self._bank_tx(self.ba_brl_a, "400.00", dt.date(2026, 5, 1)),  # unmatched
+        ]
+        je = self._journal_entry(debit="100.00")
+        self._match("matched", [bts[0]], [je])
+        self._match("matched", [bts[1]], [je])
+        self._match("approved", [bts[2]], [je])
+        accs = self._accounts_block()
+        row = accs[str(self.ba_brl_a.id)]
+        self.assertEqual(row["reconciliation_rate_pct_lifetime"], 75)
+
+    def test_window_recon_rate_only_counts_recent(self):
+        # FIXED_TODAY = 2026-05-15; window=30d -> floor 2026-04-15.
+        # 1 in-window matched, 1 in-window unmatched, 1 stale matched.
+        in_match = self._bank_tx(self.ba_brl_a, "100.00", dt.date(2026, 5, 1))
+        in_unmatch = self._bank_tx(self.ba_brl_a, "200.00", dt.date(2026, 5, 2))
+        stale_match = self._bank_tx(self.ba_brl_a, "300.00", dt.date(2026, 1, 1))
+        je = self._journal_entry(debit="100.00")
+        self._match("matched", [in_match], [je])
+        self._match("matched", [stale_match], [je])
+        accs = self._accounts_block()
+        row = accs[str(self.ba_brl_a.id)]
+        # In-window: 2 total, 1 matched -> 50%
+        self.assertEqual(row["reconciliation_rate_pct_window"], 50)
+        # Lifetime: 3 total, 2 matched -> 67%
+        self.assertEqual(row["reconciliation_rate_pct_lifetime"], 67)
+
+    def test_amount_remaining_excludes_matched_and_approved(self):
+        bt_unmatched = self._bank_tx(self.ba_brl_a, "100.00", dt.date(2026, 5, 1))
+        bt_open = self._bank_tx(self.ba_brl_a, "-50.00", dt.date(2026, 5, 2))
+        bt_matched = self._bank_tx(self.ba_brl_a, "200.00", dt.date(2026, 5, 3))
+        bt_approved = self._bank_tx(self.ba_brl_a, "300.00", dt.date(2026, 5, 4))
+        je = self._journal_entry(debit="100.00")
+        self._match("open", [bt_open], [je])  # 'open' counts as remaining
+        self._match("matched", [bt_matched], [je])
+        self._match("approved", [bt_approved], [je])
+        # Avoid unused-variable warning.
+        _ = bt_unmatched
+        accs = self._accounts_block()
+        row = accs[str(self.ba_brl_a.id)]
+        # Remaining = |100| (unmatched) + |-50| (open) = 150.
+        self.assertEqual(Decimal(row["amount_remaining"]), Decimal("150.00"))
+
+    def test_net_window_signed_sum(self):
+        # Recon window = 30d back from 2026-05-15 = 2026-04-15.
+        self._bank_tx(self.ba_brl_a, "1000.00", dt.date(2026, 5, 1))
+        self._bank_tx(self.ba_brl_a, "-300.00", dt.date(2026, 5, 5))
+        # Outside window -> ignored.
+        self._bank_tx(self.ba_brl_a, "9999.00", dt.date(2026, 1, 1))
+        accs = self._accounts_block()
+        row = accs[str(self.ba_brl_a.id)]
+        self.assertEqual(Decimal(row["net_window"]), Decimal("700.00"))
+
+    def test_burn_avg_monthly_positive_when_burning(self):
+        # Burn window = last 3 calendar months: Mar / Apr / May 2026.
+        # Net per month: Mar = -300, Apr = -600, May = -900.
+        # avg(-net) = (300+600+900)/3 = 600 -> burning.
+        self._bank_tx(self.ba_brl_a, "-300.00", dt.date(2026, 3, 5))
+        self._bank_tx(self.ba_brl_a, "-600.00", dt.date(2026, 4, 5))
+        self._bank_tx(self.ba_brl_a, "-900.00", dt.date(2026, 5, 5))
+        accs = self._accounts_block()
+        row = accs[str(self.ba_brl_a.id)]
+        self.assertEqual(Decimal(row["burn_avg_monthly"]), Decimal("600.00"))
+        self.assertFalse(row["burn_is_negative"])
+
+    def test_burn_negative_when_accumulating(self):
+        # Pure inflow over last 3 months -> burn is negative
+        # (== accumulating cash).
+        self._bank_tx(self.ba_brl_a, "300.00", dt.date(2026, 3, 5))
+        self._bank_tx(self.ba_brl_a, "600.00", dt.date(2026, 4, 5))
+        self._bank_tx(self.ba_brl_a, "900.00", dt.date(2026, 5, 5))
+        accs = self._accounts_block()
+        row = accs[str(self.ba_brl_a.id)]
+        # avg(-net) = -(300+600+900)/3 = -600
+        self.assertEqual(Decimal(row["burn_avg_monthly"]), Decimal("-600.00"))
+        self.assertTrue(row["burn_is_negative"])
+
+    def test_account_with_no_activity_safe_defaults(self):
+        # ba_usd has no bank txs.
+        accs = self._accounts_block()
+        row = accs[str(self.ba_usd.id)]
+        self.assertEqual(row["reconciliation_rate_pct_lifetime"], 0)
+        self.assertEqual(row["reconciliation_rate_pct_window"], 0)
+        self.assertEqual(row["amount_remaining"], "0")
+        self.assertEqual(row["net_window"], "0")
+        self.assertEqual(row["burn_avg_monthly"], "0")
+        self.assertFalse(row["burn_is_negative"])
+
+    def test_per_account_isolation(self):
+        """Activity on ba_brl_a must NOT leak into ba_brl_b's row."""
+        self._bank_tx(self.ba_brl_a, "1000.00", dt.date(2026, 5, 1))
+        self._bank_tx(self.ba_brl_b, "100.00", dt.date(2026, 5, 1))
+        accs = self._accounts_block()
+        self.assertEqual(Decimal(accs[str(self.ba_brl_a.id)]["amount_remaining"]), Decimal("1000.00"))
+        self.assertEqual(Decimal(accs[str(self.ba_brl_b.id)]["amount_remaining"]), Decimal("100.00"))

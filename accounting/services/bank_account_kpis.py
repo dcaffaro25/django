@@ -42,7 +42,7 @@ from django.db.models import (
     Value,
     When,
 )
-from django.db.models.functions import Coalesce, TruncMonth
+from django.db.models.functions import Abs, Coalesce, TruncMonth
 from django.utils import timezone
 
 
@@ -53,6 +53,170 @@ def _today() -> dt.date:
 
 def _zero() -> Decimal:
     return Decimal("0")
+
+
+def _compute_per_account_kpis(
+    *,
+    account_ids: List[int],
+    today: dt.date,
+    window_start: dt.date,
+    burn_months: int = 3,
+) -> Dict[int, Dict[str, Any]]:
+    """Per-account KPI block hydrated alongside the dashboard.
+
+    One aggregation per metric across *all* accounts (no per-account
+    Python loop) so the cost stays in the same ballpark as the
+    existing dashboard query plan. Returns a dict keyed by
+    ``bank_account_id`` so the frontend can join on the table row.
+
+    Fields per account:
+      * ``reconciliation_rate_pct_lifetime`` — count basis, no date floor
+      * ``reconciliation_rate_pct_window`` — count basis over recon window
+      * ``amount_remaining`` — sum |amount| for bank txs NOT in
+        matched/approved (string Decimal)
+      * ``net_window`` — signed sum(amount) over recon window
+        (positive = inflow exceeds outflow, negative = burn)
+      * ``burn_avg_monthly`` — average monthly net outflow over the last
+        ``burn_months`` calendar months. Positive = burning cash,
+        negative = accumulating. Returned as positive when burning so
+        the column reads like a "monthly burn" amount; sign carried in
+        ``burn_is_negative`` for callers that want it.
+    """
+    from accounting.models import BankTransaction
+
+    if not account_ids:
+        return {}
+
+    base_qs = BankTransaction.objects.filter(bank_account_id__in=account_ids)
+    matched_filter = Q(reconciliations__status__in=["matched", "approved"])
+
+    # Lifetime + window recon counts in one pass each.
+    lifetime_rows = (
+        base_qs.values("bank_account_id")
+        .annotate(
+            total=Count("id", distinct=True),
+            matched=Count(
+                "id",
+                filter=matched_filter,
+                distinct=True,
+            ),
+        )
+    )
+    lifetime_by_id: Dict[int, Dict[str, int]] = {
+        r["bank_account_id"]: {"total": r["total"], "matched": r["matched"]}
+        for r in lifetime_rows
+    }
+
+    window_rows = (
+        base_qs.filter(date__gte=window_start)
+        .values("bank_account_id")
+        .annotate(
+            total=Count("id", distinct=True),
+            matched=Count(
+                "id",
+                filter=matched_filter,
+                distinct=True,
+            ),
+        )
+    )
+    window_by_id: Dict[int, Dict[str, int]] = {
+        r["bank_account_id"]: {"total": r["total"], "matched": r["matched"]}
+        for r in window_rows
+    }
+
+    # ``amount_remaining`` = SUM(|amount|) for bank txs whose
+    # reconciliation_status is NOT matched/approved. We approximate at
+    # the bank-tx level — a partial-match bank tx is counted at full
+    # amount. Documented as a v1 trade-off; amount-weighted accuracy
+    # would require apportionment per row (already implemented in
+    # BankTransactionSerializer._bank_tx_match_metrics, but too
+    # expensive to run in a dashboard aggregation).
+    remaining_rows = (
+        base_qs.exclude(reconciliations__status__in=["matched", "approved"])
+        .values("bank_account_id")
+        .annotate(
+            remaining=Coalesce(
+                Sum(Abs("amount")),
+                Value(_zero(), output_field=DecimalField(max_digits=20, decimal_places=2)),
+            ),
+        )
+    )
+    remaining_by_id: Dict[int, Decimal] = {
+        r["bank_account_id"]: r["remaining"] or _zero()
+        for r in remaining_rows
+    }
+
+    # ``net_window`` = signed SUM(amount) over recon window.
+    net_rows = (
+        base_qs.filter(date__gte=window_start)
+        .values("bank_account_id")
+        .annotate(
+            net=Coalesce(
+                Sum("amount"),
+                Value(_zero(), output_field=DecimalField(max_digits=20, decimal_places=2)),
+            ),
+        )
+    )
+    net_by_id: Dict[int, Decimal] = {
+        r["bank_account_id"]: r["net"] or _zero() for r in net_rows
+    }
+
+    # ``burn_avg_monthly`` = avg of (outflow_abs - inflow) per month
+    # over the last ``burn_months`` calendar months (incl. current).
+    # Positive == net cash leaving. Implementation: TruncMonth-grouped
+    # net SUM, average across requested months.
+    year = today.year
+    month = today.month - (burn_months - 1)
+    while month <= 0:
+        month += 12
+        year -= 1
+    burn_window_start = dt.date(year, month, 1)
+
+    burn_rows = (
+        base_qs.filter(date__gte=burn_window_start)
+        .annotate(m=TruncMonth("date"))
+        .values("bank_account_id", "m")
+        .annotate(
+            net=Coalesce(
+                Sum("amount"),
+                Value(_zero(), output_field=DecimalField(max_digits=20, decimal_places=2)),
+            ),
+        )
+    )
+    burn_acc: Dict[int, Decimal] = defaultdict(_zero)
+    burn_count: Dict[int, int] = defaultdict(int)
+    for r in burn_rows:
+        # Negate so positive = burning (net outflow).
+        burn_acc[r["bank_account_id"]] += -(r["net"] or _zero())
+        burn_count[r["bank_account_id"]] += 1
+    burn_avg_by_id: Dict[int, Decimal] = {}
+    for acc_id, total in burn_acc.items():
+        # Always divide by the requested window so months without
+        # activity don't inflate the average. If the account has no
+        # activity at all, it's left out of this dict (frontend reads
+        # missing as 0).
+        burn_avg_by_id[acc_id] = (total / Decimal(burn_months)).quantize(Decimal("0.01"))
+
+    out: Dict[int, Dict[str, Any]] = {}
+    for acc_id in account_ids:
+        lt = lifetime_by_id.get(acc_id, {"total": 0, "matched": 0})
+        wn = window_by_id.get(acc_id, {"total": 0, "matched": 0})
+        burn = burn_avg_by_id.get(acc_id, _zero())
+        out[acc_id] = {
+            "reconciliation_rate_pct_lifetime": (
+                int(round(lt["matched"] * 100 / lt["total"]))
+                if lt["total"] > 0 else 0
+            ),
+            "reconciliation_rate_pct_window": (
+                int(round(wn["matched"] * 100 / wn["total"]))
+                if wn["total"] > 0 else 0
+            ),
+            "amount_remaining": str(remaining_by_id.get(acc_id, _zero())),
+            "net_window": str(net_by_id.get(acc_id, _zero())),
+            "burn_avg_monthly": str(burn),
+            "burn_is_negative": burn < 0,
+        }
+    return out
 
 
 def compute_dashboard_kpis(
@@ -87,7 +251,7 @@ def compute_dashboard_kpis(
 
     accounts = list(
         bank_account_qs.select_related("currency").only(
-            "id", "currency_id", "balance",
+            "id", "name", "currency_id", "balance", "balance_date",
         )
     )
     account_ids = [a.id for a in accounts]
@@ -103,14 +267,18 @@ def compute_dashboard_kpis(
     # Slightly more expensive than reading ``balance`` directly but
     # the dashboard surface needs the live number.
     balance_by_currency: Dict[str, Decimal] = defaultdict(_zero)
+    balance_by_account_id: Dict[int, Decimal] = {}
     for a in accounts:
         code = getattr(a.currency, "code", None) or "?"
         try:
-            balance_by_currency[code] += a.get_current_balance() or _zero()
+            bal = a.get_current_balance() or _zero()
         except Exception:
             # Defensive: any one account's bad data shouldn't black out
             # the whole dashboard.
+            balance_by_account_id[a.id] = _zero()
             continue
+        balance_by_currency[code] += bal
+        balance_by_account_id[a.id] = bal
 
     # The remaining metrics aggregate at the BankTransaction level. One
     # query per metric -- simpler than a single mega-query and reads
@@ -168,6 +336,27 @@ def compute_dashboard_kpis(
         *outflow_window.keys(),
     })
 
+    accounts_kpis = _compute_per_account_kpis(
+        account_ids=account_ids,
+        today=today,
+        window_start=window_start,
+        burn_months=3,
+    )
+    # Hydrate name + currency_code + current_balance per account so the
+    # frontend table can render without a second request.
+    for a in accounts:
+        row = accounts_kpis.setdefault(a.id, {
+            "reconciliation_rate_pct_lifetime": 0,
+            "reconciliation_rate_pct_window": 0,
+            "amount_remaining": "0",
+            "net_window": "0",
+            "burn_avg_monthly": "0",
+            "burn_is_negative": False,
+        })
+        row["name"] = a.name
+        row["currency_code"] = getattr(getattr(a, "currency", None), "code", None)
+        row["current_balance"] = str(balance_by_account_id.get(a.id, _zero()))
+
     return {
         "account_count": account_count,
         "active_account_count": active_account_count,
@@ -183,6 +372,10 @@ def compute_dashboard_kpis(
         "currency_codes": currency_codes,
         "stale_days": stale_days,
         "recon_window_days": recon_window_days,
+        # Per-account aggregates keyed by id (string keys to survive
+        # JSON safely; the frontend converts back to number to join
+        # against the BankAccount list rows).
+        "accounts": {str(k): v for k, v in accounts_kpis.items()},
     }
 
 

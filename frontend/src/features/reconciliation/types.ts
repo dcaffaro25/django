@@ -199,6 +199,28 @@ export interface BankAccountsDashboardKpis {
   currency_codes: string[]
   stale_days: number
   recon_window_days: number
+  /** Per-account row KPIs keyed by ``BankAccount.id`` (string). The
+   *  bank-accounts table merges these in by id. Missing accounts =
+   *  no activity. */
+  accounts?: Record<string, BankAccountRowKpis>
+}
+
+/** Per-account row KPIs returned by ``GET /api/bank_accounts/dashboard-kpis/``.
+ *  All amounts are Decimal-as-string. ``burn_avg_monthly`` is positive
+ *  when the account is burning cash (net outflow); negative when it is
+ *  accumulating. */
+export interface BankAccountRowKpis {
+  reconciliation_rate_pct_lifetime: number
+  reconciliation_rate_pct_window: number
+  amount_remaining: string
+  net_window: string
+  burn_avg_monthly: string
+  burn_is_negative: boolean
+  /** Hydrated server-side so consumers (e.g. the recon dashboard's
+   *  per-account table) don't need a second BankAccount list call. */
+  name?: string
+  currency_code?: string | null
+  current_balance?: string
 }
 
 /** Per-account header strip from ``GET /api/bank_accounts/<id>/kpis/``. */

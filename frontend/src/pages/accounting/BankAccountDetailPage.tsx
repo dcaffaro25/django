@@ -296,16 +296,19 @@ function BalanceChart({
   currencyCode: string | null
 }) {
   // The single-account branch of ``/api/bank-book-daily-balances/``
-  // returns parallel ``bank`` + ``book`` arrays of ``{date, balance}``
-  // rows. Merge into one chart-ready array indexed by date.
+  // returns ``bank`` and ``book`` as objects of shape
+  // ``{anchor_date, opening_balance, line: [{date, movement, balance}, ...]}``.
+  // Merge ``line`` arrays into one chart-ready row keyed by date.
   const series = useMemo(() => {
-    // Defensive: see BankAccountsPage.AggregateBalanceChart for the
-    // rationale -- guards against shape drift on
-    // ``/api/bank-book-daily-balances/``.
-    const rawBank = (data as { bank?: Array<{ date: string; balance: number }> } | undefined)?.bank
-    const rawBook = (data as { book?: Array<{ date: string; balance: number }> } | undefined)?.book
-    const bankArr = Array.isArray(rawBank) ? rawBank : []
-    const bookArr = Array.isArray(rawBook) ? rawBook : []
+    type Row = { date: string; balance: number }
+    type Side = { line?: Row[] } | Row[] | undefined
+    const pickLine = (side: Side): Row[] => {
+      if (Array.isArray(side)) return side  // legacy/test shape
+      if (side && Array.isArray(side.line)) return side.line
+      return []
+    }
+    const bankArr = pickLine((data as { bank?: Side } | undefined)?.bank)
+    const bookArr = pickLine((data as { book?: Side } | undefined)?.book)
     const byDate = new Map<string, { date: string; bank: number | null; book: number | null }>()
     for (const r of bankArr) {
       if (!r || typeof r !== "object") continue

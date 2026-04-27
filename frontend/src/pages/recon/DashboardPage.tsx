@@ -10,8 +10,8 @@ import {
 import { KpiCard } from "@/components/ui/kpi-card"
 import { SectionHeader } from "@/components/ui/section-header"
 import { StatusBadge } from "@/components/ui/status-badge"
-import { useActiveTasks, useDailyBalances, useReconKPIs, useReconTasks } from "@/features/reconciliation"
-import type { BookCurrencyMismatch, BookDailyWarning } from "@/features/reconciliation/types"
+import { useActiveTasks, useBankAccountsDashboardKpis, useDailyBalances, useReconKPIs, useReconTasks } from "@/features/reconciliation"
+import type { BankAccountRowKpis, BookCurrencyMismatch, BookDailyWarning } from "@/features/reconciliation/types"
 import { cn, formatCurrency, formatDateTime, formatDuration, formatNumber } from "@/lib/utils"
 
 type TxMode = "both" | "balanced" | "unbalanced"
@@ -203,6 +203,12 @@ export function DashboardPage() {
           />
         </button>
       </div>
+
+      {/* Per-account KPI snapshot — same data block the
+          ``/accounting/bank-accounts`` table uses. Operators get a
+          quick read on which accounts are healthy vs need attention
+          without leaving the recon dashboard. */}
+      <PerAccountKpiTable />
 
       {/* Data-quality warnings — surface service-side flags that make the
           book series look flat or break per-currency aggregation. */}
@@ -435,6 +441,139 @@ export function DashboardPage() {
         </div>
       </div>
     </div>
+  )
+}
+
+/**
+ * Compact per-account KPI snapshot for the recon dashboard. Pulls
+ * the per-account block already attached to ``GET /api/bank_accounts/dashboard-kpis/``
+ * (no extra request thanks to React Query dedup with the contas-bancárias
+ * page). Sorted by largest "amount remaining" so accounts with the
+ * most unreconciled work bubble to the top — that's the natural
+ * triage order on this dashboard.
+ */
+function PerAccountKpiTable() {
+  const { t } = useTranslation(["reconciliation", "common"])
+  const navigate = useNavigate()
+  const { data: kpis, isLoading } = useBankAccountsDashboardKpis()
+  const rows = useMemo(() => {
+    const accs = kpis?.accounts
+    if (!accs || typeof accs !== "object") return []
+    const list: Array<{ id: number } & BankAccountRowKpis> = []
+    for (const [id, row] of Object.entries(accs)) {
+      const idNum = Number(id)
+      if (!Number.isFinite(idNum) || !row) continue
+      list.push({ id: idNum, ...(row as BankAccountRowKpis) })
+    }
+    list.sort((a, b) => Number(b.amount_remaining) - Number(a.amount_remaining))
+    return list
+  }, [kpis])
+
+  if (isLoading) {
+    return (
+      <div className="card-elevated p-3 text-[12px] text-muted-foreground">
+        Carregando contas…
+      </div>
+    )
+  }
+  if (rows.length === 0) return null
+
+  return (
+    <div className="card-elevated overflow-hidden">
+      <div className="flex items-center justify-between border-b border-border px-3 py-2">
+        <div>
+          <h3 className="text-[13px] font-semibold">{t("dashboard.kpi_per_account_title", "Conciliação por conta")}</h3>
+          <p className="text-[11px] text-muted-foreground">
+            {t("dashboard.kpi_per_account_subtitle", "Ordenado pelo maior valor pendente")}
+          </p>
+        </div>
+        <button
+          onClick={() => navigate("/accounting/bank-accounts")}
+          className="text-[11px] text-primary hover:underline"
+        >
+          ver todas →
+        </button>
+      </div>
+      <table className="w-full text-[12px]">
+        <thead className="bg-surface-3 text-left text-[10px] uppercase tracking-wider text-muted-foreground">
+          <tr>
+            <th className="h-8 px-3">Conta</th>
+            <th className="h-8 px-3 text-right">Saldo</th>
+            <th className="h-8 px-3 text-right">Restante a conciliar</th>
+            <th className="h-8 px-3 text-right">% conc. (total)</th>
+            <th className="h-8 px-3 text-right">% conc. (30d)</th>
+            <th className="h-8 px-3 text-right">Net 30d</th>
+            <th className="h-8 px-3 text-right">Burn 3m/mês</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => {
+            const cur = r.currency_code ?? "BRL"
+            return (
+              <tr
+                key={r.id}
+                onClick={() => navigate(`/accounting/bank-accounts/${r.id}`)}
+                className="cursor-pointer border-t border-border hover:bg-accent/50"
+              >
+                <td className="h-9 px-3 font-medium">{r.name ?? `Conta #${r.id}`}</td>
+                <td className="h-9 px-3 text-right tabular-nums">
+                  {formatCurrency(Number(r.current_balance ?? 0), cur)}
+                </td>
+                <td className="h-9 px-3 text-right tabular-nums">
+                  {Number(r.amount_remaining) > 0 ? (
+                    <span className="font-medium text-amber-600">
+                      {formatCurrency(Number(r.amount_remaining), cur)}
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground">{formatCurrency(0, cur)}</span>
+                  )}
+                </td>
+                <td className="h-9 px-3 text-right tabular-nums">
+                  <ReconRatePill pct={r.reconciliation_rate_pct_lifetime} />
+                </td>
+                <td className="h-9 px-3 text-right tabular-nums">
+                  <ReconRatePill pct={r.reconciliation_rate_pct_window} />
+                </td>
+                <td className="h-9 px-3 text-right tabular-nums">
+                  <SignedNum amount={r.net_window} cur={cur} />
+                </td>
+                <td className="h-9 px-3 text-right tabular-nums">
+                  <BurnNum amount={r.burn_avg_monthly} cur={cur} />
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function ReconRatePill({ pct }: { pct: number }) {
+  if (pct == null || pct < 0) return <span className="text-muted-foreground">—</span>
+  const color =
+    pct >= 90 ? "text-emerald-600" : pct >= 50 ? "text-amber-600" : "text-destructive"
+  return <span className={cn("font-medium", color)}>{pct}%</span>
+}
+
+function SignedNum({ amount, cur }: { amount: string; cur: string }) {
+  const n = Number(amount)
+  if (!Number.isFinite(n)) return <span className="text-muted-foreground">—</span>
+  if (n === 0) return <span className="text-muted-foreground">{formatCurrency(0, cur)}</span>
+  return (
+    <span className={n > 0 ? "text-emerald-600" : "text-destructive"}>
+      {formatCurrency(n, cur)}
+    </span>
+  )
+}
+
+function BurnNum({ amount, cur }: { amount: string; cur: string }) {
+  const n = Number(amount)
+  if (!Number.isFinite(n) || n === 0) return <span className="text-muted-foreground">—</span>
+  return (
+    <span className={n > 0 ? "text-destructive" : "text-emerald-600"}>
+      {formatCurrency(Math.abs(n), cur)}
+    </span>
   )
 }
 
