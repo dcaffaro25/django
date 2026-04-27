@@ -1756,7 +1756,23 @@ function BankList({
   bankAccounts?: Array<{ id: number; name: string }>
 }) {
   const parentRef = useRef<HTMLDivElement>(null)
-  const virt = useVirtualizer({ count: items.length, getScrollElement: () => parentRef.current, estimateSize: () => 52, overscan: 10 })
+  // Dynamic row sizing: descriptions wrap to whatever number of lines
+  // the content needs, so we can't pin row height to 52px anymore.
+  // ``measureElement`` reads each rendered row's actual rect after
+  // mount; the virtualizer reflows ``getTotalSize()`` and item offsets
+  // once measurements arrive. ``estimateSize`` is the placeholder used
+  // before measurement (and for items that haven't been rendered yet),
+  // so it's bumped to ~64px — close to a 2-line average — to avoid a
+  // visible jump when long descriptions resolve. ``getItemKey`` keys
+  // by item.id so React doesn't blow away measurements on re-order.
+  const virt = useVirtualizer({
+    count: items.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 64,
+    overscan: 10,
+    measureElement: (el) => el?.getBoundingClientRect().height ?? 64,
+    getItemKey: (index) => items[index]?.id ?? index,
+  })
   const vis = isVisible ?? (() => true)
   const bankAccNameById = useMemo(
     () => Object.fromEntries(bankAccounts.map((b) => [b.id, b.name])),
@@ -1779,21 +1795,32 @@ function BankList({
           return (
             <button
               key={item.id}
+              // ``data-index`` + ``ref={virt.measureElement}`` tell the
+              // virtualizer which row this DOM node represents so it
+              // can record the measured height against ``vi.index``.
+              // No explicit ``height`` here — content drives it now.
+              data-index={vi.index}
+              ref={virt.measureElement}
               onClick={() => onToggle(item.id)}
-              style={{ position: "absolute", top: 0, left: 0, width: "100%", transform: `translateY(${vi.start}px)`, height: vi.size }}
+              style={{ position: "absolute", top: 0, left: 0, width: "100%", transform: `translateY(${vi.start}px)` }}
               className={cn(
-                "flex w-full items-center gap-2 border-b border-border/60 px-3 text-left text-[12px] transition-colors",
+                "flex w-full items-start gap-2 border-b border-border/60 px-3 py-2 text-left text-[12px] transition-colors",
                 isSel ? "bg-primary/10 hover:bg-primary/15" : "hover:bg-accent/50",
                 isCursor && "ring-1 ring-inset ring-primary/60",
               )}
             >
-              <input type="checkbox" checked={isSel} readOnly className="h-3.5 w-3.5 shrink-0 accent-primary" />
-              <div className="flex min-w-0 flex-1 flex-col">
-                <div className="flex items-center gap-2">
+              <input type="checkbox" checked={isSel} readOnly className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-primary" />
+              <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                <div className="flex items-start gap-2">
                   {vis("id") && (
-                    <span className="font-mono text-[10px] text-muted-foreground">#{item.id}</span>
+                    <span className="mt-px shrink-0 font-mono text-[10px] text-muted-foreground">#{item.id}</span>
                   )}
-                  <span className="truncate">{item.description}</span>
+                  {/* ``min-w-0`` on the wrapper lets the flex parent
+                      actually shrink this column; ``break-words`` +
+                      default ``whitespace-normal`` (i.e. no
+                      ``truncate``) lets long descriptions wrap to as
+                      many lines as needed. */}
+                  <span className="min-w-0 flex-1 break-words">{item.description}</span>
                 </div>
                 <div className="flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground">
                   {vis("date") && <span>{formatDate(item.date)}</span>}
@@ -1840,7 +1867,17 @@ function BookList({
   isVisible?: (key: string) => boolean
 }) {
   const parentRef = useRef<HTMLDivElement>(null)
-  const virt = useVirtualizer({ count: items.length, getScrollElement: () => parentRef.current, estimateSize: () => 52, overscan: 10 })
+  // Same dynamic-size pattern as BankList — see the comment block on
+  // ``virt`` there for the rationale (description wrapping requires
+  // measured row heights).
+  const virt = useVirtualizer({
+    count: items.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 64,
+    overscan: 10,
+    measureElement: (el) => el?.getBoundingClientRect().height ?? 64,
+    getItemKey: (index) => items[index]?.id ?? index,
+  })
   const vis = isVisible ?? (() => true)
 
   useEffect(() => {
@@ -1869,6 +1906,8 @@ function BookList({
             // like a button press.
             <div
               key={item.id}
+              data-index={vi.index}
+              ref={virt.measureElement}
               role="button"
               tabIndex={0}
               onClick={() => onToggle(item.id)}
@@ -1878,20 +1917,20 @@ function BookList({
                   onToggle(item.id)
                 }
               }}
-              style={{ position: "absolute", top: 0, left: 0, width: "100%", transform: `translateY(${vi.start}px)`, height: vi.size }}
+              style={{ position: "absolute", top: 0, left: 0, width: "100%", transform: `translateY(${vi.start}px)` }}
               className={cn(
-                "flex w-full cursor-pointer items-center gap-2 border-b border-border/60 px-3 text-left text-[12px] transition-colors outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-primary/60",
+                "flex w-full cursor-pointer items-start gap-2 border-b border-border/60 px-3 py-2 text-left text-[12px] transition-colors outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-primary/60",
                 isSel ? "bg-primary/10 hover:bg-primary/15" : "hover:bg-accent/50",
                 isCursor && "ring-1 ring-inset ring-primary/60",
               )}
             >
-              <input type="checkbox" checked={isSel} readOnly className="h-3.5 w-3.5 shrink-0 accent-primary" />
-              <div className="flex min-w-0 flex-1 flex-col">
-                <div className="flex items-center gap-2">
+              <input type="checkbox" checked={isSel} readOnly className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-primary" />
+              <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                <div className="flex items-start gap-2">
                   {vis("id") && (
-                    <span className="font-mono text-[10px] text-muted-foreground">#{item.id}</span>
+                    <span className="mt-px shrink-0 font-mono text-[10px] text-muted-foreground">#{item.id}</span>
                   )}
-                  <span className="truncate">{item.description}</span>
+                  <span className="min-w-0 flex-1 break-words">{item.description}</span>
                 </div>
                 <div className="flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground">
                   {vis("date") && <span>{formatDate(item.transaction_date)}</span>}
