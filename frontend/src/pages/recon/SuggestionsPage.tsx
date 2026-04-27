@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react"
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { useTranslation } from "react-i18next"
 import { useSearchParams, useNavigate } from "react-router-dom"
 import { toast } from "sonner"
@@ -762,6 +762,10 @@ function TaskSuggestionsView({ taskId }: { taskId: number }) {
     setMinDescScorePct(0)
     setMinAmountScorePct(0)
     setMaxDateDiffDays(null)
+    // Reset sort to its default too — operators expect "clear filters"
+    // to restore the page to a fully neutral state, including sort
+    // (otherwise a stale sort key sits in the URL after a reset).
+    setSort("confidence_desc")
   }
 
   // True when any filter deviates from its "all rows pass" default.
@@ -773,7 +777,105 @@ function TaskSuggestionsView({ taskId }: { taskId: number }) {
     minDateScorePct > 0 ||
     minDescScorePct > 0 ||
     minAmountScorePct > 0 ||
-    maxDateDiffDays != null
+    maxDateDiffDays != null ||
+    sort !== "confidence_desc"
+
+  // --- URL <-> filter state sync ---------------------------------------
+  // Persists every filter into the page URL so an operator can copy/paste
+  // a filtered view, refresh without losing context, or share a "Δ valor
+  // máx. 5,00 + ordenado por diferença" link with a colleague. One-shot
+  // hydrate-from-URL on mount, then write-back on every state change
+  // (replace: true so each keystroke doesn't pollute the back/forward
+  // stack).
+  const hydratedFromUrl = useRef(false)
+
+  useEffect(() => {
+    if (hydratedFromUrl.current) return
+    hydratedFromUrl.current = true
+
+    const sp = searchParams
+    const q = sp.get("q")
+    if (q) setSearch(q)
+    const cmin = sp.get("cmin")
+    if (cmin) setMinConfPct(Math.max(0, Math.min(100, Number(cmin) || 0)))
+    const dmax = sp.get("dmax")
+    if (dmax !== null) {
+      const n = Number(dmax)
+      if (Number.isFinite(n) && n >= 0) setMaxDiff(n)
+    }
+    const mt = sp.get("mt")
+    if (mt) setMatchTypes(new Set(mt.split(",").filter(Boolean)))
+    // ``sort`` is a 5-value union — accept only known values from the
+    // URL so a malformed ``?sort=garbage`` doesn't sneak past the
+    // <select> and leave the page in an unselectable state.
+    const sortParam = sp.get("sort")
+    const validSorts: SortKey[] = [
+      "confidence_desc",
+      "confidence_asc",
+      "difference_asc",
+      "date_asc",
+      "size_desc",
+    ]
+    if (sortParam && (validSorts as string[]).includes(sortParam)) {
+      setSort(sortParam as SortKey)
+    }
+    const dscmin = sp.get("dscmin")
+    if (dscmin) setMinDateScorePct(Math.max(0, Math.min(100, Number(dscmin) || 0)))
+    const descmin = sp.get("descmin")
+    if (descmin) setMinDescScorePct(Math.max(0, Math.min(100, Number(descmin) || 0)))
+    const amin = sp.get("amin")
+    if (amin) setMinAmountScorePct(Math.max(0, Math.min(100, Number(amin) || 0)))
+    const ddmax = sp.get("ddmax")
+    if (ddmax !== null) {
+      const n = Number(ddmax)
+      if (Number.isFinite(n) && n >= 0) setMaxDateDiffDays(n)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    if (!hydratedFromUrl.current) return
+
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev)
+        // Each filter writes its own param when it deviates from the
+        // default; deletes when it returns to default. Keeps the URL
+        // tidy and prevents `?cmin=0&dmax=` noise.
+        if (search.trim()) next.set("q", search)
+        else next.delete("q")
+        if (minConfPct > 0) next.set("cmin", String(minConfPct))
+        else next.delete("cmin")
+        if (maxDiff != null) next.set("dmax", String(maxDiff))
+        else next.delete("dmax")
+        if (matchTypes.size > 0) next.set("mt", Array.from(matchTypes).join(","))
+        else next.delete("mt")
+        if (sort !== "confidence_desc") next.set("sort", sort)
+        else next.delete("sort")
+        if (minDateScorePct > 0) next.set("dscmin", String(minDateScorePct))
+        else next.delete("dscmin")
+        if (minDescScorePct > 0) next.set("descmin", String(minDescScorePct))
+        else next.delete("descmin")
+        if (minAmountScorePct > 0) next.set("amin", String(minAmountScorePct))
+        else next.delete("amin")
+        if (maxDateDiffDays != null) next.set("ddmax", String(maxDateDiffDays))
+        else next.delete("ddmax")
+        return next
+      },
+      { replace: true },
+    )
+  }, [
+    search,
+    minConfPct,
+    maxDiff,
+    matchTypes,
+    sort,
+    minDateScorePct,
+    minDescScorePct,
+    minAmountScorePct,
+    maxDateDiffDays,
+    setSearchParams,
+  ])
 
   const toggleAccept = (key: string) => {
     setAccepted((prev) => {
@@ -863,8 +965,13 @@ function TaskSuggestionsView({ taskId }: { taskId: number }) {
         )}
       </div>
 
-      {/* Filters */}
-      <div className="card-elevated space-y-3 p-3">
+      {/* Filters — sticky so the operator can scroll a long list of
+          suggestions without losing the filter / sort / reset
+          controls. ``z-20`` keeps it above the suggestion cards
+          which sit at the default z-index. ``card-elevated`` already
+          paints an opaque background; if that ever changes, add
+          ``bg-background`` here to prevent bleed-through. */}
+      <div className="card-elevated sticky top-0 z-20 space-y-3 p-3">
         <div className="flex flex-wrap items-end gap-3">
           <div className="flex flex-col gap-0.5">
             <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
