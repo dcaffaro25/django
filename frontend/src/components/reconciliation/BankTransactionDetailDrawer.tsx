@@ -1,8 +1,6 @@
 import { useState } from "react"
 import { Drawer } from "vaul"
 import {
-  AlertCircle,
-  CheckCircle2,
   Clock,
   History,
   Info,
