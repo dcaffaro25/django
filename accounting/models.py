@@ -24,6 +24,7 @@ from pgvector.django import VectorField, HnswIndex
 from django.utils.dateparse import parse_date  # only needed if you keep saves without full_clean()
 
 from django.contrib.postgres.fields import ArrayField  # Postgres
+from django.contrib.postgres.indexes import GinIndex  # Postgres
 
 import re
 
@@ -228,11 +229,61 @@ class Account(TenantAwareBaseModel, MPTTModel):
     objects = TreeManager()
     
     account_description_embedding = VectorField(
-        dimensions=768, 
+        dimensions=768,
         help_text="Vector embeddings (embeddinggemma:300m) of the account content",
         null=True, blank=True)
 
-    
+    # ------------------------------------------------------------------
+    # Canonical taxonomy (Phase 1 of the CoA enrichment work).
+    #
+    # ``report_category`` -- one of 14 closed-enum values aligned to
+    # CPC 26 (Receita Bruta, Despesa Operacional, Ativo Circulante, ...).
+    # Nullable. Inherited via ``effective_category()`` walking up the
+    # parent chain (nearest tagged ancestor wins; self overrides).
+    # Operator tags at the level where the category is uniform across
+    # descendants -- usually level 1, but level 2 for mixed subtrees
+    # like Receita Operacional Líquida.
+    #
+    # ``tags`` -- ArrayField of zero-or-more closed-enum values
+    # (cash, debt, contra_account, ebitda_addback, ...). Cross-cutting
+    # markers that don't follow tree hierarchy. Inherited via
+    # ``effective_tags()`` as a UNION across ancestors -- a leaf with
+    # ``[contra_account]`` under a parent tagged ``[fixed_asset]``
+    # ends up with both, which is operationally correct.
+    #
+    # Choices come from ``accounting.services.taxonomy_meta`` so the
+    # reference data and the enum stay in sync. See that module for
+    # the definitions, examples, and operator-facing copy.
+    #
+    # Field-level deferred decisions (intentionally not adding now):
+    #   * ``report_role`` (fine-grained within-category) -- Phase 1.5
+    #     when first messy CoA tenant or cross-tenant analytics ships.
+    #   * ``sped_referencial_code`` -- defer until SPED export feature.
+    #   * ``ifrs_concept`` -- defer until XBRL/English export.
+    #   * ``enrichment_*`` audit fields -- defer with the AI pipeline.
+    from accounting.services.taxonomy_meta import (
+        REPORT_CATEGORY_CHOICES as _CAT_CHOICES,
+        TAG_CHOICES as _TAG_CHOICES,
+    )
+    report_category = models.CharField(
+        max_length=24, null=True, blank=True, db_index=True,
+        choices=_CAT_CHOICES,
+        help_text=(
+            "Coarse CPC 26 line-item category. Nullable; descendants "
+            "inherit via tree walk (nearest tagged ancestor wins)."
+        ),
+    )
+    tags = ArrayField(
+        models.CharField(max_length=48, choices=_TAG_CHOICES),
+        default=list, blank=True,
+        help_text=(
+            "Cross-cutting markers (cash, debt, contra_account, "
+            "ebitda_addback, ...). Closed enum; descendants inherit "
+            "as a UNION with this account's own tags."
+        ),
+    )
+
+
     class MPTTMeta:
         order_insertion_by = ['account_code']
 
@@ -247,6 +298,18 @@ class Account(TenantAwareBaseModel, MPTTModel):
                 opclasses=["vector_cosine_ops"],
             ),
             models.Index(fields=['company', 'erp_id']),
+            # GIN index on ``tags`` ArrayField. Lets ``WHERE tags @> ...``
+            # containment queries (the AccountsSelector branch for
+            # tag-based selection) hit an index instead of seq-scanning
+            # the tenant's chart. Becomes important once Phase 1.5
+            # templates start filtering by tags like ``cash`` /
+            # ``debt`` / ``ebitda_addback`` at calc-time.
+            GinIndex(fields=['tags'], name='acct_tags_gin'),
+            # Composite for category lookups within a tenant -- the
+            # standard report builders filter ``WHERE company=X AND
+            # report_category=Y``.
+            models.Index(fields=['company', 'report_category'],
+                         name='acct_company_category_idx'),
             ]
 
     def clean_fields(self, exclude=None):
