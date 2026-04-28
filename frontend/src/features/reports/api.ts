@@ -179,10 +179,14 @@ export const reportsApi = {
   // request still surfaces to the operator in a reasonable window.
   // For longer work we'll move to a Celery + poll pattern; see
   // ``accounting/reports/views.py::generate_template`` notes.
+  // Backend OpenAI client timeout is 200s (see
+  // ``ai_assistant.generate_template``); 40s headroom on top covers
+  // retries + response transit. Total stays under the 300s gunicorn
+  // budget on Railway so a truly hung request still surfaces.
   aiGenerateTemplate: (body: AiGenerateTemplateRequest) =>
     api.tenant.post<AiGenerateTemplateResponse>(
       "/api/reports/ai/generate-template/", body,
-      { timeout: 180_000 },
+      { timeout: 240_000 },
     ),
 
   aiRefine: (body: AiRefineRequest) =>

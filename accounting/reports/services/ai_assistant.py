@@ -664,7 +664,20 @@ def generate_template(
         effective_model = _resolve_openai_model(quality, explicit_model=None)
 
     try:
-        client = ExternalAIClient(provider=provider, model=effective_model)
+        # ``generate_template`` is the heaviest of our AI calls — the
+        # input prompt is ~4-5k tokens (the chart of accounts) and the
+        # output runs to several thousand tokens for a typical
+        # template. The default 120s ``ExternalAIClient`` timeout was
+        # tripping APITimeoutError on Evolat-sized charts (observed
+        # 131s on 2026-04-28). Bumping to 200s gives headroom while
+        # still staying inside the 300s gunicorn timeout. Output cap
+        # also tightened from 16k → 8k tokens — slim schema doesn't
+        # benefit from the extra ceiling and longer ceilings make tail
+        # latency worse.
+        client = ExternalAIClient(
+            provider=provider, model=effective_model,
+            timeout=200.0, max_tokens=8000,
+        )
     except Exception as exc:
         raise AiAssistantError(f"AI client init failed: {exc}") from exc
 
