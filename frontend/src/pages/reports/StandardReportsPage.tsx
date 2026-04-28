@@ -763,7 +763,11 @@ function KpiCard({
 }: {
   label: string
   value: number
-  currency: string
+  /** Required when ``format="currency"`` (the default); ignored for
+   *  ``format="int"``. We keep it optional so the int-mode card sites
+   *  (e.g. "Categorias movidas") don't have to thread a meaningless
+   *  currency code just to satisfy the type. */
+  currency?: string
   hint?: string
   accent?: boolean
   format?: "currency" | "int"
@@ -780,7 +784,7 @@ function KpiCard({
       </div>
       <div className="text-[20px] font-semibold tabular-nums">
         {format === "currency"
-          ? formatCurrency(value, currency)
+          ? formatCurrency(value, currency ?? "BRL")
           : value.toLocaleString("pt-BR")}
       </div>
       {hint && (
