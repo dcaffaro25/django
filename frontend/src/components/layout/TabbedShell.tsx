@@ -1,4 +1,4 @@
-import { NavLink } from "react-router-dom"
+import { NavLink, useLocation } from "react-router-dom"
 import type { LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 
@@ -40,6 +40,12 @@ export function TabbedShell({
   tabs: TabDef[]
   children: React.ReactNode
 }) {
+  // Preserve the URL search string when navigating between tabs.
+  // Several hubs use ``?param=…`` as shared state across tabs (e.g.
+  // ``/reports?include_pending=1`` toggles a flag every tab consumes
+  // via ``useSearchParams``). Without this, NavLink emits a location
+  // with empty ``search`` and the flag is lost on click.
+  const { search } = useLocation()
   return (
     <div className="flex h-full flex-col">
       {(title || subtitle || actions) && (
@@ -63,7 +69,7 @@ export function TabbedShell({
           return (
             <NavLink
               key={tab.to}
-              to={tab.to}
+              to={{ pathname: tab.to, search }}
               end={tab.end}
               className={({ isActive }) =>
                 cn(

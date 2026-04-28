@@ -1,5 +1,5 @@
 import { useMemo } from "react"
-import { Link, Outlet } from "react-router-dom"
+import { Link, Outlet, useSearchParams } from "react-router-dom"
 import { FileBarChart, Sparkles, Wallet, Receipt, FileText, ListChecks } from "lucide-react"
 import { TabbedShell } from "@/components/layout/TabbedShell"
 import { useAccounts } from "@/features/reconciliation"
@@ -8,6 +8,17 @@ import {
 } from "@/features/reconciliation/taxonomy_labels"
 import { cn, formatCurrency } from "@/lib/utils"
 import type { AccountLite } from "@/features/reconciliation/types"
+
+/** Read the ``?include_pending=1`` switch from the URL so every tab
+ *  shares the same value without prop drilling. The flag flows into
+ *  ``useAccounts({ include_pending })`` and from there to the
+ *  ``/api/accounts/?include_pending=1`` query, which makes the
+ *  backend add ``own_pending_delta`` to ``current_balance``. */
+function useIncludePendingFromUrl(): boolean {
+  const [params] = useSearchParams()
+  const v = (params.get("include_pending") ?? "").toLowerCase()
+  return v === "1" || v === "true" || v === "yes"
+}
 
 /**
  * The Demonstrativos hub: tabbed shell with the four standard
@@ -21,11 +32,43 @@ import type { AccountLite } from "@/features/reconciliation/types"
  * once the accounts list is in cache.
  */
 export function StandardReportsPage() {
+  const [params, setParams] = useSearchParams()
+  const includePending = useIncludePendingFromUrl()
+
+  const toggle = () => {
+    const next = new URLSearchParams(params)
+    if (includePending) {
+      next.delete("include_pending")
+    } else {
+      next.set("include_pending", "1")
+    }
+    setParams(next, { replace: true })
+  }
+
   return (
     <div className="h-full p-4">
       <TabbedShell
         title="Demonstrativos"
         subtitle="DRE · Balanço · DFC · Modelos personalizados"
+        actions={
+          <label
+            className={cn(
+              "inline-flex cursor-pointer select-none items-center gap-2 rounded-md border border-border px-2.5 py-1 text-[11px] transition-colors",
+              includePending
+                ? "border-primary/40 bg-primary/10 text-primary"
+                : "bg-surface-2 text-muted-foreground hover:text-foreground",
+            )}
+            title="Inclui lançamentos em estado 'pending' no saldo de cada conta. Útil para tenants cujos JEs ainda não foram contabilizados (posted)."
+          >
+            <input
+              type="checkbox"
+              className="h-3 w-3 cursor-pointer accent-primary"
+              checked={includePending}
+              onChange={toggle}
+            />
+            Incluir pendentes
+          </label>
+        }
         tabs={[
           { to: "/reports", end: true, label: "DRE", icon: FileBarChart },
           { to: "/reports/balanco", label: "Balanço Patrimonial", icon: Wallet },
@@ -145,7 +188,8 @@ function NotEnoughDataNotice() {
 // ---------------------------------------------------------------------
 
 export function DreTab() {
-  const { data: accounts = [], isLoading } = useAccounts()
+  const includePending = useIncludePendingFromUrl()
+  const { data: accounts = [], isLoading } = useAccounts({ include_pending: includePending })
   const cats = useMemo(() => summariseByCategory(accounts), [accounts])
   const currency = accounts[0]?.currency?.code ?? "BRL"
 
@@ -201,7 +245,8 @@ export function DreTab() {
 // ---------------------------------------------------------------------
 
 export function BalancoTab() {
-  const { data: accounts = [], isLoading } = useAccounts()
+  const includePending = useIncludePendingFromUrl()
+  const { data: accounts = [], isLoading } = useAccounts({ include_pending: includePending })
   const cats = useMemo(() => summariseByCategory(accounts), [accounts])
   const currency = accounts[0]?.currency?.code ?? "BRL"
   if (isLoading) return <StatementSkeleton />
@@ -260,7 +305,8 @@ export function BalancoTab() {
 // ---------------------------------------------------------------------
 
 export function DfcTab() {
-  const { data: accounts = [], isLoading } = useAccounts()
+  const includePending = useIncludePendingFromUrl()
+  const { data: accounts = [], isLoading } = useAccounts({ include_pending: includePending })
   if (isLoading) return <StatementSkeleton />
 
   // Cash subset: leaves with tag "cash" or "restricted_cash" inherited.

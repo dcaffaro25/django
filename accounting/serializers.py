@@ -260,8 +260,11 @@ class AccountSerializer(serializers.ModelSerializer):
     # eliminated. Non-leaf rows naturally come out as
     # ``balance + 0 = 0`` here; the frontend rolls up subtree totals
     # via the tree (see ChartOfAccountsPage's ``computeRollups``).
-    # Single-row reads (no context) get just the anchor balance --
-    # acceptable as a fallback because that path isn't hot.
+    #
+    # When ``include_pending`` is True in context, also adds
+    # ``own_pending_delta`` -- caller opted in via
+    # ``?include_pending=1`` on the list endpoint. Default stays
+    # posted-only so legacy callers don't change behaviour.
     def get_current_balance(self, obj):
         from decimal import Decimal
         try:
@@ -276,7 +279,14 @@ class AccountSerializer(serializers.ModelSerializer):
             posted = Decimal(bucket.get('own_posted_delta') or '0')
         except Exception:
             posted = Decimal('0')
-        return str(anchor + posted)
+        include_pending = bool((self.context or {}).get('include_pending'))
+        pending = Decimal('0')
+        if include_pending:
+            try:
+                pending = Decimal(bucket.get('own_pending_delta') or '0')
+            except Exception:
+                pending = Decimal('0')
+        return str(anchor + posted + pending)
 
     
 

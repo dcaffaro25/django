@@ -344,16 +344,31 @@ export const reconApi = {
     api.tenant.patch<import("./types").Entity>(`/api/entities/${id}/`, body),
   deleteEntity: (id: number) => api.tenant.delete<void>(`/api/entities/${id}/`),
 
-  listAccounts: (params?: { is_active?: boolean }) =>
+  listAccounts: (params?: { is_active?: boolean; include_pending?: boolean }) =>
     api.tenant
       // The Phase 1 N+1 fix didn't fully eliminate FlexibleRelatedField
       // per-row queries; on prod-DB-latency this still takes 60-90s
       // for tenants with 10k+ JEs. Bump for this endpoint specifically
       // until the next perf pass (FlexibleRelatedField bypass, denorm
       // cache, or async/Celery materialisation).
+      //
+      // ``include_pending=1`` opts in to ``current_balance`` including
+      // pending JEs (state='pending'). Default is posted-only. Tenants
+      // like Evolat whose JEs are entirely pending need this flag to
+      // see non-zero values in the DRE / Balanço.
       .get<import("./types").AccountLite[] | { results: import("./types").AccountLite[] }>(
         "/api/accounts/",
-        { params, timeout: 240_000 },
+        {
+          params: {
+            ...(params ?? {}),
+            // Coerce boolean → "1"/"0" so the backend's truthy-string
+            // check (``in {"1","true","yes",...}``) matches.
+            ...(params?.include_pending != null
+              ? { include_pending: params.include_pending ? "1" : "0" }
+              : {}),
+          },
+          timeout: 240_000,
+        },
       )
       .then(unwrapList<import("./types").AccountLite>),
 

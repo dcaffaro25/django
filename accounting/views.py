@@ -577,6 +577,18 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             # missing as 0.
             delta_map = {}
         ctx['account_delta_map'] = delta_map
+
+        # ``?include_pending=1`` opt-in: when set, ``current_balance``
+        # adds ``own_pending_delta`` on top of ``balance + own_posted_delta``.
+        # Useful for tenants like Evolat where most transactions are in
+        # ``state='pending'`` (no formal post step yet) -- without this
+        # the DRE / Balanço come back as zeros even though the JEs are
+        # in the books.
+        try:
+            raw = (self.request.query_params or {}).get('include_pending', '')
+            ctx['include_pending'] = (raw or '').strip().lower() in ('1', 'true', 'yes', 't', 'y')
+        except Exception:
+            ctx['include_pending'] = False
         return ctx
 
     @action(methods=['post'], detail=False)
