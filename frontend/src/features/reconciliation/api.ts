@@ -346,7 +346,15 @@ export const reconApi = {
 
   listAccounts: (params?: { is_active?: boolean }) =>
     api.tenant
-      .get<import("./types").AccountLite[] | { results: import("./types").AccountLite[] }>("/api/accounts/", { params })
+      // The Phase 1 N+1 fix didn't fully eliminate FlexibleRelatedField
+      // per-row queries; on prod-DB-latency this still takes 60-90s
+      // for tenants with 10k+ JEs. Bump for this endpoint specifically
+      // until the next perf pass (FlexibleRelatedField bypass, denorm
+      // cache, or async/Celery materialisation).
+      .get<import("./types").AccountLite[] | { results: import("./types").AccountLite[] }>(
+        "/api/accounts/",
+        { params, timeout: 240_000 },
+      )
       .then(unwrapList<import("./types").AccountLite>),
 
   createAccount: (body: Partial<import("./types").AccountLite> & { company?: number; parent?: number | null }) =>

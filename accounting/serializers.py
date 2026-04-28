@@ -194,17 +194,6 @@ class AccountSerializer(serializers.ModelSerializer):
     def get_path_ids(self, obj):
         return self._path_entry(obj)["path_ids"]
 
-    # ------------------------------------------------------------------
-    # Bulk current_balance via annotation
-    # ------------------------------------------------------------------
-    def get_current_balance(self, obj):
-        """Read the queryset-annotated column when present; fall back
-        to the (slow) per-row aggregation when not."""
-        annotated = getattr(obj, 'annotated_current_balance', None)
-        if annotated is not None:
-            return annotated
-        return obj.get_current_balance()
-
     def to_representation(self, instance):
         data = super().to_representation(instance)
         # Keep this override for backwards compat -- some callers relied
@@ -216,38 +205,78 @@ class AccountSerializer(serializers.ModelSerializer):
     # ------------------------------------------------------------------
     # MPTT-walked taxonomy
     # ------------------------------------------------------------------
+    # ``account_taxonomy_map`` from context carries pre-computed
+    # ``{effective_category, effective_tags}`` per account so we never
+    # walk ``obj.parent.parent...`` via ORM lazy loads (each level
+    # would trigger a DB roundtrip; ``select_related('parent')`` only
+    # caches ONE level). Without the map we fall back to the live
+    # walk -- only fires for ad-hoc single-row reads where the cost
+    # is negligible.
     def get_effective_category(self, obj):
+        m = (self.context or {}).get('account_taxonomy_map') or {}
+        bucket = m.get(obj.id)
+        if bucket is not None:
+            return bucket.get('effective_category')
         from accounting.services.taxonomy_resolver import effective_category
-        # Use the cached path map's parent chain when available to avoid
-        # re-fetching parents lazily. The resolver itself walks via
-        # ``node.parent``; when the queryset used select_related('parent')
-        # those FKs are already in memory and the walk is in-Python.
         return effective_category(obj)
 
     def get_effective_tags(self, obj):
+        m = (self.context or {}).get('account_taxonomy_map') or {}
+        bucket = m.get(obj.id)
+        if bucket is not None:
+            return bucket.get('effective_tags', [])
         from accounting.services.taxonomy_resolver import effective_tags
         return effective_tags(obj)
 
     # ------------------------------------------------------------------
     # JE-derived deltas
     # ------------------------------------------------------------------
-    # All three return strings (Decimal-as-str) when annotated by the
-    # viewset; fall back to "0" when the queryset wasn't annotated
-    # (single-row reads, ad-hoc callers). Frontend treats missing as 0.
-    def _annotated_decimal(self, obj, attr):
-        v = getattr(obj, attr, None)
-        if v is None:
+    # Read from the ``account_delta_map`` the viewset attaches via
+    # ``get_serializer_context``. The single bulk-query approach is
+    # massively faster than the per-row Subqueries we tried first,
+    # but means single-row callers (no viewset context) get "0" for
+    # all three deltas. Acceptable -- the data only matters in the
+    # list view.
+    def _delta(self, obj, key):
+        m = (self.context or {}).get('account_delta_map') or {}
+        bucket = m.get(obj.id)
+        if not bucket:
             return "0"
-        return str(v)
+        return bucket.get(key, "0")
 
     def get_own_posted_delta(self, obj):
-        return self._annotated_decimal(obj, 'own_posted_delta')
+        return self._delta(obj, 'own_posted_delta')
 
     def get_own_pending_delta(self, obj):
-        return self._annotated_decimal(obj, 'own_pending_delta')
+        return self._delta(obj, 'own_pending_delta')
 
     def get_own_unreconciled_delta(self, obj):
-        return self._annotated_decimal(obj, 'own_unreconciled_delta')
+        return self._delta(obj, 'own_unreconciled_delta')
+
+    # Compute ``current_balance`` from the bulk-loaded delta map +
+    # the account's own anchor. Critical: we never fall back to
+    # ``obj.get_current_balance()`` because that recurses through
+    # ``get_children()`` and reintroduces the per-row N+1 we just
+    # eliminated. Non-leaf rows naturally come out as
+    # ``balance + 0 = 0`` here; the frontend rolls up subtree totals
+    # via the tree (see ChartOfAccountsPage's ``computeRollups``).
+    # Single-row reads (no context) get just the anchor balance --
+    # acceptable as a fallback because that path isn't hot.
+    def get_current_balance(self, obj):
+        from decimal import Decimal
+        try:
+            anchor = Decimal(str(obj.balance or '0'))
+        except Exception:
+            anchor = Decimal('0')
+        m = (self.context or {}).get('account_delta_map') or {}
+        bucket = m.get(obj.id)
+        if not bucket:
+            return str(anchor)
+        try:
+            posted = Decimal(bucket.get('own_posted_delta') or '0')
+        except Exception:
+            posted = Decimal('0')
+        return str(anchor + posted)
 
     
 

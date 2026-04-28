@@ -281,6 +281,63 @@ class CostCenterViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return generic_bulk_delete(self, ids)
 
 
+def _build_account_taxonomy_map(rows):
+    """Pre-compute ``{id: {effective_category, effective_tags}}`` from
+    raw ``(id, parent_id, report_category, tags)`` rows.
+
+    Replaces the per-row ``effective_category(obj)`` / ``effective_tags(obj)``
+    walks the serializer was doing -- those iterate
+    ``obj.parent.parent.parent...`` via the ORM, and only the FIRST
+    parent is in memory thanks to ``select_related``. Every subsequent
+    level triggers a lazy DB fetch -- empirically ~4.5 queries per
+    account on Evolat (depth 5), totalling 1500+ queries on a 356-row
+    list. Walking the parent_id chain in pure Python over the
+    pre-loaded rows avoids this entirely.
+    """
+    by_id = {r['id']: r for r in rows}
+
+    cat_cache: dict[int, str | None] = {}
+    tag_cache: dict[int, list[str]] = {}
+
+    def walk_category(aid):
+        if aid in cat_cache:
+            return cat_cache[aid]
+        node = by_id.get(aid)
+        seen: set[int] = set()
+        cat: str | None = None
+        while node is not None and node['id'] not in seen:
+            seen.add(node['id'])
+            if node.get('report_category'):
+                cat = node['report_category']
+                break
+            node = by_id.get(node.get('parent_id'))
+        cat_cache[aid] = cat
+        return cat
+
+    def walk_tags(aid):
+        if aid in tag_cache:
+            return tag_cache[aid]
+        node = by_id.get(aid)
+        seen: set[int] = set()
+        accumulated: set[str] = set()
+        while node is not None and node['id'] not in seen:
+            seen.add(node['id'])
+            for t in node.get('tags') or []:
+                accumulated.add(t)
+            node = by_id.get(node.get('parent_id'))
+        result = sorted(accumulated)
+        tag_cache[aid] = result
+        return result
+
+    return {
+        aid: {
+            'effective_category': walk_category(aid),
+            'effective_tags': walk_tags(aid),
+        }
+        for aid in by_id.keys()
+    }
+
+
 def _build_account_path_map(rows):
     """Build ``{account_id -> {path, path_ids, level}}`` from a flat
     list of ``{'id', 'name', 'parent_id'}`` dicts.
@@ -360,108 +417,31 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        from django.db.models import DecimalField, F, OuterRef, Subquery, Sum, Value
+        # The N+1-killing Subquery annotations from Phase 1 turned out
+        # to be too slow on prod-DB-latency tenants -- 4 nested
+        # aggregating Subqueries × 356 outer rows = thousands of
+        # round-trips, hitting the 180s axios ceiling. The bulk
+        # delta computation now happens once in
+        # ``get_serializer_context`` (single GROUP BY across all
+        # JEs in the tenant) and is passed to the serializer via
+        # context.
+        #
+        # ``defer('account_description_embedding')`` is critical for
+        # speed: the 768-dim pgvector column transfers ~3MB per list
+        # request that the serializer never reads. With it loaded by
+        # default, Evolat's 356-account list took ~15 seconds JUST
+        # for the SQL hydration. Deferred, it drops to <500ms.
+        return (
+            super().get_queryset()
+            .select_related('parent', 'currency', 'bank_account', 'company')
+            .defer('account_description_embedding')
+        )
+
+    def get_serializer_context(self):
+        from django.db.models import Case, DecimalField, F, Q, Sum, Value, When
         from django.db.models.functions import Coalesce
         from decimal import Decimal
 
-        qs = super().get_queryset().select_related(
-            'parent', 'currency', 'bank_account', 'company',
-        )
-
-        # Account balances roll up THREE separate Journal-Entry-based
-        # deltas, mirroring ``Account.get_current_balance`` /
-        # ``Account.calculate_balance`` semantics but pushed into a
-        # single SQL plan instead of per-row aggregations.
-        #
-        # Each ``own_*_delta`` is the contribution from JEs posted
-        # DIRECTLY to this account (regardless of whether the account
-        # is a leaf -- non-leaves typically have no direct JEs and
-        # the delta is 0). The frontend rolls up the values through
-        # the MPTT tree by summing children + own values. This is
-        # cleaner than trying to express subtree aggregation in a
-        # single Subquery.
-        #
-        # Three deltas:
-        #   1. ``own_posted_delta`` -- cumulative effect of POSTED JEs
-        #      after the account's balance anchor (validated balance is
-        #      already reflected in ``F('balance')``). Same filter as
-        #      legacy ``get_current_balance`` for leaves.
-        #   2. ``own_pending_delta`` -- effect of JEs whose Transaction
-        #      is in ``state='pending'``. Shows what the balance WILL be
-        #      once those entries are posted.
-        #   3. ``own_unreconciled_delta`` -- effect of JEs that are
-        #      not yet reconciled. Useful for the operator to see how
-        #      much of the current balance is still in flight.
-        #
-        # The ``account_direction`` multiplier converts a raw
-        # debit-positive Postgres SUM into the natural sign for the
-        # account's role (-1 for credit-natural, +1 for debit-natural).
-        def _je_delta_subquery(filter_kwargs):
-            # NULL-safe: ``debit_amount`` and ``credit_amount`` are
-            # nullable on JournalEntry (a credit-only entry has
-            # ``debit_amount=NULL``, vice versa). ``NULL - X`` is NULL
-            # in SQL, which would zero out the entire sum. Coalesce
-            # each operand to 0 before subtracting.
-            zero = Value(
-                Decimal('0'),
-                output_field=DecimalField(max_digits=14, decimal_places=2),
-            )
-            qs_inner = (
-                JournalEntry.objects
-                .filter(account=OuterRef('id'), **filter_kwargs)
-                .values('account')
-                .annotate(net=Sum(
-                    Coalesce(F('debit_amount'), zero)
-                    - Coalesce(F('credit_amount'), zero)
-                ))
-                .values('net')[:1]
-            )
-            return Subquery(
-                qs_inner,
-                output_field=DecimalField(max_digits=14, decimal_places=2),
-            )
-
-        zero_dec = Value(
-            Decimal('0'),
-            output_field=DecimalField(max_digits=14, decimal_places=2),
-        )
-
-        qs = qs.annotate(
-            own_posted_delta=Coalesce(
-                _je_delta_subquery(dict(
-                    transaction__date__gt=OuterRef('balance_date'),
-                    transaction__state='posted',
-                    transaction__balance_validated=False,
-                )) * F('account_direction'),
-                zero_dec,
-            ),
-            own_pending_delta=Coalesce(
-                _je_delta_subquery(dict(
-                    transaction__state='pending',
-                )) * F('account_direction'),
-                zero_dec,
-            ),
-            own_unreconciled_delta=Coalesce(
-                _je_delta_subquery(dict(
-                    is_reconciled=False,
-                )) * F('account_direction'),
-                zero_dec,
-            ),
-        )
-
-        # ``annotated_current_balance`` was added in Phase 1 but with a
-        # BankTransaction-based formula; that turned out to miss the
-        # JE-based delta the legacy ``get_current_balance`` always
-        # used, leaving non-bank-account leaves showing stale anchor
-        # balances. Rebuild it as ``balance + own_posted_delta`` so
-        # legacy semantics are restored AND the new fields stay
-        # consistent.
-        qs = qs.annotate(
-            annotated_current_balance=F('balance') + F('own_posted_delta'),
-        )
-        return qs
-
-    def get_serializer_context(self):
         ctx = super().get_serializer_context()
         # Build the path map from a single bulk query of the queryset
         # we're actually about to serialise. ``self.filter_queryset(...)``
@@ -478,7 +458,7 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             rows = list(
                 Account.objects
                 .filter(**company_filter)
-                .values('id', 'name', 'parent_id')
+                .values('id', 'name', 'parent_id', 'balance_date', 'account_direction')
             )
         except Exception:
             # Defensive: if anything goes wrong building the map, fall
@@ -486,6 +466,117 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             # break a CoA read because the optimisation failed.
             rows = []
         ctx['account_path_map'] = _build_account_path_map(rows)
+        # Pre-compute effective_category + effective_tags from the
+        # raw rows (id, parent_id, report_category, tags) so the
+        # serializer never has to walk ``obj.parent.parent.parent...``
+        # via lazy ORM fetches. The ``select_related('parent')`` on
+        # the queryset only caches ONE level of parent; walking the
+        # full chain previously triggered lazy loads at every level
+        # × every account = thousands of round-trips. Single Python
+        # walk over the in-memory rows fixes it.
+        try:
+            tax_rows = list(
+                Account.objects
+                .filter(**company_filter)
+                .values('id', 'parent_id', 'report_category', 'tags')
+            )
+            ctx['account_taxonomy_map'] = _build_account_taxonomy_map(tax_rows)
+        except Exception:
+            ctx['account_taxonomy_map'] = {}
+
+        # JE-derived deltas: ONE bulk query (single GROUP BY across all
+        # JEs in the tenant) instead of N nested Subqueries per row.
+        # The previous Subquery approach hit the axios 180s ceiling on
+        # prod-DB latency for tenants with 10k+ JEs (4 nested subqueries
+        # × 356 outer rows = thousands of cross-region round-trips).
+        # Single aggregation reduces to one query plan; results
+        # attached to the serializer context as a per-account dict.
+        delta_map: dict[int, dict] = {}
+        try:
+            zero = Value(
+                Decimal('0'),
+                output_field=DecimalField(max_digits=14, decimal_places=2),
+            )
+            # Per-account direction is needed to sign-correct the
+            # delta; pull from the path-map rows we already loaded.
+            direction_by_id = {r['id']: r['account_direction'] for r in rows}
+            balance_date_by_id = {r['id']: r['balance_date'] for r in rows}
+
+            # ``debit - credit`` per JE, NULL-safe.
+            net_expr = (
+                Coalesce(F('debit_amount'), zero)
+                - Coalesce(F('credit_amount'), zero)
+            )
+
+            account_ids = list(direction_by_id.keys())
+            if account_ids:
+                # ``Q(account_id__in=...)`` plus per-account date
+                # filtering for the posted bucket means we can't
+                # easily push the date check into a single Sum. We
+                # instead pull two grouped sums (pending + unrec)
+                # in one query and the per-account-date posted in a
+                # second; both are constant-many queries (2 total),
+                # which is fine.
+                #
+                # Pending + unreconciled: same date scope (no anchor
+                # filter), one bulk GROUP BY.
+                rows_pending_unrec = (
+                    JournalEntry.objects
+                    .filter(account_id__in=account_ids)
+                    .values('account_id')
+                    .annotate(
+                        pending_net=Sum(net_expr, filter=Q(transaction__state='pending')),
+                        unrec_net=Sum(net_expr, filter=Q(is_reconciled=False)),
+                    )
+                )
+                for r in rows_pending_unrec:
+                    aid = r['account_id']
+                    direction = direction_by_id.get(aid) or 1
+                    delta_map[aid] = {
+                        'own_pending_delta': str((r['pending_net'] or Decimal('0')) * direction),
+                        'own_unreconciled_delta': str((r['unrec_net'] or Decimal('0')) * direction),
+                        'own_posted_delta': '0',
+                    }
+
+                # Posted: needs per-account ``date > balance_date``.
+                # Keep this as a filtered aggregate using OuterRef
+                # only when truly needed; for now we do it per-account
+                # by grouping JEs by (account_id, t.date >
+                # balance_date) using a CASE. Postgres handles this
+                # well in one GROUP BY.
+                rows_posted = (
+                    JournalEntry.objects
+                    .filter(
+                        account_id__in=account_ids,
+                        transaction__state='posted',
+                        transaction__balance_validated=False,
+                    )
+                    .values('account_id', 'transaction__date')
+                    .annotate(net=Sum(net_expr))
+                )
+                # Group by account, keep only entries where date > anchor.
+                posted_per_acc: dict[int, Decimal] = {}
+                for r in rows_posted:
+                    aid = r['account_id']
+                    txn_date = r['transaction__date']
+                    anchor = balance_date_by_id.get(aid)
+                    if anchor is None or txn_date is None or txn_date <= anchor:
+                        continue
+                    posted_per_acc[aid] = posted_per_acc.get(aid, Decimal('0')) + (r['net'] or Decimal('0'))
+                for aid, net in posted_per_acc.items():
+                    direction = direction_by_id.get(aid) or 1
+                    bucket = delta_map.setdefault(aid, {
+                        'own_pending_delta': '0',
+                        'own_unreconciled_delta': '0',
+                        'own_posted_delta': '0',
+                    })
+                    bucket['own_posted_delta'] = str(net * direction)
+        except Exception:
+            # Same defensive policy as above -- never fail a CoA read
+            # because the delta build hit a snag. Frontend treats
+            # missing as 0.
+            delta_map = {}
+        ctx['account_delta_map'] = delta_map
         return ctx
 
     @action(methods=['post'], detail=False)
