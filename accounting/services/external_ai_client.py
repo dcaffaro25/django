@@ -63,7 +63,11 @@ class ExternalAIClient:
         temperature : float
             Temperature for generation (lower = more deterministic).
         """
-        self.provider = provider.lower()
+        # ``provider`` defaults to ``PROVIDER_OPENAI`` but callers
+        # commonly pass through a ``body.get("provider")`` value that
+        # may be ``None``. ``None.lower()`` would crash, so coerce
+        # falsy values back to the default before normalising case.
+        self.provider = (provider or self.PROVIDER_OPENAI).lower()
         self.timeout = timeout
         self.max_tokens = max_tokens
         self.temperature = temperature

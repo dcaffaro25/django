@@ -664,19 +664,24 @@ def generate_template(
         effective_model = _resolve_openai_model(quality, explicit_model=None)
 
     try:
-        # ``generate_template`` is the heaviest of our AI calls — the
-        # input prompt is ~4-5k tokens (the chart of accounts) and the
-        # output runs to several thousand tokens for a typical
+        # ``generate_template`` is the heaviest of our AI calls -- the
+        # input prompt is ~4-5k tokens (the chart of accounts) and
+        # the output runs to several thousand tokens for a typical
         # template. The default 120s ``ExternalAIClient`` timeout was
-        # tripping APITimeoutError on Evolat-sized charts (observed
-        # 131s on 2026-04-28). Bumping to 200s gives headroom while
-        # still staying inside the 300s gunicorn timeout. Output cap
-        # also tightened from 16k → 8k tokens — slim schema doesn't
-        # benefit from the extra ceiling and longer ceilings make tail
-        # latency worse.
+        # tripping ``APITimeoutError`` on Evolat-sized charts
+        # (observed 131s on 2026-04-28). Bumping to 200s gives
+        # headroom while staying inside the 300s gunicorn budget.
+        #
+        # ``max_tokens`` stays at the SDK ceiling (16k) -- a 8k cap
+        # truncated mid-output on Evolat once the new prompt let the
+        # AI emit ``account_ids`` arrays alongside ``path_contains``,
+        # producing "Invalid JSON in AI response" because the slim
+        # schema's strict JSON wasn't closed properly. The actual
+        # observed completion size is ~3-5k tokens; 16k is just a
+        # ceiling so a particularly chatty run doesn't get clipped.
         client = ExternalAIClient(
             provider=provider, model=effective_model,
-            timeout=200.0, max_tokens=8000,
+            timeout=200.0,
         )
     except Exception as exc:
         raise AiAssistantError(f"AI client init failed: {exc}") from exc
