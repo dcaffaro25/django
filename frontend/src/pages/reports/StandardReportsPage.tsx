@@ -1,6 +1,6 @@
-import { useMemo } from "react"
+import { useMemo, useEffect, useRef, useState } from "react"
 import { Link, Outlet, useSearchParams } from "react-router-dom"
-import { FileBarChart, Sparkles, Wallet, Receipt, FileText, ListChecks } from "lucide-react"
+import { FileBarChart, Sparkles, Wallet, Receipt, FileText, ListChecks, ChevronLeft, ChevronRight, ChevronDown } from "lucide-react"
 import { TabbedShell } from "@/components/layout/TabbedShell"
 import { useAccounts, useEntities } from "@/features/reconciliation"
 import {
@@ -61,10 +61,11 @@ export function StandardReportsPage() {
     setParams(next, { replace: true })
   }
 
-  // Shortcut presets — months Jan..Dec, quarters T1..T4, full year.
   // Year is inferred from the currently-selected ``date_to`` (or
-  // today). Lets ops switch between 2024 / 2025 by just changing
-  // ``date_to``'s year and clicking a chip.
+  // today) so the stepper / quarter chips / month menu all operate
+  // on the same year context. Switching year preserves the period
+  // type (year → year, quarter → same quarter previous/next year,
+  // month → same month previous/next year).
   const yearAnchor = (() => {
     const ref = date_to || date_from
     if (ref) {
@@ -76,31 +77,69 @@ export function StandardReportsPage() {
   const iso = (y: number, m: number, d: number) =>
     `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`
   const monthEnd = (y: number, m: number) => new Date(y, m, 0).getDate()
-  const monthChips = Array.from({ length: 12 }, (_, i) => {
-    const m = i + 1
-    const from = iso(yearAnchor, m, 1)
-    const to = iso(yearAnchor, m, monthEnd(yearAnchor, m))
-    return {
-      label: ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"][i],
-      from, to,
+  const MONTH_ABBR = ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"]
+
+  // Detect what kind of period the active range represents. Drives
+  // the active-state highlight on each control AND makes the year
+  // arrows preserve period type ("Q1 2026 → ◀ → Q1 2025") instead
+  // of always collapsing to "full year".
+  const period: "year" | "quarter" | "month" | "custom" | null = (() => {
+    if (!date_from || !date_to) return null
+    const [fy, fm, fd] = date_from.split("-").map(Number)
+    const [ty, tm, td] = date_to.split("-").map(Number)
+    if (fy !== ty) return "custom"
+    if (fm === 1 && fd === 1 && tm === 12 && td === 31) return "year"
+    for (let q = 1; q <= 4; q++) {
+      const sm = (q - 1) * 3 + 1
+      const em = sm + 2
+      if (fm === sm && fd === 1 && tm === em && td === monthEnd(fy, em)) return "quarter"
     }
-  })
-  const quarterChips = [1,2,3,4].map((q) => {
-    const startMonth = (q - 1) * 3 + 1
-    const endMonth = startMonth + 2
-    return {
-      label: `T${q}`,
-      from: iso(yearAnchor, startMonth, 1),
-      to: iso(yearAnchor, endMonth, monthEnd(yearAnchor, endMonth)),
-    }
-  })
-  const yearChip = {
-    label: String(yearAnchor),
-    from: iso(yearAnchor, 1, 1),
-    to: iso(yearAnchor, 12, 31),
+    if (fm === tm && fd === 1 && td === monthEnd(fy, fm)) return "month"
+    return "custom"
+  })()
+  const activeQuarter =
+    period === "quarter" && date_from
+      ? Math.floor((Number(date_from.slice(5, 7)) - 1) / 3) + 1
+      : null
+  const activeMonth =
+    period === "month" && date_from ? Number(date_from.slice(5, 7)) : null
+
+  const setYearRange = (y: number) =>
+    setDateRange(iso(y, 1, 1), iso(y, 12, 31))
+  const setQuarterRange = (y: number, q: number) => {
+    const sm = (q - 1) * 3 + 1
+    const em = sm + 2
+    setDateRange(iso(y, sm, 1), iso(y, em, monthEnd(y, em)))
   }
-  const isActive = (from: string, to: string) =>
-    date_from === from && date_to === to
+  const setMonthRange = (y: number, m: number) =>
+    setDateRange(iso(y, m, 1), iso(y, m, monthEnd(y, m)))
+
+  const shiftYear = (delta: number) => {
+    const ny = yearAnchor + delta
+    if (period === "quarter" && activeQuarter) setQuarterRange(ny, activeQuarter)
+    else if (period === "month" && activeMonth) setMonthRange(ny, activeMonth)
+    else setYearRange(ny)
+  }
+
+  // Month menu — controlled popover. Clicking outside or pressing
+  // Escape closes it; selecting a month closes it as a side effect.
+  const [monthMenuOpen, setMonthMenuOpen] = useState(false)
+  const monthMenuRef = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    if (!monthMenuOpen) return
+    const onDoc = (e: MouseEvent) => {
+      if (!monthMenuRef.current?.contains(e.target as Node)) setMonthMenuOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMonthMenuOpen(false)
+    }
+    document.addEventListener("mousedown", onDoc)
+    document.addEventListener("keydown", onKey)
+    return () => {
+      document.removeEventListener("mousedown", onDoc)
+      document.removeEventListener("keydown", onKey)
+    }
+  }, [monthMenuOpen])
 
   return (
     <div className="h-full p-4">
@@ -110,57 +149,110 @@ export function StandardReportsPage() {
         actions={
           <div className="flex flex-col items-end gap-1.5">
             <div className="flex flex-wrap items-center gap-1">
-              {/* Quick presets — month/quarter/year for the year
-                  inferred from the active range (defaults to current
-                  calendar year). Clicking a chip sets both date_from
-                  and date_to atomically. */}
-              <button
-                type="button"
-                onClick={() => setDateRange(yearChip.from, yearChip.to)}
-                className={cn(
-                  "h-6 rounded-md border px-2 text-[10px] font-medium transition-colors",
-                  isActive(yearChip.from, yearChip.to)
-                    ? "border-primary/40 bg-primary/10 text-primary"
-                    : "border-border bg-surface-2 text-muted-foreground hover:text-foreground",
-                )}
-                title={`Ano todo de ${yearChip.label}`}
-              >
-                {yearChip.label}
-              </button>
-              <span className="mx-1 h-4 w-px bg-border" />
-              {quarterChips.map((q) => (
+              {/* Year stepper: ◀ 2026 ▶. Arrows shift the year while
+                  preserving period type — Q1 2026 → ◀ → Q1 2025.
+                  Clicking the year text itself selects the full year. */}
+              <div className="flex h-6 items-stretch overflow-hidden rounded-md border border-border bg-surface-2 text-[10px]">
                 <button
-                  key={q.label}
                   type="button"
-                  onClick={() => setDateRange(q.from, q.to)}
+                  onClick={() => shiftYear(-1)}
+                  className="grid w-6 place-items-center text-muted-foreground hover:bg-accent/40 hover:text-foreground"
+                  title={`Ano anterior (${yearAnchor - 1})`}
+                  aria-label="Ano anterior"
+                >
+                  <ChevronLeft className="h-3 w-3" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setYearRange(yearAnchor)}
+                  className={cn(
+                    "border-x border-border px-2 font-semibold tabular-nums transition-colors",
+                    period === "year"
+                      ? "bg-primary/10 text-primary"
+                      : "text-foreground hover:bg-accent/40",
+                  )}
+                  title={`Ano todo de ${yearAnchor}`}
+                >
+                  {yearAnchor}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => shiftYear(1)}
+                  className="grid w-6 place-items-center text-muted-foreground hover:bg-accent/40 hover:text-foreground"
+                  title={`Próximo ano (${yearAnchor + 1})`}
+                  aria-label="Próximo ano"
+                >
+                  <ChevronRight className="h-3 w-3" />
+                </button>
+              </div>
+
+              {/* Quarter chips — operate on the anchor year. */}
+              {[1, 2, 3, 4].map((q) => (
+                <button
+                  key={q}
+                  type="button"
+                  onClick={() => setQuarterRange(yearAnchor, q)}
                   className={cn(
                     "h-6 rounded-md border px-2 text-[10px] font-medium transition-colors",
-                    isActive(q.from, q.to)
+                    activeQuarter === q
                       ? "border-primary/40 bg-primary/10 text-primary"
                       : "border-border bg-surface-2 text-muted-foreground hover:text-foreground",
                   )}
-                  title={`${q.from} → ${q.to}`}
+                  title={`T${q} de ${yearAnchor}`}
                 >
-                  {q.label}
+                  T{q}
                 </button>
               ))}
-              <span className="mx-1 h-4 w-px bg-border" />
-              {monthChips.map((m) => (
+
+              {/* Month dropdown — 12 buttons in a 3×4 grid in the popover. */}
+              <div ref={monthMenuRef} className="relative">
                 <button
-                  key={m.label}
                   type="button"
-                  onClick={() => setDateRange(m.from, m.to)}
+                  onClick={() => setMonthMenuOpen((v) => !v)}
                   className={cn(
-                    "h-6 rounded-md border px-1.5 text-[10px] font-medium transition-colors",
-                    isActive(m.from, m.to)
+                    "inline-flex h-6 items-center gap-1 rounded-md border px-2 text-[10px] font-medium transition-colors",
+                    activeMonth
                       ? "border-primary/40 bg-primary/10 text-primary"
                       : "border-border bg-surface-2 text-muted-foreground hover:text-foreground",
                   )}
-                  title={`${m.from} → ${m.to}`}
+                  aria-expanded={monthMenuOpen}
+                  aria-haspopup="menu"
+                  title="Selecionar mês"
                 >
-                  {m.label}
+                  {activeMonth ? `${MONTH_ABBR[activeMonth - 1]}/${String(yearAnchor).slice(2)}` : "Mês"}
+                  <ChevronDown className="h-3 w-3" />
                 </button>
-              ))}
+                {monthMenuOpen && (
+                  <div
+                    role="menu"
+                    className="absolute right-0 z-20 mt-1 grid w-44 grid-cols-3 gap-1 rounded-md border border-border bg-surface-2 p-1.5 shadow-lg"
+                  >
+                    {MONTH_ABBR.map((label, i) => {
+                      const m = i + 1
+                      const active = activeMonth === m
+                      return (
+                        <button
+                          key={label}
+                          type="button"
+                          onClick={() => {
+                            setMonthRange(yearAnchor, m)
+                            setMonthMenuOpen(false)
+                          }}
+                          className={cn(
+                            "h-6 rounded-md border text-[10px] font-medium transition-colors",
+                            active
+                              ? "border-primary/40 bg-primary/10 text-primary"
+                              : "border-transparent text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+                          )}
+                        >
+                          {label}
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+
               {(date_from || date_to) && (
                 <button
                   type="button"
