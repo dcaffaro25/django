@@ -277,7 +277,11 @@ function JournalEntryEditor({
   const { t } = useTranslation(["reconciliation", "common"])
   const save = useSaveJournalEntry()
   const { data: accounts = [] } = useAccounts()
-  const [form, setForm] = useState<Partial<JournalEntry> & { account?: number; debit_amount?: string | null; credit_amount?: string | null }>({
+  // Mirror the underlying JournalEntry type's nullability for ``account``
+  // (the type was widened to ``number | null`` when it became part of the
+  // list payload for the report drill-down). Without ``null`` here, the
+  // ``setForm({ ...entry })`` reset path fails strict typing.
+  const [form, setForm] = useState<Partial<JournalEntry> & { account?: number | null; debit_amount?: string | null; credit_amount?: string | null }>({
     description: "",
     transaction_date: new Date().toISOString().slice(0, 10),
   })
