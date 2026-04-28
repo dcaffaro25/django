@@ -128,6 +128,19 @@ class AccountSerializer(serializers.ModelSerializer):
     # ``accounting/services/taxonomy_resolver.py`` for the rules.
     effective_category = serializers.SerializerMethodField()
     effective_tags = serializers.SerializerMethodField()
+    # JE-based balance breakdown. Annotated by ``AccountViewSet.get_queryset``
+    # via three Subqueries; the frontend rolls up subtree totals by
+    # summing children's values. Each is a Decimal-as-string in JSON
+    # (DRF's standard DecimalField behaviour).
+    #
+    # ``own_posted_delta`` is the post-anchor delta for POSTED JEs --
+    # adding ``balance`` gives the validated + posted balance.
+    # ``own_pending_delta`` is the cumulative effect of JEs whose
+    # Transaction is in ``state='pending'``.
+    # ``own_unreconciled_delta`` covers JEs not yet reconciled.
+    own_posted_delta = serializers.SerializerMethodField()
+    own_pending_delta = serializers.SerializerMethodField()
+    own_unreconciled_delta = serializers.SerializerMethodField()
 
     class Meta:
         model = Account
@@ -139,6 +152,8 @@ class AccountSerializer(serializers.ModelSerializer):
             # Phase 1 taxonomy fields. Always serialised; null/[] when unset.
             'report_category', 'tags',
             'effective_category', 'effective_tags',
+            # JE-derived deltas (see field-level docstrings above).
+            'own_posted_delta', 'own_pending_delta', 'own_unreconciled_delta',
         ]
 
     # ------------------------------------------------------------------
@@ -212,6 +227,27 @@ class AccountSerializer(serializers.ModelSerializer):
     def get_effective_tags(self, obj):
         from accounting.services.taxonomy_resolver import effective_tags
         return effective_tags(obj)
+
+    # ------------------------------------------------------------------
+    # JE-derived deltas
+    # ------------------------------------------------------------------
+    # All three return strings (Decimal-as-str) when annotated by the
+    # viewset; fall back to "0" when the queryset wasn't annotated
+    # (single-row reads, ad-hoc callers). Frontend treats missing as 0.
+    def _annotated_decimal(self, obj, attr):
+        v = getattr(obj, attr, None)
+        if v is None:
+            return "0"
+        return str(v)
+
+    def get_own_posted_delta(self, obj):
+        return self._annotated_decimal(obj, 'own_posted_delta')
+
+    def get_own_pending_delta(self, obj):
+        return self._annotated_decimal(obj, 'own_pending_delta')
+
+    def get_own_unreconciled_delta(self, obj):
+        return self._annotated_decimal(obj, 'own_unreconciled_delta')
 
     
 

@@ -783,6 +783,21 @@ export interface AccountLite {
   balance_date?: string | null
   key_words?: string | null
   examples?: string | null
+  // Phase 1 taxonomy fields. ``report_category`` and ``tags`` are the
+  // operator-set values; ``effective_*`` are the post-MPTT-walk values
+  // (nearest-tagged-ancestor for category, union for tags).
+  report_category?: string | null
+  tags?: string[] | null
+  effective_category?: string | null
+  effective_tags?: string[] | null
+  // JE-derived deltas. Each is a Decimal-as-string in JSON; missing
+  // means the queryset wasn't annotated (single-row reads). The
+  // chart-of-accounts page sums children + own to compute subtree
+  // rollups -- non-leaf rows have own_*=0 and rollups carry the
+  // values up the tree.
+  own_posted_delta?: string | null
+  own_pending_delta?: string | null
+  own_unreconciled_delta?: string | null
 }
 
 /**

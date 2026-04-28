@@ -363,40 +363,101 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         from django.db.models import DecimalField, F, OuterRef, Subquery, Sum, Value
         from django.db.models.functions import Coalesce
         from decimal import Decimal
+
         qs = super().get_queryset().select_related(
             'parent', 'currency', 'bank_account', 'company',
         )
-        # Annotate the post-anchor BankTransaction sum per Account.
-        # ``Account.get_current_balance`` was running this aggregation
-        # row-by-row. Pushing it into the queryset means one SQL plan
-        # for the whole list. ``annotated_current_balance`` is the name
-        # the serializer reads.
-        bank_sum = (
-            BankTransaction.objects
-            .filter(
-                bank_account=OuterRef('bank_account'),
-                date__gt=OuterRef('balance_date'),
-                balance_validated=False,
+
+        # Account balances roll up THREE separate Journal-Entry-based
+        # deltas, mirroring ``Account.get_current_balance`` /
+        # ``Account.calculate_balance`` semantics but pushed into a
+        # single SQL plan instead of per-row aggregations.
+        #
+        # Each ``own_*_delta`` is the contribution from JEs posted
+        # DIRECTLY to this account (regardless of whether the account
+        # is a leaf -- non-leaves typically have no direct JEs and
+        # the delta is 0). The frontend rolls up the values through
+        # the MPTT tree by summing children + own values. This is
+        # cleaner than trying to express subtree aggregation in a
+        # single Subquery.
+        #
+        # Three deltas:
+        #   1. ``own_posted_delta`` -- cumulative effect of POSTED JEs
+        #      after the account's balance anchor (validated balance is
+        #      already reflected in ``F('balance')``). Same filter as
+        #      legacy ``get_current_balance`` for leaves.
+        #   2. ``own_pending_delta`` -- effect of JEs whose Transaction
+        #      is in ``state='pending'``. Shows what the balance WILL be
+        #      once those entries are posted.
+        #   3. ``own_unreconciled_delta`` -- effect of JEs that are
+        #      not yet reconciled. Useful for the operator to see how
+        #      much of the current balance is still in flight.
+        #
+        # The ``account_direction`` multiplier converts a raw
+        # debit-positive Postgres SUM into the natural sign for the
+        # account's role (-1 for credit-natural, +1 for debit-natural).
+        def _je_delta_subquery(filter_kwargs):
+            # NULL-safe: ``debit_amount`` and ``credit_amount`` are
+            # nullable on JournalEntry (a credit-only entry has
+            # ``debit_amount=NULL``, vice versa). ``NULL - X`` is NULL
+            # in SQL, which would zero out the entire sum. Coalesce
+            # each operand to 0 before subtracting.
+            zero = Value(
+                Decimal('0'),
+                output_field=DecimalField(max_digits=14, decimal_places=2),
             )
-            .values('bank_account')
-            .annotate(s=Sum('amount'))
-            .values('s')[:1]
+            qs_inner = (
+                JournalEntry.objects
+                .filter(account=OuterRef('id'), **filter_kwargs)
+                .values('account')
+                .annotate(net=Sum(
+                    Coalesce(F('debit_amount'), zero)
+                    - Coalesce(F('credit_amount'), zero)
+                ))
+                .values('net')[:1]
+            )
+            return Subquery(
+                qs_inner,
+                output_field=DecimalField(max_digits=14, decimal_places=2),
+            )
+
+        zero_dec = Value(
+            Decimal('0'),
+            output_field=DecimalField(max_digits=14, decimal_places=2),
         )
+
         qs = qs.annotate(
-            annotated_current_balance=(
-                # ``balance + COALESCE(bank_tx_sum, 0)`` -- mirrors what
-                # ``Account.get_current_balance`` computes for leaf bank
-                # accounts. For non-leaf / non-bank rows it just returns
-                # the stored balance, which is the existing behaviour.
-                F('balance')
-                + Coalesce(
-                    Subquery(
-                        bank_sum,
-                        output_field=DecimalField(max_digits=12, decimal_places=2),
-                    ),
-                    Value(Decimal('0'), output_field=DecimalField(max_digits=12, decimal_places=2)),
-                )
+            own_posted_delta=Coalesce(
+                _je_delta_subquery(dict(
+                    transaction__date__gt=OuterRef('balance_date'),
+                    transaction__state='posted',
+                    transaction__balance_validated=False,
+                )) * F('account_direction'),
+                zero_dec,
             ),
+            own_pending_delta=Coalesce(
+                _je_delta_subquery(dict(
+                    transaction__state='pending',
+                )) * F('account_direction'),
+                zero_dec,
+            ),
+            own_unreconciled_delta=Coalesce(
+                _je_delta_subquery(dict(
+                    is_reconciled=False,
+                )) * F('account_direction'),
+                zero_dec,
+            ),
+        )
+
+        # ``annotated_current_balance`` was added in Phase 1 but with a
+        # BankTransaction-based formula; that turned out to miss the
+        # JE-based delta the legacy ``get_current_balance`` always
+        # used, leaving non-bank-account leaves showing stale anchor
+        # balances. Rebuild it as ``balance + own_posted_delta`` so
+        # legacy semantics are restored AND the new fields stay
+        # consistent.
+        qs = qs.annotate(
+            annotated_current_balance=F('balance') + F('own_posted_delta'),
         )
         return qs
 
