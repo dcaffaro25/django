@@ -1,91 +1,77 @@
 import { NavLink } from "react-router-dom"
 import { useTranslation } from "react-i18next"
 import {
-  // Admin icons (ShieldCheck, Activity, GitBranch, AlertTriangle, Bug,
-  // Server) moved to Topbar.tsx when the admin group left the sidebar.
-  LayoutDashboard, ArrowLeftRight, ListChecks, Sparkles, SlidersHorizontal, Workflow,
-  Scale, Wallet, Receipt, BookOpen, FileBarChart, FileCog, CreditCard, Users, Boxes,
-  Settings, ChevronLeft, PanelLeftOpen, Building2, CheckCircle2, Brain, Zap,
-  FileSpreadsheet, Shuffle, UploadCloud,
+  LayoutDashboard, FileBarChart, FileCog, CreditCard, Users, Boxes,
+  Settings, ChevronLeft, PanelLeftOpen, Zap, UploadCloud, Wallet,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/stores/app-store"
 import { useAuth } from "@/providers/AuthProvider"
 import { useRunningImportCount } from "@/features/imports"
+import { TenantCard } from "./TenantCard"
 
-type NavItem = { key: string; path: string; icon: typeof LayoutDashboard }
-type NavGroup = { key: string; items: NavItem[]; /** Rendered only when the predicate is true. */
-  visible?: (ctx: { isSuperuser: boolean }) => boolean }
+type NavItem = {
+  key: string
+  /** Display label (Portuguese, hard-coded -- the i18n keys lagged behind
+   *  the UI redesign). */
+  label: string
+  /** Path the link navigates to. Each item is the index of a section
+   *  whose sub-pages live under tabs in the destination. */
+  path: string
+  icon: typeof LayoutDashboard
+  /** When set, the NavLink uses ``end`` matching so a deeper child
+   *  route doesn't make the parent appear active. */
+  end?: boolean
+}
 
+type NavGroup = {
+  key: string
+  /** Display heading above the items (or null for ungrouped). */
+  label: string | null
+  items: NavItem[]
+  /** Rendered only when the predicate is true. */
+  visible?: (ctx: { isSuperuser: boolean }) => boolean
+}
+
+// Each group corresponds to a single sidebar section. Many sub-pages
+// previously listed here moved into tabbed shells inside the destination
+// page (see TabbedShell + the wrapper pages under /recon, /accounting,
+// /reports). The sidebar now surfaces ONE entry per section.
 const GROUPS: NavGroup[] = [
   {
-    key: "reconciliation",
+    key: "operations",
+    label: "Operação",
     items: [
-      { key: "reconciliation_dashboard", path: "/recon", icon: LayoutDashboard },
-      { key: "reconciliation_workbench", path: "/recon/workbench", icon: ArrowLeftRight },
-      { key: "reconciliation_matches", path: "/recon/matches", icon: CheckCircle2 },
-      { key: "reconciliation_tasks", path: "/recon/tasks", icon: ListChecks },
-      { key: "reconciliation_suggestions", path: "/recon/suggestions", icon: Sparkles },
-      { key: "reconciliation_configs", path: "/recon/configs", icon: SlidersHorizontal },
-      { key: "reconciliation_pipelines", path: "/recon/pipelines", icon: Workflow },
-      { key: "reconciliation_embeddings", path: "/recon/embeddings", icon: Brain },
-      { key: "reconciliation_balances", path: "/recon/balances", icon: Scale },
+      { key: "reconciliation", label: "Conciliação", path: "/recon", icon: LayoutDashboard },
+      { key: "accounting", label: "Contabilidade", path: "/accounting/accounts", icon: Wallet },
+      { key: "reports", label: "Demonstrativos", path: "/reports", icon: FileBarChart },
+      { key: "imports", label: "Importações", path: "/imports", icon: UploadCloud },
     ],
   },
   {
-    key: "accounting",
+    key: "tools",
+    label: "Ferramentas",
     items: [
-      { key: "bank_accounts", path: "/accounting/bank-accounts", icon: Wallet },
-      { key: "bank_transactions", path: "/accounting/bank-transactions", icon: Wallet },
-      { key: "transactions", path: "/accounting/transactions", icon: Receipt },
-      { key: "journal_entries", path: "/accounting/journal-entries", icon: BookOpen },
-      { key: "accounts", path: "/accounting/accounts", icon: FileCog },
-    ],
-  },
-  {
-    key: "financial_statements",
-    items: [
-      { key: "statements", path: "/statements", icon: FileBarChart },
-      { key: "templates", path: "/statements/templates", icon: FileCog },
-    ],
-  },
-  {
-    key: "reports_beta",
-    items: [
-      { key: "reports_build", path: "/reports/build", icon: FileBarChart },
-      { key: "reports_history", path: "/reports/history", icon: ListChecks },
-      { key: "ai_usage", path: "/settings/ai-usage", icon: Brain },
-    ],
-  },
-  {
-    key: "integrations",
-    items: [
-      { key: "integrations_sandbox", path: "/integrations/sandbox", icon: Zap },
+      { key: "integrations_sandbox", label: "Sandbox de API", path: "/integrations/sandbox", icon: Zap },
     ],
   },
   {
     key: "other",
+    label: "Outros",
     items: [
-      { key: "billing", path: "/billing", icon: CreditCard },
-      { key: "hr", path: "/hr", icon: Users },
-      { key: "inventory", path: "/inventory", icon: Boxes },
-      { key: "entities", path: "/settings/entities", icon: Building2 },
-      { key: "settings", path: "/settings", icon: Settings },
+      { key: "billing", label: "Faturamento", path: "/billing", icon: CreditCard },
+      { key: "hr", label: "RH", path: "/hr", icon: Users },
+      { key: "inventory", label: "Estoque", path: "/inventory", icon: Boxes },
     ],
   },
-  // Import/utility shortcuts pinned at the bottom of the sidebar so operator
-  // flows (conciliação, contabilidade) aren't pushed down by these.
   {
-    key: "imports",
+    key: "config",
+    label: "Configuração",
     items: [
-      { key: "imports_hub", path: "/imports", icon: UploadCloud },
-      { key: "imports_templates", path: "/imports/templates", icon: FileSpreadsheet },
-      { key: "imports_substitutions", path: "/imports/substitutions", icon: Shuffle },
+      { key: "tenant", label: "Empresa", path: "/settings/tenant", icon: Settings },
+      { key: "templates", label: "Modelos legados", path: "/statements/templates", icon: FileCog },
     ],
   },
-  // Platform-admin links used to live here behind an isSuperuser
-  // predicate. Moved to the user-avatar dropdown in Topbar.tsx —
-  // operator-tooling doesn't belong in the day-to-day sidebar.
 ]
 
 export function Sidebar() {
@@ -126,26 +112,28 @@ export function Sidebar() {
         )}
       </div>
 
-      <div className="mx-3 my-1 h-px bg-border" />
+      {/* Tenant identity card -- click-through to /settings/tenant. */}
+      <TenantCard collapsed={collapsed} />
+
+      <div className="mx-3 my-2 h-px bg-border" />
 
       <nav className="flex-1 overflow-y-auto px-2 py-2">
         {visibleGroups.map((g, gi) => (
           <div key={g.key} className={cn("space-y-0.5", gi > 0 && "mt-3")}>
-            {!collapsed && (
+            {!collapsed && g.label ? (
               <div className="px-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70">
-                {t(`nav.${g.key}`)}
+                {g.label}
               </div>
-            )}
+            ) : null}
             {g.items.map((item) => {
               const Icon = item.icon
-              const showImportBadge =
-                item.key === "imports_hub" || item.key === "imports_templates"
+              const showImportBadge = item.key === "imports"
               return (
                 <NavLink
                   key={item.key}
                   to={item.path}
-                  end={item.path === "/recon"}
-                  title={collapsed ? t(`nav.${item.key}`) ?? undefined : undefined}
+                  end={item.end}
+                  title={collapsed ? item.label : undefined}
                   className={({ isActive }) =>
                     cn(
                       "group relative flex h-8 items-center gap-2.5 rounded-md px-2 text-[13px] font-medium transition-colors",
@@ -159,7 +147,7 @@ export function Sidebar() {
                   {({ isActive }) => (
                     <>
                       <Icon className={cn("h-4 w-4 shrink-0", isActive && "text-primary")} />
-                      {!collapsed && <span className="truncate">{t(`nav.${item.key}`)}</span>}
+                      {!collapsed && <span className="truncate">{item.label}</span>}
                       {showImportBadge && <ImportsRunningBadge collapsed={collapsed} />}
                     </>
                   )}
