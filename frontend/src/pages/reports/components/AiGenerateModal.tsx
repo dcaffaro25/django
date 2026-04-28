@@ -69,17 +69,19 @@ export function AiGenerateModal({
       onGenerated(res.document)
       onClose()
     } catch (err: unknown) {
-      // The client sets a 180s timeout on this endpoint (see
+      // ``aiGenerateTemplate`` carries a 240s axios timeout (see
       // ``features/reports/api.ts``). Axios surfaces timeouts as
       // ``code === "ECONNABORTED"`` with a message starting with
       // "timeout of". Rewrite that into actionable operator copy
-      // instead of the raw axios string.
+      // instead of the raw axios string. Don't hardcode the duration
+      // here -- the timeout has changed twice already and the stale
+      // copy lied to operators.
       const code = (err as { code?: string })?.code
       const raw = (err as { response?: { data?: { error?: string } } })?.response?.data?.error
         ?? (err instanceof Error ? err.message : "")
       const isTimeout = code === "ECONNABORTED" || /timeout of/i.test(raw || "")
       const msg = isTimeout
-        ? "A IA demorou mais do que o esperado (>3 min). Tente novamente com preferências mais enxutas ou o outro provedor."
+        ? "A IA demorou mais do que o esperado. Tente novamente com preferências mais enxutas ou o outro provedor."
         : raw || "Falha na IA"
       setError(msg)
     }
