@@ -309,19 +309,36 @@ export function useEntities() {
   })
 }
 
-export function useAccounts(params?: { include_pending?: boolean }) {
+export function useAccounts(params?: {
+  include_pending?: boolean
+  date_from?: string
+  date_to?: string
+  entity?: number
+}) {
   const sub = useSub()
   // Default ``include_pending=false`` matches the backend default
   // (``current_balance`` = anchor + posted only). Pages that want to
   // see pending JEs included (Demonstrativos for tenants like Evolat
   // whose books are entirely pending) pass ``{ include_pending: true }``.
   const includePending = !!params?.include_pending
+  // Cache key includes every filter so toggling any of them re-fetches
+  // and stale results from a wider scope don't leak through.
+  const filterKey = {
+    include_pending: includePending,
+    date_from: params?.date_from || null,
+    date_to: params?.date_to || null,
+    entity: params?.entity || null,
+  }
   return useQuery({
-    // Key includes the flag so the toggle on /reports re-fetches
-    // instead of reusing the cached posted-only payload.
-    queryKey: ["recon", sub, "accounts", { include_pending: includePending }],
+    queryKey: ["recon", sub, "accounts", filterKey],
     queryFn: () =>
-      reconApi.listAccounts({ is_active: true, include_pending: includePending }),
+      reconApi.listAccounts({
+        is_active: true,
+        include_pending: includePending,
+        date_from: params?.date_from || undefined,
+        date_to: params?.date_to || undefined,
+        entity: params?.entity || undefined,
+      }),
     enabled: !!sub,
     staleTime: 10 * 60 * 1000,
   })

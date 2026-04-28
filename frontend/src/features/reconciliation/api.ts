@@ -344,7 +344,18 @@ export const reconApi = {
     api.tenant.patch<import("./types").Entity>(`/api/entities/${id}/`, body),
   deleteEntity: (id: number) => api.tenant.delete<void>(`/api/entities/${id}/`),
 
-  listAccounts: (params?: { is_active?: boolean; include_pending?: boolean }) =>
+  listAccounts: (params?: {
+    is_active?: boolean
+    include_pending?: boolean
+    /** ISO date (YYYY-MM-DD). Filters JE aggregation to this range
+     *  (transaction.date >= date_from). Anchor balance is unaffected. */
+    date_from?: string
+    date_to?: string
+    /** Entity FK. When set, the backend zeroes the per-account anchor
+     *  balance (anchor is whole-tenant, not per-entity) and returns
+     *  flow-only ``current_balance``. */
+    entity?: number
+  }) =>
     api.tenant
       // The Phase 1 N+1 fix didn't fully eliminate FlexibleRelatedField
       // per-row queries; on prod-DB-latency this still takes 60-90s

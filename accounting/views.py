@@ -491,6 +491,26 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         # × 356 outer rows = thousands of cross-region round-trips).
         # Single aggregation reduces to one query plan; results
         # attached to the serializer context as a per-account dict.
+        # Optional report-scope filters: ``?date_from=YYYY-MM-DD``,
+        # ``?date_to=YYYY-MM-DD``, ``?entity=<id>``. When set, they
+        # narrow the JE aggregation that feeds ``current_balance`` so
+        # the Demonstrativos page can render a period view (DRE for
+        # Q1, Balanço for a single entity, etc.) without a separate
+        # endpoint. Empty / unparseable values fall back to "no filter".
+        from datetime import date as _date
+        params = self.request.query_params or {}
+        def _parse_date(s):
+            try:
+                return _date.fromisoformat((s or '').strip()) if s else None
+            except Exception:
+                return None
+        date_from = _parse_date(params.get('date_from'))
+        date_to = _parse_date(params.get('date_to'))
+        try:
+            entity_id = int(params.get('entity') or 0) or None
+        except Exception:
+            entity_id = None
+
         delta_map: dict[int, dict] = {}
         try:
             zero = Value(
@@ -508,6 +528,18 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 - Coalesce(F('credit_amount'), zero)
             )
 
+            # Build a base JE queryset with the optional date / entity
+            # filters applied once. Both pending+unreconciled and
+            # posted aggregates start from this so the report scope
+            # is consistent across buckets.
+            je_base = JournalEntry.objects.all()
+            if date_from is not None:
+                je_base = je_base.filter(transaction__date__gte=date_from)
+            if date_to is not None:
+                je_base = je_base.filter(transaction__date__lte=date_to)
+            if entity_id is not None:
+                je_base = je_base.filter(transaction__entity_id=entity_id)
+
             account_ids = list(direction_by_id.keys())
             if account_ids:
                 # ``Q(account_id__in=...)`` plus per-account date
@@ -521,7 +553,7 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 # Pending + unreconciled: same date scope (no anchor
                 # filter), one bulk GROUP BY.
                 rows_pending_unrec = (
-                    JournalEntry.objects
+                    je_base
                     .filter(account_id__in=account_ids)
                     .values('account_id')
                     .annotate(
@@ -545,7 +577,7 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 # balance_date) using a CASE. Postgres handles this
                 # well in one GROUP BY.
                 rows_posted = (
-                    JournalEntry.objects
+                    je_base
                     .filter(
                         account_id__in=account_ids,
                         transaction__state='posted',
@@ -577,6 +609,15 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             # missing as 0.
             delta_map = {}
         ctx['account_delta_map'] = delta_map
+
+        # When the request is scoped to a single entity, the per-account
+        # ``balance`` anchor (which is the *whole tenant*'s opening
+        # balance for that account) becomes meaningless. Tell the
+        # serializer to drop the anchor and return flow-only
+        # (``posted + pending``) values for ``current_balance`` in
+        # that case. Date filters do NOT trigger this — anchor IS
+        # the opening point of the natural period.
+        ctx['exclude_anchor'] = entity_id is not None
 
         # ``?include_pending=1`` opt-in: when set, ``current_balance``
         # adds ``own_pending_delta`` on top of ``balance + own_posted_delta``.

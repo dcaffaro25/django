@@ -49,19 +49,14 @@ pending_qs = (
 posted_by_acc = {row["account_id"]: row["total"] or Decimal("0") for row in posted_qs}
 pending_by_acc = {row["account_id"]: row["total"] or Decimal("0") for row in pending_qs}
 
-# Build leaf set (no children among loaded accounts) — the DRE/Balanço
-# tabs sum only leaves to avoid double-counting parent rollups.
-child_count = defaultdict(int)
-for a in accounts:
-    if a.parent_id is not None:
-        child_count[a.parent_id] += 1
-leaves = [a for a in accounts if child_count[a.id] == 0]
-print(f"leaves: {len(leaves)} / {len(accounts)}")
-
-# Per-category sums, both modes.
+# Per-category sums, both modes. ``current_balance`` is per-account
+# own-only (no descendant rollup), so summing every account in a
+# category — parents AND leaves — does not double-count. The earlier
+# "leaves only" rule silently dropped JEs booked to mid-tree parents
+# (e.g. Evolat's "Venda De Produtos" level=3 with 4,342 pending JEs).
 sum_posted_only = defaultdict(lambda: Decimal("0"))
 sum_with_pending = defaultdict(lambda: Decimal("0"))
-for a in leaves:
+for a in accounts:
     cat = cat_by_id.get(a.id)
     if not cat:
         continue
@@ -148,9 +143,7 @@ for k, v in balanco(sum_with_pending).items():
 
 # Sanity: account-level coverage
 n_categorized = sum(1 for v in cat_by_id.values() if v)
-n_uncategorized_leaves = sum(1 for a in leaves if not cat_by_id.get(a.id))
 print(f"\ncategorized accounts: {n_categorized}/{len(accounts)}")
-print(f"uncategorized leaves: {n_uncategorized_leaves}")
 
 # Cross-check: total JE volume by state.
 posted_total = sum(posted_by_acc.values(), Decimal("0"))

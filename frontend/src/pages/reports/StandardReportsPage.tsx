@@ -2,22 +2,25 @@ import { useMemo } from "react"
 import { Link, Outlet, useSearchParams } from "react-router-dom"
 import { FileBarChart, Sparkles, Wallet, Receipt, FileText, ListChecks } from "lucide-react"
 import { TabbedShell } from "@/components/layout/TabbedShell"
-import { useAccounts } from "@/features/reconciliation"
+import { useAccounts, useEntities } from "@/features/reconciliation"
 import {
   REPORT_CATEGORY_STYLES,
 } from "@/features/reconciliation/taxonomy_labels"
 import { cn, formatCurrency } from "@/lib/utils"
 import type { AccountLite } from "@/features/reconciliation/types"
 
-/** Read the ``?include_pending=1`` switch from the URL so every tab
- *  shares the same value without prop drilling. The flag flows into
- *  ``useAccounts({ include_pending })`` and from there to the
- *  ``/api/accounts/?include_pending=1`` query, which makes the
- *  backend add ``own_pending_delta`` to ``current_balance``. */
-function useIncludePendingFromUrl(): boolean {
+/** Read every shared filter (``include_pending``, ``date_from``,
+ *  ``date_to``, ``entity``) from the URL so every tab consumes the
+ *  same scope without prop-drilling. */
+function useReportFilters() {
   const [params] = useSearchParams()
   const v = (params.get("include_pending") ?? "").toLowerCase()
-  return v === "1" || v === "true" || v === "yes"
+  const includePending = v === "1" || v === "true" || v === "yes"
+  const date_from = params.get("date_from") || undefined
+  const date_to = params.get("date_to") || undefined
+  const entityRaw = params.get("entity")
+  const entity = entityRaw ? Number(entityRaw) || undefined : undefined
+  return { includePending, date_from, date_to, entity }
 }
 
 /**
@@ -33,17 +36,71 @@ function useIncludePendingFromUrl(): boolean {
  */
 export function StandardReportsPage() {
   const [params, setParams] = useSearchParams()
-  const includePending = useIncludePendingFromUrl()
+  const { includePending, date_from, date_to, entity } = useReportFilters()
+  const { data: entities = [] } = useEntities()
 
-  const toggle = () => {
+  // Single-place mutator: copy the current params, set/delete one
+  // key, replace. ``replace: true`` keeps the back button useful
+  // (filter tweaks don't pollute history).
+  const setFilter = (key: string, value: string | null) => {
     const next = new URLSearchParams(params)
-    if (includePending) {
-      next.delete("include_pending")
-    } else {
-      next.set("include_pending", "1")
-    }
+    if (value == null || value === "") next.delete(key)
+    else next.set(key, value)
     setParams(next, { replace: true })
   }
+
+  const togglePending = () =>
+    setFilter("include_pending", includePending ? null : "1")
+
+  // Apply both date_from and date_to atomically (one history entry,
+  // one re-render). ``null/null`` clears the range entirely.
+  const setDateRange = (from: string | null, to: string | null) => {
+    const next = new URLSearchParams(params)
+    if (from) next.set("date_from", from); else next.delete("date_from")
+    if (to) next.set("date_to", to); else next.delete("date_to")
+    setParams(next, { replace: true })
+  }
+
+  // Shortcut presets — months Jan..Dec, quarters T1..T4, full year.
+  // Year is inferred from the currently-selected ``date_to`` (or
+  // today). Lets ops switch between 2024 / 2025 by just changing
+  // ``date_to``'s year and clicking a chip.
+  const yearAnchor = (() => {
+    const ref = date_to || date_from
+    if (ref) {
+      const y = Number(ref.slice(0, 4))
+      if (Number.isFinite(y)) return y
+    }
+    return new Date().getFullYear()
+  })()
+  const iso = (y: number, m: number, d: number) =>
+    `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`
+  const monthEnd = (y: number, m: number) => new Date(y, m, 0).getDate()
+  const monthChips = Array.from({ length: 12 }, (_, i) => {
+    const m = i + 1
+    const from = iso(yearAnchor, m, 1)
+    const to = iso(yearAnchor, m, monthEnd(yearAnchor, m))
+    return {
+      label: ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"][i],
+      from, to,
+    }
+  })
+  const quarterChips = [1,2,3,4].map((q) => {
+    const startMonth = (q - 1) * 3 + 1
+    const endMonth = startMonth + 2
+    return {
+      label: `T${q}`,
+      from: iso(yearAnchor, startMonth, 1),
+      to: iso(yearAnchor, endMonth, monthEnd(yearAnchor, endMonth)),
+    }
+  })
+  const yearChip = {
+    label: String(yearAnchor),
+    from: iso(yearAnchor, 1, 1),
+    to: iso(yearAnchor, 12, 31),
+  }
+  const isActive = (from: string, to: string) =>
+    date_from === from && date_to === to
 
   return (
     <div className="h-full p-4">
@@ -51,23 +108,122 @@ export function StandardReportsPage() {
         title="Demonstrativos"
         subtitle="DRE · Balanço · DFC · Modelos personalizados"
         actions={
-          <label
-            className={cn(
-              "inline-flex cursor-pointer select-none items-center gap-2 rounded-md border border-border px-2.5 py-1 text-[11px] transition-colors",
-              includePending
-                ? "border-primary/40 bg-primary/10 text-primary"
-                : "bg-surface-2 text-muted-foreground hover:text-foreground",
-            )}
-            title="Inclui lançamentos em estado 'pending' no saldo de cada conta. Útil para tenants cujos JEs ainda não foram contabilizados (posted)."
-          >
-            <input
-              type="checkbox"
-              className="h-3 w-3 cursor-pointer accent-primary"
-              checked={includePending}
-              onChange={toggle}
-            />
-            Incluir pendentes
-          </label>
+          <div className="flex flex-col items-end gap-1.5">
+            <div className="flex flex-wrap items-center gap-1">
+              {/* Quick presets — month/quarter/year for the year
+                  inferred from the active range (defaults to current
+                  calendar year). Clicking a chip sets both date_from
+                  and date_to atomically. */}
+              <button
+                type="button"
+                onClick={() => setDateRange(yearChip.from, yearChip.to)}
+                className={cn(
+                  "h-6 rounded-md border px-2 text-[10px] font-medium transition-colors",
+                  isActive(yearChip.from, yearChip.to)
+                    ? "border-primary/40 bg-primary/10 text-primary"
+                    : "border-border bg-surface-2 text-muted-foreground hover:text-foreground",
+                )}
+                title={`Ano todo de ${yearChip.label}`}
+              >
+                {yearChip.label}
+              </button>
+              <span className="mx-1 h-4 w-px bg-border" />
+              {quarterChips.map((q) => (
+                <button
+                  key={q.label}
+                  type="button"
+                  onClick={() => setDateRange(q.from, q.to)}
+                  className={cn(
+                    "h-6 rounded-md border px-2 text-[10px] font-medium transition-colors",
+                    isActive(q.from, q.to)
+                      ? "border-primary/40 bg-primary/10 text-primary"
+                      : "border-border bg-surface-2 text-muted-foreground hover:text-foreground",
+                  )}
+                  title={`${q.from} → ${q.to}`}
+                >
+                  {q.label}
+                </button>
+              ))}
+              <span className="mx-1 h-4 w-px bg-border" />
+              {monthChips.map((m) => (
+                <button
+                  key={m.label}
+                  type="button"
+                  onClick={() => setDateRange(m.from, m.to)}
+                  className={cn(
+                    "h-6 rounded-md border px-1.5 text-[10px] font-medium transition-colors",
+                    isActive(m.from, m.to)
+                      ? "border-primary/40 bg-primary/10 text-primary"
+                      : "border-border bg-surface-2 text-muted-foreground hover:text-foreground",
+                  )}
+                  title={`${m.from} → ${m.to}`}
+                >
+                  {m.label}
+                </button>
+              ))}
+              {(date_from || date_to) && (
+                <button
+                  type="button"
+                  onClick={() => setDateRange(null, null)}
+                  className="h-6 rounded-md border border-border bg-surface-2 px-2 text-[10px] font-medium text-muted-foreground hover:text-destructive"
+                  title="Limpar filtro de data"
+                >
+                  Limpar
+                </button>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="flex items-center gap-1 rounded-md border border-border bg-surface-2 px-2 py-1 text-[11px]">
+                <span className="text-muted-foreground">De</span>
+                <input
+                  type="date"
+                  value={date_from ?? ""}
+                  onChange={(e) => setFilter("date_from", e.target.value || null)}
+                  className="bg-transparent text-[11px] outline-none [color-scheme:dark]"
+                  aria-label="Data inicial"
+                />
+                <span className="text-muted-foreground">até</span>
+                <input
+                  type="date"
+                  value={date_to ?? ""}
+                  onChange={(e) => setFilter("date_to", e.target.value || null)}
+                  className="bg-transparent text-[11px] outline-none [color-scheme:dark]"
+                  aria-label="Data final"
+                />
+              </div>
+              <select
+                value={entity ? String(entity) : ""}
+                onChange={(e) => setFilter("entity", e.target.value || null)}
+                className="h-7 rounded-md border border-border bg-surface-2 px-2 text-[11px] outline-none"
+                aria-label="Entidade"
+                title="Filtra os lançamentos pela entidade da transação. Quando selecionado, os saldos âncora (balance) são zerados pois o âncora é por tenant, não por entidade."
+              >
+                <option value="">Todas as entidades</option>
+                {entities.map((e) => (
+                  <option key={e.id} value={e.id}>
+                    {e.name}
+                  </option>
+                ))}
+              </select>
+              <label
+                className={cn(
+                  "inline-flex cursor-pointer select-none items-center gap-2 rounded-md border border-border px-2.5 py-1 text-[11px] transition-colors",
+                  includePending
+                    ? "border-primary/40 bg-primary/10 text-primary"
+                    : "bg-surface-2 text-muted-foreground hover:text-foreground",
+                )}
+                title="Inclui lançamentos em estado 'pending' no saldo de cada conta. Útil para tenants cujos JEs ainda não foram contabilizados (posted)."
+              >
+                <input
+                  type="checkbox"
+                  className="h-3 w-3 cursor-pointer accent-primary"
+                  checked={includePending}
+                  onChange={togglePending}
+                />
+                Incluir pendentes
+              </label>
+            </div>
+          </div>
         }
         tabs={[
           { to: "/reports", end: true, label: "DRE", icon: FileBarChart },
@@ -94,31 +250,53 @@ interface CategorySum {
   accounts: Array<{ id: number; name: string; balance: number }>
 }
 
-/** Group leaf accounts by effective_category and sum the
- *  ``current_balance`` for each category. */
-function summariseByCategory(accounts: AccountLite[]): Map<string, CategorySum> {
-  // Determine leaves (accounts with no children in the loaded list)
-  const childCount = new Map<number, number>()
-  for (const a of accounts) {
-    if (a.parent != null) {
-      childCount.set(a.parent, (childCount.get(a.parent) ?? 0) + 1)
-    }
-  }
+/** Group accounts by ``effective_category`` and sum a per-account
+ *  *contribution* into the bucket:
+ *
+ *  * Anchor balance (``balance`` field, the operator-set opening
+ *    figure) is counted only at leaves — parent rows often store an
+ *    opening balance that's a rollup of their children's anchors,
+ *    and counting both would double-count.
+ *  * JE flow (``own_posted_delta`` plus ``own_pending_delta`` when
+ *    the toggle is on) is counted at every level — Evolat books
+ *    JEs to mid-tree parents (e.g. "Venda De Produtos" level=3 with
+ *    4,342 pending JEs and no children-with-JEs), so a leaves-only
+ *    rule silently dropped revenue and left the DRE at R$ 0,00.
+ *
+ *  We compute against ``balance`` + own deltas directly instead of
+ *  deriving anchor from ``current_balance − own_flow``. The deltas
+ *  the backend returns are already sign-corrected by
+ *  ``account_direction`` (positive = balance increased), while
+ *  ``balance`` is stored raw — but for the categories that drive
+ *  the DRE (revenue / expense), anchors are typically 0 anyway, so
+ *  the sign mismatch only materialises on Balanço opening positions
+ *  (where it's documented and accepted as MVP behaviour). */
+function summariseByCategory(
+  accounts: AccountLite[],
+  includePending: boolean,
+): Map<string, CategorySum> {
+  const childSet = new Set<number>()
+  for (const a of accounts) if (a.parent != null) childSet.add(a.parent)
+  const isLeaf = (id: number) => !childSet.has(id)
+
   const map = new Map<string, CategorySum>()
   for (const a of accounts) {
-    const isLeaf = (childCount.get(a.id) ?? 0) === 0
-    if (!isLeaf) continue
     const cat = a.effective_category
     if (!cat) continue
-    const balance = Number(a.current_balance ?? 0) || 0
+    const posted = Number(a.own_posted_delta ?? 0) || 0
+    const pending = includePending ? Number(a.own_pending_delta ?? 0) || 0 : 0
+    const ownFlow = posted + pending
+    const rawAnchor = Number(a.balance ?? 0) || 0
+    const contribution = (isLeaf(a.id) ? rawAnchor : 0) + ownFlow
+    if (contribution === 0) continue
     const bucket = map.get(cat) ?? {
       category: cat,
       label: REPORT_CATEGORY_STYLES[cat]?.label ?? cat,
       total: 0,
       accounts: [],
     }
-    bucket.total += balance
-    bucket.accounts.push({ id: a.id, name: a.name, balance })
+    bucket.total += contribution
+    bucket.accounts.push({ id: a.id, name: a.name, balance: contribution })
     map.set(cat, bucket)
   }
   return map
@@ -188,9 +366,17 @@ function NotEnoughDataNotice() {
 // ---------------------------------------------------------------------
 
 export function DreTab() {
-  const includePending = useIncludePendingFromUrl()
-  const { data: accounts = [], isLoading } = useAccounts({ include_pending: includePending })
-  const cats = useMemo(() => summariseByCategory(accounts), [accounts])
+  const { includePending, date_from, date_to, entity } = useReportFilters()
+  const { data: accounts = [], isLoading } = useAccounts({
+    include_pending: includePending,
+    date_from,
+    date_to,
+    entity,
+  })
+  const cats = useMemo(
+    () => summariseByCategory(accounts, includePending),
+    [accounts, includePending],
+  )
   const currency = accounts[0]?.currency?.code ?? "BRL"
 
   if (isLoading) return <StatementSkeleton />
@@ -245,9 +431,17 @@ export function DreTab() {
 // ---------------------------------------------------------------------
 
 export function BalancoTab() {
-  const includePending = useIncludePendingFromUrl()
-  const { data: accounts = [], isLoading } = useAccounts({ include_pending: includePending })
-  const cats = useMemo(() => summariseByCategory(accounts), [accounts])
+  const { includePending, date_from, date_to, entity } = useReportFilters()
+  const { data: accounts = [], isLoading } = useAccounts({
+    include_pending: includePending,
+    date_from,
+    date_to,
+    entity,
+  })
+  const cats = useMemo(
+    () => summariseByCategory(accounts, includePending),
+    [accounts, includePending],
+  )
   const currency = accounts[0]?.currency?.code ?? "BRL"
   if (isLoading) return <StatementSkeleton />
   if (cats.size === 0) return <NotEnoughDataNotice />
@@ -305,8 +499,13 @@ export function BalancoTab() {
 // ---------------------------------------------------------------------
 
 export function DfcTab() {
-  const includePending = useIncludePendingFromUrl()
-  const { data: accounts = [], isLoading } = useAccounts({ include_pending: includePending })
+  const { includePending, date_from, date_to, entity } = useReportFilters()
+  const { data: accounts = [], isLoading } = useAccounts({
+    include_pending: includePending,
+    date_from,
+    date_to,
+    entity,
+  })
   if (isLoading) return <StatementSkeleton />
 
   // Cash subset: leaves with tag "cash" or "restricted_cash" inherited.

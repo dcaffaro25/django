@@ -267,11 +267,18 @@ class AccountSerializer(serializers.ModelSerializer):
     # posted-only so legacy callers don't change behaviour.
     def get_current_balance(self, obj):
         from decimal import Decimal
+        ctx = self.context or {}
+        # ``exclude_anchor`` is set by the viewset when the request is
+        # scoped to a single entity — anchor balance is per-account
+        # (whole tenant), not per-entity, so including it would
+        # contaminate the entity-filtered report. Drop to flow-only
+        # (posted + pending).
+        exclude_anchor = bool(ctx.get('exclude_anchor'))
         try:
-            anchor = Decimal(str(obj.balance or '0'))
+            anchor = Decimal('0') if exclude_anchor else Decimal(str(obj.balance or '0'))
         except Exception:
             anchor = Decimal('0')
-        m = (self.context or {}).get('account_delta_map') or {}
+        m = ctx.get('account_delta_map') or {}
         bucket = m.get(obj.id)
         if not bucket:
             return str(anchor)
@@ -279,7 +286,7 @@ class AccountSerializer(serializers.ModelSerializer):
             posted = Decimal(bucket.get('own_posted_delta') or '0')
         except Exception:
             posted = Decimal('0')
-        include_pending = bool((self.context or {}).get('include_pending'))
+        include_pending = bool(ctx.get('include_pending'))
         pending = Decimal('0')
         if include_pending:
             try:
