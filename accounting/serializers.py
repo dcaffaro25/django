@@ -430,6 +430,12 @@ class JournalEntryListSerializer(serializers.ModelSerializer):
             'transaction_date', 'transaction_description', 'transaction_value',
             'bank_account', 'reconciliation_status', 'notes', 'tag',
             'numero_boleto', 'cnpj', 'due_date', 'nf_number',
+            # Debit / credit are needed by the Demonstrativos drill-down
+            # so a JE row can show which side hit the account. Without
+            # them the list-mode payload only carries ``balance`` (the
+            # signed cumulative annotation) and the operator can't tell
+            # a debit movement apart from a credit one.
+            'debit_amount', 'credit_amount', 'date', 'account',
         ]
 
     def to_representation(self, instance):

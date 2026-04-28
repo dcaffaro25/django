@@ -244,9 +244,41 @@ export const reconApi = {
       .get<BankTransaction[] | { results: BankTransaction[] }>("/api/bank_transactions/", { params })
       .then(unwrapList<BankTransaction>),
 
+  /**
+   * Lightweight journal-entry drill for the Demonstrativos page.
+   * Hits ``/api/journal_entries/drill/`` which hard-caps at 500 rows
+   * and returns a flat dict per row — sub-second even on accounts
+   * with thousands of entries, vs. the 90s+ of the heavy list
+   * serializer. ``account`` is required by the backend.
+   */
+  drillJournalEntries: (params: {
+    account: number
+    transaction_date_after?: string
+    transaction_date_before?: string
+    entity?: number
+    limit?: number
+  }) =>
+    api.tenant.get<
+      Array<{
+        id: number
+        transaction_id: number
+        date: string | null
+        description: string
+        debit_amount: string
+        credit_amount: string
+        state: string | null
+      }>
+    >("/api/journal_entries/drill/", { params, timeout: 30_000 }),
+
   listJournalEntries: (params?: {
     reconciliation_status?: string
     bank_account?: number
+    /** Chart-of-accounts account filter — used by the Demonstrativos
+     *  drill-down to scope JEs to one leaf. Maps to
+     *  ``JournalEntryFilter.account``. */
+    account?: number
+    /** Transaction.entity_id filter — mirrors the report's entity scope. */
+    entity?: number
     transaction_date_after?: string
     transaction_date_before?: string
     ordering?: string

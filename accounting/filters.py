@@ -291,6 +291,16 @@ class JournalEntryFilter(filters.FilterSet):
     # bank statement.
     bank_account = filters.NumberFilter(field_name="account__bank_account_id")
 
+    # Filter by the JE's chart-of-accounts account. Used by the
+    # Demonstrativos drill-down: clicking a leaf account on the DRE /
+    # Balanço / DFC opens the JE list scoped to that account in the
+    # active period. Without this declaration the param was silently
+    # dropped (Meta.fields=[] disables auto-generated FK filters), so
+    # ``useAccountHasEntries`` always returned "yes" and the drill
+    # could not narrow at all.
+    account = filters.NumberFilter(field_name="account_id")
+    entity = filters.NumberFilter(field_name="transaction__entity_id")
+
     # Reconciliation status — mirrors JournalEntryListSerializer.get_reconciliation_status
     # so the client-side and server-side views of the status agree.
     reconciliation_status = filters.CharFilter(method="filter_reconciliation_status")

@@ -278,6 +278,38 @@ export function useJournalEntries(params?: Parameters<typeof reconApi.listJourna
   })
 }
 
+/**
+ * Slim per-account JE drill for the Demonstrativos page. Hits
+ * ``/api/journal_entries/drill/`` (hard-capped at 500 rows, flat
+ * dict per row), which is two orders of magnitude faster than the
+ * heavy list serializer for accounts with thousands of entries.
+ *
+ * ``account`` must be set; otherwise the query is disabled.
+ */
+export function useJournalEntriesDrill(params: {
+  account: number | null | undefined
+  transaction_date_after?: string
+  transaction_date_before?: string
+  entity?: number
+  limit?: number
+}) {
+  const sub = useSub()
+  const enabled = !!sub && params.account != null
+  return useQuery({
+    queryKey: ["recon", sub, "journal_entries_drill", params],
+    queryFn: () =>
+      reconApi.drillJournalEntries({
+        account: params.account as number,
+        transaction_date_after: params.transaction_date_after,
+        transaction_date_before: params.transaction_date_before,
+        entity: params.entity,
+        limit: params.limit,
+      }),
+    enabled,
+    staleTime: 30 * 1000,
+  })
+}
+
 export function useUnmatchedJournalEntries(
   params?: Parameters<typeof reconApi.listUnmatchedJournalEntries>[0],
 ) {

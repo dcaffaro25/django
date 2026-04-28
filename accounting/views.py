@@ -1948,6 +1948,65 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             sheet_name="Lancamentos",
         )
 
+    @action(methods=['get'], detail=False, url_path='drill')
+    def drill(self, request, *args, **kwargs):
+        """Lightweight JE list for the Demonstrativos drill-down.
+
+        The default ``list`` action uses ``JournalEntryListSerializer``
+        which fans out to ~10 ``SerializerMethodField`` per row plus a
+        ``to_representation`` override — fine for the Workbench's
+        feature-rich grid, prohibitively slow for an inline panel that
+        just wants ``id / date / description / debit / credit``. With
+        pagination disabled on the parent viewset, asking for one
+        account with 4k entries returns 4k rows and pays the full
+        per-row cost (we measured ~90s on Evolat).
+
+        This action takes the same filterset, hard-caps at 500 rows
+        (default 100, ordered most-recent first), and returns a flat
+        dict per row. Useful from any caller that needs a quick
+        drill — chart of accounts, reports, audit drawers.
+        """
+        # account filter is required for safety; without it the cap
+        # would silently truncate the entire ledger and confuse callers.
+        account_id = (request.query_params or {}).get('account')
+        if not account_id:
+            return Response({'detail': 'account is required'}, status=400)
+        try:
+            limit = max(1, min(int((request.query_params or {}).get('limit') or 100), 500))
+        except Exception:
+            limit = 100
+
+        qs = self.filter_queryset(self.get_queryset())
+        qs = qs.order_by('-transaction__date', '-id')[:limit]
+        rows = list(qs.values(
+            'id', 'transaction_id', 'description',
+            'debit_amount', 'credit_amount', 'date',
+            'transaction__date', 'transaction__description',
+            'transaction__state',
+        ))
+
+        def _iso(d):
+            try:
+                return d.isoformat() if d else None
+            except Exception:
+                return str(d) if d else None
+
+        def _str_dec(d):
+            return str(d) if d is not None else '0'
+
+        out = []
+        for r in rows:
+            out.append({
+                'id': r['id'],
+                'transaction_id': r['transaction_id'],
+                'date': _iso(r.get('transaction__date') or r.get('date')),
+                'description': (r.get('description') or r.get('transaction__description') or '').strip(),
+                'debit_amount': _str_dec(r.get('debit_amount')),
+                'credit_amount': _str_dec(r.get('credit_amount')),
+                'state': r.get('transaction__state'),
+            })
+        return Response(out)
+
     @action(detail=False, methods=["post"], url_path="derive_from")
     def derive_from(self, request, tenant_id=None):
         """

@@ -1,6 +1,6 @@
 import { useMemo, useEffect, useRef, useState } from "react"
 import { Link, Outlet, useSearchParams } from "react-router-dom"
-import { FileBarChart, Sparkles, Wallet, Receipt, ListChecks, ChevronLeft, ChevronRight, ChevronDown } from "lucide-react"
+import { FileBarChart, Sparkles, Wallet, Receipt, ListChecks, ChevronLeft, ChevronRight, ChevronDown, Pencil } from "lucide-react"
 import { TabbedShell } from "@/components/layout/TabbedShell"
 import { useAccounts, useCashflow, useEntities } from "@/features/reconciliation"
 import {
@@ -12,6 +12,9 @@ import {
 } from "@/features/reconciliation/taxonomy_labels"
 import { cn, formatCurrency } from "@/lib/utils"
 import type { AccountLite, CashflowDirectMethod } from "@/features/reconciliation/types"
+import { DrillableLine } from "./components/DrillableLine"
+import { AccountWiringModal } from "./components/AccountWiringModal"
+import { JournalEntriesPanel } from "./components/JournalEntriesPanel"
 
 /** Read every shared filter (``include_pending``, ``date_from``,
  *  ``date_to``, ``entity``, ``basis``) from the URL so every tab
@@ -394,7 +397,11 @@ interface CategorySum {
   category: string
   label: string
   total: number
-  accounts: Array<{ id: number; name: string; balance: number }>
+  /** Per-account contributions to this category. ``amount`` matches
+   *  the field DrillableLine consumes (see ``AccountContribution``);
+   *  using the same name end-to-end avoids a translation step in the
+   *  hot path. */
+  accounts: Array<{ id: number; name: string; amount: number }>
 }
 
 /** Group accounts by ``effective_category`` and sum a per-account
@@ -452,7 +459,7 @@ function summariseByCategory(
       accounts: [],
     }
     bucket.total += contribution
-    bucket.accounts.push({ id: a.id, name: a.name, balance: contribution })
+    bucket.accounts.push({ id: a.id, name: a.name, amount: contribution })
     map.set(cat, bucket)
   }
   return map
@@ -535,6 +542,7 @@ export function DreTab() {
     [accounts, includePending],
   )
   const currency = accounts[0]?.currency?.code ?? "BRL"
+  const wiring = useAccountWiring(accounts)
 
   if (isLoading) return <StatementSkeleton />
   if (cats.size === 0) return <NotEnoughDataNotice />
@@ -544,6 +552,7 @@ export function DreTab() {
   // already a negative debit-stored number; we display them as
   // positive revenue by the math below).
   const get = (k: string) => cats.get(k)?.total ?? 0
+  const accs = (k: string) => cats.get(k)?.accounts ?? []
   const receitaBruta = get("receita_bruta")
   const deducoes = get("deducao_receita")
   const receitaLiquida = receitaBruta + deducoes  // deducoes natural sign already negative
@@ -558,6 +567,14 @@ export function DreTab() {
   const lair = ebit + resultadoFin + outras
   const impostoLucro = get("imposto_sobre_lucro")
   const lucroLiq = lair + impostoLucro
+
+  // Common props for every drillable category line. The DRE pipes the
+  // active period + entity through to the JE drill so an expanded row
+  // shows lançamentos scoped to exactly the report's view.
+  const drill = {
+    date_from, date_to, entity,
+    onEditAccount: wiring.open,
+  }
 
   return (
     <div className="space-y-2">
@@ -575,23 +592,43 @@ export function DreTab() {
           <div>Linha</div>
           <div className="tabular-nums">{currency}</div>
         </div>
-        <StatementLine label="Receita Bruta" value={receitaBruta} currency={currency} bold />
-        <StatementLine label="(-) Deduções da Receita" value={deducoes} currency={currency} indent={1} negative />
+        <DrillableLine label="Receita Bruta" value={receitaBruta} currency={currency} bold accounts={accs("receita_bruta")} {...drill} />
+        <DrillableLine label="(-) Deduções da Receita" value={deducoes} currency={currency} indent={1} negative accounts={accs("deducao_receita")} {...drill} />
         <StatementLine label="Receita Líquida" value={receitaLiquida} currency={currency} bold />
-        <StatementLine label="(-) Custos" value={custos} currency={currency} indent={1} negative />
+        <DrillableLine label="(-) Custos" value={custos} currency={currency} indent={1} negative accounts={accs("custo")} {...drill} />
         <StatementLine label="Lucro Bruto" value={lucroBruto} currency={currency} bold />
-        <StatementLine label="(-) Despesas Operacionais" value={despesasOp} currency={currency} indent={1} negative />
+        <DrillableLine label="(-) Despesas Operacionais" value={despesasOp} currency={currency} indent={1} negative accounts={accs("despesa_operacional")} {...drill} />
         <StatementLine label="EBIT (Lucro Operacional)" value={ebit} currency={currency} bold />
-        <StatementLine label="(+) Receitas Financeiras" value={receitaFin} currency={currency} indent={1} />
-        <StatementLine label="(-) Despesas Financeiras" value={despesaFin} currency={currency} indent={1} negative />
-        <StatementLine label="(+/-) Outras Receitas/Despesas" value={outras} currency={currency} indent={1} />
+        <DrillableLine label="(+) Receitas Financeiras" value={receitaFin} currency={currency} indent={1} accounts={accs("receita_financeira")} {...drill} />
+        <DrillableLine label="(-) Despesas Financeiras" value={despesaFin} currency={currency} indent={1} negative accounts={accs("despesa_financeira")} {...drill} />
+        <DrillableLine label="(+/-) Outras Receitas/Despesas" value={outras} currency={currency} indent={1} accounts={accs("outras_receitas")} {...drill} />
         <StatementLine label="Resultado Financeiro" value={resultadoFin} currency={currency} indent={1} />
         <StatementLine label="LAIR (Lucro antes IR)" value={lair} currency={currency} bold />
-        <StatementLine label="(-) IRPJ + CSLL" value={impostoLucro} currency={currency} indent={1} negative />
+        <DrillableLine label="(-) IRPJ + CSLL" value={impostoLucro} currency={currency} indent={1} negative accounts={accs("imposto_sobre_lucro")} {...drill} />
         <StatementLine label="Lucro Líquido do Exercício" value={lucroLiq} currency={currency} bold />
       </div>
+      <AccountWiringModal account={wiring.account} open={wiring.isOpen} onClose={wiring.close} />
     </div>
   )
+}
+
+/** Tiny hook that pairs the wiring-modal state with a lookup into the
+ *  active accounts list. Every report tab uses it the same way:
+ *  ``wiring.open(id)`` from a row, ``<AccountWiringModal {...wiring} />``
+ *  at the bottom of the tree. Keeps the modal owned by the tab that
+ *  fetched the accounts, so saves invalidate the same query that
+ *  populates the report. */
+function useAccountWiring(accounts: AccountLite[]) {
+  const [editingId, setEditingId] = useState<number | null>(null)
+  const account = editingId
+    ? accounts.find((a) => a.id === editingId) ?? null
+    : null
+  return {
+    isOpen: editingId != null,
+    account,
+    open: (id: number) => setEditingId(id),
+    close: () => setEditingId(null),
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -611,10 +648,12 @@ export function BalancoTab() {
     [accounts, includePending],
   )
   const currency = accounts[0]?.currency?.code ?? "BRL"
+  const wiring = useAccountWiring(accounts)
   if (isLoading) return <StatementSkeleton />
   if (cats.size === 0) return <NotEnoughDataNotice />
 
   const get = (k: string) => cats.get(k)?.total ?? 0
+  const accs = (k: string) => cats.get(k)?.accounts ?? []
   const ativoCirc = get("ativo_circulante")
   const ativoNc = get("ativo_nao_circulante")
   const totalAtivo = ativoCirc + ativoNc
@@ -624,23 +663,25 @@ export function BalancoTab() {
   const totalPassivoPl = passCirc + passNc + pl
   const balanced = Math.abs(totalAtivo - totalPassivoPl) < 0.01
 
+  const drill = { date_from, date_to, entity, onEditAccount: wiring.open }
+
   return (
     <div className="grid gap-4 md:grid-cols-2">
       <div className="card-elevated overflow-hidden text-[12px]">
         <div className="border-b border-border bg-surface-3 px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
           Ativo
         </div>
-        <StatementLine label="Ativo Circulante" value={ativoCirc} currency={currency} indent={0} />
-        <StatementLine label="Ativo Não Circulante" value={ativoNc} currency={currency} indent={0} />
+        <DrillableLine label="Ativo Circulante" value={ativoCirc} currency={currency} indent={0} accounts={accs("ativo_circulante")} {...drill} />
+        <DrillableLine label="Ativo Não Circulante" value={ativoNc} currency={currency} indent={0} accounts={accs("ativo_nao_circulante")} {...drill} />
         <StatementLine label="Total do Ativo" value={totalAtivo} currency={currency} bold />
       </div>
       <div className="card-elevated overflow-hidden text-[12px]">
         <div className="border-b border-border bg-surface-3 px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
           Passivo + Patrimônio Líquido
         </div>
-        <StatementLine label="Passivo Circulante" value={passCirc} currency={currency} indent={0} />
-        <StatementLine label="Passivo Não Circulante" value={passNc} currency={currency} indent={0} />
-        <StatementLine label="Patrimônio Líquido" value={pl} currency={currency} indent={0} />
+        <DrillableLine label="Passivo Circulante" value={passCirc} currency={currency} indent={0} accounts={accs("passivo_circulante")} {...drill} />
+        <DrillableLine label="Passivo Não Circulante" value={passNc} currency={currency} indent={0} accounts={accs("passivo_nao_circulante")} {...drill} />
+        <DrillableLine label="Patrimônio Líquido" value={pl} currency={currency} indent={0} accounts={accs("patrimonio_liquido")} {...drill} />
         <StatementLine label="Total Passivo + PL" value={totalPassivoPl} currency={currency} bold />
       </div>
       <div className={cn(
@@ -658,6 +699,7 @@ export function BalancoTab() {
           </>
         )}
       </div>
+      <AccountWiringModal account={wiring.account} open={wiring.isOpen} onClose={wiring.close} />
     </div>
   )
 }
@@ -715,6 +757,8 @@ export function DfcTab() {
     )
   }
 
+  const wiring = useAccountWiring(accounts)
+
   if (isLoading) return <StatementSkeleton />
   if (isError || !data) {
     return (
@@ -748,7 +792,15 @@ export function DfcTab() {
         />
       </div>
 
-      <CashflowDirectStatement payload={data} currency={currency} />
+      <CashflowDirectStatement
+        payload={data}
+        currency={currency}
+        date_from={date_from}
+        date_to={date_to}
+        entity={entity}
+        onEditAccount={wiring.open}
+      />
+      <AccountWiringModal account={wiring.account} open={wiring.isOpen} onClose={wiring.close} />
     </div>
   )
 }
@@ -801,9 +853,17 @@ function KpiCard({
 function CashflowDirectStatement({
   payload,
   currency,
+  date_from,
+  date_to,
+  entity,
+  onEditAccount,
 }: {
   payload: CashflowDirectMethod
   currency: string
+  date_from?: string
+  date_to?: string
+  entity?: number
+  onEditAccount?: (id: number) => void
 }) {
   // Bucket categories by section, preserving the (already-sorted)
   // backend order so largest movers per section come first.
@@ -862,6 +922,10 @@ function CashflowDirectStatement({
             currency={currency}
             categories={rows}
             accountsByCategory={accountsByCategory}
+            date_from={date_from}
+            date_to={date_to}
+            entity={entity}
+            onEditAccount={onEditAccount}
           />
         )
       })}
@@ -883,6 +947,10 @@ function CashflowSectionBlock({
   currency,
   categories,
   accountsByCategory,
+  date_from,
+  date_to,
+  entity,
+  onEditAccount,
 }: {
   sectionCode: string
   label: string
@@ -894,6 +962,10 @@ function CashflowSectionBlock({
     string,
     Array<{ id: number; name: string; amount: number }>
   >
+  date_from?: string
+  date_to?: string
+  entity?: number
+  onEditAccount?: (id: number) => void
 }) {
   const [expandedCats, setExpandedCats] = useState<Set<string>>(new Set())
   const [collapsed, setCollapsed] = useState(false)
@@ -970,27 +1042,89 @@ function CashflowSectionBlock({
               </div>
               {expanded &&
                 accounts.map((a) => (
-                  <div
+                  <CashflowAccountRow
                     key={a.id}
-                    className="flex items-center justify-between border-b border-border/30 bg-surface-2/40 px-3 py-1 text-[11px]"
-                    style={{ paddingLeft: 56 }}
-                  >
-                    <div className="truncate text-muted-foreground">
-                      {a.name}
-                    </div>
-                    <div
-                      className={cn(
-                        "tabular-nums",
-                        a.amount < 0 && "text-destructive",
-                      )}
-                    >
-                      {formatCurrency(a.amount, currency)}
-                    </div>
-                  </div>
+                    account={a}
+                    currency={currency}
+                    date_from={date_from}
+                    date_to={date_to}
+                    entity={entity}
+                    onEdit={onEditAccount}
+                  />
                 ))}
             </div>
           )
         })}
+    </>
+  )
+}
+
+/** Per-account row inside a DFC category. Identical look to the rest
+ *  of the DFC, plus: clicking expands the inline JE drill, hovering
+ *  reveals a pencil that opens ``AccountWiringModal``. The DFC's
+ *  account-level numbers come pre-aggregated from the backend so the
+ *  JE list here is a *secondary* projection: it shows every JE that
+ *  hit the account in the period (accrual view), even ones that
+ *  didn't touch cash. That's intentional — operators auditing the
+ *  DFC almost always also want to see the upstream accrual leg. */
+function CashflowAccountRow({
+  account,
+  currency,
+  date_from,
+  date_to,
+  entity,
+  onEdit,
+}: {
+  account: { id: number; name: string; amount: number }
+  currency: string
+  date_from?: string
+  date_to?: string
+  entity?: number
+  onEdit?: (id: number) => void
+}) {
+  const [open, setOpen] = useState(false)
+  return (
+    <>
+      <div
+        className="group flex cursor-pointer items-center justify-between border-b border-border/30 bg-surface-2/40 px-3 py-1 text-[11px] transition-colors hover:bg-accent/30"
+        style={{ paddingLeft: 56 }}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <div className="flex min-w-0 flex-1 items-center gap-1.5">
+          <ChevronDown
+            className={cn(
+              "h-3 w-3 shrink-0 text-muted-foreground transition-transform",
+              !open && "-rotate-90",
+            )}
+          />
+          <span className="truncate text-muted-foreground">{account.name}</span>
+          {onEdit && (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onEdit(account.id) }}
+              className="ml-1 grid h-5 w-5 place-items-center rounded-sm text-muted-foreground opacity-0 transition-opacity hover:bg-accent hover:text-foreground group-hover:opacity-100"
+              title="Editar categorização"
+              aria-label="Editar categorização"
+            >
+              <Pencil className="h-3 w-3" />
+            </button>
+          )}
+        </div>
+        <div className={cn("tabular-nums", account.amount < 0 && "text-destructive")}>
+          {formatCurrency(account.amount, currency)}
+        </div>
+      </div>
+      {open && (
+        <div className="border-b border-border/30 bg-background/40" style={{ paddingLeft: 72 }}>
+          <JournalEntriesPanel
+            accountId={account.id}
+            date_from={date_from}
+            date_to={date_to}
+            entity={entity}
+            currency={currency}
+          />
+        </div>
+      )}
     </>
   )
 }
