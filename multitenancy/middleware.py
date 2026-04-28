@@ -1,3 +1,5 @@
+import logging
+
 from django.http import JsonResponse
 from django.urls import resolve
 from .models import Company
@@ -6,15 +8,23 @@ from rest_framework.authentication import TokenAuthentication
 from rest_framework.exceptions import AuthenticationFailed
 from .utils import resolve_tenant
 
+log = logging.getLogger(__name__)
+
+
 class TenantMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response
 
     def __call__(self, request):
-        # Log the incoming request and headers
-        print(f"Path: {request.path}")
-        print(f"Headers: {request.headers}")
-        
+        # Per-request path/headers tracing was useful during the
+        # multitenancy bring-up but is now multiple kB per request on
+        # Railway logs (auth tokens included). Demoted to ``DEBUG``
+        # so it stays available behind the standard logging knob and
+        # off in production by default.
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("TenantMiddleware path=%s", request.path)
+            log.debug("TenantMiddleware headers=%s", dict(request.headers))
+
         if request.path.startswith('/login'):
             return self.get_response(request)
         
@@ -49,8 +59,11 @@ class TenantMiddleware:
                 # Don't return 401 here - let the view handle permissions
                 # Some views (like knowledge-base) allow unauthenticated access
                 # Just log and continue - the view's permission_classes will decide
-                print(f"[TenantMiddleware] Authentication failed for {request.path}, but allowing request to continue")
-                pass
+                log.info(
+                    "TenantMiddleware: auth failed for %s; allowing request "
+                    "to continue (view's permission_classes will decide)",
+                    request.path,
+                )
 
         # Handle 'all' tenants for superusers
         if subdomain == 'all':
