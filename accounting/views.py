@@ -298,21 +298,22 @@ def _build_account_taxonomy_map(rows):
 
     cat_cache: dict[int, str | None] = {}
     tag_cache: dict[int, list[str]] = {}
+    cf_cache: dict[int, str | None] = {}
 
-    def walk_category(aid):
-        if aid in cat_cache:
-            return cat_cache[aid]
+    def walk_nearest(aid, field, cache):
+        if aid in cache:
+            return cache[aid]
         node = by_id.get(aid)
         seen: set[int] = set()
-        cat: str | None = None
+        value: str | None = None
         while node is not None and node['id'] not in seen:
             seen.add(node['id'])
-            if node.get('report_category'):
-                cat = node['report_category']
+            if node.get(field):
+                value = node[field]
                 break
             node = by_id.get(node.get('parent_id'))
-        cat_cache[aid] = cat
-        return cat
+        cache[aid] = value
+        return value
 
     def walk_tags(aid):
         if aid in tag_cache:
@@ -331,8 +332,11 @@ def _build_account_taxonomy_map(rows):
 
     return {
         aid: {
-            'effective_category': walk_category(aid),
+            'effective_category': walk_nearest(aid, 'report_category', cat_cache),
             'effective_tags': walk_tags(aid),
+            'effective_cashflow_category': walk_nearest(
+                aid, 'cashflow_category', cf_cache,
+            ),
         }
         for aid in by_id.keys()
     }
@@ -478,7 +482,10 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             tax_rows = list(
                 Account.objects
                 .filter(**company_filter)
-                .values('id', 'parent_id', 'report_category', 'tags')
+                .values(
+                    'id', 'parent_id',
+                    'report_category', 'tags', 'cashflow_category',
+                )
             )
             ctx['account_taxonomy_map'] = _build_account_taxonomy_map(tax_rows)
         except Exception:

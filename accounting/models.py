@@ -264,6 +264,7 @@ class Account(TenantAwareBaseModel, MPTTModel):
     from accounting.services.taxonomy_meta import (
         REPORT_CATEGORY_CHOICES as _CAT_CHOICES,
         TAG_CHOICES as _TAG_CHOICES,
+        CASHFLOW_CATEGORY_CHOICES as _CF_CHOICES,
     )
     report_category = models.CharField(
         max_length=24, null=True, blank=True, db_index=True,
@@ -280,6 +281,23 @@ class Account(TenantAwareBaseModel, MPTTModel):
             "Cross-cutting markers (cash, debt, contra_account, "
             "ebitda_addback, ...). Closed enum; descendants inherit "
             "as a UNION with this account's own tags."
+        ),
+    )
+    # Independent of ``report_category`` — operators classify the DFC
+    # line separately because BS/PnL category and DFC sub-line are
+    # genuinely independent decisions. Inheritance pattern is identical
+    # to ``report_category`` (nearest tagged ancestor wins). The
+    # FCO/FCI/FCF section is encoded in the prefix of the value
+    # (``fco_*`` / ``fci_*`` / ``fcf_*``) — no separate mapping table.
+    # Cash and bank accounts should stay UNTAGGED here: they ARE the
+    # cash, not a flow.
+    cashflow_category = models.CharField(
+        max_length=32, null=True, blank=True, db_index=True,
+        choices=_CF_CHOICES,
+        help_text=(
+            "DFC line classification (CPC 03 / IAS 7 direct method). "
+            "Nullable; descendants inherit via tree walk. Section "
+            "(FCO/FCI/FCF) is derived from the prefix of this value."
         ),
     )
 

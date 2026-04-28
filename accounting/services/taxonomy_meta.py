@@ -851,3 +851,333 @@ assert _TAG_CODES == _TAG_META_CODES, (
     f"missing meta = {_TAG_CODES - _TAG_META_CODES}; "
     f"extra meta = {_TAG_META_CODES - _TAG_CODES}"
 )
+
+
+# ---------------------------------------------------------------------
+# cashflow_category — 15 values aligned to CPC 03 / IAS 7 (direct method)
+# ---------------------------------------------------------------------
+# Each value's prefix encodes the section (``fco_`` / ``fci_`` / ``fcf_``)
+# so the FCO/FCI/FCF aggregation is a string-prefix lookup, no separate
+# mapping table. Inheritance follows the same MPTT walk as
+# ``report_category`` (nearest tagged ancestor wins; self overrides).
+#
+# The 15 sub-lines are the standard CPC 03 disclosures expanded one
+# level beyond the bare three sections. Operators usually tag at L1
+# (e.g. "Caixa Operacional → fco_outros") with an override at L2/L3
+# for the specific sub-line. Cash and bank accounts themselves should
+# stay UNTAGGED — they are the cash, not a flow.
+#
+# Why a separate field instead of deriving from ``report_category`` +
+# ``tags`` (the previous approach):
+#   * BS/PnL category and DFC sub-line are independent decisions —
+#     "Aplicações Financeiras de Liquidez Imediata" is BS-side
+#     ``ativo_circulante`` AND DFC-side ``fci_investimentos_financeiros``;
+#     deriving one from the other forces a wrong default in either
+#     report.
+#   * Tags stop doing double-duty (they were doing both
+#     "operational marker" AND "DFC routing" jobs); they go back to
+#     pure cross-cutting markers.
+#   * Operators can override per-account in the wiring modal without
+#     a code change, exactly like ``report_category``.
+
+CASHFLOW_CATEGORY_CHOICES = [
+    # FCO — Atividades Operacionais
+    ("fco_recebimentos_clientes", "FCO · Recebimentos de Clientes"),
+    ("fco_pagamentos_fornecedores", "FCO · Pagamentos a Fornecedores"),
+    ("fco_pagamentos_empregados", "FCO · Pagamentos a Empregados"),
+    ("fco_impostos_indiretos", "FCO · Impostos Indiretos"),
+    ("fco_imposto_renda", "FCO · IR/CSLL Pagos"),
+    ("fco_juros", "FCO · Juros Pagos/Recebidos"),
+    ("fco_outros", "FCO · Outros Recebimentos/Pagamentos"),
+    # FCI — Atividades de Investimento
+    ("fci_imobilizado", "FCI · Imobilizado"),
+    ("fci_intangivel", "FCI · Intangível"),
+    ("fci_investimentos_financeiros", "FCI · Investimentos Financeiros"),
+    ("fci_outros", "FCI · Outros Investimentos"),
+    # FCF — Atividades de Financiamento
+    ("fcf_emprestimos", "FCF · Empréstimos e Financiamentos"),
+    ("fcf_capital", "FCF · Aporte/Redução de Capital"),
+    ("fcf_dividendos_jcp", "FCF · Dividendos e JCP"),
+    ("fcf_outros", "FCF · Outros Financiamentos"),
+]
+
+CASHFLOW_CATEGORY_VALUES = frozenset(code for code, _ in CASHFLOW_CATEGORY_CHOICES)
+
+
+class CashflowCategoryMeta(TypedDict):
+    label_pt: str
+    section: str  # "operacional" | "investimento" | "financiamento"
+    definition_pt: str
+    cpc_reference: str
+    examples_pt: List[str]
+    antiexamples_pt: List[str]
+
+
+CASHFLOW_CATEGORY_META: Dict[str, CashflowCategoryMeta] = {
+    "fco_recebimentos_clientes": {
+        "label_pt": "FCO · Recebimentos de Clientes",
+        "section": "operacional",
+        "definition_pt": (
+            "Entradas de caixa decorrentes de vendas de produtos e serviços, "
+            "líquidas de impostos retidos e descontos comerciais."
+        ),
+        "cpc_reference": "CPC 03.14(a)",
+        "examples_pt": [
+            "Clientes a Receber", "Duplicatas a Receber", "Recebimentos por Cartão",
+        ],
+        "antiexamples_pt": [
+            "Receita Bruta de Vendas (é DRE, não caixa)",
+            "Adiantamentos de clientes recebidos (vão em fco_outros)",
+        ],
+    },
+    "fco_pagamentos_fornecedores": {
+        "label_pt": "FCO · Pagamentos a Fornecedores",
+        "section": "operacional",
+        "definition_pt": (
+            "Saídas de caixa decorrentes da aquisição de matérias-primas, "
+            "mercadorias para revenda, e serviços operacionais. Inclui fretes "
+            "e estoques pagos."
+        ),
+        "cpc_reference": "CPC 03.14(c)",
+        "examples_pt": [
+            "Fornecedores a Pagar", "Matérias-Primas Pagas",
+            "Frete sobre Compras", "Estoque de Mercadorias",
+        ],
+        "antiexamples_pt": [
+            "Folha de pagamento (vai em fco_pagamentos_empregados)",
+            "Imposto de renda (vai em fco_imposto_renda)",
+        ],
+    },
+    "fco_pagamentos_empregados": {
+        "label_pt": "FCO · Pagamentos a Empregados",
+        "section": "operacional",
+        "definition_pt": (
+            "Saídas de caixa para folha de pagamento, encargos sociais "
+            "(INSS, FGTS), benefícios e pró-labore."
+        ),
+        "cpc_reference": "CPC 03.14(d)",
+        "examples_pt": [
+            "Salários", "INSS a Recolher", "FGTS a Recolher",
+            "Vale Refeição", "Plano de Saúde", "Pró-Labore",
+        ],
+        "antiexamples_pt": [
+            "Comissões a representantes externos (vai em fco_pagamentos_fornecedores)",
+        ],
+    },
+    "fco_impostos_indiretos": {
+        "label_pt": "FCO · Impostos Indiretos",
+        "section": "operacional",
+        "definition_pt": (
+            "Tributos sobre receitas e operações: ICMS, PIS, COFINS, ISS, IPI. "
+            "Apresentados líquidos quando há recuperação de créditos."
+        ),
+        "cpc_reference": "CPC 03.14(e)",
+        "examples_pt": [
+            "ICMS a Recolher", "PIS/COFINS a Recolher", "ISS a Recolher",
+            "IPI a Recolher", "DIFAL a Recolher",
+        ],
+        "antiexamples_pt": [
+            "IRPJ/CSLL (vai em fco_imposto_renda)",
+            "INSS empresa (vai em fco_pagamentos_empregados)",
+        ],
+    },
+    "fco_imposto_renda": {
+        "label_pt": "FCO · IR/CSLL Pagos",
+        "section": "operacional",
+        "definition_pt": (
+            "Pagamentos de IRPJ e CSLL, incluindo antecipações e ajustes "
+            "de balanço. Apresentados separadamente conforme CPC 03.35."
+        ),
+        "cpc_reference": "CPC 03.35",
+        "examples_pt": [
+            "IRPJ a Pagar", "CSLL a Pagar", "IRRF sobre Aplicações",
+        ],
+        "antiexamples_pt": [
+            "ICMS / PIS / COFINS (vão em fco_impostos_indiretos)",
+        ],
+    },
+    "fco_juros": {
+        "label_pt": "FCO · Juros Pagos/Recebidos",
+        "section": "operacional",
+        "definition_pt": (
+            "Juros pagos sobre empréstimos operacionais (capital de giro) "
+            "e juros recebidos sobre aplicações de gestão de caixa. "
+            "CPC 03 permite classificá-los em FCO ou FCF — adotamos FCO "
+            "por consistência com a maioria das práticas brasileiras. "
+            "Use a tag ``debt`` em uma sub-conta específica para mover "
+            "juros de empréstimos de longo prazo para FCF."
+        ),
+        "cpc_reference": "CPC 03.31-32",
+        "examples_pt": [
+            "Juros Bancários", "Juros sobre Capital de Giro",
+            "Rendimento de Aplicações", "Tarifas Bancárias",
+        ],
+        "antiexamples_pt": [
+            "Variação cambial passiva (vai em fco_outros)",
+            "Dividendos recebidos (vão em fci_investimentos_financeiros)",
+        ],
+    },
+    "fco_outros": {
+        "label_pt": "FCO · Outros Recebimentos/Pagamentos",
+        "section": "operacional",
+        "definition_pt": (
+            "Saco de gato operacional — adiantamentos diversos, ressarcimentos, "
+            "indenizações, e tudo que não cabe nas linhas mais específicas."
+        ),
+        "cpc_reference": "CPC 03.14",
+        "examples_pt": [
+            "Adiantamentos Diversos", "Ressarcimentos a Receber",
+            "Indenizações", "Variações Cambiais Operacionais",
+        ],
+        "antiexamples_pt": [],
+    },
+    "fci_imobilizado": {
+        "label_pt": "FCI · Imobilizado",
+        "section": "investimento",
+        "definition_pt": (
+            "Aquisição e venda de bens do imobilizado: terrenos, edificações, "
+            "máquinas, equipamentos, veículos, móveis. Inclui adições e baixas."
+        ),
+        "cpc_reference": "CPC 03.16(a)(b)",
+        "examples_pt": [
+            "Compra de Máquinas e Equipamentos", "Venda de Veículos",
+            "Aquisição de Móveis e Utensílios",
+        ],
+        "antiexamples_pt": [
+            "Software (vai em fci_intangivel)",
+            "Depreciação acumulada (não-caixa, fica fora da DFC)",
+        ],
+    },
+    "fci_intangivel": {
+        "label_pt": "FCI · Intangível",
+        "section": "investimento",
+        "definition_pt": (
+            "Aquisição e venda de ativos intangíveis: software, marcas, "
+            "patentes, ágio, direitos de uso."
+        ),
+        "cpc_reference": "CPC 03.16",
+        "examples_pt": [
+            "Compra de Software", "Aquisição de Marcas e Patentes",
+            "Licenças de Uso", "Ágio em Aquisições",
+        ],
+        "antiexamples_pt": [
+            "Imobilizado físico (vai em fci_imobilizado)",
+        ],
+    },
+    "fci_investimentos_financeiros": {
+        "label_pt": "FCI · Investimentos Financeiros",
+        "section": "investimento",
+        "definition_pt": (
+            "Aplicações financeiras de longo prazo, fundos de investimento, "
+            "renda fixa não-equivalente-de-caixa, participações societárias. "
+            "Aplicações de liquidez imediata (≤90 dias) podem ser tratadas "
+            "como equivalentes de caixa via tag ``cash``; o resto entra aqui."
+        ),
+        "cpc_reference": "CPC 03.16(c)(d)",
+        "examples_pt": [
+            "CDB > 90 dias", "Fundos de Investimento",
+            "Tesouro Direto", "Saldo do Principal Aplicado",
+            "Investimentos em Coligadas", "Participações Societárias",
+        ],
+        "antiexamples_pt": [
+            "CDB liquidez diária (tag cash, fica fora da DFC)",
+        ],
+    },
+    "fci_outros": {
+        "label_pt": "FCI · Outros Investimentos",
+        "section": "investimento",
+        "definition_pt": (
+            "Saco de gato de investimento: depósitos judiciais, fundo "
+            "de garantia, antecipações de aquisição."
+        ),
+        "cpc_reference": "CPC 03.16",
+        "examples_pt": [
+            "Depósitos Judiciais", "Antecipações para Aquisições",
+        ],
+        "antiexamples_pt": [],
+    },
+    "fcf_emprestimos": {
+        "label_pt": "FCF · Empréstimos e Financiamentos",
+        "section": "financiamento",
+        "definition_pt": (
+            "Captação e amortização de empréstimos, financiamentos, "
+            "debêntures e demais dívidas onerosas. Juros sobre dívidas "
+            "ficam em fco_juros (ou fcf_emprestimos se a empresa adotar "
+            "IFRS Option B com tag ``debt`` específica)."
+        ),
+        "cpc_reference": "CPC 03.17(a)(b)(c)",
+        "examples_pt": [
+            "Empréstimos Bancários a Pagar", "Debêntures",
+            "Financiamento BNDES", "Operações de Hedge",
+        ],
+        "antiexamples_pt": [
+            "Fornecedores a pagar (vai em fco_pagamentos_fornecedores)",
+        ],
+    },
+    "fcf_capital": {
+        "label_pt": "FCF · Aporte/Redução de Capital",
+        "section": "financiamento",
+        "definition_pt": (
+            "Movimentações de capital social — integralizações de "
+            "acionistas, reduções de capital, recompra de ações em tesouraria."
+        ),
+        "cpc_reference": "CPC 03.17(a)",
+        "examples_pt": [
+            "Capital Social Subscrito", "Aporte de Capital",
+            "Ações em Tesouraria", "Redução de Capital",
+        ],
+        "antiexamples_pt": [
+            "Reservas de lucro (não geram movimento de caixa)",
+        ],
+    },
+    "fcf_dividendos_jcp": {
+        "label_pt": "FCF · Dividendos e JCP",
+        "section": "financiamento",
+        "definition_pt": (
+            "Distribuição de dividendos e juros sobre capital próprio (JCP) "
+            "aos acionistas/sócios."
+        ),
+        "cpc_reference": "CPC 03.17(d), 31",
+        "examples_pt": [
+            "Dividendos a Pagar", "JCP a Pagar",
+            "Distribuição de Lucros",
+        ],
+        "antiexamples_pt": [],
+    },
+    "fcf_outros": {
+        "label_pt": "FCF · Outros Financiamentos",
+        "section": "financiamento",
+        "definition_pt": (
+            "Saco de gato de financiamento: arrendamento mercantil "
+            "(IFRS 16), e demais movimentos de financiamento atípicos."
+        ),
+        "cpc_reference": "CPC 03.17",
+        "examples_pt": [
+            "Arrendamento Mercantil (IFRS 16)",
+        ],
+        "antiexamples_pt": [],
+    },
+}
+
+
+_CF_CODES = CASHFLOW_CATEGORY_VALUES
+_CF_META_CODES = frozenset(CASHFLOW_CATEGORY_META.keys())
+assert _CF_CODES == _CF_META_CODES, (
+    f"CASHFLOW_CATEGORY_CHOICES and CASHFLOW_CATEGORY_META disagree: "
+    f"missing meta = {_CF_CODES - _CF_META_CODES}; "
+    f"extra meta = {_CF_META_CODES - _CF_CODES}"
+)
+
+
+def cashflow_section_for_category(code: Optional[str]) -> Optional[str]:
+    """Resolve the FCO/FCI/FCF section from a ``cashflow_category`` code.
+    The section is encoded in the prefix (``fco_`` / ``fci_`` / ``fcf_``)
+    so this is a constant-time lookup with no extra mapping table."""
+    if not code:
+        return None
+    prefix = code.split("_", 1)[0]
+    return {
+        "fco": "operacional",
+        "fci": "investimento",
+        "fcf": "financiamento",
+    }.get(prefix)

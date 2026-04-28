@@ -128,6 +128,11 @@ class AccountSerializer(serializers.ModelSerializer):
     # ``accounting/services/taxonomy_resolver.py`` for the rules.
     effective_category = serializers.SerializerMethodField()
     effective_tags = serializers.SerializerMethodField()
+    # Resolved DFC line. Same MPTT inheritance rule as
+    # ``effective_category`` (nearest tagged ancestor wins, self
+    # overrides). Independent of ``effective_category`` because BS/PnL
+    # category and DFC sub-line are genuinely independent decisions.
+    effective_cashflow_category = serializers.SerializerMethodField()
     # JE-based balance breakdown. Annotated by ``AccountViewSet.get_queryset``
     # via three Subqueries; the frontend rolls up subtree totals by
     # summing children's values. Each is a Decimal-as-string in JSON
@@ -150,8 +155,9 @@ class AccountSerializer(serializers.ModelSerializer):
             'account_direction', 'balance_date',
             'balance', 'currency', 'is_active', 'current_balance',
             # Phase 1 taxonomy fields. Always serialised; null/[] when unset.
-            'report_category', 'tags',
+            'report_category', 'tags', 'cashflow_category',
             'effective_category', 'effective_tags',
+            'effective_cashflow_category',
             # JE-derived deltas (see field-level docstrings above).
             'own_posted_delta', 'own_pending_delta', 'own_unreconciled_delta',
         ]
@@ -227,6 +233,14 @@ class AccountSerializer(serializers.ModelSerializer):
             return bucket.get('effective_tags', [])
         from accounting.services.taxonomy_resolver import effective_tags
         return effective_tags(obj)
+
+    def get_effective_cashflow_category(self, obj):
+        m = (self.context or {}).get('account_taxonomy_map') or {}
+        bucket = m.get(obj.id)
+        if bucket is not None:
+            return bucket.get('effective_cashflow_category')
+        from accounting.services.taxonomy_resolver import effective_cashflow_category
+        return effective_cashflow_category(obj)
 
     # ------------------------------------------------------------------
     # JE-derived deltas

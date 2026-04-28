@@ -4,6 +4,7 @@ import { FileBarChart, Sparkles, Wallet, Receipt, ListChecks, ChevronLeft, Chevr
 import { TabbedShell } from "@/components/layout/TabbedShell"
 import { useAccounts, useCashflow, useEntities } from "@/features/reconciliation"
 import {
+  CASHFLOW_CATEGORY_LABELS,
   CASHFLOW_SECTION_LABELS,
   CASHFLOW_SECTION_ORDER,
   CASHFLOW_SECTION_SHORT,
@@ -1025,7 +1026,10 @@ function CashflowSectionBlock({
                     )}
                   />
                   <span className="truncate">
-                    {REPORT_CATEGORY_STYLES[c.category]?.label ?? c.category}
+                    {CASHFLOW_CATEGORY_LABELS[c.category]
+                      ?? (c.category === "<no_cashflow_category>"
+                          ? "Sem categoria DFC"
+                          : c.category)}
                   </span>
                   <span className="ml-1 text-[10px] text-muted-foreground">
                     ({c.account_count} {c.account_count === 1 ? "conta" : "contas"})

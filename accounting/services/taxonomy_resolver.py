@@ -55,6 +55,21 @@ def effective_category(account) -> Optional[str]:
     return None
 
 
+def effective_cashflow_category(account) -> Optional[str]:
+    """Return the ``cashflow_category`` that applies to this account
+    after MPTT inheritance. Same nearest-ancestor-wins rule as
+    ``effective_category``. Returns ``None`` if neither self nor any
+    ancestor has a value -- the DFC will surface the account in its
+    "Não classificadas" tail bucket so it's visible for cleanup."""
+    node = account
+    while node is not None:
+        cat = getattr(node, "cashflow_category", None)
+        if cat:
+            return cat
+        node = getattr(node, "parent", None)
+    return None
+
+
 def effective_tags(account) -> List[str]:
     """Return the union of ``tags`` from this account and every
     ancestor. Sorted for deterministic ordering. Empty list when no

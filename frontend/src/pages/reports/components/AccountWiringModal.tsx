@@ -11,6 +11,8 @@ import {
 } from "@/components/ui/dialog"
 import { useSaveAccount } from "@/features/reconciliation"
 import {
+  CASHFLOW_CATEGORY_CODES_BY_ORDER,
+  CASHFLOW_CATEGORY_LABELS,
   CATEGORY_CODES_BY_ORDER,
   REPORT_CATEGORY_STYLES,
   TAG_LABELS,
@@ -49,12 +51,14 @@ export function AccountWiringModal({
   // Local copy of the wiring so the form is unaffected by background
   // refetches while it's open. Reset whenever the target changes.
   const [category, setCategory] = useState<string>("")
+  const [cashflowCategory, setCashflowCategory] = useState<string>("")
   const [tags, setTags] = useState<Set<string>>(new Set())
   const save = useSaveAccount()
 
   useEffect(() => {
     if (account) {
       setCategory(account.report_category ?? "")
+      setCashflowCategory(account.cashflow_category ?? "")
       setTags(new Set(account.tags ?? []))
     }
   }, [account?.id, open])
@@ -63,6 +67,7 @@ export function AccountWiringModal({
 
   const dirty =
     (account.report_category ?? "") !== category ||
+    (account.cashflow_category ?? "") !== cashflowCategory ||
     !setsEqual(new Set(account.tags ?? []), tags)
 
   const submit = async () => {
@@ -74,6 +79,7 @@ export function AccountWiringModal({
       id: account.id,
       body: {
         report_category: category || null,
+        cashflow_category: cashflowCategory || null,
         tags: Array.from(tags),
       },
     })
@@ -134,6 +140,43 @@ export function AccountWiringModal({
 
           <div>
             <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Categoria DFC
+            </label>
+            <select
+              value={cashflowCategory}
+              onChange={(e) => setCashflowCategory(e.target.value)}
+              className="h-8 w-full rounded-md border border-border bg-surface-2 px-2 text-[12px] outline-none"
+              title="Determina em qual linha do Demonstrativo de Fluxo de Caixa esta conta aparece. Independente da categoria de relatório (DRE/Balanço)."
+            >
+              <option value="">— sem categoria DFC (herda do pai) —</option>
+              {CASHFLOW_CATEGORY_CODES_BY_ORDER.map((code) => (
+                <option key={code} value={code}>
+                  {code.startsWith("fco_") ? "FCO · " :
+                   code.startsWith("fci_") ? "FCI · " :
+                   code.startsWith("fcf_") ? "FCF · " : ""}
+                  {CASHFLOW_CATEGORY_LABELS[code] ?? code}
+                </option>
+              ))}
+            </select>
+            {account.effective_cashflow_category &&
+              account.effective_cashflow_category !== account.cashflow_category && (
+                <div className="mt-1 text-[10px] text-muted-foreground">
+                  Atualmente herda{" "}
+                  <code className="text-foreground">
+                    {CASHFLOW_CATEGORY_LABELS[account.effective_cashflow_category] ??
+                      account.effective_cashflow_category}
+                  </code>{" "}
+                  do ancestral.
+                </div>
+              )}
+            <div className="mt-1 text-[10px] text-muted-foreground">
+              Contas de caixa (Caixa, Bancos) devem ficar SEM categoria
+              DFC — elas <em>são</em> o caixa, não um fluxo.
+            </div>
+          </div>
+
+          <div>
+            <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
               Marcadores ({tags.size})
             </label>
             <div className="grid grid-cols-3 gap-1">
@@ -162,9 +205,10 @@ export function AccountWiringModal({
               })}
             </div>
             <div className="mt-1 text-[10px] text-muted-foreground">
-              Marcadores sobrepõem a categoria para fins de DFC (ex.
-              <code className="mx-1 text-foreground">debt</code>→ FCF,
-              <code className="mx-1 text-foreground">fixed_asset</code>→ FCI).
+              Marcadores são propriedades transversais (caixa, dívida,
+              não-recorrente, EBITDA addback, etc.). Não definem
+              colocação em DRE ou DFC — para isso, use as categorias
+              acima.
             </div>
           </div>
         </div>

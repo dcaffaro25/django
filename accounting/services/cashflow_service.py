@@ -36,46 +36,19 @@ from accounting.models import Account, JournalEntry
 # ---------------------------------------------------------------------
 # Cash-flow section taxonomy (FCO / FCI / FCF)
 # ---------------------------------------------------------------------
-# The DRE / Balanço use ``report_category``. The DFC uses a *derived*
-# section computed from category + tags. We don't add a model field
-# (yet) -- the mapping below is the source of truth and ships with
-# the closed enum. When the operator's chart adds new categories the
-# default below stays sane (uncategorized tags fall through to
-# ``no_section`` and surface in the DFC tail bucket so they're
-# visible for cleanup).
-
-DEFAULT_CATEGORY_TO_SECTION: Dict[str, str] = {
-    # Operating: revenue, cost, opex, working capital
-    "receita_bruta": "operacional",
-    "deducao_receita": "operacional",
-    "custo": "operacional",
-    "despesa_operacional": "operacional",
-    "receita_financeira": "operacional",
-    "outras_receitas": "operacional",
-    "imposto_sobre_lucro": "operacional",
-    "ativo_circulante": "operacional",
-    "passivo_circulante": "operacional",
-    # Financing: long-term debt, equity, financial expense (interest
-    # is FCF in IFRS Option B; we follow that here -- can be flipped
-    # via a tag override on the specific accounts).
-    "despesa_financeira": "financiamento",
-    "passivo_nao_circulante": "financiamento",
-    "patrimonio_liquido": "financiamento",
-    # Investing: long-term assets
-    "ativo_nao_circulante": "investimento",
-}
-
-# Tag overrides win over the category default. Mostly relevant for
-# accounts that classify oddly under their parent (a debt under
-# ``passivo_circulante`` is FCF, not FCO; a fixed_asset leaf under a
-# misc parent should still be FCI).
-TAG_TO_SECTION: Dict[str, str] = {
-    "debt": "financiamento",
-    "fixed_asset": "investimento",
-    "intangible_asset": "investimento",
-    "jcp": "financiamento",
-    "dividends": "financiamento",
-}
+# Section is derived directly from the prefix of the
+# ``cashflow_category`` field on Account (``fco_*`` / ``fci_*`` /
+# ``fcf_*``). No mapping table; no derivation from ``report_category``
+# or ``tags``.
+#
+# This is the second iteration of DFC wiring. The first iteration
+# (DEFAULT_CATEGORY_TO_SECTION + TAG_TO_SECTION) tried to derive the
+# DFC section from ``report_category`` + ``tags``, but BS/PnL category
+# and DFC sub-line are genuinely independent decisions: an "Aplicação
+# Financeira de Liquidez Imediata" is BS-side ``ativo_circulante`` AND
+# DFC-side ``fci_investimentos_financeiros``; deriving one from the
+# other forces a wrong default in either report. The new
+# ``cashflow_category`` field on Account makes this explicit.
 
 CASHFLOW_SECTIONS: Tuple[str, ...] = (
     "operacional",
@@ -84,22 +57,19 @@ CASHFLOW_SECTIONS: Tuple[str, ...] = (
 )
 
 
-def cashflow_section_for(
-    category: Optional[str], tags: Optional[Iterable[str]]
-) -> Optional[str]:
-    """Resolve the FCO/FCI/FCF section for an account.
-
-    Tag override wins if any matching tag is set; otherwise fall back
-    to the category default. Returns ``None`` (=> ``no_section``) when
-    nothing matches -- the operator hasn't categorised the account.
-    """
-    if tags:
-        for t in tags:
-            if t in TAG_TO_SECTION:
-                return TAG_TO_SECTION[t]
-    if category and category in DEFAULT_CATEGORY_TO_SECTION:
-        return DEFAULT_CATEGORY_TO_SECTION[category]
-    return None
+def cashflow_section_for(cashflow_category: Optional[str]) -> Optional[str]:
+    """Resolve the FCO/FCI/FCF section from a ``cashflow_category``
+    code. The section is encoded in the prefix (``fco_`` / ``fci_`` /
+    ``fcf_``) so this is a constant-time lookup. Returns ``None`` when
+    no category is set — the DFC surfaces these in its "Não
+    classificadas" tail bucket so they're visible for cleanup."""
+    if not cashflow_category:
+        return None
+    return {
+        "fco": "operacional",
+        "fci": "investimento",
+        "fcf": "financiamento",
+    }.get(cashflow_category.split("_", 1)[0])
 
 
 # ---------------------------------------------------------------------
@@ -237,6 +207,12 @@ def _walk_taxonomy(rows: List[dict]) -> Dict[int, dict]:
     ``views.py``. We do it locally to keep the service self-contained
     (the view-layer helper is private and not all callers go through
     that code path).
+
+    Returns three resolved values per account: ``effective_category``
+    (drives DRE/Balanço), ``effective_tags`` (cross-cutting markers),
+    ``effective_cashflow_category`` (drives DFC). All three follow
+    the same nearest-tagged-ancestor inheritance rule, with tags
+    unioning across ancestors instead of taking the nearest.
     """
     by_id = {r["id"]: r for r in rows}
 
@@ -245,6 +221,15 @@ def _walk_taxonomy(rows: List[dict]) -> Dict[int, dict]:
         while cur is not None:
             if cur.get("report_category"):
                 return cur["report_category"]
+            pid = cur.get("parent_id")
+            cur = by_id.get(pid) if pid is not None else None
+        return None
+
+    def cashflow_category_for(aid: int) -> Optional[str]:
+        cur = by_id.get(aid)
+        while cur is not None:
+            if cur.get("cashflow_category"):
+                return cur["cashflow_category"]
             pid = cur.get("parent_id")
             cur = by_id.get(pid) if pid is not None else None
         return None
@@ -263,6 +248,7 @@ def _walk_taxonomy(rows: List[dict]) -> Dict[int, dict]:
         aid: {
             "effective_category": category_for(aid),
             "effective_tags": tags_for(aid),
+            "effective_cashflow_category": cashflow_category_for(aid),
         }
         for aid in by_id.keys()
     }
@@ -331,7 +317,8 @@ def compute_cashflow_direct(
     # taxonomy + apply ``account_direction`` without N+1.
     rows = list(
         Account.objects.filter(company_id=company_id).values(
-            "id", "name", "parent_id", "report_category", "tags",
+            "id", "name", "parent_id",
+            "report_category", "tags", "cashflow_category",
             "account_direction",
         )
     )
@@ -339,6 +326,8 @@ def compute_cashflow_direct(
     by_id = {r["id"]: r for r in rows}
 
     by_account_rows: List[dict] = []
+    # Bucket key is now (cashflow_category, section) — the DFC tab
+    # groups by its own category, not by the BS/PnL ``report_category``.
     by_category_acc: Dict[Tuple[str, str], dict] = defaultdict(
         lambda: {"amount": Decimal("0"), "accounts": 0}
     )
@@ -353,21 +342,27 @@ def compute_cashflow_direct(
         if signed == 0:
             continue
         tax = tax_map.get(aid, {})
-        cat = tax.get("effective_category") or "<uncategorized>"
+        cf_cat = tax.get("effective_cashflow_category")
+        report_cat = tax.get("effective_category") or "<uncategorized>"
         tags = tax.get("effective_tags") or []
-        section = cashflow_section_for(cat, tags) or "no_section"
+        section = cashflow_section_for(cf_cat) or "no_section"
+        # Bucket label: prefer the explicit cashflow_category; fall
+        # back to ``<no_cashflow_category>`` so unmapped accounts are
+        # visible for the operator to fix via the wiring modal.
+        bucket_cat = cf_cat or "<no_cashflow_category>"
 
         by_account_rows.append(
             {
                 "account_id": aid,
                 "name": info.get("name") or "",
-                "category": cat,
+                "category": bucket_cat,
+                "report_category": report_cat,
                 "tags": tags,
                 "section": section,
                 "amount": str(signed),
             }
         )
-        bucket = by_category_acc[(cat, section)]
+        bucket = by_category_acc[(bucket_cat, section)]
         bucket["amount"] += signed
         bucket["accounts"] += 1
         section_totals[section] += signed

@@ -183,6 +183,47 @@ export const CASHFLOW_SECTION_ORDER: string[] = [
   "no_section",
 ]
 
+/** Cash-flow category labels — mirrors ``CASHFLOW_CATEGORY_CHOICES``
+ *  in ``accounting/services/taxonomy_meta.py``. Section is encoded
+ *  in the prefix (``fco_*`` / ``fci_*`` / ``fcf_*``) so callers can
+ *  derive the section without a separate map. */
+export const CASHFLOW_CATEGORY_LABELS: Record<string, string> = {
+  fco_recebimentos_clientes: "Recebimentos de Clientes",
+  fco_pagamentos_fornecedores: "Pagamentos a Fornecedores",
+  fco_pagamentos_empregados: "Pagamentos a Empregados",
+  fco_impostos_indiretos: "Impostos Indiretos",
+  fco_imposto_renda: "IR/CSLL Pagos",
+  fco_juros: "Juros Pagos/Recebidos",
+  fco_outros: "Outros Recebimentos/Pagamentos",
+  fci_imobilizado: "Imobilizado",
+  fci_intangivel: "Intangível",
+  fci_investimentos_financeiros: "Investimentos Financeiros",
+  fci_outros: "Outros Investimentos",
+  fcf_emprestimos: "Empréstimos e Financiamentos",
+  fcf_capital: "Aporte/Redução de Capital",
+  fcf_dividendos_jcp: "Dividendos e JCP",
+  fcf_outros: "Outros Financiamentos",
+}
+
+/** Ordered list of cash-flow category codes. Renders deterministically
+ *  in the wiring modal dropdown and the DFC tab breakdown. */
+export const CASHFLOW_CATEGORY_CODES_BY_ORDER: string[] = Object.keys(
+  CASHFLOW_CATEGORY_LABELS,
+)
+
+/** Resolve the FCO/FCI/FCF section from a cash-flow category code by
+ *  reading its prefix. Mirrors ``cashflow_section_for`` on the
+ *  backend; clients render the section header (FCO / FCI / FCF) by
+ *  passing the resolved value into ``CASHFLOW_SECTION_LABELS``. */
+export function cashflowSectionFor(code: string | null | undefined): string | null {
+  if (!code) return null
+  const prefix = code.split("_", 1)[0]
+  return prefix === "fco" ? "operacional"
+    : prefix === "fci" ? "investimento"
+    : prefix === "fcf" ? "financiamento"
+    : null
+}
+
 /** Categories that represent flow (income statement / cash flow) --
  *  these should NOT include the ``balance`` anchor in their
  *  contribution sum. The anchor is a lifetime opening balance and

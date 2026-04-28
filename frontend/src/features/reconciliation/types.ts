@@ -847,8 +847,13 @@ export interface AccountLite {
   // (nearest-tagged-ancestor for category, union for tags).
   report_category?: string | null
   tags?: string[] | null
+  /** DFC line classification. Independent of ``report_category``;
+   *  follows the same MPTT inheritance rule (nearest tagged ancestor
+   *  wins). Section (FCO/FCI/FCF) is encoded in the prefix. */
+  cashflow_category?: string | null
   effective_category?: string | null
   effective_tags?: string[] | null
+  effective_cashflow_category?: string | null
   // JE-derived deltas. Each is a Decimal-as-string in JSON; missing
   // means the queryset wasn't annotated (single-row reads). The
   // chart-of-accounts page sums children + own to compute subtree
