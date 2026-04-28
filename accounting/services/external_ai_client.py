@@ -302,7 +302,13 @@ class ExternalAIClient:
             raise ExternalAIError("anthropic package not installed. Run: pip install anthropic")
         
         try:
-            client = anthropic.Anthropic(api_key=self.api_key, timeout=self.timeout)
+            # See _call_openai_with_meta for the rationale on
+            # max_retries=0 -- caller-level retry only.
+            client = anthropic.Anthropic(
+                api_key=self.api_key,
+                timeout=self.timeout,
+                max_retries=0,
+            )
             
             log.info(
                 "[ExternalAI] Calling Anthropic model=%s prompt_len=%d",
@@ -363,7 +369,18 @@ class ExternalAIClient:
             raise ExternalAIError("openai package not installed. Run: pip install openai")
 
         try:
-            client = OpenAI(api_key=self.api_key, timeout=self.timeout)
+            # ``max_retries=0`` makes ``self.timeout`` an absolute
+            # ceiling. The SDK default of 2 retries would otherwise
+            # multiply tail latency by 3x on APITimeoutError -- our
+            # 200s ``generate_template`` budget became 600s in the
+            # wild on 2026-04-28. Caller-level retry is the right
+            # place for retry policy because only the caller knows
+            # whether retrying is desirable (cost, idempotency).
+            client = OpenAI(
+                api_key=self.api_key,
+                timeout=self.timeout,
+                max_retries=0,
+            )
             messages = []
             if system_prompt:
                 messages.append({"role": "system", "content": system_prompt})
@@ -428,7 +445,13 @@ class ExternalAIClient:
             raise ExternalAIError("anthropic package not installed. Run: pip install anthropic")
 
         try:
-            client = anthropic.Anthropic(api_key=self.api_key, timeout=self.timeout)
+            # See _call_openai_with_meta for the rationale on
+            # max_retries=0 -- caller-level retry only.
+            client = anthropic.Anthropic(
+                api_key=self.api_key,
+                timeout=self.timeout,
+                max_retries=0,
+            )
             message = client.messages.create(
                 model=self.model,
                 max_tokens=self.max_tokens,
