@@ -325,10 +325,10 @@ export interface JournalEntry {
   nf_number?: string | null
   erp_id?: string | null
   /** Surfaced by JournalEntryListSerializer for drill-down rows on the
-   *  Demonstrativos page. Decimal-as-string per usual; one side is
-   *  always 0 / null. */
-  debit_amount?: string | number | null
-  credit_amount?: string | number | null
+   *  Demonstrativos page. DRF DecimalField always emits Decimal as
+   *  string; one side is always 0 / null. */
+  debit_amount?: string | null
+  credit_amount?: string | null
   /** JE.date — the entry's accrual date, distinct from the
    *  transaction's own date (used as the cash bank-leg date elsewhere). */
   date?: string | null
