@@ -510,8 +510,63 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             entity_id = int(params.get('entity') or 0) or None
         except Exception:
             entity_id = None
+        # ``basis=cash`` rewrites the JE-aggregation scope from
+        # "transaction.date inside [date_from, date_to]" to "transaction
+        # has bank-side cash in that window". This is what powers the
+        # DRE accrual/cash toggle: same per-account ``own_*_delta``
+        # field shape, different scope. ``accrual`` (default) keeps
+        # the existing behaviour. The cash branch needs both date
+        # bounds to be meaningful; if either is missing we fall back
+        # to accrual to avoid silently returning empty results.
+        basis = (params.get('basis') or 'accrual').strip().lower()
+        if basis not in ('accrual', 'cash'):
+            basis = 'accrual'
+        if basis == 'cash' and (date_from is None or date_to is None):
+            basis = 'accrual'
+        ctx['basis'] = basis
 
         delta_map: dict[int, dict] = {}
+        if basis == 'cash':
+            # Delegate to the cashflow service. Direction sign is
+            # already applied there, matching the accrual code path
+            # below. ``own_unreconciled_delta`` is set to "0" by the
+            # service -- the cash lens isn't about reconciliation.
+            try:
+                from accounting.services.cashflow_service import (
+                    compute_cash_basis_book_deltas,
+                )
+                tenant = getattr(self.request, 'tenant', None)
+                cash_company_id = tenant.id if (tenant and tenant != 'all') else None
+                if cash_company_id is not None:
+                    delta_map = compute_cash_basis_book_deltas(
+                        cash_company_id,
+                        date_from,
+                        date_to,
+                        entity_id=entity_id,
+                        include_pending=(params.get('include_pending') or '')
+                        .strip()
+                        .lower()
+                        in ('1', 'true', 'yes', 't', 'y'),
+                    )
+            except Exception:
+                delta_map = {}
+            ctx['account_delta_map'] = delta_map
+            # Cash basis is intrinsically flow-only; the anchor
+            # (lifetime opening) doesn't belong in a cash-period
+            # balance. The frontend already drops anchors for DRE
+            # flow categories independently, but flipping this flag
+            # makes ``current_balance`` flow-only too -- consistent
+            # with what other consumers of the serializer expect.
+            ctx['exclude_anchor'] = True
+            try:
+                raw = (self.request.query_params or {}).get('include_pending', '')
+                ctx['include_pending'] = (raw or '').strip().lower() in (
+                    '1', 'true', 'yes', 't', 'y'
+                )
+            except Exception:
+                ctx['include_pending'] = False
+            return ctx
+
         try:
             zero = Value(
                 Decimal('0'),
@@ -644,6 +699,63 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     def bulk_delete(self, request, *args, **kwargs):
         ids = request.data  # Assuming request.data is a list of IDs
         return generic_bulk_delete(self, ids)
+
+    @action(methods=['get'], detail=False, url_path='cashflow')
+    def cashflow(self, request, *args, **kwargs):
+        """Direct-method DFC: cash flow grouped by ``effective_category``
+        and rolled up into FCO / FCI / FCF.
+
+        Query params:
+          * ``date_from`` / ``date_to`` (``YYYY-MM-DD``, both required)
+          * ``entity`` (FK, optional)
+          * ``include_pending`` (truthy/falsy, default false)
+
+        The service handles the heavy lifting -- this view just resolves
+        the tenant scope and parses params. See
+        ``accounting/services/cashflow_service.py`` for the math
+        (per-transaction weighting, taxonomy resolution, sign convention).
+        """
+        from accounting.services.cashflow_service import compute_cashflow_direct
+        from datetime import date as _date
+
+        def _parse_date(s):
+            try:
+                return _date.fromisoformat((s or '').strip()) if s else None
+            except Exception:
+                return None
+
+        params = request.query_params or {}
+        date_from = _parse_date(params.get('date_from'))
+        date_to = _parse_date(params.get('date_to'))
+        if date_from is None or date_to is None:
+            return Response(
+                {"detail": "date_from and date_to are required (YYYY-MM-DD)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            entity_id = int(params.get('entity') or 0) or None
+        except Exception:
+            entity_id = None
+        include_pending = (params.get('include_pending') or '').strip().lower() in (
+            '1', 'true', 'yes', 't', 'y'
+        )
+
+        tenant = getattr(request, 'tenant', None)
+        if not tenant or tenant == 'all':
+            return Response(
+                {"detail": "Tenant scope required (subdomain)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        company_id = tenant.id
+
+        payload = compute_cashflow_direct(
+            company_id,
+            date_from,
+            date_to,
+            entity_id=entity_id,
+            include_pending=include_pending,
+        )
+        return Response(payload)
 
     @action(methods=['get'], detail=False, url_path='export_xlsx')
     def export_xlsx(self, request, *args, **kwargs):

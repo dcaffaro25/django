@@ -153,3 +153,50 @@ export const TAG_LABELS: Record<string, string> = {
 export const CATEGORY_CODES_BY_ORDER: string[] = Object.entries(REPORT_CATEGORY_STYLES)
   .sort(([, a], [, b]) => a.order - b.order)
   .map(([code]) => code)
+
+/** Cash flow section labels (FCO/FCI/FCF/no_section). Mirrors
+ *  ``CASHFLOW_SECTIONS`` in ``accounting/services/cashflow_service.py``.
+ *  Re-categorisation rules (category default + tag overrides) live on
+ *  the backend; this file only owns presentation strings. */
+export const CASHFLOW_SECTION_LABELS: Record<string, string> = {
+  operacional: "Atividades Operacionais",
+  investimento: "Atividades de Investimento",
+  financiamento: "Atividades de Financiamento",
+  no_section: "Não classificadas",
+}
+
+/** Short labels (sparkline headers, narrow chips). */
+export const CASHFLOW_SECTION_SHORT: Record<string, string> = {
+  operacional: "FCO",
+  investimento: "FCI",
+  financiamento: "FCF",
+  no_section: "—",
+}
+
+/** Display order for the DFC tab. ``no_section`` always last so the
+ *  uncategorised tail surfaces visibly without polluting the main
+ *  rollup. */
+export const CASHFLOW_SECTION_ORDER: string[] = [
+  "operacional",
+  "investimento",
+  "financiamento",
+  "no_section",
+]
+
+/** Categories that represent flow (income statement / cash flow) --
+ *  these should NOT include the ``balance`` anchor in their
+ *  contribution sum. The anchor is a lifetime opening balance and
+ *  doesn't belong in a flow report (DRE is a pure flow; DFC is the
+ *  flow of cash). The Balanço categories (ativo_*, passivo_*,
+ *  patrimonio_liquido) keep the anchor since the position IS the
+ *  anchor + post-anchor flows. */
+export const FLOW_CATEGORIES: ReadonlySet<string> = new Set<string>([
+  "receita_bruta",
+  "deducao_receita",
+  "custo",
+  "despesa_operacional",
+  "receita_financeira",
+  "despesa_financeira",
+  "outras_receitas",
+  "imposto_sobre_lucro",
+])

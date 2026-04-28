@@ -314,6 +314,12 @@ export function useAccounts(params?: {
   date_from?: string
   date_to?: string
   entity?: number
+  /** ``accrual`` (default) keeps the legacy txn.date-scoped JE
+   *  aggregation. ``cash`` swaps it for the bank-cleared-date scope
+   *  (DRE cash basis). Backend rejects ``cash`` without both date
+   *  bounds and silently falls back to accrual; we mirror that here
+   *  by only sending the param when it's meaningful. */
+  basis?: "accrual" | "cash"
 }) {
   const sub = useSub()
   // Default ``include_pending=false`` matches the backend default
@@ -321,6 +327,10 @@ export function useAccounts(params?: {
   // see pending JEs included (Demonstrativos for tenants like Evolat
   // whose books are entirely pending) pass ``{ include_pending: true }``.
   const includePending = !!params?.include_pending
+  const basis: "accrual" | "cash" =
+    params?.basis === "cash" && params?.date_from && params?.date_to
+      ? "cash"
+      : "accrual"
   // Cache key includes every filter so toggling any of them re-fetches
   // and stale results from a wider scope don't leak through.
   const filterKey = {
@@ -328,6 +338,7 @@ export function useAccounts(params?: {
     date_from: params?.date_from || null,
     date_to: params?.date_to || null,
     entity: params?.entity || null,
+    basis,
   }
   return useQuery({
     queryKey: ["recon", sub, "accounts", filterKey],
@@ -338,8 +349,44 @@ export function useAccounts(params?: {
         date_from: params?.date_from || undefined,
         date_to: params?.date_to || undefined,
         entity: params?.entity || undefined,
+        basis,
       }),
     enabled: !!sub,
+    staleTime: 10 * 60 * 1000,
+  })
+}
+
+/**
+ * Direct-method cash flow statement. Wraps
+ * ``GET /api/accounts/cashflow/`` -- the backend handles the per-
+ * transaction weighting and FCO/FCI/FCF rollup, so this hook is just
+ * a fetch + cache. Disabled until both date bounds are present (the
+ * endpoint 400s without them).
+ */
+export function useCashflow(params: {
+  date_from: string | undefined
+  date_to: string | undefined
+  entity?: number
+  include_pending?: boolean
+}) {
+  const sub = useSub()
+  const enabled = !!sub && !!params.date_from && !!params.date_to
+  const filterKey = {
+    date_from: params.date_from || null,
+    date_to: params.date_to || null,
+    entity: params.entity || null,
+    include_pending: !!params.include_pending,
+  }
+  return useQuery({
+    queryKey: ["recon", sub, "cashflow", filterKey],
+    queryFn: () =>
+      reconApi.getCashflow({
+        date_from: params.date_from as string,
+        date_to: params.date_to as string,
+        entity: params.entity,
+        include_pending: !!params.include_pending,
+      }),
+    enabled,
     staleTime: 10 * 60 * 1000,
   })
 }

@@ -355,6 +355,13 @@ export const reconApi = {
      *  balance (anchor is whole-tenant, not per-entity) and returns
      *  flow-only ``current_balance``. */
     entity?: number
+    /** Accounting basis for ``own_*_delta`` aggregation. ``accrual``
+     *  (default) keeps the long-standing behaviour: a JE counts in
+     *  the period iff its transaction date falls in [date_from,
+     *  date_to]. ``cash`` reroutes the scope through the bank-side
+     *  cash leg date and weights book legs proportionally for
+     *  multi-period transactions. */
+    basis?: "accrual" | "cash"
   }) =>
     api.tenant
       // The Phase 1 N+1 fix didn't fully eliminate FlexibleRelatedField
@@ -382,6 +389,33 @@ export const reconApi = {
         },
       )
       .then(unwrapList<import("./types").AccountLite>),
+
+  /**
+   * Direct-method DFC. Returns cash flow grouped by
+   * ``effective_category`` and rolled into FCO / FCI / FCF, with the
+   * per-transaction proportional-allocation logic implemented on the
+   * backend (see ``accounting/services/cashflow_service.py``).
+   *
+   * The frontend just renders the payload -- all weighting, taxonomy
+   * resolution and sign correction happens server-side.
+   */
+  getCashflow: (params: {
+    date_from: string
+    date_to: string
+    entity?: number
+    include_pending?: boolean
+  }) =>
+    api.tenant.get<import("./types").CashflowDirectMethod>(
+      "/api/accounts/cashflow/",
+      {
+        params: {
+          ...params,
+          ...(params.include_pending != null
+            ? { include_pending: params.include_pending ? "1" : "0" }
+            : {}),
+        },
+      },
+    ),
 
   createAccount: (body: Partial<import("./types").AccountLite> & { company?: number; parent?: number | null }) =>
     api.tenant.post<import("./types").AccountLite>("/api/accounts/", body),

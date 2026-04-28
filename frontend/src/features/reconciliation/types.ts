@@ -763,6 +763,54 @@ export interface EmbeddingJob {
   error?: string | null
 }
 
+/** Direct-method cash flow statement payload (from
+ *  ``GET /api/accounts/cashflow/``). Amounts are decimal strings to
+ *  preserve precision over the wire; the renderer parses with
+ *  ``Number(...)`` since Brazilian-real precision (2 dp) is well
+ *  inside Number's safe range for any realistic period total. */
+export type CashflowSection =
+  | "operacional"
+  | "investimento"
+  | "financiamento"
+  | "no_section"
+
+export interface CashflowDirectCategoryRow {
+  /** Effective category code (``receita_bruta``, ``despesa_operacional``, ...).
+   *  ``"<uncategorized>"`` when the account has no taxonomy set -- those
+   *  surface in the ``no_section`` bucket so operators can clean them up. */
+  category: string
+  section: CashflowSection
+  /** Signed amount in tenant currency. Positive = cash in, negative = cash out. */
+  amount: string
+  account_count: number
+}
+
+export interface CashflowDirectAccountRow {
+  account_id: number
+  name: string
+  category: string
+  tags: string[]
+  section: CashflowSection
+  amount: string
+}
+
+export interface CashflowDirectMethod {
+  date_from: string | null
+  date_to: string | null
+  include_pending: boolean
+  entity_id: number | null
+  by_category: CashflowDirectCategoryRow[]
+  by_section: {
+    operacional: string
+    investimento: string
+    financiamento: string
+    no_section: string
+    /** Sum across all sections (== net change in cash for the period). */
+    net_change_in_cash: string
+  }
+  by_account: CashflowDirectAccountRow[]
+}
+
 export interface AccountLite {
   id: number
   name: string
