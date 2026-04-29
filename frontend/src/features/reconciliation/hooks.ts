@@ -279,6 +279,29 @@ export function useJournalEntries(params?: Parameters<typeof reconApi.listJourna
 }
 
 /**
+ * Pre-aggregated DRE / Balanço / DFC payload for the Demonstrativos
+ * page. Replaces the ``useAccounts() + summariseByCategory()``
+ * client-side aggregation that loaded a 3MB account list to compute
+ * 14 category buckets. Now the backend does the math and ships a
+ * ~30KB payload — sub-second load instead of 60-90s.
+ */
+export function useFinancialStatements(params: {
+  date_from?: string
+  date_to?: string
+  entity?: number
+  include_pending?: boolean
+  basis?: "accrual" | "cash"
+}) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["recon", sub, "financial_statements", params],
+    queryFn: () => reconApi.financialStatements(params),
+    enabled: !!sub,
+    staleTime: 60 * 1000,
+  })
+}
+
+/**
  * Slim per-account JE drill for the Demonstrativos page. Hits
  * ``/api/journal_entries/drill/`` (hard-capped at 500 rows, flat
  * dict per row), which is two orders of magnitude faster than the
@@ -338,6 +361,21 @@ export function useEntities() {
     queryFn: reconApi.listEntities,
     enabled: !!sub,
     staleTime: 10 * 60 * 1000,
+  })
+}
+
+/**
+ * Lazy single-account fetch. Used by the Demonstrativos wiring modal
+ * so the report tabs don't have to keep a 356-row account list in
+ * memory just to render an edit target on click.
+ */
+export function useAccount(id: number | null | undefined) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["recon", sub, "account", id],
+    queryFn: () => reconApi.getAccount(id as number),
+    enabled: !!sub && id != null,
+    staleTime: 60 * 1000,
   })
 }
 

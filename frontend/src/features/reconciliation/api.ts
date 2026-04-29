@@ -245,6 +245,35 @@ export const reconApi = {
       .then(unwrapList<BankTransaction>),
 
   /**
+   * Pre-aggregated financial statements (DRE / Balanço / DFC).
+   * Returns ~30KB instead of the ~3MB ``/api/accounts/`` payload the
+   * Demonstrativos page used to load and aggregate client-side.
+   * Backed by ``compute_financial_statements`` on the server.
+   */
+  financialStatements: (params: {
+    date_from?: string
+    date_to?: string
+    entity?: number
+    include_pending?: boolean
+    basis?: "accrual" | "cash"
+  }) =>
+    api.tenant.get<import("./types").FinancialStatementsPayload>(
+      "/api/accounts/financial-statements/",
+      {
+        params: {
+          ...(params.date_from ? { date_from: params.date_from } : {}),
+          ...(params.date_to ? { date_to: params.date_to } : {}),
+          ...(params.entity != null ? { entity: params.entity } : {}),
+          ...(params.include_pending
+            ? { include_pending: "1" }
+            : {}),
+          ...(params.basis ? { basis: params.basis } : {}),
+        },
+        timeout: 60_000,
+      },
+    ),
+
+  /**
    * Lightweight journal-entry drill for the Demonstrativos page.
    * Hits ``/api/journal_entries/drill/`` which hard-caps at 500 rows
    * and returns a flat dict per row — sub-second even on accounts
@@ -448,6 +477,12 @@ export const reconApi = {
         },
       },
     ),
+
+  /** Single account fetch — used by the Demonstrativos wiring modal
+   *  to load the editing target on demand instead of holding the full
+   *  accounts list in memory. */
+  getAccount: (id: number) =>
+    api.tenant.get<import("./types").AccountLite>(`/api/accounts/${id}/`),
 
   createAccount: (body: Partial<import("./types").AccountLite> & { company?: number; parent?: number | null }) =>
     api.tenant.post<import("./types").AccountLite>("/api/accounts/", body),

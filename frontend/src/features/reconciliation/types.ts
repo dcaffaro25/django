@@ -822,6 +822,56 @@ export interface CashflowDirectMethod {
   by_account: CashflowDirectAccountRow[]
 }
 
+/** Drill-down account row attached to every category in
+ *  ``FinancialStatementsPayload``. ``amount`` is Decimal-as-string. */
+export interface FinancialStatementsAccount {
+  id: number
+  name: string
+  amount: string
+}
+
+/** One DRE/Balanço category bucket. */
+export interface FinancialStatementsCategory {
+  key: string
+  label: string
+  amount: string
+  account_count: number
+  accounts: FinancialStatementsAccount[]
+}
+
+/** One DFC sub-line bucket. ``section`` is one of
+ *  ``"operacional" | "investimento" | "financiamento" | "no_section"``. */
+export interface FinancialStatementsCashflowCategory {
+  key: string
+  label: string
+  section: string
+  amount: string
+  account_count: number
+  accounts: FinancialStatementsAccount[]
+}
+
+/** Top-level payload of ``GET /api/accounts/financial-statements/``.
+ *  Drives DRE / Balanço / DFC tabs without the frontend having to
+ *  load the full account list. ``cashflow`` is ``null`` when the
+ *  request didn't supply a date range (DFC only makes sense with one). */
+export interface FinancialStatementsPayload {
+  currency: string
+  period: { date_from: string | null; date_to: string | null }
+  include_pending: boolean
+  basis: "accrual" | "cash"
+  entity_id: number | null
+  categories: FinancialStatementsCategory[]
+  cashflow: {
+    by_section: Record<string, string>
+    by_category: FinancialStatementsCashflowCategory[]
+  } | null
+  /** Lifetime cash balance — sum of leaf accounts tagged ``cash`` or
+   *  ``bank_account``, ignoring date / entity scope. Drives the
+   *  "Saldo de Caixa (atual)" KPI on the DFC tab so it doesn't need
+   *  to fetch the full accounts list. Decimal-as-string. */
+  cash_total: string
+}
+
 export interface AccountLite {
   id: number
   name: string

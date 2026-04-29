@@ -764,6 +764,92 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         ids = request.data  # Assuming request.data is a list of IDs
         return generic_bulk_delete(self, ids)
 
+    @action(methods=['get'], detail=False, url_path='financial-statements')
+    def financial_statements(self, request, *args, **kwargs):
+        """Pre-aggregated DRE / Balanço / DFC payload.
+
+        The Demonstrativos page used to call ``/api/accounts/`` and sum
+        category buckets client-side -- a 3MB payload + 60-90s wait on
+        Evolat. This endpoint returns the same data pre-aggregated by
+        ``effective_category`` (DRE/Balanço) and
+        ``effective_cashflow_category`` (DFC sub-lines), shaving 99%
+        off the wire size and moving the math server-side where it
+        belongs.
+
+        Query params:
+          * ``date_from`` / ``date_to`` (``YYYY-MM-DD``, optional;
+            when both are missing, anchor balances dominate the result
+            so the response is essentially Balanço-only)
+          * ``entity`` (FK, optional)
+          * ``include_pending`` (truthy/falsy, default false)
+          * ``basis`` (``accrual`` | ``cash``, default accrual)
+
+        Output shape:
+            {
+              "currency": "BRL",
+              "period": { "date_from": "...", "date_to": "..." },
+              "include_pending": bool, "basis": "accrual"|"cash",
+              "categories": [
+                { "key", "label", "amount", "account_count",
+                  "accounts": [{ "id", "name", "amount" }] },
+                ...
+              ],
+              "cashflow": {
+                "by_section": {operacional, investimento, financiamento,
+                               net_change_in_cash, no_section},
+                "by_category": [
+                  { "key", "label", "section", "amount",
+                    "account_count", "accounts": [...] },
+                ],
+              } | null
+            }
+
+        Cashflow is null when the date range isn't fully specified --
+        the direct method only makes sense with a window.
+        """
+        from accounting.services.financial_statements import (
+            compute_financial_statements,
+        )
+        from datetime import date as _date
+
+        def _parse_date(s):
+            try:
+                return _date.fromisoformat((s or '').strip()) if s else None
+            except Exception:
+                return None
+
+        params = request.query_params or {}
+        date_from = _parse_date(params.get('date_from'))
+        date_to = _parse_date(params.get('date_to'))
+        try:
+            entity_id = int(params.get('entity') or 0) or None
+        except Exception:
+            entity_id = None
+        include_pending = (params.get('include_pending') or '').strip().lower() in (
+            '1', 'true', 'yes', 't', 'y'
+        )
+        basis = (params.get('basis') or 'accrual').strip().lower()
+        if basis not in ('accrual', 'cash'):
+            basis = 'accrual'
+
+        tenant = getattr(request, 'tenant', None)
+        if not tenant or tenant == 'all':
+            return Response(
+                {"detail": "Tenant scope required (subdomain)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        company_id = tenant.id
+
+        payload = compute_financial_statements(
+            company_id,
+            date_from=date_from,
+            date_to=date_to,
+            entity_id=entity_id,
+            include_pending=include_pending,
+            basis=basis,
+        )
+        return Response(payload)
+
     @action(methods=['get'], detail=False, url_path='cashflow')
     def cashflow(self, request, *args, **kwargs):
         """Direct-method DFC: cash flow grouped by ``effective_category``

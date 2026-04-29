@@ -2,17 +2,22 @@ import { useMemo, useEffect, useRef, useState } from "react"
 import { Link, Outlet, useSearchParams } from "react-router-dom"
 import { FileBarChart, Sparkles, Wallet, Receipt, ListChecks, ChevronLeft, ChevronRight, ChevronDown, Pencil } from "lucide-react"
 import { TabbedShell } from "@/components/layout/TabbedShell"
-import { useAccounts, useCashflow, useEntities } from "@/features/reconciliation"
+import {
+  useAccount,
+  useEntities,
+  useFinancialStatements,
+} from "@/features/reconciliation"
 import {
   CASHFLOW_CATEGORY_LABELS,
   CASHFLOW_SECTION_LABELS,
   CASHFLOW_SECTION_ORDER,
   CASHFLOW_SECTION_SHORT,
-  FLOW_CATEGORIES,
-  REPORT_CATEGORY_STYLES,
 } from "@/features/reconciliation/taxonomy_labels"
 import { cn, formatCurrency } from "@/lib/utils"
-import type { AccountLite, CashflowDirectMethod } from "@/features/reconciliation/types"
+import type {
+  FinancialStatementsCategory,
+  FinancialStatementsPayload,
+} from "@/features/reconciliation/types"
 import { DrillableLine } from "./components/DrillableLine"
 import { AccountWiringModal } from "./components/AccountWiringModal"
 import { JournalEntriesPanel } from "./components/JournalEntriesPanel"
@@ -394,77 +399,13 @@ export function StandardReportsPage() {
 // Shared helpers
 // ---------------------------------------------------------------------
 
-interface CategorySum {
-  category: string
-  label: string
-  total: number
-  /** Per-account contributions to this category. ``amount`` matches
-   *  the field DrillableLine consumes (see ``AccountContribution``);
-   *  using the same name end-to-end avoids a translation step in the
-   *  hot path. */
-  accounts: Array<{ id: number; name: string; amount: number }>
-}
-
-/** Group accounts by ``effective_category`` and sum a per-account
- *  *contribution* into the bucket.
- *
- *  Two rules govern what enters the contribution:
- *
- *  * **Anchor** (``balance`` field, the operator-set opening figure)
- *    is counted only at leaves AND only for non-flow categories.
- *    Parents would double-count (their anchor is the rollup of their
- *    children's anchors). DRE-flow categories — revenue, expense,
- *    cost, etc. — must NOT include the anchor either: the DRE is a
- *    pure flow report, so a non-zero ``balance`` on a revenue leaf
- *    (very common on imported charts where the opening figures
- *    represent cumulative-to-date) would dominate the totals and
- *    make the date filter look broken. The set of flow categories
- *    lives in ``taxonomy_labels.FLOW_CATEGORIES``.
- *  * **JE flow** (``own_posted_delta`` plus ``own_pending_delta``
- *    when the toggle is on) is counted at every level — Evolat
- *    books JEs to mid-tree parents (e.g. "Venda De Produtos"
- *    level=3 with 4,342 pending JEs and no children-with-JEs), so a
- *    leaves-only rule silently dropped revenue and left the DRE at
- *    R$ 0,00.
- *
- *  We compute against ``balance`` + own deltas directly instead of
- *  deriving anchor from ``current_balance − own_flow``. The deltas
- *  the backend returns are already sign-corrected by
- *  ``account_direction`` (positive = balance increased), while
- *  ``balance`` is stored raw — but for the categories that drive
- *  the DRE / DFC (revenue / expense), anchors no longer enter the
- *  sum so the sign mismatch is moot. */
-function summariseByCategory(
-  accounts: AccountLite[],
-  includePending: boolean,
-): Map<string, CategorySum> {
-  const childSet = new Set<number>()
-  for (const a of accounts) if (a.parent != null) childSet.add(a.parent)
-  const isLeaf = (id: number) => !childSet.has(id)
-
-  const map = new Map<string, CategorySum>()
-  for (const a of accounts) {
-    const cat = a.effective_category
-    if (!cat) continue
-    const posted = Number(a.own_posted_delta ?? 0) || 0
-    const pending = includePending ? Number(a.own_pending_delta ?? 0) || 0 : 0
-    const ownFlow = posted + pending
-    const rawAnchor = Number(a.balance ?? 0) || 0
-    const includeAnchor = isLeaf(a.id) && !FLOW_CATEGORIES.has(cat)
-    const contribution = (includeAnchor ? rawAnchor : 0) + ownFlow
-    if (contribution === 0) continue
-    const bucket = map.get(cat) ?? {
-      category: cat,
-      label: REPORT_CATEGORY_STYLES[cat]?.label ?? cat,
-      total: 0,
-      accounts: [],
-    }
-    bucket.total += contribution
-    bucket.accounts.push({ id: a.id, name: a.name, amount: contribution })
-    map.set(cat, bucket)
-  }
-  return map
-}
+// ``summariseByCategory`` was the client-side aggregation that ran
+// over the full accounts list to compute the 14 DRE/Balanço buckets.
+// Removed in favor of ``useFinancialStatements``, which gets the same
+// data already aggregated server-side for ~30KB on the wire instead
+// of ~3MB. The same FLOW_CATEGORIES rule (no anchor on income-
+// statement categories) lives in
+// ``accounting/services/financial_statements.py:FLOW_CATEGORIES``.
 
 function StatementLine({
   label, value, currency, bold, indent, negative,
@@ -531,29 +472,25 @@ function NotEnoughDataNotice() {
 
 export function DreTab() {
   const { includePending, date_from, date_to, entity, basis } = useReportFilters()
-  const { data: accounts = [], isLoading } = useAccounts({
+  const { data, isLoading } = useFinancialStatements({
     include_pending: includePending,
     date_from,
     date_to,
     entity,
     basis,
   })
-  const cats = useMemo(
-    () => summariseByCategory(accounts, includePending),
-    [accounts, includePending],
-  )
-  const currency = accounts[0]?.currency?.code ?? "BRL"
-  const wiring = useAccountWiring(accounts)
+  const wiring = useAccountWiring()
 
   if (isLoading) return <StatementSkeleton />
-  if (cats.size === 0) return <NotEnoughDataNotice />
+  if (!data || data.categories.length === 0) return <NotEnoughDataNotice />
 
-  // Pull the DRE-relevant categories. Account_direction handles sign
-  // (revenue accounts have direction=-1 so their natural balance is
-  // already a negative debit-stored number; we display them as
-  // positive revenue by the math below).
-  const get = (k: string) => cats.get(k)?.total ?? 0
-  const accs = (k: string) => cats.get(k)?.accounts ?? []
+  const currency = data.currency
+  const byKey = indexCategories(data.categories)
+
+  // Pull the DRE-relevant categories. Account_direction is already
+  // applied server-side, so revenue accounts come out positive.
+  const get = (k: string) => byKey.get(k)?.amount ?? 0
+  const accs = (k: string) => byKey.get(k)?.accounts ?? []
   const receitaBruta = get("receita_bruta")
   const deducoes = get("deducao_receita")
   const receitaLiquida = receitaBruta + deducoes  // deducoes natural sign already negative
@@ -569,13 +506,7 @@ export function DreTab() {
   const impostoLucro = get("imposto_sobre_lucro")
   const lucroLiq = lair + impostoLucro
 
-  // Common props for every drillable category line. The DRE pipes the
-  // active period + entity through to the JE drill so an expanded row
-  // shows lançamentos scoped to exactly the report's view.
-  const drill = {
-    date_from, date_to, entity,
-    onEditAccount: wiring.open,
-  }
+  const drill = { date_from, date_to, entity, onEditAccount: wiring.open }
 
   return (
     <div className="space-y-2">
@@ -608,28 +539,63 @@ export function DreTab() {
         <DrillableLine label="(-) IRPJ + CSLL" value={impostoLucro} currency={currency} indent={1} negative accounts={accs("imposto_sobre_lucro")} {...drill} />
         <StatementLine label="Lucro Líquido do Exercício" value={lucroLiq} currency={currency} bold />
       </div>
-      <AccountWiringModal account={wiring.account} open={wiring.isOpen} onClose={wiring.close} />
+      <WiringModalController wiring={wiring} />
     </div>
   )
 }
 
-/** Tiny hook that pairs the wiring-modal state with a lookup into the
- *  active accounts list. Every report tab uses it the same way:
- *  ``wiring.open(id)`` from a row, ``<AccountWiringModal {...wiring} />``
- *  at the bottom of the tree. Keeps the modal owned by the tab that
- *  fetched the accounts, so saves invalidate the same query that
- *  populates the report. */
-function useAccountWiring(accounts: AccountLite[]) {
+/** Pre-index the category array by key for O(1) lookup. Each entry
+ *  carries the parsed amount + the AccountContribution-shaped accounts
+ *  list (DrillableLine consumes ``amount`` per row, so we map the
+ *  Decimal-string ``amount`` into a number once here). */
+function indexCategories(
+  categories: FinancialStatementsCategory[],
+): Map<string, { amount: number; accounts: Array<{ id: number; name: string; amount: number }> }> {
+  const m = new Map<string, { amount: number; accounts: Array<{ id: number; name: string; amount: number }> }>()
+  for (const c of categories) {
+    m.set(c.key, {
+      amount: Number(c.amount) || 0,
+      accounts: c.accounts.map((a) => ({
+        id: a.id,
+        name: a.name,
+        amount: Number(a.amount) || 0,
+      })),
+    })
+  }
+  return m
+}
+
+/** Wiring-modal state owned by each report tab. The modal target is
+ *  loaded lazily via ``useAccount(id)`` so the report tab doesn't
+ *  have to fetch the full 356-row chart just to support inline edits.
+ *  Returns ``isOpen``, ``account`` (null while loading or no target),
+ *  ``open(id)`` and ``close()``. */
+function useAccountWiring() {
   const [editingId, setEditingId] = useState<number | null>(null)
-  const account = editingId
-    ? accounts.find((a) => a.id === editingId) ?? null
-    : null
   return {
+    editingId,
     isOpen: editingId != null,
-    account,
     open: (id: number) => setEditingId(id),
     close: () => setEditingId(null),
   }
+}
+
+/** Renders the wiring modal with a lazy single-account fetch. We keep
+ *  the modal mounted only when there's a target so the fetch doesn't
+ *  fire on every page load. */
+function WiringModalController({
+  wiring,
+}: {
+  wiring: ReturnType<typeof useAccountWiring>
+}) {
+  const { data: account } = useAccount(wiring.editingId)
+  return (
+    <AccountWiringModal
+      account={account ?? null}
+      open={wiring.isOpen}
+      onClose={wiring.close}
+    />
+  )
 }
 
 // ---------------------------------------------------------------------
@@ -637,24 +603,22 @@ function useAccountWiring(accounts: AccountLite[]) {
 // ---------------------------------------------------------------------
 
 export function BalancoTab() {
-  const { includePending, date_from, date_to, entity } = useReportFilters()
-  const { data: accounts = [], isLoading } = useAccounts({
+  const { includePending, date_from, date_to, entity, basis } = useReportFilters()
+  const { data, isLoading } = useFinancialStatements({
     include_pending: includePending,
     date_from,
     date_to,
     entity,
+    basis,
   })
-  const cats = useMemo(
-    () => summariseByCategory(accounts, includePending),
-    [accounts, includePending],
-  )
-  const currency = accounts[0]?.currency?.code ?? "BRL"
-  const wiring = useAccountWiring(accounts)
+  const wiring = useAccountWiring()
   if (isLoading) return <StatementSkeleton />
-  if (cats.size === 0) return <NotEnoughDataNotice />
+  if (!data || data.categories.length === 0) return <NotEnoughDataNotice />
 
-  const get = (k: string) => cats.get(k)?.total ?? 0
-  const accs = (k: string) => cats.get(k)?.accounts ?? []
+  const currency = data.currency
+  const byKey = indexCategories(data.categories)
+  const get = (k: string) => byKey.get(k)?.amount ?? 0
+  const accs = (k: string) => byKey.get(k)?.accounts ?? []
   const ativoCirc = get("ativo_circulante")
   const ativoNc = get("ativo_nao_circulante")
   const totalAtivo = ativoCirc + ativoNc
@@ -700,7 +664,7 @@ export function BalancoTab() {
           </>
         )}
       </div>
-      <AccountWiringModal account={wiring.account} open={wiring.isOpen} onClose={wiring.close} />
+      <WiringModalController wiring={wiring} />
     </div>
   )
 }
@@ -710,40 +674,24 @@ export function BalancoTab() {
 // ---------------------------------------------------------------------
 
 /** Direct-method DFC tab. Pulls the pre-aggregated payload from the
- *  backend (``GET /api/accounts/cashflow/``) and renders FCO / FCI /
- *  FCF sections, each broken down by ``effective_category``.
+ *  backend (``GET /api/accounts/financial-statements/``) and renders
+ *  FCO / FCI / FCF sections, each broken down by
+ *  ``effective_cashflow_category``.
  *
  *  Math is server-side (per-transaction proportional weighting +
  *  taxonomy resolution + sign correction). The frontend just sorts,
  *  groups, formats, and lets the operator drill into the per-account
  *  rows that drove each category. */
 export function DfcTab() {
-  const { includePending, date_from, date_to, entity } = useReportFilters()
-  const { data, isLoading, isError } = useCashflow({
-    date_from,
-    date_to,
-    entity,
-    include_pending: includePending,
-  })
-
-  // Current cash balance summary (kept from the previous tab as a
-  // reference snapshot — useful next to the period flow). Pulled from
-  // the same accounts list the other tabs use; cheap because the
-  // query is shared via React Query's cache.
-  const { data: accounts = [] } = useAccounts({
+  const { includePending, date_from, date_to, entity, basis } = useReportFilters()
+  const { data, isLoading, isError } = useFinancialStatements({
     include_pending: includePending,
     date_from,
     date_to,
     entity,
+    basis,
   })
-  const cashTotal = accounts.reduce((s, a) => {
-    const tags = a.effective_tags ?? []
-    if (!tags.includes("cash") && !tags.includes("bank_account")) return s
-    const hasChildren = accounts.some((c) => c.parent === a.id)
-    if (hasChildren) return s
-    return s + (Number(a.current_balance ?? 0) || 0)
-  }, 0)
-  const currency = accounts[0]?.currency?.code ?? "BRL"
+  const wiring = useAccountWiring()
 
   if (!date_from || !date_to) {
     return (
@@ -758,16 +706,17 @@ export function DfcTab() {
     )
   }
 
-  const wiring = useAccountWiring(accounts)
-
   if (isLoading) return <StatementSkeleton />
-  if (isError || !data) {
+  if (isError || !data || !data.cashflow) {
     return (
       <div className="card-elevated p-4 text-[12px] text-destructive">
         Falha ao carregar a DFC. Verifique sua conexão e tente novamente.
       </div>
     )
   }
+
+  const currency = data.currency
+  const cashTotal = Number(data.cash_total) || 0
 
   return (
     <div className="space-y-3">
@@ -780,14 +729,14 @@ export function DfcTab() {
         />
         <KpiCard
           label="Variação líquida no período"
-          value={Number(data.by_section.net_change_in_cash) || 0}
+          value={Number(data.cashflow.by_section.net_change_in_cash) || 0}
           currency={currency}
           hint="FCO + FCI + FCF para o intervalo selecionado"
           accent
         />
         <KpiCard
           label="Categorias movidas"
-          value={data.by_category.length}
+          value={data.cashflow.by_category.length}
           format="int"
           hint="Linhas com fluxo no período"
         />
@@ -801,7 +750,7 @@ export function DfcTab() {
         entity={entity}
         onEditAccount={wiring.open}
       />
-      <AccountWiringModal account={wiring.account} open={wiring.isOpen} onClose={wiring.close} />
+      <WiringModalController wiring={wiring} />
     </div>
   )
 }
@@ -859,48 +808,45 @@ function CashflowDirectStatement({
   entity,
   onEditAccount,
 }: {
-  payload: CashflowDirectMethod
+  payload: FinancialStatementsPayload
   currency: string
   date_from?: string
   date_to?: string
   entity?: number
   onEditAccount?: (id: number) => void
 }) {
-  // Bucket categories by section, preserving the (already-sorted)
-  // backend order so largest movers per section come first.
+  const cashflow = payload.cashflow
+  if (!cashflow) return null
+
+  // Bucket categories by section, preserving backend order (already
+  // sorted: section then absolute amount). Accounts per category come
+  // pre-attached by the backend, so no second pass needed.
   const bySection = useMemo(() => {
     const m = new Map<
       string,
-      Array<{ category: string; amount: number; account_count: number }>
+      Array<{
+        category: string
+        amount: number
+        account_count: number
+        accounts: Array<{ id: number; name: string; amount: number }>
+      }>
     >()
-    for (const r of payload.by_category) {
+    for (const r of cashflow.by_category) {
       const arr = m.get(r.section) ?? []
       arr.push({
-        category: r.category,
+        category: r.key,
         amount: Number(r.amount) || 0,
         account_count: r.account_count,
+        accounts: r.accounts.map((a) => ({
+          id: a.id,
+          name: a.name,
+          amount: Number(a.amount) || 0,
+        })),
       })
       m.set(r.section, arr)
     }
     return m
-  }, [payload])
-
-  const accountsByCategory = useMemo(() => {
-    const m = new Map<
-      string,
-      Array<{ id: number; name: string; amount: number }>
-    >()
-    for (const r of payload.by_account) {
-      const arr = m.get(r.category) ?? []
-      arr.push({
-        id: r.account_id,
-        name: r.name,
-        amount: Number(r.amount) || 0,
-      })
-      m.set(r.category, arr)
-    }
-    return m
-  }, [payload])
+  }, [cashflow])
 
   return (
     <div className="card-elevated overflow-hidden text-[12px]">
@@ -911,8 +857,7 @@ function CashflowDirectStatement({
       {CASHFLOW_SECTION_ORDER.map((section) => {
         const rows = bySection.get(section) ?? []
         if (!rows.length) return null
-        const sectionTotal =
-          Number(payload.by_section[section as keyof typeof payload.by_section]) || 0
+        const sectionTotal = Number(cashflow.by_section[section]) || 0
         return (
           <CashflowSectionBlock
             key={section}
@@ -922,7 +867,6 @@ function CashflowDirectStatement({
             total={sectionTotal}
             currency={currency}
             categories={rows}
-            accountsByCategory={accountsByCategory}
             date_from={date_from}
             date_to={date_to}
             entity={entity}
@@ -933,7 +877,7 @@ function CashflowDirectStatement({
       <div className="flex items-center justify-between border-b-2 border-foreground/40 bg-surface-3 px-3 py-2 text-[12px] font-semibold">
         <div>Variação Líquida do Caixa</div>
         <div className="tabular-nums">
-          {formatCurrency(Number(payload.by_section.net_change_in_cash) || 0, currency)}
+          {formatCurrency(Number(cashflow.by_section.net_change_in_cash) || 0, currency)}
         </div>
       </div>
     </div>
@@ -947,7 +891,6 @@ function CashflowSectionBlock({
   total,
   currency,
   categories,
-  accountsByCategory,
   date_from,
   date_to,
   entity,
@@ -958,11 +901,12 @@ function CashflowSectionBlock({
   short: string
   total: number
   currency: string
-  categories: Array<{ category: string; amount: number; account_count: number }>
-  accountsByCategory: Map<
-    string,
-    Array<{ id: number; name: string; amount: number }>
-  >
+  categories: Array<{
+    category: string
+    amount: number
+    account_count: number
+    accounts: Array<{ id: number; name: string; amount: number }>
+  }>
   date_from?: string
   date_to?: string
   entity?: number
@@ -1007,7 +951,7 @@ function CashflowSectionBlock({
       {!collapsed &&
         categories.map((c) => {
           const expanded = expandedCats.has(c.category)
-          const accounts = accountsByCategory.get(c.category) ?? []
+          const accounts = c.accounts
           return (
             <div key={c.category}>
               <div
