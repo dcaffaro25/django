@@ -453,7 +453,9 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return AccountSerializer
 
     def get_serializer_context(self):
-        from django.db.models import Case, DecimalField, F, Q, Sum, Value, When
+        from django.db.models import (
+            DecimalField, F, OuterRef, Q, Subquery, Sum, Value,
+        )
         from django.db.models.functions import Coalesce
         from decimal import Decimal
 
@@ -589,31 +591,74 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             basis = 'accrual'
         ctx['basis'] = basis
 
+        # ``include_pending`` is parsed once (used by both basis
+        # branches AND surfaced on ctx for the serializer); same with
+        # the cache bypass switch and the tenant resolution. Pulling
+        # them up here de-duplicates and gives the caching layer a
+        # single source of truth.
+        include_pending = (params.get('include_pending') or '').strip().lower() in (
+            '1', 'true', 'yes', 't', 'y'
+        )
+        ctx['include_pending'] = include_pending
+        bypass_cache = (params.get('nocache') or '').strip().lower() in (
+            '1', 'true', 'yes', 't', 'y'
+        )
+        tenant_obj = getattr(self.request, 'tenant', None)
+        cache_company_id = (
+            tenant_obj.id if (tenant_obj and tenant_obj != 'all') else None
+        )
+
+        # The delta_map is the *expensive* product of this method.
+        # Paginated CoA reads (page 2, page 3, ...) re-enter
+        # ``get_serializer_context`` for the same (tenant, basis,
+        # date_from, date_to, entity, include_pending) tuple, so we
+        # cache the built map under a versioned key. ``data_version``
+        # for the tenant moves whenever any JE / Transaction /
+        # Account row is written, so the cache is automatically
+        # invalidated by any data change. ``?nocache=1`` forces a
+        # rebuild for debug.
+        from accounting.services.report_cache import cached_payload
+        cache_key_parts = {
+            "df": date_from.isoformat() if date_from else None,
+            "dt": date_to.isoformat() if date_to else None,
+            "ent": entity_id,
+            "ip": include_pending,
+            "basis": basis,
+        }
+
         delta_map: dict[int, dict] = {}
         if basis == 'cash':
             # Delegate to the cashflow service. Direction sign is
             # already applied there, matching the accrual code path
             # below. ``own_unreconciled_delta`` is set to "0" by the
             # service -- the cash lens isn't about reconciliation.
-            try:
-                from accounting.services.cashflow_service import (
-                    compute_cash_basis_book_deltas,
-                )
-                tenant = getattr(self.request, 'tenant', None)
-                cash_company_id = tenant.id if (tenant and tenant != 'all') else None
-                if cash_company_id is not None:
-                    delta_map = compute_cash_basis_book_deltas(
-                        cash_company_id,
+            def _build_cash_delta_map():
+                try:
+                    from accounting.services.cashflow_service import (
+                        compute_cash_basis_book_deltas,
+                    )
+                    if cache_company_id is None:
+                        return {}
+                    return compute_cash_basis_book_deltas(
+                        cache_company_id,
                         date_from,
                         date_to,
                         entity_id=entity_id,
-                        include_pending=(params.get('include_pending') or '')
-                        .strip()
-                        .lower()
-                        in ('1', 'true', 'yes', 't', 'y'),
+                        include_pending=include_pending,
                     )
-            except Exception:
-                delta_map = {}
+                except Exception:
+                    return {}
+
+            if cache_company_id is not None:
+                delta_map = cached_payload(
+                    "coa-deltas:v1",
+                    cache_company_id,
+                    cache_key_parts,
+                    _build_cash_delta_map,
+                    bypass=bypass_cache,
+                )
+            else:
+                delta_map = _build_cash_delta_map()
             ctx['account_delta_map'] = delta_map
             # Cash basis is intrinsically flow-only; the anchor
             # (lifetime opening) doesn't belong in a cash-period
@@ -622,111 +667,122 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             # makes ``current_balance`` flow-only too -- consistent
             # with what other consumers of the serializer expect.
             ctx['exclude_anchor'] = True
-            try:
-                raw = (self.request.query_params or {}).get('include_pending', '')
-                ctx['include_pending'] = (raw or '').strip().lower() in (
-                    '1', 'true', 'yes', 't', 'y'
-                )
-            except Exception:
-                ctx['include_pending'] = False
             return ctx
 
-        try:
-            zero = Value(
-                Decimal('0'),
-                output_field=DecimalField(max_digits=14, decimal_places=2),
-            )
-            # Per-account direction is needed to sign-correct the
-            # delta; pull from the path-map rows we already loaded.
-            direction_by_id = {r['id']: r['account_direction'] for r in rows}
-            balance_date_by_id = {r['id']: r['balance_date'] for r in rows}
-
-            # ``debit - credit`` per JE, NULL-safe.
-            net_expr = (
-                Coalesce(F('debit_amount'), zero)
-                - Coalesce(F('credit_amount'), zero)
-            )
-
-            # Build a base JE queryset with the optional date / entity
-            # filters applied once. Both pending+unreconciled and
-            # posted aggregates start from this so the report scope
-            # is consistent across buckets.
-            je_base = JournalEntry.objects.all()
-            if date_from is not None:
-                je_base = je_base.filter(transaction__date__gte=date_from)
-            if date_to is not None:
-                je_base = je_base.filter(transaction__date__lte=date_to)
-            if entity_id is not None:
-                je_base = je_base.filter(transaction__entity_id=entity_id)
-
-            account_ids = list(direction_by_id.keys())
-            if account_ids:
-                # ``Q(account_id__in=...)`` plus per-account date
-                # filtering for the posted bucket means we can't
-                # easily push the date check into a single Sum. We
-                # instead pull two grouped sums (pending + unrec)
-                # in one query and the per-account-date posted in a
-                # second; both are constant-many queries (2 total),
-                # which is fine.
-                #
-                # Pending + unreconciled: same date scope (no anchor
-                # filter), one bulk GROUP BY.
-                rows_pending_unrec = (
-                    je_base
-                    .filter(account_id__in=account_ids)
-                    .values('account_id')
-                    .annotate(
-                        pending_net=Sum(net_expr, filter=Q(transaction__state='pending')),
-                        unrec_net=Sum(net_expr, filter=Q(is_reconciled=False)),
-                    )
+        def _build_accrual_delta_map():
+            built: dict[int, dict] = {}
+            try:
+                zero = Value(
+                    Decimal('0'),
+                    output_field=DecimalField(max_digits=14, decimal_places=2),
                 )
-                for r in rows_pending_unrec:
-                    aid = r['account_id']
-                    direction = direction_by_id.get(aid) or 1
-                    delta_map[aid] = {
-                        'own_pending_delta': str((r['pending_net'] or Decimal('0')) * direction),
-                        'own_unreconciled_delta': str((r['unrec_net'] or Decimal('0')) * direction),
-                        'own_posted_delta': '0',
-                    }
+                # Per-account direction is needed to sign-correct the
+                # delta; pull from the path-map rows we already loaded.
+                # ``balance_date`` is no longer materialised in Python --
+                # the posted-bucket query reads it via a correlated
+                # ``Subquery`` so the date filter happens at the DB.
+                direction_by_id = {r['id']: r['account_direction'] for r in rows}
 
-                # Posted: needs per-account ``date > balance_date``.
-                # Keep this as a filtered aggregate using OuterRef
-                # only when truly needed; for now we do it per-account
-                # by grouping JEs by (account_id, t.date >
-                # balance_date) using a CASE. Postgres handles this
-                # well in one GROUP BY.
-                rows_posted = (
-                    je_base
-                    .filter(
-                        account_id__in=account_ids,
-                        transaction__state='posted',
-                        transaction__balance_validated=False,
-                    )
-                    .values('account_id', 'transaction__date')
-                    .annotate(net=Sum(net_expr))
+                # ``debit - credit`` per JE, NULL-safe.
+                net_expr = (
+                    Coalesce(F('debit_amount'), zero)
+                    - Coalesce(F('credit_amount'), zero)
                 )
-                # Group by account, keep only entries where date > anchor.
-                posted_per_acc: dict[int, Decimal] = {}
-                for r in rows_posted:
-                    aid = r['account_id']
-                    txn_date = r['transaction__date']
-                    anchor = balance_date_by_id.get(aid)
-                    if anchor is None or txn_date is None or txn_date <= anchor:
-                        continue
-                    posted_per_acc[aid] = posted_per_acc.get(aid, Decimal('0')) + (r['net'] or Decimal('0'))
-                for aid, net in posted_per_acc.items():
-                    direction = direction_by_id.get(aid) or 1
-                    bucket = delta_map.setdefault(aid, {
-                        'own_pending_delta': '0',
-                        'own_unreconciled_delta': '0',
-                        'own_posted_delta': '0',
-                    })
-                    bucket['own_posted_delta'] = str(net * direction)
-        except Exception:
-            # Same defensive policy as above -- never fail a CoA read
-            # because the delta build hit a snag. Frontend treats
-            # missing as 0.
-            delta_map = {}
+
+                # Build a base JE queryset with the optional date / entity
+                # filters applied once. Both pending+unreconciled and
+                # posted aggregates start from this so the report scope
+                # is consistent across buckets.
+                je_base = JournalEntry.objects.all()
+                if date_from is not None:
+                    je_base = je_base.filter(transaction__date__gte=date_from)
+                if date_to is not None:
+                    je_base = je_base.filter(transaction__date__lte=date_to)
+                if entity_id is not None:
+                    je_base = je_base.filter(transaction__entity_id=entity_id)
+
+                account_ids = list(direction_by_id.keys())
+                if account_ids:
+                    # Pending + unreconciled: same date scope (no anchor
+                    # filter), one bulk GROUP BY.
+                    rows_pending_unrec = (
+                        je_base
+                        .filter(account_id__in=account_ids)
+                        .values('account_id')
+                        .annotate(
+                            pending_net=Sum(net_expr, filter=Q(transaction__state='pending')),
+                            unrec_net=Sum(net_expr, filter=Q(is_reconciled=False)),
+                        )
+                    )
+                    for r in rows_pending_unrec:
+                        aid = r['account_id']
+                        direction = direction_by_id.get(aid) or 1
+                        built[aid] = {
+                            'own_pending_delta': str((r['pending_net'] or Decimal('0')) * direction),
+                            'own_unreconciled_delta': str((r['unrec_net'] or Decimal('0')) * direction),
+                            'own_posted_delta': '0',
+                        }
+
+                    # Posted: needs per-account ``transaction.date >
+                    # account.balance_date``. The previous shape grouped
+                    # by (account_id, transaction.date) and discarded
+                    # post-anchor rows in Python -- on a tenant with N
+                    # accounts x M distinct dates that's N*M rows over
+                    # the wire, only a fraction of which contribute.
+                    #
+                    # New shape pushes the per-account anchor into the
+                    # WHERE clause via a correlated ``Subquery`` on
+                    # ``Account.balance_date`` and groups by account_id
+                    # only. Postgres can satisfy the subquery in a
+                    # single index lookup per JE row, so the planner
+                    # collapses the whole thing into one GROUP BY of
+                    # only the rows that actually count. ~5-10x fewer
+                    # rows materialised on Evolat scale.
+                    anchor_sq = Subquery(
+                        Account.objects.filter(pk=OuterRef('account_id'))
+                        .values('balance_date')[:1]
+                    )
+                    rows_posted = (
+                        je_base
+                        .filter(
+                            account_id__in=account_ids,
+                            transaction__state='posted',
+                            transaction__balance_validated=False,
+                        )
+                        .annotate(_anchor_date=anchor_sq)
+                        .filter(transaction__date__gt=F('_anchor_date'))
+                        .values('account_id')
+                        .annotate(net=Sum(net_expr))
+                    )
+                    for r in rows_posted:
+                        aid = r['account_id']
+                        net = r['net'] or Decimal('0')
+                        if net == 0:
+                            continue
+                        direction = direction_by_id.get(aid) or 1
+                        bucket = built.setdefault(aid, {
+                            'own_pending_delta': '0',
+                            'own_unreconciled_delta': '0',
+                            'own_posted_delta': '0',
+                        })
+                        bucket['own_posted_delta'] = str(net * direction)
+            except Exception:
+                # Same defensive policy as elsewhere -- never fail a
+                # CoA read because the delta build hit a snag.
+                # Frontend treats missing as 0.
+                return {}
+            return built
+
+        if cache_company_id is not None:
+            delta_map = cached_payload(
+                "coa-deltas:v1",
+                cache_company_id,
+                cache_key_parts,
+                _build_accrual_delta_map,
+                bypass=bypass_cache,
+            )
+        else:
+            delta_map = _build_accrual_delta_map()
         ctx['account_delta_map'] = delta_map
 
         # When the request is scoped to a single entity, the per-account
@@ -738,17 +794,13 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         # the opening point of the natural period.
         ctx['exclude_anchor'] = entity_id is not None
 
-        # ``?include_pending=1`` opt-in: when set, ``current_balance``
-        # adds ``own_pending_delta`` on top of ``balance + own_posted_delta``.
-        # Useful for tenants like Evolat where most transactions are in
-        # ``state='pending'`` (no formal post step yet) -- without this
-        # the DRE / Balanço come back as zeros even though the JEs are
-        # in the books.
-        try:
-            raw = (self.request.query_params or {}).get('include_pending', '')
-            ctx['include_pending'] = (raw or '').strip().lower() in ('1', 'true', 'yes', 't', 'y')
-        except Exception:
-            ctx['include_pending'] = False
+        # ``include_pending`` was already parsed and stamped on
+        # ``ctx`` at the top of the method (the cash branch needs it
+        # too); no need to parse again. Note: when set, the
+        # serializer adds ``own_pending_delta`` on top of
+        # ``balance + own_posted_delta`` for ``current_balance`` --
+        # important for tenants like Evolat where most JEs sit in
+        # ``state='pending'`` without a formal post step.
         return ctx
 
     @action(methods=['post'], detail=False)
@@ -808,7 +860,7 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         the direct method only makes sense with a window.
         """
         from accounting.services.financial_statements import (
-            compute_financial_statements,
+            compute_financial_statements_cached,
         )
         from datetime import date as _date
 
@@ -840,13 +892,22 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             )
         company_id = tenant.id
 
-        payload = compute_financial_statements(
+        # ``?nocache=1`` forces a rebuild -- handy for debugging and
+        # for the rare case an operator wants to verify the cache
+        # hasn't gone funny. Default path uses the versioned cache:
+        # any JE / Transaction / Account write in the tenant moves
+        # the data fingerprint and forces a rebuild on next read.
+        bypass_cache = (params.get('nocache') or '').strip().lower() in (
+            '1', 'true', 'yes', 't', 'y'
+        )
+        payload = compute_financial_statements_cached(
             company_id,
             date_from=date_from,
             date_to=date_to,
             entity_id=entity_id,
             include_pending=include_pending,
             basis=basis,
+            bypass_cache=bypass_cache,
         )
 
         # ``?format=xlsx`` returns the same data as a 4-sheet workbook

@@ -44,6 +44,7 @@ from accounting.services.cashflow_service import (
     compute_cash_basis_book_deltas,
     _walk_taxonomy,
 )
+from accounting.services.report_cache import cached_payload
 from accounting.services.taxonomy_meta import (
     REPORT_CATEGORY_META,
     CASHFLOW_CATEGORY_META,
@@ -348,3 +349,49 @@ def compute_financial_statements(
         "cashflow": cashflow_payload,
         "cash_total": str(cash_total),
     }
+
+
+def compute_financial_statements_cached(
+    company_id: int,
+    *,
+    date_from=None,
+    date_to=None,
+    entity_id: Optional[int] = None,
+    include_pending: bool = False,
+    basis: str = "accrual",
+    bypass_cache: bool = False,
+) -> dict:
+    """Cached wrapper around ``compute_financial_statements``.
+
+    Cache key includes the tenant data version (see
+    ``report_cache.data_version``); a write to any
+    ``JournalEntry`` / ``Transaction`` / ``Account`` row in the
+    tenant moves the version, so the next read rebuilds with
+    fresh numbers. ``bypass_cache=True`` short-circuits to a
+    direct rebuild for debug / ?nocache=1.
+
+    The cached payload is the same dict shape as the underlying
+    function -- callers can drop this in wherever they currently
+    call ``compute_financial_statements`` directly.
+    """
+    key_parts = {
+        "df": date_from.isoformat() if date_from else None,
+        "dt": date_to.isoformat() if date_to else None,
+        "ent": entity_id,
+        "ip": bool(include_pending),
+        "basis": basis,
+    }
+
+    def _build():
+        return compute_financial_statements(
+            company_id,
+            date_from=date_from,
+            date_to=date_to,
+            entity_id=entity_id,
+            include_pending=include_pending,
+            basis=basis,
+        )
+
+    return cached_payload(
+        "fs:v1", company_id, key_parts, _build, bypass=bypass_cache,
+    )
