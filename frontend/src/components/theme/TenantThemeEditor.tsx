@@ -1,19 +1,27 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { Drawer } from "vaul"
 import { toast } from "sonner"
-import { Palette, Save, X, Sparkles } from "lucide-react"
+import {
+  ChevronDown, ChevronRight, Image as ImageIcon, Palette,
+  Pipette, Save, Sparkles, Wand2, X,
+} from "lucide-react"
 import { useTenantTheme, useUpdateTenantTheme } from "@/features/theme/useTenantTheme"
 import type {
   BrandPalette, CategoryPalette, TenantThemePayload,
 } from "@/features/auth/useUserRole"
 import { contrastForeground } from "@/lib/color-utils"
+import {
+  THEME_PRESETS, deriveThemeSetFromSeed, getPresetThemeSet,
+  type ThemePreset, type ThemeSet,
+} from "@/lib/theme-presets"
+import { cn } from "@/lib/utils"
 
 /**
- * Brand-token vocabulary the editor exposes. Order matches the
- * visual hierarchy we want operators to see: identity colours
- * first, surfaces second, semantic statuses last. Foreground
- * tokens are derived automatically when their background partner
- * changes (operator can still override manually).
+ * Brand-token vocabulary the manual editor exposes. Order
+ * matches the visual hierarchy: identity colours first,
+ * surfaces second, semantic statuses last. Foreground tokens
+ * auto-derive when their background partner changes (operator
+ * override is preserved on second edit).
  */
 const BRAND_TOKEN_GROUPS: Array<{
   title: string
@@ -50,6 +58,7 @@ const BRAND_TOKEN_GROUPS: Array<{
 ]
 
 type Mode = "light" | "dark"
+type BuilderTab = "preset" | "seed" | "image"
 
 interface DraftState {
   brand_palette_light: BrandPalette
@@ -78,11 +87,91 @@ export function TenantThemeEditor({ open, onClose }: { open: boolean; onClose: (
   const update = useUpdateTenantTheme()
   const [mode, setMode] = useState<Mode>("light")
   const [draft, setDraft] = useState<DraftState | null>(null)
+  const [builder, setBuilder] = useState<BuilderTab>("preset")
+  const [seed, setSeed] = useState("#015736")
+  const [tuneOpen, setTuneOpen] = useState(false)
 
   useEffect(() => {
-    if (theme && open) setDraft(payloadToDraft(theme))
-  }, [theme, open])
+    if (!open) return
+    if (theme) {
+      setDraft(payloadToDraft(theme))
+    } else if (!isLoading) {
+      // Backend hasn't shipped a TenantTheme yet (fresh tenant or
+      // dev env without the migration applied). Seed the editor
+      // with the platform-default palette so the operator can
+      // start designing immediately -- they save it back via the
+      // normal PATCH flow once the server side is up.
+      setDraft({
+        ...deriveThemeSetFromSeed("#015736"),
+        logo_url: "",
+        logo_dark_url: "",
+        favicon_url: "",
+      })
+    }
+  }, [theme, open, isLoading])
 
+  // -------- Path 1: preset --------
+  const onApplyPreset = (preset: ThemePreset) => {
+    const set = getPresetThemeSet(preset)
+    applyThemeSet(set)
+    toast.success(`Preset "${preset.name}" aplicado — ajuste fino abaixo se quiser.`)
+  }
+
+  // -------- Path 2: seed colour --------
+  const onApplySeed = () => {
+    const set = deriveThemeSetFromSeed(seed)
+    applyThemeSet(set)
+    toast.success("Paleta gerada a partir da cor da marca.")
+  }
+
+  // -------- Path 3: image --------
+  const onExtractFromImage = async (file: File) => {
+    try {
+      const palette = await extractPaletteFromImage(file)
+      if (!palette.length) {
+        toast.error("Não consegui extrair cores dessa imagem.")
+        return
+      }
+      // Promote the top-1 colour as the brand seed and regenerate
+      // a balanced palette from it, then layer the remaining
+      // extracted hues into the category swatches. This makes the
+      // image path behave like seed-with-suggestions instead of
+      // dumping raw image colours into every UI token.
+      const set = deriveThemeSetFromSeed(palette[0])
+      // Override category swatches with the actual extracted hues
+      // for both modes, keeping the seed-derived swatches as
+      // fallback when fewer than 14 colours come back.
+      set.category_palette_light = palette.concat(set.category_palette_light).slice(0, 14)
+      set.category_palette_dark = palette.concat(set.category_palette_dark).slice(0, 14)
+      applyThemeSet(set)
+      // If the image gave us a strong second colour, use it as
+      // the accent so we don't waste it.
+      if (palette[1]) {
+        setDraft((d) => {
+          if (!d) return d
+          return {
+            ...d,
+            brand_palette_light: { ...d.brand_palette_light, accent: palette[1], accent_foreground: contrastForeground(palette[1]) },
+            brand_palette_dark: { ...d.brand_palette_dark, accent: palette[1], accent_foreground: contrastForeground(palette[1]) },
+          }
+        })
+      }
+      toast.success(`${palette.length} cores extraídas — paleta gerada.`)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Falha ao extrair cores")
+    }
+  }
+
+  const applyThemeSet = (set: ThemeSet) => {
+    setDraft((d) => ({
+      logo_url: d?.logo_url ?? "",
+      logo_dark_url: d?.logo_dark_url ?? "",
+      favicon_url: d?.favicon_url ?? "",
+      ...set,
+    }))
+  }
+
+  // -------- Manual edit (Ajuste fino) --------
   const brand = useMemo(() => {
     if (!draft) return null
     return mode === "light" ? draft.brand_palette_light : draft.brand_palette_dark
@@ -99,9 +188,6 @@ export function TenantThemeEditor({ open, onClose }: { open: boolean; onClose: (
       const target = mode === "light" ? "brand_palette_light" : "brand_palette_dark"
       const next: BrandPalette = { ...d[target], [token]: hex }
       if (autoPair && (next[autoPair] === undefined || next[autoPair] === d[target][autoPair])) {
-        // Only auto-fill the foreground if the operator hasn't
-        // diverged from the previous default -- otherwise we'd
-        // clobber a manual override.
         next[autoPair] = contrastForeground(hex)
       }
       return { ...d, [target]: next }
@@ -116,37 +202,6 @@ export function TenantThemeEditor({ open, onClose }: { open: boolean; onClose: (
       next[idx] = hex
       return { ...d, [target]: next }
     })
-  }
-
-  const onExtractFromImage = async (file: File) => {
-    try {
-      const palette = await extractPaletteFromImage(file)
-      if (!palette.length) {
-        toast.error("Não consegui extrair cores dessa imagem.")
-        return
-      }
-      setDraft((d) => {
-        if (!d) return d
-        const target = mode === "light" ? "category_palette_light" : "category_palette_dark"
-        const next = [...d[target]]
-        // Replace as many slots as we have extracted colours; keep
-        // the remainder so we never end up with fewer than the
-        // standard 14 swatches.
-        palette.slice(0, next.length).forEach((hex, i) => { next[i] = hex })
-        // If the brand primary slot is still on the platform default,
-        // promote the first extracted colour as the suggested primary.
-        const brandKey = mode === "light" ? "brand_palette_light" : "brand_palette_dark"
-        const brandNext: BrandPalette = { ...d[brandKey], primary: palette[0], primary_foreground: contrastForeground(palette[0]) }
-        if (palette[1]) {
-          brandNext.accent = palette[1]
-          brandNext.accent_foreground = contrastForeground(palette[1])
-        }
-        return { ...d, [target]: next, [brandKey]: brandNext }
-      })
-      toast.success(`${palette.length} cores extraídas da imagem`)
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Falha ao extrair cores")
-    }
   }
 
   const onSave = () => {
@@ -172,7 +227,7 @@ export function TenantThemeEditor({ open, onClose }: { open: boolean; onClose: (
     <Drawer.Root open={open} onOpenChange={(o) => !o && onClose()} direction="right">
       <Drawer.Portal>
         <Drawer.Overlay className="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm" />
-        <Drawer.Content className="fixed right-0 top-0 z-50 flex h-full w-full max-w-[560px] flex-col border-l border-border surface-2 outline-none">
+        <Drawer.Content className="fixed right-0 top-0 z-50 flex h-full w-full max-w-[600px] flex-col border-l border-border surface-2 outline-none">
           <div className="hairline flex h-12 shrink-0 items-center justify-between px-4">
             <Drawer.Title className="flex items-center gap-2 text-[13px] font-semibold">
               <Palette className="h-3.5 w-3.5 text-muted-foreground" />
@@ -184,62 +239,146 @@ export function TenantThemeEditor({ open, onClose }: { open: boolean; onClose: (
           </div>
 
           <div className="hairline flex shrink-0 items-center gap-2 px-4 py-2 text-[11px]">
-            <span className="text-muted-foreground">Modo:</span>
+            <span className="text-muted-foreground">Visualizar:</span>
             {(["light", "dark"] as Mode[]).map((m) => (
               <button
                 key={m}
                 onClick={() => setMode(m)}
-                className={`rounded-md px-2 py-1 ${mode === m ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-accent"}`}
+                className={cn(
+                  "rounded-md px-2 py-1",
+                  mode === m ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-accent",
+                )}
               >
-                {m === "light" ? "Claro" : "Escuro"}
+                {m === "light" ? "Modo claro" : "Modo escuro"}
               </button>
             ))}
-            <div className="ml-auto">
-              <ImageExtractButton onPick={onExtractFromImage} />
-            </div>
+            <span className="ml-auto text-[10px] text-muted-foreground">
+              Geradores aplicam ambos os modos.
+            </span>
           </div>
 
           <div className="flex-1 space-y-5 overflow-y-auto p-4 text-[12px]">
-            {isLoading || !brand || !categories ? (
+            {!draft || !brand || !categories ? (
               <div className="text-muted-foreground">Carregando tema…</div>
             ) : (
               <>
-                {BRAND_TOKEN_GROUPS.map((group) => (
-                  <section key={group.title} className="space-y-2">
-                    <h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{group.title}</h3>
+                {/* === BUILDERS === */}
+                <section className="rounded-lg border border-border bg-surface-1 p-3">
+                  <div className="mb-2 flex items-center gap-2">
+                    <Wand2 className="h-3.5 w-3.5 text-primary" />
+                    <h3 className="text-[12px] font-semibold">Como construir o tema</h3>
+                  </div>
+                  <p className="mb-3 text-[11px] text-muted-foreground">
+                    Comece por um destes três caminhos. Os geradores preenchem ambos
+                    os modos (claro e escuro) e a paleta de categorias de uma vez.
+                    Você ainda pode ajustar tokens individualmente em <em>Ajuste fino</em> abaixo.
+                  </p>
+                  <div className="mb-3 flex gap-1">
+                    <BuilderTabButton active={builder === "preset"} onClick={() => setBuilder("preset")} icon={<Sparkles className="h-3 w-3" />} label="Preset" />
+                    <BuilderTabButton active={builder === "seed"} onClick={() => setBuilder("seed")} icon={<Pipette className="h-3 w-3" />} label="Cor da marca" />
+                    <BuilderTabButton active={builder === "image"} onClick={() => setBuilder("image")} icon={<ImageIcon className="h-3 w-3" />} label="Da imagem" />
+                  </div>
+
+                  {builder === "preset" && (
                     <div className="grid grid-cols-2 gap-2">
-                      {group.tokens.map(({ key, label, pairsWith }) => (
-                        <ColorTokenInput
-                          key={key as string}
-                          label={label}
-                          value={brand[key as string] ?? "#000000"}
-                          onChange={(hex) => setBrandToken(key as string, hex, pairsWith as string | undefined)}
-                        />
+                      {THEME_PRESETS.map((p) => (
+                        <PresetCard key={p.id} preset={p} onPick={() => onApplyPreset(p)} />
                       ))}
                     </div>
-                  </section>
-                ))}
+                  )}
 
-                <section className="space-y-2">
-                  <h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-                    Categorias (gráficos)
-                  </h3>
-                  <div className="grid grid-cols-7 gap-2">
-                    {categories.map((hex, i) => (
-                      <ColorSwatch
-                        key={i}
-                        value={hex}
-                        onChange={(v) => setCategoryColor(i, v)}
-                      />
-                    ))}
-                  </div>
+                  {builder === "seed" && (
+                    <div className="space-y-2">
+                      <p className="text-[11px] text-muted-foreground">
+                        Escolha uma única cor — geramos primary, accent, superfícies,
+                        bordas e 14 swatches de categoria a partir dela.
+                      </p>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="color"
+                          value={seed}
+                          onChange={(e) => setSeed(e.target.value)}
+                          className="h-9 w-12 cursor-pointer rounded-md border border-border bg-transparent"
+                        />
+                        <input
+                          type="text"
+                          value={seed}
+                          onChange={(e) => setSeed(e.target.value)}
+                          placeholder="#015736"
+                          className="h-9 flex-1 rounded-md border border-border bg-background px-2 font-mono text-[12px] uppercase outline-none focus:border-ring"
+                        />
+                        <button
+                          onClick={onApplySeed}
+                          className="inline-flex h-9 items-center gap-1.5 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
+                        >
+                          <Wand2 className="h-3.5 w-3.5" /> Gerar
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {builder === "image" && (
+                    <div className="space-y-2">
+                      <p className="text-[11px] text-muted-foreground">
+                        Atalho para quando o único insumo de marca é um logo PNG.
+                        Extraímos as cores dominantes, promovemos a primeira como
+                        primary e usamos as demais nos gráficos.
+                      </p>
+                      <ImagePickerButton onPick={onExtractFromImage} />
+                    </div>
+                  )}
                 </section>
 
+                {/* === LIVE PREVIEW === */}
+                <ThemePreviewCard brand={brand} categories={categories} />
+
+                {/* === MANUAL EDIT === */}
+                <Collapsible
+                  title="Ajuste fino"
+                  hint="Edite tokens individuais. Use após escolher um caminho acima."
+                  open={tuneOpen}
+                  onToggle={() => setTuneOpen((v) => !v)}
+                >
+                  <div className="space-y-5 pt-3">
+                    {BRAND_TOKEN_GROUPS.map((group) => (
+                      <section key={group.title} className="space-y-2">
+                        <h4 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{group.title}</h4>
+                        <div className="grid grid-cols-2 gap-2">
+                          {group.tokens.map(({ key, label, pairsWith }) => (
+                            <ColorTokenInput
+                              key={key as string}
+                              label={label}
+                              value={brand[key as string] ?? "#000000"}
+                              onChange={(hex) => setBrandToken(key as string, hex, pairsWith as string | undefined)}
+                            />
+                          ))}
+                        </div>
+                      </section>
+                    ))}
+
+                    <section className="space-y-2">
+                      <h4 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                        Categorias (gráficos)
+                      </h4>
+                      <div className="grid grid-cols-7 gap-2">
+                        {categories.map((hex, i) => (
+                          <ColorSwatch
+                            key={i}
+                            value={hex}
+                            onChange={(v) => setCategoryColor(i, v)}
+                          />
+                        ))}
+                      </div>
+                    </section>
+                  </div>
+                </Collapsible>
+
+                {/* === LOGO / FAVICON === */}
                 <section className="space-y-2">
                   <h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Logo & favicon</h3>
-                  <UrlField label="Logo URL" value={draft?.logo_url ?? ""} onChange={(v) => setDraft((d) => d ? { ...d, logo_url: v } : d)} />
-                  <UrlField label="Logo (modo escuro) URL" value={draft?.logo_dark_url ?? ""} onChange={(v) => setDraft((d) => d ? { ...d, logo_dark_url: v } : d)} />
-                  <UrlField label="Favicon URL" value={draft?.favicon_url ?? ""} onChange={(v) => setDraft((d) => d ? { ...d, favicon_url: v } : d)} />
+                  <UrlField label="Logo URL" value={draft.logo_url} onChange={(v) => setDraft((d) => d ? { ...d, logo_url: v } : d)} />
+                  <UrlField label="Logo (modo escuro) URL" value={draft.logo_dark_url} onChange={(v) => setDraft((d) => d ? { ...d, logo_dark_url: v } : d)} />
+                  <UrlField label="Favicon URL" value={draft.favicon_url} onChange={(v) => setDraft((d) => d ? { ...d, favicon_url: v } : d)} />
                 </section>
               </>
             )}
@@ -257,6 +396,95 @@ export function TenantThemeEditor({ open, onClose }: { open: boolean; onClose: (
         </Drawer.Content>
       </Drawer.Portal>
     </Drawer.Root>
+  )
+}
+
+function BuilderTabButton({
+  active, onClick, icon, label,
+}: { active: boolean; onClick: () => void; icon: React.ReactNode; label: string }) {
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        "inline-flex h-7 items-center gap-1.5 rounded-md px-2 text-[11px] font-medium transition-colors",
+        active
+          ? "bg-primary text-primary-foreground"
+          : "border border-border bg-background text-muted-foreground hover:text-foreground",
+      )}
+    >
+      {icon}
+      {label}
+    </button>
+  )
+}
+
+function PresetCard({ preset, onPick }: { preset: ThemePreset; onPick: () => void }) {
+  return (
+    <button
+      onClick={onPick}
+      className="group flex flex-col gap-1.5 rounded-md border border-border bg-background p-2 text-left transition-colors hover:border-primary/40 hover:bg-accent/40"
+    >
+      <div className="flex items-center gap-2">
+        <span className="grid h-6 w-6 place-items-center rounded-md text-[10px] font-bold text-primary-foreground" style={{ background: preset.seed }}>
+          {preset.name[0]}
+        </span>
+        <span className="truncate text-[11px] font-semibold">{preset.name}</span>
+      </div>
+      <span className="line-clamp-2 text-[10px] leading-snug text-muted-foreground">{preset.description}</span>
+    </button>
+  )
+}
+
+function ThemePreviewCard({ brand, categories }: { brand: BrandPalette; categories: CategoryPalette }) {
+  return (
+    <section className="space-y-2">
+      <h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Pré-visualização</h3>
+      <div
+        className="overflow-hidden rounded-lg border"
+        style={{ background: brand.background, color: brand.foreground, borderColor: brand.border }}
+      >
+        <div className="flex items-center gap-2 border-b px-3 py-2 text-[11px]" style={{ borderColor: brand.border }}>
+          <span className="grid h-5 w-5 place-items-center rounded text-[10px] font-bold" style={{ background: brand.primary, color: brand.primary_foreground }}>T</span>
+          <span className="font-semibold">Demonstrativos</span>
+          <span className="ml-auto inline-flex items-center gap-1 rounded px-1.5 text-[10px]" style={{ background: brand.accent, color: brand.accent_foreground }}>Accent</span>
+        </div>
+        <div className="space-y-2 p-3 text-[11px]">
+          <div className="flex items-center gap-2">
+            <button className="rounded px-2 py-1 text-[10px]" style={{ background: brand.primary, color: brand.primary_foreground }}>Primary</button>
+            <button className="rounded border px-2 py-1 text-[10px]" style={{ borderColor: brand.border, color: brand.foreground }}>Secundário</button>
+            <span className="ml-auto" style={{ color: brand.muted_foreground }}>texto secundário</span>
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {categories.slice(0, 14).map((c, i) => (
+              <span key={i} className="h-3 w-3 rounded" style={{ background: c }} />
+            ))}
+          </div>
+          <div className="flex gap-2 text-[10px]">
+            <span className="rounded px-1.5 py-0.5" style={{ background: brand.good, color: "#fff" }}>OK</span>
+            <span className="rounded px-1.5 py-0.5" style={{ background: brand.warn, color: "#000" }}>!</span>
+            <span className="rounded px-1.5 py-0.5" style={{ background: brand.bad, color: "#fff" }}>Erro</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function Collapsible({
+  title, hint, open, onToggle, children,
+}: { title: string; hint?: string; open: boolean; onToggle: () => void; children: React.ReactNode }) {
+  return (
+    <section className="rounded-lg border border-border">
+      <button
+        onClick={onToggle}
+        className="flex w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-accent/40"
+      >
+        {open ? <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" /> : <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />}
+        <span className="text-[12px] font-semibold">{title}</span>
+        {hint && <span className="ml-2 truncate text-[10px] text-muted-foreground">{hint}</span>}
+      </button>
+      {open && <div className="border-t border-border px-3 pb-3">{children}</div>}
+    </section>
   )
 }
 
@@ -312,12 +540,18 @@ function UrlField({ label, value, onChange }: { label: string; value: string; on
   )
 }
 
-function ImageExtractButton({ onPick }: { onPick: (file: File) => void }) {
+function ImagePickerButton({ onPick }: { onPick: (file: File) => void }) {
+  const inputRef = useRef<HTMLInputElement>(null)
   return (
-    <label className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-md border border-border bg-background px-2 text-[11px] font-medium hover:bg-accent">
-      <Sparkles className="h-3 w-3 text-primary" />
-      Extrair de imagem
+    <>
+      <button
+        onClick={() => inputRef.current?.click()}
+        className="inline-flex h-9 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
+      >
+        <ImageIcon className="h-3.5 w-3.5 text-primary" /> Selecionar imagem
+      </button>
       <input
+        ref={inputRef}
         type="file"
         accept="image/*"
         onChange={(e) => {
@@ -327,7 +561,7 @@ function ImageExtractButton({ onPick }: { onPick: (file: File) => void }) {
         }}
         className="hidden"
       />
-    </label>
+    </>
   )
 }
 
@@ -352,8 +586,6 @@ async function extractPaletteFromImage(file: File): Promise<string[]> {
     i.src = dataUrl
   })
 
-  // Downscale to 64px on the long edge -- enough variance to find
-  // the brand colours without choking on a 4K logo.
   const maxDim = 64
   const scale = Math.min(maxDim / img.width, maxDim / img.height, 1)
   const w = Math.max(1, Math.round(img.width * scale))
@@ -373,13 +605,8 @@ async function extractPaletteFromImage(file: File): Promise<string[]> {
     const r = data[i]
     const g = data[i + 1]
     const b = data[i + 2]
-    // Skip near-white / near-black so we don't return the page
-    // background as a "brand colour".
     const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
     if (luma > 245 || luma < 12) continue
-    // Quantise to 32-step buckets per channel. Coarse enough to
-    // collapse JPEG noise, fine enough to distinguish brand
-    // accents.
     const qr = Math.round(r / 32) * 32
     const qg = Math.round(g / 32) * 32
     const qb = Math.round(b / 32) * 32

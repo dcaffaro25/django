@@ -64,6 +64,38 @@ export function hexToHslVar(hex: string): string | null {
   return `${h} ${s}% ${l}%`
 }
 
+/** Convert a hex colour to its HSL components. Returns ``null`` if
+ *  the input doesn't parse. Wraps ``hexToRgb`` + ``rgbToHsl``. */
+export function hexToHsl(hex: string): [number, number, number] | null {
+  const rgb = hexToRgb(hex)
+  if (!rgb) return null
+  return rgbToHsl(rgb[0], rgb[1], rgb[2])
+}
+
+/** Convert HSL components (h: 0-360, s/l: 0-100) back to a 6-digit
+ *  uppercase hex string. Used by the theme generator to produce
+ *  derived swatches from a single seed colour. */
+export function hslToHex(h: number, s: number, l: number): string {
+  const sn = s / 100
+  const ln = l / 100
+  const c = (1 - Math.abs(2 * ln - 1)) * sn
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1))
+  const m = ln - c / 2
+  let r = 0
+  let g = 0
+  let b = 0
+  if (h < 60) { r = c; g = x; b = 0 }
+  else if (h < 120) { r = x; g = c; b = 0 }
+  else if (h < 180) { r = 0; g = c; b = x }
+  else if (h < 240) { r = 0; g = x; b = c }
+  else if (h < 300) { r = x; g = 0; b = c }
+  else { r = c; g = 0; b = x }
+  const ri = Math.round((r + m) * 255)
+  const gi = Math.round((g + m) * 255)
+  const bi = Math.round((b + m) * 255)
+  return "#" + [ri, gi, bi].map((v) => v.toString(16).padStart(2, "0").toUpperCase()).join("")
+}
+
 /** Pick a foreground hex (``"#FFFFFF"`` or ``"#000000"``) that gives
  *  the highest contrast against the supplied background hex. Used to
  *  auto-derive ``*_foreground`` tokens when the operator only sets
