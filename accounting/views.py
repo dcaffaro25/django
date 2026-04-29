@@ -848,6 +848,31 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             include_pending=include_pending,
             basis=basis,
         )
+
+        # ``?format=xlsx`` returns the same data as a 4-sheet workbook
+        # (DRE / Balanço / DFC / Memória) with formula-driven
+        # subtotals. JSON stays the default for the live page; Excel
+        # is purely an export side-channel.
+        export = (params.get('format') or '').strip().lower()
+        if export == 'xlsx':
+            from accounting.services.financial_statements_xlsx import (
+                export_financial_statements_xlsx,
+            )
+            from django.http import HttpResponse
+            data = export_financial_statements_xlsx(payload)
+            label_from = (payload.get('period') or {}).get('date_from') or 'inicio'
+            label_to = (payload.get('period') or {}).get('date_to') or 'fim'
+            filename = f"demonstrativos_{label_from}_{label_to}.xlsx"
+            resp = HttpResponse(
+                data,
+                content_type=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+            )
+            resp['Content-Disposition'] = f'attachment; filename="{filename}"'
+            return resp
+
         return Response(payload)
 
     @action(methods=['get'], detail=False, url_path='cashflow')

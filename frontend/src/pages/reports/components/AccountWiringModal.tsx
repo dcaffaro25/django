@@ -88,7 +88,11 @@ export function AccountWiringModal({
 
   return (
     <Dialog open={open} onOpenChange={(v) => { if (!v) onClose() }}>
-      <DialogContent className="max-w-xl">
+      {/* ``max-h-[90vh]`` + flex column lets the body scroll while the
+          header / footer stay fixed. Without this the 36-tag grid + 14
+          category options + helper copy overflow the viewport on
+          short screens and clip the Save / Cancel row. */}
+      <DialogContent className="flex max-h-[90vh] max-w-xl flex-col gap-4 overflow-hidden">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <span className="truncate">{account.name}</span>
@@ -108,7 +112,10 @@ export function AccountWiringModal({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4">
+        {/* Scrollable body. Flex-1 + min-h-0 are the magic that lets
+            the inner overflow-y-auto actually scroll instead of
+            stretching the parent flex column. */}
+        <div className="-mx-6 min-h-0 flex-1 space-y-4 overflow-y-auto px-6">
           <div>
             <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
               Categoria de relatório

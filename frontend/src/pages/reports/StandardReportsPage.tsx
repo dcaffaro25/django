@@ -1,6 +1,8 @@
 import { useMemo, useEffect, useRef, useState } from "react"
 import { Link, Outlet, useSearchParams } from "react-router-dom"
-import { FileBarChart, Sparkles, Wallet, Receipt, ListChecks, ChevronLeft, ChevronRight, ChevronDown, Pencil } from "lucide-react"
+import { FileBarChart, Sparkles, Wallet, Receipt, ListChecks, ChevronLeft, ChevronRight, ChevronDown, Pencil, FileDown } from "lucide-react"
+import { toast } from "sonner"
+import { DownloadXlsxButton } from "@/components/ui/download-xlsx-button"
 import { TabbedShell } from "@/components/layout/TabbedShell"
 import {
   useAccount,
@@ -378,6 +380,15 @@ export function StandardReportsPage() {
                   Caixa
                 </button>
               </div>
+              <ReportExportButtons
+                params={{
+                  date_from,
+                  date_to,
+                  entity,
+                  include_pending: includePending ? "1" : undefined,
+                  basis,
+                }}
+              />
             </div>
           </div>
         }
@@ -435,6 +446,90 @@ function StatementLine({
       >
         {display}
       </div>
+    </div>
+  )
+}
+
+/** PDF + Excel export buttons. Both consume the URL filters so the
+ *  exported file matches what the operator sees on screen.
+ *
+ *  PDF: client-side via html2pdf, captures the active tab's main
+ *  card (each tab marks its container with ``data-statement-card``).
+ *  Excel: server-side via ``DownloadXlsxButton`` hitting
+ *  ``/api/accounts/financial-statements/?format=xlsx&...``. Backend
+ *  ships a 4-sheet workbook (DRE / Balanço / DFC / Memória de
+ *  cálculo) with formula-driven subtotals. */
+function ReportExportButtons({
+  params,
+}: {
+  params: Record<string, string | number | boolean | undefined | null>
+}) {
+  const [pdfBusy, setPdfBusy] = useState(false)
+
+  const onPdf = async () => {
+    const target = document.querySelector<HTMLElement>("[data-statement-card]")
+    if (!target) {
+      toast.error("Nada para exportar — abra um demonstrativo primeiro")
+      return
+    }
+    setPdfBusy(true)
+    try {
+      // Lazy-load html2pdf so it's only fetched when the user actually
+      // clicks export. The legacy ReportBuilder page already does
+      // this; we keep the same dynamic-import shape so the chunk is
+      // shared.
+      const mod = await import("html2pdf.js")
+      const html2pdf = mod.default
+      const tabName = (() => {
+        const path = window.location.pathname
+        if (path.endsWith("/balanco")) return "balanco"
+        if (path.endsWith("/dfc")) return "dfc"
+        return "dre"
+      })()
+      const df = (params.date_from as string) || "inicio"
+      const dt = (params.date_to as string) || "fim"
+      const filename = `demonstrativo-${tabName}-${df}-${dt}.pdf`
+      await html2pdf()
+        .from(target)
+        .set({
+          margin: [10, 10, 10, 10],
+          filename,
+          image: { type: "jpeg", quality: 0.95 },
+          html2canvas: { scale: 2, backgroundColor: "#ffffff" },
+          jsPDF: { unit: "mm", format: "a4", orientation: "portrait" },
+        })
+        .save()
+    } catch (e) {
+      toast.error(
+        e instanceof Error ? `Falha ao gerar PDF: ${e.message}` : "Falha ao gerar PDF",
+      )
+    } finally {
+      setPdfBusy(false)
+    }
+  }
+
+  return (
+    <div className="ml-auto flex items-center gap-1">
+      <button
+        type="button"
+        onClick={onPdf}
+        disabled={pdfBusy}
+        title="Baixar como PDF"
+        className={cn(
+          "inline-flex h-6 items-center gap-1.5 rounded-md border border-border bg-surface-2 px-2 text-[10px] font-medium text-muted-foreground transition-colors hover:text-foreground",
+          pdfBusy && "opacity-60",
+        )}
+      >
+        <FileDown className="h-3 w-3" />
+        {pdfBusy ? "Gerando..." : "PDF"}
+      </button>
+      <DownloadXlsxButton
+        path="/api/accounts/financial-statements/"
+        params={{ ...params, format: "xlsx" }}
+        label="Excel"
+        title="Baixar como Excel (DRE + Balanço + DFC + memória de cálculo)"
+        className="h-6 px-2 text-[10px]"
+      />
     </div>
   )
 }
@@ -508,8 +603,17 @@ export function DreTab() {
 
   const drill = { date_from, date_to, entity, onEditAccount: wiring.open }
 
+  // DRE is single-column; on wide screens it stretches and the labels
+  // float far from the values. Cap at ~960px and centre so the line
+  // items stay readable while the rest of the page (header strip,
+  // tabs) keeps using the full width.
+  //
+  // ``data-statement-card`` marks this wrapper as the PDF-export
+  // target. ``ReportExportButtons`` does ``document.querySelector(
+  // "[data-statement-card]")`` — keep at most one of these per tab so
+  // the PDF capture is unambiguous.
   return (
-    <div className="space-y-2">
+    <div data-statement-card className="mx-auto w-full max-w-3xl space-y-2">
       {basis === "cash" && (
         <div className="card-elevated rounded-md border-l-2 border-l-primary/60 px-3 py-2 text-[11px] text-muted-foreground">
           <span className="font-medium text-foreground">Regime de caixa.</span>{" "}
@@ -630,8 +734,10 @@ export function BalancoTab() {
 
   const drill = { date_from, date_to, entity, onEditAccount: wiring.open }
 
+  // ``data-statement-card`` marks the whole grid (Ativo + Passivo + reconciliation
+  // banner) as the PDF export target — see ``ReportExportButtons``.
   return (
-    <div className="grid gap-4 md:grid-cols-2">
+    <div data-statement-card className="grid gap-4 md:grid-cols-2">
       <div className="card-elevated overflow-hidden text-[12px]">
         <div className="border-b border-border bg-surface-3 px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
           Ativo
@@ -718,8 +824,10 @@ export function DfcTab() {
   const currency = data.currency
   const cashTotal = Number(data.cash_total) || 0
 
+  // ``data-statement-card`` marks the whole DFC wrapper (KPI strip +
+  // categorised statement) as the PDF export target.
   return (
-    <div className="space-y-3">
+    <div data-statement-card className="space-y-3">
       <div className="grid gap-3 md:grid-cols-3">
         <KpiCard
           label="Saldo de Caixa (atual)"
