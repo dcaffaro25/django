@@ -1,7 +1,8 @@
-import { Link } from "react-router-dom"
+import { useNavigate } from "react-router-dom"
 import { Check, ChevronsUpDown, Settings2, Tag, Wallet } from "lucide-react"
 import { useBankAccountsDashboardKpis } from "@/features/reconciliation"
 import { useTenant } from "@/providers/TenantProvider"
+import { useUserRole } from "@/features/auth/useUserRole"
 import { cn, formatCurrency } from "@/lib/utils"
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
@@ -12,29 +13,39 @@ import {
  * Top-of-sidebar tenant identification card.
  *
  * Doubles as the tenant switcher: the entire card is a dropdown
- * trigger that lists every tenant the user belongs to, with the
- * active one marked. A "Abrir configuração" entry at the bottom of
- * the menu replaces the previous click-to-config behaviour, so the
- * card now has TWO clear roles: identity (visual) + switching (menu).
+ * trigger. The menu has THREE click targets per row (so the same
+ * dropdown handles "open this tenant's config", "switch to that
+ * tenant but stay on the current page", and "switch + open that
+ * tenant's config" without needing a separate UI per intent):
  *
- *   * Tenant name + first-letter avatar (colour derived from
- *     subdomain hash so each tenant looks distinct without fetching
- *     a real logo).
- *   * Two compact KPIs: account count and primary-currency total
- *     balance, sourced from ``useBankAccountsDashboardKpis`` so they
- *     piggyback on the same React Query cache the dashboard already
- *     populates.
+ *   1. **"Abrir configuração"** at the top -- opens the active
+ *      tenant's config without changing tenant. Highest position
+ *      because it's the most-used path from this menu.
+ *   2. **Tenant row click** -- switches to that tenant, stays on
+ *      the same route. The pre-65e4a6c default behaviour, kept.
+ *   3. **Settings icon next to a non-active tenant** -- switches
+ *      AND navigates to /settings/tenant. The fast path for
+ *      operators who manage several tenants and want to jump
+ *      between their config screens.
+ *
+ * Avatar prefers ``theme.logo_url`` (set in the TenantThemeEditor)
+ * when available; otherwise falls back to a deterministic letter
+ * avatar so each tenant looks distinct without an explicit logo.
  *
  * In the collapsed sidebar we fall back to just the avatar trigger.
  */
 export function TenantCard({ collapsed }: { collapsed: boolean }) {
   const { tenant, tenants, switchTenant } = useTenant()
+  const { theme: tenantTheme, me } = useUserRole()
   const { data: kpis } = useBankAccountsDashboardKpis()
+  const navigate = useNavigate()
 
   const initial = (tenant?.name?.[0] ?? "N").toUpperCase()
   const subdomain = tenant?.subdomain ?? ""
   const name = tenant?.name ?? "Nord"
   const avatarColour = colourForSubdomain(subdomain)
+  const useDarkLogo = !!me?.prefer_dark_mode && !!tenantTheme?.logo_dark_url
+  const logoUrl = useDarkLogo ? tenantTheme?.logo_dark_url : tenantTheme?.logo_url
 
   const accountCount = kpis?.account_count ?? null
   const primaryCurrency = kpis?.currency_codes?.[0] ?? "BRL"
@@ -42,22 +53,36 @@ export function TenantCard({ collapsed }: { collapsed: boolean }) {
   const totalBalanceStr = balanceMap[primaryCurrency] ?? "0"
   const totalBalance = Number(totalBalanceStr) || 0
 
+  const onSwitchAndConfig = (sub: string) => {
+    switchTenant(sub)
+    navigate("/settings/tenant")
+  }
+  const onOpenCurrentConfig = () => {
+    navigate("/settings/tenant")
+  }
+
   if (collapsed) {
     return (
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <button
             title={`${name} (${subdomain || "—"}) — trocar empresa`}
-            className="mx-auto mt-2 grid h-9 w-9 place-items-center rounded-md text-[12px] font-bold text-primary-foreground transition-transform hover:scale-105"
-            style={{ background: avatarColour }}
+            className="mx-auto mt-2 grid h-9 w-9 place-items-center overflow-hidden rounded-md text-[12px] font-bold text-primary-foreground transition-transform hover:scale-105"
+            style={logoUrl ? undefined : { background: avatarColour }}
           >
-            {initial}
+            {logoUrl ? (
+              <img src={logoUrl} alt={name} className="h-full w-full object-cover" />
+            ) : (
+              initial
+            )}
           </button>
         </DropdownMenuTrigger>
         <TenantSwitcherMenu
           tenants={tenants}
           activeId={tenant?.id}
           onSwitch={switchTenant}
+          onSwitchAndConfig={onSwitchAndConfig}
+          onOpenCurrentConfig={onOpenCurrentConfig}
         />
       </DropdownMenu>
     )
@@ -74,10 +99,14 @@ export function TenantCard({ collapsed }: { collapsed: boolean }) {
         >
           <div className="flex items-center gap-2">
             <div
-              className="grid h-8 w-8 place-items-center rounded-md text-[12px] font-bold text-primary-foreground"
-              style={{ background: avatarColour }}
+              className="grid h-8 w-8 place-items-center overflow-hidden rounded-md text-[12px] font-bold text-primary-foreground"
+              style={logoUrl ? undefined : { background: avatarColour }}
             >
-              {initial}
+              {logoUrl ? (
+                <img src={logoUrl} alt={name} className="h-full w-full object-cover" />
+              ) : (
+                initial
+              )}
             </div>
             <div className="min-w-0 flex-1">
               <div className="truncate text-[12px] font-semibold leading-none">{name}</div>
@@ -101,6 +130,8 @@ export function TenantCard({ collapsed }: { collapsed: boolean }) {
         tenants={tenants}
         activeId={tenant?.id}
         onSwitch={switchTenant}
+        onSwitchAndConfig={onSwitchAndConfig}
+        onOpenCurrentConfig={onOpenCurrentConfig}
       />
     </DropdownMenu>
   )
@@ -113,42 +144,62 @@ interface TenantOption {
 }
 
 function TenantSwitcherMenu({
-  tenants, activeId, onSwitch,
+  tenants, activeId, onSwitch, onSwitchAndConfig, onOpenCurrentConfig,
 }: {
   tenants: TenantOption[]
   activeId: number | undefined
   onSwitch: (subdomain: string) => void
+  onSwitchAndConfig: (subdomain: string) => void
+  onOpenCurrentConfig: () => void
 }) {
   return (
-    <DropdownMenuContent align="start" className="w-64">
-      <DropdownMenuLabel className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-        Empresas
-      </DropdownMenuLabel>
+    <DropdownMenuContent align="start" className="w-72">
+      {/* Primary action FIRST -- most-used path from this menu. */}
+      <DropdownMenuItem onClick={onOpenCurrentConfig} className="cursor-pointer">
+        <Settings2 className="mr-2 h-4 w-4 text-primary" />
+        <span>Abrir configuração</span>
+      </DropdownMenuItem>
       <DropdownMenuSeparator />
+      <DropdownMenuLabel className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+        Trocar empresa
+      </DropdownMenuLabel>
       {tenants.length === 0 ? (
         <div className="px-2 py-1.5 text-xs text-muted-foreground">
           Nenhuma empresa disponível
         </div>
-      ) : tenants.map((ten) => (
-        <DropdownMenuItem
-          key={ten.id}
-          onClick={() => onSwitch(ten.subdomain)}
-          className="cursor-pointer"
-        >
-          <span className="mr-2 inline-flex h-4 w-4 items-center justify-center">
-            {activeId === ten.id && <Check className="h-3.5 w-3.5 text-primary" />}
-          </span>
-          <span className="truncate">{ten.name}</span>
-          <span className="ml-auto text-[10px] text-muted-foreground">{ten.subdomain}</span>
-        </DropdownMenuItem>
-      ))}
-      <DropdownMenuSeparator />
-      <DropdownMenuItem asChild className="cursor-pointer">
-        <Link to="/settings/tenant" className="flex items-center">
-          <Settings2 className="mr-2 h-4 w-4" />
-          Abrir configuração
-        </Link>
-      </DropdownMenuItem>
+      ) : tenants.map((ten) => {
+        const isActive = activeId === ten.id
+        return (
+          <DropdownMenuItem
+            key={ten.id}
+            onClick={() => { if (!isActive) onSwitch(ten.subdomain) }}
+            className={cn("cursor-pointer", isActive && "opacity-90")}
+          >
+            <span className="mr-2 inline-flex h-4 w-4 items-center justify-center">
+              {isActive && <Check className="h-3.5 w-3.5 text-primary" />}
+            </span>
+            <span className="truncate">{ten.name}</span>
+            <span className="ml-2 truncate text-[10px] text-muted-foreground">{ten.subdomain}</span>
+            {/* Per-tenant shortcut: switch AND open that tenant's
+                config in one click. Hidden on the active tenant
+                (its config is the top entry). */}
+            {!isActive && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation()
+                  e.preventDefault()
+                  onSwitchAndConfig(ten.subdomain)
+                }}
+                title="Trocar para esta empresa e abrir sua configuração"
+                aria-label={`Abrir configuração de ${ten.name}`}
+                className="ml-auto grid h-6 w-6 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+              >
+                <Settings2 className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </DropdownMenuItem>
+        )
+      })}
     </DropdownMenuContent>
   )
 }
