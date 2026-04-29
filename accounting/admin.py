@@ -551,7 +551,20 @@ def batch_update_account_balances(affected_account_ids):
     
     if accounts_to_update:
         Account.objects.bulk_update(accounts_to_update, ['balance'], batch_size=BULK_DELETE_BATCH_SIZE)
-    
+        # Force-invalidate the report cache for every tenant whose
+        # balances were touched -- ``bulk_update`` bypasses
+        # ``auto_now`` so the data_version() fingerprint won't move
+        # on its own. Account.balance directly drives report figures,
+        # so leaving the cache un-bumped means up to 60s (the TTL)
+        # of stale numbers for the affected tenants.
+        try:
+            from accounting.services.report_cache import bump_version
+            company_ids = {a.company_id for a in accounts_to_update if a.company_id}
+            for cid in company_ids:
+                bump_version(cid)
+        except Exception:
+            pass
+
     return balance_map
 
 
@@ -617,6 +630,17 @@ def batch_update_parent_balances(affected_account_ids, skip_if_large=True):
     
     if accounts_to_update:
         Account.objects.bulk_update(accounts_to_update, ['balance'], batch_size=BULK_DELETE_BATCH_SIZE)
+        # Same invalidation policy as the leaf-balance bulk_update
+        # site above: parent balances changed via ``bulk_update`` ->
+        # ``auto_now`` doesn't fire -> bump the per-tenant epoch so
+        # the next report read sees a fresh fingerprint.
+        try:
+            from accounting.services.report_cache import bump_version
+            company_ids = {a.company_id for a in accounts_to_update if a.company_id}
+            for cid in company_ids:
+                bump_version(cid)
+        except Exception:
+            pass
 
 
 def delete_reconciliations_for_journal_entries(journal_entry_ids, disable_signals=True):

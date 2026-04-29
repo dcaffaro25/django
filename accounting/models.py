@@ -328,6 +328,12 @@ class Account(TenantAwareBaseModel, MPTTModel):
             # report_category=Y``.
             models.Index(fields=['company', 'report_category'],
                          name='acct_company_category_idx'),
+            # Powers ``report_cache.data_version()`` -- ``MAX(updated_at)
+            # WHERE company_id=...`` runs on every cached report read,
+            # so a covering index on (company, updated_at) gets it down
+            # to a single index seek instead of scanning the chart.
+            models.Index(fields=['company', 'updated_at'],
+                         name='acct_company_updated_at_idx'),
             ]
 
     def clean_fields(self, exclude=None):
@@ -585,6 +591,11 @@ class Transaction(TenantAwareBaseModel):
             # Performance: tenant + date range for list views and filters
             models.Index(fields=['company', 'date']),
             models.Index(fields=['company', 'erp_id']),
+            # Powers ``report_cache.data_version()``: per-tenant
+            # ``MAX(updated_at)`` lookup hits this index instead of
+            # scanning the transactions table.
+            models.Index(fields=['company', 'updated_at'],
+                         name='tx_company_updated_at_idx'),
         ]
     
     def clean_fields(self, exclude=None):
@@ -802,6 +813,12 @@ class JournalEntry(TenantAwareBaseModel):
             # Performance: transaction detail views
             models.Index(fields=['transaction', 'account']),
             models.Index(fields=['company', 'erp_id']),
+            # Powers ``report_cache.data_version()``: per-tenant
+            # ``MAX(updated_at)`` over JEs is the heaviest of the
+            # three fingerprint probes (the JE table is the largest);
+            # this index makes it a single seek.
+            models.Index(fields=['company', 'updated_at'],
+                         name='je_company_updated_at_idx'),
         ]
         constraints = [
             CheckConstraint(

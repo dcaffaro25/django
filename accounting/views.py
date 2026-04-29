@@ -1102,6 +1102,16 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         _BT.objects.filter(id__in=bank_ids).update(balance_validated=False)
         _JE.objects.filter(id__in=je_ids).update(is_reconciled=False)
 
+        # ``QuerySet.update()`` bypasses ``auto_now`` so the report_cache
+        # fingerprint won't move on its own. ``is_reconciled`` flips
+        # affect the unrec_net branch of the delta_map aggregation, so
+        # we must invalidate explicitly. Cheap (one cache.incr).
+        try:
+            from accounting.services.report_cache import bump_version
+            bump_version(recon.company_id)
+        except Exception:
+            pass
+
         return Response({
             "id": recon.id,
             "status": recon.status,
@@ -4516,7 +4526,18 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             JournalEntry.objects.bulk_update(
                 list(unique_jes), ["account", "bank_designation_pending"]
             )
-    
+            # bulk_update bypasses auto_now -- the JE.account flip is a
+            # report-relevant change (an entry now belongs to a
+            # different account, so its delta migrates), so force the
+            # report cache to invalidate.
+            try:
+                from accounting.services.report_cache import bump_version
+                tenant = getattr(self.request, "tenant", None)
+                if tenant and tenant != "all":
+                    bump_version(tenant.id)
+            except Exception:
+                pass
+
         _info(
             "finalize_end",
             request_id=request_id,
@@ -4972,7 +4993,16 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 JournalEntry.objects.bulk_update(
                     list(unique_jes), ["account", "bank_designation_pending"]
                 )
-    
+                # bulk_update bypasses auto_now -- mirror the
+                # invalidation policy from the v1 finalize handler.
+                try:
+                    from accounting.services.report_cache import bump_version
+                    tenant = getattr(self.request, "tenant", None)
+                    if tenant and tenant != "all":
+                        bump_version(tenant.id)
+                except Exception:
+                    pass
+
         _info(
             "finalize_end",
             request_id=request_id,
