@@ -309,7 +309,44 @@ class AccountSerializer(serializers.ModelSerializer):
                 pending = Decimal('0')
         return str(anchor + posted + pending)
 
-    
+
+class AccountListSerializer(AccountSerializer):
+    """Read-only fast list serializer.
+
+    The default ``AccountSerializer`` uses ``FlexibleRelatedField`` for
+    ``company`` / ``currency`` / ``bank_account``. Each of those runs a
+    nested ``ModelSerializer`` per row at read time, which on Evolat
+    (356 accounts) added ~30s on top of the already-bulk-fetched
+    deltas. Reads are read-mostly: the operator browses the chart far
+    more often than they edit it.
+
+    This subclass keeps every field of ``AccountSerializer`` but
+    replaces the three FK reads with ``SerializerMethodField`` that
+    look up minimal ``{id, name, code, ...}`` dicts from a
+    pre-computed map in ``context``. The viewset builds those maps
+    once per request from a single bulk query each, so the marginal
+    cost per row is a Python dict lookup.
+
+    Writes (``create`` / ``update``) keep going through
+    ``AccountSerializer`` -- this class is only wired on the ``list``
+    action via ``AccountViewSet.get_serializer_class``.
+    """
+    company = serializers.SerializerMethodField()
+    currency = serializers.SerializerMethodField()
+    bank_account = serializers.SerializerMethodField()
+
+    def get_company(self, obj):
+        m = (self.context or {}).get('account_company_map') or {}
+        return m.get(obj.company_id) if obj.company_id else None
+
+    def get_currency(self, obj):
+        m = (self.context or {}).get('account_currency_map') or {}
+        return m.get(obj.currency_id) if obj.currency_id else None
+
+    def get_bank_account(self, obj):
+        m = (self.context or {}).get('account_bank_account_map') or {}
+        ba_id = getattr(obj, 'bank_account_id', None)
+        return m.get(ba_id) if ba_id else None
 
 
 class CostCenterSerializer(serializers.ModelSerializer):

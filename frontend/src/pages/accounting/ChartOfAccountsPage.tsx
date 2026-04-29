@@ -309,7 +309,11 @@ export function ChartOfAccountsPage() {
       <KpiStrip kpis={kpis} />
 
       <div className="grid gap-3 md:grid-cols-2">
-        <CategoryDistributionChart counts={categoryCounts} />
+        <CategoryDistributionChart
+          counts={categoryCounts}
+          activeCode={categoryFilter}
+          onBarClick={(code) => setCategoryFilter(code)}
+        />
         <ShortcutsCard />
       </div>
 
@@ -432,30 +436,62 @@ function Kpi({
 
 function CategoryDistributionChart({
   counts,
-}: { counts: Array<{ code: string; n: number; label: string; order: number }> }) {
+  activeCode,
+  onBarClick,
+}: {
+  counts: Array<{ code: string; n: number; label: string; order: number }>
+  /** Currently filtered category. Active row is highlighted; clicking
+   *  the same row again clears the filter. */
+  activeCode?: string
+  /** Receive a category code on click. ``""`` means clear. */
+  onBarClick?: (code: string) => void
+}) {
   // Reuse the canonical palette so the chart bar colours match the
-  // pill colours in each row -- visual continuity.
+  // pill colours in each row -- visual continuity. Inactive rows fade
+  // to ~40% saturation when *some* row is active, so the active row
+  // pops without losing the at-a-glance distribution.
   const data = counts.map((c) => ({
     label: c.label,
     code: c.code,
     n: c.n,
     fill: hslFromCategory(c.code),
+    dim: !!activeCode && activeCode !== c.code,
   }))
   const total = data.reduce((s, x) => s + x.n, 0)
+
+  // Dynamic height: 28px per row + chrome. Beat the previous fixed
+  // h-48 (192px / 14 cats = 13px/row, recharts truncated half the
+  // labels). Clamps to 360px so it doesn't dominate the page when
+  // there are many empty buckets.
+  const rowPx = 28
+  const chartHeight = Math.min(360, Math.max(160, data.length * rowPx + 20))
+
   return (
     <div className="card-elevated p-3">
       <div className="mb-2 flex items-center justify-between">
         <div className="flex items-center gap-1.5 text-[12px] font-semibold">
           <Layers className="h-3.5 w-3.5 text-primary" /> Distribuição por categoria
         </div>
-        <span className="text-[10px] text-muted-foreground">{total} contas</span>
+        <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+          {activeCode && (
+            <button
+              type="button"
+              onClick={() => onBarClick?.("")}
+              className="rounded-md border border-border px-1.5 py-0.5 text-[9px] font-medium hover:text-destructive"
+              title="Limpar filtro"
+            >
+              Limpar filtro
+            </button>
+          )}
+          <span>{total} contas</span>
+        </div>
       </div>
       {data.length === 0 ? (
         <div className="flex h-40 items-center justify-center text-[12px] text-muted-foreground">
           Sem dados
         </div>
       ) : (
-        <div className="h-48">
+        <div style={{ height: chartHeight }}>
           <ResponsiveContainer width="100%" height="100%">
             <BarChart data={data} layout="vertical" margin={{ top: 4, right: 8, left: 8, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" horizontal={false} />
@@ -464,7 +500,8 @@ function CategoryDistributionChart({
                 type="category"
                 dataKey="label"
                 tick={{ fontSize: 10 }}
-                width={150}
+                width={180}
+                interval={0}
               />
               <Tooltip
                 cursor={{ fill: "hsl(var(--accent))" }}
@@ -472,13 +509,29 @@ function CategoryDistributionChart({
                 formatter={(v: number) => [`${v} contas`, ""]}
                 labelFormatter={(l) => String(l)}
               />
-              <Bar dataKey="n" radius={[0, 4, 4, 0]}>
+              <Bar
+                dataKey="n"
+                radius={[0, 4, 4, 0]}
+                onClick={(d) => {
+                  if (!onBarClick) return
+                  const code = (d as { code?: string }).code
+                  if (!code) return
+                  onBarClick(activeCode === code ? "" : code)
+                }}
+                style={{ cursor: onBarClick ? "pointer" : "default" }}
+              >
                 {data.map((d) => (
-                  <Cell key={d.code} fill={d.fill} />
+                  <Cell key={d.code} fill={d.fill} fillOpacity={d.dim ? 0.35 : 1} />
                 ))}
               </Bar>
             </BarChart>
           </ResponsiveContainer>
+        </div>
+      )}
+      {onBarClick && (
+        <div className="mt-1 text-[10px] text-muted-foreground">
+          Clique em uma barra para filtrar a árvore. Clique novamente
+          (ou em "Limpar filtro") para remover o filtro.
         </div>
       )}
     </div>

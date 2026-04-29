@@ -15,7 +15,7 @@ from multitenancy.utils import resolve_tenant
 from multitenancy.models import CustomUser, Company, Entity
 from multitenancy.mixins import ScopedQuerysetMixin, SoftDeleteQuerysetMixin
 from .models import (Currency, Account, Transaction, JournalEntry, Rule, CostCenter, Bank, BankAccount, BankTransaction, Reconciliation, CostCenter,ReconciliationTask, ReconciliationConfig, ReconciliationSuggestion, ReconciliationRule)
-from .serializers import (CurrencySerializer, AccountSerializer, TransactionSerializer, CostCenterSerializer, JournalEntrySerializer, JournalEntryListSerializer, JournalEntryDeriveFromSerializer, RuleSerializer, BankSerializer, BankAccountSerializer, BankTransactionSerializer, ReconciliationSerializer, ReconciliationRecordTagBulkSerializer, TransactionListSerializer,ReconciliationTaskSerializer,ReconciliationConfigSerializer)
+from .serializers import (CurrencySerializer, AccountSerializer, AccountListSerializer, TransactionSerializer, CostCenterSerializer, JournalEntrySerializer, JournalEntryListSerializer, JournalEntryDeriveFromSerializer, RuleSerializer, BankSerializer, BankAccountSerializer, BankTransactionSerializer, ReconciliationSerializer, ReconciliationRecordTagBulkSerializer, TransactionListSerializer,ReconciliationTaskSerializer,ReconciliationConfigSerializer)
 from .services.transaction_service import *
 from .utils import update_journal_entries_and_transaction_flags, parse_ofx_text, decode_ofx_content, generate_ofx_transaction_hash, find_book_combos
 from datetime import datetime
@@ -441,6 +441,17 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             .defer('account_description_embedding')
         )
 
+    def get_serializer_class(self):
+        # Reads use the slim list serializer that bypasses
+        # FlexibleRelatedField for company / currency / bank_account
+        # (those fields fire a nested ModelSerializer per row, which
+        # on Evolat added ~30s of pure Python work). Writes still go
+        # through the writable ``AccountSerializer`` so create / update
+        # accept the rich {dict-or-pk} input shape.
+        if getattr(self, 'action', None) == 'list':
+            return AccountListSerializer
+        return AccountSerializer
+
     def get_serializer_context(self):
         from django.db.models import Case, DecimalField, F, Q, Sum, Value, When
         from django.db.models.functions import Coalesce
@@ -490,6 +501,52 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             ctx['account_taxonomy_map'] = _build_account_taxonomy_map(tax_rows)
         except Exception:
             ctx['account_taxonomy_map'] = {}
+
+        # ``account_company_map`` / ``account_currency_map`` /
+        # ``account_bank_account_map`` are bulk lookups consumed by
+        # ``AccountListSerializer`` to render the FK fields without
+        # firing the ``FlexibleRelatedField`` nested serializer per
+        # row. Each is one tenant-scoped query keyed by id; the row
+        # serializer just does a dict lookup, no extra queries, no
+        # nested ``ModelSerializer.to_representation`` Python overhead.
+        try:
+            from multitenancy.models import Company
+            company_qs = Company.objects.all() if not company_filter else \
+                Company.objects.filter(id=company_filter['company_id'])
+            ctx['account_company_map'] = {
+                r['id']: {
+                    'id': r['id'],
+                    'name': r.get('name') or '',
+                    'subdomain': r.get('subdomain') or '',
+                }
+                for r in company_qs.values('id', 'name', 'subdomain')
+            }
+        except Exception:
+            ctx['account_company_map'] = {}
+        try:
+            ctx['account_currency_map'] = {
+                r['id']: {
+                    'id': r['id'],
+                    'code': r.get('code') or '',
+                    'name': r.get('name') or '',
+                }
+                for r in Currency.objects.values('id', 'code', 'name')
+            }
+        except Exception:
+            ctx['account_currency_map'] = {}
+        try:
+            from .models import BankAccount as _BA
+            ba_qs = _BA.objects.filter(**company_filter) if company_filter else _BA.objects.all()
+            ctx['account_bank_account_map'] = {
+                r['id']: {
+                    'id': r['id'],
+                    'name': r.get('name') or '',
+                    'account_number': r.get('account_number') or '',
+                }
+                for r in ba_qs.values('id', 'name', 'account_number')
+            }
+        except Exception:
+            ctx['account_bank_account_map'] = {}
 
         # JE-derived deltas: ONE bulk query (single GROUP BY across all
         # JEs in the tenant) instead of N nested Subqueries per row.
