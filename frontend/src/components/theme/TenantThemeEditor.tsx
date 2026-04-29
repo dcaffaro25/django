@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { Drawer } from "vaul"
 import { toast } from "sonner"
 import {
-  ChevronDown, ChevronRight, Image as ImageIcon, Palette,
-  Pipette, Save, Sparkles, Wand2, X,
+  ChevronDown, ChevronRight, Image as ImageIcon, Link as LinkIcon, Palette,
+  Pipette, Save, Sparkles, Trash2, Upload, Wand2, X,
 } from "lucide-react"
 import { useTenantTheme, useUpdateTenantTheme } from "@/features/theme/useTenantTheme"
 import type {
@@ -376,9 +376,27 @@ export function TenantThemeEditor({ open, onClose }: { open: boolean; onClose: (
                 {/* === LOGO / FAVICON === */}
                 <section className="space-y-2">
                   <h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Logo & favicon</h3>
-                  <UrlField label="Logo URL" value={draft.logo_url} onChange={(v) => setDraft((d) => d ? { ...d, logo_url: v } : d)} />
-                  <UrlField label="Logo (modo escuro) URL" value={draft.logo_dark_url} onChange={(v) => setDraft((d) => d ? { ...d, logo_dark_url: v } : d)} />
-                  <UrlField label="Favicon URL" value={draft.favicon_url} onChange={(v) => setDraft((d) => d ? { ...d, favicon_url: v } : d)} />
+                  <p className="text-[11px] text-muted-foreground">
+                    Faça upload de um arquivo (PNG, SVG, JPG; até 512 KB) ou cole
+                    uma URL pública. SVG mantém qualidade em qualquer tamanho.
+                  </p>
+                  <LogoUploadField
+                    label="Logo principal"
+                    value={draft.logo_url}
+                    onChange={(v) => setDraft((d) => d ? { ...d, logo_url: v } : d)}
+                  />
+                  <LogoUploadField
+                    label="Logo (modo escuro)"
+                    value={draft.logo_dark_url}
+                    onChange={(v) => setDraft((d) => d ? { ...d, logo_dark_url: v } : d)}
+                    hint="Variante para uso sobre fundo escuro. Opcional."
+                  />
+                  <LogoUploadField
+                    label="Favicon"
+                    value={draft.favicon_url}
+                    onChange={(v) => setDraft((d) => d ? { ...d, favicon_url: v } : d)}
+                    hint="Ícone da aba do navegador. Recomendado 32x32 ou 64x64."
+                  />
                 </section>
               </>
             )}
@@ -525,18 +543,135 @@ function ColorSwatch({ value, onChange }: { value: string; onChange: (hex: strin
   )
 }
 
-function UrlField({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+/**
+ * Three-state image input: thumbnail preview + Upload + Limpar.
+ * The "URL externa" toggle reveals a text input for tenants who
+ * already host their logo on a CDN and prefer to skip the
+ * inline-data-URL path. ``onChange`` receives whatever string
+ * goes into the underlying TenantTheme field -- either a
+ * ``data:image/...`` URI from the file reader OR a plain URL.
+ */
+function LogoUploadField({
+  label, value, onChange, hint,
+}: {
+  label: string
+  value: string
+  onChange: (v: string) => void
+  hint?: string
+}) {
+  const inputRef = useRef<HTMLInputElement>(null)
+  const [showUrlInput, setShowUrlInput] = useState(false)
+
+  // 512KB hard limit (mirrors backend TenantTheme._IMAGE_MAX_BYTES);
+  // 200KB warns the operator that the image is large but still
+  // accepts it -- gives the typical "uncompressed PNG export"
+  // case a chance to land before forcing optimisation.
+  const MAX_BYTES = 512 * 1024
+  const WARN_BYTES = 200 * 1024
+
+  const onFile = async (file: File) => {
+    if (!file.type.startsWith("image/")) {
+      toast.error("Selecione um arquivo de imagem (PNG, SVG, JPG, ...).")
+      return
+    }
+    if (file.size > MAX_BYTES) {
+      toast.error(`Imagem muito grande (${Math.round(file.size / 1024)} KB; máx ${MAX_BYTES / 1024} KB). Otimize antes de enviar.`)
+      return
+    }
+    if (file.size > WARN_BYTES) {
+      toast.warning(`Imagem grande (${Math.round(file.size / 1024)} KB). Considere otimizar (SVG, TinyPNG) para acelerar o carregamento.`)
+    }
+    try {
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(reader.result as string)
+        reader.onerror = reject
+        reader.readAsDataURL(file)
+      })
+      onChange(dataUrl)
+    } catch {
+      toast.error("Não consegui ler o arquivo.")
+    }
+  }
+
+  const hasValue = !!value
+  const isDataUrl = value.startsWith("data:")
+
   return (
-    <label className="flex flex-col gap-1">
-      <span className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</span>
-      <input
-        type="url"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder="https://"
-        className="h-8 rounded-md border border-border bg-background px-2 text-[12px] outline-none focus:border-ring"
-      />
-    </label>
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">{label}</span>
+        <button
+          type="button"
+          onClick={() => setShowUrlInput((v) => !v)}
+          className="inline-flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground"
+          title="Use URL externa em vez de upload"
+        >
+          <LinkIcon className="h-3 w-3" />
+          {showUrlInput ? "Ocultar URL" : "Usar URL externa"}
+        </button>
+      </div>
+
+      <div className="flex items-stretch gap-2 rounded-md border border-border bg-background p-2">
+        {/* Thumbnail / placeholder */}
+        <div className="grid h-12 w-12 shrink-0 place-items-center overflow-hidden rounded-md border border-border bg-surface-3">
+          {hasValue ? (
+            <img src={value} alt={label} className="h-full w-full object-contain" />
+          ) : (
+            <ImageIcon className="h-4 w-4 text-muted-foreground" />
+          )}
+        </div>
+        {/* Actions + status */}
+        <div className="flex flex-1 flex-col justify-between gap-1">
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => inputRef.current?.click()}
+              className="inline-flex h-7 items-center gap-1.5 rounded-md border border-border bg-background px-2 text-[11px] font-medium hover:bg-accent"
+            >
+              <Upload className="h-3 w-3 text-primary" /> {hasValue ? "Trocar" : "Upload"}
+            </button>
+            {hasValue && (
+              <button
+                type="button"
+                onClick={() => onChange("")}
+                className="inline-flex h-7 items-center gap-1.5 rounded-md text-[11px] font-medium text-muted-foreground hover:bg-accent hover:text-destructive"
+              >
+                <Trash2 className="h-3 w-3" /> Limpar
+              </button>
+            )}
+            <input
+              ref={inputRef}
+              type="file"
+              accept="image/*"
+              onChange={(e) => {
+                const f = e.target.files?.[0]
+                if (f) void onFile(f)
+                e.currentTarget.value = ""
+              }}
+              className="hidden"
+            />
+          </div>
+          <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+            {hasValue ? (
+              <span>{isDataUrl ? "Arquivo enviado (inline)" : "URL externa"}</span>
+            ) : (
+              <span>{hint ?? "Nenhum arquivo selecionado."}</span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {showUrlInput && (
+        <input
+          type="url"
+          value={isDataUrl ? "" : value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="https://cdn.example.com/logo.svg"
+          className="h-8 w-full rounded-md border border-border bg-background px-2 text-[11px] outline-none focus:border-ring"
+        />
+      )}
+    </div>
   )
 }
 

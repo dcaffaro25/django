@@ -378,18 +378,44 @@ class TenantTheme(models.Model):
     category_palette_light = models.JSONField(default=_default_category_palette_light)
     category_palette_dark = models.JSONField(default=_default_category_palette_dark)
 
-    # Tenant logo & favicon URLs. Stored as URLs (not FileField)
-    # so we don't introduce a media-storage dependency for E2;
-    # tenants can host on S3 / their own CDN.
-    logo_url = models.URLField(max_length=500, null=True, blank=True)
-    logo_dark_url = models.URLField(
-        max_length=500, null=True, blank=True,
+    # Tenant logo & favicon. ``TextField`` (not ``URLField``) so the
+    # value can be EITHER a regular ``http(s)://`` URL or a
+    # ``data:image/...;base64,...`` data URL. The frontend uploader
+    # produces data URLs from a file picker (no media-storage
+    # dependency / no S3 wiring); operators who already host their
+    # logo on a CDN can paste the URL directly. ``clean()`` enforces
+    # a 512 KB upper bound to keep the row size sane -- favicons are
+    # sub-5KB, brand logos are typically 20-80 KB once optimised.
+    logo_url = models.TextField(null=True, blank=True)
+    logo_dark_url = models.TextField(
+        null=True, blank=True,
         help_text="Optional dark-mode variant of the logo.",
     )
-    favicon_url = models.URLField(max_length=500, null=True, blank=True)
+    favicon_url = models.TextField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    # 512 KB cap on each image-bearing field. Plenty of headroom
+    # for SVG / PNG logos; pushes operators toward optimised
+    # assets without a hard failure on the typical 100-200 KB
+    # range that uncompressed exports land in.
+    _IMAGE_MAX_BYTES = 512 * 1024
+
+    def clean(self):
+        super().clean()
+        for field_name in ("logo_url", "logo_dark_url", "favicon_url"):
+            value = getattr(self, field_name) or ""
+            # ``data:`` URLs blow up FAST in size; bound them
+            # before the row hits the database.
+            if len(value.encode("utf-8")) > self._IMAGE_MAX_BYTES:
+                raise ValidationError({
+                    field_name: (
+                        f"O arquivo é muito grande (limite de "
+                        f"{self._IMAGE_MAX_BYTES // 1024} KB). Otimize "
+                        "a imagem antes de enviar."
+                    ),
+                })
 
     def __str__(self):
         return f"Theme for {self.company.name}"

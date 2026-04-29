@@ -260,7 +260,15 @@ class CompanyMiniSerializer(serializers.ModelSerializer):
 class TenantThemeSerializer(serializers.ModelSerializer):
     """Full read/write surface for the per-tenant theme. The frontend
     fetches this once at app boot (bundled into ``/api/core/me/``)
-    and re-fetches when the operator saves an edit."""
+    and re-fetches when the operator saves an edit.
+
+    ``logo_url`` / ``logo_dark_url`` / ``favicon_url`` accept either
+    plain ``http(s)://`` URLs or ``data:image/...;base64,...`` data
+    URLs (the upload picker produces the latter). The model's
+    ``clean()`` enforces a 512 KB cap; we mirror that here so DRF
+    returns a structured 400 instead of letting it bubble up as a
+    generic save-time crash.
+    """
     class Meta:
         model = TenantTheme
         fields = [
@@ -271,6 +279,20 @@ class TenantThemeSerializer(serializers.ModelSerializer):
             'updated_at',
         ]
         read_only_fields = ['id', 'company', 'updated_at']
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        max_bytes = TenantTheme._IMAGE_MAX_BYTES
+        for field in ('logo_url', 'logo_dark_url', 'favicon_url'):
+            value = attrs.get(field)
+            if value and len(value.encode('utf-8')) > max_bytes:
+                raise serializers.ValidationError({
+                    field: (
+                        f"O arquivo excede o limite de {max_bytes // 1024} KB. "
+                        "Otimize a imagem (use SVG, comprima o PNG) antes de enviar."
+                    ),
+                })
+        return attrs
 
 class RecursiveSerializer(serializers.Serializer):
     def to_representation(self, value):
