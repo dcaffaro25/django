@@ -104,7 +104,13 @@ class MeView(views.APIView):
     """
     permission_classes = [permissions.IsAuthenticated]
 
-    def get(self, request):
+    def get(self, request, *args, **kwargs):
+        # ``**kwargs`` swallows the ``tenant_id`` URL kwarg that
+        # ``nord_backend.urls`` injects via the ``^(?P<tenant_id>...)/``
+        # tenant prefix. We don't need it here -- the active tenant
+        # is already on ``request.tenant`` (set by TenantMiddleware) --
+        # but Django's CBV dispatch passes URL kwargs straight into
+        # the handler, so the signature has to accept them.
         user = request.user
         tenant = getattr(request, "tenant", None)
         company = None
@@ -151,7 +157,8 @@ class MePreferencesView(views.APIView):
     updates go through the user-management endpoints."""
     permission_classes = [permissions.IsAuthenticated]
 
-    def patch(self, request):
+    def patch(self, request, *args, **kwargs):
+        # See MeView.get -- ``tenant_id`` URL kwarg arrives here too.
         user = request.user
         changed = []
         if "use_tenant_theme" in request.data:
@@ -194,14 +201,16 @@ class TenantThemeView(views.APIView):
         role = getattr(request, "user_role", None)
         return _ROLE_RANK.get(role, 0) >= _ROLE_RANK[UserCompanyMembership.ROLE_MANAGER]
 
-    def get(self, request):
+    def get(self, request, *args, **kwargs):
+        # ``**kwargs`` absorbs the ``tenant_id`` URL kwarg from the
+        # tenant-prefix include in ``nord_backend.urls``.
         tenant = self._get_tenant(request)
         if tenant is None:
             return Response({"detail": "No tenant in scope."}, status=status.HTTP_400_BAD_REQUEST)
         theme, _ = TenantTheme.objects.get_or_create(company=tenant)
         return Response(TenantThemeSerializer(theme).data)
 
-    def patch(self, request):
+    def patch(self, request, *args, **kwargs):
         tenant = self._get_tenant(request)
         if tenant is None:
             return Response({"detail": "No tenant in scope."}, status=status.HTTP_400_BAD_REQUEST)
