@@ -10,6 +10,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { useSaveAccount } from "@/features/reconciliation"
+import { useUserRole } from "@/features/auth/useUserRole"
 import {
   CASHFLOW_CATEGORY_CODES_BY_ORDER,
   CASHFLOW_CATEGORY_LABELS,
@@ -54,6 +55,12 @@ export function AccountWiringModal({
   const [cashflowCategory, setCashflowCategory] = useState<string>("")
   const [tags, setTags] = useState<Set<string>>(new Set())
   const save = useSaveAccount()
+  // Viewers can browse the modal (helpful audit context — they see
+  // which categories / tags an account is wired to) but can't save.
+  // We disable the form fields and hide the Save button for them;
+  // the backend would 403 a write attempt anyway, this just makes
+  // the UI honest.
+  const { canWrite } = useUserRole()
 
   useEffect(() => {
     if (account) {
@@ -228,18 +235,20 @@ export function AccountWiringModal({
           >
             <X className="h-3.5 w-3.5" /> Cancelar
           </button>
-          <button
-            type="button"
-            onClick={submit}
-            disabled={!dirty || save.isPending}
-            className={cn(
-              "inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90",
-              (!dirty || save.isPending) && "opacity-50 cursor-not-allowed",
-            )}
-          >
-            <Save className="h-3.5 w-3.5" />
-            {save.isPending ? "Salvando…" : "Salvar"}
-          </button>
+          {canWrite && (
+            <button
+              type="button"
+              onClick={submit}
+              disabled={!dirty || save.isPending}
+              className={cn(
+                "inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90",
+                (!dirty || save.isPending) && "opacity-50 cursor-not-allowed",
+              )}
+            >
+              <Save className="h-3.5 w-3.5" />
+              {save.isPending ? "Salvando…" : "Salvar"}
+            </button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>

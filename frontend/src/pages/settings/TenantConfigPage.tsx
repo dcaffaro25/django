@@ -1,10 +1,16 @@
 import { Link } from "react-router-dom"
-import { Building2, Users, Brain, CreditCard, FileBarChart, Settings, Boxes } from "lucide-react"
+import { Building2, Users, Brain, CreditCard, FileBarChart, Settings, Boxes, ChevronDown, ChevronRight } from "lucide-react"
+import { useState } from "react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { useBankAccountsDashboardKpis } from "@/features/reconciliation"
-import { useAccounts } from "@/features/reconciliation"
+import { useAccounts, useEntities } from "@/features/reconciliation"
+import {
+  CATEGORY_CODES_BY_ORDER,
+  REPORT_CATEGORY_STYLES,
+} from "@/features/reconciliation/taxonomy_labels"
 import { useTenant } from "@/providers/TenantProvider"
 import { cn, formatCurrency } from "@/lib/utils"
+import type { AccountLite } from "@/features/reconciliation/types"
 
 /**
  * Tenant configuration landing page.
@@ -82,6 +88,16 @@ export function TenantConfigPage() {
         />
       </div>
 
+      {/* Entities + Chart of accounts: read-only summary tables.
+          Entities table uses existing fields (CNPJ + endereço come in
+          a follow-up migration). CoA table strips balance columns --
+          this is a quick "what does this tenant's chart look like"
+          glance, not the operational tree at /accounting/accounts. */}
+      <div className="grid gap-3 lg:grid-cols-2">
+        <EntitiesSummary />
+        <ChartOfAccountsSummary accounts={accounts} />
+      </div>
+
       {/* Configuration sections */}
       <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
         <ConfigCard
@@ -144,6 +160,196 @@ function KpiTile({
       <div className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">{label}</div>
       <div className={cn("mt-1 text-[18px] font-semibold tabular-nums", valueClass)}>{value}</div>
       {hint ? <div className="mt-0.5 text-[10px] text-muted-foreground">{hint}</div> : null}
+    </div>
+  )
+}
+
+/** Entities summary table. Today the ``Entity`` model only carries
+ *  name + parent + erp_id. The CNPJ / endereço / inscrição estadual
+ *  columns referenced in the ask are pending a model migration; this
+ *  component wires up the table layout and empty-cell placeholders so
+ *  the migration lands behind a UI that's already shipped. */
+function EntitiesSummary() {
+  const { data: entities = [], isLoading } = useEntities()
+  // MPTT lineage path. We don't get ``path`` from the lite endpoint
+  // so we walk parent_id locally — fine for the typical tenant size
+  // (10s of entities, not thousands).
+  const byId = new Map(entities.map((e) => [e.id, e]))
+  const pathOf = (eid: number): string => {
+    const out: string[] = []
+    let cur: { id: number; name: string; parent_id?: number | null } | undefined = byId.get(eid)
+    const seen = new Set<number>()
+    while (cur && !seen.has(cur.id)) {
+      seen.add(cur.id)
+      out.unshift(cur.name)
+      cur = cur.parent_id != null ? byId.get(cur.parent_id) : undefined
+    }
+    return out.join(" › ")
+  }
+  return (
+    <div className="card-elevated overflow-hidden">
+      <div className="flex items-center justify-between border-b border-border bg-surface-2 px-3 py-2">
+        <div className="flex items-center gap-1.5 text-[12px] font-semibold">
+          <Building2 className="h-3.5 w-3.5 text-primary" /> Entidades
+        </div>
+        <Link
+          to="/settings/entities"
+          className="text-[10px] text-muted-foreground hover:text-primary"
+        >
+          Editar
+        </Link>
+      </div>
+      <div className="grid grid-cols-[1fr_120px_60px] items-center gap-2 border-b border-border/50 bg-surface-3 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+        <div>Nome / Caminho</div>
+        <div>CNPJ</div>
+        <div className="text-right">Nível</div>
+      </div>
+      {isLoading ? (
+        <div className="space-y-1 p-2">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <div key={i} className="h-6 animate-pulse rounded bg-muted/40" />
+          ))}
+        </div>
+      ) : entities.length === 0 ? (
+        <div className="px-3 py-4 text-[11px] text-muted-foreground">
+          Nenhuma entidade cadastrada para este tenant.
+        </div>
+      ) : (
+        <div className="max-h-72 overflow-y-auto">
+          {entities.map((e) => (
+            <div
+              key={e.id}
+              className="grid grid-cols-[1fr_120px_60px] items-center gap-2 border-b border-border/30 px-3 py-1.5 text-[11px] hover:bg-accent/30"
+            >
+              <div className="truncate" title={pathOf(e.id)}>
+                <span className="font-medium">{e.name}</span>
+                {e.parent_id != null ? (
+                  <span className="ml-1 text-[10px] text-muted-foreground">
+                    {pathOf(e.id)}
+                  </span>
+                ) : null}
+              </div>
+              <div className="truncate font-mono text-[10px] tabular-nums text-muted-foreground">
+                {/* CNPJ migration pending; the field doesn't exist on
+                    Entity yet. Render a placeholder so the column
+                    width settles correctly today. */}
+                —
+              </div>
+              <div className="text-right text-[10px] tabular-nums text-muted-foreground">
+                {e.level ?? 0}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="border-t border-border/40 bg-surface-2 px-3 py-1 text-[10px] text-muted-foreground">
+        {entities.length} {entities.length === 1 ? "entidade" : "entidades"}
+        {" · "}
+        <span className="italic">CNPJ + endereço chegam na próxima migração</span>
+      </div>
+    </div>
+  )
+}
+
+/** Read-only chart of accounts table. Strips balance / pending /
+ *  unreconciled columns -- this view is a "what's wired up" snapshot,
+ *  not the operational tree. Categories badge inline so the operator
+ *  can scan classification at a glance. */
+function ChartOfAccountsSummary({ accounts }: { accounts: AccountLite[] }) {
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+
+  // Group by ``effective_category`` (declared order from
+  // CATEGORY_CODES_BY_ORDER). Uncategorised accounts go in their own
+  // bucket at the bottom.
+  const byCat = new Map<string, AccountLite[]>()
+  for (const a of accounts) {
+    const cat = a.effective_category ?? "(sem categoria)"
+    const list = byCat.get(cat) ?? []
+    list.push(a)
+    byCat.set(cat, list)
+  }
+  // Stable order: declared categories first in their canonical order,
+  // then "(sem categoria)" tail bucket.
+  const ordered: Array<[string, AccountLite[]]> = []
+  for (const code of CATEGORY_CODES_BY_ORDER) {
+    if (byCat.has(code)) ordered.push([code, byCat.get(code)!])
+  }
+  if (byCat.has("(sem categoria)")) {
+    ordered.push(["(sem categoria)", byCat.get("(sem categoria)")!])
+  }
+
+  const toggle = (cat: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(cat)) next.delete(cat)
+      else next.add(cat)
+      return next
+    })
+
+  return (
+    <div className="card-elevated overflow-hidden">
+      <div className="flex items-center justify-between border-b border-border bg-surface-2 px-3 py-2">
+        <div className="flex items-center gap-1.5 text-[12px] font-semibold">
+          <FileBarChart className="h-3.5 w-3.5 text-primary" /> Plano de contas
+        </div>
+        <Link
+          to="/accounting/accounts"
+          className="text-[10px] text-muted-foreground hover:text-primary"
+        >
+          Abrir completo
+        </Link>
+      </div>
+      {accounts.length === 0 ? (
+        <div className="px-3 py-4 text-[11px] text-muted-foreground">
+          Nenhuma conta cadastrada.
+        </div>
+      ) : (
+        <div className="max-h-72 overflow-y-auto">
+          {ordered.map(([cat, items]) => {
+            const isOpen = expanded.has(cat)
+            const label = REPORT_CATEGORY_STYLES[cat]?.label ?? "Sem categoria"
+            return (
+              <div key={cat}>
+                <button
+                  type="button"
+                  onClick={() => toggle(cat)}
+                  className="flex w-full items-center justify-between border-b border-border/40 bg-surface-3/40 px-3 py-1.5 text-[11px] font-semibold transition-colors hover:bg-accent/30"
+                >
+                  <span className="flex items-center gap-1.5">
+                    {isOpen ? (
+                      <ChevronDown className="h-3 w-3" />
+                    ) : (
+                      <ChevronRight className="h-3 w-3" />
+                    )}
+                    {label}
+                  </span>
+                  <span className="text-[10px] text-muted-foreground">
+                    {items.length} {items.length === 1 ? "conta" : "contas"}
+                  </span>
+                </button>
+                {isOpen &&
+                  items.map((a) => (
+                    <div
+                      key={a.id}
+                      className="grid grid-cols-[80px_1fr] items-center gap-2 border-b border-border/30 px-3 py-1 text-[11px] hover:bg-accent/20"
+                      style={{ paddingLeft: 28 }}
+                    >
+                      <span className="font-mono text-[10px] tabular-nums text-muted-foreground">
+                        {a.account_code ?? "—"}
+                      </span>
+                      <span className="truncate" title={a.name}>{a.name}</span>
+                    </div>
+                  ))}
+              </div>
+            )
+          })}
+        </div>
+      )}
+      <div className="border-t border-border/40 bg-surface-2 px-3 py-1 text-[10px] text-muted-foreground">
+        {accounts.length} {accounts.length === 1 ? "conta" : "contas"}
+        {" · "}
+        <span className="italic">Visualização. Saldos no Plano de contas.</span>
+      </div>
     </div>
   )
 }

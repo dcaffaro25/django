@@ -38,6 +38,12 @@ http.interceptors.request.use((config) => {
   return config
 })
 
+// Track the last 403-role-block toast so a burst of write attempts
+// (e.g. a form that accidentally calls a mutation twice) doesn't
+// stack 5 identical toasts. 3-second debounce is enough for a real
+// click-then-click sequence to surface fresh feedback.
+let _lastRoleBlockToastAt = 0
+
 http.interceptors.response.use(
   (r) => r,
   (error) => {
@@ -46,6 +52,28 @@ http.interceptors.response.use(
       if (localStorage.getItem(TOKEN_KEY)) setStoredToken(null)
       if (typeof window !== "undefined" && window.location.pathname !== "/login") {
         window.location.href = "/login"
+      }
+    }
+    if (error?.response?.status === 403) {
+      // The viewer-write gate in TenantMiddleware emits this exact
+      // detail; surface a friendly toast instead of letting each
+      // call site reinvent the message. Other 403s (per-viewset
+      // permissions) get a generic toast — at worst a duplicate
+      // with a less-specific copy, never silent failure.
+      const detail = error.response?.data?.detail || ""
+      const isRoleBlock = typeof detail === "string" && detail.includes("Read-only access")
+      const now = Date.now()
+      if (now - _lastRoleBlockToastAt > 3000) {
+        _lastRoleBlockToastAt = now
+        // Lazy import so the api-client doesn't depend on sonner at
+        // module-load (sonner pulls React internals).
+        void import("sonner").then(({ toast }) => {
+          if (isRoleBlock) {
+            toast.error("Apenas operadores podem fazer alterações nesta tela.")
+          } else {
+            toast.error("Sem permissão para esta ação.")
+          }
+        })
       }
     }
     return Promise.reject(error)

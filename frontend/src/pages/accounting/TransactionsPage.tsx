@@ -28,6 +28,7 @@ import type {
 import { reconApi } from "@/features/reconciliation"
 import { useMutation, useQueryClient } from "@tanstack/react-query"
 import { useTenant } from "@/providers/TenantProvider"
+import { useUserRole } from "@/features/auth/useUserRole"
 import { cn, formatCurrency, formatDate } from "@/lib/utils"
 
 function isoDaysAgo(n: number) {
@@ -40,6 +41,7 @@ const STATE_FILTERS = ["all", "pending", "posted", "canceled"] as const
 
 export function TransactionsPage() {
   const { t } = useTranslation(["reconciliation", "common"])
+  const { canWrite } = useUserRole()
   const [editing, setEditing] = useState<Transaction | "new" | null>(null)
   const [stateFilter, setStateFilter] = useState<(typeof STATE_FILTERS)[number]>("all")
   const [dateFrom, setDateFrom] = useState(isoDaysAgo(60))
@@ -166,12 +168,14 @@ export function TransactionsPage() {
               <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} />
               {t("actions.refresh", { ns: "common" })}
             </button>
-            <button
-              onClick={() => setEditing("new")}
-              className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
-            >
-              <Plus className="h-3.5 w-3.5" /> Nova transação
-            </button>
+            {canWrite && (
+              <button
+                onClick={() => setEditing("new")}
+                className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
+              >
+                <Plus className="h-3.5 w-3.5" /> Nova transação
+              </button>
+            )}
           </>
         }
       />

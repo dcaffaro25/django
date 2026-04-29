@@ -17,6 +17,7 @@ import { useRowSelection } from "@/lib/use-row-selection"
 import {
   useAccounts, useBankAccountsList, useDeleteJournalEntry, useJournalEntries, useSaveJournalEntry,
 } from "@/features/reconciliation"
+import { useUserRole } from "@/features/auth/useUserRole"
 import type { JournalEntry } from "@/features/reconciliation/types"
 import { cn, formatCurrency, formatDate } from "@/lib/utils"
 
@@ -37,6 +38,7 @@ export function JournalEntriesPage() {
   const [bankAccountFilter, setBankAccountFilter] = useState<number | "">("")
   const [search, setSearch] = useState("")
 
+  const { canWrite } = useUserRole()
   const { data: bankAccounts = [] } = useBankAccountsList()
   const { data: entries = [], isLoading, isFetching, refetch } = useJournalEntries({
     reconciliation_status: statusFilter === "all" ? undefined : statusFilter,
@@ -139,12 +141,14 @@ export function JournalEntriesPage() {
               <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} />
               {t("actions.refresh", { ns: "common" })}
             </button>
-            <button
-              onClick={() => setEditing("new")}
-              className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
-            >
-              <Plus className="h-3.5 w-3.5" /> Novo lançamento
-            </button>
+            {canWrite && (
+              <button
+                onClick={() => setEditing("new")}
+                className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
+              >
+                <Plus className="h-3.5 w-3.5" /> Novo lançamento
+              </button>
+            )}
           </>
         }
       />

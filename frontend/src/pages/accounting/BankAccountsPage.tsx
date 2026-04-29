@@ -46,6 +46,7 @@ import {
   useEntities,
   useSaveBankAccount,
 } from "@/features/reconciliation"
+import { useUserRole } from "@/features/auth/useUserRole"
 import type {
   BankAccountFull,
   BankAccountsDashboardKpis,
@@ -55,6 +56,7 @@ import { cn, formatCurrency, formatDate } from "@/lib/utils"
 
 export function BankAccountsPage() {
   const { t } = useTranslation(["reconciliation", "common"])
+  const { canWrite } = useUserRole()
   const { data: accounts = [], isLoading, isFetching, refetch } = useBankAccountsList()
   // ``dashboard-kpis`` carries a per-account block we merge into the
   // table by id. React Query dedupes — the dashboard section above
@@ -159,12 +161,14 @@ export function BankAccountsPage() {
               <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} />
               {t("actions.refresh", { ns: "common" })}
             </button>
-            <button
-              onClick={() => setEditing("new")}
-              className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
-            >
-              <Plus className="h-3.5 w-3.5" /> Nova conta
-            </button>
+            {canWrite && (
+              <button
+                onClick={() => setEditing("new")}
+                className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
+              >
+                <Plus className="h-3.5 w-3.5" /> Nova conta
+              </button>
+            )}
           </>
         }
       />
