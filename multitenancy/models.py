@@ -19,6 +19,23 @@ class CustomUser(AbstractUser):
     must_change_password = models.BooleanField(default=False)
     email_last_sent_at = models.DateTimeField(null=True, blank=True)
 
+    # Theme preferences (Phase E2-Theme). The user picks their own
+    # appearance independent of which tenant they're viewing -- one
+    # toggle for tenant-vs-system palette, one for dark mode. The
+    # frontend reads these at app boot from /api/core/me/.
+    use_tenant_theme = models.BooleanField(
+        default=True,
+        help_text=(
+            "When true, the active tenant's TenantTheme drives "
+            "brand colours. When false, fall back to the platform "
+            "default theme. Saved per user, applies globally."
+        ),
+    )
+    prefer_dark_mode = models.BooleanField(
+        default=False,
+        help_text="Per-user light/dark preference. Tenant ships both modes.",
+    )
+
     def mark_email_sent(self):
         """Helper to update timestamp when an email is sent to the user"""
         self.email_last_sent_at = timezone.now()
@@ -122,15 +139,130 @@ class BaseModel(models.Model):
             self.updated_by = current_user
         super().save(*args, **kwargs)
 
+# Closed-enum choices for the Entity / Company legal/fiscal fields.
+# Defined ahead of Company because Company also references them
+# (matriz CNPJ block + endereço UF). Inline -- if we ever ship
+# operator-editable choice rows, promote to a DB table.
+
+ENTITY_TYPE_CHOICES = [
+    ("matriz", "Matriz"),
+    ("filial", "Filial"),
+    ("holding", "Holding"),
+    ("sociedade", "Sociedade Simples"),
+    ("fundo", "Fundo de Investimento"),
+    ("departamento", "Departamento"),
+    ("centro_de_custo", "Centro de Custo"),
+    ("projeto", "Projeto"),
+    ("outro", "Outro"),
+]
+
+# Brazilian tax-regime classification. ``nao_aplicavel`` covers
+# cost centres, projects, fund-of-funds and other entity types that
+# don't pay corporate tax in their own right.
+REGIME_TRIBUTARIO_CHOICES = [
+    ("simples", "Simples Nacional"),
+    ("lucro_presumido", "Lucro Presumido"),
+    ("lucro_real", "Lucro Real"),
+    ("mei", "MEI"),
+    ("imune", "Imune / Isento"),
+    ("nao_aplicavel", "Não se aplica"),
+]
+
+# 27 Brazilian states/UFs. Closed enum to keep operator typos out
+# of the address column. ``EX`` (Exterior) covers offshore / foreign
+# entities for tenants that consolidate cross-border subsidiaries.
+UF_CHOICES = [
+    (s, s) for s in (
+        "AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO",
+        "MA", "MG", "MS", "MT", "PA", "PB", "PE", "PI", "PR",
+        "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO",
+        "EX",
+    )
+]
+
+
 # Company model representing each tenant
 class Company(BaseModel):
     name = models.CharField(max_length=100, unique=True)
     subdomain = models.CharField(max_length=100, unique=True)
-    #icon = models.FileField(upload_to=company_icon_upload_path ,null=True, blank=True)
-    # Additional fields like address, contact details, etc.
+
+    # ------------------------------------------------------------------
+    # Legal / fiscal profile (Phase E2-Company). The Company row
+    # represents the tenant's holding entity -- the matriz CNPJ in
+    # most setups. Filiais / unidades operacionais live as Entity
+    # children. All fields are nullable so existing tenants don't
+    # fail validation at deploy time; the onboarding flow makes
+    # them required at the UI layer.
+    # ------------------------------------------------------------------
+    cnpj = models.CharField(
+        max_length=14, null=True, blank=True, db_index=True,
+        help_text=(
+            "CNPJ raiz do tenant (matriz). Normalizado para 14 "
+            "dígitos sem máscara em ``clean()``."
+        ),
+    )
+    razao_social = models.CharField(
+        max_length=255, null=True, blank=True,
+        help_text="Nome completo no contrato social.",
+    )
+    nome_fantasia = models.CharField(
+        max_length=255, null=True, blank=True,
+        help_text="Nome comercial / marca exibido em relatórios.",
+    )
+    inscricao_estadual = models.CharField(max_length=20, null=True, blank=True)
+    inscricao_municipal = models.CharField(max_length=20, null=True, blank=True)
+    cnae_principal = models.CharField(max_length=10, null=True, blank=True)
+    regime_tributario = models.CharField(
+        max_length=24, choices=REGIME_TRIBUTARIO_CHOICES,
+        null=True, blank=True,
+    )
+
+    # Endereço da matriz
+    endereco_logradouro = models.CharField(max_length=255, null=True, blank=True)
+    endereco_numero = models.CharField(max_length=20, null=True, blank=True)
+    endereco_complemento = models.CharField(max_length=120, null=True, blank=True)
+    endereco_bairro = models.CharField(max_length=120, null=True, blank=True)
+    endereco_cidade = models.CharField(max_length=120, null=True, blank=True)
+    endereco_uf = models.CharField(
+        max_length=2, choices=UF_CHOICES, null=True, blank=True,
+    )
+    endereco_cep = models.CharField(
+        max_length=8, null=True, blank=True,
+        help_text="CEP normalizado para 8 dígitos sem máscara.",
+    )
+
+    # Contato corporativo
+    email = models.EmailField(null=True, blank=True)
+    telefone = models.CharField(max_length=24, null=True, blank=True)
+    website = models.URLField(max_length=255, null=True, blank=True)
+
+    # Operacional / preferências por tenant
+    default_currency = models.CharField(
+        max_length=3, default="BRL",
+        help_text="ISO 4217 (3 letras). Moeda padrão para novos lançamentos / contas.",
+    )
+    default_locale = models.CharField(
+        max_length=12, default="pt-BR",
+        help_text="BCP-47 locale tag. Usado em formatação de números/datas.",
+    )
+    default_timezone = models.CharField(
+        max_length=64, default="America/Sao_Paulo",
+        help_text="IANA timezone. Driva agendamentos e cutoffs de relatório.",
+    )
 
     def __str__(self):
         return self.name
+
+    def clean(self):
+        super().clean()
+        if self.cnpj:
+            self.cnpj = "".join(ch for ch in self.cnpj if ch.isdigit())
+        if self.endereco_cep:
+            self.endereco_cep = "".join(ch for ch in self.endereco_cep if ch.isdigit())
+        if self.endereco_uf:
+            self.endereco_uf = self.endereco_uf.upper()
+        if self.default_currency:
+            self.default_currency = self.default_currency.upper()
 
     def save(self, *args, **kwargs):
         # If the subdomain is not manually set, generate it from the company name
@@ -151,8 +283,117 @@ class Company(BaseModel):
             self.subdomain = slugify(self.subdomain)
             if Company.objects.filter(subdomain=self.subdomain).exclude(pk=self.pk).exists():
                 raise ValueError("The subdomain must be unique.")
-        
+
         super().save(*args, **kwargs)
+
+
+def _default_brand_palette_light():
+    """Platform-default brand palette in light mode. Tenants without
+    a custom TenantTheme inherit this. Tokens mirror the Tailwind /
+    shadcn surface vocabulary the frontend already speaks."""
+    return {
+        "primary": "#0F172A",
+        "primary_foreground": "#F8FAFC",
+        "accent": "#2563EB",
+        "accent_foreground": "#FFFFFF",
+        "background": "#FFFFFF",
+        "foreground": "#0F172A",
+        "muted": "#F1F5F9",
+        "muted_foreground": "#64748B",
+        "border": "#E2E8F0",
+        "ring": "#2563EB",
+        "good": "#16A34A",
+        "warn": "#F59E0B",
+        "bad": "#DC2626",
+    }
+
+
+def _default_brand_palette_dark():
+    """Platform-default brand palette in dark mode."""
+    return {
+        "primary": "#F8FAFC",
+        "primary_foreground": "#0F172A",
+        "accent": "#3B82F6",
+        "accent_foreground": "#0F172A",
+        "background": "#0F172A",
+        "foreground": "#F8FAFC",
+        "muted": "#1E293B",
+        "muted_foreground": "#94A3B8",
+        "border": "#334155",
+        "ring": "#3B82F6",
+        "good": "#22C55E",
+        "warn": "#F59E0B",
+        "bad": "#EF4444",
+    }
+
+
+def _default_category_palette_light():
+    """Fixed 14-colour category set for light mode. Designed for
+    distinguishability + colour-blindness safety; not derived from
+    the brand seed. Operators can override per token in the editor.
+    Order matters -- chart series cycle through this list."""
+    return [
+        "#1F77B4", "#FF7F0E", "#2CA02C", "#D62728",
+        "#9467BD", "#8C564B", "#E377C2", "#7F7F7F",
+        "#BCBD22", "#17BECF", "#0EA5E9", "#A855F7",
+        "#F97316", "#10B981",
+    ]
+
+
+def _default_category_palette_dark():
+    """Fixed 14-colour category set for dark mode."""
+    return [
+        "#5DADE2", "#F39C12", "#58D68D", "#E74C3C",
+        "#AF7AC5", "#A1887F", "#F48FB1", "#BDC3C7",
+        "#D4E157", "#26C6DA", "#38BDF8", "#C084FC",
+        "#FB923C", "#34D399",
+    ]
+
+
+class TenantTheme(models.Model):
+    """Per-tenant brand + category palette (Phase E2-Theme).
+
+    Stored as JSON so we can evolve the token shape without a schema
+    bump every time the design system grows a colour. Keys are
+    well-known (background, primary, etc. for the brand block; an
+    ordered list for category swatches).
+
+    Both modes always ship -- ``prefer_dark_mode`` on the user
+    decides which one renders. ``use_tenant_theme = False`` on the
+    user falls back to platform defaults regardless of what's here.
+    """
+    company = models.OneToOneField(
+        Company, on_delete=models.CASCADE, related_name="theme",
+    )
+
+    # Brand palette -- driven by a single seed colour in the
+    # editor; user can override individual tokens after the
+    # generator runs.
+    brand_palette_light = models.JSONField(default=_default_brand_palette_light)
+    brand_palette_dark = models.JSONField(default=_default_brand_palette_dark)
+
+    # Category palette -- 14 colours used by chart series and
+    # KPI tag colouring. Fixed set by default; advanced users
+    # can edit individual swatches.
+    category_palette_light = models.JSONField(default=_default_category_palette_light)
+    category_palette_dark = models.JSONField(default=_default_category_palette_dark)
+
+    # Tenant logo & favicon URLs. Stored as URLs (not FileField)
+    # so we don't introduce a media-storage dependency for E2;
+    # tenants can host on S3 / their own CDN.
+    logo_url = models.URLField(max_length=500, null=True, blank=True)
+    logo_dark_url = models.URLField(
+        max_length=500, null=True, blank=True,
+        help_text="Optional dark-mode variant of the logo.",
+    )
+    favicon_url = models.URLField(max_length=500, null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Theme for {self.company.name}"
+
 
 class TenantAwareBaseModel(BaseModel):
     company = models.ForeignKey(
@@ -196,48 +437,6 @@ class TenantAwareBaseModel(BaseModel):
                 )
         super().clean()
     
-# Closed-enum choices for the Entity legal/fiscal fields. These live
-# inline because they're tightly coupled to the model and we want
-# Django's choices=[...] validation at the form/admin layer. If we
-# ever ship operator-editable choice rows, promote to a DB table.
-
-ENTITY_TYPE_CHOICES = [
-    ("matriz", "Matriz"),
-    ("filial", "Filial"),
-    ("holding", "Holding"),
-    ("sociedade", "Sociedade Simples"),
-    ("fundo", "Fundo de Investimento"),
-    ("departamento", "Departamento"),
-    ("centro_de_custo", "Centro de Custo"),
-    ("projeto", "Projeto"),
-    ("outro", "Outro"),
-]
-
-# Brazilian tax-regime classification. ``nao_aplicavel`` covers
-# cost centres, projects, fund-of-funds and other entity types that
-# don't pay corporate tax in their own right.
-REGIME_TRIBUTARIO_CHOICES = [
-    ("simples", "Simples Nacional"),
-    ("lucro_presumido", "Lucro Presumido"),
-    ("lucro_real", "Lucro Real"),
-    ("mei", "MEI"),
-    ("imune", "Imune / Isento"),
-    ("nao_aplicavel", "Não se aplica"),
-]
-
-# 27 Brazilian states/UFs. Closed enum to keep operator typos out
-# of the address column. ``EX`` (Exterior) covers offshore / foreign
-# entities for tenants that consolidate cross-border subsidiaries.
-UF_CHOICES = [
-    (s, s) for s in (
-        "AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO",
-        "MA", "MG", "MS", "MT", "PA", "PB", "PE", "PI", "PR",
-        "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO",
-        "EX",
-    )
-]
-
-
 # Entity model representing the hierarchical organizational structure
 class Entity(TenantAwareBaseModel, MPTTModel):
     company = models.ForeignKey(Company, related_name='entities', on_delete=models.CASCADE)

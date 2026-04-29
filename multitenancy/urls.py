@@ -4,7 +4,8 @@ from django.urls import path, include, re_path
 from rest_framework.routers import DefaultRouter
 from .views import (
     CustomUserViewSet, CompanyViewSet, EntityViewSet, EntityTreeView,
-    LoginView, LogoutView, MeView, IntegrationRuleViewSet, ChangePasswordView,
+    LoginView, LogoutView, MeView, MePreferencesView, TenantThemeView,
+    IntegrationRuleViewSet, ChangePasswordView,
     UserCreateView, PasswordResetForceView, AdminForcePasswordView,
     SubstitutionRuleViewSet, ValidateRuleView, ExecuteRuleView, BulkImportAPIView,
     MergeRecordsView,
@@ -46,6 +47,14 @@ urlpatterns = [
     # for viewers, etc.). Authenticated; tenant-scoped via the URL
     # prefix the same way every other ``/api/core/...`` route is.
     re_path(r'^api/core/me/?$', MeView.as_view(), name='me'),
+    # ``/api/core/me/preferences/`` — PATCH only. Updates the user's
+    # display preferences (use_tenant_theme + prefer_dark_mode). The
+    # rest of /api/core/me/ stays GET-only.
+    re_path(r'^api/core/me/preferences/?$', MePreferencesView.as_view(), name='me-preferences'),
+    # ``/api/core/tenant-theme/`` — GET (any member) / PATCH (manager+).
+    # Auto-creates the row on first PATCH so a fresh tenant doesn't
+    # need an explicit "create theme" step before editing colours.
+    re_path(r'^api/core/tenant-theme/?$', TenantThemeView.as_view(), name='tenant-theme'),
     path('api/core/bulk-import/', BulkImportAPIView.as_view(), name='bulk-import'),
     # v2 interactive imports — analyze → resolve → commit flow. Legacy
     # ``/api/core/bulk-import/`` and ``/api/core/etl/*`` stay untouched.

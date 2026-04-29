@@ -22,17 +22,56 @@ const ROLE_RANK: Record<Exclude<TenantRole, null>, number> = {
   superuser: 99,
 }
 
+/** Brand palette tokens (CSS variable equivalents). Open shape so
+ *  the design system can grow without a TS bump. Keys mirror the
+ *  Tailwind / shadcn surface vocabulary (background / foreground /
+ *  primary / accent / muted / border / ring / good / warn / bad). */
+export type BrandPalette = Record<string, string>
+
+/** Category palette is an ordered list -- chart series cycle
+ *  through it. 14 colours by convention but the type is open. */
+export type CategoryPalette = string[]
+
+export interface TenantThemePayload {
+  id: number
+  company: number
+  brand_palette_light: BrandPalette
+  brand_palette_dark: BrandPalette
+  category_palette_light: CategoryPalette
+  category_palette_dark: CategoryPalette
+  logo_url: string | null
+  logo_dark_url: string | null
+  favicon_url: string | null
+  updated_at: string
+}
+
+export interface MeUser {
+  id: number
+  username: string
+  email?: string | null
+  first_name?: string
+  last_name?: string
+  is_superuser: boolean
+  use_tenant_theme: boolean
+  prefer_dark_mode: boolean
+}
+
+export interface MeCompany {
+  id: number
+  name: string
+  subdomain: string
+  nome_fantasia?: string | null
+  cnpj?: string | null
+  default_currency?: string
+  default_locale?: string
+  default_timezone?: string
+}
+
 interface MePayload {
-  user: {
-    id: number
-    username: string
-    email?: string | null
-    first_name?: string
-    last_name?: string
-    is_superuser: boolean
-  }
+  user: MeUser
   role: TenantRole
-  company: { id: number; name: string; subdomain: string } | null
+  company: MeCompany | null
+  theme: TenantThemePayload | null
 }
 
 /**
@@ -69,6 +108,8 @@ export function useUserRole() {
   return {
     role,
     me: data?.user ?? null,
+    company: data?.company ?? null,
+    theme: data?.theme ?? null,
     isLoading,
     /** True when the user can ONLY read. Hide every write button on
      *  the page if this is true. */

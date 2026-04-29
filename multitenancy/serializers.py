@@ -1,7 +1,7 @@
 # NORD/multitenancy/serializers.py
 
 from rest_framework import serializers
-from .models import CustomUser, Company, Entity, IntegrationRule, SubstitutionRule, ImportTransformationRule, ETLPipelineLog
+from .models import CustomUser, Company, Entity, IntegrationRule, SubstitutionRule, ImportTransformationRule, ETLPipelineLog, TenantTheme
 from rest_framework.exceptions import ValidationError
 from django.contrib.auth import authenticate
 from accounting.models import Account, CostCenter
@@ -254,7 +254,23 @@ class CompanySerializer(serializers.ModelSerializer):
 class CompanyMiniSerializer(serializers.ModelSerializer):
     class Meta:
         model = Company
-        fields = ['id', 'name', 'subdomain']
+        fields = ['id', 'name', 'subdomain', 'nome_fantasia', 'cnpj']
+
+
+class TenantThemeSerializer(serializers.ModelSerializer):
+    """Full read/write surface for the per-tenant theme. The frontend
+    fetches this once at app boot (bundled into ``/api/core/me/``)
+    and re-fetches when the operator saves an edit."""
+    class Meta:
+        model = TenantTheme
+        fields = [
+            'id', 'company',
+            'brand_palette_light', 'brand_palette_dark',
+            'category_palette_light', 'category_palette_dark',
+            'logo_url', 'logo_dark_url', 'favicon_url',
+            'updated_at',
+        ]
+        read_only_fields = ['id', 'company', 'updated_at']
 
 class RecursiveSerializer(serializers.Serializer):
     def to_representation(self, value):

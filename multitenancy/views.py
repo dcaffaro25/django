@@ -3,14 +3,14 @@ from rest_framework.views import APIView
 from django.contrib.auth import authenticate, login, logout
 from rest_framework import views, viewsets, generics, status, serializers
 from rest_framework.response import Response
-from .models import CustomUser, Company, Entity, IntegrationRule, SubstitutionRule, ImportTransformationRule, ETLPipelineLog
+from .models import CustomUser, Company, Entity, IntegrationRule, SubstitutionRule, ImportTransformationRule, ETLPipelineLog, TenantTheme
 from .mixins import ScopedQuerysetMixin, SoftDeleteQuerysetMixin, apply_soft_delete_filter
 from .serializers import (
     CustomUserSerializer, CompanySerializer, EntitySerializer, UserLoginSerializer,
     IntegrationRuleSerializer, EntityMiniSerializer, ChangePasswordSerializer,
     UserCreateSerializer, PasswordResetForceSerializer, SubstitutionRuleSerializer,
     ImportTransformationRuleSerializer, ImportTransformationRuleListSerializer,
-    ETLPipelineLogSerializer, ETLPipelineLogListSerializer,
+    ETLPipelineLogSerializer, ETLPipelineLogListSerializer, TenantThemeSerializer,
 )
 from .api_utils import create_csv_response, create_excel_response, _to_bool
 from .merge_service import merge_rows_into_target, MergeError
@@ -108,12 +108,25 @@ class MeView(views.APIView):
         user = request.user
         tenant = getattr(request, "tenant", None)
         company = None
+        theme = None
         if tenant and tenant != "all":
             company = {
                 "id": tenant.id,
                 "name": tenant.name,
                 "subdomain": tenant.subdomain,
+                "nome_fantasia": getattr(tenant, "nome_fantasia", None),
+                "cnpj": getattr(tenant, "cnpj", None),
+                "default_currency": getattr(tenant, "default_currency", "BRL"),
+                "default_locale": getattr(tenant, "default_locale", "pt-BR"),
+                "default_timezone": getattr(tenant, "default_timezone", "America/Sao_Paulo"),
             }
+            # Bundle the theme so the frontend can paint on first
+            # render -- avoids a flash of platform colours while
+            # the tenant palette is fetched separately.
+            from .serializers import TenantThemeSerializer
+            tenant_theme = getattr(tenant, "theme", None)
+            if tenant_theme is not None:
+                theme = TenantThemeSerializer(tenant_theme).data
         return Response({
             "user": {
                 "id": user.id,
@@ -122,10 +135,87 @@ class MeView(views.APIView):
                 "first_name": user.first_name,
                 "last_name": user.last_name,
                 "is_superuser": user.is_superuser,
+                "use_tenant_theme": getattr(user, "use_tenant_theme", True),
+                "prefer_dark_mode": getattr(user, "prefer_dark_mode", False),
             },
             "role": getattr(request, "user_role", None),
             "company": company,
+            "theme": theme,
         })
+
+
+class MePreferencesView(views.APIView):
+    """Update the current user's display preferences (theme toggle +
+    dark mode). Limited surface intentionally -- only the two fields
+    that the global theme switcher needs. PII / role / username
+    updates go through the user-management endpoints."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def patch(self, request):
+        user = request.user
+        changed = []
+        if "use_tenant_theme" in request.data:
+            user.use_tenant_theme = bool(request.data["use_tenant_theme"])
+            changed.append("use_tenant_theme")
+        if "prefer_dark_mode" in request.data:
+            user.prefer_dark_mode = bool(request.data["prefer_dark_mode"])
+            changed.append("prefer_dark_mode")
+        if changed:
+            user.save(update_fields=changed)
+        return Response({
+            "use_tenant_theme": user.use_tenant_theme,
+            "prefer_dark_mode": user.prefer_dark_mode,
+        })
+
+
+class TenantThemeView(views.APIView):
+    """Read or edit the active tenant's TenantTheme.
+
+    GET is open to any authenticated tenant member -- the theme is
+    not sensitive data and the frontend needs it for non-write
+    flows (chart colours on read-only dashboards). PATCH/PUT is
+    gated to ``manager`` and above so a viewer cannot rebrand the
+    tenant. Auto-creates the row on first PATCH so onboarding
+    doesn't require a separate "create theme" step.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _get_tenant(self, request):
+        tenant = getattr(request, "tenant", None)
+        if tenant is None or tenant == "all":
+            return None
+        return tenant
+
+    def _can_edit(self, request):
+        from .permissions import _ROLE_RANK
+        from .models import UserCompanyMembership
+        if request.user.is_superuser:
+            return True
+        role = getattr(request, "user_role", None)
+        return _ROLE_RANK.get(role, 0) >= _ROLE_RANK[UserCompanyMembership.ROLE_MANAGER]
+
+    def get(self, request):
+        tenant = self._get_tenant(request)
+        if tenant is None:
+            return Response({"detail": "No tenant in scope."}, status=status.HTTP_400_BAD_REQUEST)
+        theme, _ = TenantTheme.objects.get_or_create(company=tenant)
+        return Response(TenantThemeSerializer(theme).data)
+
+    def patch(self, request):
+        tenant = self._get_tenant(request)
+        if tenant is None:
+            return Response({"detail": "No tenant in scope."}, status=status.HTTP_400_BAD_REQUEST)
+        if not self._can_edit(request):
+            return Response(
+                {"detail": "Apenas managers ou owners podem editar o tema."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        theme, _ = TenantTheme.objects.get_or_create(company=tenant)
+        serializer = TenantThemeSerializer(theme, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
 
 #User = get_user_model()
 
