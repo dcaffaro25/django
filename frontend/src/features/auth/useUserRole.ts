@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query"
 import { api } from "@/lib/api-client"
 import { useAuth } from "@/providers/AuthProvider"
 import { useTenant } from "@/providers/TenantProvider"
+import { useAppStore } from "@/stores/app-store"
 
 /** Tenant role values the backend returns. ``superuser`` is the
  *  string literal sent for Django superusers; all others come from
@@ -99,6 +100,7 @@ interface MePayload {
 export function useUserRole() {
   const { isAuthenticated } = useAuth()
   const { tenant } = useTenant()
+  const viewAsViewer = useAppStore((s) => s.viewAsViewer)
 
   const { data, isLoading } = useQuery({
     queryKey: ["core", "me", tenant?.subdomain ?? null],
@@ -107,7 +109,20 @@ export function useUserRole() {
     staleTime: 60 * 1000,
   })
 
-  const role: TenantRole = data?.role ?? null
+  const actualRole: TenantRole = data?.role ?? null
+
+  // "View as viewer" mode -- shape the role-aware UI as if the
+  // operator were a read-only viewer, while leaving every API
+  // call, the auth token, and the actual tenant role untouched.
+  // Only managers+/superusers can enter the mode (lower roles
+  // would just see the same UI they already have, no point).
+  const previewActive =
+    viewAsViewer &&
+    actualRole !== null &&
+    actualRole !== "viewer" &&
+    (actualRole === "manager" || actualRole === "owner" || actualRole === "superuser")
+
+  const role: TenantRole = previewActive ? "viewer" : actualRole
 
   const isAtLeast = (min: Exclude<TenantRole, null | "superuser">) => {
     if (!role) return false
@@ -116,6 +131,15 @@ export function useUserRole() {
 
   return {
     role,
+    /** The user's REAL tenant role, ignoring the preview overlay.
+     *  Use this only for things that must stay aware of who the
+     *  operator actually is (e.g. the "Exit preview" button, the
+     *  banner copy). Don't reach for it to bypass the view-as-viewer
+     *  gating; that defeats the whole point. */
+    actualRole,
+    /** True when the operator is in "view as viewer" preview mode.
+     *  Surface a banner / exit button when set. */
+    isPreviewingViewer: previewActive,
     me: data?.user ?? null,
     company: data?.company ?? null,
     theme: data?.theme ?? null,

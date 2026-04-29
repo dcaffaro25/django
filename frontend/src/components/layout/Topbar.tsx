@@ -1,7 +1,7 @@
 import { useTranslation } from "react-i18next"
 import { Link } from "react-router-dom"
 import {
-  Activity, AlertTriangle, Bug,
+  Activity, AlertTriangle, Bug, Eye,
   GitBranch, LogOut, Moon, Palette, Search, Server, ShieldCheck, Sun, Users,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -41,8 +41,16 @@ export function Topbar() {
   const setCommandOpen = useAppStore((s) => s.setCommandOpen)
   const theme = useAppStore((s) => s.theme)
   const setTheme = useAppStore((s) => s.setTheme)
-  const { me } = useUserRole()
+  const viewAsViewer = useAppStore((s) => s.viewAsViewer)
+  const setViewAsViewer = useAppStore((s) => s.setViewAsViewer)
+  // Pull the ACTUAL role here -- the preview overlay returns
+  // ``role: "viewer"`` from useUserRole, which would hide the very
+  // toggle we need to leave preview mode if we read ``role``
+  // straight. ``actualRole`` is unaffected by the overlay.
+  const { me, actualRole } = useUserRole()
   const updatePrefs = useUpdatePreferences()
+  const canPreviewAsViewer =
+    actualRole === "manager" || actualRole === "owner" || actualRole === "superuser"
 
   const onToggleDark = () => {
     const next = theme === "dark" ? "light" : "dark"
@@ -124,6 +132,23 @@ export function Topbar() {
                     {me.use_tenant_theme ? "tenant" : "sistema"}
                   </span>
                 </DropdownMenuItem>
+                {/* "View as viewer" preview -- only offered to
+                    managers / owners / superusers (lower roles
+                    already see the viewer surface). The actual
+                    backend role is untouched; this just shapes the
+                    UI client-side so operators can verify what an
+                    external tenant user sees. */}
+                {canPreviewAsViewer && (
+                  <DropdownMenuItem onClick={() => setViewAsViewer(!viewAsViewer)} className="cursor-pointer">
+                    <Eye className="mr-2 h-4 w-4" />
+                    <span className="flex-1">
+                      {viewAsViewer ? "Sair do preview de cliente" : "Ver como cliente"}
+                    </span>
+                    <span className="text-[10px] text-muted-foreground">
+                      {viewAsViewer ? "ativo" : "viewer"}
+                    </span>
+                  </DropdownMenuItem>
+                )}
               </>
             )}
             {/* Admin entries — superuser only. Non-superusers don't

@@ -3,6 +3,7 @@ import { useHotkeys } from "react-hotkeys-hook"
 import { Sidebar } from "./Sidebar"
 import { Topbar } from "./Topbar"
 import { CommandPalette } from "./CommandPalette"
+import { ViewAsViewerBanner } from "./ViewAsViewerBanner"
 import { ErrorBoundary } from "@/components/ErrorBoundary"
 import { useAppStore } from "@/stores/app-store"
 import { useActivityBeacon } from "@/hooks/useActivityBeacon"
@@ -29,6 +30,7 @@ export function AppShell({ children }: { children: ReactNode }) {
     <div className="flex h-screen w-full overflow-hidden bg-background text-foreground">
       <Sidebar />
       <div className={cn("flex min-w-0 flex-1 flex-col")}>
+        <ViewAsViewerBanner />
         <Topbar />
         <main className="flex-1 overflow-y-auto">
           <div className="mx-auto w-full max-w-[1440px] px-6 py-6">
