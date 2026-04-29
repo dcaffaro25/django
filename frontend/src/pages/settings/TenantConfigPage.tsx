@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom"
-import { Building2, Users, Brain, CreditCard, FileBarChart, Settings, Boxes, ChevronDown, ChevronRight, Palette } from "lucide-react"
+import { Building2, Users, Brain, CreditCard, FileBarChart, Settings, Boxes, ChevronDown, ChevronRight, Palette, Pencil } from "lucide-react"
 import { useState } from "react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { useBankAccountsDashboardKpis } from "@/features/reconciliation"
@@ -9,10 +9,10 @@ import {
   REPORT_CATEGORY_STYLES,
 } from "@/features/reconciliation/taxonomy_labels"
 import { useTenant } from "@/providers/TenantProvider"
-import { useUserRole } from "@/features/auth/useUserRole"
 import { cn, formatCurrency } from "@/lib/utils"
 import type { AccountLite } from "@/features/reconciliation/types"
 import { TenantThemeEditor } from "@/components/theme/TenantThemeEditor"
+import { CompanyInfoEditor } from "@/components/settings/CompanyInfoEditor"
 
 /**
  * Tenant configuration landing page.
@@ -32,8 +32,8 @@ export function TenantConfigPage() {
   const { tenant } = useTenant()
   const { data: kpis } = useBankAccountsDashboardKpis()
   const { data: accounts = [] } = useAccounts()
-  const { isManager } = useUserRole()
   const [themeEditorOpen, setThemeEditorOpen] = useState(false)
+  const [companyEditorOpen, setCompanyEditorOpen] = useState(false)
 
   // ``kpis.account_count`` is the BANK-account count from
   // ``/dashboard-kpis/`` -- NOT the chart-of-accounts count. Use the
@@ -52,7 +52,20 @@ export function TenantConfigPage() {
         title="Configuração da empresa"
         subtitle="Parâmetros e entidades por inquilino"
         actions={
-          isManager ? (
+          // Both edit drawers are visible to anyone who reaches the
+          // page; the actual write is gated server-side by the
+          // middleware role check (viewers get a friendly 403 toast
+          // via the api-client interceptor). Showing them
+          // unconditionally avoids hiding the entry point during
+          // the brief window before /api/core/me/ resolves on boot.
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setCompanyEditorOpen(true)}
+              className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
+            >
+              <Pencil className="h-3.5 w-3.5 text-primary" />
+              Editar empresa
+            </button>
             <button
               onClick={() => setThemeEditorOpen(true)}
               className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
@@ -60,7 +73,7 @@ export function TenantConfigPage() {
               <Palette className="h-3.5 w-3.5 text-primary" />
               Editar tema
             </button>
-          ) : null
+          </div>
         }
       />
 
@@ -160,6 +173,7 @@ export function TenantConfigPage() {
       </div>
 
       <TenantThemeEditor open={themeEditorOpen} onClose={() => setThemeEditorOpen(false)} />
+      <CompanyInfoEditor open={companyEditorOpen} onClose={() => setCompanyEditorOpen(false)} />
     </div>
   )
 }

@@ -16,61 +16,15 @@ import { useUserRole } from "@/features/auth/useUserRole"
 import { useTenant } from "@/providers/TenantProvider"
 import type { Entity } from "@/features/reconciliation/types"
 import { cn } from "@/lib/utils"
-
-const ENTITY_TYPE_OPTIONS: Array<[string, string]> = [
-  ["matriz", "Matriz"],
-  ["filial", "Filial"],
-  ["holding", "Holding"],
-  ["sociedade", "Sociedade Simples"],
-  ["fundo", "Fundo de Investimento"],
-  ["departamento", "Departamento"],
-  ["centro_de_custo", "Centro de Custo"],
-  ["projeto", "Projeto"],
-  ["outro", "Outro"],
-]
-
-const REGIME_TRIBUTARIO_OPTIONS: Array<[string, string]> = [
-  ["simples", "Simples Nacional"],
-  ["lucro_presumido", "Lucro Presumido"],
-  ["lucro_real", "Lucro Real"],
-  ["mei", "MEI"],
-  ["imune", "Imune / Isento"],
-  ["nao_aplicavel", "Não se aplica"],
-]
-
-const UF_OPTIONS = [
-  "AC","AL","AM","AP","BA","CE","DF","ES","GO",
-  "MA","MG","MS","MT","PA","PB","PE","PI","PR",
-  "RJ","RN","RO","RR","RS","SC","SE","SP","TO","EX",
-] as const
+import {
+  ENTITY_TYPE_OPTIONS, REGIME_TRIBUTARIO_OPTIONS, UF_OPTIONS,
+  formatCepInput, formatCnpjInput,
+} from "@/lib/br-fiscal"
 
 // Types for which the CNPJ / IE / IM / regime tributário block is
 // meaningful. Centros de custo / projetos / departamentos don't have
 // independent fiscal identification — keep the form light for them.
 const TYPES_WITH_FISCAL = new Set(["matriz", "filial", "holding", "sociedade", "fundo"])
-
-function formatCnpjInput(raw: string): string {
-  const digits = raw.replace(/\D/g, "").slice(0, 14)
-  const parts = [
-    digits.slice(0, 2),
-    digits.slice(2, 5),
-    digits.slice(5, 8),
-    digits.slice(8, 12),
-    digits.slice(12, 14),
-  ]
-  let out = parts[0]
-  if (parts[1]) out += "." + parts[1]
-  if (parts[2]) out += "." + parts[2]
-  if (parts[3]) out += "/" + parts[3]
-  if (parts[4]) out += "-" + parts[4]
-  return out
-}
-
-function formatCepInput(raw: string): string {
-  const digits = raw.replace(/\D/g, "").slice(0, 8)
-  if (digits.length <= 5) return digits
-  return digits.slice(0, 5) + "-" + digits.slice(5)
-}
 
 export function EntitiesPage() {
   const { t } = useTranslation(["reconciliation", "common"])
