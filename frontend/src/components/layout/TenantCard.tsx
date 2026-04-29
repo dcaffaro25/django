@@ -1,13 +1,21 @@
 import { Link } from "react-router-dom"
-import { ChevronRight, Wallet, Tag } from "lucide-react"
+import { Check, ChevronsUpDown, Settings2, Tag, Wallet } from "lucide-react"
 import { useBankAccountsDashboardKpis } from "@/features/reconciliation"
 import { useTenant } from "@/providers/TenantProvider"
 import { cn, formatCurrency } from "@/lib/utils"
+import {
+  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
+  DropdownMenuSeparator, DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 
 /**
  * Top-of-sidebar tenant identification card.
  *
- * Replaces the static Nord logo + tagline with a tenant-aware tile:
+ * Doubles as the tenant switcher: the entire card is a dropdown
+ * trigger that lists every tenant the user belongs to, with the
+ * active one marked. A "Abrir configuração" entry at the bottom of
+ * the menu replaces the previous click-to-config behaviour, so the
+ * card now has TWO clear roles: identity (visual) + switching (menu).
  *
  *   * Tenant name + first-letter avatar (colour derived from
  *     subdomain hash so each tenant looks distinct without fetching
@@ -16,13 +24,11 @@ import { cn, formatCurrency } from "@/lib/utils"
  *     balance, sourced from ``useBankAccountsDashboardKpis`` so they
  *     piggyback on the same React Query cache the dashboard already
  *     populates.
- *   * Click target navigates to ``/settings/tenant`` for the
- *     full-page tenant config (entities, users, AI usage, billing).
  *
- * In the collapsed sidebar we fall back to just the avatar.
+ * In the collapsed sidebar we fall back to just the avatar trigger.
  */
 export function TenantCard({ collapsed }: { collapsed: boolean }) {
-  const { tenant } = useTenant()
+  const { tenant, tenants, switchTenant } = useTenant()
   const { data: kpis } = useBankAccountsDashboardKpis()
 
   const initial = (tenant?.name?.[0] ?? "N").toUpperCase()
@@ -38,49 +44,112 @@ export function TenantCard({ collapsed }: { collapsed: boolean }) {
 
   if (collapsed) {
     return (
-      <Link
-        to="/settings/tenant"
-        title={`${name} (${subdomain || "—"}) — abrir configuração`}
-        className="mx-auto mt-2 grid h-9 w-9 place-items-center rounded-md text-[12px] font-bold text-primary-foreground transition-transform hover:scale-105"
-        style={{ background: avatarColour }}
-      >
-        {initial}
-      </Link>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button
+            title={`${name} (${subdomain || "—"}) — trocar empresa`}
+            className="mx-auto mt-2 grid h-9 w-9 place-items-center rounded-md text-[12px] font-bold text-primary-foreground transition-transform hover:scale-105"
+            style={{ background: avatarColour }}
+          >
+            {initial}
+          </button>
+        </DropdownMenuTrigger>
+        <TenantSwitcherMenu
+          tenants={tenants}
+          activeId={tenant?.id}
+          onSwitch={switchTenant}
+        />
+      </DropdownMenu>
     )
   }
 
   return (
-    <Link
-      to="/settings/tenant"
-      className={cn(
-        "group mx-2 mt-2 block rounded-lg border border-border bg-surface-2 px-3 py-2 transition-colors hover:bg-accent/50",
-      )}
-      title="Abrir configuração da empresa"
-    >
-      <div className="flex items-center gap-2">
-        <div
-          className="grid h-8 w-8 place-items-center rounded-md text-[12px] font-bold text-primary-foreground"
-          style={{ background: avatarColour }}
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          className={cn(
+            "group mx-2 mt-2 block w-[calc(100%-1rem)] rounded-lg border border-border bg-surface-2 px-3 py-2 text-left transition-colors hover:bg-accent/50",
+          )}
+          title="Trocar empresa ou abrir configuração"
         >
-          {initial}
+          <div className="flex items-center gap-2">
+            <div
+              className="grid h-8 w-8 place-items-center rounded-md text-[12px] font-bold text-primary-foreground"
+              style={{ background: avatarColour }}
+            >
+              {initial}
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-[12px] font-semibold leading-none">{name}</div>
+              {subdomain ? (
+                <div className="truncate text-[10px] text-muted-foreground">{subdomain}</div>
+              ) : null}
+            </div>
+            <ChevronsUpDown className="h-3.5 w-3.5 text-muted-foreground transition-colors group-hover:text-foreground" />
+          </div>
+          <div className="mt-2 flex items-center justify-between gap-2 border-t border-border/50 pt-1.5 text-[10px] text-muted-foreground">
+            <span className="inline-flex items-center gap-1" title="Total de contas no plano de contas">
+              <Tag className="h-3 w-3" /> {accountCount ?? "—"} contas
+            </span>
+            <span className="inline-flex items-center gap-1 tabular-nums" title="Saldo total na moeda principal">
+              <Wallet className="h-3 w-3" /> {formatCurrency(totalBalance, primaryCurrency)}
+            </span>
+          </div>
+        </button>
+      </DropdownMenuTrigger>
+      <TenantSwitcherMenu
+        tenants={tenants}
+        activeId={tenant?.id}
+        onSwitch={switchTenant}
+      />
+    </DropdownMenu>
+  )
+}
+
+interface TenantOption {
+  id: number
+  name: string
+  subdomain: string
+}
+
+function TenantSwitcherMenu({
+  tenants, activeId, onSwitch,
+}: {
+  tenants: TenantOption[]
+  activeId: number | undefined
+  onSwitch: (subdomain: string) => void
+}) {
+  return (
+    <DropdownMenuContent align="start" className="w-64">
+      <DropdownMenuLabel className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+        Empresas
+      </DropdownMenuLabel>
+      <DropdownMenuSeparator />
+      {tenants.length === 0 ? (
+        <div className="px-2 py-1.5 text-xs text-muted-foreground">
+          Nenhuma empresa disponível
         </div>
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-[12px] font-semibold leading-none">{name}</div>
-          {subdomain ? (
-            <div className="truncate text-[10px] text-muted-foreground">{subdomain}</div>
-          ) : null}
-        </div>
-        <ChevronRight className="h-3.5 w-3.5 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
-      </div>
-      <div className="mt-2 flex items-center justify-between gap-2 border-t border-border/50 pt-1.5 text-[10px] text-muted-foreground">
-        <span className="inline-flex items-center gap-1" title="Total de contas no plano de contas">
-          <Tag className="h-3 w-3" /> {accountCount ?? "—"} contas
-        </span>
-        <span className="inline-flex items-center gap-1 tabular-nums" title="Saldo total na moeda principal">
-          <Wallet className="h-3 w-3" /> {formatCurrency(totalBalance, primaryCurrency)}
-        </span>
-      </div>
-    </Link>
+      ) : tenants.map((ten) => (
+        <DropdownMenuItem
+          key={ten.id}
+          onClick={() => onSwitch(ten.subdomain)}
+          className="cursor-pointer"
+        >
+          <span className="mr-2 inline-flex h-4 w-4 items-center justify-center">
+            {activeId === ten.id && <Check className="h-3.5 w-3.5 text-primary" />}
+          </span>
+          <span className="truncate">{ten.name}</span>
+          <span className="ml-auto text-[10px] text-muted-foreground">{ten.subdomain}</span>
+        </DropdownMenuItem>
+      ))}
+      <DropdownMenuSeparator />
+      <DropdownMenuItem asChild className="cursor-pointer">
+        <Link to="/settings/tenant" className="flex items-center">
+          <Settings2 className="mr-2 h-4 w-4" />
+          Abrir configuração
+        </Link>
+      </DropdownMenuItem>
+    </DropdownMenuContent>
   )
 }
 

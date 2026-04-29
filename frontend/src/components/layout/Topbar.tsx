@@ -1,13 +1,12 @@
 import { useTranslation } from "react-i18next"
 import { Link } from "react-router-dom"
 import {
-  Activity, AlertTriangle, Bug, Building2, Check, ChevronsUpDown,
+  Activity, AlertTriangle, Bug,
   GitBranch, LogOut, Moon, Palette, Search, Server, ShieldCheck, Sun, Users,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/stores/app-store"
 import { useAuth } from "@/providers/AuthProvider"
-import { useTenant } from "@/providers/TenantProvider"
 import { useUserRole } from "@/features/auth/useUserRole"
 import { useUpdatePreferences } from "@/features/auth/usePreferences"
 import {
@@ -39,7 +38,6 @@ const ADMIN_LINKS = [
 export function Topbar() {
   const { t } = useTranslation()
   const { user, logout, isSuperuser } = useAuth()
-  const { tenant, tenants, switchTenant } = useTenant()
   const setCommandOpen = useAppStore((s) => s.setCommandOpen)
   const theme = useAppStore((s) => s.theme)
   const setTheme = useAppStore((s) => s.setTheme)
@@ -78,36 +76,6 @@ export function Topbar() {
       </button>
 
       <div className="flex items-center gap-1.5">
-        {/* Tenant switcher */}
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <button className="flex h-8 items-center gap-2 rounded-md border border-border bg-background px-2.5 text-[13px] hover:bg-accent">
-              <Building2 className="h-3.5 w-3.5 text-muted-foreground" />
-              <span className="max-w-[140px] truncate font-medium">{tenant?.name ?? t("tenant.select")}</span>
-              <ChevronsUpDown className="h-3 w-3 text-muted-foreground" />
-            </button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-56">
-            <DropdownMenuLabel>{t("tenant.workspace")}</DropdownMenuLabel>
-            <DropdownMenuSeparator />
-            {tenants.length === 0 ? (
-              <div className="px-2 py-1.5 text-xs text-muted-foreground">{t("tenant.no_tenants")}</div>
-            ) : tenants.map((ten) => (
-              <DropdownMenuItem
-                key={ten.id}
-                onClick={() => switchTenant(ten.subdomain)}
-                className="cursor-pointer"
-              >
-                <span className="mr-2 inline-flex h-4 w-4 items-center justify-center">
-                  {tenant?.id === ten.id && <Check className="h-3.5 w-3.5 text-primary" />}
-                </span>
-                <span className="truncate">{ten.name}</span>
-                <span className="ml-auto text-[10px] text-muted-foreground">{ten.subdomain}</span>
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
-
         {/* Notifications */}
         <NotificationBell />
 
