@@ -43,6 +43,41 @@ http.interceptors.request.use((config) => {
 // stack 5 identical toasts. 3-second debounce is enough for a real
 // click-then-click sequence to surface fresh feedback.
 let _lastRoleBlockToastAt = 0
+let _last5xxToastAt = 0
+
+/**
+ * Pull a human-readable error string out of an Axios error response
+ * if the server gave us anything useful. Walks the common DRF shapes:
+ *
+ *   * ``{detail: "..."}``                       — APIException default
+ *   * ``{field: ["msg", "..."]}``               — serializer errors
+ *   * ``{non_field_errors: ["msg"]}``
+ *
+ * Falls back to ``null`` when the body isn't a structured error
+ * (e.g. Django's debug HTML page on 500). Callers can substitute
+ * their own copy in that case.
+ */
+export function extractApiErrorMessage(error: unknown): string | null {
+  const data = (error as { response?: { data?: unknown } })?.response?.data
+  if (!data) return null
+  if (typeof data === "string") {
+    // HTML responses (Django debug pages) are useless to operators.
+    return data.startsWith("<") ? null : data
+  }
+  if (typeof data !== "object") return null
+  const obj = data as Record<string, unknown>
+  if (typeof obj.detail === "string") return obj.detail
+  if (Array.isArray(obj.non_field_errors) && typeof obj.non_field_errors[0] === "string") {
+    return obj.non_field_errors[0] as string
+  }
+  // First field-level error wins. Format as ``field: message`` so
+  // the operator can tell which input failed validation.
+  for (const [key, value] of Object.entries(obj)) {
+    if (Array.isArray(value) && typeof value[0] === "string") return `${key}: ${value[0]}`
+    if (typeof value === "string") return `${key}: ${value}`
+  }
+  return null
+}
 
 http.interceptors.response.use(
   (r) => r,
@@ -73,6 +108,25 @@ http.interceptors.response.use(
           } else {
             toast.error("Sem permissão para esta ação.")
           }
+        })
+      }
+    }
+    if (error?.response?.status >= 500 && error.response.status < 600) {
+      // Server-side crashes used to surface as a generic "Erro ao
+      // salvar" in the calling component, which hid the underlying
+      // cause (most commonly: a migration that hasn't been applied
+      // on the deploy box). Toast a short version + log the full
+      // body so the next time it happens, operators can act on it.
+      const detail = extractApiErrorMessage(error)
+      const now = Date.now()
+      if (now - _last5xxToastAt > 3000) {
+        _last5xxToastAt = now
+        void import("sonner").then(({ toast }) => {
+          toast.error(
+            detail
+              ? `Erro do servidor: ${detail}`
+              : "Erro do servidor (500). Verifique se as migrações estão aplicadas e se o servidor foi reiniciado.",
+          )
         })
       }
     }
