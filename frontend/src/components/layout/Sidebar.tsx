@@ -122,10 +122,7 @@ export function Sidebar() {
             N
           </div>
           {!collapsed && (
-            <div className="flex flex-col leading-tight">
-              <span className="text-[13px] font-semibold">{t("app.name")}</span>
-              <span className="text-[10px] text-muted-foreground">{t("app.tagline")}</span>
-            </div>
+            <span className="text-[13px] font-semibold leading-tight">{t("app.name")}</span>
           )}
         </div>
         {!collapsed && (

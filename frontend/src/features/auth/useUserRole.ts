@@ -42,6 +42,10 @@ export interface TenantThemePayload {
   logo_url: string | null
   logo_dark_url: string | null
   favicon_url: string | null
+  /** Tenant-level default appearance mode. Used as the floor when
+   *  a user hasn't explicitly toggled dark/light yet
+   *  (``MeUser.prefer_dark_mode_explicit === false``). */
+  default_mode: "light" | "dark"
   updated_at: string
 }
 
@@ -54,6 +58,11 @@ export interface MeUser {
   is_superuser: boolean
   use_tenant_theme: boolean
   prefer_dark_mode: boolean
+  /** True only after the user has clicked the dark/light toggle.
+   *  Until then, the tenant theme's ``default_mode`` wins -- prevents
+   *  the model-default ``prefer_dark_mode=False`` from silently
+   *  flipping every operator to light mode after deploy. */
+  prefer_dark_mode_explicit: boolean
 }
 
 export interface MeCompany {

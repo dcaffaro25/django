@@ -68,6 +68,7 @@ interface DraftState {
   logo_url: string
   logo_dark_url: string
   favicon_url: string
+  default_mode: "light" | "dark"
 }
 
 function payloadToDraft(payload: TenantThemePayload): DraftState {
@@ -79,6 +80,7 @@ function payloadToDraft(payload: TenantThemePayload): DraftState {
     logo_url: payload.logo_url ?? "",
     logo_dark_url: payload.logo_dark_url ?? "",
     favicon_url: payload.favicon_url ?? "",
+    default_mode: payload.default_mode ?? "dark",
   }
 }
 
@@ -106,6 +108,7 @@ export function TenantThemeEditor({ open, onClose }: { open: boolean; onClose: (
         logo_url: "",
         logo_dark_url: "",
         favicon_url: "",
+        default_mode: "dark",
       })
     }
   }, [theme, open, isLoading])
@@ -167,6 +170,7 @@ export function TenantThemeEditor({ open, onClose }: { open: boolean; onClose: (
       logo_url: d?.logo_url ?? "",
       logo_dark_url: d?.logo_dark_url ?? "",
       favicon_url: d?.favicon_url ?? "",
+      default_mode: d?.default_mode ?? "dark",
       ...set,
     }))
   }
@@ -215,6 +219,7 @@ export function TenantThemeEditor({ open, onClose }: { open: boolean; onClose: (
         logo_url: draft.logo_url || null,
         logo_dark_url: draft.logo_dark_url || null,
         favicon_url: draft.favicon_url || null,
+        default_mode: draft.default_mode,
       },
       {
         onSuccess: () => { toast.success("Tema salvo"); onClose() },
@@ -372,6 +377,34 @@ export function TenantThemeEditor({ open, onClose }: { open: boolean; onClose: (
                     </section>
                   </div>
                 </Collapsible>
+
+                {/* === DEFAULT APPEARANCE MODE === */}
+                <section className="space-y-2">
+                  <h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Modo padrão</h3>
+                  <p className="text-[11px] text-muted-foreground">
+                    Modo aplicado a usuários que ainda não escolheram explicitamente
+                    claro ou escuro. <strong>Preferências individuais sempre prevalecem</strong> —
+                    quando o operador clica no botão sol/lua na barra superior, sua
+                    escolha é gravada e este padrão deixa de afetá-lo.
+                  </p>
+                  <div className="flex gap-2">
+                    {(["light", "dark"] as const).map((m) => (
+                      <button
+                        key={m}
+                        type="button"
+                        onClick={() => setDraft((d) => d ? { ...d, default_mode: m } : d)}
+                        className={cn(
+                          "inline-flex h-8 items-center gap-1.5 rounded-md border px-3 text-[11px] font-medium",
+                          draft.default_mode === m
+                            ? "border-primary bg-primary/10 text-primary"
+                            : "border-border bg-background text-muted-foreground hover:bg-accent",
+                        )}
+                      >
+                        {m === "light" ? "Claro" : "Escuro"}
+                      </button>
+                    ))}
+                  </div>
+                </section>
 
                 {/* === LOGO / FAVICON === */}
                 <section className="space-y-2">

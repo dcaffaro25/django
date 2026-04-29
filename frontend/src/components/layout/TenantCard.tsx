@@ -93,30 +93,36 @@ export function TenantCard({ collapsed }: { collapsed: boolean }) {
       <DropdownMenuTrigger asChild>
         <button
           className={cn(
-            "group mx-2 mt-2 block w-[calc(100%-1rem)] rounded-lg border border-border bg-surface-2 px-3 py-2 text-left transition-colors hover:bg-accent/50",
+            "group mx-2 mt-2 block w-[calc(100%-1rem)] rounded-lg border border-border bg-surface-2 px-3 py-2.5 text-left transition-colors hover:bg-accent/50",
           )}
           title="Trocar empresa ou abrir configuração"
         >
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-3">
+            {/* Avatar/logo at the same scale as the identity card on
+                /settings/tenant (h-14) so both surfaces feel like the
+                same thing. */}
             <div
-              className="grid h-8 w-8 place-items-center overflow-hidden rounded-md text-[12px] font-bold text-primary-foreground"
+              className="grid h-14 w-14 shrink-0 place-items-center overflow-hidden rounded-lg text-[20px] font-bold text-primary-foreground shadow-sm"
               style={logoUrl ? undefined : { background: avatarColour }}
             >
               {logoUrl ? (
-                <img src={logoUrl} alt={name} className="h-full w-full object-cover" />
+                <img src={logoUrl} alt={name} className="h-full w-full object-contain" />
               ) : (
                 initial
               )}
             </div>
+            {/* Name + subdomain stacked to the right of the icon.
+                Bigger weight than before so the tenant identity is
+                unmistakable at a glance. */}
             <div className="min-w-0 flex-1">
-              <div className="truncate text-[12px] font-semibold leading-none">{name}</div>
+              <div className="truncate text-[14px] font-semibold leading-tight">{name}</div>
               {subdomain ? (
-                <div className="truncate text-[10px] text-muted-foreground">{subdomain}</div>
+                <div className="truncate text-[11px] text-muted-foreground">{subdomain}</div>
               ) : null}
             </div>
-            <ChevronsUpDown className="h-3.5 w-3.5 text-muted-foreground transition-colors group-hover:text-foreground" />
+            <ChevronsUpDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-colors group-hover:text-foreground" />
           </div>
-          <div className="mt-2 flex items-center justify-between gap-2 border-t border-border/50 pt-1.5 text-[10px] text-muted-foreground">
+          <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-border/50 pt-2 text-[10px] text-muted-foreground">
             <span className="inline-flex items-center gap-1" title="Total de contas no plano de contas">
               <Tag className="h-3 w-3" /> {accountCount ?? "—"} contas
             </span>

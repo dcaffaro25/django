@@ -9,6 +9,7 @@ import {
   REPORT_CATEGORY_STYLES,
 } from "@/features/reconciliation/taxonomy_labels"
 import { useTenant } from "@/providers/TenantProvider"
+import { useUserRole } from "@/features/auth/useUserRole"
 import { cn, formatCurrency } from "@/lib/utils"
 import type { AccountLite } from "@/features/reconciliation/types"
 import { TenantThemeEditor } from "@/components/theme/TenantThemeEditor"
@@ -32,8 +33,14 @@ export function TenantConfigPage() {
   const { tenant } = useTenant()
   const { data: kpis } = useBankAccountsDashboardKpis()
   const { data: accounts = [] } = useAccounts()
+  const { theme: tenantTheme, me } = useUserRole()
   const [themeEditorOpen, setThemeEditorOpen] = useState(false)
   const [companyEditorOpen, setCompanyEditorOpen] = useState(false)
+  // Match the TenantCard logic: prefer the dark logo when the user
+  // is in dark mode AND a dark variant is configured. Otherwise the
+  // primary logo (or the letter avatar) wins.
+  const useDarkLogo = !!me?.prefer_dark_mode && !!tenantTheme?.logo_dark_url
+  const identityLogoUrl = useDarkLogo ? tenantTheme?.logo_dark_url : tenantTheme?.logo_url
 
   // ``kpis.account_count`` is the BANK-account count from
   // ``/dashboard-kpis/`` -- NOT the chart-of-accounts count. Use the
@@ -77,10 +84,20 @@ export function TenantConfigPage() {
         }
       />
 
-      {/* Identity card */}
+      {/* Identity card -- renders ``tenantTheme.logo_url`` (or its
+          dark variant) as an ``<img>`` when set, falling back to the
+          deterministic letter avatar so the page never looks empty
+          before a tenant configures its theme. */}
       <div className="card-elevated flex items-center gap-4 p-4">
-        <div className="grid h-14 w-14 shrink-0 place-items-center rounded-lg text-[20px] font-bold text-primary-foreground" style={{ background: "hsl(220 65% 50%)" }}>
-          {(tenant?.name ?? "N")[0].toUpperCase()}
+        <div
+          className="grid h-14 w-14 shrink-0 place-items-center overflow-hidden rounded-lg text-[20px] font-bold text-primary-foreground"
+          style={identityLogoUrl ? undefined : { background: "hsl(220 65% 50%)" }}
+        >
+          {identityLogoUrl ? (
+            <img src={identityLogoUrl} alt={tenant?.name ?? "Logo"} className="h-full w-full object-contain" />
+          ) : (
+            (tenant?.name ?? "N")[0].toUpperCase()
+          )}
         </div>
         <div className="min-w-0 flex-1">
           <div className="text-[18px] font-semibold leading-tight">{tenant?.name ?? "—"}</div>

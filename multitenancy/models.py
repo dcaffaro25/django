@@ -35,6 +35,16 @@ class CustomUser(AbstractUser):
         default=False,
         help_text="Per-user light/dark preference. Tenant ships both modes.",
     )
+    prefer_dark_mode_explicit = models.BooleanField(
+        default=False,
+        help_text=(
+            "True only after the user clicks the dark/light toggle. "
+            "While False, the active TenantTheme.default_mode wins "
+            "-- avoids the migration-default ``prefer_dark_mode=False`` "
+            "from silently flipping every operator to light mode "
+            "after deploy."
+        ),
+    )
 
     def mark_email_sent(self):
         """Helper to update timestamp when an email is sent to the user"""
@@ -377,6 +387,16 @@ class TenantTheme(models.Model):
     # can edit individual swatches.
     category_palette_light = models.JSONField(default=_default_category_palette_light)
     category_palette_dark = models.JSONField(default=_default_category_palette_dark)
+
+    # Default appearance mode for this tenant. Used as the floor for
+    # any user who hasn't explicitly clicked the dark/light toggle
+    # (``CustomUser.prefer_dark_mode_explicit = False``). Set per-tenant
+    # in the editor so a "we ship in dark by default" brand stays in
+    # dark for new users without each one having to re-toggle.
+    DEFAULT_MODE_CHOICES = (("light", "Light"), ("dark", "Dark"))
+    default_mode = models.CharField(
+        max_length=8, choices=DEFAULT_MODE_CHOICES, default="dark",
+    )
 
     # Tenant logo & favicon. ``TextField`` (not ``URLField``) so the
     # value can be EITHER a regular ``http(s)://`` URL or a

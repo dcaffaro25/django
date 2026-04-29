@@ -143,6 +143,7 @@ class MeView(views.APIView):
                 "is_superuser": user.is_superuser,
                 "use_tenant_theme": getattr(user, "use_tenant_theme", True),
                 "prefer_dark_mode": getattr(user, "prefer_dark_mode", False),
+                "prefer_dark_mode_explicit": getattr(user, "prefer_dark_mode_explicit", False),
             },
             "role": getattr(request, "user_role", None),
             "company": company,
@@ -166,12 +167,17 @@ class MePreferencesView(views.APIView):
             changed.append("use_tenant_theme")
         if "prefer_dark_mode" in request.data:
             user.prefer_dark_mode = bool(request.data["prefer_dark_mode"])
-            changed.append("prefer_dark_mode")
+            # Any explicit toggle flips the explicit flag so the
+            # tenant default no longer overrides the user's choice
+            # on subsequent loads.
+            user.prefer_dark_mode_explicit = True
+            changed.extend(["prefer_dark_mode", "prefer_dark_mode_explicit"])
         if changed:
             user.save(update_fields=changed)
         return Response({
             "use_tenant_theme": user.use_tenant_theme,
             "prefer_dark_mode": user.prefer_dark_mode,
+            "prefer_dark_mode_explicit": user.prefer_dark_mode_explicit,
         })
 
 

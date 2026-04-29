@@ -1,4 +1,4 @@
-import { useEffect, type ReactNode } from "react"
+import { useEffect, useMemo, type ReactNode } from "react"
 import { useUserRole, type BrandPalette } from "@/features/auth/useUserRole"
 import { useAppStore } from "@/stores/app-store"
 import { hexToHslVar } from "@/lib/color-utils"
@@ -90,14 +90,30 @@ export function TenantThemeBridge({ children }: { children: ReactNode }) {
   const setTheme = useAppStore((s) => s.setTheme)
   const currentMode = useAppStore((s) => s.theme)
 
-  // Mirror the user's dark/light preference into the existing
-  // app-store so the rest of the system (ThemeProvider) doesn't
-  // need to know preferences come from a different source.
+  // Resolve the EFFECTIVE dark-mode flag. The user's
+  // ``prefer_dark_mode`` only wins after they've explicitly clicked
+  // the toggle (``prefer_dark_mode_explicit``). Until then, the
+  // tenant theme's ``default_mode`` is the source of truth -- which
+  // avoids the model-default ``prefer_dark_mode=False`` from
+  // silently flipping every operator to light mode the first time
+  // /api/core/me/ resolves after a deploy.
+  const effectiveDark = useMemo(() => {
+    if (!me) return null
+    if (me.prefer_dark_mode_explicit) return !!me.prefer_dark_mode
+    if (tenantTheme?.default_mode) return tenantTheme.default_mode === "dark"
+    // No tenant theme yet -- fall back to whatever app-store has
+    // (preserves the operator's previous local choice instead of
+    // forcing light).
+    return currentMode === "dark"
+  }, [me, tenantTheme?.default_mode, currentMode])
+
+  // Mirror the resolved dark/light into the existing app-store so
+  // ThemeProvider keeps applying ``.dark`` on the html element.
   useEffect(() => {
-    if (!me) return
-    const desired = me.prefer_dark_mode ? "dark" : "light"
+    if (effectiveDark === null) return
+    const desired = effectiveDark ? "dark" : "light"
     if (desired !== currentMode) setTheme(desired)
-  }, [me, currentMode, setTheme])
+  }, [effectiveDark, currentMode, setTheme])
 
   useEffect(() => {
     if (isLoading) return
@@ -105,10 +121,10 @@ export function TenantThemeBridge({ children }: { children: ReactNode }) {
       clearAppliedVars()
       return
     }
-    const isDark = !!me.prefer_dark_mode
+    const isDark = effectiveDark === true
     applyBrandPalette(isDark ? tenantTheme.brand_palette_dark : tenantTheme.brand_palette_light)
     applyCategoryPalette(isDark ? tenantTheme.category_palette_dark : tenantTheme.category_palette_light)
-  }, [isLoading, me?.use_tenant_theme, me?.prefer_dark_mode, tenantTheme])
+  }, [isLoading, me?.use_tenant_theme, effectiveDark, tenantTheme])
 
   return <>{children}</>
 }

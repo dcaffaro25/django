@@ -276,6 +276,7 @@ class TenantThemeSerializer(serializers.ModelSerializer):
             'brand_palette_light', 'brand_palette_dark',
             'category_palette_light', 'category_palette_dark',
             'logo_url', 'logo_dark_url', 'favicon_url',
+            'default_mode',
             'updated_at',
         ]
         read_only_fields = ['id', 'company', 'updated_at']
