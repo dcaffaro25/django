@@ -230,10 +230,7 @@ function EntitiesSummary() {
                 ) : null}
               </div>
               <div className="truncate font-mono text-[10px] tabular-nums text-muted-foreground">
-                {/* CNPJ migration pending; the field doesn't exist on
-                    Entity yet. Render a placeholder so the column
-                    width settles correctly today. */}
-                —
+                {formatCnpj(e.cnpj) ?? "—"}
               </div>
               <div className="text-right text-[10px] tabular-nums text-muted-foreground">
                 {e.level ?? 0}
@@ -245,9 +242,29 @@ function EntitiesSummary() {
       <div className="border-t border-border/40 bg-surface-2 px-3 py-1 text-[10px] text-muted-foreground">
         {entities.length} {entities.length === 1 ? "entidade" : "entidades"}
         {" · "}
-        <span className="italic">CNPJ + endereço chegam na próxima migração</span>
+        <Link to="/settings/entities" className="hover:text-primary">
+          Editar campos completos
+        </Link>
       </div>
     </div>
+  )
+}
+
+/** Format a 14-digit CNPJ string as ``00.000.000/0000-00``. Returns
+ *  ``null`` for nullable / partial values so the caller can fall
+ *  back to its own placeholder. The model stores 14 digits with no
+ *  mask (the ``Entity.clean()`` strips it on save), so this is the
+ *  display-side counterpart. */
+function formatCnpj(raw: string | null | undefined): string | null {
+  if (!raw) return null
+  const digits = raw.replace(/\D/g, "")
+  if (digits.length !== 14) return raw  // show as-is if non-canonical
+  return (
+    digits.slice(0, 2) +
+    "." + digits.slice(2, 5) +
+    "." + digits.slice(5, 8) +
+    "/" + digits.slice(8, 12) +
+    "-" + digits.slice(12, 14)
   )
 }
 

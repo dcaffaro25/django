@@ -271,10 +271,19 @@ class EntitySerializer2(serializers.ModelSerializer):
 
 class EntityMiniSerializer(serializers.ModelSerializer):
     path = serializers.SerializerMethodField()
-    
+
     class Meta:
         model = Entity
-        fields = ['id', 'level', 'parent_id', 'name', 'path', 'inherit_accounts', 'inherit_cost_centers']
+        # Lite payload for entity pickers + the tenant config page's
+        # entity summary table. ``cnpj`` and ``entity_type`` are
+        # included so the table can render them without a second
+        # round-trip; the heavier fiscal/address fields stay on the
+        # full ``EntitySerializer`` for the edit form.
+        fields = [
+            'id', 'level', 'parent_id', 'name', 'path',
+            'inherit_accounts', 'inherit_cost_centers',
+            'cnpj', 'entity_type',
+        ]
     
     def get_level(self, obj):
         """Calculate the level of the entity in the tree."""
@@ -313,10 +322,24 @@ class EntitySerializer(serializers.ModelSerializer):
     
     class Meta:
         model = Entity
-        fields = ['id', 'name', 'company', 'parent', 'parent_id', 'level', 'path', 'path_ids',
-                  'accounts', 'cost_centers',
-                  'inherit_accounts', 'inherit_cost_centers',
-            'effective_accounts', 'effective_cost_centers'
+        fields = [
+            'id', 'name', 'erp_id', 'company', 'parent', 'parent_id',
+            'level', 'path', 'path_ids',
+            'accounts', 'cost_centers',
+            'inherit_accounts', 'inherit_cost_centers',
+            'effective_accounts', 'effective_cost_centers',
+            # Phase E2 legal/fiscal fields. ``entity_type`` defaults
+            # to ``filial``; the rest are nullable and surfaced by
+            # the EntitiesPage edit form when present.
+            'entity_type',
+            'cnpj', 'inscricao_estadual', 'inscricao_municipal',
+            'cnae_principal',
+            'razao_social', 'nome_fantasia',
+            'regime_tributario',
+            'endereco_logradouro', 'endereco_numero',
+            'endereco_complemento', 'endereco_bairro',
+            'endereco_cidade', 'endereco_uf', 'endereco_cep',
+            'email', 'telefone',
         ]
 
     def get_level(self, obj):

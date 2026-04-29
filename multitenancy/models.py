@@ -196,6 +196,48 @@ class TenantAwareBaseModel(BaseModel):
                 )
         super().clean()
     
+# Closed-enum choices for the Entity legal/fiscal fields. These live
+# inline because they're tightly coupled to the model and we want
+# Django's choices=[...] validation at the form/admin layer. If we
+# ever ship operator-editable choice rows, promote to a DB table.
+
+ENTITY_TYPE_CHOICES = [
+    ("matriz", "Matriz"),
+    ("filial", "Filial"),
+    ("holding", "Holding"),
+    ("sociedade", "Sociedade Simples"),
+    ("fundo", "Fundo de Investimento"),
+    ("departamento", "Departamento"),
+    ("centro_de_custo", "Centro de Custo"),
+    ("projeto", "Projeto"),
+    ("outro", "Outro"),
+]
+
+# Brazilian tax-regime classification. ``nao_aplicavel`` covers
+# cost centres, projects, fund-of-funds and other entity types that
+# don't pay corporate tax in their own right.
+REGIME_TRIBUTARIO_CHOICES = [
+    ("simples", "Simples Nacional"),
+    ("lucro_presumido", "Lucro Presumido"),
+    ("lucro_real", "Lucro Real"),
+    ("mei", "MEI"),
+    ("imune", "Imune / Isento"),
+    ("nao_aplicavel", "Não se aplica"),
+]
+
+# 27 Brazilian states/UFs. Closed enum to keep operator typos out
+# of the address column. ``EX`` (Exterior) covers offshore / foreign
+# entities for tenants that consolidate cross-border subsidiaries.
+UF_CHOICES = [
+    (s, s) for s in (
+        "AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO",
+        "MA", "MG", "MS", "MT", "PA", "PB", "PE", "PI", "PR",
+        "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO",
+        "EX",
+    )
+]
+
+
 # Entity model representing the hierarchical organizational structure
 class Entity(TenantAwareBaseModel, MPTTModel):
     company = models.ForeignKey(Company, related_name='entities', on_delete=models.CASCADE)
@@ -210,17 +252,113 @@ class Entity(TenantAwareBaseModel, MPTTModel):
     parent = TreeForeignKey('self', null=True, blank=True, related_name='children', on_delete=models.CASCADE)
     accounts = models.ManyToManyField('accounting.Account', related_name='entities', blank=True, default=None)
     cost_centers = models.ManyToManyField('accounting.CostCenter', related_name='entities', blank=True, default=None)
-    
+
     inherit_accounts = models.BooleanField(default=True)  # Inherit accounts from parent
     inherit_cost_centers = models.BooleanField(default=True)  # Inherit cost centers from parent
 
+    # ------------------------------------------------------------------
+    # Legal / fiscal identification (Phase E2). Most fields are
+    # nullable because their requirement depends on ``entity_type`` --
+    # a "centro_de_custo" carries no CNPJ; a "matriz"/"filial" must.
+    # The form / admin layer enforces conditional required-ness; the
+    # DB stays permissive so existing rows don't fail validation when
+    # the field rolls out.
+    # ------------------------------------------------------------------
+    entity_type = models.CharField(
+        max_length=24, choices=ENTITY_TYPE_CHOICES, default="filial",
+        help_text=(
+            "Tipo da entidade. CNPJ / IE / IM / regime tributário só "
+            "fazem sentido para alguns tipos -- a UI condiciona campos "
+            "obrigatórios por tipo."
+        ),
+    )
+
+    # Documentos
+    cnpj = models.CharField(
+        max_length=14, null=True, blank=True, db_index=True,
+        help_text=(
+            "CNPJ normalizado para 14 dígitos sem máscara. Único por "
+            "tenant quando preenchido (UI valida). Aceita máscara na "
+            "entrada e a remove no clean()."
+        ),
+    )
+    inscricao_estadual = models.CharField(
+        max_length=20, null=True, blank=True,
+        help_text="IE (relevante para entidades que recolhem ICMS)."
+    )
+    inscricao_municipal = models.CharField(
+        max_length=20, null=True, blank=True,
+        help_text="IM (relevante para entidades que recolhem ISS)."
+    )
+    cnae_principal = models.CharField(
+        max_length=10, null=True, blank=True,
+        help_text="Código CNAE 7-dígitos da atividade principal."
+    )
+
+    # Nomes legais
+    razao_social = models.CharField(
+        max_length=255, null=True, blank=True,
+        help_text="Nome completo no contrato social. ``name`` é o rótulo de display."
+    )
+    nome_fantasia = models.CharField(
+        max_length=255, null=True, blank=True,
+        help_text="Nome comercial / marca."
+    )
+
+    # Regime tributário
+    regime_tributario = models.CharField(
+        max_length=24, choices=REGIME_TRIBUTARIO_CHOICES,
+        null=True, blank=True,
+    )
+
+    # Endereço
+    endereco_logradouro = models.CharField(max_length=255, null=True, blank=True)
+    endereco_numero = models.CharField(max_length=20, null=True, blank=True)
+    endereco_complemento = models.CharField(max_length=120, null=True, blank=True)
+    endereco_bairro = models.CharField(max_length=120, null=True, blank=True)
+    endereco_cidade = models.CharField(max_length=120, null=True, blank=True)
+    endereco_uf = models.CharField(
+        max_length=2, choices=UF_CHOICES, null=True, blank=True,
+    )
+    endereco_cep = models.CharField(
+        max_length=8, null=True, blank=True,
+        help_text="CEP normalizado para 8 dígitos sem máscara.",
+    )
+
+    # Contato
+    email = models.EmailField(max_length=254, null=True, blank=True)
+    telefone = models.CharField(max_length=24, null=True, blank=True)
+
     def __str__(self):
         return self.name
-    
+
+    def clean(self):
+        """Normalize CNPJ + CEP to digit-only strings before save.
+        Operators paste them with masks (``00.000.000/0001-00``,
+        ``00000-000``); we strip everything that isn't a digit so
+        downstream lookups + uniqueness checks are deterministic."""
+        super().clean()
+        if self.cnpj:
+            digits = "".join(ch for ch in self.cnpj if ch.isdigit())
+            if digits and len(digits) != 14:
+                raise ValidationError({"cnpj": "CNPJ deve ter 14 dígitos."})
+            self.cnpj = digits or None
+        if self.endereco_cep:
+            digits = "".join(ch for ch in self.endereco_cep if ch.isdigit())
+            if digits and len(digits) != 8:
+                raise ValidationError({"endereco_cep": "CEP deve ter 8 dígitos."})
+            self.endereco_cep = digits or None
+        if self.endereco_uf:
+            self.endereco_uf = self.endereco_uf.upper()
+
     class Meta:
         unique_together = ('company', 'name')
         indexes = [
             models.Index(fields=['company', 'erp_id']),
+            # Lookup by CNPJ inside a tenant -- supports the "find
+            # entity by partial CNPJ match" UX in the entity-picker
+            # and the import-time "match existing on CNPJ" flow.
+            models.Index(fields=['company', 'cnpj']),
         ]
 
     def get_path(self):

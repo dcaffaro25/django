@@ -683,6 +683,31 @@ export interface Entity {
   path: string
   inherit_accounts?: boolean
   inherit_cost_centers?: boolean
+  /** Phase E2 legal/fiscal fields. The lite endpoint
+   *  (``EntityMiniSerializer``) ships ``cnpj`` and ``entity_type``;
+   *  the full serializer adds the rest for the edit form. All
+   *  optional because most existing rows pre-date the migration. */
+  cnpj?: string | null
+  entity_type?: string | null
+  /** Detail-only fields. Present on responses from the full
+   *  ``EntitySerializer`` (``/api/entities/`` detail or write payload),
+   *  absent from the lite ``/api/entities-mini/`` listing. */
+  erp_id?: string | null
+  inscricao_estadual?: string | null
+  inscricao_municipal?: string | null
+  cnae_principal?: string | null
+  razao_social?: string | null
+  nome_fantasia?: string | null
+  regime_tributario?: string | null
+  endereco_logradouro?: string | null
+  endereco_numero?: string | null
+  endereco_complemento?: string | null
+  endereco_bairro?: string | null
+  endereco_cidade?: string | null
+  endereco_uf?: string | null
+  endereco_cep?: string | null
+  email?: string | null
+  telefone?: string | null
 }
 
 export interface ReconKPIs {

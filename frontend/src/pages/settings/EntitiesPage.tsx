@@ -17,6 +17,61 @@ import { useTenant } from "@/providers/TenantProvider"
 import type { Entity } from "@/features/reconciliation/types"
 import { cn } from "@/lib/utils"
 
+const ENTITY_TYPE_OPTIONS: Array<[string, string]> = [
+  ["matriz", "Matriz"],
+  ["filial", "Filial"],
+  ["holding", "Holding"],
+  ["sociedade", "Sociedade Simples"],
+  ["fundo", "Fundo de Investimento"],
+  ["departamento", "Departamento"],
+  ["centro_de_custo", "Centro de Custo"],
+  ["projeto", "Projeto"],
+  ["outro", "Outro"],
+]
+
+const REGIME_TRIBUTARIO_OPTIONS: Array<[string, string]> = [
+  ["simples", "Simples Nacional"],
+  ["lucro_presumido", "Lucro Presumido"],
+  ["lucro_real", "Lucro Real"],
+  ["mei", "MEI"],
+  ["imune", "Imune / Isento"],
+  ["nao_aplicavel", "Não se aplica"],
+]
+
+const UF_OPTIONS = [
+  "AC","AL","AM","AP","BA","CE","DF","ES","GO",
+  "MA","MG","MS","MT","PA","PB","PE","PI","PR",
+  "RJ","RN","RO","RR","RS","SC","SE","SP","TO","EX",
+] as const
+
+// Types for which the CNPJ / IE / IM / regime tributário block is
+// meaningful. Centros de custo / projetos / departamentos don't have
+// independent fiscal identification — keep the form light for them.
+const TYPES_WITH_FISCAL = new Set(["matriz", "filial", "holding", "sociedade", "fundo"])
+
+function formatCnpjInput(raw: string): string {
+  const digits = raw.replace(/\D/g, "").slice(0, 14)
+  const parts = [
+    digits.slice(0, 2),
+    digits.slice(2, 5),
+    digits.slice(5, 8),
+    digits.slice(8, 12),
+    digits.slice(12, 14),
+  ]
+  let out = parts[0]
+  if (parts[1]) out += "." + parts[1]
+  if (parts[2]) out += "." + parts[2]
+  if (parts[3]) out += "/" + parts[3]
+  if (parts[4]) out += "-" + parts[4]
+  return out
+}
+
+function formatCepInput(raw: string): string {
+  const digits = raw.replace(/\D/g, "").slice(0, 8)
+  if (digits.length <= 5) return digits
+  return digits.slice(0, 5) + "-" + digits.slice(5)
+}
+
 export function EntitiesPage() {
   const { t } = useTranslation(["reconciliation", "common"])
   const { canWrite } = useUserRole()
@@ -242,34 +297,168 @@ function EntityEditor({
             </button>
           </div>
 
-          <div className="flex-1 space-y-4 overflow-y-auto p-4 text-[12px]">
-            <Field label="Nome">
-              <input value={form.name ?? ""} onChange={(e) => set("name", e.target.value)}
-                className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring" />
-            </Field>
+          <div className="flex-1 space-y-5 overflow-y-auto p-4 text-[12px]">
+            <FormSection title="Identificação">
+              <Field label="Nome">
+                <input value={form.name ?? ""} onChange={(e) => set("name", e.target.value)}
+                  className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring" />
+              </Field>
 
-            <Field label="Entidade pai (opcional)">
-              <select value={form.parent_id ?? ""} onChange={(e) => set("parent_id", e.target.value ? Number(e.target.value) : null)}
-                className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring">
-                <option value="">— raiz —</option>
-                {entities
-                  .filter((e) => e.id !== entity?.id)
-                  .map((e) => (
-                    <option key={e.id} value={e.id}>{e.path ?? e.name}</option>
-                  ))}
-              </select>
-            </Field>
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Tipo">
+                  <select value={form.entity_type ?? "filial"} onChange={(e) => set("entity_type", e.target.value)}
+                    className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring">
+                    {ENTITY_TYPE_OPTIONS.map(([value, label]) => (
+                      <option key={value} value={value}>{label}</option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="ERP ID">
+                  <input value={form.erp_id ?? ""} onChange={(e) => set("erp_id", e.target.value || null)}
+                    placeholder="código no ERP do cliente"
+                    className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring" />
+                </Field>
+              </div>
 
-            <div className="grid grid-cols-2 gap-3">
-              <label className="flex items-center gap-2 rounded-md border border-border p-2.5">
-                <input type="checkbox" checked={!!form.inherit_accounts} onChange={(e) => set("inherit_accounts", e.target.checked)} className="accent-primary" />
-                Herdar contas
-              </label>
-              <label className="flex items-center gap-2 rounded-md border border-border p-2.5">
-                <input type="checkbox" checked={!!form.inherit_cost_centers} onChange={(e) => set("inherit_cost_centers", e.target.checked)} className="accent-primary" />
-                Herdar centros de custo
-              </label>
-            </div>
+              <Field label="Entidade pai (opcional)">
+                <select value={form.parent_id ?? ""} onChange={(e) => set("parent_id", e.target.value ? Number(e.target.value) : null)}
+                  className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring">
+                  <option value="">— raiz —</option>
+                  {entities
+                    .filter((e) => e.id !== entity?.id)
+                    .map((e) => (
+                      <option key={e.id} value={e.id}>{e.path ?? e.name}</option>
+                    ))}
+                </select>
+              </Field>
+
+              <div className="grid grid-cols-2 gap-3">
+                <label className="flex items-center gap-2 rounded-md border border-border p-2.5">
+                  <input type="checkbox" checked={!!form.inherit_accounts} onChange={(e) => set("inherit_accounts", e.target.checked)} className="accent-primary" />
+                  Herdar contas
+                </label>
+                <label className="flex items-center gap-2 rounded-md border border-border p-2.5">
+                  <input type="checkbox" checked={!!form.inherit_cost_centers} onChange={(e) => set("inherit_cost_centers", e.target.checked)} className="accent-primary" />
+                  Herdar centros de custo
+                </label>
+              </div>
+            </FormSection>
+
+            {TYPES_WITH_FISCAL.has(form.entity_type ?? "filial") && (
+              <FormSection title="Dados legais e fiscais">
+                <Field label="CNPJ">
+                  <input
+                    value={formatCnpjInput(form.cnpj ?? "")}
+                    onChange={(e) => set("cnpj", e.target.value.replace(/\D/g, "") || null)}
+                    placeholder="00.000.000/0000-00"
+                    inputMode="numeric"
+                    className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring"
+                  />
+                </Field>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="Razão social">
+                    <input value={form.razao_social ?? ""} onChange={(e) => set("razao_social", e.target.value || null)}
+                      className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring" />
+                  </Field>
+                  <Field label="Nome fantasia">
+                    <input value={form.nome_fantasia ?? ""} onChange={(e) => set("nome_fantasia", e.target.value || null)}
+                      className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring" />
+                  </Field>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="Inscrição estadual">
+                    <input value={form.inscricao_estadual ?? ""} onChange={(e) => set("inscricao_estadual", e.target.value || null)}
+                      className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring" />
+                  </Field>
+                  <Field label="Inscrição municipal">
+                    <input value={form.inscricao_municipal ?? ""} onChange={(e) => set("inscricao_municipal", e.target.value || null)}
+                      className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring" />
+                  </Field>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="CNAE principal">
+                    <input value={form.cnae_principal ?? ""} onChange={(e) => set("cnae_principal", e.target.value || null)}
+                      placeholder="0000-0/00"
+                      className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring" />
+                  </Field>
+                  <Field label="Regime tributário">
+                    <select value={form.regime_tributario ?? ""} onChange={(e) => set("regime_tributario", e.target.value || null)}
+                      className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring">
+                      <option value="">—</option>
+                      {REGIME_TRIBUTARIO_OPTIONS.map(([value, label]) => (
+                        <option key={value} value={value}>{label}</option>
+                      ))}
+                    </select>
+                  </Field>
+                </div>
+              </FormSection>
+            )}
+
+            <FormSection title="Endereço">
+              <div className="grid grid-cols-[1fr_120px] gap-3">
+                <Field label="Logradouro">
+                  <input value={form.endereco_logradouro ?? ""} onChange={(e) => set("endereco_logradouro", e.target.value || null)}
+                    className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring" />
+                </Field>
+                <Field label="Número">
+                  <input value={form.endereco_numero ?? ""} onChange={(e) => set("endereco_numero", e.target.value || null)}
+                    className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring" />
+                </Field>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Complemento">
+                  <input value={form.endereco_complemento ?? ""} onChange={(e) => set("endereco_complemento", e.target.value || null)}
+                    className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring" />
+                </Field>
+                <Field label="Bairro">
+                  <input value={form.endereco_bairro ?? ""} onChange={(e) => set("endereco_bairro", e.target.value || null)}
+                    className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring" />
+                </Field>
+              </div>
+
+              <div className="grid grid-cols-[1fr_80px_120px] gap-3">
+                <Field label="Cidade">
+                  <input value={form.endereco_cidade ?? ""} onChange={(e) => set("endereco_cidade", e.target.value || null)}
+                    className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring" />
+                </Field>
+                <Field label="UF">
+                  <select value={form.endereco_uf ?? ""} onChange={(e) => set("endereco_uf", e.target.value || null)}
+                    className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring">
+                    <option value="">—</option>
+                    {UF_OPTIONS.map((uf) => (
+                      <option key={uf} value={uf}>{uf}</option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="CEP">
+                  <input
+                    value={formatCepInput(form.endereco_cep ?? "")}
+                    onChange={(e) => set("endereco_cep", e.target.value.replace(/\D/g, "") || null)}
+                    placeholder="00000-000"
+                    inputMode="numeric"
+                    className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring"
+                  />
+                </Field>
+              </div>
+            </FormSection>
+
+            <FormSection title="Contato">
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Email">
+                  <input type="email" value={form.email ?? ""} onChange={(e) => set("email", e.target.value || null)}
+                    className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring" />
+                </Field>
+                <Field label="Telefone">
+                  <input value={form.telefone ?? ""} onChange={(e) => set("telefone", e.target.value || null)}
+                    placeholder="(00) 0000-0000"
+                    className="h-8 w-full rounded-md border border-border bg-background px-2 outline-none focus:border-ring" />
+                </Field>
+              </div>
+            </FormSection>
           </div>
 
           <div className="hairline flex shrink-0 items-center justify-end gap-2 border-t p-3">
@@ -294,5 +483,14 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">{label}</span>
       {children}
     </label>
+  )
+}
+
+function FormSection({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section className="space-y-3">
+      <h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">{title}</h3>
+      <div className="space-y-3">{children}</div>
+    </section>
   )
 }
