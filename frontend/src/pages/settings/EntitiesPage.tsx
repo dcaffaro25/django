@@ -12,12 +12,14 @@ import { useColumnVisibility, type ColumnDef } from "@/stores/column-visibility"
 import { useSortable } from "@/lib/use-sortable"
 import { useRowSelection } from "@/lib/use-row-selection"
 import { useDeleteEntity, useEntities, useSaveEntity } from "@/features/reconciliation"
+import { useUserRole } from "@/features/auth/useUserRole"
 import { useTenant } from "@/providers/TenantProvider"
 import type { Entity } from "@/features/reconciliation/types"
 import { cn } from "@/lib/utils"
 
 export function EntitiesPage() {
   const { t } = useTranslation(["reconciliation", "common"])
+  const { canWrite } = useUserRole()
   const { data: entities = [], isLoading } = useEntities()
   const [editing, setEditing] = useState<Entity | "new" | null>(null)
 
@@ -90,12 +92,14 @@ export function EntitiesPage() {
               resetDefaults={col.resetDefaults}
               label={t("actions.columns", { ns: "common" })}
             />
-            <button
-              onClick={() => setEditing("new")}
-              className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
-            >
-              <Plus className="h-3.5 w-3.5" /> Nova entidade
-            </button>
+            {canWrite && (
+              <button
+                onClick={() => setEditing("new")}
+                className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
+              >
+                <Plus className="h-3.5 w-3.5" /> Nova entidade
+              </button>
+            )}
           </>
         }
       />
@@ -151,10 +155,14 @@ export function EntitiesPage() {
                   {col.isVisible("level") && <td className="h-10 px-3 text-right tabular-nums text-muted-foreground">{ent.level ?? 0}</td>}
                   {col.isVisible("inherit_accounts") && <td className="h-10 px-3 text-muted-foreground">{ent.inherit_accounts ? "sim" : "não"}</td>}
                   {col.isVisible("inherit_cost_centers") && <td className="h-10 px-3 text-muted-foreground">{ent.inherit_cost_centers ? "sim" : "não"}</td>}
-                  <RowActionsCell>
-                    <RowAction icon={<Copy className="h-3.5 w-3.5" />} label="Duplicar" onClick={(e) => onDuplicate(ent, e)} />
-                    <RowAction icon={<Trash2 className="h-3.5 w-3.5" />} label="Excluir" variant="danger" onClick={(e) => onDelete(ent, e)} />
-                  </RowActionsCell>
+                  {canWrite ? (
+                    <RowActionsCell>
+                      <RowAction icon={<Copy className="h-3.5 w-3.5" />} label="Duplicar" onClick={(e) => onDuplicate(ent, e)} />
+                      <RowAction icon={<Trash2 className="h-3.5 w-3.5" />} label="Excluir" variant="danger" onClick={(e) => onDelete(ent, e)} />
+                    </RowActionsCell>
+                  ) : (
+                    <td className="h-10 px-3" />
+                  )}
                 </tr>
               ))
             )}

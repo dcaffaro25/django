@@ -222,9 +222,11 @@ export function TransactionsPage() {
         </button>
       </div>
 
-      <BulkActionsBar count={selection.count} onClear={selection.clear}>
-        <BulkAction icon={<Trash2 className="h-3 w-3" />} label={`Excluir ${selection.count}`} variant="danger" onClick={onBulkDelete} />
-      </BulkActionsBar>
+      {canWrite && (
+        <BulkActionsBar count={selection.count} onClear={selection.clear}>
+          <BulkAction icon={<Trash2 className="h-3 w-3" />} label={`Excluir ${selection.count}`} variant="danger" onClick={onBulkDelete} />
+        </BulkActionsBar>
+      )}
 
       <div className="flex items-center gap-1 rounded-md border border-border bg-surface-1 p-1 text-[12px]">
         {STATE_FILTERS.map((s) => (
@@ -333,23 +335,27 @@ export function TransactionsPage() {
                           {tx.is_posted ? "✓P" : "—P"}
                         </td>
                       )}
-                      <RowActionsCell>
-                        {tx.state !== "posted" && (
-                          <RowAction
-                            icon={<PlayCircle className="h-3.5 w-3.5" />}
-                            label="Postar"
-                            onClick={(e) => {
-                              e.stopPropagation()
-                              action.mutate({ id: tx.id, action: "post" }, {
-                                onSuccess: () => toast.success(`Transação #${tx.id} postada`),
-                                onError: (err: unknown) => toast.error(err instanceof Error ? err.message : "Erro"),
-                              })
-                            }}
-                          />
-                        )}
-                        <RowAction icon={<Copy className="h-3.5 w-3.5" />} label="Duplicar" onClick={(e) => onDuplicate(tx, e)} />
-                        <RowAction icon={<Trash2 className="h-3.5 w-3.5" />} label="Excluir" variant="danger" onClick={(e) => onDelete(tx, e)} />
-                      </RowActionsCell>
+                      {canWrite ? (
+                        <RowActionsCell>
+                          {tx.state !== "posted" && (
+                            <RowAction
+                              icon={<PlayCircle className="h-3.5 w-3.5" />}
+                              label="Postar"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                action.mutate({ id: tx.id, action: "post" }, {
+                                  onSuccess: () => toast.success(`Transação #${tx.id} postada`),
+                                  onError: (err: unknown) => toast.error(err instanceof Error ? err.message : "Erro"),
+                                })
+                              }}
+                            />
+                          )}
+                          <RowAction icon={<Copy className="h-3.5 w-3.5" />} label="Duplicar" onClick={(e) => onDuplicate(tx, e)} />
+                          <RowAction icon={<Trash2 className="h-3.5 w-3.5" />} label="Excluir" variant="danger" onClick={(e) => onDelete(tx, e)} />
+                        </RowActionsCell>
+                      ) : (
+                        <td className="h-10 px-3" />
+                      )}
                     </tr>
                     {isExpanded && (
                       <tr className="border-t-0 bg-muted/10">

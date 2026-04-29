@@ -173,9 +173,11 @@ export function BankAccountsPage() {
         }
       />
 
-      <BulkActionsBar count={selection.count} onClear={selection.clear}>
-        <BulkAction icon={<Trash2 className="h-3 w-3" />} label={`Excluir ${selection.count}`} variant="danger" onClick={onBulkDelete} />
-      </BulkActionsBar>
+      {canWrite && (
+        <BulkActionsBar count={selection.count} onClear={selection.clear}>
+          <BulkAction icon={<Trash2 className="h-3 w-3" />} label={`Excluir ${selection.count}`} variant="danger" onClick={onBulkDelete} />
+        </BulkActionsBar>
+      )}
 
       {/* Dashboard section -- KPI strip + currency-grouped totals +
           cross-account daily balance chart. Sits above the
@@ -280,10 +282,14 @@ export function BankAccountsPage() {
                       <BurnCell amount={kpiOf(a.id)?.burn_avg_monthly} currency={a.currency?.code ?? "BRL"} />
                     </td>
                   )}
-                  <RowActionsCell>
-                    <RowAction icon={<Copy className="h-3.5 w-3.5" />} label="Duplicar" onClick={(e) => onDuplicate(a, e)} />
-                    <RowAction icon={<Trash2 className="h-3.5 w-3.5" />} label="Excluir" variant="danger" onClick={(e) => onDelete(a, e)} />
-                  </RowActionsCell>
+                  {canWrite ? (
+                    <RowActionsCell>
+                      <RowAction icon={<Copy className="h-3.5 w-3.5" />} label="Duplicar" onClick={(e) => onDuplicate(a, e)} />
+                      <RowAction icon={<Trash2 className="h-3.5 w-3.5" />} label="Excluir" variant="danger" onClick={(e) => onDelete(a, e)} />
+                    </RowActionsCell>
+                  ) : (
+                    <td className="h-10 px-3" />
+                  )}
                 </tr>
               ))
             )}
