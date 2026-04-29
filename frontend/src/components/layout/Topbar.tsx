@@ -2,12 +2,14 @@ import { useTranslation } from "react-i18next"
 import { Link } from "react-router-dom"
 import {
   Activity, AlertTriangle, Bug, Building2, Check, ChevronsUpDown,
-  GitBranch, LogOut, Moon, Search, Server, ShieldCheck, Sun, Users,
+  GitBranch, LogOut, Moon, Palette, Search, Server, ShieldCheck, Sun, Users,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/stores/app-store"
 import { useAuth } from "@/providers/AuthProvider"
 import { useTenant } from "@/providers/TenantProvider"
+import { useUserRole } from "@/features/auth/useUserRole"
+import { useUpdatePreferences } from "@/features/auth/usePreferences"
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
   DropdownMenuSeparator, DropdownMenuTrigger,
@@ -41,6 +43,19 @@ export function Topbar() {
   const setCommandOpen = useAppStore((s) => s.setCommandOpen)
   const theme = useAppStore((s) => s.theme)
   const setTheme = useAppStore((s) => s.setTheme)
+  const { me } = useUserRole()
+  const updatePrefs = useUpdatePreferences()
+
+  const onToggleDark = () => {
+    const next = theme === "dark" ? "light" : "dark"
+    setTheme(next)
+    if (me) updatePrefs.mutate({ prefer_dark_mode: next === "dark" })
+  }
+
+  const onToggleTenantTheme = () => {
+    if (!me) return
+    updatePrefs.mutate({ use_tenant_theme: !me.use_tenant_theme })
+  }
 
   const isMac = typeof navigator !== "undefined" && /mac/i.test(navigator.platform)
   const kbd = isMac ? "⌘K" : "Ctrl+K"
@@ -99,9 +114,10 @@ export function Topbar() {
         {/* Palette picker */}
         <ThemePicker />
 
-        {/* Light/dark toggle */}
+        {/* Light/dark toggle — also persists to /api/core/me/preferences/
+            so the choice follows the user across devices. */}
         <button
-          onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+          onClick={onToggleDark}
           className="grid h-8 w-8 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
           aria-label="Toggle theme"
         >
@@ -124,6 +140,24 @@ export function Topbar() {
                 {user?.email && <span className="text-xs text-muted-foreground">{user.email}</span>}
               </div>
             </DropdownMenuLabel>
+            {/* Display preferences — every authenticated user can
+                flip between system colours and the active tenant's
+                brand palette. The toggle is hidden when /api/core/me/
+                hasn't loaded yet to avoid a flicker on app boot. */}
+            {me && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={onToggleTenantTheme} className="cursor-pointer">
+                  <Palette className="mr-2 h-4 w-4" />
+                  <span className="flex-1">
+                    {me.use_tenant_theme ? "Cores do tenant" : "Cores do sistema"}
+                  </span>
+                  <span className="text-[10px] text-muted-foreground">
+                    {me.use_tenant_theme ? "tenant" : "sistema"}
+                  </span>
+                </DropdownMenuItem>
+              </>
+            )}
             {/* Admin entries — superuser only. Non-superusers don't
                 see the group at all (not just disabled), matching the
                 backend's "hide, don't tease" policy on admin routes. */}

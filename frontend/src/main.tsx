@@ -7,6 +7,7 @@ import { queryClient } from "@/lib/query-client"
 import { AuthProvider } from "@/providers/AuthProvider"
 import { TenantProvider } from "@/providers/TenantProvider"
 import { ThemeProvider } from "@/providers/ThemeProvider"
+import { TenantThemeBridge } from "@/components/theme/TenantThemeBridge"
 import App from "./App"
 import "./index.css"
 import "./styles/themes.css"
@@ -20,7 +21,9 @@ ReactDOM.createRoot(el).render(
       <ThemeProvider>
         <AuthProvider>
           <TenantProvider>
-            <App />
+            <TenantThemeBridge>
+              <App />
+            </TenantThemeBridge>
             <Toaster
               theme="dark"
               position="bottom-right"
