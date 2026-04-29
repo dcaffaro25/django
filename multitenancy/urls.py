@@ -4,7 +4,7 @@ from django.urls import path, include, re_path
 from rest_framework.routers import DefaultRouter
 from .views import (
     CustomUserViewSet, CompanyViewSet, EntityViewSet, EntityTreeView,
-    LoginView, LogoutView, IntegrationRuleViewSet, ChangePasswordView,
+    LoginView, LogoutView, MeView, IntegrationRuleViewSet, ChangePasswordView,
     UserCreateView, PasswordResetForceView, AdminForcePasswordView,
     SubstitutionRuleViewSet, ValidateRuleView, ExecuteRuleView, BulkImportAPIView,
     MergeRecordsView,
@@ -41,6 +41,11 @@ urlpatterns = [
     path("force-reset-password/", AdminForcePasswordView.as_view(), name="force-reset-password"),
     
     path('api/core/', include(router.urls)),
+    # ``/api/core/me/`` — current user + tenant role. The frontend
+    # uses this to drive role-aware UI (hide write buttons / sections
+    # for viewers, etc.). Authenticated; tenant-scoped via the URL
+    # prefix the same way every other ``/api/core/...`` route is.
+    re_path(r'^api/core/me/?$', MeView.as_view(), name='me'),
     path('api/core/bulk-import/', BulkImportAPIView.as_view(), name='bulk-import'),
     # v2 interactive imports — analyze → resolve → commit flow. Legacy
     # ``/api/core/bulk-import/`` and ``/api/core/etl/*`` stay untouched.

@@ -21,6 +21,7 @@ import {
   useSaveAccount,
 } from "@/features/reconciliation"
 import { useTenant } from "@/providers/TenantProvider"
+import { useUserRole } from "@/features/auth/useUserRole"
 import type { AccountLite } from "@/features/reconciliation/types"
 import {
   CATEGORY_CODES_BY_ORDER,
@@ -210,6 +211,12 @@ function summarise(accounts: AccountLite[], _rollups: Map<number, NodeBalances>)
 
 export function ChartOfAccountsPage() {
   const { data: accounts = [], isLoading, isFetching, refetch } = useAccounts()
+  // ``canWrite`` gates every mutation surface on this page: the
+  // "Nova conta" button, the row-hover edit/duplicate/delete actions,
+  // and the bulk drawer's save/save+close. Viewers can still expand,
+  // search, filter, and export the chart -- it's read-only-by-default
+  // for them.
+  const { canWrite } = useUserRole()
   const [editing, setEditing] = useState<AccountLite | "new" | null>(null)
   const [query, setQuery] = useState("")
   const [categoryFilter, setCategoryFilter] = useState("")
@@ -296,12 +303,14 @@ export function ChartOfAccountsPage() {
             >
               <ChevronRight className="h-3.5 w-3.5" /> Colapsar
             </button>
-            <button
-              onClick={() => setEditing("new")}
-              className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
-            >
-              <Plus className="h-3.5 w-3.5" /> Nova conta
-            </button>
+            {canWrite && (
+              <button
+                onClick={() => setEditing("new")}
+                className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
+              >
+                <Plus className="h-3.5 w-3.5" /> Nova conta
+              </button>
+            )}
           </>
         }
       />
@@ -357,9 +366,9 @@ export function ChartOfAccountsPage() {
                 depth={0}
                 isExpanded={isExpanded}
                 onToggle={toggleExpand}
-                onEdit={(a) => setEditing(a)}
-                onDuplicate={onDuplicate}
-                onDelete={onDelete}
+                onEdit={canWrite ? (a) => setEditing(a) : undefined}
+                onDuplicate={canWrite ? onDuplicate : undefined}
+                onDelete={canWrite ? onDelete : undefined}
                 rollups={rollups}
               />
             ))}
@@ -700,9 +709,12 @@ function TreeRow({
   depth: number
   isExpanded: (id: number) => boolean
   onToggle: (id: number) => void
-  onEdit: (a: AccountLite) => void
-  onDuplicate: (a: AccountLite, e: React.MouseEvent) => void
-  onDelete: (a: AccountLite, e: React.MouseEvent) => void
+  /** Optional — viewers (read-only role) get ``undefined`` so the
+   *  row falls back to expand-on-click and the edit/duplicate/delete
+   *  buttons disappear from the hover toolbar. */
+  onEdit?: (a: AccountLite) => void
+  onDuplicate?: (a: AccountLite, e: React.MouseEvent) => void
+  onDelete?: (a: AccountLite, e: React.MouseEvent) => void
   rollups: Map<number, NodeBalances>
 }) {
   const hasChildren = node.children.length > 0
@@ -714,8 +726,14 @@ function TreeRow({
   return (
     <>
       <div
-        onClick={() => onEdit(a)}
-        className="group grid h-9 cursor-pointer grid-cols-[1fr_140px_repeat(3,minmax(110px,140px))_80px] items-center gap-2 border-t border-border/60 text-[12px] transition-colors hover:bg-accent/50"
+        onClick={() => {
+          if (onEdit) onEdit(a)
+          else if (hasChildren) onToggle(a.id)
+        }}
+        className={cn(
+          "group grid h-9 grid-cols-[1fr_140px_repeat(3,minmax(110px,140px))_80px] items-center gap-2 border-t border-border/60 text-[12px] transition-colors hover:bg-accent/50",
+          (onEdit || hasChildren) && "cursor-pointer",
+        )}
       >
         <div className="flex items-center" style={{ paddingLeft: 12 + depth * 16 }}>
           {hasChildren ? (
@@ -755,20 +773,24 @@ function TreeRow({
           >
             <ExternalLink className="h-3 w-3" />
           </Link>
-          <button
-            onClick={(e) => onDuplicate(a, e)}
-            className="grid h-6 w-6 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
-            title="Duplicar"
-          >
-            <Copy className="h-3.5 w-3.5" />
-          </button>
-          <button
-            onClick={(e) => onDelete(a, e)}
-            className="grid h-6 w-6 place-items-center rounded-md text-muted-foreground hover:bg-danger/10 hover:text-danger"
-            title="Excluir"
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-          </button>
+          {onDuplicate && (
+            <button
+              onClick={(e) => onDuplicate(a, e)}
+              className="grid h-6 w-6 place-items-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+              title="Duplicar"
+            >
+              <Copy className="h-3.5 w-3.5" />
+            </button>
+          )}
+          {onDelete && (
+            <button
+              onClick={(e) => onDelete(a, e)}
+              className="grid h-6 w-6 place-items-center rounded-md text-muted-foreground hover:bg-danger/10 hover:text-danger"
+              title="Excluir"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          )}
         </div>
       </div>
       {hasChildren && open && node.children.map((c) => (

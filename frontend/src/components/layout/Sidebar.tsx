@@ -7,6 +7,7 @@ import {
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/stores/app-store"
 import { useAuth } from "@/providers/AuthProvider"
+import { useUserRole } from "@/features/auth/useUserRole"
 import { useRunningImportCount } from "@/features/imports"
 import { TenantCard } from "./TenantCard"
 
@@ -22,6 +23,9 @@ type NavItem = {
   /** When set, the NavLink uses ``end`` matching so a deeper child
    *  route doesn't make the parent appear active. */
   end?: boolean
+  /** True when the section requires write access. Hidden from
+   *  ``viewer`` role accounts (read-only external users). */
+  requiresWrite?: boolean
 }
 
 type NavGroup = {
@@ -30,7 +34,7 @@ type NavGroup = {
   label: string | null
   items: NavItem[]
   /** Rendered only when the predicate is true. */
-  visible?: (ctx: { isSuperuser: boolean }) => boolean
+  visible?: (ctx: { isSuperuser: boolean; canWrite: boolean }) => boolean
 }
 
 // Each group corresponds to a single sidebar section. Many sub-pages
@@ -42,34 +46,44 @@ const GROUPS: NavGroup[] = [
     key: "operations",
     label: "Operação",
     items: [
+      // Read-only viewers see Conciliação dashboards, the chart of
+      // accounts (read-only) and the financial statements. They do
+      // NOT see Importações — that's a write-heavy section.
       { key: "reconciliation", label: "Conciliação", path: "/recon", icon: LayoutDashboard },
       { key: "accounting", label: "Contabilidade", path: "/accounting/accounts", icon: Wallet },
       { key: "reports", label: "Demonstrativos", path: "/reports", icon: FileBarChart },
-      { key: "imports", label: "Importações", path: "/imports", icon: UploadCloud },
+      { key: "imports", label: "Importações", path: "/imports", icon: UploadCloud, requiresWrite: true },
     ],
   },
   {
     key: "tools",
     label: "Ferramentas",
+    // Sandbox is a developer tool — only show to operators+.
+    visible: ({ canWrite }) => canWrite,
     items: [
-      { key: "integrations_sandbox", label: "Sandbox de API", path: "/integrations/sandbox", icon: Zap },
+      { key: "integrations_sandbox", label: "Sandbox de API", path: "/integrations/sandbox", icon: Zap, requiresWrite: true },
     ],
   },
   {
     key: "other",
     label: "Outros",
     items: [
+      // Billing visible to viewers (they may want to see invoices).
+      // HR / Inventory are write-heavy modules; hide for viewers.
       { key: "billing", label: "Faturamento", path: "/billing", icon: CreditCard },
-      { key: "hr", label: "RH", path: "/hr", icon: Users },
-      { key: "inventory", label: "Estoque", path: "/inventory", icon: Boxes },
+      { key: "hr", label: "RH", path: "/hr", icon: Users, requiresWrite: true },
+      { key: "inventory", label: "Estoque", path: "/inventory", icon: Boxes, requiresWrite: true },
     ],
   },
   {
     key: "config",
     label: "Configuração",
+    // Whole config section is operator+ — viewer can't change tenant
+    // settings or report templates.
+    visible: ({ canWrite }) => canWrite,
     items: [
-      { key: "tenant", label: "Empresa", path: "/settings/tenant", icon: Settings },
-      { key: "templates", label: "Modelos legados", path: "/statements/templates", icon: FileCog },
+      { key: "tenant", label: "Empresa", path: "/settings/tenant", icon: Settings, requiresWrite: true },
+      { key: "templates", label: "Modelos legados", path: "/statements/templates", icon: FileCog, requiresWrite: true },
     ],
   },
 ]
@@ -79,7 +93,21 @@ export function Sidebar() {
   const collapsed = useAppStore((s) => s.sidebarCollapsed)
   const toggle = useAppStore((s) => s.toggleSidebar)
   const { isSuperuser } = useAuth()
-  const visibleGroups = GROUPS.filter((g) => !g.visible || g.visible({ isSuperuser }))
+  const { canWrite, isLoading: roleLoading, role } = useUserRole()
+  // While the role is loading we render the full sidebar (so the
+  // page doesn't flicker for operators+). Once loaded, viewers
+  // (canWrite=false, role!=null) see a trimmed sidebar.
+  // Superusers always see everything regardless of tenant role.
+  const effectiveCanWrite = isSuperuser || canWrite || roleLoading || !role
+  const visibleGroups = GROUPS
+    .filter((g) => !g.visible || g.visible({ isSuperuser, canWrite: effectiveCanWrite }))
+    .map((g) => ({
+      ...g,
+      // Filter individual items inside each group too — a group may
+      // have a mix of read-only and write items.
+      items: g.items.filter((i) => !i.requiresWrite || effectiveCanWrite),
+    }))
+    .filter((g) => g.items.length > 0)
 
   return (
     <aside

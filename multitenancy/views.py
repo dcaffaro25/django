@@ -80,6 +80,53 @@ class LogoutView(views.APIView):
         logout(request)
         return Response({'detail': 'Logged out successfully'}, status=status.HTTP_200_OK)
 
+
+class MeView(views.APIView):
+    """Return the current user + their role for the active tenant.
+
+    The frontend uses this to render conditionally — sidebar entries,
+    write buttons, edit drawers — based on whether the user is a
+    viewer (read-only), operator, manager, owner, or superuser.
+
+    Roles:
+      * ``"viewer"`` / ``"operator"`` / ``"manager"`` / ``"owner"`` —
+        per-tenant via ``UserCompanyMembership`` (set by
+        ``TenantMiddleware`` on ``request.user_role``).
+      * ``"superuser"`` — Django superusers; same string everywhere.
+      * ``null`` — authenticated but not a member of the active
+        tenant. The middleware would already have 404'd this user;
+        the field exists so unscoped routes (e.g. ``/api/core/me/``
+        before tenant resolution) don't crash.
+
+    Output is intentionally minimal — no PII beyond username + email.
+    Adding fields here means widening every viewer's read surface,
+    so any addition should pass a privacy review first.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        tenant = getattr(request, "tenant", None)
+        company = None
+        if tenant and tenant != "all":
+            company = {
+                "id": tenant.id,
+                "name": tenant.name,
+                "subdomain": tenant.subdomain,
+            }
+        return Response({
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "is_superuser": user.is_superuser,
+            },
+            "role": getattr(request, "user_role", None),
+            "company": company,
+        })
+
 #User = get_user_model()
 
 class UserCreateView(generics.CreateAPIView):

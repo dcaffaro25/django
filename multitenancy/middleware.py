@@ -10,6 +10,23 @@ from .utils import resolve_tenant
 
 log = logging.getLogger(__name__)
 
+# HTTP methods that read state. Anything outside this set is a
+# mutation and must be gated by role above ``viewer``.
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+# Role ordering. Higher rank == more privileges. Used by the
+# write-method gate below and by the ``TenantRolePermission`` class
+# in ``multitenancy.permissions``. Mirror of
+# ``UserCompanyMembership.ROLE_*``; kept inline so the middleware
+# doesn't have to import the (cached) values dynamically.
+_ROLE_RANK = {
+    UserCompanyMembership.ROLE_VIEWER: 1,
+    UserCompanyMembership.ROLE_OPERATOR: 2,
+    UserCompanyMembership.ROLE_MANAGER: 3,
+    UserCompanyMembership.ROLE_OWNER: 4,
+}
+_MIN_WRITE_RANK = _ROLE_RANK[UserCompanyMembership.ROLE_OPERATOR]
+
 
 class TenantMiddleware:
     def __init__(self, get_response):
@@ -99,10 +116,17 @@ class TenantMiddleware:
                 and request.tenant is not None
                 and request.tenant != 'all'
             ):
-                if not UserCompanyMembership.objects.filter(
-                    user=request.user,
-                    company=request.tenant,
-                ).exists():
+                # Single query: fetch the membership row's role
+                # alongside the existence check. Annotate
+                # ``request.user_role`` for downstream consumers
+                # (TenantRolePermission, /api/core/me/, audit logs).
+                membership = (
+                    UserCompanyMembership.objects
+                    .filter(user=request.user, company=request.tenant)
+                    .values_list('role', flat=True)
+                    .first()
+                )
+                if membership is None:
                     log.warning(
                         "TenantMiddleware: user %s denied access to tenant "
                         "%s (no membership)",
@@ -110,5 +134,27 @@ class TenantMiddleware:
                         getattr(request.tenant, 'subdomain', request.tenant),
                     )
                     raise Http404("Company not found")
+                request.user_role = membership
+
+                # Global write gate: ``viewer`` role can only call
+                # safe methods. Without this every viewset would have
+                # to thread its own role check; doing it once at the
+                # middleware layer means even a forgotten viewset is
+                # safe-by-default.
+                if (
+                    request.method not in _SAFE_METHODS
+                    and _ROLE_RANK.get(membership, 0) < _MIN_WRITE_RANK
+                ):
+                    log.info(
+                        "TenantMiddleware: viewer %s blocked from %s %s",
+                        request.user.pk, request.method, request.path,
+                    )
+                    return JsonResponse(
+                        {"detail": "Read-only access for this role."},
+                        status=403,
+                    )
+            elif request.user.is_authenticated and request.user.is_superuser:
+                # Superuser metadata for the /api/core/me/ endpoint.
+                request.user_role = "superuser"
         #print(request.tenant)
         return self.get_response(request)
