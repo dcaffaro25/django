@@ -7,3 +7,7 @@ class MultitenancyConfig(AppConfig):
 
     def ready(self):
         import multitenancy.signals
+        # Importing the checks module registers the ``@register``'d
+        # functions with Django's system-check framework. No-op when
+        # no checks fire (i.e. healthy config).
+        import multitenancy.checks  # noqa: F401

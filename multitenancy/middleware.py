@@ -2,7 +2,7 @@ import logging
 
 from django.http import JsonResponse
 from django.urls import resolve
-from .models import Company
+from .models import Company, UserCompanyMembership
 from django.http import Http404
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.exceptions import AuthenticationFailed
@@ -77,5 +77,38 @@ class TenantMiddleware:
                 request.tenant = resolve_tenant(subdomain)
             except Company.DoesNotExist:
                 raise Http404("Company not found")
+
+            # Membership check: an authenticated non-superuser may only
+            # touch the tenant(s) they're a member of via
+            # ``UserCompanyMembership``. Without this, the URL prefix
+            # alone decides which tenant a request lands on -- a user
+            # authenticated for tenant A could call ``/tenant_b/...``
+            # and ``ScopedQuerysetMixin`` would happily serve them
+            # tenant_b's data. We 404 (not 403) so a probing client
+            # can't tell the difference between "tenant doesn't exist"
+            # and "tenant exists but you're not a member".
+            #
+            # Unauthenticated requests fall through unchanged -- DRF's
+            # ``IsAuthenticated`` on each viewset will reject them. The
+            # legacy ``testco`` dev escape hatch (above) also flows
+            # through unaffected because ``request.user`` stays
+            # ``AnonymousUser`` for those.
+            if (
+                request.user.is_authenticated
+                and not request.user.is_superuser
+                and request.tenant is not None
+                and request.tenant != 'all'
+            ):
+                if not UserCompanyMembership.objects.filter(
+                    user=request.user,
+                    company=request.tenant,
+                ).exists():
+                    log.warning(
+                        "TenantMiddleware: user %s denied access to tenant "
+                        "%s (no membership)",
+                        request.user.pk,
+                        getattr(request.tenant, 'subdomain', request.tenant),
+                    )
+                    raise Http404("Company not found")
         #print(request.tenant)
         return self.get_response(request)
