@@ -445,3 +445,16 @@ export interface ConsolidatedBPResponse {
   count: number
   results: ConsolidatedBPRow[]
 }
+
+/** Auto-derived matriz/filial cluster — same cnpj_root, no explicit Group yet. */
+export interface CnpjRootCluster {
+  cnpj_root: string
+  size: number
+  primary: BusinessPartner
+  members: BusinessPartner[]
+}
+
+export interface CnpjRootClustersResponse {
+  count: number
+  results: CnpjRootCluster[]
+}

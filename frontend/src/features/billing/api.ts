@@ -6,6 +6,7 @@ import type {
   BusinessPartnerCategory,
   BusinessPartnerGroup,
   BusinessPartnerGroupMembership,
+  CnpjRootClustersResponse,
   ConsolidatedBPResponse,
   CriticAuditResponse,
   CriticsResponse,
@@ -271,6 +272,15 @@ export const billingApi = {
     api.tenant.post<BusinessPartnerGroup>(
       `/api/business-partner-groups/${targetId}/merge/`,
       { source_group_id: sourceGroupId },
+    ),
+  listCnpjRootClusters: (): Promise<CnpjRootClustersResponse> =>
+    api.tenant.get<CnpjRootClustersResponse>(
+      `/api/business-partner-groups/cnpj-root-clusters/`,
+    ),
+  materializeCnpjRoot: (cnpjRoot: string): Promise<BusinessPartnerGroup> =>
+    api.tenant.post<BusinessPartnerGroup>(
+      `/api/business-partner-groups/materialize-cnpj-root/`,
+      { cnpj_root: cnpjRoot },
     ),
 
   // ============================================================

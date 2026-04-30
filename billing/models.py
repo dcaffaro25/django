@@ -123,6 +123,19 @@ class BusinessPartner(TenantAwareBaseModel):
             else:
                 self.cnpj_root = ""
         super().save(*args, **kwargs)
+        # Auto-materialize a Group whenever this BP shares its cnpj_root
+        # with another BP in the same tenant — so matriz/filial flows
+        # through the same primitive (BusinessPartnerGroup) as cross-root
+        # consolidation. Best-effort: never break a BP save.
+        if self.cnpj_root and self.id:
+            try:
+                from billing.services.bp_group_service import ensure_root_group
+                ensure_root_group(self)
+            except Exception:
+                import logging as _logging
+                _logging.getLogger(__name__).exception(
+                    "ensure_root_group failed for bp_id=%s", self.id,
+                )
 
 class ProductServiceCategory(TenantAwareBaseModel, MPTTModel):
     name = models.CharField(max_length=100)

@@ -366,6 +366,119 @@ def suggest_groups_from_reconciliation(
     return upserts
 
 
+@db_transaction.atomic
+def ensure_root_group(bp: BusinessPartner) -> Optional[BusinessPartnerGroup]:
+    """Ensure a Group exists for ``bp.cnpj_root`` and contains ``bp``.
+
+    The "matriz/filial" relationship — multiple BPs sharing the first 8
+    digits of their CNPJ — is structural (legally same PJ, different
+    establishment). We materialize that as a real ``BusinessPartnerGroup``
+    so all consolidation flows (reports, UI, alias scoring) go through a
+    single primitive instead of branching on ``cnpj_root``.
+
+    Behavior:
+    - No-op when ``bp.cnpj_root`` is empty (CPF, foreign id, etc.).
+    - No-op when ``bp`` is already in an accepted Group (any Group, not
+      just root-derived). User-curated cross-root groupings take
+      precedence; we don't override them.
+    - When a root sibling is already in an accepted Group → add ``bp``
+      as accepted member of that same Group.
+    - When no sibling is in any Group yet → only create one if there's
+      at least one other BP sharing the root (otherwise solo BPs don't
+      need a group).
+
+    Idempotent: safe to call repeatedly. Called from ``BusinessPartner.save``
+    on every persist plus from the ``backfill_bp_groups`` mgmt command.
+    """
+    if not bp or not bp.cnpj_root or not bp.id:
+        return None
+
+    # Already in a group of any kind → leave it alone.
+    if _accepted_membership(bp) is not None:
+        return _accepted_membership(bp).group
+
+    # Find an existing Group via any sibling that's already in one.
+    sibling_membership = (
+        BusinessPartnerGroupMembership.objects
+        .filter(
+            company=bp.company,
+            review_status=BusinessPartnerGroupMembership.REVIEW_ACCEPTED,
+            business_partner__cnpj_root=bp.cnpj_root,
+        )
+        .exclude(business_partner_id=bp.id)
+        .select_related('group')
+        .first()
+    )
+
+    auto_evidence = [{
+        'method': BusinessPartnerGroupMembership.METHOD_AUTO_ROOT,
+        'source_id': None,
+        'kind': 'auto_root',
+    }]
+
+    if sibling_membership is not None:
+        BusinessPartnerGroupMembership.objects.get_or_create(
+            group=sibling_membership.group,
+            business_partner=bp,
+            defaults={
+                'company': bp.company,
+                'role': BusinessPartnerGroupMembership.ROLE_MEMBER,
+                'review_status': BusinessPartnerGroupMembership.REVIEW_ACCEPTED,
+                'confidence': Decimal('1.0'),
+                'hit_count': 0,
+                'evidence': list(auto_evidence),
+                'reviewed_at': timezone.now(),
+            },
+        )
+        return sibling_membership.group
+
+    # No sibling has a group yet — only create one if there IS a sibling.
+    siblings = list(
+        BusinessPartner.objects
+        .filter(company=bp.company, cnpj_root=bp.cnpj_root)
+        .exclude(pk=bp.pk)
+        .order_by('id')
+    )
+    if not siblings:
+        return None
+
+    all_bps = sorted([bp, *siblings], key=lambda b: b.id)
+    primary = all_bps[0]
+    others = all_bps[1:]
+
+    group = BusinessPartnerGroup.objects.create(
+        company=bp.company,
+        name=primary.name,
+        primary_partner=primary,
+    )
+    BusinessPartnerGroupMembership.objects.create(
+        company=bp.company,
+        group=group,
+        business_partner=primary,
+        role=BusinessPartnerGroupMembership.ROLE_PRIMARY,
+        review_status=BusinessPartnerGroupMembership.REVIEW_ACCEPTED,
+        confidence=Decimal('1.0'),
+        hit_count=0,
+        evidence=list(auto_evidence),
+        reviewed_at=timezone.now(),
+    )
+    for other in others:
+        BusinessPartnerGroupMembership.objects.get_or_create(
+            group=group,
+            business_partner=other,
+            defaults={
+                'company': bp.company,
+                'role': BusinessPartnerGroupMembership.ROLE_MEMBER,
+                'review_status': BusinessPartnerGroupMembership.REVIEW_ACCEPTED,
+                'confidence': Decimal('1.0'),
+                'hit_count': 0,
+                'evidence': list(auto_evidence),
+                'reviewed_at': timezone.now(),
+            },
+        )
+    return group
+
+
 def resolve_bp_by_cnpj(company, cnpj_or_cpf: str) -> Optional[BusinessPartner]:
     """Resolve string CNPJ/CPF para BP do mesmo tenant.
 

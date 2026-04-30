@@ -816,6 +816,111 @@ class BusinessPartnerGroupViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         target.refresh_from_db()
         return Response(BusinessPartnerGroupSerializer(target).data)
 
+    @action(methods=['get'], detail=False, url_path='cnpj-root-clusters')
+    def cnpj_root_clusters(self, request, **kwargs):
+        """Surface matriz/filial clusters that share a CNPJ root but
+        aren't yet wrapped in an explicit ``BusinessPartnerGroup``.
+
+        These are the "structural" groupings we already use for matching
+        and self-billing — same legal entity (PJ), different establishment.
+        Returning them here lets the UI render every BP that conceptually
+        belongs together, even when no review-driven Group exists yet.
+
+        BPs already part of an *accepted* explicit Group are excluded so
+        the curated and structural views don't double-show partners.
+        """
+        from django.db.models import Count
+        tenant = getattr(request, 'tenant', None)
+        if tenant is None or tenant == 'all':
+            return Response({'detail': 'Operação requer tenant explícito.'}, status=400)
+
+        # BP IDs already absorbed into an accepted explicit Group.
+        absorbed_ids = set(
+            BusinessPartnerGroupMembership.objects
+            .filter(
+                company=tenant,
+                review_status=BusinessPartnerGroupMembership.REVIEW_ACCEPTED,
+            )
+            .values_list('business_partner_id', flat=True)
+        )
+
+        # Roots with at least 2 BPs in the tenant. Empty cnpj_root means
+        # CPF/foreign id and is excluded.
+        from billing.models import BusinessPartner
+        root_qs = (
+            BusinessPartner.objects
+            .filter(company=tenant)
+            .exclude(cnpj_root='')
+            .exclude(cnpj_root__isnull=True)
+            .values('cnpj_root')
+            .annotate(n=Count('id'))
+            .filter(n__gte=2)
+            .order_by('-n', 'cnpj_root')
+        )
+
+        clusters = []
+        for row in root_qs:
+            root = row['cnpj_root']
+            bps = list(
+                BusinessPartner.objects
+                .filter(company=tenant, cnpj_root=root)
+                .order_by('id')
+            )
+            # Drop members already in an explicit Group.
+            visible = [b for b in bps if b.id not in absorbed_ids]
+            if len(visible) < 2:
+                continue
+            primary = visible[0]
+            clusters.append({
+                'cnpj_root': root,
+                'size': len(visible),
+                'primary': BusinessPartnerSerializer(primary).data,
+                'members': BusinessPartnerSerializer(visible[1:], many=True).data,
+            })
+        return Response({'count': len(clusters), 'results': clusters})
+
+    @action(methods=['post'], detail=False, url_path='materialize-cnpj-root')
+    def materialize_cnpj_root(self, request, **kwargs):
+        """Promote a cnpj_root cluster to a Group (idempotent).
+
+        Body: ``{ cnpj_root: "12345678" }``. Delegates to
+        ``ensure_root_group`` so the same logic powers both auto-creation
+        on ``BusinessPartner.save`` and explicit user-driven materialization
+        from the UI. Returns the resulting Group whether new or pre-existing.
+        """
+        from billing.models import BusinessPartner
+        from billing.services.bp_group_service import ensure_root_group
+
+        tenant = getattr(request, 'tenant', None)
+        if tenant is None or tenant == 'all':
+            return Response({'detail': 'Operação requer tenant explícito.'}, status=400)
+        root = (request.data.get('cnpj_root') or '').strip()
+        if len(root) != 8 or not root.isdigit():
+            return Response({'detail': 'cnpj_root deve ter 8 dígitos.'}, status=400)
+
+        bps = list(
+            BusinessPartner.objects
+            .filter(company=tenant, cnpj_root=root)
+            .order_by('id')
+        )
+        if len(bps) < 2:
+            return Response({'detail': 'Cluster precisa ter ao menos 2 BPs.'}, status=400)
+
+        # ensure_root_group will short-circuit if the BPs are already in
+        # other groups; the caller can re-query if they expected a fresh row.
+        group = None
+        for bp in bps:
+            group = ensure_root_group(bp) or group
+        if group is None:
+            return Response(
+                {'detail': 'Todos os BPs deste root já estão em outros grupos.'},
+                status=409,
+            )
+        return Response(
+            BusinessPartnerGroupSerializer(group).data,
+            status=201 if group.created_at == group.updated_at else 200,
+        )
+
 
 class BusinessPartnerGroupMembershipViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     """CRUD on memberships + custom accept/reject actions."""

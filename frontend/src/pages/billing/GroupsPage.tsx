@@ -1,7 +1,7 @@
 import { useState } from "react"
 import {
   CheckCircle2, XCircle, ChevronRight, ChevronDown,
-  GitMerge, Crown, Network, Tag, RefreshCw,
+  GitMerge, Crown, Network, Tag, RefreshCw, Sparkles, GitBranch,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { Button } from "@/components/ui/button"
@@ -12,9 +12,11 @@ import {
 import {
   useBusinessPartnerAliases,
   useBusinessPartnerGroups,
+  useCnpjRootClusters,
   useGroupMemberships,
   useAcceptAlias,
   useAcceptMembership,
+  useMaterializeCnpjRoot,
   useMergeGroup,
   usePromoteGroupPrimary,
   useRejectAlias,
@@ -24,6 +26,7 @@ import type {
   BusinessPartnerAlias,
   BusinessPartnerGroup,
   BusinessPartnerGroupMembership,
+  CnpjRootCluster,
 } from "@/features/billing"
 import { ConfidenceBadge } from "./components/ConfidenceBadge"
 import { cn } from "@/lib/utils"
@@ -390,6 +393,97 @@ function AliasRow({ a }: { a: BusinessPartnerAlias }) {
   )
 }
 
+function CnpjRootClusterRow({ cluster }: { cluster: CnpjRootCluster }) {
+  const materialize = useMaterializeCnpjRoot()
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="rounded-lg border border-border bg-card">
+      <div className="flex items-center gap-2 px-3 py-2">
+        <button
+          type="button"
+          className="flex flex-1 items-center gap-2 text-left"
+          onClick={() => setOpen(!open)}
+        >
+          {open ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+          <GitBranch className="h-4 w-4 text-info" />
+          <div className="flex-1 min-w-0">
+            <div className="font-medium truncate">{cluster.primary.name}</div>
+            <div className="font-mono text-[11px] text-muted-foreground">
+              raiz {cluster.cnpj_root} · {cluster.size} parceiros
+            </div>
+          </div>
+          <span className="rounded-full bg-info/10 px-1.5 py-0.5 text-[10px] uppercase text-info">
+            automático
+          </span>
+        </button>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={materialize.isPending}
+          onClick={() => materialize.mutate(cluster.cnpj_root)}
+          title="Promover este cluster a um Grupo curado"
+        >
+          <Sparkles className="h-3.5 w-3.5 mr-1" />
+          Materializar
+        </Button>
+      </div>
+      {open ? (
+        <div className="border-t border-border/60 px-3 py-2 space-y-1">
+          <div className="flex items-center gap-2 text-[12px]">
+            <Crown className="h-3 w-3 text-amber-500" />
+            <span className="font-medium">{cluster.primary.name}</span>
+            <span className="font-mono text-[11px] text-muted-foreground">
+              {fmtCnpj(cluster.primary.identifier)}
+            </span>
+          </div>
+          {cluster.members.map((m) => (
+            <div key={m.id} className="flex items-center gap-2 pl-5 text-[12px]">
+              <span className="truncate">{m.name}</span>
+              <span className="font-mono text-[11px] text-muted-foreground">
+                {fmtCnpj(m.identifier)}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function CnpjRootClustersSection() {
+  const clusters = useCnpjRootClusters()
+  if (clusters.isLoading) {
+    return <div className="py-8 text-center text-muted-foreground">Carregando…</div>
+  }
+  const items = clusters.data?.results ?? []
+  if (items.length === 0) {
+    return (
+      <div className="py-8 text-center text-muted-foreground">
+        Nenhum cluster por raiz CNPJ pendente — todos os matriz/filial já estão
+        materializados em grupos curados.
+      </div>
+    )
+  }
+  return (
+    <div>
+      <p className="mb-3 text-[12px] text-muted-foreground">
+        Parceiros que compartilham os 8 primeiros dígitos do CNPJ (mesma pessoa
+        jurídica, estabelecimentos diferentes) e ainda não foram promovidos a um
+        Grupo curado. Use "Materializar" para criar o grupo, ou rode{" "}
+        <code className="rounded bg-muted px-1 font-mono text-[11px]">
+          backfill_bp_groups --tenant ...
+        </code>{" "}
+        para fazer em massa.
+      </p>
+      <div className="space-y-2">
+        {items.map((c) => (
+          <CnpjRootClusterRow key={c.cnpj_root} cluster={c} />
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function AliasesSection() {
   const [status, setStatus] = useState<"suggested" | "accepted" | "rejected">("suggested")
   const aliases = useBusinessPartnerAliases({ review_status: status })
@@ -432,14 +526,16 @@ function AliasesSection() {
 export function GroupsPage() {
   const memberships = useGroupMemberships({ review_status: "suggested" })
   const groupsHook = useBusinessPartnerGroups({ is_active: 1 })
+  const clusters = useCnpjRootClusters()
   const suggestionCount = (memberships.data ?? []).length
   const groupCount = (groupsHook.data ?? []).length
+  const clusterCount = clusters.data?.count ?? 0
 
   return (
     <div>
       <SectionHeader
         title="Grupos de Parceiros"
-        subtitle="Consolide branches, CNPJs distintos e CPFs de um mesmo ator econômico. Sugestões aprendem com vínculos NF↔Tx e conciliações."
+        subtitle="Consolide branches, CNPJs distintos e CPFs de um mesmo ator econômico. Matriz/filial são materializados automaticamente; cross-CNPJ aprende com vínculos NF↔Tx e conciliações."
         actions={
           <Button
             size="sm"
@@ -447,6 +543,7 @@ export function GroupsPage() {
             onClick={() => {
               memberships.refetch()
               groupsHook.refetch()
+              clusters.refetch()
             }}
           >
             <RefreshCw className="h-4 w-4 mr-1" />
@@ -455,26 +552,32 @@ export function GroupsPage() {
         }
       />
 
-      <Tabs defaultValue="suggestions" className="mt-4">
+      <Tabs defaultValue="groups" className="mt-4">
         <TabsList>
+          <TabsTrigger value="groups">
+            Grupos {groupCount > 0 ? `(${groupCount})` : ""}
+          </TabsTrigger>
           <TabsTrigger value="suggestions">
             Sugestões {suggestionCount > 0 ? `(${suggestionCount})` : ""}
           </TabsTrigger>
           <TabsTrigger value="merges">Mesclagens</TabsTrigger>
-          <TabsTrigger value="groups">
-            Grupos {groupCount > 0 ? `(${groupCount})` : ""}
+          <TabsTrigger value="cnpj-roots">
+            Raiz CNPJ {clusterCount > 0 ? `(${clusterCount})` : ""}
           </TabsTrigger>
           <TabsTrigger value="aliases">Apelidos</TabsTrigger>
         </TabsList>
 
+        <TabsContent value="groups" className="mt-4">
+          <GroupsListSection />
+        </TabsContent>
         <TabsContent value="suggestions" className="mt-4">
           <SuggestionsSection mergeOnly={false} />
         </TabsContent>
         <TabsContent value="merges" className="mt-4">
           <SuggestionsSection mergeOnly={true} />
         </TabsContent>
-        <TabsContent value="groups" className="mt-4">
-          <GroupsListSection />
+        <TabsContent value="cnpj-roots" className="mt-4">
+          <CnpjRootClustersSection />
         </TabsContent>
         <TabsContent value="aliases" className="mt-4">
           <AliasesSection />

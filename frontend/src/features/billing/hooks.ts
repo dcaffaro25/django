@@ -743,3 +743,27 @@ export function useConsolidatedBPs(params?: Record<string, string | number | boo
     enabled: !!sub,
   })
 }
+
+export function useCnpjRootClusters() {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["billing", sub, "bp-cnpj-root-clusters"],
+    queryFn: () => billingApi.listCnpjRootClusters(),
+    enabled: !!sub,
+  })
+}
+
+export function useMaterializeCnpjRoot() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: (cnpjRoot: string) => billingApi.materializeCnpjRoot(cnpjRoot),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "bp-cnpj-root-clusters"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "bp-groups"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "partners"] })
+      toast.success("Grupo materializado a partir da raiz CNPJ.")
+    },
+    onError: (e) => showError("Falha ao materializar grupo", e),
+  })
+}
