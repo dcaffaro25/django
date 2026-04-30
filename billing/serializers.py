@@ -71,6 +71,26 @@ class InvoiceSerializer(serializers.ModelSerializer):
         model = Invoice
         fields = '__all__'
 
+
+class InvoiceListSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for the list endpoint — excludes ``lines`` so
+    rendering 500+ invoices doesn't trigger an N+1 join chain.
+    Used by InvoiceViewSet.list()."""
+    partner_name = serializers.CharField(source='partner.name', read_only=True)
+    partner_identifier = serializers.CharField(source='partner.identifier', read_only=True)
+
+    class Meta:
+        model = Invoice
+        fields = [
+            'id', 'company', 'partner', 'partner_name', 'partner_identifier',
+            'contract', 'erp_id', 'invoice_type', 'invoice_number',
+            'invoice_date', 'due_date', 'status', 'fiscal_status',
+            'has_pending_corrections', 'currency',
+            'total_amount', 'tax_amount', 'discount_amount',
+            'description',
+            'created_at', 'updated_at',
+        ]
+
 class ContractSerializer(serializers.ModelSerializer):
     def to_internal_value(self, data):
         # Convert empty strings to None for specific fields

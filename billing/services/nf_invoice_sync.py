@@ -38,14 +38,45 @@ def _digits(value: Optional[str]) -> str:
     return re.sub(r"\D", "", str(value))
 
 
+def _is_self_cnpj(cnpj: Optional[str], company) -> bool:
+    """
+    True when ``cnpj`` belongs to the tenant itself (matriz or filial).
+    Compared by 8-digit CNPJ root since filiais share the matriz root —
+    avoids requiring every filial CNPJ to be configured on the tenant.
+    """
+    if not cnpj or not company or not company.cnpj:
+        return False
+    cnpj_digits = _digits(cnpj)
+    own_digits = _digits(company.cnpj)
+    if len(cnpj_digits) != 14 or len(own_digits) != 14:
+        return False
+    return cnpj_digits[:8] == own_digits[:8]
+
+
 def _resolve_partner_for_nf(nf) -> Optional[object]:
-    """Return the BusinessPartner to use on a generated Invoice. Prefer the
-    counterparty from the perspective of the tenant's CNPJ but fall back to
-    whichever side has a resolved FK."""
-    # tipo_operacao 1 = saída (sale), 0 = entrada (purchase)
-    if nf.tipo_operacao == 1:
-        return nf.destinatario or nf.emitente
-    return nf.emitente or nf.destinatario
+    """
+    Return the BusinessPartner that represents the *counterparty* on a
+    generated Invoice — never the tenant itself.
+
+    Drops the candidate whose CNPJ matches the tenant root (matriz or
+    filial), so an NF where evolat is the destinatario doesn't generate
+    an Invoice billing evolat against itself.
+    """
+    company = nf.company
+    if nf.tipo_operacao == 1:  # saída → counterparty is destinatário
+        primary, secondary = nf.destinatario, nf.emitente
+        primary_cnpj, secondary_cnpj = nf.dest_cnpj, nf.emit_cnpj
+    else:  # entrada → counterparty is emitente
+        primary, secondary = nf.emitente, nf.destinatario
+        primary_cnpj, secondary_cnpj = nf.emit_cnpj, nf.dest_cnpj
+
+    if primary is not None and not _is_self_cnpj(primary_cnpj, company):
+        return primary
+    if secondary is not None and not _is_self_cnpj(secondary_cnpj, company):
+        return secondary
+    # Both sides are the tenant itself (self-transfer between branches) or
+    # no FK resolved — return None so the caller records a skip.
+    return None
 
 
 def _invoice_type_for_nf(nf) -> str:
@@ -112,7 +143,9 @@ def _is_eligible_for_auto_create(nf, config) -> bool:
 
 
 def _create_invoice_from_nf(nf):
-    """Build a draft Invoice mirroring NF totals + partner. Does NOT save lines."""
+    """Build a draft Invoice mirroring NF totals + partner. Does NOT save
+    lines. Returns None when no counterparty resolves (self-billing or
+    missing partner FK)."""
     from billing.models import Invoice
 
     partner = _resolve_partner_for_nf(nf)
@@ -179,9 +212,18 @@ def attach_invoice_to_nf(invoice, nf, *, relation_type: Optional[str] = None,
 
 
 @db_transaction.atomic
-def match_or_create_invoice_for_nf(nf, *, dry_run: bool = False) -> dict:
+def match_or_create_invoice_for_nf(
+    nf, *, dry_run: bool = False, force: bool = False,
+) -> dict:
     """
     Top-level entry point called by the NF importer.
+
+    Args:
+        dry_run: simulate without persisting (matched/created Invoice
+            references are returned as sentinels in this mode).
+        force: bypass ``BillingTenantConfig.auto_create_invoice_from_nf``
+            and the finalidade/tipo whitelist. Used by targeted backfill
+            commands that have their own filtering logic upstream.
 
     Returns:
         {
@@ -212,12 +254,20 @@ def match_or_create_invoice_for_nf(nf, *, dry_run: bool = False) -> dict:
             out["link_id"] = link.id
         return out
 
-    if not _is_eligible_for_auto_create(nf, config):
+    if not force and not _is_eligible_for_auto_create(nf, config):
         out["skipped_reason"] = (
             "auto_create_disabled"
             if not config.auto_create_invoice_from_nf
             else "tipo_or_finalidade_filtered"
         )
+        return out
+
+    # Self-billing guard: even with force=True, never create an Invoice
+    # where the tenant bills itself. Surfaces as a distinct skip reason
+    # so backfill reports show the count.
+    partner = _resolve_partner_for_nf(nf)
+    if partner is None:
+        out["skipped_reason"] = "no_counterparty_or_self_billing"
         return out
 
     if dry_run:

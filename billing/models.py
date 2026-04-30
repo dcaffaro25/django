@@ -58,6 +58,16 @@ class BusinessPartner(TenantAwareBaseModel):
     partner_type = models.CharField(max_length=10, choices=PARTNER_TYPES)
     category = TreeForeignKey(BusinessPartnerCategory, null=True, blank=True, on_delete=models.SET_NULL)
     identifier = models.CharField(max_length=50)  # CPF/CNPJ; unique per company (see Meta)
+    cnpj_root = models.CharField(
+        max_length=8,
+        blank=True,
+        db_index=True,
+        help_text=(
+            "Primeiros 8 dígitos do CNPJ — a 'raiz' que une matriz e "
+            "filiais de uma mesma pessoa jurídica. Auto-populado pelo "
+            "save() quando identifier tem 14 dígitos."
+        ),
+    )
     address = models.CharField(max_length=255, blank=True)
     city = models.CharField(max_length=100, blank=True)
     state = models.CharField(max_length=100, blank=True)
@@ -97,10 +107,22 @@ class BusinessPartner(TenantAwareBaseModel):
         ]
         indexes = [
             models.Index(fields=['company', 'erp_id']),
+            models.Index(fields=['company', 'cnpj_root'], name='bp_company_cnpjroot_idx'),
         ]
 
     def __str__(self):
         return f"{self.name} ({self.partner_type})"
+
+    def save(self, *args, **kwargs):
+        # Auto-populate cnpj_root from identifier whenever identifier
+        # changes. Ignores non-CNPJ identifiers (CPF, foreign IDs).
+        if self.identifier:
+            digits = "".join(ch for ch in self.identifier if ch.isdigit())
+            if len(digits) == 14:
+                self.cnpj_root = digits[:8]
+            else:
+                self.cnpj_root = ""
+        super().save(*args, **kwargs)
 
 class ProductServiceCategory(TenantAwareBaseModel, MPTTModel):
     name = models.CharField(max_length=100)

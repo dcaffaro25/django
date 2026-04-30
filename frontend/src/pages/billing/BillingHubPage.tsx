@@ -1,6 +1,7 @@
 import { Outlet } from "react-router-dom"
 import {
   FileText, Receipt, Link as LinkIcon, Settings as SettingsIcon,
+  Users, Package,
 } from "lucide-react"
 import { TabbedShell } from "@/components/layout/TabbedShell"
 import { useNfTxLinks } from "@/features/billing"
@@ -29,6 +30,8 @@ export function BillingHubPage() {
       tabs={[
         { to: "/billing", label: "Faturas", icon: FileText, end: true },
         { to: "/billing/nfe", label: "Notas Fiscais", icon: Receipt },
+        { to: "/billing/parceiros", label: "Parceiros", icon: Users },
+        { to: "/billing/produtos", label: "Produtos", icon: Package },
         {
           to: "/billing/links",
           label: "Vínculos NF↔Tx",

@@ -38,6 +38,8 @@ import { InvoicesPage } from "@/pages/billing/InvoicesPage"
 import { NotasFiscaisPage } from "@/pages/billing/NotasFiscaisPage"
 import { NfLinkReviewPage } from "@/pages/billing/NfLinkReviewPage"
 import { BillingSettingsPage } from "@/pages/billing/BillingSettingsPage"
+import { BusinessPartnersPage } from "@/pages/billing/BusinessPartnersPage"
+import { ProductServicesPage } from "@/pages/billing/ProductServicesPage"
 import { AdminHomePage } from "@/pages/admin/AdminHomePage"
 import { UsersPage as AdminUsersPage } from "@/pages/admin/UsersPage"
 import { RuntimePage as AdminRuntimePage } from "@/pages/admin/RuntimePage"
@@ -127,6 +129,8 @@ export default function App() {
                   <Route path="/billing" element={<BillingHubPage />}>
                     <Route index element={<InvoicesPage />} />
                     <Route path="nfe" element={<NotasFiscaisPage />} />
+                    <Route path="parceiros" element={<BusinessPartnersPage />} />
+                    <Route path="produtos" element={<ProductServicesPage />} />
                     <Route path="links" element={<NfLinkReviewPage />} />
                     <Route path="settings" element={<BillingSettingsPage />} />
                   </Route>

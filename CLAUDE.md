@@ -32,7 +32,64 @@ hit something it covers.
 
 ## 2. Recent work (most recent first)
 
-### Uncommitted — Billing module: NF↔Tx links, fiscal status, auto-create Invoice
+### Uncommitted — Billing module phase 2: BP/PS pages, CNPJ-root matching, targeted Invoice backfill
+
+Builds on the billing commit (`8c05798`) below. Three threads:
+
+- **CNPJ-root (matriz↔branch) handling.** `BusinessPartner.cnpj_root`
+  is a new 8-char column auto-populated from the first 8 digits of
+  `identifier` whenever the BP is saved (see `BusinessPartner.save()`
+  override in [billing/models.py](billing/models.py)). Indexed by
+  `(company, cnpj_root)` so "find all branches of this legal entity"
+  is a single index seek. Migration
+  [billing/migrations/0021_businesspartner_cnpj_root.py](billing/migrations/0021_businesspartner_cnpj_root.py)
+  backfills via `bulk_update` in 2k-row chunks.
+  - `nf_link_service._score` ([billing/services/nf_link_service.py](billing/services/nf_link_service.py))
+    falls back to root match when full CNPJ doesn't match: scores
+    `+0.20` on `cnpj_root` (vs `+0.25` on full `cnpj`) and adds
+    `cnpj_root` to `matched_fields` so the UI distinguishes.
+  - `nf_invoice_sync._is_self_cnpj` + `_resolve_partner_for_nf`
+    ([billing/services/nf_invoice_sync.py](billing/services/nf_invoice_sync.py))
+    use the same root comparison for the **self-billing guard**:
+    refuses to create an Invoice where the tenant's own CNPJ
+    (matriz or filial) appears as the counterparty. Dropping in
+    Evolat's data this skipped ~7% of NFs that had Evolat as both
+    emitente and destinatario.
+- **Targeted Invoice backfill (Option C from the planning doc).**
+  Mgmt command
+  [billing/management/commands/backfill_invoices_from_tx_linked_nfs.py](billing/management/commands/backfill_invoices_from_tx_linked_nfs.py)
+  creates Invoices ONLY for NFs that have at least one Tx-link
+  (the GL-footprint signal for "this NF represents real money"),
+  bypassing `BillingTenantConfig.auto_create_invoice_from_nf` via
+  the new `force=True` arg on `match_or_create_invoice_for_nf`.
+  Idempotent: NFs already linked to an Invoice are excluded by the
+  cohort filter. Flags: `--include-suggested` (otherwise only
+  accepted links count), `--finalidade` / `--tipo` (defaults: 1=Normal
+  / 1=Saída), `--limit`, `--dry-run`.
+  Backfill on Evolat: **501 Invoices created from 539 NF links** —
+  every Invoice now has a confirmed money trail in the GL.
+- **Frontend: BP + PS CRUD with category management.** Two new tabs
+  in `BillingHubPage` (now 6 total):
+  - `/billing/parceiros` — `BusinessPartnersPage` with filters,
+    edit drawer, and a CNPJ-root branch indicator (small `+N`
+    badge next to the partner name when N other BPs share the
+    same root, with a tooltip listing them). Includes posting
+    accounts (A/R, A/P) on the drawer.
+  - `/billing/produtos` — `ProductServicesPage` with filters and
+    a 6-account mapping fieldset (revenue / purchase / COGS /
+    inventory / adjustment / discount).
+  - Both pages have a "Categorias" button opening a flat-list
+    modal for adding/removing categories (tree picker is a future
+    enhancement).
+- **Perf: `InvoiceListSerializer`.** The list endpoint was N+1ing
+  on `lines` for every Invoice. Added a separate lightweight
+  serializer (`partner_name` + `partner_identifier`, no lines, no
+  attachments) and wired it via
+  `InvoiceViewSet.get_serializer_class()` — `retrieve` keeps
+  `InvoiceDetailSerializer`, `list` switches to the new one. Cuts
+  list response from ~30s to subsecond on Evolat's 501-invoice set.
+
+### Earlier — Billing module phase 1 (commit `8c05798`): NF↔Tx links, fiscal status, auto-create Invoice
 
 Multi-phase feature linking the existing siloed Invoice / NotaFiscal /
 Contract surfaces to each other and (eventually) to the GL. Phases 1, 2,

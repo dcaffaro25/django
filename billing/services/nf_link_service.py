@@ -102,6 +102,16 @@ def _score(
     if cnpj_tx and cnpj_tx in {cnpj_emit, cnpj_dest}:
         score += Decimal("0.25")
         matched.append("cnpj")
+    elif (
+        cnpj_tx and len(cnpj_tx) == 14
+        and (cnpj_tx[:8] == cnpj_emit[:8] or cnpj_tx[:8] == cnpj_dest[:8])
+        and (cnpj_emit or cnpj_dest)
+    ):
+        # Matrix↔branch case: same legal entity (8-digit root), different
+        # establishment. Common when the GL records the filial CNPJ but
+        # the NF was issued from the matriz (or vice-versa).
+        score += Decimal("0.20")
+        matched.append("cnpj_root")
 
     if tx.date and nf.data_emissao:
         try:

@@ -159,12 +159,72 @@ export interface NotaFiscal {
 
 export interface BusinessPartner {
   id: number
+  company: number
+  erp_id: string | null
   name: string
   identifier: string
+  cnpj_root: string
   partner_type: "client" | "vendor" | "both"
+  category: number | null
   receivable_account: number | null
   payable_account: number | null
+  address: string
+  city: string
+  state: string
+  zipcode: string
+  country: string
+  email: string
+  phone: string
+  currency: number | null
+  payment_terms: string
   is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface BusinessPartnerCategory {
+  id: number
+  company: number
+  name: string
+  parent: number | null
+  parent_id: number | null
+  level: number
+  path: string
+  erp_id: string | null
+}
+
+export interface ProductService {
+  id: number
+  company: number
+  erp_id: string | null
+  name: string
+  code: string
+  category: number | null
+  description: string
+  item_type: "product" | "service"
+  price: string
+  cost: string | null
+  currency: number | null
+  tax_code: string
+  track_inventory: boolean
+  stock_quantity: string
+  is_active: boolean
+  inventory_account: number | null
+  cogs_account: number | null
+  adjustment_account: number | null
+  revenue_account: number | null
+  purchase_account: number | null
+  discount_given_account: number | null
+  created_at: string
+  updated_at: string
+}
+
+export interface ProductServiceCategory {
+  id: number
+  company: number
+  name: string
+  parent: number | null
+  erp_id: string | null
 }
 
 export interface BillingTenantConfig {

@@ -16,6 +16,7 @@ from .serializers import (
     ContractSerializer, InvoiceSerializer, InvoiceLineSerializer,
     NFTransactionLinkSerializer, InvoiceNFLinkSerializer,
     BillingTenantConfigSerializer, InvoiceDetailSerializer,
+    InvoiceListSerializer,
 )
 from multitenancy.mixins import ScopedQuerysetMixin
 from multitenancy.api_utils import generic_bulk_create, generic_bulk_update, generic_bulk_delete
@@ -90,8 +91,12 @@ class InvoiceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
 
     def get_serializer_class(self):
         # Detail endpoint returns the enriched payload (lines + nf_attachments).
+        # List endpoint uses the lightweight serializer (no lines) so 500+
+        # rows don't trigger an N+1 line-fetch chain.
         if self.action in ('retrieve',):
             return InvoiceDetailSerializer
+        if self.action in ('list',):
+            return InvoiceListSerializer
         return InvoiceSerializer
 
     def get_queryset(self):

@@ -3,7 +3,10 @@ import { toast } from "sonner"
 import { useTenant } from "@/providers/TenantProvider"
 import { extractApiErrorMessage } from "@/lib/api-client"
 import { billingApi } from "./api"
-import type { BillingTenantConfig, Invoice, NFTransactionLink } from "./types"
+import type {
+  BillingTenantConfig, BusinessPartner, BusinessPartnerCategory,
+  Invoice, NFTransactionLink, ProductService, ProductServiceCategory,
+} from "./types"
 
 const qk = {
   invoices: (sub: string, params?: unknown) => ["billing", sub, "invoices", params] as const,
@@ -307,5 +310,165 @@ export function useBusinessPartners(params?: Record<string, string | number | un
     queryKey: qk.partners(sub, params),
     queryFn: () => billingApi.listBusinessPartners(params),
     enabled: !!sub,
+  })
+}
+
+export function useBusinessPartner(id: number | null | undefined) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: id ? ["billing", sub, "partner", id] : ["billing", sub, "partner", "none"],
+    queryFn: () => billingApi.getBusinessPartner(id as number),
+    enabled: !!sub && id != null,
+  })
+}
+
+export function useSaveBusinessPartner() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: ({ id, body }: { id: number | null; body: Partial<BusinessPartner> }) =>
+      billingApi.saveBusinessPartner(id, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "partners"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "partner"] })
+      toast.success("Parceiro salvo.")
+    },
+    onError: (e) => showError("Falha ao salvar parceiro", e),
+  })
+}
+
+export function useDeleteBusinessPartner() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: (id: number) => billingApi.deleteBusinessPartner(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "partners"] })
+      toast.success("Parceiro removido.")
+    },
+    onError: (e) => showError("Falha ao remover parceiro", e),
+  })
+}
+
+// BP categories
+export function useBusinessPartnerCategories() {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["billing", sub, "bp-categories"],
+    queryFn: () => billingApi.listBusinessPartnerCategories(),
+    enabled: !!sub,
+  })
+}
+
+export function useSaveBusinessPartnerCategory() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: ({ id, body }: { id: number | null; body: Partial<BusinessPartnerCategory> }) =>
+      billingApi.saveBusinessPartnerCategory(id, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "bp-categories"] })
+      toast.success("Categoria salva.")
+    },
+    onError: (e) => showError("Falha ao salvar categoria", e),
+  })
+}
+
+export function useDeleteBusinessPartnerCategory() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: (id: number) => billingApi.deleteBusinessPartnerCategory(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "bp-categories"] })
+      toast.success("Categoria removida.")
+    },
+    onError: (e) => showError("Falha ao remover categoria", e),
+  })
+}
+
+// ============================================================
+// ProductService
+// ============================================================
+export function useProductServices(params?: Record<string, string | number | undefined>) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["billing", sub, "product-services", params],
+    queryFn: () => billingApi.listProductServices(params),
+    enabled: !!sub,
+  })
+}
+
+export function useProductService(id: number | null | undefined) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: id ? ["billing", sub, "product-service", id] : ["billing", sub, "product-service", "none"],
+    queryFn: () => billingApi.getProductService(id as number),
+    enabled: !!sub && id != null,
+  })
+}
+
+export function useSaveProductService() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: ({ id, body }: { id: number | null; body: Partial<ProductService> }) =>
+      billingApi.saveProductService(id, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "product-services"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "product-service"] })
+      toast.success("Produto/Serviço salvo.")
+    },
+    onError: (e) => showError("Falha ao salvar produto/serviço", e),
+  })
+}
+
+export function useDeleteProductService() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: (id: number) => billingApi.deleteProductService(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "product-services"] })
+      toast.success("Produto/Serviço removido.")
+    },
+    onError: (e) => showError("Falha ao remover produto/serviço", e),
+  })
+}
+
+// PS categories
+export function useProductServiceCategories() {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["billing", sub, "ps-categories"],
+    queryFn: () => billingApi.listProductServiceCategories(),
+    enabled: !!sub,
+  })
+}
+
+export function useSaveProductServiceCategory() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: ({ id, body }: { id: number | null; body: Partial<ProductServiceCategory> }) =>
+      billingApi.saveProductServiceCategory(id, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "ps-categories"] })
+      toast.success("Categoria salva.")
+    },
+    onError: (e) => showError("Falha ao salvar categoria", e),
+  })
+}
+
+export function useDeleteProductServiceCategory() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: (id: number) => billingApi.deleteProductServiceCategory(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "ps-categories"] })
+      toast.success("Categoria removida.")
+    },
+    onError: (e) => showError("Falha ao remover categoria", e),
   })
 }

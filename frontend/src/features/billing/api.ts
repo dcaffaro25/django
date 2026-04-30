@@ -2,12 +2,15 @@ import { api, unwrapList } from "@/lib/api-client"
 import type {
   BillingTenantConfig,
   BusinessPartner,
+  BusinessPartnerCategory,
   Invoice,
   InvoiceDetail,
   InvoiceNFLink,
   NFTransactionLink,
   NotaFiscal,
   PaginatedListResponse,
+  ProductService,
+  ProductServiceCategory,
   ScanResponse,
 } from "./types"
 
@@ -129,7 +132,7 @@ export const billingApi = {
     api.tenant.patch<BillingTenantConfig>(`/api/billing-config/current/`, body),
 
   // ============================================================
-  // BusinessPartner (light list for pickers)
+  // BusinessPartner CRUD
   // ============================================================
   listBusinessPartners: async (params?: AnyParams): Promise<BusinessPartner[]> => {
     const qs = toQueryString(params)
@@ -138,4 +141,61 @@ export const billingApi = {
     )
     return unwrapList(data as never)
   },
+  getBusinessPartner: (id: number): Promise<BusinessPartner> =>
+    api.tenant.get<BusinessPartner>(`/api/business_partners/${id}/`),
+  saveBusinessPartner: (id: number | null, body: Partial<BusinessPartner>): Promise<BusinessPartner> => {
+    if (id == null) return api.tenant.post<BusinessPartner>("/api/business_partners/", body)
+    return api.tenant.patch<BusinessPartner>(`/api/business_partners/${id}/`, body)
+  },
+  deleteBusinessPartner: (id: number) =>
+    api.tenant.delete(`/api/business_partners/${id}/`),
+
+  // BP categories
+  listBusinessPartnerCategories: async (params?: AnyParams): Promise<BusinessPartnerCategory[]> => {
+    const qs = toQueryString(params)
+    const data = await api.tenant.get<BusinessPartnerCategory[] | PaginatedListResponse<BusinessPartnerCategory>>(
+      `/api/business_partner_categories/${qs}`,
+    )
+    return unwrapList(data as never)
+  },
+  saveBusinessPartnerCategory: (id: number | null, body: Partial<BusinessPartnerCategory>): Promise<BusinessPartnerCategory> => {
+    if (id == null) return api.tenant.post<BusinessPartnerCategory>("/api/business_partner_categories/", body)
+    return api.tenant.patch<BusinessPartnerCategory>(`/api/business_partner_categories/${id}/`, body)
+  },
+  deleteBusinessPartnerCategory: (id: number) =>
+    api.tenant.delete(`/api/business_partner_categories/${id}/`),
+
+  // ============================================================
+  // ProductService CRUD
+  // ============================================================
+  listProductServices: async (params?: AnyParams): Promise<ProductService[]> => {
+    const qs = toQueryString(params)
+    const data = await api.tenant.get<ProductService[] | PaginatedListResponse<ProductService>>(
+      `/api/product_services/${qs}`,
+    )
+    return unwrapList(data as never)
+  },
+  getProductService: (id: number): Promise<ProductService> =>
+    api.tenant.get<ProductService>(`/api/product_services/${id}/`),
+  saveProductService: (id: number | null, body: Partial<ProductService>): Promise<ProductService> => {
+    if (id == null) return api.tenant.post<ProductService>("/api/product_services/", body)
+    return api.tenant.patch<ProductService>(`/api/product_services/${id}/`, body)
+  },
+  deleteProductService: (id: number) =>
+    api.tenant.delete(`/api/product_services/${id}/`),
+
+  // PS categories
+  listProductServiceCategories: async (params?: AnyParams): Promise<ProductServiceCategory[]> => {
+    const qs = toQueryString(params)
+    const data = await api.tenant.get<ProductServiceCategory[] | PaginatedListResponse<ProductServiceCategory>>(
+      `/api/product_service_categories/${qs}`,
+    )
+    return unwrapList(data as never)
+  },
+  saveProductServiceCategory: (id: number | null, body: Partial<ProductServiceCategory>): Promise<ProductServiceCategory> => {
+    if (id == null) return api.tenant.post<ProductServiceCategory>("/api/product_service_categories/", body)
+    return api.tenant.patch<ProductServiceCategory>(`/api/product_service_categories/${id}/`, body)
+  },
+  deleteProductServiceCategory: (id: number) =>
+    api.tenant.delete(`/api/product_service_categories/${id}/`),
 }
