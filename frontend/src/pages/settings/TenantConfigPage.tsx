@@ -33,9 +33,18 @@ export function TenantConfigPage() {
   const { tenant } = useTenant()
   const { data: kpis } = useBankAccountsDashboardKpis()
   const { data: accounts = [] } = useAccounts()
-  const { theme: tenantTheme, me } = useUserRole()
+  const { theme: tenantTheme, me, isManager, isLoading: roleLoading } = useUserRole()
   const [themeEditorOpen, setThemeEditorOpen] = useState(false)
   const [companyEditorOpen, setCompanyEditorOpen] = useState(false)
+  // Show the edit buttons only when the operator is manager+ in
+  // their REAL role (the ``isManager`` flag respects the
+  // view-as-viewer overlay -- so flipping into preview mode hides
+  // them too, which is the whole point). During the brief boot
+  // window before /api/core/me/ resolves we err on the side of
+  // showing the buttons so an admin landing here directly doesn't
+  // see an empty page header. Backend write gate is the actual
+  // source of truth for permissions.
+  const showEditButtons = isManager || roleLoading
   // Match the TenantCard logic: prefer the dark logo when the user
   // is in dark mode AND a dark variant is configured. Otherwise the
   // primary logo (or the letter avatar) wins.
@@ -59,28 +68,32 @@ export function TenantConfigPage() {
         title="Configuração da empresa"
         subtitle="Parâmetros e entidades por inquilino"
         actions={
-          // Both edit drawers are visible to anyone who reaches the
-          // page; the actual write is gated server-side by the
-          // middleware role check (viewers get a friendly 403 toast
-          // via the api-client interceptor). Showing them
-          // unconditionally avoids hiding the entry point during
-          // the brief window before /api/core/me/ resolves on boot.
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => setCompanyEditorOpen(true)}
-              className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
-            >
-              <Pencil className="h-3.5 w-3.5 text-primary" />
-              Editar empresa
-            </button>
-            <button
-              onClick={() => setThemeEditorOpen(true)}
-              className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
-            >
-              <Palette className="h-3.5 w-3.5 text-primary" />
-              Editar tema
-            </button>
-          </div>
+          // Edit buttons gate on the operator's REAL role
+          // (``isManager`` respects the view-as-viewer overlay so
+          // toggling preview hides them too -- which is the whole
+          // point of the preview). During the brief boot window
+          // before /api/core/me/ resolves we show them anyway so an
+          // admin landing here directly doesn't see an empty page
+          // header. Backend write gate is the actual source of
+          // truth for permissions.
+          showEditButtons ? (
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setCompanyEditorOpen(true)}
+                className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
+              >
+                <Pencil className="h-3.5 w-3.5 text-primary" />
+                Editar empresa
+              </button>
+              <button
+                onClick={() => setThemeEditorOpen(true)}
+                className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
+              >
+                <Palette className="h-3.5 w-3.5 text-primary" />
+                Editar tema
+              </button>
+            </div>
+          ) : null
         }
       />
 

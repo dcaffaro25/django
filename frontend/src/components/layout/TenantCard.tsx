@@ -36,7 +36,7 @@ import {
  */
 export function TenantCard({ collapsed }: { collapsed: boolean }) {
   const { tenant, tenants, switchTenant } = useTenant()
-  const { theme: tenantTheme, me } = useUserRole()
+  const { theme: tenantTheme, me, canWrite } = useUserRole()
   const { data: kpis } = useBankAccountsDashboardKpis()
   const navigate = useNavigate()
 
@@ -83,6 +83,7 @@ export function TenantCard({ collapsed }: { collapsed: boolean }) {
           onSwitch={switchTenant}
           onSwitchAndConfig={onSwitchAndConfig}
           onOpenCurrentConfig={onOpenCurrentConfig}
+          canConfigure={canWrite}
         />
       </DropdownMenu>
     )
@@ -138,6 +139,7 @@ export function TenantCard({ collapsed }: { collapsed: boolean }) {
         onSwitch={switchTenant}
         onSwitchAndConfig={onSwitchAndConfig}
         onOpenCurrentConfig={onOpenCurrentConfig}
+        canConfigure={canWrite}
       />
     </DropdownMenu>
   )
@@ -150,22 +152,33 @@ interface TenantOption {
 }
 
 function TenantSwitcherMenu({
-  tenants, activeId, onSwitch, onSwitchAndConfig, onOpenCurrentConfig,
+  tenants, activeId, onSwitch, onSwitchAndConfig, onOpenCurrentConfig, canConfigure,
 }: {
   tenants: TenantOption[]
   activeId: number | undefined
   onSwitch: (subdomain: string) => void
   onSwitchAndConfig: (subdomain: string) => void
   onOpenCurrentConfig: () => void
+  /** When false (viewer / view-as-viewer preview), hide the
+   *  config entries. The tenant switcher itself stays visible
+   *  -- a viewer might still belong to multiple tenants. */
+  canConfigure: boolean
 }) {
   return (
     <DropdownMenuContent align="start" className="w-72">
-      {/* Primary action FIRST -- most-used path from this menu. */}
-      <DropdownMenuItem onClick={onOpenCurrentConfig} className="cursor-pointer">
-        <Settings2 className="mr-2 h-4 w-4 text-primary" />
-        <span>Abrir configuração</span>
-      </DropdownMenuItem>
-      <DropdownMenuSeparator />
+      {/* Primary action FIRST -- most-used path from this menu.
+          Hidden in viewer mode: viewers can't edit, so showing
+          them a config link that 403s on every action would just
+          confuse. */}
+      {canConfigure && (
+        <>
+          <DropdownMenuItem onClick={onOpenCurrentConfig} className="cursor-pointer">
+            <Settings2 className="mr-2 h-4 w-4 text-primary" />
+            <span>Abrir configuração</span>
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+        </>
+      )}
       <DropdownMenuLabel className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
         Trocar empresa
       </DropdownMenuLabel>
@@ -188,8 +201,9 @@ function TenantSwitcherMenu({
             <span className="ml-2 truncate text-[10px] text-muted-foreground">{ten.subdomain}</span>
             {/* Per-tenant shortcut: switch AND open that tenant's
                 config in one click. Hidden on the active tenant
-                (its config is the top entry). */}
-            {!isActive && (
+                (its config is the top entry) and on viewer accounts
+                (the target page would 403 every action anyway). */}
+            {!isActive && canConfigure && (
               <button
                 onClick={(e) => {
                   e.stopPropagation()

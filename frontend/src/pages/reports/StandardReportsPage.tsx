@@ -20,6 +20,7 @@ import type {
   FinancialStatementsCategory,
   FinancialStatementsPayload,
 } from "@/features/reconciliation/types"
+import { useUserRole } from "@/features/auth/useUserRole"
 import { DrillableLine } from "./components/DrillableLine"
 import { AccountWiringModal } from "./components/AccountWiringModal"
 import { JournalEntriesPanel } from "./components/JournalEntriesPanel"
@@ -575,6 +576,12 @@ export function DreTab() {
     basis,
   })
   const wiring = useAccountWiring()
+  const { canWrite } = useUserRole()
+  // Gate the "edit account categorization" pencil so the wiring
+  // modal entry only appears for operators who can actually save
+  // changes. Hides automatically in view-as-viewer preview because
+  // ``canWrite`` follows the role overlay.
+  const onEditAccount = canWrite ? wiring.open : undefined
 
   if (isLoading) return <StatementSkeleton />
   if (!data || data.categories.length === 0) return <NotEnoughDataNotice />
@@ -582,26 +589,37 @@ export function DreTab() {
   const currency = data.currency
   const byKey = indexCategories(data.categories)
 
-  // Pull the DRE-relevant categories. Account_direction is already
-  // applied server-side, so revenue accounts come out positive.
+  // Pull the DRE-relevant categories. Server-side sign convention
+  // ("positive = balance increased") means credit-natural categories
+  // (deducao_receita, receita_financeira) arrive negative when they
+  // accumulate debits, and debit-natural categories (custo, despesa_*,
+  // imposto) arrive positive when they accumulate debits. The DRE math
+  // therefore SUMS credit-natural categories and SUBTRACTS debit-natural
+  // ones from the running total. Keep this alignment in sync with
+  // ``REPORT_CATEGORY_META[*].sign_hint`` — if a category's sign_hint
+  // changes, the corresponding line below changes from + to - or back.
   const get = (k: string) => byKey.get(k)?.amount ?? 0
   const accs = (k: string) => byKey.get(k)?.accounts ?? []
-  const receitaBruta = get("receita_bruta")
-  const deducoes = get("deducao_receita")
-  const receitaLiquida = receitaBruta + deducoes  // deducoes natural sign already negative
-  const custos = get("custo")
-  const lucroBruto = receitaLiquida + custos
-  const despesasOp = get("despesa_operacional")
-  const ebit = lucroBruto + despesasOp
-  const receitaFin = get("receita_financeira")
-  const despesaFin = get("despesa_financeira")
-  const resultadoFin = receitaFin + despesaFin
-  const outras = get("outras_receitas")
-  const lair = ebit + resultadoFin + outras
-  const impostoLucro = get("imposto_sobre_lucro")
-  const lucroLiq = lair + impostoLucro
+  const receitaBruta = get("receita_bruta")            // credit_natural → +
+  const deducoes = get("deducao_receita")              // credit_natural → +
+  const receitaLiquida = receitaBruta + deducoes
+  const custos = get("custo")                          // debit_natural  → -
+  const lucroBruto = receitaLiquida - custos
+  const despesasOp = get("despesa_operacional")        // debit_natural  → -
+  const ebit = lucroBruto - despesasOp
+  const receitaFin = get("receita_financeira")         // credit_natural → +
+  const despesaFin = get("despesa_financeira")         // debit_natural  → -
+  const outras = get("outras_receitas")                // any → + (Outras
+  // Receitas/Despesas is a CPC 26 line in its own right and per Brazilian
+  // practice sits inside the Resultado Financeiro grouping; rolling it
+  // into resultadoFin keeps the displayed subtotal consistent with what
+  // the operator sees nested beneath it).
+  const resultadoFin = receitaFin - despesaFin + outras
+  const lair = ebit + resultadoFin
+  const impostoLucro = get("imposto_sobre_lucro")      // debit_natural  → -
+  const lucroLiq = lair - impostoLucro
 
-  const drill = { date_from, date_to, entity, onEditAccount: wiring.open }
+  const drill = { date_from, date_to, entity, onEditAccount }
 
   // DRE is single-column; on wide screens it stretches and the labels
   // float far from the values. Cap at ~960px and centre so the line
@@ -716,6 +734,8 @@ export function BalancoTab() {
     basis,
   })
   const wiring = useAccountWiring()
+  const { canWrite } = useUserRole()
+  const onEditAccount = canWrite ? wiring.open : undefined
   if (isLoading) return <StatementSkeleton />
   if (!data || data.categories.length === 0) return <NotEnoughDataNotice />
 
@@ -732,7 +752,7 @@ export function BalancoTab() {
   const totalPassivoPl = passCirc + passNc + pl
   const balanced = Math.abs(totalAtivo - totalPassivoPl) < 0.01
 
-  const drill = { date_from, date_to, entity, onEditAccount: wiring.open }
+  const drill = { date_from, date_to, entity, onEditAccount }
 
   // ``data-statement-card`` marks the whole grid (Ativo + Passivo + reconciliation
   // banner) as the PDF export target — see ``ReportExportButtons``.
@@ -798,6 +818,8 @@ export function DfcTab() {
     basis,
   })
   const wiring = useAccountWiring()
+  const { canWrite } = useUserRole()
+  const onEditAccount = canWrite ? wiring.open : undefined
 
   if (!date_from || !date_to) {
     return (
@@ -856,7 +878,7 @@ export function DfcTab() {
         date_from={date_from}
         date_to={date_to}
         entity={entity}
-        onEditAccount={wiring.open}
+        onEditAccount={onEditAccount}
       />
       <WiringModalController wiring={wiring} />
     </div>
