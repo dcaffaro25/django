@@ -8,6 +8,18 @@ allocated **proportionally** to the in-period bank-leg share -- this
 keeps the period total tied to the actual cash that hit the bank in
 the window, not to the full accrual.
 
+Date scope per bank leg ("effective cash date" — see
+``_annotate_effective_cash_date``):
+
+* JE is **reconciled** → use the linked ``BankTransaction.date``
+  (when the cash actually settled at the bank).
+* JE is **not reconciled** → use the JE's own ``date`` (the
+  bookkeeper's expected/estimated payment date).
+
+This is the only point where DRE-cash and DFC scoping diverges from
+``Transaction.date``: accrual uses transaction date, cash uses the
+bank-settle-or-estimate date above.
+
 The same machinery powers two surfaces:
 
 * ``compute_cashflow_direct`` -- the DFC tab (FCO / FCI / FCF
@@ -27,10 +39,21 @@ from collections import defaultdict
 from decimal import Decimal
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from django.db.models import DecimalField, F, Q, Sum, Value
+from django.db.models import (
+    Case,
+    DateField,
+    DecimalField,
+    F,
+    OuterRef,
+    Q,
+    Subquery,
+    Sum,
+    Value,
+    When,
+)
 from django.db.models.functions import Coalesce
 
-from accounting.models import Account, JournalEntry
+from accounting.models import Account, BankTransaction, JournalEntry
 
 
 # ---------------------------------------------------------------------
@@ -98,6 +121,50 @@ def _abs_expr() -> F:
     return Coalesce(F("debit_amount"), z) + Coalesce(F("credit_amount"), z)
 
 
+def _annotate_effective_cash_date(je_qs):
+    """Annotate ``effective_cash_date`` on a bank-leg JE queryset.
+
+    Cash flow scoping should follow *when the cash actually hit the
+    bank*, not when the bookkeeper dated the GL entry. The two diverge
+    routinely: an A/P payable JE is dated on the due date, the bank
+    settles a few days later. Without this annotation, accrued-but-not-
+    settled JEs leak into the period and reconciled JEs that settled
+    in the period get pushed out.
+
+    Resolution rule per JE:
+
+    * ``is_reconciled=True`` → use the date of any linked
+      ``BankTransaction`` (earliest, picked by ``date`` then ``id``
+      for determinism). Falls back to the JE's own ``date`` if the
+      reconciliation row exists but no BT is linked (rare data drift).
+    * ``is_reconciled=False`` → use the JE's own ``date`` (the
+      forward-looking estimated payment date set by the bookkeeper).
+
+    Path: ``JournalEntry → reconciliations (M2M) → bank_transactions
+    (M2M) → date``. Multi-BT reconciliations pick the earliest date;
+    that's a heuristic, not a perfect answer when one JE settles via
+    several payments, but the typical 1:1 case is correct and the
+    rest stays bounded.
+    """
+    bt_date_subq = (
+        BankTransaction.objects.filter(
+            reconciliations__journal_entries=OuterRef("pk"),
+        )
+        .order_by("date", "id")
+        .values("date")[:1]
+    )
+    return je_qs.annotate(
+        effective_cash_date=Case(
+            When(
+                is_reconciled=True,
+                then=Coalesce(Subquery(bt_date_subq), F("date")),
+            ),
+            default=F("date"),
+            output_field=DateField(),
+        )
+    )
+
+
 def _state_filter(include_pending: bool) -> Q:
     """Which transaction states count.
 
@@ -137,12 +204,15 @@ def _compute_transaction_weights(
     if entity_id is not None:
         bank_qs = bank_qs.filter(transaction__entity_id=entity_id)
 
+    bank_qs = _annotate_effective_cash_date(bank_qs)
+
     abs_e = _abs_expr()
     aggs = bank_qs.values("transaction_id").annotate(
         total_abs=Sum(abs_e),
         in_period_abs=Sum(
             abs_e,
-            filter=Q(date__gte=date_from) & Q(date__lte=date_to),
+            filter=Q(effective_cash_date__gte=date_from)
+            & Q(effective_cash_date__lte=date_to),
         ),
     )
 
@@ -313,11 +383,16 @@ def _distribute_cash_to_book_categories(
     if entity_id is not None:
         bank_qs = bank_qs.filter(transaction__entity_id=entity_id)
 
+    bank_qs = _annotate_effective_cash_date(bank_qs)
+
     # Per-tx bank-leg net in-period. Sign is naturally cash-correct
     # because cash accounts are direction=+1 (debit-natural assets):
     # DR cash → cash in (+), CR cash → cash out (−).
     cash_per_tx_aggs = (
-        bank_qs.filter(date__gte=date_from, date__lte=date_to)
+        bank_qs.filter(
+            effective_cash_date__gte=date_from,
+            effective_cash_date__lte=date_to,
+        )
         .values("transaction_id")
         .annotate(net=Sum(_net_expr()))
     )
