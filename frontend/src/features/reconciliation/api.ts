@@ -256,6 +256,12 @@ export const reconApi = {
     entity?: number
     include_pending?: boolean
     basis?: "accrual" | "cash"
+    /** Break the window into sub-periods. Adds ``series.periods[]``
+     *  to the payload — one totals dict per sub-period. */
+    series?: "month" | "quarter" | "semester" | "year"
+    /** Compute a comparison-window totals dict. Adds ``comparison``
+     *  to the payload. */
+    compare?: "previous_period" | "previous_year"
   }) =>
     api.tenant.get<import("./types").FinancialStatementsPayload>(
       "/api/accounts/financial-statements/",
@@ -268,6 +274,8 @@ export const reconApi = {
             ? { include_pending: "1" }
             : {}),
           ...(params.basis ? { basis: params.basis } : {}),
+          ...(params.series ? { series: params.series } : {}),
+          ...(params.compare ? { compare: params.compare } : {}),
         },
         timeout: 60_000,
       },

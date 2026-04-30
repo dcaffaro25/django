@@ -291,6 +291,8 @@ export function useFinancialStatements(params: {
   entity?: number
   include_pending?: boolean
   basis?: "accrual" | "cash"
+  series?: "month" | "quarter" | "semester" | "year"
+  compare?: "previous_period" | "previous_year"
 }) {
   const sub = useSub()
   return useQuery({

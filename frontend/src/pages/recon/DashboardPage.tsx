@@ -10,7 +10,7 @@ import {
 import { KpiCard } from "@/components/ui/kpi-card"
 import { SectionHeader } from "@/components/ui/section-header"
 import { StatusBadge } from "@/components/ui/status-badge"
-import { useActiveTasks, useBankAccountsDashboardKpis, useDailyBalances, useReconKPIs, useReconTasks } from "@/features/reconciliation"
+import { useActiveTasks, useBankAccountsDashboardKpis, useBankAccountsList, useDailyBalances, useReconKPIs, useReconTasks } from "@/features/reconciliation"
 import { useUserRole } from "@/features/auth/useUserRole"
 import type { BankAccountRowKpis, BookCurrencyMismatch, BookDailyWarning } from "@/features/reconciliation/types"
 import { cn, formatCurrency, formatDateTime, formatDuration, formatNumber } from "@/lib/utils"
@@ -608,8 +608,16 @@ function BookFlatWarning({
   onOpen: () => void
 }) {
   const { t } = useTranslation("reconciliation")
-  const ids = warnings.map((w) => w.bank_account_id)
-  const preview = ids.slice(0, 8).join(", ") + (ids.length > 8 ? ` (+${ids.length - 8})` : "")
+  // Resolve bank-account names from the cached list. Falls back to
+  // the bare id if the list hasn't loaded yet (no flicker either way
+  // because both renders pick up React Query's cached snapshot).
+  const { data: accounts = [] } = useBankAccountsList()
+  const accountById = new Map(accounts.map((a) => [a.id, a]))
+  const labels = warnings.map((w) => {
+    const a = accountById.get(w.bank_account_id)
+    return a ? a.name : `id ${w.bank_account_id}`
+  })
+  const preview = labels.slice(0, 6).join(", ") + (labels.length > 6 ? ` (+${labels.length - 6})` : "")
   return (
     <div className="flex items-start gap-3 rounded-md border border-warning/40 bg-warning/10 p-3 text-[12px]">
       <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
@@ -620,8 +628,8 @@ function BookFlatWarning({
         <div className="text-muted-foreground">
           {t("dashboard.book_flat_warning_desc", { count: warnings.length })}
         </div>
-        <div className="font-mono text-[11px] text-muted-foreground/80">
-          {t("dashboard.book_flat_warning_ids", { ids: preview })}
+        <div className="text-[11px] text-muted-foreground/80">
+          {preview}
         </div>
       </div>
       <button

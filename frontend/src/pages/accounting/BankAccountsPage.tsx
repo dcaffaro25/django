@@ -5,10 +5,12 @@ import { toast } from "sonner"
 import { Drawer } from "vaul"
 import {
   AlertCircle,
+  AlertTriangle,
   ArrowDown,
   ArrowUp,
   Copy,
   ExternalLink,
+  Link as LinkIcon,
   Plus,
   RefreshCw,
   Save,
@@ -53,6 +55,7 @@ import type {
   BankAccountWrite,
 } from "@/features/reconciliation/types"
 import { cn, formatCurrency, formatDate } from "@/lib/utils"
+import { BankAccountWireModal } from "./components/BankAccountWireModal"
 
 export function BankAccountsPage() {
   const { t } = useTranslation(["reconciliation", "common"])
@@ -66,6 +69,13 @@ export function BankAccountsPage() {
   const accountKpis = kpis?.accounts ?? {}
   const kpiOf = (id: number) => accountKpis[String(id)]
   const [editing, setEditing] = useState<BankAccountFull | "new" | null>(null)
+  // Separate state for the "Vincular ao Plano de Contas" modal so it
+  // doesn't fight the edit drawer for the same slot. Surfaced when
+  // the row's reverse-FK summary (``linked_account_ids``) is empty —
+  // the data integrity warning on the dashboard points at exactly
+  // these rows. Hidden from view-as-viewer because ``canWrite`` gates
+  // the entire wiring action.
+  const [wiring, setWiring] = useState<BankAccountFull | null>(null)
 
   const { sort, sorted, toggle: toggleSort } = useSortable(accounts, {
     initialKey: "name",
@@ -179,6 +189,46 @@ export function BankAccountsPage() {
         </BulkActionsBar>
       )}
 
+      {/* Unlinked-CoA summary banner. Counts bank accounts whose
+          ``Account.bank_account`` reverse FK is empty — these are
+          the rows the dashboard's "Linha do livro pode estar
+          incompleta" warning points at, but here the operator gets
+          per-row affordances (the badge + row action) so a fix is
+          one click away instead of a context switch. Hidden when
+          everything is wired. */}
+      {(() => {
+        const unlinked = sorted.filter((a) => (a.linked_account_ids?.length ?? 0) === 0)
+        if (unlinked.length === 0) return null
+        return (
+          <div className="flex items-start gap-3 rounded-md border border-warning/40 bg-warning/10 p-3 text-[12px]">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+            <div className="min-w-0 flex-1 space-y-0.5">
+              <div className="font-semibold text-foreground">
+                {unlinked.length} conta{unlinked.length === 1 ? "" : "s"} sem vínculo no Plano de Contas
+              </div>
+              <div className="text-muted-foreground">
+                A linha do livro fica achatada (R$ 0) para essas contas. Clique no badge{" "}
+                <span className="rounded border border-warning/40 bg-warning/20 px-1 py-0.5 text-[10px] font-medium text-warning">
+                  sem CoA
+                </span>{" "}
+                ao lado do nome de cada conta para vincular ou criar uma conta no Plano.
+              </div>
+            </div>
+            {canWrite && (
+              <button
+                type="button"
+                onClick={() => setWiring(unlinked[0])}
+                className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-border bg-background px-2 text-[11px] font-medium hover:bg-accent"
+                title={`Começar pela primeira: ${unlinked[0].name}`}
+              >
+                <LinkIcon className="h-3 w-3" />
+                Vincular agora
+              </button>
+            )}
+          </div>
+        )
+      })()}
+
       {/* Dashboard section -- KPI strip + currency-grouped totals +
           cross-account daily balance chart. Sits above the
           management table so the operator sees the org-wide health
@@ -239,15 +289,43 @@ export function BankAccountsPage() {
                         account Detail page. ``stopPropagation``
                         keeps the two paths from triggering each
                         other. */}
-                    <Link
-                      to={`/accounting/bank-accounts/${a.id}`}
-                      onClick={(e) => e.stopPropagation()}
-                      className="inline-flex items-center gap-1 hover:text-primary hover:underline"
-                      title="Abrir painel da conta"
-                    >
-                      {a.name}
-                      <ExternalLink className="h-3 w-3 opacity-60" />
-                    </Link>
+                    <div className="flex items-center gap-1.5">
+                      <Link
+                        to={`/accounting/bank-accounts/${a.id}`}
+                        onClick={(e) => e.stopPropagation()}
+                        className="inline-flex items-center gap-1 hover:text-primary hover:underline"
+                        title="Abrir painel da conta"
+                      >
+                        {a.name}
+                        <ExternalLink className="h-3 w-3 opacity-60" />
+                      </Link>
+                      {/* Warning badge: this bank account has no
+                          ``Account.bank_account`` FK pointing at it,
+                          so the daily-balance service emits flat
+                          zeros for it. The badge is also a CTA —
+                          clicking opens the wiring modal directly,
+                          short-circuiting the row-actions menu for
+                          the most common fix path. */}
+                      {(a.linked_account_ids?.length ?? 0) === 0 && canWrite && (
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); setWiring(a) }}
+                          className="inline-flex items-center gap-1 rounded border border-warning/40 bg-warning/10 px-1.5 py-0.5 text-[10px] font-medium text-warning hover:bg-warning/20"
+                          title="Esta conta bancária não tem nenhuma conta do Plano vinculada — clique para vincular."
+                        >
+                          <AlertTriangle className="h-3 w-3" />
+                          sem CoA
+                        </button>
+                      )}
+                      {(a.linked_account_ids?.length ?? 0) > 1 && (
+                        <span
+                          className="rounded border border-border bg-surface-2 px-1.5 py-0.5 text-[10px] text-muted-foreground"
+                          title={`Vinculada a ${a.linked_account_ids!.length} contas: ${(a.linked_account_names ?? []).join(", ")}`}
+                        >
+                          {a.linked_account_ids!.length} CoA
+                        </span>
+                      )}
+                    </div>
                   </td>
                   {col.isVisible("bank") && <td className="h-10 px-3 text-muted-foreground">{a.bank?.name ?? "—"}</td>}
                   {col.isVisible("entity") && <td className="h-10 px-3 text-muted-foreground">{a.entity?.name ?? "—"}</td>}
@@ -284,6 +362,15 @@ export function BankAccountsPage() {
                   )}
                   {canWrite ? (
                     <RowActionsCell>
+                      <RowAction
+                        icon={<LinkIcon className="h-3.5 w-3.5" />}
+                        label={
+                          (a.linked_account_ids?.length ?? 0) === 0
+                            ? "Vincular ao Plano de Contas"
+                            : "Vincular outra conta do Plano"
+                        }
+                        onClick={(e) => { e.stopPropagation(); setWiring(a) }}
+                      />
                       <RowAction icon={<Copy className="h-3.5 w-3.5" />} label="Duplicar" onClick={(e) => onDuplicate(a, e)} />
                       <RowAction icon={<Trash2 className="h-3.5 w-3.5" />} label="Excluir" variant="danger" onClick={(e) => onDelete(a, e)} />
                     </RowActionsCell>
@@ -301,6 +388,11 @@ export function BankAccountsPage() {
         open={editing !== null}
         account={editing === "new" ? null : editing}
         onClose={() => setEditing(null)}
+      />
+      <BankAccountWireModal
+        open={wiring !== null}
+        bankAccount={wiring}
+        onClose={() => setWiring(null)}
       />
     </div>
   )

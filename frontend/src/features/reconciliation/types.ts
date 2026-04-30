@@ -373,6 +373,13 @@ export interface BankAccountFull {
   currency?: { id: number; code: string; name: string } | null
   entity?: { id: number; name: string } | null
   company?: { id: number; name: string; subdomain: string } | null
+  /** Reverse-FK summary — every CoA ``Account`` whose
+   *  ``bank_account`` points at this row. Empty array means the
+   *  daily-balance service returns flat zeros for this bank account
+   *  (no GL leaf to read JE flow from). Drives the warning badge +
+   *  "Vincular ao plano de contas" action on the bank-accounts page. */
+  linked_account_ids?: number[]
+  linked_account_names?: string[]
 }
 
 /** Write shape for bank account (flat FK IDs). */
@@ -848,11 +855,20 @@ export interface CashflowDirectMethod {
 }
 
 /** Drill-down account row attached to every category in
- *  ``FinancialStatementsPayload``. ``amount`` is Decimal-as-string. */
+ *  ``FinancialStatementsPayload``. ``amount`` is Decimal-as-string.
+ *
+ *  ``synthetic=true`` flags rows that don't correspond to a real
+ *  ``Account`` row — e.g. the "Resultado do Exercício (período)"
+ *  line injected by the backend into ``patrimonio_liquido`` so the
+ *  Balanço can balance during the period (standard mid-period
+ *  treatment of the unposted year-end closing JE). ``id`` is a
+ *  negative sentinel for synthetic rows; the frontend should not
+ *  attempt to drill JEs or open the wiring modal for them. */
 export interface FinancialStatementsAccount {
   id: number
   name: string
   amount: string
+  synthetic?: boolean
 }
 
 /** One DRE/Balanço category bucket. */
@@ -875,6 +891,89 @@ export interface FinancialStatementsCashflowCategory {
   accounts: FinancialStatementsAccount[]
 }
 
+/** Per-period roll-up emitted under ``series.periods`` when the
+ *  caller asked for granularity. Carries totals only (no drill-down
+ *  accounts) so the wire size stays bounded as the period count grows.
+ *  ``cashflow_totals`` mirrors ``cashflow.by_section`` keys
+ *  (operacional / investimento / financiamento / no_section /
+ *  net_change_in_cash); ``null`` when the sub-period has no DFC data. */
+export interface FinancialStatementsSeriesPeriod {
+  key: string
+  label: string
+  date_from: string
+  date_to: string
+  /** ``{ category_key: amount-as-string }``. Only categories with
+   *  non-zero contribution are present, same as the main payload. */
+  totals: Record<string, string>
+  cashflow_totals: Record<string, string> | null
+}
+
+/** Comparison-window payload — same shape as a series period plus a
+ *  human-readable label and the comparison type that produced it.
+ *  Drives Δ% / Δ-abs columns next to the main figures. */
+export interface FinancialStatementsComparison {
+  type: "previous_period" | "previous_year"
+  label: string
+  period: { date_from: string; date_to: string }
+  totals: Record<string, string>
+  cashflow_totals: Record<string, string> | null
+}
+
+/** A single uncategorized leaf that's silently dropped from the
+ *  Balanço. ``impact`` is the (anchor + flow) total this account would
+ *  have contributed if it were categorized; sign-corrected. The
+ *  ``suggested_*`` fields come from a backend heuristic (tags + name
+ *  patterns + direction) and are advisory — the operator confirms via
+ *  the wiring modal. */
+export interface FinancialStatementsUncategorizedLeaf {
+  id: number
+  name: string
+  /** ``Account.balance`` at ``balance_date``. Decimal-as-string. */
+  anchor: string
+  /** Period flow under the active scope. Decimal-as-string. */
+  flow: string
+  /** anchor + flow, signed. The number that would land in the
+   *  Balanço if the account were properly categorized. */
+  impact: string
+  suggested_category: string | null
+  suggested_label: string | null
+}
+
+/** A Passivo/PL leaf with credit-natural category but
+ *  ``account_direction = +1``. Excludes ``(-)`` contra-accounts which
+ *  are intentionally debit-natural. */
+export interface FinancialStatementsWrongDirectionAccount {
+  id: number
+  name: string
+  current_category: string
+  current_direction: 1
+  suggested_direction: -1
+}
+
+/** Imbalance diagnostics: present only when the Balanço doesn't close
+ *  (within 1¢). Drives the actionable panel that replaces the bare
+ *  "Diferença: R$ X" banner — each section maps to a concrete fix
+ *  the operator can perform inline. */
+export interface FinancialStatementsBalanceDiagnostics {
+  total_ativo: string
+  total_passivo_pl: string
+  /** The synthetic Resultado do Exercício that the backend already
+   *  folded into ``patrimonio_liquido``; surfaced so the panel can
+   *  explain why PL is non-zero even when no real PL JEs exist. */
+  synthetic_lucro: string
+  /** Total Ativo − Total Passivo+PL (after synthetic Lucro applied). */
+  imbalance: string
+  anchor_gap: {
+    ativo_anchor: string
+    pas_pl_anchor: string
+    delta: string
+  }
+  uncategorized_leaves: FinancialStatementsUncategorizedLeaf[]
+  /** Σ of ``impact`` across ``uncategorized_leaves``. */
+  uncategorized_total_impact: string
+  wrong_direction_accounts: FinancialStatementsWrongDirectionAccount[]
+}
+
 /** Top-level payload of ``GET /api/accounts/financial-statements/``.
  *  Drives DRE / Balanço / DFC tabs without the frontend having to
  *  load the full account list. ``cashflow`` is ``null`` when the
@@ -895,6 +994,22 @@ export interface FinancialStatementsPayload {
    *  "Saldo de Caixa (atual)" KPI on the DFC tab so it doesn't need
    *  to fetch the full accounts list. Decimal-as-string. */
   cash_total: string
+  /** Present when the caller passed ``series=month|quarter|semester|year``.
+   *  Each period carries totals only (no drill-down) so the payload
+   *  stays small even with 12+ columns. ``truncated`` flags when the
+   *  service hit its sub-period cap (currently 36). */
+  series?: {
+    granularity: "month" | "quarter" | "semester" | "year"
+    periods: FinancialStatementsSeriesPeriod[]
+    truncated: boolean
+  }
+  /** Present when the caller passed ``compare=previous_period|previous_year``. */
+  comparison?: FinancialStatementsComparison
+  /** Present only when the Balanço doesn't balance. Drives the
+   *  guided-fix panel under Total Passivo + PL. ``null`` when the
+   *  date scope didn't include a Balanço window or the books close
+   *  cleanly. */
+  balance_diagnostics?: FinancialStatementsBalanceDiagnostics | null
 }
 
 export interface AccountLite {

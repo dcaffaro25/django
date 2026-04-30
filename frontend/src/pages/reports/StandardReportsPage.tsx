@@ -17,6 +17,7 @@ import {
 } from "@/features/reconciliation/taxonomy_labels"
 import { cn, formatCurrency } from "@/lib/utils"
 import type {
+  FinancialStatementsBalanceDiagnostics,
   FinancialStatementsCategory,
   FinancialStatementsPayload,
 } from "@/features/reconciliation/types"
@@ -25,12 +26,20 @@ import { DrillableLine } from "./components/DrillableLine"
 import { AccountWiringModal } from "./components/AccountWiringModal"
 import { JournalEntriesPanel } from "./components/JournalEntriesPanel"
 
+type Granularity = "month" | "quarter" | "semester" | "year"
+type Compare = "previous_period" | "previous_year"
+
 /** Read every shared filter (``include_pending``, ``date_from``,
- *  ``date_to``, ``entity``, ``basis``) from the URL so every tab
- *  consumes the same scope without prop-drilling. ``basis`` only
- *  affects the DRE tab today (Balanço is always anchor + flows; DFC
- *  is intrinsically cash-basis), but it's a global URL param so the
- *  toggle is shareable / bookmarkable. */
+ *  ``date_to``, ``entity``, ``basis``, ``granularity``, ``compare``)
+ *  from the URL so every tab consumes the same scope without
+ *  prop-drilling. ``basis`` only affects the DRE tab today (Balanço
+ *  is always anchor + flows; DFC is intrinsically cash-basis), but
+ *  it's a global URL param so the toggle is shareable / bookmarkable.
+ *
+ *  ``granularity`` triggers the per-period column expansion
+ *  (server-side ``series=...``); ``compare`` adds a delta column
+ *  against ``previous_period`` or ``previous_year``. Both default to
+ *  off and degrade silently when the value isn't recognised. */
 function useReportFilters() {
   const [params] = useSearchParams()
   const v = (params.get("include_pending") ?? "").toLowerCase()
@@ -41,7 +50,18 @@ function useReportFilters() {
   const entity = entityRaw ? Number(entityRaw) || undefined : undefined
   const basisRaw = (params.get("basis") || "").toLowerCase()
   const basis: "accrual" | "cash" = basisRaw === "cash" ? "cash" : "accrual"
-  return { includePending, date_from, date_to, entity, basis }
+  const granRaw = (params.get("granularity") || "").toLowerCase()
+  const granularity: Granularity | undefined =
+    granRaw === "month" || granRaw === "quarter" ||
+    granRaw === "semester" || granRaw === "year"
+      ? granRaw
+      : undefined
+  const cmpRaw = (params.get("compare") || "").toLowerCase()
+  const compare: Compare | undefined =
+    cmpRaw === "previous_period" || cmpRaw === "previous_year"
+      ? cmpRaw
+      : undefined
+  return { includePending, date_from, date_to, entity, basis, granularity, compare }
 }
 
 /**
@@ -57,7 +77,8 @@ function useReportFilters() {
  */
 export function StandardReportsPage() {
   const [params, setParams] = useSearchParams()
-  const { includePending, date_from, date_to, entity, basis } = useReportFilters()
+  const { includePending, date_from, date_to, entity, basis, granularity, compare } =
+    useReportFilters()
   const { data: entities = [] } = useEntities()
 
   // Single-place mutator: copy the current params, set/delete one
@@ -381,6 +402,45 @@ export function StandardReportsPage() {
                   Caixa
                 </button>
               </div>
+              {/* Granularity — splits the period into sub-period
+                  columns (Mês / Trim. / Sem. / Ano). Disabled without
+                  a date range because the backend ignores series in
+                  that case. */}
+              <select
+                value={granularity ?? ""}
+                onChange={(e) => setFilter("granularity", e.target.value || null)}
+                disabled={!(date_from && date_to)}
+                className={cn(
+                  "h-7 rounded-md border border-border bg-surface-2 px-2 text-[11px] outline-none disabled:opacity-50",
+                  granularity && "border-primary/40 bg-primary/10 text-primary",
+                )}
+                aria-label="Granularidade"
+                title="Quebra o período em sub-períodos (uma coluna por sub-período)."
+              >
+                <option value="">Total</option>
+                <option value="month">Mensal</option>
+                <option value="quarter">Trimestral</option>
+                <option value="semester">Semestral</option>
+                <option value="year">Anual</option>
+              </select>
+              {/* Comparison — adds a second-window column with Δ% and
+                  Δ-abs against the main period. Same disabled-without-
+                  range guard as granularity. */}
+              <select
+                value={compare ?? ""}
+                onChange={(e) => setFilter("compare", e.target.value || null)}
+                disabled={!(date_from && date_to)}
+                className={cn(
+                  "h-7 rounded-md border border-border bg-surface-2 px-2 text-[11px] outline-none disabled:opacity-50",
+                  compare && "border-primary/40 bg-primary/10 text-primary",
+                )}
+                aria-label="Comparação"
+                title="Compara contra o período anterior (mesma duração) ou contra o mesmo período do ano anterior."
+              >
+                <option value="">Sem comparação</option>
+                <option value="previous_period">vs. Período anterior</option>
+                <option value="previous_year">vs. Mesmo período ano anterior</option>
+              </select>
               <ReportExportButtons
                 params={{
                   date_from,
@@ -563,17 +623,317 @@ function NotEnoughDataNotice() {
 }
 
 // ---------------------------------------------------------------------
+// DRE / Balanço derived-line helpers (shared by single + multi-column)
+// ---------------------------------------------------------------------
+
+/** Per-row spec rendered by both the single-column and multi-column
+ *  statements. ``key`` is either a category code (looked up via the
+ *  amount getter) or a ``"derived:..."`` synthetic key whose value is
+ *  computed from earlier rows. Drill-down is enabled by setting
+ *  ``categoryKey`` to a real category code; synthetic rows omit it. */
+type RowSpec = {
+  label: string
+  /** Display flags: bold = subtotal, indent = nesting depth,
+   *  negative = render in destructive color when non-zero. */
+  bold?: boolean
+  indent?: number
+  negative?: boolean
+  /** Direct lookup against ``getAmount(categoryKey)``. Mutually
+   *  exclusive with ``derive``. */
+  categoryKey?: string
+  /** Synthetic subtotal: receives the running totals so far and
+   *  returns this row's amount. Lets the multi-column path stay a
+   *  pure function of ``getAmount`` without re-implementing DRE math
+   *  per column. */
+  derive?: (rows: Record<string, number>) => number
+  /** Stable id used to feed ``derive`` for downstream rows. Falls
+   *  back to ``categoryKey`` when omitted. */
+  id?: string
+}
+
+const DRE_ROWS: RowSpec[] = [
+  { id: "receita_bruta", label: "Receita Bruta", categoryKey: "receita_bruta", bold: true },
+  { id: "deducao_receita", label: "(-) Deduções da Receita", categoryKey: "deducao_receita", indent: 1, negative: true },
+  { id: "receita_liquida", label: "Receita Líquida", bold: true,
+    derive: (r) => (r.receita_bruta ?? 0) + (r.deducao_receita ?? 0) },
+  { id: "custo", label: "(-) Custos", categoryKey: "custo", indent: 1, negative: true },
+  { id: "lucro_bruto", label: "Lucro Bruto", bold: true,
+    derive: (r) => (r.receita_liquida ?? 0) - (r.custo ?? 0) },
+  { id: "despesa_operacional", label: "(-) Despesas Operacionais", categoryKey: "despesa_operacional", indent: 1, negative: true },
+  { id: "ebit", label: "EBIT (Lucro Operacional)", bold: true,
+    derive: (r) => (r.lucro_bruto ?? 0) - (r.despesa_operacional ?? 0) },
+  { id: "receita_financeira", label: "(+) Receitas Financeiras", categoryKey: "receita_financeira", indent: 1 },
+  { id: "despesa_financeira", label: "(-) Despesas Financeiras", categoryKey: "despesa_financeira", indent: 1, negative: true },
+  { id: "outras_receitas", label: "(+/-) Outras Receitas/Despesas", categoryKey: "outras_receitas", indent: 1 },
+  { id: "resultado_financeiro", label: "Resultado Financeiro", indent: 1,
+    derive: (r) => (r.receita_financeira ?? 0) - (r.despesa_financeira ?? 0) + (r.outras_receitas ?? 0) },
+  { id: "lair", label: "LAIR (Lucro antes IR)", bold: true,
+    derive: (r) => (r.ebit ?? 0) + (r.resultado_financeiro ?? 0) },
+  { id: "imposto_sobre_lucro", label: "(-) IRPJ + CSLL", categoryKey: "imposto_sobre_lucro", indent: 1, negative: true },
+  { id: "lucro_liquido", label: "Lucro Líquido do Exercício", bold: true,
+    derive: (r) => (r.lair ?? 0) - (r.imposto_sobre_lucro ?? 0) },
+]
+
+const BALANCO_ATIVO_ROWS: RowSpec[] = [
+  { id: "ativo_circulante", label: "Ativo Circulante", categoryKey: "ativo_circulante" },
+  { id: "ativo_nao_circulante", label: "Ativo Não Circulante", categoryKey: "ativo_nao_circulante" },
+  { id: "total_ativo", label: "Total do Ativo", bold: true,
+    derive: (r) => (r.ativo_circulante ?? 0) + (r.ativo_nao_circulante ?? 0) },
+]
+
+const BALANCO_PASSIVO_ROWS: RowSpec[] = [
+  { id: "passivo_circulante", label: "Passivo Circulante", categoryKey: "passivo_circulante" },
+  { id: "passivo_nao_circulante", label: "Passivo Não Circulante", categoryKey: "passivo_nao_circulante" },
+  { id: "patrimonio_liquido", label: "Patrimônio Líquido", categoryKey: "patrimonio_liquido" },
+  { id: "total_passivo_pl", label: "Total Passivo + PL", bold: true,
+    derive: (r) => (r.passivo_circulante ?? 0) + (r.passivo_nao_circulante ?? 0) + (r.patrimonio_liquido ?? 0) },
+]
+
+/** Walk a list of ``RowSpec``s with a value getter, returning
+ *  ``{rowId: amount}``. Synthetic ``derive`` rows feed off earlier
+ *  resolved values. */
+function resolveRows(
+  rows: RowSpec[],
+  getAmount: (categoryKey: string) => number,
+): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const row of rows) {
+    const id = row.id || row.categoryKey || row.label
+    if (row.derive) out[id] = row.derive(out)
+    else if (row.categoryKey) out[id] = getAmount(row.categoryKey)
+    else out[id] = 0
+  }
+  return out
+}
+
+/** Build a value getter from a totals map (``{cat_key: number}``). */
+function makeGetter(totals: Record<string, number>): (k: string) => number {
+  return (k) => totals[k] ?? 0
+}
+
+/** Convert the main payload's ``categories`` array into a
+ *  ``{cat_key: amount}`` totals map so the rest of the pipeline can
+ *  treat it the same as a series-period or comparison ``totals``. */
+function categoriesToTotals(
+  cats: FinancialStatementsCategory[],
+): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const c of cats) out[c.key] = Number(c.amount) || 0
+  return out
+}
+
+/** Convert a series/comparison ``totals`` (Decimal-as-string) into a
+ *  number map. */
+function stringTotalsToNumbers(
+  totals: Record<string, string>,
+): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const [k, v] of Object.entries(totals)) out[k] = Number(v) || 0
+  return out
+}
+
+/** Format a Δ% string. Returns ``"—"`` when the comparison value is
+ *  zero (avoids the divide-by-zero "Infinity%" trap). */
+function formatPctDelta(current: number, prior: number): string {
+  if (prior === 0) return "—"
+  const pct = ((current - prior) / Math.abs(prior)) * 100
+  const sign = pct > 0 ? "+" : ""
+  return `${sign}${pct.toFixed(1)}%`
+}
+
+// ---------------------------------------------------------------------
+// Multi-column statement (used by DRE and Balanço when ``series`` or
+// ``compare`` is set).
+// ---------------------------------------------------------------------
+
+/** One column shown to the right of the row label. */
+type StatementColumn = {
+  /** Header text (Total, Jan/25, vs. 2024, Δ%). */
+  header: string
+  /** Resolves the row's value for this column from the row id map.
+   *  Returning ``null`` renders an em-dash (used for percentage rows
+   *  where the comparison can't be computed). */
+  getValue: (resolved: Record<string, number>, rowId: string) => number | null
+  /** When set, the cell is rendered as a percentage string; otherwise
+   *  as a currency value. */
+  asPercent?: boolean
+  /** Slimmer column for percentage / delta cells. */
+  narrow?: boolean
+}
+
+/** Renders a ``RowSpec[]`` with one or more numeric columns. Used when
+ *  granularity or comparison is on; the single-column / drill-down
+ *  view still owns the no-extras path so DRE row drill-downs keep
+ *  working. */
+function MultiColumnStatement({
+  title,
+  rows,
+  resolvedColumns,
+  currency,
+  highlightId,
+}: {
+  title?: string
+  rows: RowSpec[]
+  resolvedColumns: Array<{ column: StatementColumn; resolved: Record<string, number> }>
+  currency: string
+  /** Row id whose row should be highlighted (e.g. ``lucro_liquido``).
+   *  Optional, purely cosmetic. */
+  highlightId?: string
+}) {
+  const columns = resolvedColumns.map((c) => c.column)
+  const gridCols = `minmax(180px, 1fr) ${columns.map((c) => (c.narrow ? "80px" : "120px")).join(" ")}`
+  return (
+    <div className="card-elevated overflow-x-auto text-[12px]">
+      {title && (
+        <div className="border-b border-border bg-surface-3 px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+          {title}
+        </div>
+      )}
+      <div
+        className="grid border-b border-border bg-surface-3 px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground"
+        style={{ gridTemplateColumns: gridCols }}
+      >
+        <div>Linha</div>
+        {columns.map((c, i) => (
+          <div key={i} className="text-right tabular-nums">{c.header}</div>
+        ))}
+      </div>
+      {rows.map((row) => {
+        const id = row.id || row.categoryKey || row.label
+        const isHighlight = highlightId === id
+        return (
+          <div
+            key={id}
+            className={cn(
+              "grid items-center border-b border-border/40 px-3 py-1.5",
+              row.bold && "border-b-foreground/30 bg-surface-3 font-semibold",
+              isHighlight && "bg-primary/5",
+            )}
+            style={{
+              gridTemplateColumns: gridCols,
+              paddingLeft: 12 + (row.indent ?? 0) * 16,
+            }}
+          >
+            <div className="truncate">{row.label}</div>
+            {resolvedColumns.map((rc, i) => {
+              const v = rc.column.getValue(rc.resolved, id)
+              const display =
+                v == null
+                  ? "—"
+                  : rc.column.asPercent
+                  ? v === 0 ? "0,0%" : `${v > 0 ? "+" : ""}${v.toFixed(1)}%`
+                  : formatCurrency(v, currency)
+              return (
+                <div
+                  key={i}
+                  className={cn(
+                    "text-right tabular-nums",
+                    row.negative && v != null && v !== 0 && !rc.column.asPercent && "text-destructive",
+                    rc.column.asPercent && v != null && v < 0 && "text-destructive",
+                    rc.column.asPercent && v != null && v > 0 && "text-emerald-600 dark:text-emerald-400",
+                  )}
+                >
+                  {display}
+                </div>
+              )
+            })}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+/** Build the column list for a statement. Order: per-period series
+ *  columns (when ``series`` is set), then "Total", then comparison +
+ *  Δ% (when ``compare`` is set). When neither is set, returns just
+ *  "Total" so the multi-column shape can still be used. */
+function buildColumns({
+  rows,
+  data,
+  mainTotals,
+}: {
+  rows: RowSpec[]
+  data: FinancialStatementsPayload
+  /** Pre-resolved totals map for the main window — drives the "Total"
+   *  column. */
+  mainTotals: Record<string, number>
+}): Array<{ column: StatementColumn; resolved: Record<string, number> }> {
+  const out: Array<{ column: StatementColumn; resolved: Record<string, number> }> = []
+
+  if (data.series) {
+    for (const p of data.series.periods) {
+      const totals = stringTotalsToNumbers(p.totals)
+      const resolved = resolveRows(rows, makeGetter(totals))
+      out.push({
+        column: {
+          header: p.label,
+          getValue: (r, id) => r[id] ?? 0,
+        },
+        resolved,
+      })
+    }
+  }
+
+  // Always show the Total column for the requested window.
+  const mainResolved = resolveRows(rows, makeGetter(mainTotals))
+  out.push({
+    column: {
+      header: "Total",
+      getValue: (r, id) => r[id] ?? 0,
+    },
+    resolved: mainResolved,
+  })
+
+  if (data.comparison) {
+    const cmpTotals = stringTotalsToNumbers(data.comparison.totals)
+    const cmpResolved = resolveRows(rows, makeGetter(cmpTotals))
+    const shortLabel =
+      data.comparison.type === "previous_year" ? "Ano anterior" : "Período anterior"
+    out.push({
+      column: {
+        header: shortLabel,
+        getValue: (r, id) => r[id] ?? 0,
+      },
+      resolved: cmpResolved,
+    })
+    // Δ% column shares the row spec but synthesises a percentage from
+    // the main vs comparison resolved maps. Keep it ``narrow`` so the
+    // grid stays compact.
+    out.push({
+      column: {
+        header: "Δ%",
+        narrow: true,
+        asPercent: true,
+        getValue: (_r, id) => {
+          const cur = mainResolved[id] ?? 0
+          const prev = cmpResolved[id] ?? 0
+          if (prev === 0) return null
+          return ((cur - prev) / Math.abs(prev)) * 100
+        },
+      },
+      resolved: {},
+    })
+  }
+
+  return out
+}
+
+// ---------------------------------------------------------------------
 // Tab: DRE
 // ---------------------------------------------------------------------
 
 export function DreTab() {
-  const { includePending, date_from, date_to, entity, basis } = useReportFilters()
+  const { includePending, date_from, date_to, entity, basis, granularity, compare } =
+    useReportFilters()
   const { data, isLoading } = useFinancialStatements({
     include_pending: includePending,
     date_from,
     date_to,
     entity,
     basis,
+    series: granularity,
+    compare,
   })
   const wiring = useAccountWiring()
   const { canWrite } = useUserRole()
@@ -589,47 +949,76 @@ export function DreTab() {
   const currency = data.currency
   const byKey = indexCategories(data.categories)
 
-  // Pull the DRE-relevant categories. Server-side sign convention
-  // ("positive = balance increased") means credit-natural categories
-  // (deducao_receita, receita_financeira) arrive negative when they
-  // accumulate debits, and debit-natural categories (custo, despesa_*,
-  // imposto) arrive positive when they accumulate debits. The DRE math
-  // therefore SUMS credit-natural categories and SUBTRACTS debit-natural
-  // ones from the running total. Keep this alignment in sync with
-  // ``REPORT_CATEGORY_META[*].sign_hint`` — if a category's sign_hint
-  // changes, the corresponding line below changes from + to - or back.
-  const get = (k: string) => byKey.get(k)?.amount ?? 0
+  // Server-side sign convention: "positive = balance increased" means
+  // credit-natural categories (deducao_receita, receita_financeira)
+  // arrive negative when they accumulate debits, debit-natural ones
+  // arrive positive when they accumulate debits. The DRE math therefore
+  // SUMS credit-natural categories and SUBTRACTS debit-natural ones.
+  // See ``DRE_ROWS`` for the full pipeline; both paths (single-column
+  // drill-down and multi-column series/compare) feed off the same
+  // RowSpec array so the math can't drift.
   const accs = (k: string) => byKey.get(k)?.accounts ?? []
-  const receitaBruta = get("receita_bruta")            // credit_natural → +
-  const deducoes = get("deducao_receita")              // credit_natural → +
-  const receitaLiquida = receitaBruta + deducoes
-  const custos = get("custo")                          // debit_natural  → -
-  const lucroBruto = receitaLiquida - custos
-  const despesasOp = get("despesa_operacional")        // debit_natural  → -
-  const ebit = lucroBruto - despesasOp
-  const receitaFin = get("receita_financeira")         // credit_natural → +
-  const despesaFin = get("despesa_financeira")         // debit_natural  → -
-  const outras = get("outras_receitas")                // any → + (Outras
-  // Receitas/Despesas is a CPC 26 line in its own right and per Brazilian
-  // practice sits inside the Resultado Financeiro grouping; rolling it
-  // into resultadoFin keeps the displayed subtotal consistent with what
-  // the operator sees nested beneath it).
-  const resultadoFin = receitaFin - despesaFin + outras
-  const lair = ebit + resultadoFin
-  const impostoLucro = get("imposto_sobre_lucro")      // debit_natural  → -
-  const lucroLiq = lair - impostoLucro
 
   const drill = { date_from, date_to, entity, onEditAccount }
+  const showMultiColumn = !!(data.series || data.comparison)
 
-  // DRE is single-column; on wide screens it stretches and the labels
-  // float far from the values. Cap at ~960px and centre so the line
-  // items stay readable while the rest of the page (header strip,
-  // tabs) keeps using the full width.
-  //
-  // ``data-statement-card`` marks this wrapper as the PDF-export
-  // target. ``ReportExportButtons`` does ``document.querySelector(
-  // "[data-statement-card]")`` — keep at most one of these per tab so
-  // the PDF capture is unambiguous.
+  // Multi-column path — used whenever granularity or comparison is on.
+  // Drops the per-row drill-down (no per-period accounts list on the
+  // wire); the operator can clear the granularity to fall back to the
+  // detail view. Shows a notice strip explaining the trade-off.
+  if (showMultiColumn) {
+    const mainTotals = categoriesToTotals(data.categories)
+    const resolvedColumns = buildColumns({
+      rows: DRE_ROWS,
+      data,
+      mainTotals,
+    })
+    return (
+      <div data-statement-card className="mx-auto w-full max-w-6xl space-y-2">
+        {basis === "cash" && (
+          <div className="card-elevated rounded-md border-l-2 border-l-primary/60 px-3 py-2 text-[11px] text-muted-foreground">
+            <span className="font-medium text-foreground">Regime de caixa.</span>{" "}
+            Cada lançamento entra no período conforme a data em que o caixa
+            bateu na conta. Transações com pernas bancárias em múltiplos
+            períodos são alocadas proporcionalmente.
+          </div>
+        )}
+        <ComparisonHeaderStrip data={data} />
+        <MultiColumnStatement
+          rows={DRE_ROWS}
+          resolvedColumns={resolvedColumns}
+          currency={currency}
+          highlightId="lucro_liquido"
+        />
+        {data.series?.truncated && (
+          <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-400">
+            Faixa muito longa para a granularidade escolhida — exibindo apenas os primeiros
+            sub-períodos. Reduza o intervalo ou aumente a granularidade.
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // Single-column path — preserves the existing detail drill-down with
+  // per-row account lists, JE drill panel, etc. This is the default
+  // when neither series nor comparison is requested.
+  const get = (k: string) => byKey.get(k)?.amount ?? 0
+  const receitaBruta = get("receita_bruta")
+  const deducoes = get("deducao_receita")
+  const receitaLiquida = receitaBruta + deducoes
+  const custos = get("custo")
+  const lucroBruto = receitaLiquida - custos
+  const despesasOp = get("despesa_operacional")
+  const ebit = lucroBruto - despesasOp
+  const receitaFin = get("receita_financeira")
+  const despesaFin = get("despesa_financeira")
+  const outras = get("outras_receitas")
+  const resultadoFin = receitaFin - despesaFin + outras
+  const lair = ebit + resultadoFin
+  const impostoLucro = get("imposto_sobre_lucro")
+  const lucroLiq = lair - impostoLucro
+
   return (
     <div data-statement-card className="mx-auto w-full max-w-3xl space-y-2">
       {basis === "cash" && (
@@ -666,21 +1055,41 @@ export function DreTab() {
   )
 }
 
+/** Tiny header strip that surfaces the comparison window's actual
+ *  date range (so the operator knows what "vs. Período anterior"
+ *  resolved to). Renders nothing when no comparison is active. */
+function ComparisonHeaderStrip({ data }: { data: FinancialStatementsPayload }) {
+  if (!data.comparison) return null
+  return (
+    <div className="card-elevated rounded-md border-l-2 border-l-primary/40 px-3 py-2 text-[11px] text-muted-foreground">
+      <span className="font-medium text-foreground">Comparação:</span>{" "}
+      {data.comparison.label} · {data.comparison.period.date_from} a{" "}
+      {data.comparison.period.date_to}
+    </div>
+  )
+}
+
 /** Pre-index the category array by key for O(1) lookup. Each entry
  *  carries the parsed amount + the AccountContribution-shaped accounts
  *  list (DrillableLine consumes ``amount`` per row, so we map the
  *  Decimal-string ``amount`` into a number once here). */
 function indexCategories(
   categories: FinancialStatementsCategory[],
-): Map<string, { amount: number; accounts: Array<{ id: number; name: string; amount: number }> }> {
-  const m = new Map<string, { amount: number; accounts: Array<{ id: number; name: string; amount: number }> }>()
+): Map<string, { amount: number; accounts: Array<{ id: number; name: string; amount: number; synthetic?: boolean }> }> {
+  const m = new Map<string, { amount: number; accounts: Array<{ id: number; name: string; amount: number; synthetic?: boolean }> }>()
   for (const c of categories) {
     m.set(c.key, {
       amount: Number(c.amount) || 0,
+      // Pass the ``synthetic`` flag through unchanged. DrillableLine /
+      // AccountDrillRow keys on it to suppress the chevron, hide the
+      // pencil, and skip the JE drill for entries like the
+      // "Resultado do Exercício (período)" line that the backend
+      // injects into ``patrimonio_liquido``.
       accounts: c.accounts.map((a) => ({
         id: a.id,
         name: a.name,
         amount: Number(a.amount) || 0,
+        ...(a.synthetic ? { synthetic: true } : {}),
       })),
     })
   }
@@ -721,17 +1130,231 @@ function WiringModalController({
 }
 
 // ---------------------------------------------------------------------
+// Balanço imbalance diagnostics panel
+// ---------------------------------------------------------------------
+
+/** Replaces the bare "⚠ Diferença: R$ X" banner with a guided panel
+ *  that explains *why* the books don't close and offers a concrete
+ *  next step for each cause. The backend computes the breakdown
+ *  (anchor gap, uncategorized leaves, wrong-direction PL accounts)
+ *  in ``balance_diagnostics``; we just frame the narrative.
+ *
+ *  ``onEditAccount`` is the same callback the rest of the Balanço
+ *  uses to open ``AccountWiringModal`` — clicking an uncategorized
+ *  leaf or a wrong-direction account jumps the operator straight to
+ *  the fix surface. Hidden in view-as-viewer mode (``onEditAccount``
+ *  comes back ``undefined`` from ``canWrite``). */
+function BalanceDiagnosticsPanel({
+  diagnostics,
+  currency,
+  onEditAccount,
+}: {
+  diagnostics: FinancialStatementsBalanceDiagnostics
+  currency: string
+  onEditAccount?: (id: number) => void
+}) {
+  const imbalance = Number(diagnostics.imbalance) || 0
+  const anchorGap = Number(diagnostics.anchor_gap.delta) || 0
+  const uncatTotal = Number(diagnostics.uncategorized_total_impact) || 0
+  const synthLucro = Number(diagnostics.synthetic_lucro) || 0
+  const ativoAnchor = Number(diagnostics.anchor_gap.ativo_anchor) || 0
+  const pasPlAnchor = Number(diagnostics.anchor_gap.pas_pl_anchor) || 0
+
+  return (
+    <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-[12px] text-destructive md:col-span-2">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="font-semibold">⚠ Balanço não fecha</div>
+        <div className="tabular-nums">
+          Diferença: {formatCurrency(imbalance, currency)}
+        </div>
+      </div>
+
+      <p className="mb-3 text-foreground/80">
+        A diferença abaixo decompõe a causa em itens acionáveis.
+        Resolver cada item aproxima o Total do Ativo do Total do Passivo + PL.
+      </p>
+
+      {/* 1) Anchor gap — informational. Operator action is bookkeeping
+          (recompute opening balances), not a wiring-modal click. */}
+      {Math.abs(anchorGap) >= 0.01 && (
+        <DiagSection
+          title="Saldos iniciais não recordados no lado do Passivo + PL"
+          intent="info"
+          impact={anchorGap}
+          currency={currency}
+        >
+          <p>
+            O <code>balance</code> está preenchido nas folhas do Ativo
+            (Σ {formatCurrency(ativoAnchor, currency)}) mas as folhas
+            do Passivo + PL somam {formatCurrency(pasPlAnchor, currency)}.
+            Saldos iniciais (Capital Social, Lucros Acumulados, Empréstimos,
+            etc.) precisam ser registrados no <code>Account.balance</code>{" "}
+            das contas correspondentes — esse é trabalho contábil, não
+            uma correção de classificação.
+          </p>
+          <p className="mt-1 opacity-80">
+            Caminho típico: Plano de Contas → conta de PL → editar saldo
+            inicial em <code>balance_date</code>.
+          </p>
+        </DiagSection>
+      )}
+
+      {/* 2) Uncategorized leaves — each is a one-click fix. */}
+      {diagnostics.uncategorized_leaves.length > 0 && (
+        <DiagSection
+          title={`Contas folha sem categoria (${diagnostics.uncategorized_leaves.length})`}
+          intent="action"
+          impact={uncatTotal}
+          currency={currency}
+          subtitle="Lançamentos hit estas contas mas elas não têm report_category, então não aparecem no Balanço. Clique para definir."
+        >
+          <div className="overflow-hidden rounded border border-destructive/20 bg-background/60">
+            {diagnostics.uncategorized_leaves.map((u) => {
+              const impact = Number(u.impact) || 0
+              return (
+                <button
+                  key={u.id}
+                  type="button"
+                  onClick={onEditAccount ? () => onEditAccount(u.id) : undefined}
+                  disabled={!onEditAccount}
+                  className={cn(
+                    "flex w-full items-center justify-between gap-3 border-b border-border/40 px-2.5 py-1.5 text-left text-[11px] transition-colors last:border-b-0",
+                    onEditAccount
+                      ? "cursor-pointer hover:bg-accent/30"
+                      : "cursor-default opacity-80",
+                  )}
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate font-medium text-foreground">{u.name}</div>
+                    {u.suggested_label && (
+                      <div className="text-[10px] text-muted-foreground">
+                        Sugestão: <span className="font-medium">{u.suggested_label}</span>
+                      </div>
+                    )}
+                  </div>
+                  <div className="shrink-0 text-right">
+                    <div className="tabular-nums text-foreground">
+                      {formatCurrency(impact, currency)}
+                    </div>
+                    <div className="text-[10px] text-muted-foreground">impacto</div>
+                  </div>
+                </button>
+              )
+            })}
+          </div>
+        </DiagSection>
+      )}
+
+      {/* 3) Wrong-direction Passivo/PL leaves. */}
+      {diagnostics.wrong_direction_accounts.length > 0 && (
+        <DiagSection
+          title={`Direção provavelmente invertida (${diagnostics.wrong_direction_accounts.length})`}
+          intent="action"
+          subtitle="Contas em Passivo / PL devem ser credit-natural (account_direction = -1). Estas estão como +1; o sinal do agregado pode estar invertido."
+        >
+          <div className="overflow-hidden rounded border border-destructive/20 bg-background/60">
+            {diagnostics.wrong_direction_accounts.map((w) => (
+              <button
+                key={w.id}
+                type="button"
+                onClick={onEditAccount ? () => onEditAccount(w.id) : undefined}
+                disabled={!onEditAccount}
+                className={cn(
+                  "flex w-full items-center justify-between gap-3 border-b border-border/40 px-2.5 py-1.5 text-left text-[11px] transition-colors last:border-b-0",
+                  onEditAccount
+                    ? "cursor-pointer hover:bg-accent/30"
+                    : "cursor-default opacity-80",
+                )}
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="truncate font-medium text-foreground">{w.name}</div>
+                  <div className="text-[10px] text-muted-foreground">
+                    Categoria: {w.current_category} · Direção atual: +1 · Sugerido: −1
+                  </div>
+                </div>
+              </button>
+            ))}
+          </div>
+        </DiagSection>
+      )}
+
+      {/* Footnote: synthetic Resultado do Exercício explanation. */}
+      {Math.abs(synthLucro) >= 0.01 && (
+        <p className="mt-3 text-[10px] text-muted-foreground">
+          Nota: o Patrimônio Líquido inclui {formatCurrency(synthLucro, currency)} de{" "}
+          <em>Resultado do Exercício (período)</em>, uma linha sintética
+          que reflete o resultado da DRE no período. Sem ela, o
+          desbalanço seria ainda maior antes de qualquer correção
+          listada acima.
+        </p>
+      )}
+    </div>
+  )
+}
+
+/** Section block inside ``BalanceDiagnosticsPanel`` — a labeled
+ *  group with optional impact value. ``intent`` shifts the badge
+ *  color (info = subtle, action = stronger). */
+function DiagSection({
+  title,
+  subtitle,
+  impact,
+  currency,
+  intent,
+  children,
+}: {
+  title: string
+  subtitle?: string
+  impact?: number
+  currency?: string
+  intent: "info" | "action"
+  children: React.ReactNode
+}) {
+  return (
+    <div className="mb-3 last:mb-0">
+      <div className="mb-1 flex items-baseline justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <span
+            className={cn(
+              "rounded px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider",
+              intent === "info"
+                ? "bg-muted text-muted-foreground"
+                : "bg-destructive/20 text-destructive",
+            )}
+          >
+            {intent === "info" ? "Contábil" : "Ação"}
+          </span>
+          <span className="font-semibold text-foreground">{title}</span>
+        </div>
+        {impact != null && currency && (
+          <span className="tabular-nums text-foreground/80">
+            {formatCurrency(impact, currency)}
+          </span>
+        )}
+      </div>
+      {subtitle && (
+        <p className="mb-1.5 text-[11px] text-muted-foreground">{subtitle}</p>
+      )}
+      <div className="text-[11px]">{children}</div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------
 // Tab: Balanço Patrimonial
 // ---------------------------------------------------------------------
 
 export function BalancoTab() {
-  const { includePending, date_from, date_to, entity, basis } = useReportFilters()
+  const { includePending, date_from, date_to, entity, basis, granularity, compare } =
+    useReportFilters()
   const { data, isLoading } = useFinancialStatements({
     include_pending: includePending,
     date_from,
     date_to,
     entity,
     basis,
+    series: granularity,
+    compare,
   })
   const wiring = useAccountWiring()
   const { canWrite } = useUserRole()
@@ -743,6 +1366,67 @@ export function BalancoTab() {
   const byKey = indexCategories(data.categories)
   const get = (k: string) => byKey.get(k)?.amount ?? 0
   const accs = (k: string) => byKey.get(k)?.accounts ?? []
+
+  const drill = { date_from, date_to, entity, onEditAccount }
+  const showMultiColumn = !!(data.series || data.comparison)
+
+  // Multi-column path — Ativo and Passivo+PL are rendered as two
+  // separate ``MultiColumnStatement`` cards stacked, each with its
+  // own per-period columns. The balance-check banner uses the main
+  // column totals so it still validates the active period.
+  if (showMultiColumn) {
+    const mainTotals = categoriesToTotals(data.categories)
+    const ativoCols = buildColumns({ rows: BALANCO_ATIVO_ROWS, data, mainTotals })
+    const passivoCols = buildColumns({ rows: BALANCO_PASSIVO_ROWS, data, mainTotals })
+    const totalAtivoMain = (ativoCols[ativoCols.length - (data.comparison ? 3 : 1)]
+      ?.resolved.total_ativo) ?? 0
+    const totalPassivoMain = (passivoCols[passivoCols.length - (data.comparison ? 3 : 1)]
+      ?.resolved.total_passivo_pl) ?? 0
+    const balanced = Math.abs(totalAtivoMain - totalPassivoMain) < 0.01
+    return (
+      <div data-statement-card className="mx-auto w-full max-w-6xl space-y-3">
+        <ComparisonHeaderStrip data={data} />
+        <MultiColumnStatement
+          title="Ativo"
+          rows={BALANCO_ATIVO_ROWS}
+          resolvedColumns={ativoCols}
+          currency={currency}
+          highlightId="total_ativo"
+        />
+        <MultiColumnStatement
+          title="Passivo + Patrimônio Líquido"
+          rows={BALANCO_PASSIVO_ROWS}
+          resolvedColumns={passivoCols}
+          currency={currency}
+          highlightId="total_passivo_pl"
+        />
+        {balanced ? (
+          <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3 text-[12px] text-emerald-700 dark:text-emerald-400">
+            ✓ Balanço fecha (período principal): Total Ativo = Total Passivo + PL
+          </div>
+        ) : data.balance_diagnostics ? (
+          <BalanceDiagnosticsPanel
+            diagnostics={data.balance_diagnostics}
+            currency={currency}
+            onEditAccount={onEditAccount}
+          />
+        ) : (
+          <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-[12px] text-destructive">
+            ⚠ Diferença no período principal:{" "}
+            {formatCurrency(totalAtivoMain - totalPassivoMain, currency)}.
+          </div>
+        )}
+        {data.series?.truncated && (
+          <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-400">
+            Faixa muito longa para a granularidade escolhida — exibindo apenas os primeiros sub-períodos.
+          </div>
+        )}
+        <WiringModalController wiring={wiring} />
+      </div>
+    )
+  }
+
+  // Single-column path with full drill-down (default).
   const ativoCirc = get("ativo_circulante")
   const ativoNc = get("ativo_nao_circulante")
   const totalAtivo = ativoCirc + ativoNc
@@ -752,10 +1436,6 @@ export function BalancoTab() {
   const totalPassivoPl = passCirc + passNc + pl
   const balanced = Math.abs(totalAtivo - totalPassivoPl) < 0.01
 
-  const drill = { date_from, date_to, entity, onEditAccount }
-
-  // ``data-statement-card`` marks the whole grid (Ativo + Passivo + reconciliation
-  // banner) as the PDF export target — see ``ReportExportButtons``.
   return (
     <div data-statement-card className="grid gap-4 md:grid-cols-2">
       <div className="card-elevated overflow-hidden text-[12px]">
@@ -775,21 +1455,22 @@ export function BalancoTab() {
         <DrillableLine label="Patrimônio Líquido" value={pl} currency={currency} indent={0} accounts={accs("patrimonio_liquido")} {...drill} />
         <StatementLine label="Total Passivo + PL" value={totalPassivoPl} currency={currency} bold />
       </div>
-      <div className={cn(
-        "md:col-span-2 rounded-md border p-3 text-[12px]",
-        balanced
-          ? "border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400"
-          : "border-destructive/30 bg-destructive/5 text-destructive",
-      )}>
-        {balanced ? (
-          <>✓ Balanço fecha: Total Ativo = Total Passivo + PL</>
-        ) : (
-          <>
-            ⚠ Diferença: {formatCurrency(totalAtivo - totalPassivoPl, currency)}.
-            Verifique se as contas estão classificadas corretamente.
-          </>
-        )}
-      </div>
+      {balanced ? (
+        <div className="md:col-span-2 rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3 text-[12px] text-emerald-700 dark:text-emerald-400">
+          ✓ Balanço fecha: Total Ativo = Total Passivo + PL
+        </div>
+      ) : data.balance_diagnostics ? (
+        <BalanceDiagnosticsPanel
+          diagnostics={data.balance_diagnostics}
+          currency={currency}
+          onEditAccount={onEditAccount}
+        />
+      ) : (
+        <div className="md:col-span-2 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-[12px] text-destructive">
+          ⚠ Diferença: {formatCurrency(totalAtivo - totalPassivoPl, currency)}.
+          Verifique se as contas estão classificadas corretamente.
+        </div>
+      )}
       <WiringModalController wiring={wiring} />
     </div>
   )
@@ -809,13 +1490,16 @@ export function BalancoTab() {
  *  groups, formats, and lets the operator drill into the per-account
  *  rows that drove each category. */
 export function DfcTab() {
-  const { includePending, date_from, date_to, entity, basis } = useReportFilters()
+  const { includePending, date_from, date_to, entity, basis, granularity, compare } =
+    useReportFilters()
   const { data, isLoading, isError } = useFinancialStatements({
     include_pending: includePending,
     date_from,
     date_to,
     entity,
     basis,
+    series: granularity,
+    compare,
   })
   const wiring = useAccountWiring()
   const { canWrite } = useUserRole()
@@ -845,6 +1529,7 @@ export function DfcTab() {
 
   const currency = data.currency
   const cashTotal = Number(data.cash_total) || 0
+  const showMultiColumn = !!(data.series || data.comparison)
 
   // ``data-statement-card`` marks the whole DFC wrapper (KPI strip +
   // categorised statement) as the PDF export target.
@@ -872,16 +1557,112 @@ export function DfcTab() {
         />
       </div>
 
-      <CashflowDirectStatement
-        payload={data}
-        currency={currency}
-        date_from={date_from}
-        date_to={date_to}
-        entity={entity}
-        onEditAccount={onEditAccount}
-      />
+      <ComparisonHeaderStrip data={data} />
+
+      {showMultiColumn ? (
+        <CashflowSectionMatrix data={data} currency={currency} />
+      ) : (
+        <CashflowDirectStatement
+          payload={data}
+          currency={currency}
+          date_from={date_from}
+          date_to={date_to}
+          entity={entity}
+          onEditAccount={onEditAccount}
+        />
+      )}
+      {data.series?.truncated && (
+        <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-400">
+          Faixa muito longa para a granularidade escolhida — exibindo apenas os primeiros sub-períodos.
+        </div>
+      )}
       <WiringModalController wiring={wiring} />
     </div>
+  )
+}
+
+/** DFC matrix view used when granularity or comparison is on. Rows
+ *  are the four section totals (FCO / FCI / FCF / Não classificadas)
+ *  plus "Variação líquida"; columns are the per-period totals plus
+ *  the main-window total plus optional comparison + Δ%. Drops the
+ *  per-category drill-down which the single-column view owns — the
+ *  user can clear granularity to fall back to the detail layout. */
+function CashflowSectionMatrix({
+  data,
+  currency,
+}: {
+  data: FinancialStatementsPayload
+  currency: string
+}) {
+  if (!data.cashflow) return null
+
+  const sectionRows: RowSpec[] = [
+    { id: "operacional", label: CASHFLOW_SECTION_LABELS.operacional ?? "Operacional", categoryKey: "operacional" },
+    { id: "investimento", label: CASHFLOW_SECTION_LABELS.investimento ?? "Investimento", categoryKey: "investimento" },
+    { id: "financiamento", label: CASHFLOW_SECTION_LABELS.financiamento ?? "Financiamento", categoryKey: "financiamento" },
+    { id: "no_section", label: "Não classificadas", categoryKey: "no_section" },
+    { id: "net_change_in_cash", label: "Variação Líquida do Caixa", bold: true,
+      derive: (r) => (r.operacional ?? 0) + (r.investimento ?? 0) + (r.financiamento ?? 0) + (r.no_section ?? 0) },
+  ]
+
+  // The DFC matrix doesn't go through ``buildColumns`` because its
+  // value source is ``cashflow_totals`` (per period) and
+  // ``cashflow.by_section`` (main), not ``categories`` /
+  // ``totals``. So we resolve columns manually with the same
+  // shape the rest of the multi-column layer expects.
+  const columns: Array<{ column: StatementColumn; resolved: Record<string, number> }> = []
+
+  if (data.series) {
+    for (const p of data.series.periods) {
+      const totals = stringTotalsToNumbers(p.cashflow_totals ?? {})
+      const resolved = resolveRows(sectionRows, makeGetter(totals))
+      columns.push({
+        column: { header: p.label, getValue: (r, id) => r[id] ?? 0 },
+        resolved,
+      })
+    }
+  }
+
+  const mainTotals = stringTotalsToNumbers(data.cashflow.by_section)
+  const mainResolved = resolveRows(sectionRows, makeGetter(mainTotals))
+  columns.push({
+    column: { header: "Total", getValue: (r, id) => r[id] ?? 0 },
+    resolved: mainResolved,
+  })
+
+  if (data.comparison) {
+    const cmpTotals = stringTotalsToNumbers(data.comparison.cashflow_totals ?? {})
+    const cmpResolved = resolveRows(sectionRows, makeGetter(cmpTotals))
+    const shortLabel =
+      data.comparison.type === "previous_year" ? "Ano anterior" : "Período anterior"
+    columns.push({
+      column: { header: shortLabel, getValue: (r, id) => r[id] ?? 0 },
+      resolved: cmpResolved,
+    })
+    columns.push({
+      column: {
+        header: "Δ%",
+        narrow: true,
+        asPercent: true,
+        getValue: (_r, id) => {
+          const cur = mainResolved[id] ?? 0
+          const prev = cmpResolved[id] ?? 0
+          if (prev === 0) return null
+          return ((cur - prev) / Math.abs(prev)) * 100
+        },
+      },
+      resolved: {},
+    })
+  }
+
+  return (
+    <MultiColumnStatement
+      title="Atividades"
+      rows={sectionRows}
+      resolvedColumns={columns}
+      currency={currency}
+      highlightId="net_change_in_cash"
+    />
   )
 }
 

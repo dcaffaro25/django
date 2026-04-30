@@ -55,20 +55,42 @@ class BankAccountSerializer(serializers.ModelSerializer):
         serializer_class=CurrencyMiniSerializer,
         unique_field=['name', 'code']
     )
-    
-    current_balance = serializers.SerializerMethodField()  # <-- NEW FIELD
-    
+
+    current_balance = serializers.SerializerMethodField()
+    # Reverse-FK summary of every CoA ``Account`` that points at this
+    # bank account via ``Account.bank_account``. Drives the warning
+    # badge on the bank-accounts page (no link → daily-balance service
+    # returns flat zeros for the row → aggregate book line goes flat
+    # too). The viewset prefetches ``account_set`` so this is O(1)
+    # per row, not N+1. ``__all__`` doesn't pick up these
+    # ``SerializerMethodField``s automatically; ``to_representation``
+    # below re-stamps them so the JSON payload always carries the
+    # linked-account summary even on detail / write responses.
+    linked_account_ids = serializers.SerializerMethodField()
+    linked_account_names = serializers.SerializerMethodField()
+
     class Meta:
         model = BankAccount
         fields = '__all__'
-    
+
     def to_representation(self, instance):
         data = super().to_representation(instance)
         data['current_balance'] = self.get_current_balance(instance)
+        data['linked_account_ids'] = self.get_linked_account_ids(instance)
+        data['linked_account_names'] = self.get_linked_account_names(instance)
         return data
-    
+
     def get_current_balance(self, obj):
-        return obj.get_current_balance()  
+        return obj.get_current_balance()
+
+    def get_linked_account_ids(self, obj):
+        # ``account_set`` comes prefetched on list endpoints. Detail
+        # / write paths fall back to a per-instance hit, which is
+        # fine because they return a single row.
+        return [a.id for a in obj.account_set.all()]
+
+    def get_linked_account_names(self, obj):
+        return [a.name for a in obj.account_set.all()]
 
 
 class AccountSerializer(serializers.ModelSerializer):

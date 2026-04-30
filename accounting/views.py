@@ -884,6 +884,20 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         if basis not in ('accrual', 'cash'):
             basis = 'accrual'
 
+        # ``series`` breaks the [date_from, date_to] window into
+        # sub-periods (month/quarter/semester/year) so the UI can show
+        # per-column totals. ``compare`` toggles a comparison-period
+        # sibling (previous_period / previous_year) for Δ% / Δ-abs UI.
+        # Both default to off; bad values are dropped silently in the
+        # service layer rather than 400'd here, so URL shares stay
+        # robust across feature-flag rollouts.
+        series = (params.get('series') or '').strip().lower() or None
+        if series not in (None, 'month', 'quarter', 'semester', 'year'):
+            series = None
+        compare = (params.get('compare') or '').strip().lower() or None
+        if compare not in (None, 'previous_period', 'previous_year'):
+            compare = None
+
         tenant = getattr(request, 'tenant', None)
         if not tenant or tenant == 'all':
             return Response(
@@ -907,6 +921,8 @@ class AccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             entity_id=entity_id,
             include_pending=include_pending,
             basis=basis,
+            series=series,
+            compare=compare,
             bypass_cache=bypass_cache,
         )
 
@@ -2888,7 +2904,15 @@ class BankAccountViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         permission_classes = []
     else:
         permission_classes = [permissions.IsAuthenticated]
-        
+
+    def get_queryset(self):
+        # Prefetch the reverse FK so the serializer's
+        # ``linked_account_ids`` / ``linked_account_names`` walks
+        # don't fire N+1 on the bank-accounts list (used to drive
+        # the "no CoA link" badges on the page).
+        qs = super().get_queryset()
+        return qs.prefetch_related('account_set')
+
     @action(methods=['post'], detail=False)
     def bulk_create(self, request, *args, **kwargs):
         return generic_bulk_create(self, request.data)

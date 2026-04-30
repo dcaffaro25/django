@@ -3,11 +3,18 @@ import { ChevronDown, Pencil } from "lucide-react"
 import { cn, formatCurrency } from "@/lib/utils"
 import { JournalEntriesPanel } from "./JournalEntriesPanel"
 
-/** A single account contribution row that can drill into its JE list. */
+/** A single account contribution row that can drill into its JE list.
+ *
+ *  ``synthetic=true`` marks rows that don't correspond to a real
+ *  ``Account`` (e.g. the "Resultado do Exercício (período)" line
+ *  injected into Patrimônio Líquido by the backend). Synthetic rows
+ *  render in italic, hide the chevron / pencil, and don't try to
+ *  load JEs — the underlying id is a negative sentinel. */
 export interface AccountContribution {
   id: number
   name: string
   amount: number
+  synthetic?: boolean
 }
 
 /** A statement line that may expand to show contributing accounts.
@@ -165,6 +172,28 @@ function AccountDrillRow({
   onEdit?: (id: number) => void
 }) {
   const [open, setOpen] = useState(false)
+  // Synthetic rows (e.g. Resultado do Exercício) don't have a real
+  // Account underneath, so suppress the chevron / drill / wiring
+  // edit and tag the row with a "(virtual)" hint so the operator
+  // understands the entry isn't a JE-backed account. The amount
+  // still renders normally so it visibly contributes to the
+  // category total.
+  if (account.synthetic) {
+    return (
+      <div
+        className="flex items-center justify-between border-b border-border/30 px-3 py-1 text-[11px] italic text-muted-foreground"
+        style={{ paddingLeft: 12 + indent * 16 + 18 /* match chevron offset */ }}
+        title="Linha sintética: derivada do resultado do período (Lucro Líquido), não corresponde a uma conta com lançamentos."
+      >
+        <span className="truncate">
+          {account.name} <span className="text-[10px] opacity-70">(virtual)</span>
+        </span>
+        <span className={cn("tabular-nums not-italic", account.amount < 0 && "text-destructive")}>
+          {formatCurrency(account.amount, currency)}
+        </span>
+      </div>
+    )
+  }
   return (
     <>
       <div
