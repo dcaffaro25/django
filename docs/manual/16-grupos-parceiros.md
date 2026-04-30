@@ -14,26 +14,36 @@ apenas confirma sugestões quando elas surgem.
 
 ## 16.1 Conceitos
 
-### Por que `cnpj_root` não basta
+### Um único primitivo: `BusinessPartnerGroup`
 
-A "raiz" de 8 dígitos do CNPJ já une matriz e filiais de uma mesma pessoa
-jurídica (resolvido em [`BusinessPartner.cnpj_root`](08-faturamento-nfe.md)).
-Mas existem três cenários que `cnpj_root` **não** cobre:
+Toda consolidação fiscal — matriz/filial, grupo econômico cross-CNPJ,
+CPF de sócio pagando pela PJ — passa pelo mesmo modelo
+**`BusinessPartnerGroup`**. Cada grupo tem um **`primary_partner`** que
+é o "rosto" usado nos relatórios consolidados, e zero ou mais
+*memberships* aceitos vinculando outros BPs ao grupo.
 
-| Cenário | Exemplo | Como `cnpj_root` falha |
-|---------|---------|-----------------------|
-| Grupo econômico cross-root | "Petrobras Distribuidora" e "Petrobras Refino" — raízes diferentes | raízes não batem |
-| CPF ↔ CNPJ | Sócio paga conta da PJ pelo CPF dele | tipos de documento diferentes |
-| Adquirente / marketplace | Extrato banco mostra CNPJ da Cielo, NF é do cliente real | partes não relacionadas |
+Cobre os três cenários típicos:
 
-Para cada um existem dois primitivos complementares:
+| Cenário | Exemplo | Como vira Group |
+|---------|---------|-----------------|
+| Matriz + filiais (mesmo CNPJ raiz) | Filiais do Mateus Supermercados em RJ, MA, CE… | **Auto-criado** ao salvar o segundo BP que compartilha a raiz |
+| Grupo econômico cross-root | "Petrobras Distribuidora" e "Petrobras Refino" — raízes diferentes | Sugerido pelos hooks (NF↔Tx, conciliação) e aceito ao bater threshold |
+| CPF ↔ CNPJ | Sócio paga conta da PJ pelo CPF dele | Sugerido pelos mesmos hooks; aceito após N confirmações |
 
-- **`BusinessPartnerGroup`** — agrupa **dois ou mais BPs cadastrados**
-  num único ator econômico. Cada grupo tem um **`primary_partner`** que
-  é o "rosto" do grupo nos relatórios consolidados.
-- **`BusinessPartnerAlias`** — apelida uma **string** observada
-  externamente (CNPJ no extrato bancário) para um BP cadastrado. Útil
-  quando uma das pontas não tem cadastro próprio (caso do adquirente).
+`cnpj_root` continua existindo como uma coluna indexada de 8 dígitos no
+`BusinessPartner` (usado pelo motor de matching de NF, self-billing
+guard, etc.) — mas ela **não é mais a unidade de consolidação**: ela
+apenas alimenta a auto-criação de Groups.
+
+### `BusinessPartnerAlias` — quando uma das pontas não tem BP
+
+Para o caso de **adquirentes / marketplaces** (Cielo, Stone, Mercado
+Livre), o lado bancário traz um CNPJ que não corresponde a nenhum BP
+cadastrado — só ao adquirente. Aqui usamos `BusinessPartnerAlias`,
+que apelida uma **string** observada externamente para um BP existente.
+Aliases não criam grupos; alimentam o boost de scoring no
+`nf_link_service._score` para que matches futuros consigam casar
+"depósito Cielo" com a NF do cliente real.
 
 ### Estado de revisão
 
@@ -64,10 +74,35 @@ sistema nunca fica em estado ambíguo.
 
 ---
 
-## 16.2 Como sugestões nascem (os hooks)
+## 16.2 Como Groups são criados
 
-O sistema observa ações do operador e gera sugestões automaticamente. Há
-**três pontos de captura para Groups** e **um para Aliases**.
+Há **dois caminhos** que materializam um Group:
+
+### Auto-criação por raiz CNPJ (estrutural)
+
+`BusinessPartner.save()` chama `ensure_root_group(bp)` após persistir.
+Quando `bp.cnpj_root` tem 2+ siblings no tenant (matriz + ao menos uma
+filial), o sistema:
+
+1. Verifica se já existe um Group para essa raiz (busca via qualquer
+   sibling com membership aceito).
+2. Se sim → adiciona o BP corrente como `member` aceito daquele Group.
+3. Se não → cria um Group novo com o BP de id mais antigo como
+   `primary` e adiciona todos os siblings como `member` aceitos.
+
+Idempotente: salvar o mesmo BP duas vezes não duplica nada. Best-effort:
+falha silenciosa em logs, sem nunca quebrar o save.
+
+Na importação de NF-e (que cria BPs automaticamente quando vê um CNPJ
+novo) isso significa que o segundo BP de um root produz o Group sem
+intervenção do operador. A aba **Grupos** já mostra a relação na
+próxima atualização.
+
+### Sugestões aprendidas (cross-root, CPF, etc.)
+
+Para casos onde a auto-criação por raiz não se aplica, o sistema
+observa três ações do operador e gera *sugestões* — que viram aceitas
+após batem o threshold ou aprovação manual.
 
 | Hook | Quando dispara | Tipo de sugestão | Confiança padrão |
 |------|----------------|------------------|------------------|
@@ -106,6 +141,30 @@ Aba **Grupos** dentro do hub de Faturamento. Mostra um badge com a
 quantidade de sugestões pendentes — operadores chegam aqui para limpar
 fila.
 
+A página tem **cinco sub-abas**:
+
+### Sub-aba **Grupos** (default)
+
+Lista todos os grupos ativos do tenant — auto-criados (matriz/filial)
+e curados (cross-CNPJ, CPF). Cada linha é colapsável (chevron à
+esquerda) com header:
+
+- Coroa âmbar (ícone do primary)
+- Nome do grupo (= nome do primary)
+- CNPJ raiz formatado
+- Texto à direita: `N aceitos · M total` (todos os memberships, inclui
+  pendentes e rejeitados para auditoria)
+
+**Ao expandir** o grupo, três blocos aparecem:
+
+1. **Membros aceitos** — cada BP do grupo, com coroa para o primary,
+   tipo, CNPJ. Botão de coroa em não-primaries promove o BP a primary
+   atomicamente.
+2. **Sugestões pendentes** (se houver) — sugestões em estado `suggested`
+   apontando para este grupo, com aceitar/rejeitar inline.
+3. **Mesclar para cá** — input numérico + botão. Digite o ID do grupo
+   **origem** e clique para absorvê-lo.
+
 ### Sub-aba **Sugestões**
 
 Lista cards de sugestões "puras" (não-merge) pendentes de revisão. Cada
@@ -134,36 +193,22 @@ Grupos (botão "Mesclar para cá").
 Esse passo extra é deliberado: mesclar grupos é decisão de consolidação
 em relatórios e merece confirmação intencional.
 
-### Sub-aba **Grupos**
+### Sub-aba **Raiz CNPJ**
 
-Lista todos os grupos ativos do tenant. Cada linha é colapsável (chevron
-à esquerda) com header:
+Diagnóstico para clusters de BPs que **deveriam** estar materializados
+em Group mas ainda não estão (ex: um BP solto recém-importado antes do
+hook rodar, ou um cluster que perdeu seu Group por exclusão manual).
 
-- Coroa âmbar (ícone do primary)
-- Nome do grupo (= nome do primary)
-- CNPJ raiz formatado
-- Texto à direita: `N aceitos · M total` (todos os memberships, inclui
-  pendentes e rejeitados para auditoria)
+Cada cluster mostra:
 
-**Ao expandir** o grupo, três blocos aparecem:
+- Pílula "automático" (azul)
+- Nome do BP mais antigo + raiz CNPJ + contagem
+- Botão **Materializar** (estrela) — cria o Group ali mesmo, com o
+  primary sendo o BP mais antigo e os demais como membros aceitos
 
-1. **Membros** — cada BP aceito do grupo, com:
-   - Coroa para o primary
-   - Nome + pílula de tipo + CNPJ
-   - Para não-primaries: botão de coroa que **promove a primary**.
-     Promoção troca o `role` do antigo primary para `member` e move a
-     coroa, atualizando também `BusinessPartnerGroup.name` e
-     `primary_partner_id`. Operação atômica.
-
-2. **Sugestões pendentes** (se houver) — sugestões em estado `suggested`
-   apontando para este grupo, com botões de aceitar/rejeitar inline e
-   chip de cor (azul = grupo, âmbar = merge).
-
-3. **Mesclar para cá** — input numérico + botão. Digite o ID do grupo
-   **origem** (que será absorvido) e clique. O grupo origem desaparece;
-   seus membros migram para este grupo como `member` (o primary do
-   origem perde o título mas mantém o vínculo). Esta é a forma manual
-   de aceitar uma mesclagem que estava na fila de Mesclagens.
+Em estado normal (após `BusinessPartner.save` rodar para todos os BPs
+do tenant), esta aba fica **vazia** com a mensagem "todos os
+matriz/filial já estão materializados em grupos curados".
 
 ### Sub-aba **Apelidos**
 
@@ -317,41 +362,51 @@ concorrente primeiro.
 
 ## 16.7 Backfill retroativo
 
-Para tenants que já acumularam `NFTransactionLink` aceitos antes de
-a feature existir, há um management command que replays os links e
-gera sugestões de Group:
+Para tenants que já existiam antes de a feature ser instalada, um
+management command roda **dois passes** sequenciais:
 
 ```bash
 # Simulação (não escreve nada)
 python manage.py backfill_bp_groups --tenant evolat --dry-run
 
-# Aplicar
+# Aplicar (ambos os passes)
 python manage.py backfill_bp_groups --tenant evolat
+
+# Apenas pass 1 (matriz/filial)
+python manage.py backfill_bp_groups --tenant evolat --skip-links
+
+# Apenas pass 2 (cross-root via NF↔Tx)
+python manage.py backfill_bp_groups --tenant evolat --skip-roots
 
 # Todos os tenants
 python manage.py backfill_bp_groups --all-tenants
-
-# Com limite (útil para testes)
-python manage.py backfill_bp_groups --tenant evolat --limit 100
 ```
 
 Saída por tenant:
 
 ```
 === Tenant evolat (id=5) ===
-  inspected=515 suggested=87 same_bp=412 unresolved=16 errors=0
+  [1/2] Materializing cnpj_root clusters…
+    bps_visited=1224 groups_touched=50 errors=0
+  [2/2] Replaying accepted NF↔Tx links…
+    inspected=515 suggested=87 same_bp=412 unresolved=16 errors=0
 ```
 
-| Contador | Significa |
-|----------|-----------|
-| `inspected` | Links aceitos avaliados |
-| `suggested` | Pares (BP_a, BP_b) com BPs distintos → upsert chamado |
-| `same_bp` | Tx e NF resolvem para o mesmo BP — sem sugestão |
-| `unresolved` | Tx ou NF não resolvem para BP — sem sugestão |
-| `errors` | Falhas no upsert (logado em stderr) |
+| Pass | Contador | Significa |
+|------|----------|-----------|
+| 1 | `bps_visited` | BPs com `cnpj_root` não-vazio inspecionados |
+| 1 | `groups_touched` | Groups criados ou estendidos por raiz |
+| 2 | `inspected` | Links aceitos avaliados |
+| 2 | `suggested` | Pares (BP_a, BP_b) com BPs distintos → upsert chamado |
+| 2 | `same_bp` | Tx e NF resolvem para o mesmo BP — sem sugestão |
+| 2 | `unresolved` | Tx ou NF não resolvem para BP — sem sugestão |
 
-**Idempotência:** rodar 2× não infla contadores no DB porque o
-`evidence` array dedupe por `(method, source_id)`.
+**Idempotência:** rodar 2× não duplica state. Pass 1 detecta Groups
+existentes; pass 2 dedupe por `(method, source_id)` no array `evidence`.
+
+Após o backfill, `BusinessPartner.save()` mantém o pass 1 atualizado
+automaticamente — não é preciso re-rodar a menos que o sistema seja
+restaurado de um snapshot anterior à feature.
 
 ---
 
@@ -359,9 +414,11 @@ Saída por tenant:
 
 ### "Um cliente novo abriu uma filial — devo criar um grupo?"
 
-Não. Filiais com a mesma raiz de CNPJ já são unidas via `cnpj_root` em
-toda lógica de matching e self-billing — sem precisar de Group. Group é
-para casos **cross-root**.
+Não. Quando você cadastra (ou importa) o BP da filial, o
+`BusinessPartner.save()` detecta que outro BP do mesmo tenant
+compartilha os 8 primeiros dígitos do CNPJ e **cria o Group
+automaticamente** (ou adiciona a filial ao Group existente, se a matriz
+já estiver em um). Você pode verificar imediatamente em `/billing/grupos`.
 
 ### "Aceitei uma sugestão por engano. Como desfazer?"
 
@@ -430,6 +487,8 @@ Todos os endpoints respeitam o prefixo de tenant (`/<sub>/api/…`).
 | DELETE | `/business-partner-groups/<id>/` | Apagar (cascateia memberships) |
 | POST | `/business-partner-groups/<id>/promote-primary/` | `{membership_id}` |
 | POST | `/business-partner-groups/<id>/merge/` | `{source_group_id}` |
+| GET | `/business-partner-groups/cnpj-root-clusters/` | Lista clusters de raiz CNPJ ainda não materializados |
+| POST | `/business-partner-groups/materialize-cnpj-root/` | `{cnpj_root}` — promove um cluster (idempotente) |
 
 ### Memberships
 
