@@ -49,7 +49,7 @@ export function Topbar() {
   // their viewer sees, with no admin links bleeding through.
   // ``actualRole`` is unaffected by the overlay so the preview
   // toggle item itself stays available.
-  const { me, actualRole, isSuperuser } = useUserRole()
+  const { me, actualRole, isSuperuser, canWrite } = useUserRole()
   const updatePrefs = useUpdatePreferences()
   const canPreviewAsViewer =
     actualRole === "manager" || actualRole === "owner" || actualRole === "superuser"
@@ -89,8 +89,11 @@ export function Topbar() {
         {/* Notifications */}
         <NotificationBell />
 
-        {/* Palette picker */}
-        <ThemePicker />
+        {/* Palette picker — internal/operator tooling. Hidden from
+            viewers (and from operators in view-as-viewer preview) so
+            external clients see the locked-in tenant look without a
+            "select a different palette" affordance. */}
+        {canWrite && <ThemePicker />}
 
         {/* Light/dark toggle — also persists to /api/core/me/preferences/
             so the choice follows the user across devices. */}

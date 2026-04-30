@@ -882,6 +882,23 @@ export function useReconciliationSummaries(
 }
 
 /**
+ * Paginated reconciliation summaries hook. Pass ``page`` + ``page_size``
+ * to opt into server-side pagination -- the table page uses this to
+ * keep the working set small even when the closed-matches list grows
+ * into the thousands.
+ */
+export function useReconciliationSummariesPaged(
+  params: Parameters<typeof reconApi.listReconciliationSummariesPaged>[0],
+) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["recon", sub, "reconciliation_summaries_paged", params] as const,
+    queryFn: () => reconApi.listReconciliationSummariesPaged(params),
+    enabled: !!sub,
+  })
+}
+
+/**
  * Unmatch one reconciliation. On success invalidates the recon list plus the
  * bank-tx / JE caches so the Workbench picks up the newly-freed rows.
  */

@@ -717,13 +717,24 @@ export interface Entity {
   telefone?: string | null
 }
 
+export interface ReconUnreconciledSide {
+  count: number
+  amount_abs: string
+  oldest_age_days: number | null
+  oldest_date: string | null
+}
+
 export interface ReconKPIs {
   as_of: string
   unreconciled: {
+    /** Backward-compat: legacy callers read these as "bank side" totals.
+     *  New code should prefer ``bank`` / ``book`` for clarity. */
     count: number
     amount_abs: string
     oldest_age_days: number | null
     oldest_date: string | null
+    bank: ReconUnreconciledSide
+    book: ReconUnreconciledSide
   }
   tasks_30d: {
     completed: number
@@ -878,6 +889,13 @@ export interface FinancialStatementsCategory {
   amount: string
   account_count: number
   accounts: FinancialStatementsAccount[]
+  /** Reconciled portion of ``amount`` -- emitted by the backend only
+   *  when ``include_pending=true`` and only for FLOW_CATEGORIES (DRE
+   *  / DFC). The reconciled portion is the sum of contributions from
+   *  JEs with ``is_reconciled=True``; the unreconciled portion
+   *  (``amount_unreconciled``) is everything else. Decimal-as-string. */
+  amount_reconciled?: string
+  amount_unreconciled?: string
 }
 
 /** One DFC sub-line bucket. ``section`` is one of

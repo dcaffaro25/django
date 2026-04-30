@@ -1072,7 +1072,15 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     # to respect the same filter the operator sees on screen --
     # without this, the export grabs every row in the status scope
     # regardless of what the search box says.
-    filter_backends = [drf_filters.SearchFilter]
+    #
+    # ``OrderingFilter`` enables ``?ordering=<field>`` so the matches
+    # table can sort by id / status / reference server-side. Value-
+    # column sorts (bank_sum / book_sum / difference / dates) stay
+    # client-side because those numbers are derived inside the
+    # ``summaries`` action; sorting them server-side would require
+    # subquery annotations and offers no win for typical tenant
+    # sizes.
+    filter_backends = [drf_filters.SearchFilter, drf_filters.OrderingFilter]
     search_fields = [
         "reference",
         "notes",
@@ -1080,6 +1088,8 @@ class ReconciliationViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         "journal_entries__description",
         "journal_entries__transaction__description",
     ]
+    ordering_fields = ["id", "status", "reference", "created_at", "updated_at"]
+    ordering = ["-id"]
 
     if settings.AUTH_OFF:
         permission_classes = []
@@ -2239,12 +2249,34 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             limit = 100
 
         qs = self.filter_queryset(self.get_queryset())
+
+        # Annotate with the linked bank-transaction date so the
+        # Demonstrativos drill panel can show, per JE, which date
+        # drove inclusion in the report. ``Subquery`` over the
+        # ``bank_transaction`` M2M (``Reconciliation.bank_transactions``
+        # via ``JournalEntry.reconciliations``) -- pick the most recent
+        # tx date when several are linked, since cashflow uses MAX too.
+        from django.db.models import Subquery, OuterRef, Max
+        from accounting.models import BankTransaction
+        bank_date_sq = (
+            BankTransaction.objects
+            .filter(reconciliations__journal_entries=OuterRef("pk"))
+            .order_by()
+            .values("reconciliations__journal_entries")
+            .annotate(d=Max("date"))
+            .values("d")[:1]
+        )
+        qs = qs.annotate(_linked_bank_tx_date=Subquery(bank_date_sq))
         qs = qs.order_by('-transaction__date', '-id')[:limit]
+
         rows = list(qs.values(
             'id', 'transaction_id', 'description',
             'debit_amount', 'credit_amount', 'date',
             'transaction__date', 'transaction__description',
             'transaction__state',
+            'is_reconciled', 'is_cash',
+            'account__bank_account_id',
+            '_linked_bank_tx_date',
         ))
 
         def _iso(d):
@@ -2258,6 +2290,15 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
 
         out = []
         for r in rows:
+            je_date = r.get('date')
+            linked_bank_date = r.get('_linked_bank_tx_date')
+            # ``effective_cash_date`` mirrors ``cashflow_service``:
+            # when the JE is reconciled, the linked bank date drives
+            # cash-basis inclusion; otherwise the JE's own date does.
+            # Only meaningful for cash-side legs (``is_cash`` /
+            # account.bank_account); other legs flow through the GL on
+            # accrual dates regardless.
+            effective_cash = linked_bank_date if (r.get('is_reconciled') and linked_bank_date) else je_date
             out.append({
                 'id': r['id'],
                 'transaction_id': r['transaction_id'],
@@ -2266,6 +2307,14 @@ class JournalEntryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                 'debit_amount': _str_dec(r.get('debit_amount')),
                 'credit_amount': _str_dec(r.get('credit_amount')),
                 'state': r.get('transaction__state'),
+                # New fields surfaced for the Demonstrativos drill so
+                # the operator can see *why* this JE is in the report
+                # on this date / under cash basis.
+                'is_reconciled': bool(r.get('is_reconciled')),
+                'is_cash': bool(r.get('is_cash')) or bool(r.get('account__bank_account_id')),
+                'linked_bank_tx_date': _iso(linked_bank_date),
+                'effective_cash_date': _iso(effective_cash),
+                'je_date': _iso(je_date),
             })
         return Response(out)
 

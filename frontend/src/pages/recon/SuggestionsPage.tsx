@@ -556,7 +556,41 @@ export function SuggestionsPage() {
 // TASK MODE — renders the raw M:M payloads persisted for a past execution.
 // ---------------------------------------------------------------------------
 
-type SortKey = "confidence_desc" | "confidence_asc" | "difference_asc" | "date_asc" | "size_desc"
+type SortKey =
+  | "confidence_desc"
+  | "confidence_asc"
+  | "difference_asc"
+  | "date_asc"
+  | "size_desc"
+  | "bank_desc"
+  | "bank_asc"
+  | "book_desc"
+  | "book_asc"
+
+/** Sum the absolute bank-side amount of a suggestion. Falls back to the
+ *  pre-computed ``bank_sum_value`` when the engine ships it; otherwise
+ *  walks ``bank_transaction_details``. Same shape on the book side via
+ *  ``bookSumAbs``. */
+function bankSumAbs(p: TaskSuggestionPayload): number {
+  const pre = (p as any).bank_sum_value
+  if (pre != null && Number.isFinite(Number(pre))) return Math.abs(Number(pre))
+  let s = 0
+  for (const d of p.bank_transaction_details ?? []) {
+    const v = Number(d?.amount ?? 0)
+    if (Number.isFinite(v)) s += v
+  }
+  return Math.abs(s)
+}
+function bookSumAbs(p: TaskSuggestionPayload): number {
+  const pre = (p as any).book_sum_value
+  if (pre != null && Number.isFinite(Number(pre))) return Math.abs(Number(pre))
+  let s = 0
+  for (const d of p.journal_entry_details ?? []) {
+    const v = Number(d?.amount ?? 0)
+    if (Number.isFinite(v)) s += v
+  }
+  return Math.abs(s)
+}
 
 export function TaskSuggestionsView({
   taskId,
@@ -710,6 +744,10 @@ export function TaskSuggestionsView({
           const sB = (b["N bank"] ?? b.bank_ids.length) + (b["N book"] ?? b.journal_entries_ids.length)
           return sB - sA
         }
+        case "bank_desc": return bankSumAbs(b) - bankSumAbs(a)
+        case "bank_asc": return bankSumAbs(a) - bankSumAbs(b)
+        case "book_desc": return bookSumAbs(b) - bookSumAbs(a)
+        case "book_asc": return bookSumAbs(a) - bookSumAbs(b)
         case "confidence_desc":
         default:
           return (b.confidence_score ?? 0) - (a.confidence_score ?? 0)
@@ -830,6 +868,10 @@ export function TaskSuggestionsView({
       "confidence_desc",
       "confidence_asc",
       "difference_asc",
+      "bank_desc",
+      "bank_asc",
+      "book_desc",
+      "book_asc",
       "date_asc",
       "size_desc",
     ]
@@ -1072,6 +1114,10 @@ export function TaskSuggestionsView({
               <option value="difference_asc">Diferença ↑</option>
               <option value="date_asc">Δ data médio ↑</option>
               <option value="size_desc">Tamanho ↓</option>
+              <option value="bank_desc">Valor banco ↓</option>
+              <option value="bank_asc">Valor banco ↑</option>
+              <option value="book_desc">Valor livro ↓</option>
+              <option value="book_asc">Valor livro ↑</option>
             </select>
           </div>
 

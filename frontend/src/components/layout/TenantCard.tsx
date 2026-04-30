@@ -61,7 +61,34 @@ export function TenantCard({ collapsed }: { collapsed: boolean }) {
     navigate("/settings/tenant")
   }
 
+  // Viewers (and operators in view-as-viewer preview) see a STATIC
+  // card with the current tenant's identity -- no dropdown, no
+  // switcher. External clients are scoped to a single tenant and
+  // shouldn't see other tenants in a menu, even if they technically
+  // have membership elsewhere; switching tenants is an account-level
+  // action, not a per-session UI affordance.
+  const switcherEnabled = canWrite
+
   if (collapsed) {
+    const avatar = (
+      <span
+        className="mx-auto mt-2 grid h-9 w-9 place-items-center overflow-hidden rounded-md text-[12px] font-bold text-primary-foreground"
+        style={logoUrl ? undefined : { background: avatarColour }}
+      >
+        {logoUrl ? (
+          <img src={logoUrl} alt={name} className="h-full w-full object-cover" />
+        ) : (
+          initial
+        )}
+      </span>
+    )
+
+    if (!switcherEnabled) {
+      return (
+        <div title={`${name} (${subdomain || "—"})`}>{avatar}</div>
+      )
+    }
+
     return (
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
@@ -89,6 +116,60 @@ export function TenantCard({ collapsed }: { collapsed: boolean }) {
     )
   }
 
+  // Expanded card content -- shared between the interactive (dropdown
+  // trigger) and static (viewer) variants so both surfaces stay
+  // visually identical.
+  const cardBody = (
+    <>
+      <div className="flex items-center gap-3">
+        {/* Avatar/logo at the same scale as the identity card on
+            /settings/tenant (h-14) so both surfaces feel like the
+            same thing. */}
+        <div
+          className="grid h-14 w-14 shrink-0 place-items-center overflow-hidden rounded-lg text-[20px] font-bold text-primary-foreground shadow-sm"
+          style={logoUrl ? undefined : { background: avatarColour }}
+        >
+          {logoUrl ? (
+            <img src={logoUrl} alt={name} className="h-full w-full object-contain" />
+          ) : (
+            initial
+          )}
+        </div>
+        {/* Name + subdomain stacked to the right of the icon.
+            Bigger weight than before so the tenant identity is
+            unmistakable at a glance. */}
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-[14px] font-semibold leading-tight">{name}</div>
+          {subdomain ? (
+            <div className="truncate text-[11px] text-muted-foreground">{subdomain}</div>
+          ) : null}
+        </div>
+        {switcherEnabled && (
+          <ChevronsUpDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-colors group-hover:text-foreground" />
+        )}
+      </div>
+      <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-border/50 pt-2 text-[10px] text-muted-foreground">
+        <span className="inline-flex items-center gap-1" title="Total de contas no plano de contas">
+          <Tag className="h-3 w-3" /> {accountCount ?? "—"} contas
+        </span>
+        <span className="inline-flex items-center gap-1 tabular-nums" title="Saldo total na moeda principal">
+          <Wallet className="h-3 w-3" /> {formatCurrency(totalBalance, primaryCurrency)}
+        </span>
+      </div>
+    </>
+  )
+
+  if (!switcherEnabled) {
+    return (
+      <div
+        className="mx-2 mt-2 block w-[calc(100%-1rem)] rounded-lg border border-border bg-surface-2 px-3 py-2.5 text-left"
+        title={`${name} (${subdomain || "—"})`}
+      >
+        {cardBody}
+      </div>
+    )
+  }
+
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -98,39 +179,7 @@ export function TenantCard({ collapsed }: { collapsed: boolean }) {
           )}
           title="Trocar empresa ou abrir configuração"
         >
-          <div className="flex items-center gap-3">
-            {/* Avatar/logo at the same scale as the identity card on
-                /settings/tenant (h-14) so both surfaces feel like the
-                same thing. */}
-            <div
-              className="grid h-14 w-14 shrink-0 place-items-center overflow-hidden rounded-lg text-[20px] font-bold text-primary-foreground shadow-sm"
-              style={logoUrl ? undefined : { background: avatarColour }}
-            >
-              {logoUrl ? (
-                <img src={logoUrl} alt={name} className="h-full w-full object-contain" />
-              ) : (
-                initial
-              )}
-            </div>
-            {/* Name + subdomain stacked to the right of the icon.
-                Bigger weight than before so the tenant identity is
-                unmistakable at a glance. */}
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-[14px] font-semibold leading-tight">{name}</div>
-              {subdomain ? (
-                <div className="truncate text-[11px] text-muted-foreground">{subdomain}</div>
-              ) : null}
-            </div>
-            <ChevronsUpDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-colors group-hover:text-foreground" />
-          </div>
-          <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-border/50 pt-2 text-[10px] text-muted-foreground">
-            <span className="inline-flex items-center gap-1" title="Total de contas no plano de contas">
-              <Tag className="h-3 w-3" /> {accountCount ?? "—"} contas
-            </span>
-            <span className="inline-flex items-center gap-1 tabular-nums" title="Saldo total na moeda principal">
-              <Wallet className="h-3 w-3" /> {formatCurrency(totalBalance, primaryCurrency)}
-            </span>
-          </div>
+          {cardBody}
         </button>
       </DropdownMenuTrigger>
       <TenantSwitcherMenu

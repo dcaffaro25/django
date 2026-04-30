@@ -125,10 +125,14 @@ def _accrual_flow_deltas(
     entity_id: Optional[int],
     include_pending: bool,
     direction_by_id: Dict[int, int],
+    reconciled_only: bool = False,
 ) -> Dict[int, Decimal]:
     """Sum signed JE deltas in [date_from, date_to] — flow window. Used
     for FLOW_CATEGORIES (DRE/DFC) where the line is a period activity,
-    not a balance snapshot. ``include_pending`` widens the state filter."""
+    not a balance snapshot. ``include_pending`` widens the state filter.
+    ``reconciled_only=True`` restricts to ``is_reconciled=True`` JEs --
+    used by ``compute_financial_statements`` to expose the reconciled
+    portion of each category when ``include_pending`` is on."""
     je_base = JournalEntry.objects.filter(account__company_id=company_id)
     if date_from is not None:
         je_base = je_base.filter(transaction__date__gte=date_from)
@@ -139,6 +143,8 @@ def _accrual_flow_deltas(
 
     states = ["posted", "pending"] if include_pending else ["posted"]
     je_base = je_base.filter(transaction__state__in=states)
+    if reconciled_only:
+        je_base = je_base.filter(is_reconciled=True)
 
     aggs = je_base.values("account_id").annotate(net=Sum(_net_expr()))
 
@@ -954,6 +960,48 @@ def compute_financial_statements(
         entity_id=entity_id, include_pending=include_pending,
         main_totals=main_totals, synthetic_lucro=synthetic_lucro,
     )
+
+    # ---- Reconciled-vs-not-reconciled split ----
+    # When ``include_pending=True``, the demonstrativos page wants to
+    # show the operator how much of each category is *actually*
+    # reconciled (cash physically moved + matched to a bank tx) vs
+    # how much is still floating in unreconciled JEs. Compute a
+    # reconciled-only pass over the FLOW window using the same scope
+    # as the main aggregation; the unreconciled portion is the
+    # difference.
+    #
+    # Limited to FLOW_CATEGORIES today: Balanço closings combine an
+    # anchor balance with post-anchor flow, and the "reconciled"
+    # framing makes most sense for activity (DRE/DFC) anyway. The
+    # frontend renders the split inline only when ``amount_reconciled``
+    # is present and meaningfully different from ``amount``.
+    if include_pending:
+        try:
+            rec_deltas = _accrual_flow_deltas(
+                company_id,
+                date_from=date_from, date_to=date_to,
+                entity_id=entity_id, include_pending=include_pending,
+                direction_by_id=direction_by_id, reconciled_only=True,
+            )
+            rec_per_category: Dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+            for aid, contrib in rec_deltas.items():
+                eff_cat = (tax_map.get(aid) or {}).get("effective_category")
+                if eff_cat and eff_cat in FLOW_CATEGORIES:
+                    rec_per_category[eff_cat] += contrib
+            for c in categories:
+                if c["key"] in FLOW_CATEGORIES:
+                    rec = rec_per_category.get(c["key"], Decimal("0"))
+                    try:
+                        total = Decimal(c["amount"])
+                    except Exception:
+                        total = Decimal("0")
+                    c["amount_reconciled"] = str(rec)
+                    c["amount_unreconciled"] = str(total - rec)
+        except Exception:
+            # Diagnostic-only feature: never block the main payload on
+            # the split aggregation. If it fails the report still
+            # renders, just without the inline reconciled breakdown.
+            pass
 
     payload: dict = {
         "currency": primary_currency_code,

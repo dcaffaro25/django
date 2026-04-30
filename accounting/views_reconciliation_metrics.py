@@ -325,7 +325,12 @@ class ReconciliationKPIsView(APIView):
         from django.db.models import Sum, Count, Q, F, Min
         from django.db.models.functions import Abs, TruncDate
         from multitenancy.utils import resolve_tenant
-        from accounting.models import BankTransaction, Reconciliation, ReconciliationTask
+        from accounting.models import (
+            BankTransaction,
+            JournalEntry,
+            Reconciliation,
+            ReconciliationTask,
+        )
 
         try:
             company_id = resolve_tenant(tenant_id).id
@@ -368,6 +373,38 @@ class ReconciliationKPIsView(APIView):
         amount_abs = agg.get("amount_abs") or Decimal("0")
         oldest_date = agg.get("oldest_date")
         oldest_age = (today - oldest_date).days if oldest_date else None
+
+        # --- Unreconciled BOOK side (journal entries on cash/bank legs) ---
+        # The dashboard's "Valores abertos" was bank-only, which painted
+        # half the picture: a tenant can also have plenty of recorded
+        # cash JEs that nobody has tied to a bank transaction yet (e.g.
+        # imported invoices waiting for payment matching). We surface
+        # the book counterpart so the Painel can show both sides.
+        #
+        # Filters mirror the bank query: cash-side legs only
+        # (``account.bank_account`` set), exclude canceled, exclude
+        # already-reconciled. Pending state is included to match the
+        # bank side's lack of a state filter -- "open book" means
+        # anything not yet resolved.
+        je_qs = JournalEntry.objects.filter(
+            company_id=company_id,
+            is_reconciled=False,
+            account__bank_account__isnull=False,
+        ).exclude(state="canceled")
+        if date_from:
+            je_qs = je_qs.filter(date__gte=date_from)
+        if date_to:
+            je_qs = je_qs.filter(date__lte=date_to)
+
+        je_agg = je_qs.aggregate(
+            count=Count("id", distinct=True),
+            amount_abs=Sum(Abs(F("debit_amount") - F("credit_amount"))),
+            oldest_date=Min("date"),
+        )
+        book_count = int(je_agg.get("count") or 0)
+        book_amount_abs = je_agg.get("amount_abs") or Decimal("0")
+        book_oldest_date = je_agg.get("oldest_date")
+        book_oldest_age = (today - book_oldest_date).days if book_oldest_date else None
 
         # --- Tasks in lookback window ---
         tasks = ReconciliationTask.objects.filter(
@@ -427,10 +464,26 @@ class ReconciliationKPIsView(APIView):
             {
                 "as_of": today.isoformat(),
                 "unreconciled": {
+                    # Top-level keys preserved for backward compat: the
+                    # legacy dashboard widget reads these as the bank
+                    # side. New callers should prefer ``unreconciled.bank``
+                    # / ``unreconciled.book`` for clarity.
                     "count": count,
                     "amount_abs": str(amount_abs),
                     "oldest_age_days": oldest_age,
                     "oldest_date": oldest_date.isoformat() if oldest_date else None,
+                    "bank": {
+                        "count": count,
+                        "amount_abs": str(amount_abs),
+                        "oldest_age_days": oldest_age,
+                        "oldest_date": oldest_date.isoformat() if oldest_date else None,
+                    },
+                    "book": {
+                        "count": book_count,
+                        "amount_abs": str(book_amount_abs),
+                        "oldest_age_days": book_oldest_age,
+                        "oldest_date": book_oldest_date.isoformat() if book_oldest_date else None,
+                    },
                 },
                 "tasks_30d": {
                     "completed": int(task_totals.get("completed") or 0),

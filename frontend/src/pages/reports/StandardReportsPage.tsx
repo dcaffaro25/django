@@ -949,8 +949,20 @@ export function DreTab() {
   // drill-down and multi-column series/compare) feed off the same
   // RowSpec array so the math can't drift.
   const accs = (k: string) => byKey.get(k)?.accounts ?? []
-
-  const drill = { date_from, date_to, entity, onEditAccount }
+  // ``split(k)`` exposes the optional reconciled / unreconciled
+  // breakdown the backend emits when ``include_pending`` is on. When
+  // the category lacks a split, ``DrillableLine`` falls back to the
+  // single-amount rendering it has always done.
+  const split = (k: string) => {
+    const b = byKey.get(k)
+    return b && b.reconciled != null
+      ? { reconciled: b.reconciled, unreconciled: b.unreconciled ?? 0 }
+      : undefined
+  }
+  // ``basis`` flows through so the per-account JE drill panel knows
+  // whether to show the cash-basis effective-date column (which date
+  // drove inclusion: bank tx vs JE date).
+  const drill = { date_from, date_to, entity, onEditAccount, basis }
   const showMultiColumn = !!(data.series || data.comparison)
 
   // Multi-column path — used whenever granularity or comparison is on.
@@ -1026,19 +1038,19 @@ export function DreTab() {
           <div>Linha</div>
           <div className="tabular-nums">{currency}</div>
         </div>
-        <DrillableLine label="Receita Bruta" value={receitaBruta} currency={currency} bold accounts={accs("receita_bruta")} {...drill} />
-        <DrillableLine label="(-) Deduções da Receita" value={deducoes} currency={currency} indent={1} negative accounts={accs("deducao_receita")} {...drill} />
+        <DrillableLine label="Receita Bruta" value={receitaBruta} currency={currency} bold accounts={accs("receita_bruta")} split={split("receita_bruta")} {...drill} />
+        <DrillableLine label="(-) Deduções da Receita" value={deducoes} currency={currency} indent={1} negative accounts={accs("deducao_receita")} split={split("deducao_receita")} {...drill} />
         <StatementLine label="Receita Líquida" value={receitaLiquida} currency={currency} bold />
-        <DrillableLine label="(-) Custos" value={custos} currency={currency} indent={1} negative accounts={accs("custo")} {...drill} />
+        <DrillableLine label="(-) Custos" value={custos} currency={currency} indent={1} negative accounts={accs("custo")} split={split("custo")} {...drill} />
         <StatementLine label="Lucro Bruto" value={lucroBruto} currency={currency} bold />
-        <DrillableLine label="(-) Despesas Operacionais" value={despesasOp} currency={currency} indent={1} negative accounts={accs("despesa_operacional")} {...drill} />
+        <DrillableLine label="(-) Despesas Operacionais" value={despesasOp} currency={currency} indent={1} negative accounts={accs("despesa_operacional")} split={split("despesa_operacional")} {...drill} />
         <StatementLine label="EBIT (Lucro Operacional)" value={ebit} currency={currency} bold />
-        <DrillableLine label="(+) Receitas Financeiras" value={receitaFin} currency={currency} indent={1} accounts={accs("receita_financeira")} {...drill} />
-        <DrillableLine label="(-) Despesas Financeiras" value={despesaFin} currency={currency} indent={1} negative accounts={accs("despesa_financeira")} {...drill} />
-        <DrillableLine label="(+/-) Outras Receitas/Despesas" value={outras} currency={currency} indent={1} accounts={accs("outras_receitas")} {...drill} />
+        <DrillableLine label="(+) Receitas Financeiras" value={receitaFin} currency={currency} indent={1} accounts={accs("receita_financeira")} split={split("receita_financeira")} {...drill} />
+        <DrillableLine label="(-) Despesas Financeiras" value={despesaFin} currency={currency} indent={1} negative accounts={accs("despesa_financeira")} split={split("despesa_financeira")} {...drill} />
+        <DrillableLine label="(+/-) Outras Receitas/Despesas" value={outras} currency={currency} indent={1} accounts={accs("outras_receitas")} split={split("outras_receitas")} {...drill} />
         <StatementLine label="Resultado Financeiro" value={resultadoFin} currency={currency} indent={1} />
         <StatementLine label="LAIR (Lucro antes IR)" value={lair} currency={currency} bold />
-        <DrillableLine label="(-) IRPJ + CSLL" value={impostoLucro} currency={currency} indent={1} negative accounts={accs("imposto_sobre_lucro")} {...drill} />
+        <DrillableLine label="(-) IRPJ + CSLL" value={impostoLucro} currency={currency} indent={1} negative accounts={accs("imposto_sobre_lucro")} split={split("imposto_sobre_lucro")} {...drill} />
         <StatementLine label="Lucro Líquido do Exercício" value={lucroLiq} currency={currency} bold />
       </div>
       <WiringModalController wiring={wiring} />
@@ -1066,11 +1078,16 @@ function ComparisonHeaderStrip({ data }: { data: FinancialStatementsPayload }) {
  *  Decimal-string ``amount`` into a number once here). */
 function indexCategories(
   categories: FinancialStatementsCategory[],
-): Map<string, { amount: number; accounts: Array<{ id: number; name: string; amount: number; synthetic?: boolean }> }> {
-  const m = new Map<string, { amount: number; accounts: Array<{ id: number; name: string; amount: number; synthetic?: boolean }> }>()
+): Map<string, { amount: number; reconciled?: number; unreconciled?: number; accounts: Array<{ id: number; name: string; amount: number; synthetic?: boolean }> }> {
+  const m = new Map<string, { amount: number; reconciled?: number; unreconciled?: number; accounts: Array<{ id: number; name: string; amount: number; synthetic?: boolean }> }>()
   for (const c of categories) {
     m.set(c.key, {
       amount: Number(c.amount) || 0,
+      // Reconciled split surfaces only when the backend chose to emit
+      // it (today: ``include_pending=true`` + FLOW_CATEGORIES). When
+      // absent, the row renders the single total as before.
+      ...(c.amount_reconciled != null ? { reconciled: Number(c.amount_reconciled) || 0 } : {}),
+      ...(c.amount_unreconciled != null ? { unreconciled: Number(c.amount_unreconciled) || 0 } : {}),
       // Pass the ``synthetic`` flag through unchanged. DrillableLine /
       // AccountDrillRow keys on it to suppress the chevron, hide the
       // pencil, and skip the JE drill for entries like the
@@ -1357,8 +1374,20 @@ export function BalancoTab() {
   const byKey = indexCategories(data.categories)
   const get = (k: string) => byKey.get(k)?.amount ?? 0
   const accs = (k: string) => byKey.get(k)?.accounts ?? []
-
-  const drill = { date_from, date_to, entity, onEditAccount }
+  // ``split(k)`` exposes the optional reconciled / unreconciled
+  // breakdown the backend emits when ``include_pending`` is on. When
+  // the category lacks a split, ``DrillableLine`` falls back to the
+  // single-amount rendering it has always done.
+  const split = (k: string) => {
+    const b = byKey.get(k)
+    return b && b.reconciled != null
+      ? { reconciled: b.reconciled, unreconciled: b.unreconciled ?? 0 }
+      : undefined
+  }
+  // ``basis`` flows through so the per-account JE drill panel knows
+  // whether to show the cash-basis effective-date column (which date
+  // drove inclusion: bank tx vs JE date).
+  const drill = { date_from, date_to, entity, onEditAccount, basis }
   const showMultiColumn = !!(data.series || data.comparison)
 
   // Multi-column path — Ativo and Passivo+PL are rendered as two
@@ -1433,17 +1462,17 @@ export function BalancoTab() {
         <div className="border-b border-border bg-surface-3 px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
           Ativo
         </div>
-        <DrillableLine label="Ativo Circulante" value={ativoCirc} currency={currency} indent={0} accounts={accs("ativo_circulante")} {...drill} />
-        <DrillableLine label="Ativo Não Circulante" value={ativoNc} currency={currency} indent={0} accounts={accs("ativo_nao_circulante")} {...drill} />
+        <DrillableLine label="Ativo Circulante" value={ativoCirc} currency={currency} indent={0} accounts={accs("ativo_circulante")} split={split("ativo_circulante")} {...drill} />
+        <DrillableLine label="Ativo Não Circulante" value={ativoNc} currency={currency} indent={0} accounts={accs("ativo_nao_circulante")} split={split("ativo_nao_circulante")} {...drill} />
         <StatementLine label="Total do Ativo" value={totalAtivo} currency={currency} bold />
       </div>
       <div className="card-elevated overflow-hidden text-[12px]">
         <div className="border-b border-border bg-surface-3 px-3 py-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
           Passivo + Patrimônio Líquido
         </div>
-        <DrillableLine label="Passivo Circulante" value={passCirc} currency={currency} indent={0} accounts={accs("passivo_circulante")} {...drill} />
-        <DrillableLine label="Passivo Não Circulante" value={passNc} currency={currency} indent={0} accounts={accs("passivo_nao_circulante")} {...drill} />
-        <DrillableLine label="Patrimônio Líquido" value={pl} currency={currency} indent={0} accounts={accs("patrimonio_liquido")} {...drill} />
+        <DrillableLine label="Passivo Circulante" value={passCirc} currency={currency} indent={0} accounts={accs("passivo_circulante")} split={split("passivo_circulante")} {...drill} />
+        <DrillableLine label="Passivo Não Circulante" value={passNc} currency={currency} indent={0} accounts={accs("passivo_nao_circulante")} split={split("passivo_nao_circulante")} {...drill} />
+        <DrillableLine label="Patrimônio Líquido" value={pl} currency={currency} indent={0} accounts={accs("patrimonio_liquido")} split={split("patrimonio_liquido")} {...drill} />
         <StatementLine label="Total Passivo + PL" value={totalPassivoPl} currency={currency} bold />
       </div>
       {balanced ? (

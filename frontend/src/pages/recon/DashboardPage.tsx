@@ -5,7 +5,7 @@ import {
   AreaChart, Area, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis, Bar, BarChart, Legend,
 } from "recharts"
 import {
-  AlertTriangle, Banknote, AlarmClock, Sparkles, Play, Upload, ArrowRight, Activity, ListChecks,
+  AlertTriangle, Banknote, AlarmClock, Sparkles, Play, Upload, ArrowRight, Activity, ListChecks, BookOpen,
 } from "lucide-react"
 import { KpiCard } from "@/components/ui/kpi-card"
 import { SectionHeader } from "@/components/ui/section-header"
@@ -35,6 +35,12 @@ export function DashboardPage() {
   const { canWrite } = useUserRole()
 
   const [period, setPeriod] = useState<PeriodDays>(30)
+  // ``include_pending_book`` widens the book daily-balance series to
+  // include un-posted ("pending") JEs. Off by default because the chart
+  // is most often used to reason about settled cash, but exposed as a
+  // toggle so operators can also see the projected book balance after
+  // pending invoices clear.
+  const [includePendingBook, setIncludePendingBook] = useState(false)
 
   const dateFrom = useMemo(() => isoDaysAgo(period), [period])
   const dateTo = useMemo(() => isoDaysAgo(0), [])
@@ -46,6 +52,7 @@ export function DashboardPage() {
   const { data: balances, isLoading: balancesLoading } = useDailyBalances({
     date_from: dateFrom,
     date_to: dateTo,
+    include_pending_book: includePendingBook,
   })
   const { data: tasks } = useReconTasks({ pollMs: 5000 })
   const { data: active } = useActiveTasks(3000)
@@ -121,9 +128,20 @@ export function DashboardPage() {
     txTrendData.length > 0 &&
     (txTrendTotals.balanced > 0 || txTrendTotals.unbalanced > 0)
 
-  const unreconciledCount = kpis?.unreconciled.count ?? 0
-  const unreconciledAmount = kpis ? Number(kpis.unreconciled.amount_abs) : 0
-  const oldestAge = kpis?.unreconciled.oldest_age_days ?? null
+  // Bank side -- legacy ``unreconciled.count`` / ``amount_abs`` still
+  // reflect this side, but read the ``bank`` block too so the hook
+  // continues to work if the legacy keys ever go away.
+  const unreconciledCount = kpis?.unreconciled.bank?.count ?? kpis?.unreconciled.count ?? 0
+  const unreconciledAmount = kpis
+    ? Number(kpis.unreconciled.bank?.amount_abs ?? kpis.unreconciled.amount_abs)
+    : 0
+  const oldestAge = kpis?.unreconciled.bank?.oldest_age_days ?? kpis?.unreconciled.oldest_age_days ?? null
+  // Book side -- introduced in the dashboard refresh so "Valores em
+  // aberto" stops being bank-only. Falls back to zero when the
+  // backend hasn't been redeployed yet (older payloads lack the
+  // ``book`` block).
+  const unreconciledBookCount = kpis?.unreconciled.book?.count ?? 0
+  const unreconciledBookAmount = kpis ? Number(kpis.unreconciled.book?.amount_abs ?? 0) : 0
   const autoRate = kpis?.tasks_30d.automatch_rate != null ? kpis.tasks_30d.automatch_rate * 100 : null
   const completedTasks = kpis?.tasks_30d.completed ?? 0
 
@@ -158,24 +176,42 @@ export function DashboardPage() {
         }
       />
 
-      {/* KPIs — clickable for drill-down */}
+      {/* KPIs — clickable for drill-down. ``Valores em aberto`` was
+          previously a single card showing only the bank side; the
+          dashboard now splits it into Banco / Livro so operators see
+          both halves of the picture (a tenant can have substantial
+          unreconciled JEs even with a clean bank ledger). */}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <button onClick={() => navigate("/recon/workbench")} className="text-left transition-transform hover:scale-[1.01]">
           <KpiCard
-            label={t("dashboard.kpi_unreconciled_count")}
-            value={kpisLoading ? "—" : formatNumber(unreconciledCount)}
-            icon={<AlertTriangle className="h-4 w-4" />}
+            label={t("dashboard.kpi_open_bank", { defaultValue: "Banco em aberto" })}
+            value={kpisLoading ? "—" : formatCurrency(unreconciledAmount)}
+            icon={<Banknote className="h-4 w-4" />}
             tone="default"
-            hint={<span className="text-muted-foreground/70">abrir bancada →</span>}
+            hint={
+              <span className="text-muted-foreground/70">
+                {t("dashboard.kpi_open_bank_hint", {
+                  count: unreconciledCount,
+                  defaultValue: "{{count}} transações →",
+                })}
+              </span>
+            }
           />
         </button>
         <button onClick={() => navigate("/recon/workbench")} className="text-left transition-transform hover:scale-[1.01]">
           <KpiCard
-            label={t("dashboard.kpi_unreconciled_amount")}
-            value={kpisLoading ? "—" : formatCurrency(unreconciledAmount)}
-            icon={<Banknote className="h-4 w-4" />}
+            label={t("dashboard.kpi_open_book", { defaultValue: "Livro em aberto" })}
+            value={kpisLoading ? "—" : formatCurrency(unreconciledBookAmount)}
+            icon={<BookOpen className="h-4 w-4" />}
             tone="default"
-            hint={<span className="text-muted-foreground/70">bancárias em aberto →</span>}
+            hint={
+              <span className="text-muted-foreground/70">
+                {t("dashboard.kpi_open_book_hint", {
+                  count: unreconciledBookCount,
+                  defaultValue: "{{count}} lançamentos →",
+                })}
+              </span>
+            }
           />
         </button>
         <button onClick={() => navigate("/recon/tasks")} className="text-left transition-transform hover:scale-[1.01]">
@@ -243,6 +279,23 @@ export function DashboardPage() {
             <div className="flex flex-wrap items-center gap-2">
               <PeriodSwitch value={period} onChange={setPeriod} />
               <TxModeSwitch value={txMode} onChange={setTxMode} />
+              {/* Pending-book toggle: lets operators ask the chart to
+                  include un-posted JEs in the book series. Off by
+                  default since most operators want settled cash, but
+                  exposed here so a "where will my book balance land
+                  once invoices clear?" view is one click away. */}
+              <label
+                className="inline-flex h-8 select-none items-center gap-1.5 rounded-md border border-border bg-background px-2 text-[11px] font-medium text-foreground hover:bg-accent"
+                title="Incluir lançamentos pendentes (não-postados) na série do livro"
+              >
+                <input
+                  type="checkbox"
+                  className="h-3 w-3 accent-primary"
+                  checked={includePendingBook}
+                  onChange={(e) => setIncludePendingBook(e.target.checked)}
+                />
+                Pendentes (livro)
+              </label>
             </div>
           </div>
           <div className="h-[240px] w-full">

@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { ChevronDown, Pencil } from "lucide-react"
+import { ChevronDown, Link2, Link2Off, Pencil } from "lucide-react"
 import { cn, formatCurrency } from "@/lib/utils"
 import { JournalEntriesPanel } from "./JournalEntriesPanel"
 
@@ -42,6 +42,8 @@ export function DrillableLine({
   date_from,
   date_to,
   entity,
+  basis,
+  split,
   onEditAccount,
 }: {
   label: string
@@ -56,6 +58,16 @@ export function DrillableLine({
   date_from?: string
   date_to?: string
   entity?: number
+  /** Report basis -- forwarded to the JE drill panel so cash-basis
+   *  reports can show the "effective cash date" column (bank-tx
+   *  date for reconciled JEs vs. JE date when unreconciled). */
+  basis?: "accrual" | "cash"
+  /** Optional reconciled / unreconciled breakdown of ``value``. When
+   *  present, the row renders an inline second line showing the
+   *  split, so operators running ``include_pending`` reports can see
+   *  how much of the headline number is actually backed by reconciled
+   *  cash vs. still floating in unreconciled JEs. */
+  split?: { reconciled: number; unreconciled: number }
   /** Pencil-icon handler. Receives the account id of the row being
    *  edited; the parent owns the modal state and passes it the
    *  matching ``AccountLite`` from its accounts list. */
@@ -94,11 +106,33 @@ export function DrillableLine({
         </div>
         <div
           className={cn(
-            "tabular-nums",
+            "flex flex-col items-end tabular-nums",
             negative && value != null && value !== 0 && "text-destructive",
           )}
         >
-          {display}
+          <span>{display}</span>
+          {/* Inline reconciled / unreconciled split. Rendered only
+              when the backend emits the breakdown (today: ``include_pending``
+              + DRE/DFC categories). The numbers are absolute values so
+              the icons carry the meaning. */}
+          {split && (
+            <span className="mt-0.5 inline-flex items-center gap-2 text-[10px] font-normal text-muted-foreground">
+              <span
+                className="inline-flex items-center gap-1"
+                title="Parcela já conciliada (JE com is_reconciled=true)"
+              >
+                <Link2 className="h-2.5 w-2.5 text-success" />
+                {formatCurrency(split.reconciled, currency)}
+              </span>
+              <span
+                className="inline-flex items-center gap-1"
+                title="Parcela não conciliada (JE com is_reconciled=false)"
+              >
+                <Link2Off className="h-2.5 w-2.5 text-warning" />
+                {formatCurrency(split.unreconciled, currency)}
+              </span>
+            </span>
+          )}
         </div>
       </div>
       {open && drillable && (
@@ -109,6 +143,7 @@ export function DrillableLine({
           date_from={date_from}
           date_to={date_to}
           entity={entity}
+          basis={basis}
           onEditAccount={onEditAccount}
         />
       )}
@@ -123,6 +158,7 @@ function AccountList({
   date_from,
   date_to,
   entity,
+  basis,
   onEditAccount,
 }: {
   accounts: AccountContribution[]
@@ -131,6 +167,7 @@ function AccountList({
   date_from?: string
   date_to?: string
   entity?: number
+  basis?: "accrual" | "cash"
   onEditAccount?: (id: number) => void
 }) {
   // Sort by absolute contribution so the largest movers come first —
@@ -147,6 +184,7 @@ function AccountList({
           date_from={date_from}
           date_to={date_to}
           entity={entity}
+          basis={basis}
           onEdit={onEditAccount}
         />
       ))}
@@ -161,6 +199,7 @@ function AccountDrillRow({
   date_from,
   date_to,
   entity,
+  basis,
   onEdit,
 }: {
   account: AccountContribution
@@ -169,6 +208,7 @@ function AccountDrillRow({
   date_from?: string
   date_to?: string
   entity?: number
+  basis?: "accrual" | "cash"
   onEdit?: (id: number) => void
 }) {
   const [open, setOpen] = useState(false)
@@ -236,6 +276,7 @@ function AccountDrillRow({
             date_to={date_to}
             entity={entity}
             currency={currency}
+            basis={basis}
           />
         </div>
       )}

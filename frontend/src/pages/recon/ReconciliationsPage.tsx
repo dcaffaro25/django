@@ -1,10 +1,14 @@
-import { Fragment, useMemo, useState } from "react"
+import { Fragment, useEffect, useMemo, useState } from "react"
 import { useTranslation } from "react-i18next"
 import { toast } from "sonner"
 import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   Calculator,
   CheckCircle2,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   Edit3,
   Loader2,
@@ -28,8 +32,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+// We use the shadcn ``TableHeader``/``TableRow``/``TableHead``/``TableCell``
+// primitives but render them inside a raw ``<table>`` (not the shadcn
+// ``Table`` wrapper) so the inner ``overflow-auto`` div doesn't trap
+// the sticky header. See the JSX comment near the table itself.
 import {
-  Table,
   TableBody,
   TableCell,
   TableHead,
@@ -56,7 +63,7 @@ import {
 } from "@/components/ui/dialog"
 import {
   useRecalcUnpostedFlags,
-  useReconciliationSummaries,
+  useReconciliationSummariesPaged,
   useUnmatchReconciliation,
   useUpdateReconciliation,
 } from "@/features/reconciliation"
@@ -73,22 +80,32 @@ const STATUS_SCOPE_PARAM: Record<StatusScope, string | undefined> = {
   all: "matched,approved,open,pending,review,unmatched",
 }
 
+const PAGE_SIZE = 50
+
+/**
+ * Sortable columns. Three buckets:
+ *
+ *   * server-side -- direct fields the backend's ``OrderingFilter``
+ *     can sort on without aggregation work. Toggling these refetches.
+ *   * client-side -- value/date columns derived inside the
+ *     ``summaries`` action; sorted in the browser on the rows the
+ *     server already returned. Reflects only the current page; the
+ *     header indicator carries a tooltip stating that.
+ *   * unsorted -- selection / expand chevron / actions columns.
+ */
+type ServerSortKey = "id" | "status" | "reference"
+type ClientSortKey =
+  | "bank_sum_value"
+  | "book_sum_value"
+  | "difference"
+  | "min_date"
+type SortKey = ServerSortKey | ClientSortKey
+type SortDir = "asc" | "desc"
+
+const SERVER_SORT_KEYS: ReadonlyArray<ServerSortKey> = ["id", "status", "reference"]
+
 function n(v: number | null | undefined) {
   return v == null ? 0 : Number(v)
-}
-
-function matchesSearch(row: ReconciliationSummary, q: string) {
-  if (!q) return true
-  const hay = [
-    row.reference ?? "",
-    row.notes ?? "",
-    row.bank_description,
-    row.book_description,
-    String(row.reconciliation_id),
-  ]
-    .join(" ")
-    .toLowerCase()
-  return hay.includes(q.toLowerCase())
 }
 
 export function ReconciliationsPage() {
@@ -98,24 +115,83 @@ export function ReconciliationsPage() {
   const [search, setSearch] = useState("")
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
   const [selected, setSelected] = useState<Set<number>>(new Set())
+  const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({ key: "id", dir: "desc" })
+  const [page, setPage] = useState(1)
 
-  // Server-side status filter; search + selection run client-side for instant feedback.
+  const isServerSort = (SERVER_SORT_KEYS as readonly string[]).includes(sort.key)
+  const orderingParam = isServerSort
+    ? `${sort.dir === "desc" ? "-" : ""}${sort.key}`
+    : "-id"
+
+  // Push the search box through to the server-side ``SearchFilter`` so
+  // pagination math, status filtering, and the xlsx export all refer to
+  // the same row set the operator sees on screen. Client-side search
+  // would drop the result count for the pager and silently shrink the
+  // export.
   const summariesParams = useMemo(
-    () => ({ status: STATUS_SCOPE_PARAM[statusScope], ordering: "-id" }),
-    [statusScope],
+    () => ({
+      status: STATUS_SCOPE_PARAM[statusScope],
+      ordering: orderingParam,
+      page,
+      page_size: PAGE_SIZE,
+      ...(search.trim() ? { search: search.trim() } : {}),
+    }),
+    [statusScope, orderingParam, page, search],
   )
-  const {
-    data: rows = [],
-    isLoading,
-    isFetching,
-    refetch,
-  } = useReconciliationSummaries(summariesParams)
 
+  // Reset to page 1 whenever filter / search / sort changes -- otherwise
+  // a stale page number can land us off the end of the new result set.
+  useEffect(() => {
+    setPage(1)
+  }, [statusScope, search, sort.key, sort.dir])
+
+  const { data, isLoading, isFetching, refetch } = useReconciliationSummariesPaged(summariesParams)
+  const rows = data?.results ?? []
+  const totalCount = data?.count ?? 0
+
+  // Client-side sort layer for the value / date columns the backend
+  // can't order without subquery annotations. Operates only on the
+  // current page's rows -- the column header tooltip surfaces this
+  // limitation.
   const filtered = useMemo(() => {
-    const q = search.trim()
-    if (!q) return rows
-    return rows.filter((r) => matchesSearch(r, q))
-  }, [rows, search])
+    if (isServerSort) return rows
+    const dir = sort.dir === "desc" ? -1 : 1
+    const copy = [...rows]
+    copy.sort((a, b) => {
+      let av: number = 0
+      let bv: number = 0
+      if (sort.key === "min_date") {
+        av = a.min_date ? new Date(a.min_date).getTime() : 0
+        bv = b.min_date ? new Date(b.min_date).getTime() : 0
+      } else {
+        av = n(a[sort.key])
+        bv = n(b[sort.key])
+      }
+      if (av < bv) return -1 * dir
+      if (av > bv) return 1 * dir
+      return 0
+    })
+    return copy
+  }, [rows, isServerSort, sort.key, sort.dir])
+
+  const lastPage = Math.max(1, Math.ceil(totalCount / PAGE_SIZE))
+
+  const onSort = (key: SortKey) => {
+    setSort((prev) => {
+      if (prev.key !== key) {
+        // First click on a new column: descending for numeric/date
+        // keys (most useful default), ascending for textual ones.
+        const numericOrDate =
+          key === "bank_sum_value" ||
+          key === "book_sum_value" ||
+          key === "difference" ||
+          key === "min_date" ||
+          key === "id"
+        return { key, dir: numericOrDate ? "desc" : "asc" }
+      }
+      return { key, dir: prev.dir === "asc" ? "desc" : "asc" }
+    })
+  }
 
   const update = useUpdateReconciliation()
   const unmatch = useUnmatchReconciliation()
@@ -249,7 +325,9 @@ export function ReconciliationsPage() {
   }
 
   // Render ------------------------------------------------------------------
-  const totalLabel = t("matches.total_count", { count: filtered.length })
+  // Show the SERVER total in the chip so operators see "X of N" rather
+  // than the page slice when paged.
+  const totalLabel = t("matches.total_count", { count: totalCount })
 
   return (
     <div className="space-y-4">
@@ -274,7 +352,10 @@ export function ReconciliationsPage() {
               path="/api/reconciliation/summaries/"
               params={{
                 status: STATUS_SCOPE_PARAM[statusScope],
-                ordering: "-id",
+                // Mirror whatever ordering the operator picked in
+                // the table; falls back to ``-id`` when the active
+                // sort is a client-only column.
+                ordering: orderingParam,
                 export: "xlsx",
                 // Pass the operator's free-text search to the
                 // server so the downloaded xlsx mirrors what's
@@ -306,8 +387,11 @@ export function ReconciliationsPage() {
         }
       />
 
-      {/* Filter row */}
-      <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-card p-2">
+      {/* Filter row -- sticky to the top of the page-scroll container so
+          status / search / bulk actions stay reachable while operators
+          scan a long matches list. The table header below sticks
+          immediately under it so column labels follow as well. */}
+      <div className="sticky top-0 z-20 flex flex-wrap items-center gap-2 rounded-lg border bg-card p-2 shadow-sm">
         <Select value={statusScope} onValueChange={(v) => setStatusScope(v as StatusScope)}>
           <SelectTrigger className="h-8 w-[220px]">
             <SelectValue />
@@ -361,10 +445,15 @@ export function ReconciliationsPage() {
         )}
       </div>
 
-      {/* Table */}
+      {/* Table -- using a raw ``<table>`` (not the shadcn ``Table``
+          wrapper) so the inner ``overflow-auto`` div doesn't trap
+          ``sticky`` for the header. The header rides the page-scroll
+          container at ``top-14`` (just below the sticky filter bar).
+          TableHeader / TableRow / TableHead / TableCell are still
+          shadcn primitives and keep the same styling. */}
       <div className="rounded-lg border bg-card">
-        <Table>
-          <TableHeader>
+        <table className="w-full caption-bottom text-sm">
+          <TableHeader className="sticky top-14 z-10 bg-card shadow-sm">
             <TableRow>
               <TableHead className="w-10 px-3">
                 <Checkbox
@@ -374,15 +463,15 @@ export function ReconciliationsPage() {
                 />
               </TableHead>
               <TableHead className="w-10 px-2" />
-              <TableHead className="w-16">{t("matches.columns.id")}</TableHead>
-              <TableHead className="w-28">{t("matches.columns.status")}</TableHead>
+              <SortableHead label={t("matches.columns.id")} sortKey="id" sort={sort} onSort={onSort} className="w-16" />
+              <SortableHead label={t("matches.columns.status")} sortKey="status" sort={sort} onSort={onSort} className="w-28" />
               <TableHead>{t("matches.columns.bank_records")}</TableHead>
               <TableHead>{t("matches.columns.book_records")}</TableHead>
-              <TableHead className="text-right">{t("matches.columns.bank_sum")}</TableHead>
-              <TableHead className="text-right">{t("matches.columns.book_sum")}</TableHead>
-              <TableHead className="text-right">{t("matches.columns.difference")}</TableHead>
-              <TableHead className="w-40">{t("matches.columns.dates")}</TableHead>
-              <TableHead>{t("matches.columns.reference")}</TableHead>
+              <SortableHead label={t("matches.columns.bank_sum")} sortKey="bank_sum_value" sort={sort} onSort={onSort} className="text-right" align="right" />
+              <SortableHead label={t("matches.columns.book_sum")} sortKey="book_sum_value" sort={sort} onSort={onSort} className="text-right" align="right" />
+              <SortableHead label={t("matches.columns.difference")} sortKey="difference" sort={sort} onSort={onSort} className="text-right" align="right" />
+              <SortableHead label={t("matches.columns.dates")} sortKey="min_date" sort={sort} onSort={onSort} className="w-40" />
+              <SortableHead label={t("matches.columns.reference")} sortKey="reference" sort={sort} onSort={onSort} />
               <TableHead className="w-[140px] text-right">
                 {t("matches.columns.actions")}
               </TableHead>
@@ -565,7 +654,49 @@ export function ReconciliationsPage() {
               })
             )}
           </TableBody>
-        </Table>
+        </table>
+        {/* Pagination footer */}
+        {totalCount > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border px-3 py-2 text-[12px] text-muted-foreground">
+            <span>
+              {t("matches.pagination.showing", {
+                from: (page - 1) * PAGE_SIZE + 1,
+                to: Math.min(page * PAGE_SIZE, totalCount),
+                total: totalCount,
+                defaultValue: "Mostrando {{from}}–{{to}} de {{total}}",
+              })}
+            </span>
+            <div className="flex items-center gap-1">
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7"
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={page <= 1 || isFetching}
+              >
+                <ChevronLeft className="h-3.5 w-3.5" />
+                {t("matches.pagination.prev", { defaultValue: "Anterior" })}
+              </Button>
+              <span className="px-2 tabular-nums">
+                {t("matches.pagination.page_n_of_m", {
+                  n: page,
+                  m: lastPage,
+                  defaultValue: "Página {{n}} de {{m}}",
+                })}
+              </span>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7"
+                onClick={() => setPage((p) => Math.min(lastPage, p + 1))}
+                disabled={page >= lastPage || isFetching}
+              >
+                {t("matches.pagination.next", { defaultValue: "Próxima" })}
+                <ChevronRight className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Approve dialog */}
@@ -632,6 +763,8 @@ export function ReconciliationsPage() {
         </AlertDialogContent>
       </AlertDialog>
 
+      {/* Pagination footer is rendered above, inside the table card. */}
+
       {/* Edit dialog */}
       <Dialog open={editTarget !== null} onOpenChange={(o) => !o && setEditTarget(null)}>
         <DialogContent>
@@ -675,5 +808,53 @@ export function ReconciliationsPage() {
         </DialogContent>
       </Dialog>
     </div>
+  )
+}
+
+/**
+ * Clickable column header. Toggles between asc / desc on repeat clicks
+ * and switches columns on first click. Server-sortable keys (id /
+ * status / reference) update the ``ordering`` query param and refetch;
+ * client-sortable keys (bank_sum / book_sum / difference / dates)
+ * sort the visible page in the browser and the icon carries a
+ * tooltip noting the per-page scope.
+ */
+function SortableHead({
+  label,
+  sortKey,
+  sort,
+  onSort,
+  className,
+  align = "left",
+}: {
+  label: React.ReactNode
+  sortKey: SortKey
+  sort: { key: SortKey; dir: SortDir }
+  onSort: (key: SortKey) => void
+  className?: string
+  align?: "left" | "right"
+}) {
+  const active = sort.key === sortKey
+  const isClientOnly = !(SERVER_SORT_KEYS as readonly string[]).includes(sortKey)
+  const Icon = !active ? ArrowUpDown : sort.dir === "asc" ? ArrowUp : ArrowDown
+  return (
+    <TableHead className={className}>
+      <button
+        type="button"
+        onClick={() => onSort(sortKey)}
+        className={cn(
+          "inline-flex items-center gap-1 text-inherit hover:text-foreground",
+          align === "right" && "ml-auto justify-end",
+        )}
+        title={
+          isClientOnly
+            ? "Ordena apenas a página atual (esta coluna é calculada no servidor)."
+            : undefined
+        }
+      >
+        <span>{label}</span>
+        <Icon className={cn("h-3 w-3 shrink-0", active ? "text-foreground" : "text-muted-foreground/60")} />
+      </button>
+    </TableHead>
   )
 }

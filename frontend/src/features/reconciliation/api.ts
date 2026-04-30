@@ -304,6 +304,11 @@ export const reconApi = {
         debit_amount: string
         credit_amount: string
         state: string | null
+        is_reconciled?: boolean
+        is_cash?: boolean
+        je_date?: string | null
+        linked_bank_tx_date?: string | null
+        effective_cash_date?: string | null
       }>
     >("/api/journal_entries/drill/", { params, timeout: 30_000 }),
 
@@ -559,6 +564,27 @@ export const reconApi = {
         { params },
       )
       .then(unwrapList<ReconciliationSummary>),
+
+  /**
+   * Paginated variant of ``listReconciliationSummaries`` used by the
+   * matches page table. Pass ``page`` + ``page_size`` to opt into
+   * pagination -- without them the backend returns a flat array.
+   * Returns the raw paginated payload so the caller can wire prev /
+   * next / total-count UI without re-fetching.
+   */
+  listReconciliationSummariesPaged: (params: {
+    status?: string
+    ordering?: string
+    search?: string
+    page?: number
+    page_size?: number
+  }) =>
+    api.tenant.get<{
+      count: number
+      next: string | null
+      previous: string | null
+      results: ReconciliationSummary[]
+    }>("/api/reconciliation/summaries/", { params }),
 
   getReconciliation: (id: number) =>
     api.tenant.get<Reconciliation>(`/api/reconciliation/${id}/`),
