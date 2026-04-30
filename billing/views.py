@@ -549,6 +549,10 @@ class NFTransactionLinkViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         """
         Bulk-accept every ``suggested`` link with confidence ≥ threshold for
         the current tenant. Body: { confidence: float }.
+
+        Mirrors ``bulk_accept`` for the threshold-based selector — also
+        runs the BP-Group suggestion hook per accepted link so that bulk
+        flows don't silently bypass the consolidation pipeline.
         """
         tenant = getattr(request, 'tenant', None)
         if tenant is None or tenant == 'all':
@@ -567,6 +571,7 @@ class NFTransactionLinkViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             review_status=NFTransactionLink.REVIEW_SUGGESTED,
             confidence__gte=threshold,
         )
+        affected = list(qs.select_related('transaction', 'nota_fiscal'))
         count = qs.update(
             review_status=NFTransactionLink.REVIEW_ACCEPTED,
             reviewed_by=request.user,
@@ -578,7 +583,83 @@ class NFTransactionLinkViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             bump_version(tenant.id)
         except Exception:
             pass
+        if affected:
+            from billing.services.nf_link_service import (
+                _suggest_group_from_accepted_link,
+            )
+            for link in affected:
+                try:
+                    _suggest_group_from_accepted_link(link)
+                except Exception:
+                    pass
         return Response({'accepted': count})
+
+    @action(methods=['post'], detail=False, url_path='bulk-accept')
+    def bulk_accept(self, request, **kwargs):
+        """Accept a curated set of suggested links by ID. Body: { ids: [...] }.
+
+        Used by the review page's bulk-action bar (operator selects rows
+        with checkboxes, hits "Aceitar selecionados"). Bypasses
+        ``accept_link`` per-row to avoid N round trips, but still fires the
+        BP-Group suggestion hook for each link in a single pass so future
+        Group consolidations don't go missing.
+        """
+        return self._bulk_status_change(
+            request,
+            target=NFTransactionLink.REVIEW_ACCEPTED,
+            run_group_hook=True,
+        )
+
+    @action(methods=['post'], detail=False, url_path='bulk-reject')
+    def bulk_reject(self, request, **kwargs):
+        """Reject a curated set of suggested links by ID. Body: { ids: [...] }."""
+        return self._bulk_status_change(
+            request,
+            target=NFTransactionLink.REVIEW_REJECTED,
+            run_group_hook=False,
+        )
+
+    def _bulk_status_change(self, request, *, target: str, run_group_hook: bool):
+        tenant = getattr(request, 'tenant', None)
+        if tenant is None or tenant == 'all':
+            return Response({'detail': 'Operação requer tenant explícito.'}, status=400)
+        ids = request.data.get('ids') or []
+        if not isinstance(ids, list) or not ids:
+            return Response({'detail': 'ids (lista não vazia) é obrigatório.'}, status=400)
+        try:
+            ids = [int(x) for x in ids]
+        except (TypeError, ValueError):
+            return Response({'detail': 'ids inválidos.'}, status=400)
+
+        from django.utils import timezone
+        qs = NFTransactionLink.objects.filter(
+            company=tenant,
+            id__in=ids,
+            review_status=NFTransactionLink.REVIEW_SUGGESTED,
+        )
+        affected = list(qs.select_related('transaction', 'nota_fiscal'))
+        count = qs.update(
+            review_status=target,
+            reviewed_by=request.user if request.user.is_authenticated else None,
+            reviewed_at=timezone.now(),
+        )
+        try:
+            from accounting.services.report_cache import bump_version
+            bump_version(tenant.id)
+        except Exception:
+            pass
+        if run_group_hook and affected:
+            # Mirror the per-link accept hook so grouping suggestions still
+            # accumulate. Best-effort.
+            from billing.services.nf_link_service import (
+                _suggest_group_from_accepted_link,
+            )
+            for link in affected:
+                try:
+                    _suggest_group_from_accepted_link(link)
+                except Exception:
+                    pass
+        return Response({'count': count, 'requested': len(ids)})
 
 
 class InvoiceNFLinkViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):

@@ -116,6 +116,10 @@ export const billingApi = {
     api.tenant.post<ScanResponse>(`/api/nf-transaction-links/scan/`, body),
   acceptAllAbove: (confidence: number | string): Promise<{ accepted: number }> =>
     api.tenant.post(`/api/nf-transaction-links/accept-all-above/`, { confidence }),
+  bulkAcceptLinks: (ids: number[]): Promise<{ count: number; requested: number }> =>
+    api.tenant.post(`/api/nf-transaction-links/bulk-accept/`, { ids }),
+  bulkRejectLinks: (ids: number[]): Promise<{ count: number; requested: number }> =>
+    api.tenant.post(`/api/nf-transaction-links/bulk-reject/`, { ids }),
   createManualLink: (body: {
     transaction: number
     nota_fiscal: number

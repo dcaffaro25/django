@@ -295,6 +295,34 @@ export function useAcceptAllAbove() {
   })
 }
 
+export function useBulkAcceptLinks() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: (ids: number[]) => billingApi.bulkAcceptLinks(ids),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "nf-tx-links"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "invoices"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "bp-group-memberships"] })
+      toast.success(`${res.count} vínculos aceitos.`)
+    },
+    onError: (e) => showError("Falha em aceite em massa", e),
+  })
+}
+
+export function useBulkRejectLinks() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: (ids: number[]) => billingApi.bulkRejectLinks(ids),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "nf-tx-links"] })
+      toast.success(`${res.count} vínculos rejeitados.`)
+    },
+    onError: (e) => showError("Falha ao rejeitar em massa", e),
+  })
+}
+
 export function useCreateManualLink() {
   const qc = useQueryClient()
   const sub = useSub()
