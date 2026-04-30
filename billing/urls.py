@@ -12,6 +12,9 @@ from .views import (
     NFTransactionLinkViewSet,
     InvoiceNFLinkViewSet,
     BillingTenantConfigViewSet,
+    BusinessPartnerGroupViewSet,
+    BusinessPartnerGroupMembershipViewSet,
+    BusinessPartnerAliasViewSet,
 )
 from .views_nfe import (
     NFeImportView,
@@ -36,6 +39,9 @@ router.register('nfe-eventos', NFeEventoViewSet)
 router.register('nf-transaction-links', NFTransactionLinkViewSet)
 router.register('invoice-nf-links', InvoiceNFLinkViewSet)
 router.register('billing-config', BillingTenantConfigViewSet)
+router.register('business-partner-groups', BusinessPartnerGroupViewSet)
+router.register('business-partner-group-memberships', BusinessPartnerGroupMembershipViewSet)
+router.register('business-partner-aliases', BusinessPartnerAliasViewSet)
 
 urlpatterns = [
     re_path(r'api/nfe/import/?$', NFeImportView.as_view(), name='nfe-import'),

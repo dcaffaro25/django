@@ -496,3 +496,8 @@ from .models_nfe import (  # noqa: E402
 from .models_nf_link import NFTransactionLink  # noqa: E402, F401
 from .models_config import BillingTenantConfig  # noqa: E402, F401
 from .models_critics import CriticAcknowledgement  # noqa: E402, F401
+from .models_groups import (  # noqa: E402, F401
+    BusinessPartnerGroup,
+    BusinessPartnerGroupMembership,
+    BusinessPartnerAlias,
+)

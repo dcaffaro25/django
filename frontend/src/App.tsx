@@ -40,6 +40,7 @@ import { NfLinkReviewPage } from "@/pages/billing/NfLinkReviewPage"
 import { BillingSettingsPage } from "@/pages/billing/BillingSettingsPage"
 import { BusinessPartnersPage } from "@/pages/billing/BusinessPartnersPage"
 import { ProductServicesPage } from "@/pages/billing/ProductServicesPage"
+import { GroupsPage } from "@/pages/billing/GroupsPage"
 import { AdminHomePage } from "@/pages/admin/AdminHomePage"
 import { UsersPage as AdminUsersPage } from "@/pages/admin/UsersPage"
 import { RuntimePage as AdminRuntimePage } from "@/pages/admin/RuntimePage"
@@ -132,6 +133,7 @@ export default function App() {
                     <Route path="parceiros" element={<BusinessPartnersPage />} />
                     <Route path="produtos" element={<ProductServicesPage />} />
                     <Route path="links" element={<NfLinkReviewPage />} />
+                    <Route path="grupos" element={<GroupsPage />} />
                     <Route path="settings" element={<BillingSettingsPage />} />
                   </Route>
                   <Route path="/hr/*" element={<PlaceholderPage title="RH" />} />

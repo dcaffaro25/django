@@ -112,6 +112,21 @@ def _score(
         # the NF was issued from the matriz (or vice-versa).
         score += Decimal("0.20")
         matched.append("cnpj_root")
+    elif cnpj_tx and (nf.emitente_id or nf.destinatario_id):
+        # Alias fallback: the Tx's CNPJ may belong to an acquirer or
+        # marketplace that the user has previously taught the system to
+        # resolve to a real BP. If that BP is the NF's emitente or
+        # destinatário, boost slightly less than cnpj_root.
+        try:
+            from billing.services.bp_alias_service import resolve_alias
+            aliased_bp = resolve_alias(tx.company, cnpj_tx)
+            if aliased_bp is not None and aliased_bp.id in (
+                nf.emitente_id, nf.destinatario_id,
+            ):
+                score += Decimal("0.18")
+                matched.append("cnpj_alias")
+        except Exception:
+            pass
 
     if tx.date and nf.data_emissao:
         try:
@@ -529,7 +544,15 @@ def persist_links(
 
 
 def accept_link(link: NFTransactionLink, *, user=None, notes: str = "") -> NFTransactionLink:
-    """Mark a single link as accepted. Idempotent."""
+    """Mark a single link as accepted. Idempotent.
+
+    Beyond marking the link itself, an accepted NF↔Tx link is a strong
+    signal that the Tx's counterparty (CNPJ on the bank/book side) and
+    the NF's counterparty (CNPJ on the fiscal side) are the same
+    economic actor. When the two resolve to *different* BPs, suggest a
+    BusinessPartnerGroup membership so future reports can consolidate
+    them. The suggestion call is best-effort — never breaks accept.
+    """
     if link.review_status == NFTransactionLink.REVIEW_ACCEPTED:
         return link
     link.review_status = NFTransactionLink.REVIEW_ACCEPTED
@@ -543,7 +566,42 @@ def accept_link(link: NFTransactionLink, *, user=None, notes: str = "") -> NFTra
         bump_version(link.company_id)
     except Exception:
         logger.exception("nf_link_service: bump_version failed for company_id=%s", link.company_id)
+    try:
+        _suggest_group_from_accepted_link(link)
+    except Exception:
+        logger.exception(
+            "nf_link_service: bp_group suggest failed for link_id=%s", link.id,
+        )
     return link
+
+
+def _suggest_group_from_accepted_link(link: NFTransactionLink) -> None:
+    """Resolve both sides of an accepted link to BPs and suggest grouping.
+
+    Tx side: ``Transaction.cnpj`` → BP via identifier (with cnpj_root
+    fallback inside ``resolve_bp_by_cnpj``).
+    NF side: ``_resolve_partner_for_nf`` already drops self-CNPJ, so it
+    returns the actual counterparty BP.
+    """
+    from billing.services.bp_group_service import (
+        resolve_bp_by_cnpj, upsert_membership_suggestion,
+    )
+    from billing.services.nf_invoice_sync import _resolve_partner_for_nf
+
+    tx = link.transaction
+    nf = link.nota_fiscal
+    if not tx or not nf:
+        return
+    bp_tx = resolve_bp_by_cnpj(tx.company, getattr(tx, "cnpj", None))
+    bp_nf = _resolve_partner_for_nf(nf)
+    if bp_tx is None or bp_nf is None or bp_tx.id == bp_nf.id:
+        return
+    upsert_membership_suggestion(
+        bp_tx, bp_nf,
+        method="nf_tx_link",
+        source_id=link.id,
+        confidence=link.confidence,
+    )
 
 
 def reject_link(link: NFTransactionLink, *, user=None, notes: str = "") -> NFTransactionLink:

@@ -218,6 +218,11 @@ export interface BusinessPartner {
   is_active: boolean
   created_at: string
   updated_at: string
+  // Group context — populated by the BusinessPartnerSerializer when the BP
+  // has an accepted group membership. null otherwise.
+  group_id: number | null
+  group_primary_partner_id: number | null
+  group_role: "primary" | "member" | null
 }
 
 export interface BusinessPartnerCategory {
@@ -349,4 +354,94 @@ export interface CriticAuditResponse {
   by_severity: Record<string, number>
   by_kind: Record<string, number>
   results: CriticAuditInvoiceRow[]
+}
+
+// =====================================================
+// BusinessPartnerGroup / Membership / Alias
+// =====================================================
+
+export type GroupReviewStatus = "suggested" | "accepted" | "rejected"
+export type GroupRole = "primary" | "member"
+
+export interface BusinessPartnerGroupMembership {
+  id: number
+  company: number
+  group: number
+  business_partner: number
+  role: GroupRole
+  review_status: GroupReviewStatus
+  confidence: string
+  hit_count: number
+  evidence: Array<{
+    method?: string
+    source?: string
+    source_id?: number | null
+    at?: string
+    confidence?: string
+    kind?: string
+  }>
+  reviewed_by: number | null
+  reviewed_at: string | null
+  // Denormalized for the review UI
+  business_partner_name: string
+  business_partner_identifier: string
+  business_partner_partner_type: "client" | "vendor" | "both"
+  group_name: string
+  group_primary_partner_id: number
+  created_at: string
+  updated_at: string
+}
+
+export interface BusinessPartnerGroup {
+  id: number
+  company: number
+  name: string
+  description: string
+  is_active: boolean
+  primary_partner: number
+  primary_partner_name: string
+  primary_partner_identifier: string
+  memberships: BusinessPartnerGroupMembership[]
+  member_count: number
+  accepted_member_count: number
+  created_at: string
+  updated_at: string
+}
+
+export type AliasReviewStatus = "suggested" | "accepted" | "rejected"
+
+export interface BusinessPartnerAlias {
+  id: number
+  company: number
+  business_partner: number
+  alias_identifier: string
+  review_status: AliasReviewStatus
+  source: string
+  confidence: string
+  hit_count: number
+  last_used_at: string | null
+  evidence: Array<{
+    source?: string
+    source_id?: number | null
+    at?: string
+    confidence?: string
+  }>
+  reviewed_by: number | null
+  reviewed_at: string | null
+  business_partner_name: string
+  business_partner_identifier: string
+  created_at: string
+  updated_at: string
+}
+
+export interface ConsolidatedBPRow {
+  kind: "group" | "standalone"
+  primary: BusinessPartner
+  members: BusinessPartner[]
+  group_id: number | null
+}
+
+export interface ConsolidatedBPResponse {
+  count: number
+  results: ConsolidatedBPRow[]
 }

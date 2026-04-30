@@ -4469,7 +4469,49 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                         i=idx,
                         error=str(lbl_exc),
                     )
-                
+
+                # Suggest BP-Group memberships when bank-side and book-side
+                # CNPJs resolve to different BusinessPartners. Best-effort —
+                # never blocks finalize.
+                try:
+                    from billing.services.bp_group_service import (
+                        suggest_groups_from_reconciliation,
+                    )
+                    suggest_groups_from_reconciliation(
+                        rec.company,
+                        bank_txs,
+                        journal_entries,
+                        reconciliation_id=rec.id,
+                    )
+                except Exception as grp_exc:
+                    _warn(
+                        "bp_group_suggest_error",
+                        request_id=request_id,
+                        i=idx,
+                        error=str(grp_exc),
+                    )
+
+                # Alias learning — handles the "bank CNPJ doesn't resolve to
+                # any BP" case (acquirers, marketplaces). Independent from
+                # the group suggestion above.
+                try:
+                    from billing.services.bp_alias_service import (
+                        suggest_aliases_from_reconciliation,
+                    )
+                    suggest_aliases_from_reconciliation(
+                        rec.company,
+                        bank_txs,
+                        journal_entries,
+                        reconciliation_id=rec.id,
+                    )
+                except Exception as alias_exc:
+                    _warn(
+                        "bp_alias_suggest_error",
+                        request_id=request_id,
+                        i=idx,
+                        error=str(alias_exc),
+                    )
+
                 # Mark used in this batch (so they won't be reused)
                 used_bank_ids_batch.update(bank_ids_used)
                 used_journal_ids_batch.update(journal_ids_used)
@@ -4942,6 +4984,44 @@ class BankTransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
                             request_id=request_id,
                             i=idx,
                             error=str(lbl_exc),
+                        )
+
+                    # BP-Group suggestion hook — mirrors the v1 finalize.
+                    try:
+                        from billing.services.bp_group_service import (
+                            suggest_groups_from_reconciliation,
+                        )
+                        suggest_groups_from_reconciliation(
+                            rec.company,
+                            bank_txs,
+                            journal_entries,
+                            reconciliation_id=rec.id,
+                        )
+                    except Exception as grp_exc:
+                        _warn(
+                            "bp_group_suggest_error_legacy",
+                            request_id=request_id,
+                            i=idx,
+                            error=str(grp_exc),
+                        )
+
+                    # Alias learning — mirrors the v1 finalize.
+                    try:
+                        from billing.services.bp_alias_service import (
+                            suggest_aliases_from_reconciliation,
+                        )
+                        suggest_aliases_from_reconciliation(
+                            rec.company,
+                            bank_txs,
+                            journal_entries,
+                            reconciliation_id=rec.id,
+                        )
+                    except Exception as alias_exc:
+                        _warn(
+                            "bp_alias_suggest_error_legacy",
+                            request_id=request_id,
+                            i=idx,
+                            error=str(alias_exc),
                         )
                     
                     #_info("reconciliation_created",request_id=request_id,i=idx,reconciliation_id=rec.id,status=rec_status,n_bank=len(bank_txs),n_journal=len(journal_entries))

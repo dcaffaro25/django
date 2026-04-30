@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { Save, X, FileText, ArrowUpFromLine, ArrowDownToLine } from "lucide-react"
+import { Save, X, FileText, ArrowUpFromLine, ArrowDownToLine, Crown, Network } from "lucide-react"
 import { Drawer } from "@/components/ui/drawer"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -11,6 +11,7 @@ import { Checkbox } from "@/components/ui/checkbox"
 import {
   useBusinessPartner, useBusinessPartnerCategories, useSaveBusinessPartner,
   useInvoicesByPartner, useNFsByEmitente, useNFsByDestinatario,
+  useBusinessPartnerGroup,
 } from "@/features/billing"
 import type { BusinessPartner } from "@/features/billing"
 import { useUserRole } from "@/features/auth/useUserRole"
@@ -266,6 +267,9 @@ export function BusinessPartnerEditDrawer({
           Ativo
         </label>
 
+        {!isNew && id != null && existing ? (
+          <GroupSection bp={existing} />
+        ) : null}
         {!isNew && id != null ? <RelatedSections partnerId={id} /> : null}
       </div>
 
@@ -367,3 +371,77 @@ function RelatedSections({ partnerId }: { partnerId: number }) {
   )
 }
 
+
+/**
+ * Renders the Group consolidation block for a BP that has an accepted
+ * group membership. Shows the primary partner badge, the other members,
+ * and a deep link to the Grupos page for management.
+ */
+function GroupSection({ bp }: { bp: BusinessPartner }) {
+  const groupId = bp.group_id ?? null
+  const group = useBusinessPartnerGroup(groupId)
+
+  if (groupId == null) return null
+  if (group.isLoading) {
+    return (
+      <div className="border-t border-border pt-3 text-[12px] text-muted-foreground">
+        Carregando grupo…
+      </div>
+    )
+  }
+  const g = group.data
+  if (!g) return null
+
+  const accepted = (g.memberships ?? []).filter((m) => m.review_status === "accepted")
+  const others = accepted.filter((m) => m.business_partner !== bp.id)
+  const isPrimary = bp.group_role === "primary"
+
+  return (
+    <div className="space-y-2 border-t border-border pt-3">
+      <div className="flex items-center gap-2 text-[13px]">
+        <Network className="h-4 w-4 text-info" />
+        <span className="font-semibold">Grupo: {g.name}</span>
+        {isPrimary ? (
+          <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 dark:bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-700 dark:text-amber-400">
+            <Crown className="h-3 w-3" />
+            primary
+          </span>
+        ) : (
+          <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
+            membro
+          </span>
+        )}
+      </div>
+      {others.length > 0 ? (
+        <ul className="space-y-1 pl-6">
+          {others.map((m) => (
+            <li
+              key={m.id}
+              className="flex items-center gap-2 text-[12px]"
+            >
+              {m.role === "primary" ? (
+                <Crown className="h-3 w-3 text-amber-500" />
+              ) : (
+                <span className="h-3 w-3" />
+              )}
+              <span className="truncate font-medium">{m.business_partner_name}</span>
+              <span className="font-mono text-[11px] text-muted-foreground">
+                {m.business_partner_identifier}
+              </span>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="pl-6 text-[12px] text-muted-foreground">
+          Nenhum outro parceiro neste grupo ainda.
+        </p>
+      )}
+      <a
+        href="/billing/grupos"
+        className="inline-block text-[11px] text-info underline-offset-2 hover:underline"
+      >
+        Gerenciar grupo →
+      </a>
+    </div>
+  )
+}

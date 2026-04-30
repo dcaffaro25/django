@@ -580,3 +580,138 @@ export function useDeleteProductServiceCategory() {
     onError: (e) => showError("Falha ao remover categoria", e),
   })
 }
+
+// ============================================================
+// BusinessPartnerGroup / Membership / Alias
+// ============================================================
+
+export function useBusinessPartnerGroups(params?: Record<string, string | number | boolean | undefined>) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["billing", sub, "bp-groups", params],
+    queryFn: () => billingApi.listBusinessPartnerGroups(params),
+    enabled: !!sub,
+  })
+}
+
+export function useBusinessPartnerGroup(id: number | null | undefined) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: id ? ["billing", sub, "bp-group", id] : ["billing", sub, "bp-group", "none"],
+    queryFn: () => billingApi.getBusinessPartnerGroup(id as number),
+    enabled: !!sub && id != null,
+  })
+}
+
+export function usePromoteGroupPrimary() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: ({ groupId, membershipId }: { groupId: number; membershipId: number }) =>
+      billingApi.promoteGroupPrimary(groupId, membershipId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "bp-groups"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "bp-group"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "partners"] })
+      toast.success("Primary do grupo atualizado.")
+    },
+    onError: (e) => showError("Falha ao promover primary", e),
+  })
+}
+
+export function useMergeGroup() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: ({ targetId, sourceGroupId }: { targetId: number; sourceGroupId: number }) =>
+      billingApi.mergeGroup(targetId, sourceGroupId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "bp-groups"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "bp-group-memberships"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "partners"] })
+      toast.success("Grupos mesclados.")
+    },
+    onError: (e) => showError("Falha ao mesclar grupos", e),
+  })
+}
+
+export function useGroupMemberships(params?: Record<string, string | number | boolean | undefined>) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["billing", sub, "bp-group-memberships", params],
+    queryFn: () => billingApi.listGroupMemberships(params),
+    enabled: !!sub,
+  })
+}
+
+export function useAcceptMembership() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: (id: number) => billingApi.acceptMembership(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "bp-group-memberships"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "bp-groups"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "partners"] })
+      toast.success("Membership aceito.")
+    },
+    onError: (e) => showError("Falha ao aceitar membership", e),
+  })
+}
+
+export function useRejectMembership() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: (id: number) => billingApi.rejectMembership(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "bp-group-memberships"] })
+      toast.success("Membership rejeitado.")
+    },
+    onError: (e) => showError("Falha ao rejeitar membership", e),
+  })
+}
+
+export function useBusinessPartnerAliases(params?: Record<string, string | number | boolean | undefined>) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["billing", sub, "bp-aliases", params],
+    queryFn: () => billingApi.listBusinessPartnerAliases(params),
+    enabled: !!sub,
+  })
+}
+
+export function useAcceptAlias() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: (id: number) => billingApi.acceptAlias(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "bp-aliases"] })
+      toast.success("Apelido aceito.")
+    },
+    onError: (e) => showError("Falha ao aceitar apelido", e),
+  })
+}
+
+export function useRejectAlias() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: (id: number) => billingApi.rejectAlias(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "bp-aliases"] })
+      toast.success("Apelido rejeitado.")
+    },
+    onError: (e) => showError("Falha ao rejeitar apelido", e),
+  })
+}
+
+export function useConsolidatedBPs(params?: Record<string, string | number | boolean | undefined>) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["billing", sub, "bp-consolidated", params],
+    queryFn: () => billingApi.listConsolidatedBPs(params),
+    enabled: !!sub,
+  })
+}

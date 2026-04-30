@@ -4,6 +4,8 @@ from .models import (
     ProductServiceCategory, ProductService,
     Contract, Invoice, InvoiceLine,
     NFTransactionLink, InvoiceNFLink, BillingTenantConfig,
+    BusinessPartnerGroup, BusinessPartnerGroupMembership,
+    BusinessPartnerAlias,
 )
 
 from multitenancy.serializers import FlexibleRelatedField, CompanySerializer
@@ -42,10 +44,33 @@ class BusinessPartnerCategorySerializer(serializers.ModelSerializer):
 
 class BusinessPartnerSerializer(serializers.ModelSerializer):
     category = serializers.PrimaryKeyRelatedField(queryset=BusinessPartnerCategory.objects.all(), allow_null=True)
+    # Group context — read-only annotations so the frontend can render the
+    # Leroy-Merlin-style "main + branches" view without a follow-up call.
+    group_id = serializers.SerializerMethodField()
+    group_primary_partner_id = serializers.SerializerMethodField()
+    group_role = serializers.SerializerMethodField()
 
     class Meta:
         model = BusinessPartner
         fields = '__all__'
+
+    def _accepted_membership(self, obj):
+        for m in obj.group_memberships.all():
+            if m.review_status == BusinessPartnerGroupMembership.REVIEW_ACCEPTED:
+                return m
+        return None
+
+    def get_group_id(self, obj):
+        m = self._accepted_membership(obj)
+        return m.group_id if m else None
+
+    def get_group_primary_partner_id(self, obj):
+        m = self._accepted_membership(obj)
+        return m.group.primary_partner_id if m else None
+
+    def get_group_role(self, obj):
+        m = self._accepted_membership(obj)
+        return m.role if m else None
 
 class ProductServiceCategorySerializer(serializers.ModelSerializer):
     class Meta:
@@ -256,3 +281,93 @@ class InvoiceDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = Invoice
         fields = '__all__'
+
+
+# ============================================================
+# BusinessPartnerGroup / Membership / Alias
+# ============================================================
+
+class BusinessPartnerGroupMembershipSerializer(serializers.ModelSerializer):
+    """Lista de membros de um grupo, com contexto suficiente para a UI
+    montar os cards de revisão sem N+1 follow-ups."""
+    business_partner_name = serializers.CharField(
+        source='business_partner.name', read_only=True,
+    )
+    business_partner_identifier = serializers.CharField(
+        source='business_partner.identifier', read_only=True,
+    )
+    business_partner_partner_type = serializers.CharField(
+        source='business_partner.partner_type', read_only=True,
+    )
+    group_name = serializers.CharField(source='group.name', read_only=True)
+    group_primary_partner_id = serializers.IntegerField(
+        source='group.primary_partner_id', read_only=True,
+    )
+
+    class Meta:
+        model = BusinessPartnerGroupMembership
+        fields = [
+            'id', 'company', 'group', 'business_partner',
+            'role', 'review_status', 'confidence', 'hit_count',
+            'evidence', 'reviewed_by', 'reviewed_at',
+            'business_partner_name', 'business_partner_identifier',
+            'business_partner_partner_type',
+            'group_name', 'group_primary_partner_id',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = [
+            'reviewed_by', 'reviewed_at', 'hit_count', 'evidence',
+        ]
+
+
+class BusinessPartnerGroupSerializer(serializers.ModelSerializer):
+    """Group + members embutidos, suficiente para render expansion na UI."""
+    primary_partner_name = serializers.CharField(
+        source='primary_partner.name', read_only=True,
+    )
+    primary_partner_identifier = serializers.CharField(
+        source='primary_partner.identifier', read_only=True,
+    )
+    memberships = BusinessPartnerGroupMembershipSerializer(many=True, read_only=True)
+    member_count = serializers.SerializerMethodField()
+    accepted_member_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BusinessPartnerGroup
+        fields = [
+            'id', 'company', 'name', 'description', 'is_active',
+            'primary_partner', 'primary_partner_name', 'primary_partner_identifier',
+            'memberships', 'member_count', 'accepted_member_count',
+            'created_at', 'updated_at',
+        ]
+
+    def get_member_count(self, obj):
+        return obj.memberships.count()
+
+    def get_accepted_member_count(self, obj):
+        return obj.memberships.filter(
+            review_status=BusinessPartnerGroupMembership.REVIEW_ACCEPTED,
+        ).count()
+
+
+class BusinessPartnerAliasSerializer(serializers.ModelSerializer):
+    business_partner_name = serializers.CharField(
+        source='business_partner.name', read_only=True,
+    )
+    business_partner_identifier = serializers.CharField(
+        source='business_partner.identifier', read_only=True,
+    )
+
+    class Meta:
+        model = BusinessPartnerAlias
+        fields = [
+            'id', 'company', 'business_partner', 'alias_identifier',
+            'review_status', 'source', 'confidence', 'hit_count',
+            'last_used_at', 'evidence', 'reviewed_by', 'reviewed_at',
+            'business_partner_name', 'business_partner_identifier',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = [
+            'reviewed_by', 'reviewed_at', 'hit_count', 'evidence',
+            'last_used_at',
+        ]

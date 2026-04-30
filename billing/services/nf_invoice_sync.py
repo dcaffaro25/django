@@ -187,7 +187,14 @@ def _relation_type_for_nf(nf) -> str:
 
 def attach_invoice_to_nf(invoice, nf, *, relation_type: Optional[str] = None,
                          allocated_amount=None, notes: str = ""):
-    """Idempotent M:N attach. Triggers fiscal_status refresh."""
+    """Idempotent M:N attach. Triggers fiscal_status refresh.
+
+    When the Invoice's ``partner`` differs from the NF's resolved
+    counterparty BP, also raises a BP-Group suggestion — common when the
+    Invoice was created earlier from one document (e.g. a bank deposit
+    showing the acquirer's CNPJ) but the NF carries the actual customer
+    CNPJ.
+    """
     from billing.models import InvoiceNFLink
     if invoice.company_id != nf.company_id:
         raise ValueError("Invoice e NF de tenants diferentes; recusando attach.")
@@ -208,6 +215,29 @@ def attach_invoice_to_nf(invoice, nf, *, relation_type: Optional[str] = None,
         refresh(invoice, persist=True)
     except Exception:
         logger.exception("attach_invoice_to_nf: fiscal_status.refresh failed for invoice_id=%s", invoice.id)
+    # Suggest BP-Group when invoice partner ≠ NF counterparty.
+    try:
+        nf_partner = _resolve_partner_for_nf(nf)
+        inv_partner = invoice.partner
+        if (
+            nf_partner is not None
+            and inv_partner is not None
+            and nf_partner.id != inv_partner.id
+        ):
+            from billing.services.bp_group_service import (
+                upsert_membership_suggestion,
+            )
+            upsert_membership_suggestion(
+                inv_partner, nf_partner,
+                method="nf_invoice_attach",
+                source_id=invoice.id,
+                confidence=Decimal("0.75"),
+            )
+    except Exception:
+        logger.exception(
+            "attach_invoice_to_nf: bp_group suggest failed for invoice_id=%s",
+            invoice.id,
+        )
     return link, created
 
 

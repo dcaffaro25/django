@@ -9,6 +9,8 @@ from .models import (
     Contract, Invoice, InvoiceLine,
     NFTransactionLink, InvoiceNFLink, BillingTenantConfig,
     NotaFiscal,
+    BusinessPartnerGroup, BusinessPartnerGroupMembership,
+    BusinessPartnerAlias,
 )
 from .serializers import (
     BusinessPartnerCategorySerializer, BusinessPartnerSerializer,
@@ -17,6 +19,8 @@ from .serializers import (
     NFTransactionLinkSerializer, InvoiceNFLinkSerializer,
     BillingTenantConfigSerializer, InvoiceDetailSerializer,
     InvoiceListSerializer, InvoiceLineWithContextSerializer,
+    BusinessPartnerGroupSerializer, BusinessPartnerGroupMembershipSerializer,
+    BusinessPartnerAliasSerializer,
 )
 from multitenancy.mixins import ScopedQuerysetMixin
 from multitenancy.api_utils import generic_bulk_create, generic_bulk_update, generic_bulk_delete
@@ -38,7 +42,9 @@ class BusinessPartnerCategoryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet)
         return generic_bulk_delete(self, request.data)
 
 class BusinessPartnerViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
-    queryset = BusinessPartner.objects.all()
+    queryset = BusinessPartner.objects.all().prefetch_related(
+        'group_memberships__group',
+    )
     serializer_class = BusinessPartnerSerializer
 
     @action(methods=['post'], detail=False)
@@ -52,6 +58,103 @@ class BusinessPartnerViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     @action(methods=['delete'], detail=False)
     def bulk_delete(self, request, **kwargs):
         return generic_bulk_delete(self, request.data)
+
+    @action(methods=['get'], detail=False, url_path='consolidated')
+    def consolidated(self, request, **kwargs):
+        """Returns BPs grouped by economic Group.
+
+        Each row is either a Group (when ``primary_only=1`` filter is set
+        and the BP is the primary of its Group) or a standalone BP (no
+        Group). Members of a Group are nested inside ``members`` so the
+        frontend can render the Leroy-Merlin pattern: a single visible
+        line per economic actor with an expand chevron.
+
+        Query params:
+          - partner_type: 'client' | 'vendor' | 'both'
+          - is_active: 0 | 1
+          - search: substring match on name or identifier
+        """
+        from billing.models import BusinessPartnerGroupMembership as _M
+        qs = self.get_queryset()
+        params = request.query_params
+
+        partner_type = params.get('partner_type')
+        if partner_type:
+            qs = qs.filter(partner_type=partner_type)
+        is_active = params.get('is_active')
+        if is_active is not None:
+            qs = qs.filter(is_active=is_active in ('1', 'true', 'True'))
+        search = params.get('search', '').strip()
+        if search:
+            from django.db.models import Q as _Q
+            qs = qs.filter(_Q(name__icontains=search) | _Q(identifier__icontains=search))
+
+        # Build a primary→members map and a list of standalone BPs.
+        bps = list(qs.order_by('name', 'id')[:1000])
+        bp_by_id = {bp.id: bp for bp in bps}
+
+        primary_to_members: dict[int, list] = {}
+        members_seen: set = set()
+        primaries: list = []
+        standalone: list = []
+
+        # Get accepted memberships for the visible BPs.
+        memberships = (
+            _M.objects
+            .filter(
+                business_partner_id__in=list(bp_by_id),
+                review_status=_M.REVIEW_ACCEPTED,
+            )
+            .select_related('group__primary_partner')
+        )
+        bp_to_group = {m.business_partner_id: m for m in memberships}
+
+        for bp in bps:
+            membership = bp_to_group.get(bp.id)
+            if membership is None:
+                standalone.append(bp)
+                continue
+            primary_id = membership.group.primary_partner_id
+            if bp.id == primary_id:
+                primaries.append(bp)
+            else:
+                primary_to_members.setdefault(primary_id, []).append(bp)
+                members_seen.add(bp.id)
+
+        # Edge case: a BP is a member of a Group whose primary isn't in the
+        # current visible page — fetch that primary so the row can render.
+        missing_primary_ids = [
+            pid for pid in primary_to_members
+            if pid not in bp_by_id
+        ]
+        if missing_primary_ids:
+            extras = (
+                BusinessPartner.objects
+                .filter(id__in=missing_primary_ids)
+                .prefetch_related('group_memberships__group')
+            )
+            for bp in extras:
+                bp_by_id[bp.id] = bp
+                primaries.append(bp)
+
+        # Build the response shape.
+        rows = []
+        for primary in primaries:
+            members = primary_to_members.get(primary.id, [])
+            rows.append({
+                'kind': 'group',
+                'primary': BusinessPartnerSerializer(primary).data,
+                'members': BusinessPartnerSerializer(members, many=True).data,
+                'group_id': bp_to_group.get(primary.id).group_id if primary.id in bp_to_group else None,
+            })
+        for bp in standalone:
+            rows.append({
+                'kind': 'standalone',
+                'primary': BusinessPartnerSerializer(bp).data,
+                'members': [],
+                'group_id': None,
+            })
+        return Response({'count': len(rows), 'results': rows})
 
 class ProductServiceCategoryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = ProductServiceCategory.objects.all()
@@ -529,3 +632,244 @@ class BillingTenantConfigViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)
+
+
+# ============================================================
+# BusinessPartnerGroup / Membership / Alias
+# ============================================================
+
+class BusinessPartnerGroupViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
+    """CRUD on BusinessPartnerGroup. ``memberships`` are managed via the
+    ``BusinessPartnerGroupMembershipViewSet`` plus the custom actions on
+    this viewset for higher-level operations (``promote-primary``,
+    ``merge``)."""
+    queryset = BusinessPartnerGroup.objects.all().select_related(
+        'primary_partner',
+    ).prefetch_related(
+        'memberships__business_partner',
+    )
+    serializer_class = BusinessPartnerGroupSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = getattr(self.request, 'query_params', None)
+        if params is None:
+            return qs
+        if params.get('is_active') is not None:
+            qs = qs.filter(is_active=params.get('is_active') in ('1', 'true', 'True'))
+        bp_id = params.get('business_partner')
+        if bp_id:
+            try:
+                qs = qs.filter(memberships__business_partner_id=int(bp_id)).distinct()
+            except (TypeError, ValueError):
+                pass
+        return qs.order_by('name', 'id')
+
+    @action(methods=['post'], detail=True, url_path='promote-primary')
+    def promote_primary(self, request, pk=None, **kwargs):
+        """Move o role 'primary' para outro membership do mesmo grupo.
+        Body: { membership_id }."""
+        from django.db import transaction as db_transaction
+        group = self.get_object()
+        membership_id = request.data.get('membership_id')
+        if not membership_id:
+            return Response({'detail': 'membership_id é obrigatório.'}, status=400)
+        try:
+            new_primary_membership = group.memberships.get(pk=int(membership_id))
+        except BusinessPartnerGroupMembership.DoesNotExist:
+            return Response(
+                {'detail': 'Membership não pertence a este grupo.'}, status=404,
+            )
+        if new_primary_membership.review_status != BusinessPartnerGroupMembership.REVIEW_ACCEPTED:
+            return Response(
+                {'detail': 'Membership precisa estar aceito antes de virar primary.'},
+                status=400,
+            )
+        with db_transaction.atomic():
+            current_primary = group.memberships.filter(
+                role=BusinessPartnerGroupMembership.ROLE_PRIMARY,
+            ).first()
+            if current_primary is not None:
+                current_primary.role = BusinessPartnerGroupMembership.ROLE_MEMBER
+                current_primary.save(update_fields=['role', 'updated_at'])
+            new_primary_membership.role = BusinessPartnerGroupMembership.ROLE_PRIMARY
+            new_primary_membership.save(update_fields=['role', 'updated_at'])
+            group.primary_partner = new_primary_membership.business_partner
+            group.name = new_primary_membership.business_partner.name
+            group.save(update_fields=['primary_partner', 'name', 'updated_at'])
+        return Response(BusinessPartnerGroupSerializer(group).data)
+
+    @action(methods=['post'], detail=True, url_path='merge')
+    def merge(self, request, pk=None, **kwargs):
+        """Mescla outro grupo nele. Move todos os memberships do grupo de
+        origem para este, descartando o primary do origem (vira member).
+        Body: { source_group_id }."""
+        from django.db import transaction as db_transaction
+        target = self.get_object()
+        source_id = request.data.get('source_group_id')
+        if not source_id:
+            return Response({'detail': 'source_group_id é obrigatório.'}, status=400)
+        try:
+            source = BusinessPartnerGroup.objects.get(
+                pk=int(source_id), company=target.company,
+            )
+        except BusinessPartnerGroup.DoesNotExist:
+            return Response({'detail': 'Source group não encontrado.'}, status=404)
+        if source.id == target.id:
+            return Response({'detail': 'Não pode mesclar consigo mesmo.'}, status=400)
+
+        with db_transaction.atomic():
+            for membership in source.memberships.all():
+                # If the BP is already a member of target, skip; otherwise
+                # move it as 'member' (target keeps its primary).
+                already = target.memberships.filter(
+                    business_partner=membership.business_partner,
+                ).first()
+                if already is not None:
+                    membership.delete()
+                    continue
+                membership.group = target
+                membership.role = BusinessPartnerGroupMembership.ROLE_MEMBER
+                membership.save(update_fields=['group', 'role', 'updated_at'])
+            source.delete()
+        target.refresh_from_db()
+        return Response(BusinessPartnerGroupSerializer(target).data)
+
+
+class BusinessPartnerGroupMembershipViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
+    """CRUD on memberships + custom accept/reject actions."""
+    queryset = BusinessPartnerGroupMembership.objects.all().select_related(
+        'group', 'group__primary_partner', 'business_partner', 'reviewed_by',
+    )
+    serializer_class = BusinessPartnerGroupMembershipSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = getattr(self.request, 'query_params', None)
+        if params is None:
+            return qs
+        rs = params.get('review_status')
+        if rs:
+            qs = qs.filter(review_status=rs)
+        group = params.get('group')
+        if group:
+            try:
+                qs = qs.filter(group_id=int(group))
+            except (TypeError, ValueError):
+                pass
+        bp = params.get('business_partner')
+        if bp:
+            try:
+                qs = qs.filter(business_partner_id=int(bp))
+            except (TypeError, ValueError):
+                pass
+        merge_only = params.get('merge_only')
+        if merge_only in ('1', 'true', 'True'):
+            # Filter by evidence kind=merge — JSONField "@>" operator.
+            qs = qs.filter(evidence__contains=[{'kind': 'merge'}])
+        ordering = params.get('ordering') or '-confidence'
+        return qs.order_by(ordering, '-id')
+
+    @action(methods=['post'], detail=True, url_path='accept')
+    def accept(self, request, pk=None, **kwargs):
+        from django.db import transaction as db_transaction
+        from django.utils import timezone
+        membership = self.get_object()
+        if membership.review_status == BusinessPartnerGroupMembership.REVIEW_ACCEPTED:
+            return Response(BusinessPartnerGroupMembershipSerializer(membership).data)
+        with db_transaction.atomic():
+            membership.review_status = BusinessPartnerGroupMembership.REVIEW_ACCEPTED
+            membership.reviewed_by = request.user if request.user.is_authenticated else None
+            membership.reviewed_at = timezone.now()
+            membership.save()
+            # Reject conflicting suggestions for this BP in other groups.
+            (
+                BusinessPartnerGroupMembership.objects
+                .filter(
+                    business_partner=membership.business_partner,
+                    review_status=BusinessPartnerGroupMembership.REVIEW_SUGGESTED,
+                )
+                .exclude(group_id=membership.group_id)
+                .update(
+                    review_status=BusinessPartnerGroupMembership.REVIEW_REJECTED,
+                    reviewed_at=timezone.now(),
+                )
+            )
+        membership.refresh_from_db()
+        return Response(BusinessPartnerGroupMembershipSerializer(membership).data)
+
+    @action(methods=['post'], detail=True, url_path='reject')
+    def reject(self, request, pk=None, **kwargs):
+        from django.utils import timezone
+        membership = self.get_object()
+        if membership.review_status == BusinessPartnerGroupMembership.REVIEW_REJECTED:
+            return Response(BusinessPartnerGroupMembershipSerializer(membership).data)
+        membership.review_status = BusinessPartnerGroupMembership.REVIEW_REJECTED
+        membership.reviewed_by = request.user if request.user.is_authenticated else None
+        membership.reviewed_at = timezone.now()
+        membership.save()
+        return Response(BusinessPartnerGroupMembershipSerializer(membership).data)
+
+
+class BusinessPartnerAliasViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
+    queryset = BusinessPartnerAlias.objects.all().select_related(
+        'business_partner', 'reviewed_by',
+    )
+    serializer_class = BusinessPartnerAliasSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = getattr(self.request, 'query_params', None)
+        if params is None:
+            return qs
+        rs = params.get('review_status')
+        if rs:
+            qs = qs.filter(review_status=rs)
+        bp = params.get('business_partner')
+        if bp:
+            try:
+                qs = qs.filter(business_partner_id=int(bp))
+            except (TypeError, ValueError):
+                pass
+        ordering = params.get('ordering') or '-hit_count'
+        return qs.order_by(ordering, '-id')
+
+    @action(methods=['post'], detail=True, url_path='accept')
+    def accept(self, request, pk=None, **kwargs):
+        from django.utils import timezone
+        alias = self.get_object()
+        if alias.review_status == BusinessPartnerAlias.REVIEW_ACCEPTED:
+            return Response(BusinessPartnerAliasSerializer(alias).data)
+        # Refuse if a different BP already owns this identifier as accepted.
+        conflict = (
+            BusinessPartnerAlias.objects
+            .filter(
+                company=alias.company,
+                alias_identifier=alias.alias_identifier,
+                review_status=BusinessPartnerAlias.REVIEW_ACCEPTED,
+            )
+            .exclude(pk=alias.pk)
+            .exists()
+        )
+        if conflict:
+            return Response(
+                {'detail': 'Outro alias aceito já reivindica este identificador.'},
+                status=409,
+            )
+        alias.review_status = BusinessPartnerAlias.REVIEW_ACCEPTED
+        alias.reviewed_by = request.user if request.user.is_authenticated else None
+        alias.reviewed_at = timezone.now()
+        alias.save()
+        return Response(BusinessPartnerAliasSerializer(alias).data)
+
+    @action(methods=['post'], detail=True, url_path='reject')
+    def reject(self, request, pk=None, **kwargs):
+        from django.utils import timezone
+        alias = self.get_object()
+        if alias.review_status == BusinessPartnerAlias.REVIEW_REJECTED:
+            return Response(BusinessPartnerAliasSerializer(alias).data)
+        alias.review_status = BusinessPartnerAlias.REVIEW_REJECTED
+        alias.reviewed_by = request.user if request.user.is_authenticated else None
+        alias.reviewed_at = timezone.now()
+        alias.save()
+        return Response(BusinessPartnerAliasSerializer(alias).data)

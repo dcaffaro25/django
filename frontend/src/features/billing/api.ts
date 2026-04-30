@@ -2,7 +2,11 @@ import { api, unwrapList } from "@/lib/api-client"
 import type {
   BillingTenantConfig,
   BusinessPartner,
+  BusinessPartnerAlias,
   BusinessPartnerCategory,
+  BusinessPartnerGroup,
+  BusinessPartnerGroupMembership,
+  ConsolidatedBPResponse,
   CriticAuditResponse,
   CriticsResponse,
   Invoice,
@@ -235,4 +239,77 @@ export const billingApi = {
   },
   deleteProductServiceCategory: (id: number) =>
     api.tenant.delete(`/api/product_service_categories/${id}/`),
+
+  // ============================================================
+  // BusinessPartnerGroup
+  // ============================================================
+  listBusinessPartnerGroups: async (params?: AnyParams): Promise<BusinessPartnerGroup[]> => {
+    const qs = toQueryString(params)
+    const data = await api.tenant.get<BusinessPartnerGroup[] | PaginatedListResponse<BusinessPartnerGroup>>(
+      `/api/business-partner-groups/${qs}`,
+    )
+    return unwrapList(data as never)
+  },
+  getBusinessPartnerGroup: (id: number): Promise<BusinessPartnerGroup> =>
+    api.tenant.get<BusinessPartnerGroup>(`/api/business-partner-groups/${id}/`),
+  saveBusinessPartnerGroup: (id: number | null, body: Partial<BusinessPartnerGroup>): Promise<BusinessPartnerGroup> => {
+    if (id == null) return api.tenant.post<BusinessPartnerGroup>("/api/business-partner-groups/", body)
+    return api.tenant.patch<BusinessPartnerGroup>(`/api/business-partner-groups/${id}/`, body)
+  },
+  deleteBusinessPartnerGroup: (id: number) =>
+    api.tenant.delete(`/api/business-partner-groups/${id}/`),
+  promoteGroupPrimary: (groupId: number, membershipId: number): Promise<BusinessPartnerGroup> =>
+    api.tenant.post<BusinessPartnerGroup>(
+      `/api/business-partner-groups/${groupId}/promote-primary/`,
+      { membership_id: membershipId },
+    ),
+  mergeGroup: (targetId: number, sourceGroupId: number): Promise<BusinessPartnerGroup> =>
+    api.tenant.post<BusinessPartnerGroup>(
+      `/api/business-partner-groups/${targetId}/merge/`,
+      { source_group_id: sourceGroupId },
+    ),
+
+  // ============================================================
+  // BusinessPartnerGroupMembership
+  // ============================================================
+  listGroupMemberships: async (params?: AnyParams): Promise<BusinessPartnerGroupMembership[]> => {
+    const qs = toQueryString(params)
+    const data = await api.tenant.get<BusinessPartnerGroupMembership[] | PaginatedListResponse<BusinessPartnerGroupMembership>>(
+      `/api/business-partner-group-memberships/${qs}`,
+    )
+    return unwrapList(data as never)
+  },
+  acceptMembership: (id: number): Promise<BusinessPartnerGroupMembership> =>
+    api.tenant.post<BusinessPartnerGroupMembership>(
+      `/api/business-partner-group-memberships/${id}/accept/`, {},
+    ),
+  rejectMembership: (id: number): Promise<BusinessPartnerGroupMembership> =>
+    api.tenant.post<BusinessPartnerGroupMembership>(
+      `/api/business-partner-group-memberships/${id}/reject/`, {},
+    ),
+
+  // ============================================================
+  // BusinessPartnerAlias
+  // ============================================================
+  listBusinessPartnerAliases: async (params?: AnyParams): Promise<BusinessPartnerAlias[]> => {
+    const qs = toQueryString(params)
+    const data = await api.tenant.get<BusinessPartnerAlias[] | PaginatedListResponse<BusinessPartnerAlias>>(
+      `/api/business-partner-aliases/${qs}`,
+    )
+    return unwrapList(data as never)
+  },
+  acceptAlias: (id: number): Promise<BusinessPartnerAlias> =>
+    api.tenant.post<BusinessPartnerAlias>(`/api/business-partner-aliases/${id}/accept/`, {}),
+  rejectAlias: (id: number): Promise<BusinessPartnerAlias> =>
+    api.tenant.post<BusinessPartnerAlias>(`/api/business-partner-aliases/${id}/reject/`, {}),
+
+  // ============================================================
+  // BP consolidated view (Leroy-Merlin pattern)
+  // ============================================================
+  listConsolidatedBPs: (params?: AnyParams): Promise<ConsolidatedBPResponse> => {
+    const qs = toQueryString(params)
+    return api.tenant.get<ConsolidatedBPResponse>(
+      `/api/business_partners/consolidated/${qs}`,
+    )
+  },
 }

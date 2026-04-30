@@ -1,10 +1,10 @@
 import { Outlet } from "react-router-dom"
 import {
   FileText, Receipt, Link as LinkIcon, Settings as SettingsIcon,
-  Users, Package,
+  Users, Package, Network,
 } from "lucide-react"
 import { TabbedShell } from "@/components/layout/TabbedShell"
-import { useNfTxLinks } from "@/features/billing"
+import { useGroupMemberships, useNfTxLinks } from "@/features/billing"
 
 /**
  * Hub page for the Faturamento module.
@@ -22,6 +22,9 @@ export function BillingHubPage() {
   // operators land here precisely to clear that queue.
   const pending = useNfTxLinks({ review_status: "suggested" })
   const pendingCount = pending.data?.length ?? 0
+  // Same idea for the Grupos tab — surface pending suggestions count.
+  const groupSuggestions = useGroupMemberships({ review_status: "suggested" })
+  const groupSuggestionCount = groupSuggestions.data?.length ?? 0
 
   return (
     <TabbedShell
@@ -37,6 +40,12 @@ export function BillingHubPage() {
           label: "Vínculos NF↔Tx",
           icon: LinkIcon,
           badge: pendingCount > 0 ? pendingCount : null,
+        },
+        {
+          to: "/billing/grupos",
+          label: "Grupos",
+          icon: Network,
+          badge: groupSuggestionCount > 0 ? groupSuggestionCount : null,
         },
         { to: "/billing/settings", label: "Configurações", icon: SettingsIcon },
       ]}
