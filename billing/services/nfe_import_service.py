@@ -611,8 +611,16 @@ def _post_import_billing_hooks(nf, company):
             )
 
     try:
-        from billing.services.nf_invoice_sync import match_or_create_invoice_for_nf
-        match_or_create_invoice_for_nf(nf)
+        from billing.services.nf_invoice_sync import (
+            match_or_create_invoice_for_nf, auto_attach_devolucao_to_parent_invoice,
+        )
+        # Devoluções (finalidade=4) auto-attach to the parent Invoice that
+        # owns the referenced original NF. Originals (finalidade=1) go
+        # through the standard match-or-create flow.
+        if nf.finalidade == 4:
+            auto_attach_devolucao_to_parent_invoice(nf)
+        else:
+            match_or_create_invoice_for_nf(nf)
     except Exception:
         import logging
         logging.getLogger(__name__).exception(

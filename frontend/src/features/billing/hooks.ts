@@ -108,6 +108,56 @@ export function useInvoiceCritics(id: number | null | undefined) {
   })
 }
 
+export function useAcknowledgeCritic() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: ({ invoiceId, ...body }: {
+      invoiceId: number; kind: string; subject_type: string;
+      subject_id: number; note?: string;
+    }) => billingApi.acknowledgeCritic(invoiceId, body),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "invoice-critics", vars.invoiceId] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "invoices"] })
+      toast.success("Crítica aceita.")
+    },
+    onError: (e) => showError("Falha ao aceitar crítica", e),
+  })
+}
+
+export function useUnacknowledgeCritic() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: ({ invoiceId, ...body }: {
+      invoiceId: number; kind: string; subject_type: string; subject_id: number;
+    }) => billingApi.unacknowledgeCritic(invoiceId, body),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "invoice-critics", vars.invoiceId] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "invoices"] })
+      toast.success("Aceite removido.")
+    },
+    onError: (e) => showError("Falha ao remover aceite", e),
+  })
+}
+
+export function useAuditCritics() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: (body?: Parameters<typeof billingApi.auditCritics>[0]) =>
+      billingApi.auditCritics(body),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "invoices"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "invoice-critics"] })
+      toast.success(
+        `Auditoria: ${res.swept} faturas analisadas, ${res.invoices_with_critics_count} com críticas.`,
+      )
+    },
+    onError: (e) => showError("Falha na auditoria", e),
+  })
+}
+
 export function useRefreshFiscalStatus() {
   const qc = useQueryClient()
   const sub = useSub()

@@ -158,6 +158,9 @@ def refresh(invoice, *, persist: bool = True) -> str:
     """
     Recompute and (by default) write back to invoice.fiscal_status. Returns
     the new status value. Idempotent.
+
+    Also re-counts unacknowledged critics and stores the totals on the
+    Invoice so list views can filter without per-row computation.
     """
     new_status, breakdown = compute_fiscal_status(invoice)
     has_cce = bool(breakdown.get("has_pending_cce"))
@@ -174,6 +177,27 @@ def refresh(invoice, *, persist: bool = True) -> str:
         update_fields.append("has_pending_corrections")
     invoice.fiscal_status_computed_at = timezone.now()
     update_fields.append("fiscal_status_computed_at")
+
+    # Critics tally — best-effort. Never block the fiscal_status save on this.
+    try:
+        from billing.services.critics_service import (
+            compute_critics_for_invoice, annotate_acknowledgements, severity_counts,
+        )
+        critics = compute_critics_for_invoice(invoice)
+        annotate_acknowledgements(invoice, critics)
+        sev = severity_counts(critics, only_unacknowledged=True)
+        new_count = sum(sev.values())
+        if invoice.critics_count != new_count:
+            invoice.critics_count = new_count
+            update_fields.append("critics_count")
+        if invoice.critics_count_by_severity != sev:
+            invoice.critics_count_by_severity = sev
+            update_fields.append("critics_count_by_severity")
+    except Exception:
+        logger.exception(
+            "fiscal_status_service: critics tally failed for invoice_id=%s",
+            invoice.id,
+        )
 
     if update_fields:
         invoice.save(update_fields=update_fields)

@@ -211,6 +211,63 @@ def attach_invoice_to_nf(invoice, nf, *, relation_type: Optional[str] = None,
     return link, created
 
 
+def auto_attach_devolucao_to_parent_invoice(nf) -> int:
+    """
+    For a devolução NF (finalidade=4), find every Invoice whose linked NFs
+    include any of the NFs this devolução references, and attach the
+    devolução with relation_type='devolucao'.
+
+    Returns the number of attachments created. Idempotent — re-running on
+    an already-attached devolução produces zero new attachments.
+    """
+    from billing.models import Invoice, InvoiceNFLink, NotaFiscalReferencia
+
+    if nf.finalidade != 4:
+        return 0
+
+    # Collect referenced original NFs
+    refs = list(
+        NotaFiscalReferencia.objects
+        .filter(company=nf.company, nota_fiscal=nf)
+        .values_list("nota_referenciada_id", flat=True)
+    )
+    referenced_ids = [r for r in refs if r is not None]
+    if not referenced_ids:
+        return 0
+
+    # Invoices that have any of those NFs M2M-attached
+    parent_invoices = list(
+        Invoice.objects
+        .filter(company=nf.company, notas_fiscais__id__in=referenced_ids)
+        .distinct()
+    )
+    if not parent_invoices:
+        return 0
+
+    created = 0
+    for inv in parent_invoices:
+        link, was_created = InvoiceNFLink.objects.get_or_create(
+            company=inv.company,
+            invoice=inv,
+            nota_fiscal=nf,
+            defaults={
+                "relation_type": InvoiceNFLink.REL_DEVOLUCAO,
+                "notes": "Auto-vinculado pela importação (devolução referencia NF da fatura).",
+            },
+        )
+        if was_created:
+            created += 1
+            try:
+                from billing.services.fiscal_status_service import refresh
+                refresh(inv, persist=True)
+            except Exception:
+                logger.exception(
+                    "auto_attach_devolucao: fiscal_status.refresh failed for invoice_id=%s",
+                    inv.id,
+                )
+    return created
+
+
 @db_transaction.atomic
 def match_or_create_invoice_for_nf(
     nf, *, dry_run: bool = False, force: bool = False,

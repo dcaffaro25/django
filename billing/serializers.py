@@ -108,6 +108,7 @@ class InvoiceListSerializer(serializers.ModelSerializer):
             'has_pending_corrections', 'currency',
             'total_amount', 'tax_amount', 'discount_amount',
             'description',
+            'critics_count', 'critics_count_by_severity',
             'created_at', 'updated_at',
         ]
 

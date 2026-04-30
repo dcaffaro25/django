@@ -3,6 +3,7 @@ import type {
   BillingTenantConfig,
   BusinessPartner,
   BusinessPartnerCategory,
+  CriticAuditResponse,
   CriticsResponse,
   Invoice,
   InvoiceDetail,
@@ -56,6 +57,21 @@ export const billingApi = {
     api.tenant.post<InvoiceDetail>(`/api/invoices/${invoiceId}/refresh-fiscal-status/`, {}),
   getInvoiceCritics: (invoiceId: number): Promise<CriticsResponse> =>
     api.tenant.get<CriticsResponse>(`/api/invoices/${invoiceId}/critics/`),
+  acknowledgeCritic: (invoiceId: number, body: {
+    kind: string; subject_type: string; subject_id: number; note?: string;
+  }): Promise<{ acknowledged: boolean; ack_id: number }> =>
+    api.tenant.post(`/api/invoices/${invoiceId}/acknowledge-critic/`, body),
+  unacknowledgeCritic: (invoiceId: number, body: {
+    kind: string; subject_type: string; subject_id: number;
+  }): Promise<{ unacknowledged: boolean }> =>
+    api.tenant.delete(`/api/invoices/${invoiceId}/unacknowledge-critic/`, { data: body }),
+  auditCritics: (body?: {
+    invoice_ids?: number[];
+    severity_in?: ("error" | "warning" | "info")[];
+    only_unacknowledged?: boolean;
+    persist?: boolean;
+  }): Promise<CriticAuditResponse> =>
+    api.tenant.post<CriticAuditResponse>(`/api/invoices/audit-critics/`, body ?? {}),
 
   // ============================================================
   // NotaFiscal (read-only listing for picking)

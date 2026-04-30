@@ -35,6 +35,8 @@ export interface Invoice {
   id: number
   company: number
   partner: number
+  partner_name?: string
+  partner_identifier?: string
   contract: number | null
   invoice_type: "sale" | "purchase"
   invoice_number: string
@@ -50,6 +52,8 @@ export interface Invoice {
   currency: number | null
   description: string
   erp_id: string | null
+  critics_count?: number
+  critics_count_by_severity?: { error?: number; warning?: number; info?: number }
 }
 
 export interface InvoiceDetail extends Invoice {
@@ -313,10 +317,36 @@ export interface Critic {
   subject_type: "invoice" | "nota_fiscal" | "nota_fiscal_item"
   subject_id: number
   evidence: Record<string, unknown>
+  acknowledged?: boolean
+  acknowledged_at?: string | null
+  acknowledged_by_email?: string | null
+  acknowledged_note?: string
 }
 
 export interface CriticsResponse {
   count: number
+  total_including_acknowledged?: number
   by_severity: { error: number; warning: number; info: number }
   items: Critic[]
+}
+
+export interface CriticAuditInvoiceRow {
+  invoice_id: number
+  invoice_number: string
+  partner_id: number | null
+  total_amount: string
+  fiscal_status: InvoiceFiscalStatus
+  count: number
+  by_severity: { error?: number; warning?: number; info?: number }
+  items: Critic[]
+}
+
+export interface CriticAuditResponse {
+  started_at: string
+  completed_at: string
+  swept: number
+  invoices_with_critics_count: number
+  by_severity: Record<string, number>
+  by_kind: Record<string, number>
+  results: CriticAuditInvoiceRow[]
 }

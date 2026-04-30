@@ -64,6 +64,10 @@ class Critic:
     subject_type: str  # "invoice" | "nota_fiscal" | "nota_fiscal_item"
     subject_id: int
     evidence: dict[str, Any] = field(default_factory=dict)
+    acknowledged: bool = False  # set by mark_acknowledged() after lookup
+    acknowledged_at: str | None = None
+    acknowledged_by_email: str | None = None
+    acknowledged_note: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -342,11 +346,158 @@ def _critics_for_nf_pair(orig, related_devs, **opts) -> list[Critic]:
 
 
 def _sort_critics(critics: Iterable[Critic]) -> list[Critic]:
-    """Errors → warnings → info, then by kind for stable display."""
+    """Acknowledged last; within each group, errors → warnings → info, then by kind."""
     sev_order = {SEVERITY_ERROR: 0, SEVERITY_WARNING: 1, SEVERITY_INFO: 2}
-    return sorted(critics, key=lambda c: (sev_order.get(c.severity, 99), c.kind))
+    return sorted(
+        critics,
+        key=lambda c: (1 if c.acknowledged else 0, sev_order.get(c.severity, 99), c.kind),
+    )
 
 
 def critics_to_dict(critics: Iterable[Critic]) -> list[dict]:
     """Convenience: serialize for JSON response."""
     return [asdict(c) for c in critics]
+
+
+def annotate_acknowledgements(invoice, critics: list[Critic]) -> list[Critic]:
+    """
+    Stamp each critic with its acknowledgement state by querying
+    CriticAcknowledgement for matching (kind, subject_type, subject_id).
+    Critics are returned in-place, mutated.
+    """
+    if not critics:
+        return critics
+    from billing.models import CriticAcknowledgement
+    keys = {(c.kind, c.subject_type, c.subject_id) for c in critics}
+    if not keys:
+        return critics
+    acks = list(
+        CriticAcknowledgement.objects
+        .filter(company=invoice.company, invoice=invoice)
+        .select_related("acknowledged_by")
+    )
+    by_key = {(a.kind, a.subject_type, a.subject_id): a for a in acks}
+    for c in critics:
+        a = by_key.get((c.kind, c.subject_type, c.subject_id))
+        if a is None:
+            continue
+        c.acknowledged = True
+        c.acknowledged_at = a.updated_at.isoformat() if a.updated_at else None
+        c.acknowledged_by_email = (
+            getattr(a.acknowledged_by, "email", None) if a.acknowledged_by_id else None
+        )
+        c.acknowledged_note = a.note or ""
+    return critics
+
+
+def severity_counts(critics: Iterable[Critic], *, only_unacknowledged: bool = True) -> dict:
+    """Tally critics by severity. By default skips acknowledged ones — that's
+    the count operators care about (the badge / list filter)."""
+    counts = {SEVERITY_ERROR: 0, SEVERITY_WARNING: 0, SEVERITY_INFO: 0}
+    for c in critics:
+        if only_unacknowledged and c.acknowledged:
+            continue
+        counts[c.severity] = counts.get(c.severity, 0) + 1
+    return counts
+
+
+def audit_critics_for_company(
+    company,
+    *,
+    only_unacknowledged: bool = True,
+    severity_in: tuple[str, ...] | None = None,
+    invoice_ids: tuple[int, ...] | None = None,
+    persist: bool = True,
+) -> dict:
+    """
+    Sweep all (or a subset of) Invoices for a tenant and aggregate critic
+    statistics. Used by:
+        - the management command ``audit_invoice_critics``
+        - the bulk-audit endpoint ``POST /api/invoices/audit-critics/``
+    Optionally persists the latest counters back to ``Invoice.critics_count``
+    so list views can filter without a re-scan.
+
+    Args:
+        only_unacknowledged: when True, acknowledged critics are excluded
+            from per-invoice ``count`` and ``by_severity`` tallies but the
+            full critic list still runs (so storage stays consistent).
+        severity_in: filter the per-invoice ``items`` by severity (the
+            aggregate counts always reflect the full unfiltered set).
+        invoice_ids: limit sweep to these invoice ids (default: all of
+            tenant's Invoices).
+        persist: write critics_count and critics_count_by_severity back
+            on each Invoice. Default True for the mgmt command path.
+
+    Returns a JSON-serializable summary dict.
+    """
+    from billing.models import Invoice
+    from collections import Counter
+    from django.utils import timezone
+
+    qs = Invoice.objects.filter(company=company)
+    if invoice_ids:
+        qs = qs.filter(id__in=list(invoice_ids))
+
+    started = timezone.now()
+    sev_totals = Counter()
+    kind_totals = Counter()
+    invoices_with_critics: list[dict] = []
+
+    for inv in qs.iterator(chunk_size=100):
+        critics = compute_critics_for_invoice(inv)
+        annotate_acknowledgements(inv, critics)
+        sev_counts = severity_counts(critics, only_unacknowledged=only_unacknowledged)
+        unack_total = sum(sev_counts.values())
+
+        if persist:
+            new_count = unack_total
+            new_by_sev = sev_counts
+            if (inv.critics_count != new_count) or (
+                inv.critics_count_by_severity != new_by_sev
+            ):
+                inv.critics_count = new_count
+                inv.critics_count_by_severity = new_by_sev
+                inv.save(update_fields=["critics_count", "critics_count_by_severity"])
+
+        if unack_total == 0:
+            continue
+        for c in critics:
+            if only_unacknowledged and c.acknowledged:
+                continue
+            sev_totals[c.severity] += 1
+            kind_totals[c.kind] += 1
+
+        # Surface filtered items in the response when requested
+        if severity_in:
+            shown = [
+                c for c in critics
+                if c.severity in severity_in and (not only_unacknowledged or not c.acknowledged)
+            ]
+        else:
+            shown = [c for c in critics if not only_unacknowledged or not c.acknowledged]
+
+        invoices_with_critics.append({
+            "invoice_id": inv.id,
+            "invoice_number": inv.invoice_number,
+            "partner_id": inv.partner_id,
+            "total_amount": str(inv.total_amount),
+            "fiscal_status": inv.fiscal_status,
+            "count": unack_total,
+            "by_severity": sev_counts,
+            "items": critics_to_dict(shown),
+        })
+
+    # Sort the per-invoice list: errors first, then by total count desc
+    invoices_with_critics.sort(
+        key=lambda r: (-r["by_severity"].get("error", 0), -r["count"]),
+    )
+
+    return {
+        "started_at": started.isoformat(),
+        "completed_at": timezone.now().isoformat(),
+        "swept": qs.count(),
+        "invoices_with_critics_count": len(invoices_with_critics),
+        "by_severity": dict(sev_totals),
+        "by_kind": dict(kind_totals),
+        "results": invoices_with_critics,
+    }

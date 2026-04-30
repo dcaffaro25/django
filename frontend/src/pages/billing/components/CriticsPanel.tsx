@@ -1,9 +1,13 @@
 import { useState } from "react"
 import {
-  AlertCircle, AlertTriangle, ChevronDown, ChevronRight, Info,
+  AlertCircle, AlertTriangle, Check, ChevronDown, ChevronRight, Info, Undo2,
 } from "lucide-react"
-import { useInvoiceCritics } from "@/features/billing"
+import {
+  useAcknowledgeCritic, useInvoiceCritics, useUnacknowledgeCritic,
+} from "@/features/billing"
 import type { Critic, CriticSeverity } from "@/features/billing"
+import { Button } from "@/components/ui/button"
+import { useUserRole } from "@/features/auth/useUserRole"
 import { cn } from "@/lib/utils"
 
 const SEVERITY_TONE: Record<CriticSeverity, { cls: string; icon: typeof Info }> = {
@@ -21,34 +25,94 @@ const KIND_LABEL: Record<string, string> = {
   produto_unresolved: "Produto não cadastrado",
 }
 
-function CriticRow({ critic }: { critic: Critic }) {
+function CriticRow({ critic, invoiceId }: { critic: Critic; invoiceId: number }) {
   const [open, setOpen] = useState(false)
   const tone = SEVERITY_TONE[critic.severity]
   const Icon = tone.icon
   const evidenceKeys = Object.keys(critic.evidence)
+  const ack = useAcknowledgeCritic()
+  const unack = useUnacknowledgeCritic()
+  const { canWrite } = useUserRole()
+  const isAck = !!critic.acknowledged
   return (
-    <li className={cn("rounded-md border p-2", tone.cls)}>
-      <button
-        type="button"
-        onClick={() => evidenceKeys.length && setOpen((v) => !v)}
-        className={cn(
-          "flex w-full items-start gap-2 text-left",
-          evidenceKeys.length ? "cursor-pointer" : "cursor-default",
-        )}
-      >
-        <Icon className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="text-[10px] font-semibold uppercase tracking-wider opacity-80">
-              {KIND_LABEL[critic.kind] ?? critic.kind}
-            </span>
+    <li className={cn(
+      "rounded-md border p-2",
+      isAck ? "bg-muted text-muted-foreground border-muted-foreground/20 opacity-75" : tone.cls,
+    )}>
+      <div className="flex items-start gap-2">
+        <button
+          type="button"
+          onClick={() => evidenceKeys.length && setOpen((v) => !v)}
+          className={cn(
+            "flex flex-1 items-start gap-2 text-left min-w-0",
+            evidenceKeys.length ? "cursor-pointer" : "cursor-default",
+          )}
+        >
+          <Icon className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <div className="flex-1 min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[10px] font-semibold uppercase tracking-wider opacity-80">
+                {KIND_LABEL[critic.kind] ?? critic.kind}
+              </span>
+              {isAck ? (
+                <span className="inline-flex items-center gap-0.5 rounded-full bg-success/15 px-1.5 py-0.5 text-[10px] font-semibold text-success">
+                  <Check className="h-2.5 w-2.5" />
+                  aceito
+                </span>
+              ) : null}
+            </div>
+            <div className="text-[12px] leading-snug">{critic.message}</div>
+            {isAck && critic.acknowledged_by_email ? (
+              <div className="mt-0.5 text-[10px]">
+                por {critic.acknowledged_by_email}
+                {critic.acknowledged_note ? ` — “${critic.acknowledged_note}”` : ""}
+              </div>
+            ) : null}
           </div>
-          <div className="text-[12px] leading-snug">{critic.message}</div>
-        </div>
-        {evidenceKeys.length ? (
-          open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />
+          {evidenceKeys.length ? (
+            open ? <ChevronDown className="h-3.5 w-3.5 shrink-0" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0" />
+          ) : null}
+        </button>
+        {canWrite ? (
+          isAck ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => unack.mutate({
+                invoiceId,
+                kind: critic.kind,
+                subject_type: critic.subject_type,
+                subject_id: critic.subject_id,
+              })}
+              disabled={unack.isPending}
+              title="Remover aceite"
+              className="h-7 shrink-0 px-2"
+            >
+              <Undo2 className="h-3 w-3" />
+            </Button>
+          ) : (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                const note = prompt("Observação (opcional):") || ""
+                ack.mutate({
+                  invoiceId,
+                  kind: critic.kind,
+                  subject_type: critic.subject_type,
+                  subject_id: critic.subject_id,
+                  note,
+                })
+              }}
+              disabled={ack.isPending}
+              title="Aceitar — marcar esta crítica como esperada"
+              className="h-7 shrink-0 px-2"
+            >
+              <Check className="h-3 w-3" />
+            </Button>
+          )
         ) : null}
-      </button>
+      </div>
       {open && evidenceKeys.length ? (
         <dl className="mt-2 grid grid-cols-[max-content_1fr] gap-x-3 gap-y-0.5 rounded bg-background/50 p-2 text-[11px] font-mono">
           {evidenceKeys.map((k) => (
@@ -122,7 +186,7 @@ export function CriticsPanel({ invoiceId }: { invoiceId: number }) {
       </h4>
       <ul className="space-y-1.5">
         {data.items.map((c, i) => (
-          <CriticRow key={`${c.kind}-${c.subject_id}-${i}`} critic={c} />
+          <CriticRow key={`${c.kind}-${c.subject_id}-${i}`} critic={c} invoiceId={invoiceId} />
         ))}
       </ul>
     </section>

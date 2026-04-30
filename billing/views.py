@@ -123,6 +123,20 @@ class InvoiceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         date_to = params.get('date_to')
         if date_to:
             qs = qs.filter(invoice_date__lte=date_to)
+        # Critics filters: has_critics=1 → only invoices with at least one
+        # unacknowledged critic. critics_severity=error|warning|info → only
+        # those with that severity present.
+        has_critics = params.get('has_critics')
+        if has_critics in ('1', 'true', 'yes'):
+            qs = qs.filter(critics_count__gt=0)
+        critics_severity = params.get('critics_severity')
+        if critics_severity in ('error', 'warning', 'info'):
+            # JSONField __gt comparison varies by backend. Use the simple
+            # contains pattern: severity key exists with value > 0. We exclude
+            # zero-count rows to keep the query indexed by critics_count.
+            qs = qs.filter(critics_count__gt=0).extra(
+                where=[f"(critics_count_by_severity ->> '{critics_severity}')::int > 0"],
+            )
         return qs
 
     @action(methods=['post'], detail=False)
@@ -170,21 +184,115 @@ class InvoiceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
 
     @action(methods=['get'], detail=True, url_path='critics')
     def critics(self, request, pk=None, **kwargs):
-        """Coherence critics computed live from linked NFs.
-        Read-only: never mutates Invoice / NF / GL state.
-        Response shape: {"count": N, "by_severity": {"error": x, "warning": y,
-        "info": z}, "items": [Critic, ...]}"""
+        """Coherence critics computed live from linked NFs, annotated with
+        ack state. Read-only: never mutates Invoice / NF / GL state.
+        Response: ``{count, by_severity, items}`` — counts are
+        unacknowledged-only; ``items`` includes both with an ``acknowledged``
+        flag so the UI can render acknowledged ones distinctly."""
         invoice = self.get_object()
-        from billing.services.critics_service import compute_critics_for_invoice, critics_to_dict
+        from billing.services.critics_service import (
+            compute_critics_for_invoice, critics_to_dict,
+            annotate_acknowledgements, severity_counts,
+        )
         critics = compute_critics_for_invoice(invoice)
-        by_sev = {"error": 0, "warning": 0, "info": 0}
-        for c in critics:
-            by_sev[c.severity] = by_sev.get(c.severity, 0) + 1
+        annotate_acknowledgements(invoice, critics)
+        sev = severity_counts(critics, only_unacknowledged=True)
         return Response({
-            "count": len(critics),
-            "by_severity": by_sev,
+            "count": sum(sev.values()),
+            "total_including_acknowledged": len(critics),
+            "by_severity": sev,
             "items": critics_to_dict(critics),
         })
+
+    @action(methods=['post'], detail=True, url_path='acknowledge-critic')
+    def acknowledge_critic(self, request, pk=None, **kwargs):
+        """Mark a single (kind, subject_type, subject_id) tuple as
+        acknowledged on this Invoice. Idempotent. Body:
+            {"kind": "...", "subject_type": "...", "subject_id": N, "note": "..."}
+        """
+        invoice = self.get_object()
+        from billing.models import CriticAcknowledgement
+        kind = request.data.get('kind')
+        subj_type = request.data.get('subject_type')
+        subj_id = request.data.get('subject_id')
+        note = request.data.get('note', '') or ''
+        if not all([kind, subj_type, subj_id is not None]):
+            return Response(
+                {'detail': 'kind, subject_type e subject_id são obrigatórios.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        ack, _created = CriticAcknowledgement.objects.update_or_create(
+            company=invoice.company,
+            invoice=invoice,
+            kind=kind,
+            subject_type=subj_type,
+            subject_id=int(subj_id),
+            defaults={
+                'acknowledged_by': request.user if request.user.is_authenticated else None,
+                'note': note,
+            },
+        )
+        # Refresh the invoice's critics_count so the list view reflects the ack.
+        try:
+            from billing.services.fiscal_status_service import refresh
+            refresh(invoice, persist=True)
+        except Exception:
+            pass
+        return Response({'acknowledged': True, 'ack_id': ack.id})
+
+    @action(methods=['delete'], detail=True, url_path='unacknowledge-critic')
+    def unacknowledge_critic(self, request, pk=None, **kwargs):
+        """Reverse a previous ack. Body shape matches acknowledge_critic."""
+        invoice = self.get_object()
+        from billing.models import CriticAcknowledgement
+        kind = request.data.get('kind')
+        subj_type = request.data.get('subject_type')
+        subj_id = request.data.get('subject_id')
+        if not all([kind, subj_type, subj_id is not None]):
+            return Response(
+                {'detail': 'kind, subject_type e subject_id são obrigatórios.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        deleted, _ = CriticAcknowledgement.objects.filter(
+            company=invoice.company,
+            invoice=invoice,
+            kind=kind,
+            subject_type=subj_type,
+            subject_id=int(subj_id),
+        ).delete()
+        try:
+            from billing.services.fiscal_status_service import refresh
+            refresh(invoice, persist=True)
+        except Exception:
+            pass
+        return Response({'unacknowledged': bool(deleted)})
+
+    @action(methods=['post'], detail=False, url_path='audit-critics')
+    def audit_critics(self, request, **kwargs):
+        """Sweep all (or a subset of) Invoices for the current tenant and
+        return per-invoice critic counts + aggregate stats. Body (optional):
+            {
+              "invoice_ids": [...],         # limit scope
+              "severity_in": ["error", ...], # filter items
+              "only_unacknowledged": true,   # default
+              "persist": true                # default; updates Invoice.critics_count
+            }
+        Same logic as the management command — UI runs it from the Faturas
+        page action menu and shows the result in a modal.
+        """
+        tenant = getattr(request, 'tenant', None)
+        if tenant is None or tenant == 'all':
+            return Response({'detail': 'Operação requer tenant explícito.'}, status=400)
+        body = request.data or {}
+        from billing.services.critics_service import audit_critics_for_company
+        result = audit_critics_for_company(
+            tenant,
+            only_unacknowledged=bool(body.get('only_unacknowledged', True)),
+            severity_in=tuple(body['severity_in']) if body.get('severity_in') else None,
+            invoice_ids=tuple(body['invoice_ids']) if body.get('invoice_ids') else None,
+            persist=bool(body.get('persist', True)),
+        )
+        return Response(result)
 
 class InvoiceLineViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = InvoiceLine.objects.all().select_related('invoice', 'product_service', 'invoice__partner')

@@ -353,6 +353,20 @@ class Invoice(TenantAwareBaseModel):
         help_text="True quando alguma NF vinculada teve uma CCe desde o último review.",
     )
 
+    # Denormalized critics count — refreshed by fiscal_status_service.refresh()
+    # so list endpoints can filter / sort by anomaly severity without paying
+    # per-row computation cost. Excludes acknowledged critics.
+    critics_count = models.IntegerField(
+        default=0,
+        db_index=True,
+        help_text="Número de críticas não-aceitas atualmente registradas para esta fatura.",
+    )
+    critics_count_by_severity = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text='Contagens por severidade: {"error": N, "warning": M, "info": K}.',
+    )
+
     notas_fiscais = models.ManyToManyField(
         'billing.NotaFiscal',
         through='billing.InvoiceNFLink',
@@ -481,3 +495,4 @@ from .models_nfe import (  # noqa: E402
 )
 from .models_nf_link import NFTransactionLink  # noqa: E402, F401
 from .models_config import BillingTenantConfig  # noqa: E402, F401
+from .models_critics import CriticAcknowledgement  # noqa: E402, F401
