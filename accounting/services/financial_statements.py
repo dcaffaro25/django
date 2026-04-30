@@ -1089,5 +1089,5 @@ def compute_financial_statements_cached(
         )
 
     return cached_payload(
-        "fs:v3", company_id, key_parts, _build, bypass=bypass_cache,
+        "fs:v4", company_id, key_parts, _build, bypass=bypass_cache,
     )

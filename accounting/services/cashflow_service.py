@@ -258,6 +258,112 @@ def _walk_taxonomy(rows: List[dict]) -> Dict[int, dict]:
 # Public surface 1: DFC direct method
 # ---------------------------------------------------------------------
 
+
+def _distribute_cash_to_book_categories(
+    company_id: int,
+    date_from,
+    date_to,
+    *,
+    entity_id: Optional[int] = None,
+    include_pending: bool = False,
+) -> Dict[int, Decimal]:
+    """Compute the actual cash that moved per period and distribute
+    it across each transaction's book-leg accounts proportionally to
+    each book leg's |debit−credit| share.
+
+    Returns ``{book_account_id: cash_amount_signed}``.
+
+    Why this shape: in the Direct Method DFC, the *amount* is the
+    cash that hit the bank (so its sign is governed by the bank-leg
+    direction, naturally +1 for cash accounts) and the
+    *categorisation* is "what did the cash buy / what did it come
+    from" — i.e. the opposing book leg's category. The previous
+    implementation summed book-leg amounts and applied
+    ``account_direction``, which is correct for DRE math but wrong
+    for cash flow: an expense payment (DR Despesa | CR Bancos) came
+    out **positive** because Despesa is debit-natural with dir=+1,
+    even though cash actually went *out*. See the
+    ``compute_cashflow_direct`` docstring for the worked example.
+
+    Allocation per transaction:
+
+        cash_in_period = Σ bank_leg (debit − credit) where leg.date
+                         ∈ [date_from, date_to]
+        per book leg b:
+            weight_b = |debit_b − credit_b| / Σ |debit_b' − credit_b'|
+                       across all book legs of the same tx
+            allocated_b = cash_in_period × weight_b
+
+    Multi-period transactions: only the bank legs that hit in-window
+    contribute to ``cash_in_period``, so a transaction settled across
+    a period boundary attributes only its in-period cash to book
+    categories. This subsumes the old per-tx weight scaling.
+
+    Multi-bank-leg transactions (DR Banco1 + DR Banco2 | CR Receita):
+    the two cash legs sum naturally inside ``cash_in_period``.
+
+    Edge case — transaction with no book legs (pure bank-to-bank
+    transfer, ``cash_in_period`` already nets to zero): nothing to
+    distribute, the tx is skipped.
+    """
+    bank_qs = JournalEntry.objects.filter(
+        account__company_id=company_id,
+        account__bank_account__isnull=False,
+    ).filter(_state_filter(include_pending))
+    if entity_id is not None:
+        bank_qs = bank_qs.filter(transaction__entity_id=entity_id)
+
+    # Per-tx bank-leg net in-period. Sign is naturally cash-correct
+    # because cash accounts are direction=+1 (debit-natural assets):
+    # DR cash → cash in (+), CR cash → cash out (−).
+    cash_per_tx_aggs = (
+        bank_qs.filter(date__gte=date_from, date__lte=date_to)
+        .values("transaction_id")
+        .annotate(net=Sum(_net_expr()))
+    )
+    cash_per_tx: Dict[int, Decimal] = {}
+    for r in cash_per_tx_aggs:
+        net = r["net"] or Decimal("0")
+        if net != 0:
+            cash_per_tx[r["transaction_id"]] = net
+    if not cash_per_tx:
+        return {}
+
+    # Book legs across the same transaction set, with each leg's
+    # ABSOLUTE amount used for proportional weighting. Bank legs
+    # excluded so they don't get cash allocated to themselves.
+    book_qs = JournalEntry.objects.filter(
+        account__company_id=company_id,
+        transaction_id__in=list(cash_per_tx.keys()),
+        account__bank_account__isnull=True,
+    ).filter(_state_filter(include_pending))
+
+    abs_e = _abs_expr()
+    book_aggs = book_qs.values("transaction_id", "account_id").annotate(
+        abs_amount=Sum(abs_e),
+    )
+    rows = list(book_aggs)
+
+    total_book_abs_per_tx: Dict[int, Decimal] = defaultdict(lambda: Decimal("0"))
+    for r in rows:
+        total_book_abs_per_tx[r["transaction_id"]] += r["abs_amount"] or Decimal("0")
+
+    by_account: Dict[int, Decimal] = defaultdict(lambda: Decimal("0"))
+    for r in rows:
+        tx_id = r["transaction_id"]
+        cash = cash_per_tx.get(tx_id, Decimal("0"))
+        total_abs = total_book_abs_per_tx.get(tx_id, Decimal("0"))
+        if total_abs <= 0:
+            # No book activity to anchor the categorisation — usually
+            # a pure bank-to-bank transfer that already netted to
+            # zero in ``cash_per_tx`` and was filtered out. Defensive
+            # guard for unusual data.
+            continue
+        leg_abs = r["abs_amount"] or Decimal("0")
+        by_account[r["account_id"]] += cash * (leg_abs / total_abs)
+    return dict(by_account)
+
+
 def compute_cashflow_direct(
     company_id: int,
     date_from,
@@ -293,28 +399,35 @@ def compute_cashflow_direct(
           ],
         }
 
-    Amounts are signed-by-account_direction, so revenue → positive
-    (cash in), expense → negative (cash out), matching the DRE
-    convention used elsewhere on the frontend.
+    Sign convention: amounts are real cash flows. Cash in → positive,
+    cash out → negative. The sign comes from the bank-leg direction
+    (cash accounts are debit-natural, so DR cash = +, CR cash = −).
+    The book-leg category just labels the line — it does NOT
+    contribute its ``account_direction`` to the sign. This is the
+    Direct Method definition: cash flow IS the bank movement,
+    classified by what the cash was for.
+
+    Worked example. JE: ``DR Despesa Operacional 500 | CR Bancos
+    500`` (paying R$ 500 in cash for an expense). The bank leg is
+    ``-500`` (CR cash → cash out). The single book leg is Despesa
+    Operacional with weight 1.0. Allocation: ``despesa_operacional
+    bucket += -500 × 1.0 = -500``. ✓ (The previous implementation
+    came out at +500 because it summed the book leg with
+    ``direction=+1``.)
     """
-    weights = _compute_transaction_weights(
+    by_account_unsigned = _distribute_cash_to_book_categories(
         company_id,
         date_from,
         date_to,
         entity_id=entity_id,
         include_pending=include_pending,
     )
-    if not weights:
-        return _empty_cashflow_response(date_from, date_to, include_pending)
-
-    by_account_unsigned = _aggregate_book_legs_with_weights(
-        company_id, weights, include_pending=include_pending
-    )
     if not by_account_unsigned:
         return _empty_cashflow_response(date_from, date_to, include_pending)
 
     # Pull the full account chart in one query so we can resolve
-    # taxonomy + apply ``account_direction`` without N+1.
+    # taxonomy without N+1. ``account_direction`` is intentionally
+    # NOT applied here — sign already reflects cash movement.
     rows = list(
         Account.objects.filter(company_id=company_id).values(
             "id", "name", "parent_id",
@@ -326,19 +439,17 @@ def compute_cashflow_direct(
     by_id = {r["id"]: r for r in rows}
 
     by_account_rows: List[dict] = []
-    # Bucket key is now (cashflow_category, section) — the DFC tab
+    # Bucket key is (cashflow_category, section) — the DFC tab
     # groups by its own category, not by the BS/PnL ``report_category``.
     by_category_acc: Dict[Tuple[str, str], dict] = defaultdict(
         lambda: {"amount": Decimal("0"), "accounts": 0}
     )
     section_totals: Dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
 
-    for aid, raw_amount in by_account_unsigned.items():
+    for aid, signed in by_account_unsigned.items():
         info = by_id.get(aid)
         if info is None:
             continue
-        direction = info.get("account_direction") or 1
-        signed = raw_amount * direction
         if signed == 0:
             continue
         tax = tax_map.get(aid, {})
