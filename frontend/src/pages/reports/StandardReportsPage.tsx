@@ -732,15 +732,6 @@ function stringTotalsToNumbers(
   return out
 }
 
-/** Format a Δ% string. Returns ``"—"`` when the comparison value is
- *  zero (avoids the divide-by-zero "Infinity%" trap). */
-function formatPctDelta(current: number, prior: number): string {
-  if (prior === 0) return "—"
-  const pct = ((current - prior) / Math.abs(prior)) * 100
-  const sign = pct > 0 ? "+" : ""
-  return `${sign}${pct.toFixed(1)}%`
-}
-
 // ---------------------------------------------------------------------
 // Multi-column statement (used by DRE and Balanço when ``series`` or
 // ``compare`` is set).
