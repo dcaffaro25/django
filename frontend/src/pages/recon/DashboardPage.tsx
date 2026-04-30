@@ -142,7 +142,7 @@ export function DashboardPage() {
                 <Play className="h-3.5 w-3.5" /> {t("dashboard.quick_start")}
               </button>
               <button
-                onClick={() => navigate("/recon/suggestions")}
+                onClick={() => navigate("/recon/tasks")}
                 className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
               >
                 <Sparkles className="h-3.5 w-3.5" /> {t("dashboard.quick_review_suggestions")}
@@ -420,11 +420,11 @@ export function DashboardPage() {
                   </td>
                 </tr>
               ) : recentTasks.map((task) => {
-                // Past executions (completed/failed/cancelled) jump straight
-                // to the Sugestões page so the operator can act on the
-                // persisted suggestions; active tasks open the live detail.
+                // All executions land on /recon/tasks?id= — the merged page
+                // shows the suggestions panel for past runs and the live
+                // status drawer for in-flight ones.
                 const past = task.status === "completed" || task.status === "failed" || task.status === "cancelled"
-                const href = past ? `/recon/suggestions?task_id=${task.id}` : `/recon/tasks?id=${task.id}`
+                const href = `/recon/tasks?id=${task.id}${past ? "" : "&live=1"}`
                 return (
                 <tr
                   key={task.id}

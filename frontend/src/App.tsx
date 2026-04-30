@@ -6,7 +6,7 @@ import { DashboardPage } from "@/pages/recon/DashboardPage"
 import { TasksPage } from "@/pages/recon/TasksPage"
 import { WorkbenchPage } from "@/pages/recon/WorkbenchPage"
 import { ReconciliationsPage } from "@/pages/recon/ReconciliationsPage"
-import { SuggestionsPage } from "@/pages/recon/SuggestionsPage"
+import { SuggestionsLegacyRedirect } from "@/pages/recon/SuggestionsLegacyRedirect"
 import { ConfigsPage } from "@/pages/recon/ConfigsPage"
 import { PipelinesPage } from "@/pages/recon/PipelinesPage"
 import { EmbeddingsPage } from "@/pages/recon/EmbeddingsPage"
@@ -71,7 +71,10 @@ export default function App() {
                     <Route path="tasks" element={<TasksPage />} />
                     <Route path="workbench" element={<WorkbenchPage />} />
                     <Route path="matches" element={<ReconciliationsPage />} />
-                    <Route path="suggestions" element={<SuggestionsPage />} />
+                    {/* Sugestões is merged into Execuções — preserve old
+                        bookmarks by redirecting `/recon/suggestions` (and
+                        `?task_id=X`) to the new combined page. */}
+                    <Route path="suggestions" element={<SuggestionsLegacyRedirect />} />
                     <Route path="configs" element={<ConfigsPage />} />
                     <Route path="pipelines" element={<PipelinesPage />} />
                     <Route path="embeddings" element={<EmbeddingsPage />} />

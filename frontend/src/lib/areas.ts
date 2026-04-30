@@ -30,7 +30,6 @@ export const AREAS: readonly Area[] = [
   { id: "recon.workbench",      label: "Bancada",                 group: "Conciliação",   prefix: "/recon/workbench" },
   { id: "recon.reconciliations",label: "Conciliações",            group: "Conciliação",   prefix: "/recon/matches" },
   { id: "recon.tasks",          label: "Execuções",               group: "Conciliação",   prefix: "/recon/tasks" },
-  { id: "recon.suggestions",    label: "Sugestões",               group: "Conciliação",   prefix: "/recon/suggestions" },
   { id: "recon.configs",        label: "Configurações",           group: "Conciliação",   prefix: "/recon/configs" },
   { id: "recon.pipelines",      label: "Pipelines",               group: "Conciliação",   prefix: "/recon/pipelines" },
   { id: "recon.embeddings",     label: "Embeddings",              group: "Conciliação",   prefix: "/recon/embeddings" },

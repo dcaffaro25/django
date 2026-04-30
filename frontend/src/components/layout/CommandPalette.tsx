@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next"
 import { useQuery } from "@tanstack/react-query"
 import { Command } from "cmdk"
 import {
-  LayoutDashboard, ArrowLeftRight, ListChecks, Sparkles, SlidersHorizontal, Workflow, Scale,
+  LayoutDashboard, ArrowLeftRight, ListChecks, SlidersHorizontal, Workflow, Scale,
   Wallet, Receipt, BookOpen, FileCog, FileBarChart, CreditCard, Users, Boxes, Settings,
   Building2, Loader2, Search, Brain,
 } from "lucide-react"
@@ -19,7 +19,6 @@ const ITEMS: Item[] = [
   { key: "reconciliation_dashboard", path: "/recon", icon: LayoutDashboard, group: "reconciliation" },
   { key: "reconciliation_workbench", path: "/recon/workbench", icon: ArrowLeftRight, group: "reconciliation" },
   { key: "reconciliation_tasks", path: "/recon/tasks", icon: ListChecks, group: "reconciliation" },
-  { key: "reconciliation_suggestions", path: "/recon/suggestions", icon: Sparkles, group: "reconciliation" },
   { key: "reconciliation_configs", path: "/recon/configs", icon: SlidersHorizontal, group: "reconciliation" },
   { key: "reconciliation_pipelines", path: "/recon/pipelines", icon: Workflow, group: "reconciliation" },
   { key: "reconciliation_embeddings", path: "/recon/embeddings", icon: Brain, group: "reconciliation" },

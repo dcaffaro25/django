@@ -1,6 +1,6 @@
 import { Outlet } from "react-router-dom"
 import {
-  LayoutDashboard, ArrowLeftRight, ListChecks, Sparkles, SlidersHorizontal, Workflow,
+  LayoutDashboard, ArrowLeftRight, ListChecks, SlidersHorizontal, Workflow,
   Scale, CheckCircle2, Brain,
 } from "lucide-react"
 import { TabbedShell } from "@/components/layout/TabbedShell"
@@ -25,7 +25,6 @@ export function ReconHubPage() {
           { to: "/recon/workbench", label: "Bancada", icon: ArrowLeftRight },
           { to: "/recon/matches", label: "Conciliações", icon: CheckCircle2 },
           { to: "/recon/tasks", label: "Execuções", icon: ListChecks },
-          { to: "/recon/suggestions", label: "Sugestões", icon: Sparkles },
           { to: "/recon/configs", label: "Configurações", icon: SlidersHorizontal },
           { to: "/recon/pipelines", label: "Pipelines", icon: Workflow },
           { to: "/recon/embeddings", label: "Embeddings", icon: Brain },

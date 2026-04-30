@@ -558,7 +558,20 @@ export function SuggestionsPage() {
 
 type SortKey = "confidence_desc" | "confidence_asc" | "difference_asc" | "date_asc" | "size_desc"
 
-function TaskSuggestionsView({ taskId }: { taskId: number }) {
+export function TaskSuggestionsView({
+  taskId,
+  embedded,
+  onExit,
+}: {
+  taskId: number
+  /** Hide the SectionHeader + redirect the "Sair" button to ``onExit`` so
+   *  the view can be hosted inside the Execuções split layout instead of
+   *  rendering as a standalone page. */
+  embedded?: boolean
+  /** Invoked when the user clicks "Sair da execução". Required when
+   *  ``embedded`` so the host page can drop the selected execution. */
+  onExit?: () => void
+}) {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
 
@@ -748,6 +761,10 @@ function TaskSuggestionsView({ taskId }: { taskId: number }) {
   )
 
   const clearTaskId = () => {
+    if (embedded) {
+      onExit?.()
+      return
+    }
     const next = new URLSearchParams(searchParams)
     next.delete("task_id")
     setSearchParams(next)
@@ -924,32 +941,38 @@ function TaskSuggestionsView({ taskId }: { taskId: number }) {
 
   return (
     <div className="space-y-4">
-      <SectionHeader
-        title="Sugestões"
-        subtitle={`Execução #${taskId}`}
-        actions={
-          <button
-            type="button"
-            onClick={clearTaskId}
-            className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium text-muted-foreground hover:bg-accent"
-          >
-            <X className="h-3.5 w-3.5" /> Sair da execução
-          </button>
-        }
-      />
+      {!embedded && (
+        <SectionHeader
+          title="Sugestões"
+          subtitle={`Execução #${taskId}`}
+          actions={
+            <button
+              type="button"
+              onClick={clearTaskId}
+              className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium text-muted-foreground hover:bg-accent"
+            >
+              <X className="h-3.5 w-3.5" /> Sair da execução
+            </button>
+          }
+        />
+      )}
 
       {/* Task banner */}
       <div className="card-elevated flex flex-wrap items-center gap-3 px-3 py-2 text-[12px]">
         <Hash className="h-3.5 w-3.5 text-primary" />
         <span>
           Sugestões persistidas da execução{" "}
-          <button
-            type="button"
-            onClick={() => navigate(`/recon/tasks?id=${taskId}`)}
-            className="font-mono font-semibold text-primary hover:underline"
-          >
-            #{taskId}
-          </button>
+          {embedded ? (
+            <span className="font-mono font-semibold text-primary">#{taskId}</span>
+          ) : (
+            <button
+              type="button"
+              onClick={() => navigate(`/recon/tasks?id=${taskId}`)}
+              className="font-mono font-semibold text-primary hover:underline"
+            >
+              #{taskId}
+            </button>
+          )}
           .
         </span>
         <span className="text-muted-foreground">
@@ -962,6 +985,16 @@ function TaskSuggestionsView({ taskId }: { taskId: number }) {
         )}
         {taskSuggestions.isError && (
           <span className="text-danger">Falha ao carregar. Tente novamente.</span>
+        )}
+        {embedded && (
+          <button
+            type="button"
+            onClick={clearTaskId}
+            className="ml-auto inline-flex h-6 items-center gap-1 rounded-md border border-border bg-background px-2 text-[11px] font-medium text-muted-foreground hover:bg-accent"
+            title="Fechar execução"
+          >
+            <X className="h-3 w-3" /> Fechar
+          </button>
         )}
       </div>
 
