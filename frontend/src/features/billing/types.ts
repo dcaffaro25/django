@@ -294,3 +294,29 @@ export interface PaginatedListResponse<T> {
   previous?: string | null
   results?: T[]
 }
+
+export type CriticSeverity = "info" | "warning" | "error"
+
+export type CriticKind =
+  | "over_returned"
+  | "quantity_over_returned"
+  | "unit_price_drift"
+  | "bundle_expansion_suspected"
+  | "ncm_drift"
+  | "produto_unresolved"
+  | string
+
+export interface Critic {
+  kind: CriticKind
+  severity: CriticSeverity
+  message: string
+  subject_type: "invoice" | "nota_fiscal" | "nota_fiscal_item"
+  subject_id: number
+  evidence: Record<string, unknown>
+}
+
+export interface CriticsResponse {
+  count: number
+  by_severity: { error: number; warning: number; info: number }
+  items: Critic[]
+}

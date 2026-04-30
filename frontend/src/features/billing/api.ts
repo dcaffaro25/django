@@ -3,6 +3,7 @@ import type {
   BillingTenantConfig,
   BusinessPartner,
   BusinessPartnerCategory,
+  CriticsResponse,
   Invoice,
   InvoiceDetail,
   InvoiceNFLink,
@@ -53,6 +54,8 @@ export const billingApi = {
     api.tenant.post<InvoiceNFLink>(`/api/invoices/${invoiceId}/attach-nf/`, body),
   refreshFiscalStatus: (invoiceId: number): Promise<InvoiceDetail> =>
     api.tenant.post<InvoiceDetail>(`/api/invoices/${invoiceId}/refresh-fiscal-status/`, {}),
+  getInvoiceCritics: (invoiceId: number): Promise<CriticsResponse> =>
+    api.tenant.get<CriticsResponse>(`/api/invoices/${invoiceId}/critics/`),
 
   // ============================================================
   // NotaFiscal (read-only listing for picking)

@@ -19,6 +19,7 @@ import {
 } from "@/features/billing"
 import type { InvoiceNFRelation } from "@/features/billing"
 import { FiscalStatusBadge } from "./components/FiscalStatusBadge"
+import { CriticsBadge, CriticsPanel } from "./components/CriticsPanel"
 import { useUserRole } from "@/features/auth/useUserRole"
 import { cn, formatCurrency, formatDate, formatDateTime } from "@/lib/utils"
 
@@ -270,6 +271,7 @@ export function InvoiceDetailDrawer({
                     status={invoice.fiscal_status}
                     pendingCorrections={invoice.has_pending_corrections}
                   />
+                  <CriticsBadge invoiceId={invoice.id} />
                 </div>
               </div>
 
@@ -342,6 +344,8 @@ export function InvoiceDetailDrawer({
                 ) : null}
               </div>
             </div>
+
+            <CriticsPanel invoiceId={invoice.id} />
 
             {/* Lines */}
             <section>

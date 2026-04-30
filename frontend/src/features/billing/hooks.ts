@@ -99,6 +99,15 @@ export function useAttachNfToInvoice() {
   })
 }
 
+export function useInvoiceCritics(id: number | null | undefined) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: id ? ["billing", sub, "invoice-critics", id] : ["billing", sub, "invoice-critics", "none"],
+    queryFn: () => billingApi.getInvoiceCritics(id as number),
+    enabled: !!sub && id != null,
+  })
+}
+
 export function useRefreshFiscalStatus() {
   const qc = useQueryClient()
   const sub = useSub()

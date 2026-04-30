@@ -168,6 +168,24 @@ class InvoiceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         invoice.refresh_from_db()
         return Response(InvoiceDetailSerializer(invoice).data)
 
+    @action(methods=['get'], detail=True, url_path='critics')
+    def critics(self, request, pk=None, **kwargs):
+        """Coherence critics computed live from linked NFs.
+        Read-only: never mutates Invoice / NF / GL state.
+        Response shape: {"count": N, "by_severity": {"error": x, "warning": y,
+        "info": z}, "items": [Critic, ...]}"""
+        invoice = self.get_object()
+        from billing.services.critics_service import compute_critics_for_invoice, critics_to_dict
+        critics = compute_critics_for_invoice(invoice)
+        by_sev = {"error": 0, "warning": 0, "info": 0}
+        for c in critics:
+            by_sev[c.severity] = by_sev.get(c.severity, 0) + 1
+        return Response({
+            "count": len(critics),
+            "by_severity": by_sev,
+            "items": critics_to_dict(critics),
+        })
+
 class InvoiceLineViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = InvoiceLine.objects.all().select_related('invoice', 'product_service', 'invoice__partner')
     serializer_class = InvoiceLineSerializer
