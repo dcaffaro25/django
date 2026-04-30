@@ -44,6 +44,7 @@ http.interceptors.request.use((config) => {
 // click-then-click sequence to surface fresh feedback.
 let _lastRoleBlockToastAt = 0
 let _last5xxToastAt = 0
+let _lastTenant404ToastAt = 0
 
 /**
  * Pull a human-readable error string out of an Axios error response
@@ -109,6 +110,31 @@ http.interceptors.response.use(
             toast.error("Sem permissão para esta ação.")
           }
         })
+      }
+    }
+    // Tenant-scoped 404s usually mean the user has no
+    // ``UserCompanyMembership`` for the URL's tenant — the middleware
+    // 404s the whole prefix to avoid leaking which tenants exist.
+    // Without a toast the workbench just looks empty, so surface a
+    // hint pointing operators at the right fix.
+    if (error?.response?.status === 404) {
+      const url: string = error.response?.config?.url || error.config?.url || ""
+      const tenantSub = getStoredTenant()
+      const looksTenantScoped =
+        !!tenantSub && (url.startsWith(`/${tenantSub}/`) || url.includes(`/${tenantSub}/`))
+      const detail = error.response?.data?.detail || ""
+      const isCompanyNotFound =
+        typeof detail === "string" && detail.toLowerCase().includes("company not found")
+      if (looksTenantScoped && (isCompanyNotFound || detail === "")) {
+        const now = Date.now()
+        if (now - _lastTenant404ToastAt > 5000) {
+          _lastTenant404ToastAt = now
+          void import("sonner").then(({ toast }) => {
+            toast.error(
+              `Sem acesso a esta empresa (${tenantSub}). Peça a um administrador para vincular seu usuário ao tenant.`,
+            )
+          })
+        }
       }
     }
     if (error?.response?.status >= 500 && error.response.status < 600) {

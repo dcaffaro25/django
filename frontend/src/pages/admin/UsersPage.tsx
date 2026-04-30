@@ -2,8 +2,8 @@ import { useEffect, useMemo, useState } from "react"
 import { toast } from "sonner"
 import { Drawer } from "vaul"
 import {
-  Check, KeyRound, Loader2, Plus, RefreshCw, Search, ShieldCheck,
-  Trash2, UserCheck, UserMinus, X,
+  Check, Globe2, KeyRound, Loader2, Plus, RefreshCw, Search, ShieldCheck,
+  Trash2, UserCheck, UserMinus, Wand2, X,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import {
@@ -335,6 +335,35 @@ function UserEditorDrawer({
       ],
     }))
   }
+  /**
+   * Apply a role to every tenant in one click. Adds missing memberships
+   * with the selected role, overwrites the role on memberships that
+   * already exist, and preserves whichever entry is marked primary
+   * (defaults to the first row when there's none yet). The "all
+   * tenants" shortcut the operator asked for — no more clicking through
+   * the dropdown six times for a fresh hire.
+   */
+  const applyRoleToAllTenants = (role: string) => {
+    setDraft((d) => {
+      const existing = new Map(d.set_companies.map((m) => [m.company, m]))
+      const merged: DraftMembership[] = companies.map((c) => {
+        const prior = existing.get(c.id)
+        return {
+          company: c.id,
+          role,
+          is_primary: prior?.is_primary ?? false,
+        }
+      })
+      // Guarantee exactly one primary so the backend doesn't have to demote.
+      if (!merged.some((m) => m.is_primary) && merged.length > 0) {
+        merged[0].is_primary = true
+      }
+      return { ...d, set_companies: merged }
+    })
+  }
+  const clearAllMemberships = () => {
+    setDraft((d) => ({ ...d, set_companies: [] }))
+  }
   const updateMembership = (i: number, p: Partial<DraftMembership>) => {
     setDraft((d) => ({
       ...d,
@@ -446,9 +475,34 @@ function UserEditorDrawer({
             </section>
 
             <section className="rounded-md border border-border bg-surface-1 p-2">
-              <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-                Empresas ({draft.set_companies.length})
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  Empresas ({draft.set_companies.length}/{companies.length})
+                </span>
+                {draft.set_companies.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={clearAllMemberships}
+                    className="text-[10px] text-muted-foreground hover:text-danger"
+                    title="Remover todos os vínculos"
+                  >
+                    Limpar todos
+                  </button>
+                )}
               </div>
+
+              {/* "All tenants" shortcut — pick a role and stamp it
+                  across every company in one click. Existing entries
+                  get their role overwritten; new ones are added. */}
+              <BulkAssignRow
+                disabled={companies.length === 0}
+                allCovered={
+                  companies.length > 0 &&
+                  draft.set_companies.length === companies.length
+                }
+                onApply={applyRoleToAllTenants}
+              />
+
               <div className="space-y-2">
                 {draft.set_companies.map((m, i) => {
                   const c = companies.find((cc) => cc.id === m.company)
@@ -521,6 +575,59 @@ function UserEditorDrawer({
         </Drawer.Content>
       </Drawer.Portal>
     </Drawer.Root>
+  )
+}
+
+/**
+ * Pick-a-role + "Aplicar a todas" shortcut for the user editor's
+ * Empresas section. Lives in this file because it touches the same
+ * draft state as the surrounding editor and is too thin to deserve
+ * its own module.
+ */
+function BulkAssignRow({
+  disabled,
+  allCovered,
+  onApply,
+}: {
+  disabled: boolean
+  /** True when the draft already covers every tenant — used to switch
+   *  the button copy from "Aplicar a todas" to "Sobrescrever todas"
+   *  so operators don't think it's a no-op. */
+  allCovered: boolean
+  onApply: (role: string) => void
+}) {
+  const [role, setRole] = useState<string>("operator")
+  return (
+    <div className="mb-2 flex items-center gap-2 rounded-md border border-dashed border-border bg-background/40 px-2 py-1.5">
+      <Globe2 className="h-3.5 w-3.5 text-muted-foreground" />
+      <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+        Todas
+      </span>
+      <select
+        value={role}
+        onChange={(e) => setRole(e.target.value)}
+        disabled={disabled}
+        className="h-7 rounded-md border border-border bg-background px-2 text-[11px] disabled:opacity-50"
+      >
+        {ROLES.map((r) => (
+          <option key={r.id} value={r.id}>{r.label}</option>
+        ))}
+      </select>
+      <button
+        type="button"
+        onClick={() => onApply(role)}
+        disabled={disabled}
+        title={
+          allCovered
+            ? "Sobrescrever o papel em todas as empresas"
+            : "Vincular a todas as empresas com este papel"
+        }
+        className="ml-auto inline-flex h-7 items-center gap-1 rounded-md border border-primary/40 bg-primary/10 px-2 text-[11px] font-medium text-primary hover:bg-primary/20 disabled:opacity-50"
+      >
+        <Wand2 className="h-3 w-3" />
+        {allCovered ? "Sobrescrever todas" : "Aplicar a todas"}
+      </button>
+    </div>
   )
 }
 
