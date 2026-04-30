@@ -64,6 +64,26 @@ class InvoiceLineSerializer(serializers.ModelSerializer):
         model = InvoiceLine
         fields = '__all__'
 
+
+class InvoiceLineWithContextSerializer(serializers.ModelSerializer):
+    """Adds invoice + product names so cross-link panels (e.g. 'show me
+    every invoice line for this product') can render rows without N+1
+    follow-up requests."""
+    invoice_number = serializers.CharField(source='invoice.invoice_number', read_only=True)
+    invoice_date = serializers.DateField(source='invoice.invoice_date', read_only=True)
+    invoice_status = serializers.CharField(source='invoice.status', read_only=True)
+    invoice_partner = serializers.CharField(source='invoice.partner.name', read_only=True)
+    product_service_name = serializers.CharField(source='product_service.name', read_only=True, allow_null=True)
+    product_service_code = serializers.CharField(source='product_service.code', read_only=True, allow_null=True)
+
+    class Meta:
+        model = InvoiceLine
+        fields = [
+            'id', 'invoice', 'invoice_number', 'invoice_date', 'invoice_status', 'invoice_partner',
+            'product_service', 'product_service_name', 'product_service_code',
+            'description', 'quantity', 'unit_price', 'total_price', 'tax_amount',
+        ]
+
 class InvoiceSerializer(serializers.ModelSerializer):
     lines = InvoiceLineSerializer(many=True, read_only=True)
 

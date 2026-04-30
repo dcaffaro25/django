@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { Save, X } from "lucide-react"
+import { Save, X, FileText, Receipt } from "lucide-react"
 import { Drawer } from "@/components/ui/drawer"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -11,9 +11,12 @@ import {
 import { Checkbox } from "@/components/ui/checkbox"
 import {
   useProductService, useProductServiceCategories, useSaveProductService,
+  useInvoiceLinesByProduct, useNFItemsByProduct,
 } from "@/features/billing"
 import type { ProductService } from "@/features/billing"
 import { useUserRole } from "@/features/auth/useUserRole"
+import { formatCurrency, formatDate } from "@/lib/utils"
+import { CollapsibleRelatedList } from "./components/CollapsibleRelatedList"
 
 const EMPTY: Partial<ProductService> = {
   name: "",
@@ -243,6 +246,8 @@ export function ProductServiceEditDrawer({
           />
           Ativo
         </label>
+
+        {!isNew && id != null ? <PSRelatedSections productId={id} /> : null}
       </div>
 
       {canWrite ? (
@@ -258,5 +263,70 @@ export function ProductServiceEditDrawer({
         </div>
       ) : null}
     </Drawer>
+  )
+}
+
+
+/**
+ * Cross-links section shown at the bottom of the PS drawer.
+ * Two collapsible groups: Faturas (linhas) where this product was billed,
+ * and NFs (itens) where this product appeared in the fiscal doc.
+ */
+function PSRelatedSections({ productId }: { productId: number }) {
+  const lines = useInvoiceLinesByProduct(productId)
+  const items = useNFItemsByProduct(productId)
+
+  return (
+    <div className="space-y-3 border-t border-border pt-3">
+      <CollapsibleRelatedList
+        title="Faturas (linhas)"
+        subtitle="Linhas de Faturas onde este item foi cobrado"
+        icon={FileText}
+        count={lines.data?.length ?? 0}
+        loading={lines.isLoading}
+        empty="Este produto/serviço não aparece em nenhuma fatura ainda."
+      >
+        {(lines.data ?? []).slice(0, 50).map((l) => (
+          <li key={l.id} className="flex items-center justify-between border-b border-border/40 px-2 py-1.5 last:border-b-0 text-[12px]">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="font-mono">{l.invoice_number}</span>
+              <span className="text-muted-foreground">{formatDate(l.invoice_date)}</span>
+              <span className="truncate text-muted-foreground" title={l.invoice_partner}>
+                {l.invoice_partner}
+              </span>
+              <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] tabular-nums text-muted-foreground">
+                {Number(l.quantity).toLocaleString("pt-BR")} × {formatCurrency(l.unit_price)}
+              </span>
+            </div>
+            <span className="font-medium tabular-nums">{formatCurrency(l.total_price)}</span>
+          </li>
+        ))}
+      </CollapsibleRelatedList>
+
+      <CollapsibleRelatedList
+        title="NFs (itens)"
+        subtitle="Itens de Notas Fiscais que referenciam este produto"
+        icon={Receipt}
+        count={items.data?.length ?? 0}
+        loading={items.isLoading}
+        empty="Este produto/serviço não aparece em nenhuma NF ainda."
+      >
+        {(items.data ?? []).slice(0, 50).map((it) => (
+          <li key={it.id} className="flex items-center justify-between border-b border-border/40 px-2 py-1.5 last:border-b-0 text-[12px]">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="font-mono">NF #{it.nota_fiscal}</span>
+              <span className="text-muted-foreground">item {it.numero_item}</span>
+              <span className="truncate text-muted-foreground" title={it.descricao}>
+                {it.descricao}
+              </span>
+              <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] tabular-nums text-muted-foreground">
+                {Number(it.quantidade).toLocaleString("pt-BR")} {it.unidade}
+              </span>
+            </div>
+            <span className="font-medium tabular-nums">{formatCurrency(it.valor_total)}</span>
+          </li>
+        ))}
+      </CollapsibleRelatedList>
+    </div>
   )
 }

@@ -16,7 +16,7 @@ from .serializers import (
     ContractSerializer, InvoiceSerializer, InvoiceLineSerializer,
     NFTransactionLinkSerializer, InvoiceNFLinkSerializer,
     BillingTenantConfigSerializer, InvoiceDetailSerializer,
-    InvoiceListSerializer,
+    InvoiceListSerializer, InvoiceLineWithContextSerializer,
 )
 from multitenancy.mixins import ScopedQuerysetMixin
 from multitenancy.api_utils import generic_bulk_create, generic_bulk_update, generic_bulk_delete
@@ -169,8 +169,29 @@ class InvoiceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return Response(InvoiceDetailSerializer(invoice).data)
 
 class InvoiceLineViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
-    queryset = InvoiceLine.objects.all()
+    queryset = InvoiceLine.objects.all().select_related('invoice', 'product_service', 'invoice__partner')
     serializer_class = InvoiceLineSerializer
+
+    def get_serializer_class(self):
+        # List endpoint returns invoice + product context so cross-link
+        # panels (e.g. "show me lines for product X") render without N+1.
+        if self.action in ('list',):
+            return InvoiceLineWithContextSerializer
+        return InvoiceLineSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = getattr(self.request, 'query_params', None)
+        if params is None:
+            return qs
+        for fk, key in (("product_service", "product_service"), ("invoice", "invoice")):
+            v = params.get(key)
+            if v:
+                try:
+                    qs = qs.filter(**{f"{fk}_id": int(v)})
+                except (TypeError, ValueError):
+                    pass
+        return qs
 
     @action(methods=['post'], detail=False)
     def bulk_create(self, request, **kwargs):

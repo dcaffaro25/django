@@ -71,6 +71,40 @@ export interface InvoiceLine {
   tax_amount: string
 }
 
+export interface InvoiceLineWithContext {
+  id: number
+  invoice: number
+  invoice_number: string
+  invoice_date: string
+  invoice_status: string
+  invoice_partner: string
+  product_service: number | null
+  product_service_name: string | null
+  product_service_code: string | null
+  description: string
+  quantity: string
+  unit_price: string
+  total_price: string
+  tax_amount: string
+}
+
+export interface NotaFiscalItem {
+  id: number
+  nota_fiscal: number
+  numero_item: number
+  codigo_produto: string
+  ean: string
+  descricao: string
+  ncm: string
+  cfop: string
+  unidade: string
+  quantidade: string
+  valor_unitario: string
+  valor_total: string
+  produto: number | null
+  produto_nome: string | null
+}
+
 export interface NFTransactionLink {
   id: number
   company: number

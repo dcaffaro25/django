@@ -89,7 +89,10 @@ class NotaFiscalViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = NotaFiscal.objects.all()
     serializer_class = NotaFiscalSerializer
     filter_backends = [DjangoFilterBackend]
-    filterset_fields = ["emit_cnpj", "dest_cnpj", "finalidade", "tipo_operacao", "numero", "serie"]
+    filterset_fields = [
+        "emit_cnpj", "dest_cnpj", "emitente", "destinatario",
+        "finalidade", "tipo_operacao", "numero", "serie",
+    ]
 
     def get_serializer_class(self):
         if self.action == "list":

@@ -5,7 +5,8 @@ import { extractApiErrorMessage } from "@/lib/api-client"
 import { billingApi } from "./api"
 import type {
   BillingTenantConfig, BusinessPartner, BusinessPartnerCategory,
-  Invoice, NFTransactionLink, ProductService, ProductServiceCategory,
+  Invoice, InvoiceLineWithContext, NFTransactionLink, NotaFiscal,
+  NotaFiscalItem, ProductService, ProductServiceCategory,
 } from "./types"
 
 const qk = {
@@ -384,6 +385,54 @@ export function useDeleteBusinessPartnerCategory() {
       toast.success("Categoria removida.")
     },
     onError: (e) => showError("Falha ao remover categoria", e),
+  })
+}
+
+// ============================================================
+// Cross-link queries (BP→Invoices/NFs, PS→Lines/Items)
+// ============================================================
+export function useInvoicesByPartner(partnerId: number | null | undefined) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["billing", sub, "invoices-by-partner", partnerId],
+    queryFn: () => billingApi.listInvoices({ partner: partnerId as number }),
+    enabled: !!sub && partnerId != null,
+  })
+}
+
+export function useNFsByEmitente(partnerId: number | null | undefined) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["billing", sub, "nfs-by-emitente", partnerId],
+    queryFn: () => billingApi.listNotasFiscais({ emitente: partnerId as number }) as Promise<NotaFiscal[]>,
+    enabled: !!sub && partnerId != null,
+  })
+}
+
+export function useNFsByDestinatario(partnerId: number | null | undefined) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["billing", sub, "nfs-by-destinatario", partnerId],
+    queryFn: () => billingApi.listNotasFiscais({ destinatario: partnerId as number }) as Promise<NotaFiscal[]>,
+    enabled: !!sub && partnerId != null,
+  })
+}
+
+export function useInvoiceLinesByProduct(productId: number | null | undefined) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["billing", sub, "invoice-lines-by-product", productId],
+    queryFn: () => billingApi.listInvoiceLines({ product_service: productId as number }) as Promise<InvoiceLineWithContext[]>,
+    enabled: !!sub && productId != null,
+  })
+}
+
+export function useNFItemsByProduct(productId: number | null | undefined) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["billing", sub, "nf-items-by-product", productId],
+    queryFn: () => billingApi.listNotaFiscalItems({ produto: productId as number }) as Promise<NotaFiscalItem[]>,
+    enabled: !!sub && productId != null,
   })
 }
 

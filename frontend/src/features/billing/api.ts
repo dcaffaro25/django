@@ -184,6 +184,24 @@ export const billingApi = {
   deleteProductService: (id: number) =>
     api.tenant.delete(`/api/product_services/${id}/`),
 
+  // Invoice lines (cross-link from product)
+  listInvoiceLines: async (params?: AnyParams): Promise<unknown[]> => {
+    const qs = toQueryString(params)
+    const data = await api.tenant.get<unknown[] | PaginatedListResponse<unknown>>(
+      `/api/invoice_lines/${qs}`,
+    )
+    return unwrapList(data as never)
+  },
+
+  // NotaFiscalItem (cross-link from product)
+  listNotaFiscalItems: async (params?: AnyParams): Promise<unknown[]> => {
+    const qs = toQueryString(params)
+    const data = await api.tenant.get<unknown[] | PaginatedListResponse<unknown>>(
+      `/api/nfe-itens/${qs}`,
+    )
+    return unwrapList(data as never)
+  },
+
   // PS categories
   listProductServiceCategories: async (params?: AnyParams): Promise<ProductServiceCategory[]> => {
     const qs = toQueryString(params)

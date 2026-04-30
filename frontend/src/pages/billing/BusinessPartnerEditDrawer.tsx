@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { Save, X } from "lucide-react"
+import { Save, X, FileText, ArrowUpFromLine, ArrowDownToLine } from "lucide-react"
 import { Drawer } from "@/components/ui/drawer"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -10,9 +10,12 @@ import {
 import { Checkbox } from "@/components/ui/checkbox"
 import {
   useBusinessPartner, useBusinessPartnerCategories, useSaveBusinessPartner,
+  useInvoicesByPartner, useNFsByEmitente, useNFsByDestinatario,
 } from "@/features/billing"
 import type { BusinessPartner } from "@/features/billing"
 import { useUserRole } from "@/features/auth/useUserRole"
+import { formatCurrency, formatDate } from "@/lib/utils"
+import { CollapsibleRelatedList } from "./components/CollapsibleRelatedList"
 
 const EMPTY: Partial<BusinessPartner> = {
   name: "",
@@ -262,6 +265,8 @@ export function BusinessPartnerEditDrawer({
           />
           Ativo
         </label>
+
+        {!isNew && id != null ? <RelatedSections partnerId={id} /> : null}
       </div>
 
       {canWrite ? (
@@ -279,3 +284,86 @@ export function BusinessPartnerEditDrawer({
     </Drawer>
   )
 }
+
+
+/**
+ * Cross-links section shown at the bottom of the BP drawer.
+ * Three collapsible groups: Faturas (Invoice.partner), NFs como
+ * emitente, NFs como destinatário. Counts in the headers tell the
+ * operator at a glance how much activity this partner has.
+ */
+function RelatedSections({ partnerId }: { partnerId: number }) {
+  const invs = useInvoicesByPartner(partnerId)
+  const nfsEmit = useNFsByEmitente(partnerId)
+  const nfsDest = useNFsByDestinatario(partnerId)
+
+  return (
+    <div className="space-y-3 border-t border-border pt-3">
+      <CollapsibleRelatedList
+        title="Faturas"
+        icon={FileText}
+        count={invs.data?.length ?? 0}
+        loading={invs.isLoading}
+        empty="Nenhuma fatura para este parceiro."
+      >
+        {(invs.data ?? []).slice(0, 50).map((inv) => (
+          <li key={inv.id} className="flex items-center justify-between border-b border-border/40 px-2 py-1.5 last:border-b-0 text-[12px]">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="font-mono">{inv.invoice_number}</span>
+              <span className="text-muted-foreground">{formatDate(inv.invoice_date)}</span>
+              <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground capitalize">
+                {inv.invoice_type === "sale" ? "Venda" : "Compra"}
+              </span>
+            </div>
+            <span className="font-medium tabular-nums">{formatCurrency(inv.total_amount)}</span>
+          </li>
+        ))}
+      </CollapsibleRelatedList>
+
+      <CollapsibleRelatedList
+        title="NFs emitidas"
+        subtitle="Este parceiro como emitente (você é o destinatário)"
+        icon={ArrowDownToLine}
+        count={nfsEmit.data?.length ?? 0}
+        loading={nfsEmit.isLoading}
+        empty="Nenhuma NF onde este parceiro aparece como emitente."
+      >
+        {(nfsEmit.data ?? []).slice(0, 50).map((nf) => (
+          <li key={nf.id} className="flex items-center justify-between border-b border-border/40 px-2 py-1.5 last:border-b-0 text-[12px]">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="font-mono">NF {nf.numero}</span>
+              <span className="text-muted-foreground">{formatDate(nf.data_emissao)}</span>
+              {nf.finalidade === 4 ? (
+                <span className="rounded-full bg-warning/10 px-1.5 py-0.5 text-[10px] text-warning">devolução</span>
+              ) : null}
+            </div>
+            <span className="font-medium tabular-nums">{formatCurrency(nf.valor_nota)}</span>
+          </li>
+        ))}
+      </CollapsibleRelatedList>
+
+      <CollapsibleRelatedList
+        title="NFs recebidas"
+        subtitle="Este parceiro como destinatário (você é o emitente)"
+        icon={ArrowUpFromLine}
+        count={nfsDest.data?.length ?? 0}
+        loading={nfsDest.isLoading}
+        empty="Nenhuma NF onde este parceiro aparece como destinatário."
+      >
+        {(nfsDest.data ?? []).slice(0, 50).map((nf) => (
+          <li key={nf.id} className="flex items-center justify-between border-b border-border/40 px-2 py-1.5 last:border-b-0 text-[12px]">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="font-mono">NF {nf.numero}</span>
+              <span className="text-muted-foreground">{formatDate(nf.data_emissao)}</span>
+              {nf.finalidade === 4 ? (
+                <span className="rounded-full bg-warning/10 px-1.5 py-0.5 text-[10px] text-warning">devolução</span>
+              ) : null}
+            </div>
+            <span className="font-medium tabular-nums">{formatCurrency(nf.valor_nota)}</span>
+          </li>
+        ))}
+      </CollapsibleRelatedList>
+    </div>
+  )
+}
+

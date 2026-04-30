@@ -3,6 +3,7 @@ import type { InvoiceFiscalStatus } from "@/features/billing"
 import {
   AlertTriangle,
   Ban,
+  Bell,
   CheckCircle2,
   CornerDownLeft,
   HelpCircle,
@@ -57,21 +58,25 @@ export function FiscalStatusBadge({
   const conf = STYLE[status] ?? STYLE.pending_nf
   const Icon = conf.icon
   return (
-    <span
-      className={cn(
-        "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium",
-        conf.cls,
-        className,
-      )}
-      title={conf.label + (pendingCorrections ? " · CCe pendente" : "")}
-    >
-      <Icon className="h-3 w-3" />
-      <span>{conf.label}</span>
+    <span className={cn("inline-flex items-center gap-1", className)}>
+      <span
+        className={cn(
+          "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium",
+          conf.cls,
+        )}
+        title={conf.label}
+      >
+        <Icon className="h-3 w-3" />
+        <span>{conf.label}</span>
+      </span>
       {pendingCorrections ? (
         <span
-          className="ml-1 inline-block h-1.5 w-1.5 rounded-full bg-warning"
+          className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-warning/15 text-warning"
+          title="CCe pendente — esta fatura tem uma Carta de Correção registrada na NF vinculada"
           aria-label="CCe pendente"
-        />
+        >
+          <Bell className="h-3 w-3" />
+        </span>
       ) : null}
     </span>
   )
