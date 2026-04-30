@@ -60,6 +60,7 @@ import {
   useUnmatchReconciliation,
   useUpdateReconciliation,
 } from "@/features/reconciliation"
+import { useUserRole } from "@/features/auth/useUserRole"
 import type { ReconciliationSummary } from "@/features/reconciliation/types"
 import { cn, formatCurrency, formatDate } from "@/lib/utils"
 
@@ -119,6 +120,7 @@ export function ReconciliationsPage() {
   const update = useUpdateReconciliation()
   const unmatch = useUnmatchReconciliation()
   const recalc = useRecalcUnpostedFlags()
+  const { canWrite } = useUserRole()
 
   // Dialog state ------------------------------------------------------------
   const [approveTarget, setApproveTarget] = useState<ReconciliationSummary | null>(null)
@@ -283,21 +285,23 @@ export function ReconciliationsPage() {
               }}
               filename="conciliacoes.xlsx"
             />
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-8"
-              onClick={onRecalcClick}
-              disabled={recalc.isPending}
-              title={t("matches.actions.recalc") ?? ""}
-            >
-              {recalc.isPending ? (
-                <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Calculator className="mr-1 h-3.5 w-3.5" />
-              )}
-              {t("matches.actions.recalc")}
-            </Button>
+            {canWrite && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8"
+                onClick={onRecalcClick}
+                disabled={recalc.isPending}
+                title={t("matches.actions.recalc") ?? ""}
+              >
+                {recalc.isPending ? (
+                  <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Calculator className="mr-1 h-3.5 w-3.5" />
+                )}
+                {t("matches.actions.recalc")}
+              </Button>
+            )}
           </div>
         }
       />
@@ -486,7 +490,7 @@ export function ReconciliationsPage() {
                       </TableCell>
                       <TableCell className="text-right">
                         <div className="flex justify-end gap-1">
-                          {canApprove && (
+                          {canWrite && canApprove && (
                             <Button
                               size="sm"
                               variant="ghost"
@@ -497,24 +501,28 @@ export function ReconciliationsPage() {
                               <CheckCircle2 className="h-3.5 w-3.5" />
                             </Button>
                           )}
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            className="h-7 w-7 p-0"
-                            title={t("matches.actions.edit") ?? ""}
-                            onClick={() => openEdit(row)}
-                          >
-                            <Edit3 className="h-3.5 w-3.5" />
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            className="h-7 w-7 p-0 text-danger hover:text-danger"
-                            title={t("matches.actions.unmatch") ?? ""}
-                            onClick={() => openUnmatch(row)}
-                          >
-                            <Unlink2 className="h-3.5 w-3.5" />
-                          </Button>
+                          {canWrite && (
+                            <>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 w-7 p-0"
+                                title={t("matches.actions.edit") ?? ""}
+                                onClick={() => openEdit(row)}
+                              >
+                                <Edit3 className="h-3.5 w-3.5" />
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 w-7 p-0 text-danger hover:text-danger"
+                                title={t("matches.actions.unmatch") ?? ""}
+                                onClick={() => openUnmatch(row)}
+                              >
+                                <Unlink2 className="h-3.5 w-3.5" />
+                              </Button>
+                            </>
+                          )}
                         </div>
                       </TableCell>
                     </TableRow>

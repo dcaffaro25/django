@@ -21,6 +21,7 @@ import {
   useReconConfigsFull,
   useSaveReconConfig,
 } from "@/features/reconciliation"
+import { useUserRole } from "@/features/auth/useUserRole"
 import type {
   FilterColumnDef,
   FilterStack,
@@ -41,6 +42,7 @@ export function ConfigsPage() {
   const { t } = useTranslation(["reconciliation", "common"])
   const { data: configs = [], isLoading, isFetching, refetch } = useReconConfigsFull()
   const [editing, setEditing] = useState<ReconciliationConfig | "new" | null>(null)
+  const { canWrite } = useUserRole()
 
   const [scopeFilter, setScopeFilter] = useState<"all" | "global" | "company" | "user" | "company_user">("all")
 
@@ -135,12 +137,14 @@ export function ConfigsPage() {
               <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} />
               {t("actions.refresh", { ns: "common" })}
             </button>
-            <button
-              onClick={() => setEditing("new")}
-              className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
-            >
-              <Plus className="h-3.5 w-3.5" /> {t("configs.new")}
-            </button>
+            {canWrite && (
+              <button
+                onClick={() => setEditing("new")}
+                className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
+              >
+                <Plus className="h-3.5 w-3.5" /> {t("configs.new")}
+              </button>
+            )}
           </>
         }
       />
@@ -160,14 +164,16 @@ export function ConfigsPage() {
         ))}
       </div>
 
-      <BulkActionsBar count={selection.count} onClear={selection.clear}>
-        <BulkAction
-          icon={<Trash2 className="h-3 w-3" />}
-          label={`Excluir ${selection.count}`}
-          variant="danger"
-          onClick={onBulkDelete}
-        />
-      </BulkActionsBar>
+      {canWrite && (
+        <BulkActionsBar count={selection.count} onClear={selection.clear}>
+          <BulkAction
+            icon={<Trash2 className="h-3 w-3" />}
+            label={`Excluir ${selection.count}`}
+            variant="danger"
+            onClick={onBulkDelete}
+          />
+        </BulkActionsBar>
+      )}
 
       <div className="card-elevated overflow-hidden">
         <table className="w-full text-[12px]">
@@ -255,19 +261,23 @@ export function ConfigsPage() {
                   {col.isVisible("is_default") && (
                     <td className="h-10 px-3">{c.is_default && <Star className="h-3.5 w-3.5 fill-warning text-warning" />}</td>
                   )}
-                  <RowActionsCell>
-                    <RowAction
-                      icon={<Copy className="h-3.5 w-3.5" />}
-                      label="Duplicar"
-                      onClick={(e) => onDuplicate(c, e)}
-                    />
-                    <RowAction
-                      icon={<Trash2 className="h-3.5 w-3.5" />}
-                      label="Excluir"
-                      variant="danger"
-                      onClick={(e) => onDelete(c, e)}
-                    />
-                  </RowActionsCell>
+                  {canWrite ? (
+                    <RowActionsCell>
+                      <RowAction
+                        icon={<Copy className="h-3.5 w-3.5" />}
+                        label="Duplicar"
+                        onClick={(e) => onDuplicate(c, e)}
+                      />
+                      <RowAction
+                        icon={<Trash2 className="h-3.5 w-3.5" />}
+                        label="Excluir"
+                        variant="danger"
+                        onClick={(e) => onDelete(c, e)}
+                      />
+                    </RowActionsCell>
+                  ) : (
+                    <td className="h-10 px-3" />
+                  )}
                 </tr>
               ))
             )}

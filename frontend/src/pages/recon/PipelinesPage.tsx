@@ -17,6 +17,7 @@ import {
   useReconPipelinesFull,
   useSaveReconPipeline,
 } from "@/features/reconciliation"
+import { useUserRole } from "@/features/auth/useUserRole"
 import type { ReconciliationPipeline, ReconciliationPipelineStage } from "@/features/reconciliation/types"
 import { cn } from "@/lib/utils"
 
@@ -27,6 +28,7 @@ export function PipelinesPage() {
   const { data: pipelines = [], isLoading, isFetching, refetch } = useReconPipelinesFull()
   const [editing, setEditing] = useState<ReconciliationPipeline | "new" | null>(null)
   const [scopeFilter, setScopeFilter] = useState<(typeof SCOPES)[number]>("all")
+  const { canWrite } = useUserRole()
 
   const filtered = useMemo(
     () => (scopeFilter === "all" ? pipelines : pipelines.filter((p) => p.scope === scopeFilter)),
@@ -117,19 +119,23 @@ export function PipelinesPage() {
               <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} />
               {t("actions.refresh", { ns: "common" })}
             </button>
-            <button
-              onClick={() => setEditing("new")}
-              className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
-            >
-              <Plus className="h-3.5 w-3.5" /> Novo pipeline
-            </button>
+            {canWrite && (
+              <button
+                onClick={() => setEditing("new")}
+                className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
+              >
+                <Plus className="h-3.5 w-3.5" /> Novo pipeline
+              </button>
+            )}
           </>
         }
       />
 
-      <BulkActionsBar count={selection.count} onClear={selection.clear}>
-        <BulkAction icon={<Trash2 className="h-3 w-3" />} label={`Excluir ${selection.count}`} variant="danger" onClick={onBulkDelete} />
-      </BulkActionsBar>
+      {canWrite && (
+        <BulkActionsBar count={selection.count} onClear={selection.clear}>
+          <BulkAction icon={<Trash2 className="h-3 w-3" />} label={`Excluir ${selection.count}`} variant="danger" onClick={onBulkDelete} />
+        </BulkActionsBar>
+      )}
 
       <div className="flex items-center gap-1 rounded-md border border-border bg-surface-1 p-1 text-[12px]">
         {SCOPES.map((s) => (
@@ -211,19 +217,23 @@ export function PipelinesPage() {
                   {col.isVisible("is_default") && (
                     <td className="h-10 px-3">{p.is_default && <Star className="h-3.5 w-3.5 fill-warning text-warning" />}</td>
                   )}
-                  <RowActionsCell>
-                    <RowAction
-                      icon={<Copy className="h-3.5 w-3.5" />}
-                      label="Duplicar"
-                      onClick={(e) => onDuplicate(p, e)}
-                    />
-                    <RowAction
-                      icon={<Trash2 className="h-3.5 w-3.5" />}
-                      label="Excluir"
-                      variant="danger"
-                      onClick={(e) => onDelete(p, e)}
-                    />
-                  </RowActionsCell>
+                  {canWrite ? (
+                    <RowActionsCell>
+                      <RowAction
+                        icon={<Copy className="h-3.5 w-3.5" />}
+                        label="Duplicar"
+                        onClick={(e) => onDuplicate(p, e)}
+                      />
+                      <RowAction
+                        icon={<Trash2 className="h-3.5 w-3.5" />}
+                        label="Excluir"
+                        variant="danger"
+                        onClick={(e) => onDelete(p, e)}
+                      />
+                    </RowActionsCell>
+                  ) : (
+                    <td className="h-10 px-3" />
+                  )}
                 </tr>
               ))
             )}

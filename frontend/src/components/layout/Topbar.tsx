@@ -37,17 +37,19 @@ const ADMIN_LINKS = [
 
 export function Topbar() {
   const { t } = useTranslation()
-  const { user, logout, isSuperuser } = useAuth()
+  const { user, logout } = useAuth()
   const setCommandOpen = useAppStore((s) => s.setCommandOpen)
   const theme = useAppStore((s) => s.theme)
   const setTheme = useAppStore((s) => s.setTheme)
   const viewAsViewer = useAppStore((s) => s.viewAsViewer)
   const setViewAsViewer = useAppStore((s) => s.setViewAsViewer)
-  // Pull the ACTUAL role here -- the preview overlay returns
-  // ``role: "viewer"`` from useUserRole, which would hide the very
-  // toggle we need to leave preview mode if we read ``role``
-  // straight. ``actualRole`` is unaffected by the overlay.
-  const { me, actualRole } = useUserRole()
+  // ``isSuperuser`` MUST come from useUserRole (not useAuth) so the
+  // view-as-viewer overlay correctly hides the Administração section
+  // -- a Django superuser previewing as viewer should see what
+  // their viewer sees, with no admin links bleeding through.
+  // ``actualRole`` is unaffected by the overlay so the preview
+  // toggle item itself stays available.
+  const { me, actualRole, isSuperuser } = useUserRole()
   const updatePrefs = useUpdatePreferences()
   const canPreviewAsViewer =
     actualRole === "manager" || actualRole === "owner" || actualRole === "superuser"

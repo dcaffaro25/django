@@ -6,7 +6,6 @@ import {
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/stores/app-store"
-import { useAuth } from "@/providers/AuthProvider"
 import { useUserRole } from "@/features/auth/useUserRole"
 import { useRunningImportCount } from "@/features/imports"
 import { TenantCard } from "./TenantCard"
@@ -92,12 +91,17 @@ export function Sidebar() {
   const { t } = useTranslation()
   const collapsed = useAppStore((s) => s.sidebarCollapsed)
   const toggle = useAppStore((s) => s.toggleSidebar)
-  const { isSuperuser } = useAuth()
-  const { canWrite, isLoading: roleLoading, role } = useUserRole()
+  // ``isSuperuser`` here MUST come from useUserRole, not useAuth.
+  // The view-as-viewer overlay flips the useUserRole role to
+  // "viewer", which makes isSuperuser=false in the role hook --
+  // but useAuth().isSuperuser is the raw Django auth flag and is
+  // unaffected by the overlay. Reading useAuth here meant
+  // ``effectiveCanWrite`` stayed true for Django superusers in
+  // preview mode, defeating the entire feature.
+  const { canWrite, isLoading: roleLoading, role, isSuperuser } = useUserRole()
   // While the role is loading we render the full sidebar (so the
   // page doesn't flicker for operators+). Once loaded, viewers
   // (canWrite=false, role!=null) see a trimmed sidebar.
-  // Superusers always see everything regardless of tenant role.
   const effectiveCanWrite = isSuperuser || canWrite || roleLoading || !role
   const visibleGroups = GROUPS
     .filter((g) => !g.visible || g.visible({ isSuperuser, canWrite: effectiveCanWrite }))

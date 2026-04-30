@@ -11,6 +11,7 @@ import { KpiCard } from "@/components/ui/kpi-card"
 import { SectionHeader } from "@/components/ui/section-header"
 import { StatusBadge } from "@/components/ui/status-badge"
 import { useActiveTasks, useBankAccountsDashboardKpis, useDailyBalances, useReconKPIs, useReconTasks } from "@/features/reconciliation"
+import { useUserRole } from "@/features/auth/useUserRole"
 import type { BankAccountRowKpis, BookCurrencyMismatch, BookDailyWarning } from "@/features/reconciliation/types"
 import { cn, formatCurrency, formatDateTime, formatDuration, formatNumber } from "@/lib/utils"
 
@@ -28,6 +29,10 @@ function isoDaysAgo(n: number) {
 export function DashboardPage() {
   const { t } = useTranslation(["reconciliation", "common"])
   const navigate = useNavigate()
+  // Quick-action buttons (Iniciar conciliação / Revisar sugestões /
+  // Importar OFX) are write surfaces -- hide from viewers (and from
+  // operators in view-as-viewer preview).
+  const { canWrite } = useUserRole()
 
   const [period, setPeriod] = useState<PeriodDays>(30)
 
@@ -128,26 +133,28 @@ export function DashboardPage() {
         title={t("dashboard.title")}
         subtitle={t("dashboard.subtitle") ?? ""}
         actions={
-          <>
-            <button
-              onClick={() => navigate("/recon/tasks?new=1")}
-              className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
-            >
-              <Play className="h-3.5 w-3.5" /> {t("dashboard.quick_start")}
-            </button>
-            <button
-              onClick={() => navigate("/recon/suggestions")}
-              className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
-            >
-              <Sparkles className="h-3.5 w-3.5" /> {t("dashboard.quick_review_suggestions")}
-            </button>
-            <button
-              onClick={() => navigate("/accounting/bank-transactions?action=import")}
-              className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
-            >
-              <Upload className="h-3.5 w-3.5" /> {t("dashboard.quick_import_ofx")}
-            </button>
-          </>
+          canWrite ? (
+            <>
+              <button
+                onClick={() => navigate("/recon/tasks?new=1")}
+                className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
+              >
+                <Play className="h-3.5 w-3.5" /> {t("dashboard.quick_start")}
+              </button>
+              <button
+                onClick={() => navigate("/recon/suggestions")}
+                className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
+              >
+                <Sparkles className="h-3.5 w-3.5" /> {t("dashboard.quick_review_suggestions")}
+              </button>
+              <button
+                onClick={() => navigate("/accounting/bank-transactions?action=import")}
+                className="inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
+              >
+                <Upload className="h-3.5 w-3.5" /> {t("dashboard.quick_import_ofx")}
+              </button>
+            </>
+          ) : null
         }
       />
 

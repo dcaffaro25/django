@@ -23,6 +23,7 @@ import type {
   ReportType,
   TemplateDocument,
 } from "@/features/reports"
+import { useUserRole } from "@/features/auth/useUserRole"
 import { BlockEditor } from "./components/BlockEditor"
 import { ReportRenderer } from "./components/ReportRenderer"
 import { PeriodStrip } from "./components/PeriodStrip"
@@ -58,6 +59,11 @@ export function BuilderPage() {
   const duplicateTemplate = useDuplicateReportTemplate()
   const calculate = useCalculateReport()
   const saveReport = useSaveReport()
+  // Hide template-mutation buttons (Novo / Duplicar / Excluir /
+  // Salvar modelo) and instance-save (Salvar) from viewers /
+  // view-as-viewer preview. Calculate + Export stay available so
+  // a viewer can still run + download an existing template.
+  const { canWrite } = useUserRole()
 
   const [selectedTemplateId, setSelectedTemplateId] = useState<number | null>(null)
   const [doc, setDoc] = useState<TemplateDocument>(newDocument())
@@ -264,34 +270,38 @@ export function BuilderPage() {
         subtitle="Novo motor — edite o modelo, veja a pré-visualização multi-período, exporte"
         actions={
           <>
-            <button
-              onClick={() => setAiOpen(true)}
-              className="inline-flex h-8 items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 text-[12px] font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-300"
-            >
-              <Sparkles className="h-3.5 w-3.5" /> Gerar com IA
-            </button>
-            <button
-              onClick={() => setChatOpen(true)}
-              className="inline-flex h-8 items-center gap-2 rounded-md border border-blue-500/40 bg-blue-500/10 px-3 text-[12px] font-medium text-blue-700 hover:bg-blue-500/20 dark:text-blue-300"
-            >
-              <MessageSquare className="h-3.5 w-3.5" /> Chat IA
-            </button>
-            <BtnGhost onClick={onNew}>
-              <Plus className="h-3 w-3" /> Novo
-            </BtnGhost>
-            <BtnGhost onClick={onDuplicate} disabled={!selectedTemplateId}>
-              <Copy className="h-3 w-3" /> Duplicar
-            </BtnGhost>
-            <BtnGhost onClick={onDelete} disabled={!selectedTemplateId} className="text-red-600">
-              <Trash2 className="h-3 w-3" /> Excluir
-            </BtnGhost>
-            <button
-              onClick={onSaveTemplate}
-              disabled={!dirty || saveTemplate.isPending}
-              className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-            >
-              <Save className="h-3.5 w-3.5" /> Salvar modelo
-            </button>
+            {canWrite && (
+              <>
+                <button
+                  onClick={() => setAiOpen(true)}
+                  className="inline-flex h-8 items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 text-[12px] font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-300"
+                >
+                  <Sparkles className="h-3.5 w-3.5" /> Gerar com IA
+                </button>
+                <button
+                  onClick={() => setChatOpen(true)}
+                  className="inline-flex h-8 items-center gap-2 rounded-md border border-blue-500/40 bg-blue-500/10 px-3 text-[12px] font-medium text-blue-700 hover:bg-blue-500/20 dark:text-blue-300"
+                >
+                  <MessageSquare className="h-3.5 w-3.5" /> Chat IA
+                </button>
+                <BtnGhost onClick={onNew}>
+                  <Plus className="h-3 w-3" /> Novo
+                </BtnGhost>
+                <BtnGhost onClick={onDuplicate} disabled={!selectedTemplateId}>
+                  <Copy className="h-3 w-3" /> Duplicar
+                </BtnGhost>
+                <BtnGhost onClick={onDelete} disabled={!selectedTemplateId} className="text-red-600">
+                  <Trash2 className="h-3 w-3" /> Excluir
+                </BtnGhost>
+                <button
+                  onClick={onSaveTemplate}
+                  disabled={!dirty || saveTemplate.isPending}
+                  className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                >
+                  <Save className="h-3.5 w-3.5" /> Salvar modelo
+                </button>
+              </>
+            )}
           </>
         }
       />
@@ -423,9 +433,11 @@ export function BuilderPage() {
               <BtnGhost onClick={onCalculate} disabled={calculate.isPending}>
                 <Play className="h-3 w-3" /> Calcular
               </BtnGhost>
-              <BtnGhost onClick={onSaveInstance} disabled={!preview || saveReport.isPending}>
-                <Download className="h-3 w-3" /> Salvar
-              </BtnGhost>
+              {canWrite && (
+                <BtnGhost onClick={onSaveInstance} disabled={!preview || saveReport.isPending}>
+                  <Download className="h-3 w-3" /> Salvar
+                </BtnGhost>
+              )}
               <BtnGhost onClick={() => onExport("xlsx")} disabled={!preview}>
                 <FileSpreadsheet className="h-3 w-3" /> Excel
               </BtnGhost>
