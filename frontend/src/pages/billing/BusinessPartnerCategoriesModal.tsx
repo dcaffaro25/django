@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { Plus, Trash2, Save } from "lucide-react"
+import { Plus, Trash2 } from "lucide-react"
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from "@/components/ui/dialog"
