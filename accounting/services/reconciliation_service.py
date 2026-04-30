@@ -99,13 +99,44 @@ def _normalize_numero_boleto(raw: Optional[str]) -> str:
 
 
 def _cnpj_pair_ok(bank: BankTransactionDTO, book: JournalEntryDTO, require: bool) -> bool:
+    """Conservative CNPJ pair check used during candidate filtering.
+
+    When ``require`` is set, accepts the pair if **any** of the
+    consolidation primitives agree:
+
+    1. Exact CNPJ match (the original behavior).
+    2. Same CNPJ root (matriz/filial — same legal entity).
+    3. The two CNPJs resolve to BPs in the same accepted
+       ``BusinessPartnerGroup`` (cross-root consolidation: CPF↔CNPJ,
+       holding company, acquirer alias, etc.).
+
+    Missing CNPJs on either side fall through to True (the absence of
+    info shouldn't actively reject — same as before). Group lookup is
+    a fast indexed read; bp_group_service swallows its own errors.
+    """
     if not require:
         return True
     bn = _normalize_cnpj(getattr(bank, "cnpj", None))
     jn = _normalize_cnpj(getattr(book, "cnpj", None))
     if not bn or not jn:
         return True
-    return bn == jn
+    if bn == jn:
+        return True
+    # Matriz/filial — same first 8 digits (CNPJ root).
+    if len(bn) == 14 and len(jn) == 14 and bn[:8] == jn[:8]:
+        return True
+    # Cross-root via curated BusinessPartnerGroup.
+    try:
+        company_id = getattr(bank, "company_id", None) or getattr(book, "company_id", None)
+        if company_id is not None:
+            from billing.services.bp_group_service import cnpj_share_group
+            from multitenancy.models import Company
+            company = Company.objects.filter(id=company_id).first()
+            if company is not None and cnpj_share_group(company, bn, jn) is not None:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def _cnpj_groups_compatible(

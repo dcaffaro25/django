@@ -97,6 +97,14 @@ export function computeDimensions(link: NFTransactionLink): DimensionInfo[] {
       detail: "apelido aprendido",
       weight: 0.18,
     }
+  } else if (fields.has("cnpj_group")) {
+    cnpjInfo = {
+      key: "cnpj",
+      label: "CNPJ",
+      match: "partial",
+      detail: "mesmo grupo",
+      weight: 0.22,
+    }
   } else if (!link.transaction_cnpj) {
     cnpjInfo = { key: "cnpj", label: "CNPJ", match: "na", detail: "Tx sem CNPJ", weight: 0 }
   } else {

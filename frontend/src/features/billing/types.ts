@@ -139,6 +139,10 @@ export interface NFTransactionLink {
   nf_dest_nome: string
   nf_dest_cnpj: string
   is_stale: boolean
+  /** Populated when matched_fields contains 'cnpj_group' — the BPs on
+   *  each side share an accepted BusinessPartnerGroup. The review row
+   *  uses this to wire the "Ver grupo" badge to GroupDetailModal. */
+  cnpj_group_id: number | null
   created_at: string
   updated_at: string
 }

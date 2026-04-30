@@ -216,6 +216,31 @@ class NFTransactionLinkSerializer(serializers.ModelSerializer):
     nf_dest_nome = serializers.CharField(source='nota_fiscal.dest_nome', read_only=True)
     nf_dest_cnpj = serializers.CharField(source='nota_fiscal.dest_cnpj', read_only=True)
     is_stale = serializers.BooleanField(read_only=True)
+    # When the link was scored via a cross-root BusinessPartnerGroup
+    # match (matched_fields contains 'cnpj_group'), expose the group id
+    # so the review UI can open the inline group editor without a
+    # follow-up roundtrip.
+    cnpj_group_id = serializers.SerializerMethodField()
+
+    def get_cnpj_group_id(self, obj):
+        if 'cnpj_group' not in (obj.matched_fields or []):
+            return None
+        try:
+            from billing.services.bp_group_service import (
+                find_shared_group, resolve_bp_by_cnpj,
+            )
+            tx = obj.transaction
+            nf = obj.nota_fiscal
+            if not tx or not nf:
+                return None
+            bp_tx = resolve_bp_by_cnpj(tx.company, getattr(tx, 'cnpj', None))
+            if bp_tx is None:
+                return None
+            nf_bp = nf.emitente if nf.emitente_id else nf.destinatario
+            shared = find_shared_group(bp_tx, nf_bp)
+            return shared.id if shared else None
+        except Exception:
+            return None
 
     class Meta:
         model = NFTransactionLink
@@ -228,7 +253,7 @@ class NFTransactionLinkSerializer(serializers.ModelSerializer):
             'transaction_nf_number', 'transaction_cnpj',
             'nf_numero', 'nf_chave', 'nf_data_emissao', 'nf_valor_nota',
             'nf_emit_nome', 'nf_emit_cnpj', 'nf_dest_nome', 'nf_dest_cnpj',
-            'is_stale',
+            'is_stale', 'cnpj_group_id',
             'created_at', 'updated_at',
         ]
         read_only_fields = ['reviewed_by', 'reviewed_at']

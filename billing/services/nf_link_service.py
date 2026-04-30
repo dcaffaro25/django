@@ -117,6 +117,7 @@ def _score(
         # marketplace that the user has previously taught the system to
         # resolve to a real BP. If that BP is the NF's emitente or
         # destinatário, boost slightly less than cnpj_root.
+        boosted = False
         try:
             from billing.services.bp_alias_service import resolve_alias
             aliased_bp = resolve_alias(tx.company, cnpj_tx)
@@ -125,8 +126,28 @@ def _score(
             ):
                 score += Decimal("0.18")
                 matched.append("cnpj_alias")
+                boosted = True
         except Exception:
             pass
+        # Group fallback: even with no alias, the Tx's CNPJ might
+        # resolve to a BP that shares an accepted Group with the NF's
+        # counterparty (cross-root consolidation: CPF↔CNPJ, holding
+        # company, etc.). Catches what cnpj_root + alias don't.
+        if not boosted:
+            try:
+                from billing.services.bp_group_service import (
+                    find_shared_group, resolve_bp_by_cnpj,
+                )
+                bp_tx = resolve_bp_by_cnpj(tx.company, cnpj_tx)
+                if bp_tx is not None:
+                    nf_bp_id = nf.emitente_id or nf.destinatario_id
+                    nf_bp = nf.emitente if nf.emitente_id else nf.destinatario
+                    shared = find_shared_group(bp_tx, nf_bp)
+                    if shared is not None:
+                        score += Decimal("0.22")
+                        matched.append("cnpj_group")
+            except Exception:
+                pass
 
     if tx.date and nf.data_emissao:
         try:

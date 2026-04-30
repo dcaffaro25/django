@@ -3,7 +3,7 @@ import { useSearchParams } from "react-router-dom"
 import {
   CheckCircle2, XCircle, Search, Wand2, RefreshCw,
   AlertTriangle, FileText, Receipt, ArrowRight, ArrowUpDown,
-  Filter,
+  Filter, Network,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { Button } from "@/components/ui/button"
@@ -29,6 +29,7 @@ import {
   DimensionScores,
   type DimensionKey,
 } from "./components/DimensionScores"
+import { GroupDetailModal } from "./components/GroupDetailModal"
 import { useUserRole } from "@/features/auth/useUserRole"
 import { cn, formatCurrency } from "@/lib/utils"
 
@@ -89,6 +90,7 @@ function LinkRow({
   onToggle,
   onAccept,
   onReject,
+  onOpenGroup,
   busy,
   selectable,
 }: {
@@ -97,6 +99,7 @@ function LinkRow({
   onToggle: () => void
   onAccept: () => void
   onReject: () => void
+  onOpenGroup: (groupId: number) => void
   busy?: boolean
   selectable: boolean
 }) {
@@ -133,6 +136,17 @@ function LinkRow({
                     <AlertTriangle className="h-3 w-3" />
                     desatualizado
                   </span>
+                ) : null}
+                {link.cnpj_group_id != null ? (
+                  <button
+                    type="button"
+                    onClick={() => onOpenGroup(link.cnpj_group_id!)}
+                    className="inline-flex items-center gap-1 rounded-full border border-info/40 bg-info/10 px-1.5 py-0.5 text-[10px] font-medium text-info hover:bg-info/20"
+                    title="CNPJs distintos pertencem ao mesmo grupo de parceiros. Clique para ver/editar."
+                  >
+                    <Network className="h-3 w-3" />
+                    mesmo grupo
+                  </button>
                 ) : null}
               </div>
               <DimensionScores link={link} />
@@ -516,6 +530,7 @@ export function NfLinkReviewPage() {
 
   const [scanOpen, setScanOpen] = useState(false)
   const [acceptAllOpen, setAcceptAllOpen] = useState(false)
+  const [openGroupId, setOpenGroupId] = useState<number | null>(null)
 
   const totalCount = data?.length ?? 0
   const filteredCount = filteredAndSorted.length
@@ -749,6 +764,7 @@ export function NfLinkReviewPage() {
                 busy={accept.isPending || reject.isPending}
                 onAccept={() => accept.mutate({ id: link.id })}
                 onReject={() => reject.mutate({ id: link.id })}
+                onOpenGroup={(gid) => setOpenGroupId(gid)}
               />
             ))
           )}
@@ -800,6 +816,7 @@ export function NfLinkReviewPage() {
 
       <ScanModal open={scanOpen} onClose={() => setScanOpen(false)} />
       <AcceptAllModal open={acceptAllOpen} onClose={() => setAcceptAllOpen(false)} />
+      <GroupDetailModal groupId={openGroupId} onClose={() => setOpenGroupId(null)} />
     </div>
   )
 }

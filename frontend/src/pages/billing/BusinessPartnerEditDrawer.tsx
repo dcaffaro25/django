@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { Save, X, FileText, ArrowUpFromLine, ArrowDownToLine, Crown, Network } from "lucide-react"
+import { Save, X, FileText, ArrowUpFromLine, ArrowDownToLine, Crown, Network, Settings2 } from "lucide-react"
 import { Drawer } from "@/components/ui/drawer"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -17,6 +17,7 @@ import type { BusinessPartner } from "@/features/billing"
 import { useUserRole } from "@/features/auth/useUserRole"
 import { formatCurrency, formatDate } from "@/lib/utils"
 import { CollapsibleRelatedList } from "./components/CollapsibleRelatedList"
+import { GroupDetailModal } from "./components/GroupDetailModal"
 
 const EMPTY: Partial<BusinessPartner> = {
   name: "",
@@ -380,6 +381,7 @@ function RelatedSections({ partnerId }: { partnerId: number }) {
 function GroupSection({ bp }: { bp: BusinessPartner }) {
   const groupId = bp.group_id ?? null
   const group = useBusinessPartnerGroup(groupId)
+  const [modalOpen, setModalOpen] = useState(false)
 
   if (groupId == null) return null
   if (group.isLoading) {
@@ -397,51 +399,60 @@ function GroupSection({ bp }: { bp: BusinessPartner }) {
   const isPrimary = bp.group_role === "primary"
 
   return (
-    <div className="space-y-2 border-t border-border pt-3">
-      <div className="flex items-center gap-2 text-[13px]">
-        <Network className="h-4 w-4 text-info" />
-        <span className="font-semibold">Grupo: {g.name}</span>
-        {isPrimary ? (
-          <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 dark:bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-700 dark:text-amber-400">
-            <Crown className="h-3 w-3" />
-            primary
-          </span>
+    <>
+      <div className="space-y-2 border-t border-border pt-3">
+        <div className="flex items-center gap-2 text-[13px]">
+          <Network className="h-4 w-4 text-info" />
+          <span className="font-semibold">Grupo: {g.name}</span>
+          {isPrimary ? (
+            <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 dark:bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-700 dark:text-amber-400">
+              <Crown className="h-3 w-3" />
+              primary
+            </span>
+          ) : (
+            <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
+              membro
+            </span>
+          )}
+          <Button
+            size="sm"
+            variant="ghost"
+            className="ml-auto h-7 px-2 text-[11px]"
+            onClick={() => setModalOpen(true)}
+          >
+            <Settings2 className="h-3.5 w-3.5 mr-1" />
+            Editar grupo
+          </Button>
+        </div>
+        {others.length > 0 ? (
+          <ul className="space-y-1 pl-6">
+            {others.map((m) => (
+              <li
+                key={m.id}
+                className="flex items-center gap-2 text-[12px]"
+              >
+                {m.role === "primary" ? (
+                  <Crown className="h-3 w-3 text-amber-500" />
+                ) : (
+                  <span className="h-3 w-3" />
+                )}
+                <span className="truncate font-medium">{m.business_partner_name}</span>
+                <span className="font-mono text-[11px] text-muted-foreground">
+                  {m.business_partner_identifier}
+                </span>
+              </li>
+            ))}
+          </ul>
         ) : (
-          <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground">
-            membro
-          </span>
+          <p className="pl-6 text-[12px] text-muted-foreground">
+            Nenhum outro parceiro neste grupo ainda.
+          </p>
         )}
       </div>
-      {others.length > 0 ? (
-        <ul className="space-y-1 pl-6">
-          {others.map((m) => (
-            <li
-              key={m.id}
-              className="flex items-center gap-2 text-[12px]"
-            >
-              {m.role === "primary" ? (
-                <Crown className="h-3 w-3 text-amber-500" />
-              ) : (
-                <span className="h-3 w-3" />
-              )}
-              <span className="truncate font-medium">{m.business_partner_name}</span>
-              <span className="font-mono text-[11px] text-muted-foreground">
-                {m.business_partner_identifier}
-              </span>
-            </li>
-          ))}
-        </ul>
-      ) : (
-        <p className="pl-6 text-[12px] text-muted-foreground">
-          Nenhum outro parceiro neste grupo ainda.
-        </p>
-      )}
-      <a
-        href="/billing/grupos"
-        className="inline-block text-[11px] text-info underline-offset-2 hover:underline"
-      >
-        Gerenciar grupo →
-      </a>
-    </div>
+      <GroupDetailModal
+        groupId={modalOpen ? groupId : null}
+        onClose={() => setModalOpen(false)}
+      />
+    </>
   )
 }

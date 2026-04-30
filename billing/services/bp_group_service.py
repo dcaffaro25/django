@@ -479,6 +479,58 @@ def ensure_root_group(bp: BusinessPartner) -> Optional[BusinessPartnerGroup]:
     return group
 
 
+def find_shared_group(
+    bp_a: Optional[BusinessPartner],
+    bp_b: Optional[BusinessPartner],
+) -> Optional[BusinessPartnerGroup]:
+    """If ``bp_a`` and ``bp_b`` belong to the same accepted Group, return
+    that Group. Otherwise None.
+
+    Used by the NF↔Tx scorer and the reconciliation pair check to detect
+    cross-root consolidation (CPF↔CNPJ, two CNPJs of an economic group)
+    that ``cnpj_root`` matching can't catch.
+    """
+    if bp_a is None or bp_b is None:
+        return None
+    if bp_a.id == bp_b.id:
+        return None
+    mem_a = (
+        BusinessPartnerGroupMembership.objects
+        .filter(
+            business_partner_id=bp_a.id,
+            review_status=BusinessPartnerGroupMembership.REVIEW_ACCEPTED,
+        )
+        .select_related("group")
+        .first()
+    )
+    if mem_a is None:
+        return None
+    mem_b = (
+        BusinessPartnerGroupMembership.objects
+        .filter(
+            business_partner_id=bp_b.id,
+            group_id=mem_a.group_id,
+            review_status=BusinessPartnerGroupMembership.REVIEW_ACCEPTED,
+        )
+        .first()
+    )
+    return mem_a.group if mem_b is not None else None
+
+
+def cnpj_share_group(company, cnpj_a: str, cnpj_b: str) -> Optional[BusinessPartnerGroup]:
+    """Resolve two CNPJs to BPs and return their shared Group, if any.
+
+    Returns None when either CNPJ doesn't resolve to a BP, when both
+    resolve to the same BP (no Group needed), or when their BPs aren't
+    in the same Group.
+    """
+    if not cnpj_a or not cnpj_b:
+        return None
+    bp_a = resolve_bp_by_cnpj(company, cnpj_a)
+    bp_b = resolve_bp_by_cnpj(company, cnpj_b)
+    return find_shared_group(bp_a, bp_b)
+
+
 def resolve_bp_by_cnpj(company, cnpj_or_cpf: str) -> Optional[BusinessPartner]:
     """Resolve string CNPJ/CPF para BP do mesmo tenant.
 

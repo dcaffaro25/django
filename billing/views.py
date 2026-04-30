@@ -929,6 +929,40 @@ class BusinessPartnerGroupMembershipViewSet(ScopedQuerysetMixin, viewsets.ModelV
     )
     serializer_class = BusinessPartnerGroupMembershipSerializer
 
+    def perform_destroy(self, instance):
+        """Refuse deletion of structurally pinned memberships.
+
+        - The Group's primary can't be removed; promote another member first.
+        - Auto-root members (matriz/filial materialized from cnpj_root) get
+          recreated by ``BusinessPartner.save()`` anyway, so deleting them is
+          pointless and confusing. The user has to change the BP's identifier
+          to dissociate it.
+
+        Other memberships (curated cross-root, alias-derived, manual) are
+        freely removable.
+        """
+        from rest_framework.exceptions import ValidationError
+        if instance.role == BusinessPartnerGroupMembership.ROLE_PRIMARY:
+            raise ValidationError({
+                'detail': (
+                    "Não é possível remover o primary do grupo. Promova "
+                    "outro membro a primary antes."
+                ),
+            })
+        is_auto_root = any(
+            (e or {}).get('method') == BusinessPartnerGroupMembership.METHOD_AUTO_ROOT
+            for e in (instance.evidence or [])
+        )
+        if is_auto_root:
+            raise ValidationError({
+                'detail': (
+                    "Membro auto-criado por raiz CNPJ — não pode ser removido "
+                    "manualmente. Altere o identifier do parceiro para "
+                    "dissociá-lo."
+                ),
+            })
+        super().perform_destroy(instance)
+
     def get_queryset(self):
         qs = super().get_queryset()
         params = getattr(self.request, 'query_params', None)

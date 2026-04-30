@@ -700,6 +700,22 @@ export function useRejectMembership() {
   })
 }
 
+export function useDeleteMembership() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: (id: number) => billingApi.deleteMembership(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "bp-groups"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "bp-group"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "bp-group-memberships"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "partners"] })
+      toast.success("Membro removido do grupo.")
+    },
+    onError: (e) => showError("Falha ao remover membro", e),
+  })
+}
+
 export function useBusinessPartnerAliases(params?: Record<string, string | number | boolean | undefined>) {
   const sub = useSub()
   return useQuery({

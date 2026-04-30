@@ -301,6 +301,8 @@ export const billingApi = {
     api.tenant.post<BusinessPartnerGroupMembership>(
       `/api/business-partner-group-memberships/${id}/reject/`, {},
     ),
+  deleteMembership: (id: number) =>
+    api.tenant.delete(`/api/business-partner-group-memberships/${id}/`),
 
   // ============================================================
   // BusinessPartnerAlias

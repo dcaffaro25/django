@@ -2,6 +2,7 @@ import { useState } from "react"
 import {
   CheckCircle2, XCircle, ChevronRight, ChevronDown,
   GitMerge, Crown, Network, Tag, RefreshCw, Sparkles, GitBranch,
+  Trash2, Lock,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { Button } from "@/components/ui/button"
@@ -13,6 +14,7 @@ import {
   useBusinessPartnerAliases,
   useBusinessPartnerGroups,
   useCnpjRootClusters,
+  useDeleteMembership,
   useGroupMemberships,
   useAcceptAlias,
   useAcceptMembership,
@@ -167,11 +169,16 @@ function SuggestionsSection({ mergeOnly }: { mergeOnly: boolean }) {
 // Section 2: existing groups
 // =====================================================
 
+function isAutoRootMembership(m: BusinessPartnerGroupMembership): boolean {
+  return (m.evidence ?? []).some((e) => e?.method === "auto_root")
+}
+
 function GroupRow({ group }: { group: BusinessPartnerGroup }) {
   const [open, setOpen] = useState(false)
   const promote = usePromoteGroupPrimary()
   const reject = useRejectMembership()
   const accept = useAcceptMembership()
+  const removeMember = useDeleteMembership()
   const merge = useMergeGroup()
   const [mergeId, setMergeId] = useState<string>("")
 
@@ -203,36 +210,64 @@ function GroupRow({ group }: { group: BusinessPartnerGroup }) {
           <div className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
             Membros
           </div>
-          {accepted.map((m) => (
-            <div
-              key={m.id}
-              className="flex items-center gap-2 rounded border border-border/60 bg-muted/20 px-2 py-1.5 text-sm"
-            >
-              {m.role === "primary" ? (
-                <Crown className="h-3.5 w-3.5 text-amber-500" />
-              ) : (
-                <span className="h-3.5 w-3.5" />
-              )}
-              <span className="flex-1 truncate">{m.business_partner_name}</span>
-              <PartnerTypeChip type={m.business_partner_partner_type} />
-              <span className="font-mono text-[11px] text-muted-foreground">
-                {fmtCnpj(m.business_partner_identifier)}
-              </span>
-              {m.role !== "primary" ? (
+          {accepted.map((m) => {
+            const auto = isAutoRootMembership(m)
+            const isPrimary = m.role === "primary"
+            const removeTitle = isPrimary
+              ? "Promova outro membro a primary antes de remover este."
+              : auto
+                ? "Membro auto-criado por raiz CNPJ — alterar o identifier do parceiro para dissociar."
+                : "Remover do grupo"
+            return (
+              <div
+                key={m.id}
+                className="flex items-center gap-2 rounded border border-border/60 bg-muted/20 px-2 py-1.5 text-sm"
+              >
+                {isPrimary ? (
+                  <Crown className="h-3.5 w-3.5 text-amber-500" />
+                ) : (
+                  <span className="h-3.5 w-3.5" />
+                )}
+                <span className="flex-1 truncate">{m.business_partner_name}</span>
+                <PartnerTypeChip type={m.business_partner_partner_type} />
+                <span className="font-mono text-[11px] text-muted-foreground">
+                  {fmtCnpj(m.business_partner_identifier)}
+                </span>
+                {auto ? (
+                  <span
+                    className="inline-flex items-center gap-1 rounded-full bg-info/10 px-1.5 py-0.5 text-[10px] uppercase text-info"
+                    title="Auto-criado a partir da raiz CNPJ"
+                  >
+                    <Lock className="h-3 w-3" />
+                    auto
+                  </span>
+                ) : null}
+                {!isPrimary ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() =>
+                      promote.mutate({ groupId: group.id, membershipId: m.id })
+                    }
+                    title="Promover a primary"
+                    disabled={promote.isPending}
+                  >
+                    <Crown className="h-3.5 w-3.5" />
+                  </Button>
+                ) : null}
                 <Button
                   size="sm"
                   variant="ghost"
-                  onClick={() =>
-                    promote.mutate({ groupId: group.id, membershipId: m.id })
-                  }
-                  title="Promover a primary"
-                  disabled={promote.isPending}
+                  onClick={() => removeMember.mutate(m.id)}
+                  title={removeTitle}
+                  disabled={removeMember.isPending || isPrimary || auto}
+                  className="text-destructive hover:bg-destructive/10"
                 >
-                  <Crown className="h-3.5 w-3.5" />
+                  <Trash2 className="h-3.5 w-3.5" />
                 </Button>
-              ) : null}
-            </div>
-          ))}
+              </div>
+            )
+          })}
 
           {suggested.length > 0 ? (
             <>
