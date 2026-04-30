@@ -1,0 +1,234 @@
+# -*- coding: utf-8 -*-
+"""
+Bidirectional NF ↔ Invoice sync.
+
+Two operations:
+
+1. ``match_or_create_invoice_for_nf(nf)``
+   When a new NF lands, try to find an existing Invoice that should "own" it.
+   If found, attach via ``InvoiceNFLink``. Otherwise (and only when the
+   tenant flag is on), create a new Invoice from NF data.
+
+2. ``attach_invoice_to_nf(invoice, nf, *, relation_type)``
+   Manual M:N attach helper — used by the UI's "link existing invoice" action.
+
+Both operations refresh fiscal_status on affected Invoices.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import date, timedelta
+from decimal import Decimal
+from typing import Optional
+
+from django.db import transaction as db_transaction
+from django.utils import timezone
+
+logger = logging.getLogger(__name__)
+
+
+# Heurística: janela em torno da data de emissão para casar Invoice→NF.
+_DEFAULT_DATE_WINDOW_DAYS = 30
+
+
+def _digits(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    import re
+    return re.sub(r"\D", "", str(value))
+
+
+def _resolve_partner_for_nf(nf) -> Optional[object]:
+    """Return the BusinessPartner to use on a generated Invoice. Prefer the
+    counterparty from the perspective of the tenant's CNPJ but fall back to
+    whichever side has a resolved FK."""
+    # tipo_operacao 1 = saída (sale), 0 = entrada (purchase)
+    if nf.tipo_operacao == 1:
+        return nf.destinatario or nf.emitente
+    return nf.emitente or nf.destinatario
+
+
+def _invoice_type_for_nf(nf) -> str:
+    return "sale" if nf.tipo_operacao == 1 else "purchase"
+
+
+def _find_match(nf, *, date_window_days: int = _DEFAULT_DATE_WINDOW_DAYS):
+    """
+    Search for an existing Invoice that should attach to ``nf``.
+
+    Match preference:
+    1. invoice_number == NF.numero AND partner.identifier ∈ {emit_cnpj, dest_cnpj}
+    2. partner match + total_amount within tolerance + date window
+    Falls back to None when nothing convincing is found.
+    """
+    from billing.models import Invoice
+
+    company = nf.company
+    partner_candidates_cnpjs = {_digits(nf.emit_cnpj), _digits(nf.dest_cnpj)}
+    partner_candidates_cnpjs.discard("")
+
+    qs = Invoice.objects.filter(company=company).exclude(status="canceled")
+    qs = qs.filter(partner__identifier__in=list(partner_candidates_cnpjs)) if partner_candidates_cnpjs else qs
+
+    # Hard match: invoice_number == numero (string comparison; numero is int)
+    nf_numero_str = str(nf.numero)
+    by_number = qs.filter(invoice_number=nf_numero_str).first()
+    if by_number is not None:
+        return by_number
+
+    # Soft match: same partner + amount within 1% + same month
+    nf_date = nf.data_emissao.date() if nf.data_emissao else None
+    if nf_date is None:
+        return None
+    date_low = nf_date - timedelta(days=date_window_days)
+    date_high = nf_date + timedelta(days=date_window_days)
+    candidates = qs.filter(invoice_date__range=(date_low, date_high))
+
+    nf_total = Decimal(nf.valor_nota or 0)
+    if nf_total <= 0:
+        return None
+    tol = Decimal("0.01")  # 1%
+    for inv in candidates:
+        try:
+            inv_total = Decimal(inv.total_amount or 0)
+            if inv_total <= 0:
+                continue
+            if abs(inv_total - nf_total) / nf_total <= tol:
+                return inv
+        except Exception:
+            continue
+    return None
+
+
+def _is_eligible_for_auto_create(nf, config) -> bool:
+    """Tenant policy gate. False = skip auto-create."""
+    if not config.auto_create_invoice_from_nf:
+        return False
+    if nf.tipo_operacao not in config.allowed_tipos_operacao():
+        return False
+    if nf.finalidade not in config.allowed_finalidades():
+        return False
+    return True
+
+
+def _create_invoice_from_nf(nf):
+    """Build a draft Invoice mirroring NF totals + partner. Does NOT save lines."""
+    from billing.models import Invoice
+
+    partner = _resolve_partner_for_nf(nf)
+    if partner is None:
+        return None
+
+    invoice = Invoice.objects.create(
+        company=nf.company,
+        partner=partner,
+        invoice_type=_invoice_type_for_nf(nf),
+        invoice_number=str(nf.numero),
+        invoice_date=nf.data_emissao.date() if nf.data_emissao else timezone.now().date(),
+        due_date=nf.data_emissao.date() if nf.data_emissao else timezone.now().date(),
+        status="issued",
+        total_amount=nf.valor_nota or 0,
+        tax_amount=(
+            Decimal(nf.valor_icms or 0)
+            + Decimal(nf.valor_pis or 0)
+            + Decimal(nf.valor_cofins or 0)
+            + Decimal(nf.valor_ipi or 0)
+        ),
+        discount_amount=nf.valor_desconto or 0,
+        description=f"Auto-criada a partir da NF {nf.numero} ({nf.chave[-8:]})",
+    )
+    return invoice
+
+
+def _relation_type_for_nf(nf) -> str:
+    """Map NF.finalidade → InvoiceNFLink.relation_type."""
+    from billing.models import InvoiceNFLink
+    if nf.finalidade == 4:
+        return InvoiceNFLink.REL_DEVOLUCAO
+    if nf.finalidade == 2:
+        return InvoiceNFLink.REL_COMPLEMENTAR
+    if nf.finalidade == 3:
+        return InvoiceNFLink.REL_AJUSTE
+    return InvoiceNFLink.REL_NORMAL
+
+
+def attach_invoice_to_nf(invoice, nf, *, relation_type: Optional[str] = None,
+                         allocated_amount=None, notes: str = ""):
+    """Idempotent M:N attach. Triggers fiscal_status refresh."""
+    from billing.models import InvoiceNFLink
+    if invoice.company_id != nf.company_id:
+        raise ValueError("Invoice e NF de tenants diferentes; recusando attach.")
+    rel_type = relation_type or _relation_type_for_nf(nf)
+    link, created = InvoiceNFLink.objects.get_or_create(
+        company=invoice.company,
+        invoice=invoice,
+        nota_fiscal=nf,
+        defaults={
+            "relation_type": rel_type,
+            "allocated_amount": allocated_amount,
+            "notes": notes,
+        },
+    )
+    # Refresh fiscal_status for the affected Invoice(s)
+    try:
+        from billing.services.fiscal_status_service import refresh
+        refresh(invoice, persist=True)
+    except Exception:
+        logger.exception("attach_invoice_to_nf: fiscal_status.refresh failed for invoice_id=%s", invoice.id)
+    return link, created
+
+
+@db_transaction.atomic
+def match_or_create_invoice_for_nf(nf, *, dry_run: bool = False) -> dict:
+    """
+    Top-level entry point called by the NF importer.
+
+    Returns:
+        {
+          "matched_invoice_id": int | None,
+          "created_invoice_id": int | None,
+          "link_id": int | None,
+          "skipped_reason": str | None,
+          "dry_run": bool,
+        }
+    """
+    from billing.models import BillingTenantConfig
+
+    out = {
+        "matched_invoice_id": None,
+        "created_invoice_id": None,
+        "link_id": None,
+        "skipped_reason": None,
+        "dry_run": dry_run,
+    }
+
+    config = BillingTenantConfig.get_or_default(nf.company)
+
+    matched = _find_match(nf)
+    if matched is not None:
+        out["matched_invoice_id"] = matched.id
+        if not dry_run:
+            link, _ = attach_invoice_to_nf(matched, nf)
+            out["link_id"] = link.id
+        return out
+
+    if not _is_eligible_for_auto_create(nf, config):
+        out["skipped_reason"] = (
+            "auto_create_disabled"
+            if not config.auto_create_invoice_from_nf
+            else "tipo_or_finalidade_filtered"
+        )
+        return out
+
+    if dry_run:
+        out["created_invoice_id"] = -1  # sentinel for preview
+        return out
+
+    invoice = _create_invoice_from_nf(nf)
+    if invoice is None:
+        out["skipped_reason"] = "no_partner_resolved"
+        return out
+    out["created_invoice_id"] = invoice.id
+    link, _ = attach_invoice_to_nf(invoice, nf)
+    out["link_id"] = link.id
+    return out

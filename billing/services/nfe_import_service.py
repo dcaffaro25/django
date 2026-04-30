@@ -573,7 +573,61 @@ def import_one(xml_content, company, filename=""):
             chave_referenciada=nf.chave,
             nota_referenciada__isnull=True,
         ).update(nota_referenciada=nf)
+
+        # Phase 1+2.5+3 hooks (best-effort: never break the import flow).
+        _post_import_billing_hooks(nf, company)
+
     return "importada", nf
+
+
+def _post_import_billing_hooks(nf, company):
+    """
+    Run after NotaFiscal + items + referências are persisted, *inside the same
+    transaction*. Three hooks, each isolated in try/except so one failure does
+    not corrupt the import:
+
+    1. Auto-link to existing Transactions (suggested rows in NFTransactionLink).
+    2. Auto-attach / auto-create Invoice from NF.
+    3. Refresh fiscal_status on any newly-attached Invoices.
+    """
+    from billing.models import BillingTenantConfig
+
+    config = BillingTenantConfig.get_or_default(company)
+
+    if config.auto_link_nf_to_transactions:
+        try:
+            from billing.services.nf_link_service import rescan_for_nf
+            rescan_for_nf(
+                nf,
+                date_window_days=int(config.link_date_window_days or 7),
+                amount_tolerance=Decimal(config.link_amount_tolerance_pct or "0.01"),
+                min_confidence=Decimal("0.5"),
+            )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "post_import_billing_hooks: nf_link_service.rescan_for_nf failed for nf_id=%s",
+                nf.id,
+            )
+
+    try:
+        from billing.services.nf_invoice_sync import match_or_create_invoice_for_nf
+        match_or_create_invoice_for_nf(nf)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception(
+            "post_import_billing_hooks: nf_invoice_sync failed for nf_id=%s", nf.id,
+        )
+
+    try:
+        from billing.services.fiscal_status_service import refresh_for_nf
+        refresh_for_nf(nf)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception(
+            "post_import_billing_hooks: fiscal_status.refresh_for_nf failed for nf_id=%s",
+            nf.id,
+        )
 
 
 def import_many(files, company):

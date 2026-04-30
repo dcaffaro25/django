@@ -2,7 +2,8 @@ from rest_framework import serializers
 from .models import (
     BusinessPartnerCategory, BusinessPartner,
     ProductServiceCategory, ProductService,
-    Contract, Invoice, InvoiceLine
+    Contract, Invoice, InvoiceLine,
+    NFTransactionLink, InvoiceNFLink, BillingTenantConfig,
 )
 
 from multitenancy.serializers import FlexibleRelatedField, CompanySerializer
@@ -108,9 +109,109 @@ class ProductServiceMiniSerializer(serializers.ModelSerializer):
 class InvoiceMiniSerializer(serializers.ModelSerializer):
     class Meta:
         model = Invoice
-        fields = ['id', 'invoice_number', 'invoice_date', 'total_amount']
-        
+        fields = ['id', 'invoice_number', 'invoice_date', 'total_amount',
+                  'status', 'fiscal_status', 'has_pending_corrections']
+
 class ContractMiniSerializer(serializers.ModelSerializer):
     class Meta:
         model = Contract
         fields = ['id', 'contract_number', 'start_date', 'base_value']
+
+
+# ============================================================
+# NF ↔ Tx link, Invoice ↔ NF link, BillingTenantConfig
+# ============================================================
+
+class NFTransactionLinkSerializer(serializers.ModelSerializer):
+    """Includes denormalized tx + nf snippets so the review UI doesn't
+    have to make N+1 follow-up requests."""
+    transaction_amount = serializers.DecimalField(
+        source='transaction.amount', max_digits=18, decimal_places=2,
+        read_only=True, allow_null=True,
+    )
+    transaction_date = serializers.DateField(source='transaction.date', read_only=True)
+    transaction_description = serializers.CharField(
+        source='transaction.description', read_only=True, allow_null=True,
+    )
+    transaction_nf_number = serializers.CharField(
+        source='transaction.nf_number', read_only=True, allow_null=True,
+    )
+    transaction_cnpj = serializers.CharField(
+        source='transaction.cnpj', read_only=True, allow_null=True,
+    )
+    nf_numero = serializers.IntegerField(source='nota_fiscal.numero', read_only=True)
+    nf_chave = serializers.CharField(source='nota_fiscal.chave', read_only=True)
+    nf_data_emissao = serializers.DateTimeField(source='nota_fiscal.data_emissao', read_only=True)
+    nf_valor_nota = serializers.DecimalField(
+        source='nota_fiscal.valor_nota', max_digits=15, decimal_places=2, read_only=True,
+    )
+    nf_emit_nome = serializers.CharField(source='nota_fiscal.emit_nome', read_only=True)
+    nf_emit_cnpj = serializers.CharField(source='nota_fiscal.emit_cnpj', read_only=True)
+    nf_dest_nome = serializers.CharField(source='nota_fiscal.dest_nome', read_only=True)
+    nf_dest_cnpj = serializers.CharField(source='nota_fiscal.dest_cnpj', read_only=True)
+    is_stale = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = NFTransactionLink
+        fields = [
+            'id', 'company', 'transaction', 'nota_fiscal',
+            'allocated_amount', 'confidence', 'method', 'matched_fields',
+            'review_status', 'reviewed_by', 'reviewed_at', 'notes',
+            'tx_amount_snapshot', 'nf_valor_snapshot',
+            'transaction_amount', 'transaction_date', 'transaction_description',
+            'transaction_nf_number', 'transaction_cnpj',
+            'nf_numero', 'nf_chave', 'nf_data_emissao', 'nf_valor_nota',
+            'nf_emit_nome', 'nf_emit_cnpj', 'nf_dest_nome', 'nf_dest_cnpj',
+            'is_stale',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = ['reviewed_by', 'reviewed_at']
+
+
+class InvoiceNFLinkSerializer(serializers.ModelSerializer):
+    nf_numero = serializers.IntegerField(source='nota_fiscal.numero', read_only=True)
+    nf_chave = serializers.CharField(source='nota_fiscal.chave', read_only=True)
+    nf_data_emissao = serializers.DateTimeField(source='nota_fiscal.data_emissao', read_only=True)
+    nf_valor_nota = serializers.DecimalField(
+        source='nota_fiscal.valor_nota', max_digits=15, decimal_places=2, read_only=True,
+    )
+    nf_finalidade = serializers.IntegerField(source='nota_fiscal.finalidade', read_only=True)
+    nf_status_sefaz = serializers.CharField(source='nota_fiscal.status_sefaz', read_only=True)
+    invoice_number = serializers.CharField(source='invoice.invoice_number', read_only=True)
+    invoice_date = serializers.DateField(source='invoice.invoice_date', read_only=True)
+    invoice_total_amount = serializers.DecimalField(
+        source='invoice.total_amount', max_digits=12, decimal_places=2, read_only=True,
+    )
+
+    class Meta:
+        model = InvoiceNFLink
+        fields = [
+            'id', 'company', 'invoice', 'nota_fiscal',
+            'relation_type', 'allocated_amount', 'notes',
+            'nf_numero', 'nf_chave', 'nf_data_emissao', 'nf_valor_nota',
+            'nf_finalidade', 'nf_status_sefaz',
+            'invoice_number', 'invoice_date', 'invoice_total_amount',
+            'created_at', 'updated_at',
+        ]
+
+
+class BillingTenantConfigSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BillingTenantConfig
+        fields = '__all__'
+        read_only_fields = ['company']
+
+
+# Re-export an enriched Invoice serializer that includes attachments — used by
+# the detail page. We avoid changing the existing InvoiceSerializer's shape so
+# bulk import flows aren't broken; new code can opt into this one explicitly.
+class InvoiceDetailSerializer(serializers.ModelSerializer):
+    lines = InvoiceLineSerializer(many=True, read_only=True)
+    nf_attachments = InvoiceNFLinkSerializer(many=True, read_only=True)
+    partner_name = serializers.CharField(source='partner.name', read_only=True)
+    partner_identifier = serializers.CharField(source='partner.identifier', read_only=True)
+    contract_number = serializers.CharField(source='contract.contract_number', read_only=True, allow_null=True)
+
+    class Meta:
+        model = Invoice
+        fields = '__all__'

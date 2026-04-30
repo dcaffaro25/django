@@ -9,6 +9,9 @@ from .views import (
     ContractViewSet,
     InvoiceViewSet,
     InvoiceLineViewSet,
+    NFTransactionLinkViewSet,
+    InvoiceNFLinkViewSet,
+    BillingTenantConfigViewSet,
 )
 from .views_nfe import (
     NFeImportView,
@@ -30,6 +33,9 @@ router.register('invoice_lines', InvoiceLineViewSet)
 router.register('nfe', NotaFiscalViewSet)
 router.register('nfe-itens', NotaFiscalItemViewSet)
 router.register('nfe-eventos', NFeEventoViewSet)
+router.register('nf-transaction-links', NFTransactionLinkViewSet)
+router.register('invoice-nf-links', InvoiceNFLinkViewSet)
+router.register('billing-config', BillingTenantConfigViewSet)
 
 urlpatterns = [
     re_path(r'api/nfe/import/?$', NFeImportView.as_view(), name='nfe-import'),

@@ -69,6 +69,25 @@ class BusinessPartner(TenantAwareBaseModel):
     payment_terms = models.CharField(max_length=50, blank=True)
     is_active = models.BooleanField(default=True)
 
+    # Account mappings used when posting Invoices/NFs to the GL. When blank,
+    # caller falls back to BillingTenantConfig.default_{receivable,payable}_account.
+    receivable_account = models.ForeignKey(
+        "accounting.Account",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text="Conta A/R deste cliente (vendas).",
+    )
+    payable_account = models.ForeignKey(
+        "accounting.Account",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text="Conta A/P deste fornecedor (compras).",
+    )
+
     class Meta:
         constraints = [
             models.UniqueConstraint(
@@ -109,7 +128,7 @@ class ProductService(TenantAwareBaseModel):
     TYPES = [('product', 'Product'), ('service', 'Service')]
 
     name = models.CharField(max_length=255)
-    code = models.CharField(max_length=100, unique=True)
+    code = models.CharField(max_length=100, db_index=True)
     erp_id = models.CharField(
         max_length=128,
         null=True,
@@ -179,6 +198,12 @@ class ProductService(TenantAwareBaseModel):
     )
 
     class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['company', 'code'],
+                name='billing_ps_company_code_uniq',
+            ),
+        ]
         indexes = [
             models.Index(fields=['company', 'erp_id']),
         ]
@@ -246,7 +271,26 @@ class Invoice(TenantAwareBaseModel):
         ('canceled', 'Canceled')
     ]
 
+    # Two-axis lifecycle: payment ``status`` (operacional) +
+    # ``fiscal_status`` (derivado das NFs vinculadas).
+    FISCAL_STATUS_CHOICES = [
+        ('pending_nf', 'Pendente de NF'),
+        ('invoiced', 'Faturada (NF emitida)'),
+        ('partially_returned', 'Devolvida parcialmente'),
+        ('fully_returned', 'Devolvida'),
+        ('fiscally_cancelled', 'NF cancelada'),
+        ('mixed', 'Misto (múltiplas NFs com estados diferentes)'),
+    ]
+
     partner = models.ForeignKey(BusinessPartner, on_delete=models.CASCADE)
+    contract = models.ForeignKey(
+        'Contract',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='invoices',
+        help_text='Contrato-mãe que originou esta fatura (recorrência).',
+    )
     erp_id = models.CharField(
         max_length=128,
         null=True,
@@ -268,18 +312,104 @@ class Invoice(TenantAwareBaseModel):
     recurrence_end_date = models.DateField(null=True, blank=True)
     description = models.TextField(blank=True)
 
+    # Eixo fiscal — projeção do estado das NFs vinculadas. Não é fonte de
+    # verdade: é cache. Recalculado por ``fiscal_status_service`` em hooks
+    # explícitos (NF importada, evento, link aceito). Nunca derivar GL daqui.
+    fiscal_status = models.CharField(
+        max_length=24,
+        choices=FISCAL_STATUS_CHOICES,
+        default='pending_nf',
+        db_index=True,
+    )
+    fiscal_status_computed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Última vez que o cache de fiscal_status foi recalculado.",
+    )
+    has_pending_corrections = models.BooleanField(
+        default=False,
+        help_text="True quando alguma NF vinculada teve uma CCe desde o último review.",
+    )
+
+    notas_fiscais = models.ManyToManyField(
+        'billing.NotaFiscal',
+        through='billing.InvoiceNFLink',
+        through_fields=('invoice', 'nota_fiscal'),
+        related_name='invoices',
+        blank=True,
+    )
+
     class Meta:
         indexes = [
             models.Index(fields=['company', 'erp_id']),
+            models.Index(fields=['company', 'fiscal_status']),
+            models.Index(fields=['company', 'status']),
         ]
-    
+
     def __str__(self):
         return f"Invoice {self.invoice_number} - {self.partner.name}"
-    
+
     def update_totals(self):
         self.total_amount = sum(line.total_price for line in self.lines.all())
         self.tax_amount = sum(line.tax_amount for line in self.lines.all())
         self.save(update_fields=['total_amount', 'tax_amount'])
+
+
+class InvoiceNFLink(TenantAwareBaseModel):
+    """
+    Through-model do M:N Invoice ↔ NotaFiscal.
+    Carrega o tipo de relação (normal / devolução / complementar) e o valor
+    coberto, permitindo que uma Invoice satisfaça N NFs e vice-versa.
+    """
+    REL_NORMAL = 'normal'
+    REL_DEVOLUCAO = 'devolucao'
+    REL_COMPLEMENTAR = 'complementar'
+    REL_AJUSTE = 'ajuste'
+    REL_CHOICES = [
+        (REL_NORMAL, 'Normal'),
+        (REL_DEVOLUCAO, 'Devolução'),
+        (REL_COMPLEMENTAR, 'Complementar'),
+        (REL_AJUSTE, 'Ajuste'),
+    ]
+
+    invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name='nf_attachments')
+    nota_fiscal = models.ForeignKey(
+        'billing.NotaFiscal',
+        on_delete=models.CASCADE,
+        related_name='invoice_attachments',
+    )
+    relation_type = models.CharField(
+        max_length=16,
+        choices=REL_CHOICES,
+        default=REL_NORMAL,
+        db_index=True,
+    )
+    allocated_amount = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text='Valor da NF coberto por esta Invoice (para casos parciais).',
+    )
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        verbose_name = 'Vínculo Invoice ↔ NF'
+        verbose_name_plural = 'Vínculos Invoice ↔ NF'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['company', 'invoice', 'nota_fiscal'],
+                name='billing_invnflink_company_inv_nf_uniq',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['company', 'invoice']),
+            models.Index(fields=['company', 'nota_fiscal']),
+            models.Index(fields=['company', 'relation_type']),
+        ]
+
+    def __str__(self):
+        return f"Invoice#{self.invoice_id} ↔ NF#{self.nota_fiscal_id} ({self.relation_type})"
     
 class InvoiceLine(TenantAwareBaseModel):
     invoice = models.ForeignKey(Invoice, related_name='lines', on_delete=models.CASCADE)
@@ -327,3 +457,5 @@ from .models_nfe import (  # noqa: E402
     NFeEvento,
     NFeInutilizacao,
 )
+from .models_nf_link import NFTransactionLink  # noqa: E402, F401
+from .models_config import BillingTenantConfig  # noqa: E402, F401

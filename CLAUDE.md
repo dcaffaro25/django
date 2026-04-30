@@ -32,6 +32,101 @@ hit something it covers.
 
 ## 2. Recent work (most recent first)
 
+### Uncommitted — Billing module: NF↔Tx links, fiscal status, auto-create Invoice
+
+Multi-phase feature linking the existing siloed Invoice / NotaFiscal /
+Contract surfaces to each other and (eventually) to the GL. Phases 1, 2,
+2.5, 3 landed; phase 4 (actual GL posting) deliberately deferred.
+
+- New models in `billing/`:
+  - `NFTransactionLink` ([billing/models_nf_link.py](billing/models_nf_link.py))
+    — M:N between `accounting.Transaction` and `billing.NotaFiscal`.
+    Carries `confidence`, `method`, `matched_fields`, `review_status`
+    (suggested/accepted/rejected), and snapshot columns for stale-link
+    detection. **Read-only against accounting** — no FKs added on
+    `Transaction` / `JournalEntry`.
+  - `InvoiceNFLink` ([billing/models.py](billing/models.py)) —
+    through-model for the new `Invoice ↔ NotaFiscal` M2M, with
+    `relation_type` (normal / devolucao / complementar / ajuste) and
+    optional `allocated_amount` for partial coverage.
+  - `BillingTenantConfig` ([billing/models_config.py](billing/models_config.py))
+    — singleton-per-tenant feature flags + posting defaults
+    (default A/R, default A/P).
+  - `Invoice.contract` FK, `Invoice.fiscal_status` (six-state enum:
+    `pending_nf`/`invoiced`/`partially_returned`/`fully_returned`/
+    `fiscally_cancelled`/`mixed`), `Invoice.has_pending_corrections`
+    (CCe flag), and `Invoice.notas_fiscais` M2M (through `InvoiceNFLink`).
+  - `BusinessPartner.{receivable,payable}_account` FKs.
+  - Bug fix: `ProductService.code` is now `(company, code)` unique
+    (was global unique — different tenants couldn't share codes).
+- Migration: [billing/migrations/0020_nf_link_invoice_relations_partner_accounts.py](billing/migrations/0020_nf_link_invoice_relations_partner_accounts.py)
+  — purely additive (Add/Create), no data migration. Applied cleanly.
+- Services (all isolated, callable from anywhere):
+  - [billing/services/nf_link_service.py](billing/services/nf_link_service.py)
+    — `find_candidates`, `persist_links`, `accept_link`, `reject_link`,
+    `rescan_for_nf`, `rescan_for_transaction`. Matching passes:
+    1. `Transaction.nf_number == NotaFiscal.numero` (+0.50)
+    2. CNPJ ∈ {emit, dest} (+0.25)
+    3. Date within window (+0.15)
+    4. Amount within tolerance (+0.10)
+    Plus regex fallback over `Transaction.description` (+0.30 base).
+    Confidence clamped to [0, 1]. Calls `bump_version` only when an
+    accepted row is created.
+  - [billing/services/fiscal_status_service.py](billing/services/fiscal_status_service.py)
+    — `compute_fiscal_status(invoice)`, `refresh(invoice)`,
+    `refresh_for_nf(nf)`. Reads NF chain (eventos for cancelamento +
+    CCe, NotaFiscalReferencia for devolução). Cancelamento detected by
+    NFeEvento `tipo_evento ∈ {110111, 110112}` with SEFAZ
+    `status_sefaz` 135 or 155.
+  - [billing/services/nf_invoice_sync.py](billing/services/nf_invoice_sync.py)
+    — `match_or_create_invoice_for_nf` (gated on tenant flag +
+    finalidade/tipo whitelist), `attach_invoice_to_nf` (idempotent
+    M:N attach + fiscal_status refresh).
+- Hook points (explicit calls, not signals — keeps the chain auditable):
+  - [billing/services/nfe_import_service.py:545](billing/services/nfe_import_service.py:545)
+    `_post_import_billing_hooks` runs link rescan + invoice
+    match-or-create + fiscal_status refresh inside the import txn,
+    each in try/except.
+  - [billing/services/nfe_event_import_service.py:106](billing/services/nfe_event_import_service.py:106)
+    cancelamento / CCe events trigger `refresh_for_nf` for any
+    Invoices linked via the M2M.
+- API surface ([billing/views.py](billing/views.py),
+  [billing/urls.py](billing/urls.py)):
+  - `nf-transaction-links/` ViewSet + `/scan/`, `/accept-all-above/`,
+    per-row `/accept/`, `/reject/` actions.
+  - `invoice-nf-links/` ViewSet (delete refreshes fiscal_status).
+  - `billing-config/` ViewSet with `/current/` GET/PATCH for the
+    singleton row.
+  - `invoices/<id>/attach-nf/` and `invoices/<id>/refresh-fiscal-status/`
+    custom actions.
+  - Invoice list filters: `fiscal_status`, `status`, `partner`,
+    `date_from/to`.
+- Mgmt command:
+  `python manage.py rescan_nf_links --tenant evolat --dry-run`
+  (also `--all-tenants`, `--auto-accept-above`, `--limit`,
+  `--min-confidence`, `--date-window-days`, `--amount-tolerance`).
+  Backfill on Evolat surfaced 515 candidate matches at 100% confidence
+  on real data.
+- Frontend (new module under `frontend/src/features/billing/` + pages
+  in `frontend/src/pages/billing/`):
+  - `BillingHubPage` — TabbedShell at `/billing` with 4 routable tabs:
+    Faturas / Notas Fiscais / Vínculos NF↔Tx / Configurações.
+    The Vínculos tab badge shows pending suggestion count.
+  - `InvoicesPage` + `InvoiceDetailDrawer` — list + drawer with NF
+    attachments, attach-NF modal (NF picker + relation_type + allocated
+    amount), refresh-fiscal-status button. Two-axis filter: payment
+    status × fiscal_status.
+  - `NotasFiscaisPage` — read-only list of imported NFs with
+    finalidade/tipo filters and SEFAZ status pill.
+  - `NfLinkReviewPage` — confidence-banded sub-tabs (Sugeridos /
+    Aceitos / Rejeitados), side-by-side Tx ↔ NF cards, accept/reject
+    with optimistic update, Rodar scan modal (date_window, tolerance,
+    min_confidence, dry_run), Aceitar em massa modal (single
+    confidence threshold).
+  - `BillingSettingsPage` — three sections: link tuning, auto-create
+    gates, posting account defaults. Closes with an info banner stating
+    GL posting (Phase 4) isn't active yet.
+
 ### `5bfea5e` — perf(reports): close cache invalidation gaps
 
 - Added composite indexes `(company, updated_at)` on
@@ -282,7 +377,13 @@ brings you near them:
   `balance`, `balance_date`, `account_direction`,
   `report_category`, `cashflow_category`, `tags`, `parent_id`,
   `is_reconciled`, `transaction.balance_validated`,
-  `debit_amount`, `credit_amount`).
+  `debit_amount`, `credit_amount`). Also when bulk-flipping
+  `NFTransactionLink.review_status` to `accepted` (see
+  `accept_all_above` action in [billing/views.py](billing/views.py)
+  — already wired). Per-row save() paths in
+  `nf_link_service.accept_link` / `reject_link` go through `.save()`
+  but still bump explicitly because the link table is auditable from
+  reports and we want immediate cache invalidation.
 - **Don't commit `.claude/launch.json` modifications**. The
   user's local launch config drifts; it's not meant to be
   versioned even though it's tracked.

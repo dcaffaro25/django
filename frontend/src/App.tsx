@@ -33,6 +33,11 @@ import {
   StandardReportsPage, DreTab, BalancoTab, DfcTab, CustomReportsTab,
 } from "@/pages/reports/StandardReportsPage"
 import { AiUsagePage } from "@/pages/settings/AiUsagePage"
+import { BillingHubPage } from "@/pages/billing/BillingHubPage"
+import { InvoicesPage } from "@/pages/billing/InvoicesPage"
+import { NotasFiscaisPage } from "@/pages/billing/NotasFiscaisPage"
+import { NfLinkReviewPage } from "@/pages/billing/NfLinkReviewPage"
+import { BillingSettingsPage } from "@/pages/billing/BillingSettingsPage"
 import { AdminHomePage } from "@/pages/admin/AdminHomePage"
 import { UsersPage as AdminUsersPage } from "@/pages/admin/UsersPage"
 import { RuntimePage as AdminRuntimePage } from "@/pages/admin/RuntimePage"
@@ -119,7 +124,12 @@ export default function App() {
                   <Route path="/settings/entities" element={<EntitiesPage />} />
                   <Route path="/settings/*" element={<PlaceholderPage title="Ajustes" />} />
 
-                  <Route path="/billing/*" element={<PlaceholderPage title="Faturamento" />} />
+                  <Route path="/billing" element={<BillingHubPage />}>
+                    <Route index element={<InvoicesPage />} />
+                    <Route path="nfe" element={<NotasFiscaisPage />} />
+                    <Route path="links" element={<NfLinkReviewPage />} />
+                    <Route path="settings" element={<BillingSettingsPage />} />
+                  </Route>
                   <Route path="/hr/*" element={<PlaceholderPage title="RH" />} />
                   <Route path="/inventory/*" element={<PlaceholderPage title="Estoque" />} />
                   <Route path="/integrations/sandbox" element={<ApiSandboxPage />} />

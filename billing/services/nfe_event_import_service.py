@@ -103,6 +103,18 @@ def import_event_one(content, company, filename=""):
             nota_fiscal.status_sefaz = data.get("status_sefaz") or "101"
             nota_fiscal.motivo_sefaz = (data.get("motivo_sefaz") or "")[:300]
             nota_fiscal.save(update_fields=["status_sefaz", "motivo_sefaz", "updated_at"])
+
+        # Refresh fiscal_status of any Invoices that linked to this NF; safe-no-op
+        # if there are none. Cancelamento and CCe both flow through this path.
+        if nota_fiscal:
+            try:
+                from billing.services.fiscal_status_service import refresh_for_nf
+                refresh_for_nf(nota_fiscal)
+            except Exception:
+                logger.exception(
+                    "import_event_one: fiscal_status.refresh_for_nf failed nf_id=%s",
+                    nota_fiscal.id,
+                )
     logger.info(
         "import_event_one: evento criado id=%s chave=%s tipo=%s file=%r",
         evento.pk,
