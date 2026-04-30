@@ -47,6 +47,7 @@ Este manual foi criado para ajudar **administradores, contadores, analistas fina
 | # | Capítulo | Descrição |
 |---|----------|-----------|
 | 15 | [Referência da API](15-api-referencia.md) | Catálogo completo de endpoints, parâmetros e exemplos |
+| 16 | [Grupos de Parceiros](16-grupos-parceiros.md) | Consolidação de matriz/filiais/CPF/adquirentes via Groups e Aliases auto-aprendidos |
 
 ---
 
