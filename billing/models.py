@@ -514,3 +514,8 @@ from .models_groups import (  # noqa: E402, F401
     BusinessPartnerGroupMembership,
     BusinessPartnerAlias,
 )
+from .models_product_groups import (  # noqa: E402, F401
+    ProductServiceGroup,
+    ProductServiceGroupMembership,
+    ProductServiceAlias,
+)
