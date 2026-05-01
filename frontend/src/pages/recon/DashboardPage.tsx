@@ -13,7 +13,7 @@ import { StatusBadge } from "@/components/ui/status-badge"
 import { useActiveTasks, useBankAccountsDashboardKpis, useBankAccountsList, useDailyBalances, useReconKPIs, useReconTasks } from "@/features/reconciliation"
 import { useUserRole } from "@/features/auth/useUserRole"
 import type { BankAccountRowKpis, BookCurrencyMismatch, BookDailyWarning } from "@/features/reconciliation/types"
-import { cn, formatCurrency, formatDateTime, formatDuration, formatNumber } from "@/lib/utils"
+import { cn, formatCurrency, formatDateTime, formatDuration } from "@/lib/utils"
 
 type TxMode = "both" | "balanced" | "unbalanced"
 

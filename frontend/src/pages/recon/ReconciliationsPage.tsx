@@ -157,16 +157,26 @@ export function ReconciliationsPage() {
     if (isServerSort) return rows
     const dir = sort.dir === "desc" ? -1 : 1
     const copy = [...rows]
-    copy.sort((a, b) => {
-      let av: number = 0
-      let bv: number = 0
-      if (sort.key === "min_date") {
-        av = a.min_date ? new Date(a.min_date).getTime() : 0
-        bv = b.min_date ? new Date(b.min_date).getTime() : 0
-      } else {
-        av = n(a[sort.key])
-        bv = n(b[sort.key])
+    // Narrow ``sort.key`` to the four client-sortable columns. Server
+    // keys ("id" / "status" / "reference") never reach here because
+    // ``isServerSort`` short-circuits above; we keep the explicit
+    // branches so a future addition to ``ClientSortKey`` lights up
+    // type errors instead of silently falling through.
+    const valueOf = (row: ReconciliationSummary): number => {
+      switch (sort.key as ClientSortKey) {
+        case "min_date":
+          return row.min_date ? new Date(row.min_date).getTime() : 0
+        case "bank_sum_value":
+          return n(row.bank_sum_value)
+        case "book_sum_value":
+          return n(row.book_sum_value)
+        case "difference":
+          return n(row.difference)
       }
+    }
+    copy.sort((a, b) => {
+      const av = valueOf(a)
+      const bv = valueOf(b)
       if (av < bv) return -1 * dir
       if (av > bv) return 1 * dir
       return 0
