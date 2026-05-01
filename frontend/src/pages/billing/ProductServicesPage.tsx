@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { useSearchParams } from "react-router-dom"
 import {
   RefreshCw, Search, Plus, Pencil, Trash2, Tag, Package, Wrench,
@@ -16,6 +16,7 @@ import type { ProductService } from "@/features/billing"
 import { ProductServiceEditDrawer } from "./ProductServiceEditDrawer"
 import { ProductServiceCategoriesModal } from "./ProductServiceCategoriesModal"
 import { useUserRole } from "@/features/auth/useUserRole"
+import { useDebounced } from "@/lib/useDebounced"
 import { cn, formatCurrency } from "@/lib/utils"
 
 const ITEM_TYPE_LABEL: Record<ProductService["item_type"], string> = {
@@ -25,7 +26,11 @@ const ITEM_TYPE_LABEL: Record<ProductService["item_type"], string> = {
 
 export function ProductServicesPage() {
   const [params, setParams] = useSearchParams()
-  const search = params.get("q") || ""
+  // Local input + debounced filter so typing stays snappy on long
+  // catalogs.
+  const initialSearch = useMemo(() => params.get("q") || "", []) // eslint-disable-line react-hooks/exhaustive-deps
+  const [searchInput, setSearchInput] = useState(initialSearch)
+  const search = useDebounced(searchInput, 200)
   const itype = params.get("item_type") || "all"
   const active = params.get("is_active") || "all"
 
@@ -35,6 +40,13 @@ export function ProductServicesPage() {
     else next.set(key, value)
     setParams(next, { replace: true })
   }
+
+  const skipFirstSync = useRef(true)
+  useEffect(() => {
+    if (skipFirstSync.current) { skipFirstSync.current = false; return }
+    setFilter("q", search)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search])
 
   const { data, isLoading, isFetching, refetch } = useProductServices()
   const cats = useProductServiceCategories()
@@ -95,8 +107,8 @@ export function ProductServicesPage() {
         <div className="relative min-w-[240px] flex-1">
           <Search className="pointer-events-none absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
-            value={search}
-            onChange={(e) => setFilter("q", e.target.value)}
+            value={searchInput}
+            onChange={(e) => setSearchInput(e.target.value)}
             placeholder="Buscar nome, código, descrição, ERP id…"
             className="pl-8"
           />

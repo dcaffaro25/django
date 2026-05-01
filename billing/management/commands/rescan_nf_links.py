@@ -63,9 +63,24 @@ class Command(BaseCommand):
             default=None,
             help="Maximum candidates per tenant (after dedup + sort).",
         )
+        parser.add_argument(
+            "--audit-existing",
+            action="store_true",
+            help=(
+                "After the scan, re-score every existing 'suggested' "
+                "link against the current logic. Auto-rejects rows whose "
+                "Tx sign disagrees with the NF (chargebacks) or whose "
+                "score has fallen below --min-confidence. Boosts rows "
+                "whose score increased (e.g. parcela detection). "
+                "Useful after rolling out scoring changes to clean up "
+                "the queue without re-scanning fresh candidates."
+            ),
+        )
 
     def handle(self, *args, **opts):
-        from billing.services.nf_link_service import find_candidates, persist_links
+        from billing.services.nf_link_service import (
+            audit_suggested_links, find_candidates, persist_links,
+        )
 
         if opts["all_tenants"]:
             companies = Company.objects.all()
@@ -101,6 +116,15 @@ class Command(BaseCommand):
                     dry_run=opts["dry_run"],
                 )
                 self.stdout.write(f"  Persisted: {counters}")
+                if opts["audit_existing"]:
+                    audit = audit_suggested_links(
+                        company,
+                        date_window_days=opts["date_window_days"],
+                        amount_tolerance=tol,
+                        min_confidence=min_conf,
+                        dry_run=opts["dry_run"],
+                    )
+                    self.stdout.write(f"  Audit: {audit}")
             except Exception as e:
                 self.stderr.write(self.style.ERROR(f"  FAILED for {company.subdomain}: {e}"))
 

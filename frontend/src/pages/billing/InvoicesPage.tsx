@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { useSearchParams } from "react-router-dom"
 import {
   RefreshCw, Search, ArrowDownToLine, ArrowUpFromLine, Eye,
@@ -16,6 +16,7 @@ import type { Invoice, InvoiceFiscalStatus, InvoiceStatus } from "@/features/bil
 import { FiscalStatusBadge } from "./components/FiscalStatusBadge"
 import { CriticsAuditModal } from "./components/CriticsAuditModal"
 import { InvoiceDetailDrawer } from "./InvoiceDetailDrawer"
+import { useDebounced } from "@/lib/useDebounced"
 import { cn, formatCurrency, formatDate } from "@/lib/utils"
 import { useUserRole } from "@/features/auth/useUserRole"
 
@@ -97,7 +98,12 @@ const STATUS_FILTER_OPTIONS: Array<{ value: "all" | InvoiceStatus; label: string
 
 export function InvoicesPage() {
   const [params, setParams] = useSearchParams()
-  const search = params.get("q") || ""
+  // Local input + debounced copy: keeps typing snappy by deferring the
+  // URL write (and the filter useMemo over a potentially long invoice
+  // list) until 200 ms after the user stops typing.
+  const initialSearch = useMemo(() => params.get("q") || "", []) // eslint-disable-line react-hooks/exhaustive-deps
+  const [searchInput, setSearchInput] = useState(initialSearch)
+  const search = useDebounced(searchInput, 200)
   const fiscalFilter = (params.get("fiscal_status") || "all") as "all" | InvoiceFiscalStatus
   const statusFilter = (params.get("status") || "all") as "all" | InvoiceStatus
   const hasCritics = params.get("has_critics") === "1"
@@ -111,6 +117,13 @@ export function InvoicesPage() {
     else next.set(key, value)
     setParams(next, { replace: true })
   }
+
+  const skipFirstSync = useRef(true)
+  useEffect(() => {
+    if (skipFirstSync.current) { skipFirstSync.current = false; return }
+    setFilter("q", search)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search])
 
   const apiParams = useMemo(() => {
     const p: Record<string, string> = {}
@@ -172,8 +185,8 @@ export function InvoicesPage() {
         <div className="relative min-w-[240px] flex-1">
           <Search className="pointer-events-none absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
-            value={search}
-            onChange={(e) => setFilter("q", e.target.value)}
+            value={searchInput}
+            onChange={(e) => setSearchInput(e.target.value)}
             placeholder="Buscar número, descrição, ERP id…"
             className="pl-8"
           />

@@ -1,4 +1,4 @@
-import { useMemo } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { useSearchParams } from "react-router-dom"
 import { RefreshCw, Search } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
@@ -8,6 +8,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select"
 import { useNotasFiscais } from "@/features/billing"
+import { useDebounced } from "@/lib/useDebounced"
 import { cn, formatCurrency, formatDate } from "@/lib/utils"
 
 const FINALIDADE_LABEL: Record<number, string> = {
@@ -35,7 +36,14 @@ function fmtCnpj(d?: string | null) {
 
 export function NotasFiscaisPage() {
   const [params, setParams] = useSearchParams()
-  const search = params.get("q") || ""
+  // Search input is a LOCAL state for snappy typing; the debounced
+  // copy is what flows into URL writes + the filter useMemo so a fast
+  // typist doesn't pay re-render cost per keystroke (the URL write
+  // alone fires the whole tree). Initial value comes from the URL
+  // once at mount so a deep-link with ?q=foo still pre-fills the box.
+  const initialSearch = useMemo(() => params.get("q") || "", []) // eslint-disable-line react-hooks/exhaustive-deps
+  const [searchInput, setSearchInput] = useState(initialSearch)
+  const search = useDebounced(searchInput, 200)
   const finalidade = params.get("finalidade") || "all"
   const tipo = params.get("tipo_operacao") || "all"
 
@@ -45,6 +53,16 @@ export function NotasFiscaisPage() {
     else next.set(key, value)
     setParams(next, { replace: true })
   }
+
+  // Sync the debounced search back to the URL. ``skipFirstSync``
+  // suppresses the no-op first run (initial value already matches the
+  // URL); subsequent debounced changes write through.
+  const skipFirstSync = useRef(true)
+  useEffect(() => {
+    if (skipFirstSync.current) { skipFirstSync.current = false; return }
+    setFilter("q", search)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search])
 
   const { data, isLoading, isFetching, refetch } = useNotasFiscais()
 
@@ -86,8 +104,8 @@ export function NotasFiscaisPage() {
         <div className="relative min-w-[240px] flex-1">
           <Search className="pointer-events-none absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
-            value={search}
-            onChange={(e) => setFilter("q", e.target.value)}
+            value={searchInput}
+            onChange={(e) => setSearchInput(e.target.value)}
             placeholder="Buscar número, chave, CNPJ ou parceiro…"
             className="pl-8"
           />

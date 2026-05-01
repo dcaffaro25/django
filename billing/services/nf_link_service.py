@@ -46,6 +46,30 @@ _NF_NUMBER_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+# "Parcela 2/3" / "01/02" / "002/003" embedded in the Tx description --
+# the standard Brazilian way of tagging installment payments. When
+# present, the expected per-Tx amount is ``nf.valor_nota / total``, not
+# the full total. Real-world tags zero-pad to 3 digits ("002/003"), so
+# we accept up to 3-digit parts; the ``_PARCELA_MAX`` gate then keeps
+# implausible pairs out (typical retail caps at 12x; "143/949" would
+# parse to 143 ≤ 949 but be rejected because 143 > 12). The
+# ``(?<!\d)`` / ``(?!\d)`` lookarounds ensure we don't pick up the X/Y
+# sub-string of a longer doc number.
+_PARCELA_RE = re.compile(r"(?<!\d)(\d{1,3})\s*/\s*(\d{1,3})(?!\d)")
+_PARCELA_MAX = 12
+
+
+def _expected_tx_sign(nf: NotaFiscal) -> int:
+    """Return the sign Transaction.amount should have to be consistent
+    with this NF. Saída (tipo_operacao=1) → money in (+1); Entrada
+    (=0) → money out (-1). Devolução (finalidade=4) inverts both:
+    a return on a Saída refunds the customer (-1), and a return on
+    an Entrada gets money back from the vendor (+1)."""
+    base = +1 if (nf.tipo_operacao == 1) else -1
+    if nf.finalidade == 4:
+        base = -base
+    return base
+
 
 def _digits_only(value: Optional[str]) -> str:
     if not value:
@@ -162,10 +186,65 @@ def _score(
         nf_val = Decimal(nf.valor_nota or 0)
         tx_val = Decimal(tx.amount or 0)
         if nf_val != 0:
-            ratio = abs(tx_val - nf_val) / nf_val
+            ratio = abs(tx_val - nf_val) / abs(nf_val)
             if ratio <= amount_tolerance:
                 score += Decimal("0.10")
                 matched.append("amount")
+            else:
+                # Parcela detection -- when the Tx description carries
+                # an "X/Y" tag, we treat ``nf.valor_nota / Y`` as the
+                # expected per-Tx amount and grade against that. Catches
+                # the dominant Brazilian installment-payment case where
+                # one NF is settled by N Txs of value/N each, which the
+                # plain full-amount comparison flagged as a 50-67%
+                # mismatch. ``parcela_X/Y`` lands in matched_fields so
+                # the UI / audit can see how the score was built.
+                desc = getattr(tx, "description", "") or ""
+                # Pick the FIRST plausible X/Y pair: 1 ≤ part ≤ total ≤
+                # PARCELA_MAX. Earlier matches with implausible values
+                # (e.g. doc numbers) get skipped without falling back.
+                m = None
+                for cand in _PARCELA_RE.finditer(desc):
+                    try:
+                        p = int(cand.group(1))
+                        t = int(cand.group(2))
+                    except (TypeError, ValueError):
+                        continue
+                    if 1 <= p <= t <= _PARCELA_MAX:
+                        m = (p, t)
+                        break
+                if m is not None:
+                    part, total = m
+                    expected_per = nf_val / total
+                    if expected_per != 0:
+                        ratio_p = abs(tx_val - expected_per) / abs(expected_per)
+                        if ratio_p <= amount_tolerance:
+                            score += Decimal("0.10")
+                            matched.append(f"parcela_{part}/{total}")
+    except Exception:
+        pass
+
+    # Sign-mismatch guard: a Saída NF (we sold) should match a positive
+    # Tx (money in). A negative Tx against a Saída NF is almost
+    # certainly a chargeback / fee reversal that the matcher snared on
+    # nf_number alone. Zero out the candidate so it falls below the
+    # default min_confidence and disappears from the suggested queue.
+    # Devolução (finalidade=4) inverts the expected sign and is handled
+    # by ``_expected_tx_sign``.
+    try:
+        tx_val_check = Decimal(tx.amount or 0)
+        if tx_val_check != 0 and Decimal(nf.valor_nota or 0) != 0:
+            expected_sign = _expected_tx_sign(nf)
+            actual_sign = +1 if tx_val_check > 0 else -1
+            if expected_sign != actual_sign:
+                return MatchResult(
+                    transaction_id=tx.id,
+                    nota_fiscal_id=nf.id,
+                    confidence=Decimal("0"),
+                    method=method,
+                    matched_fields=list(matched) + ["sign_mismatch"],
+                    notes="Tx sign does not match NF tipo_operacao/finalidade",
+                )
     except Exception:
         pass
 
@@ -564,7 +643,13 @@ def persist_links(
     return counters
 
 
-def accept_link(link: NFTransactionLink, *, user=None, notes: str = "") -> NFTransactionLink:
+def accept_link(
+    link: NFTransactionLink,
+    *,
+    user=None,
+    notes: str = "",
+    allocated_amount: Optional[Decimal] = None,
+) -> NFTransactionLink:
     """Mark a single link as accepted. Idempotent.
 
     Beyond marking the link itself, an accepted NF↔Tx link is a strong
@@ -573,12 +658,38 @@ def accept_link(link: NFTransactionLink, *, user=None, notes: str = "") -> NFTra
     economic actor. When the two resolve to *different* BPs, suggest a
     BusinessPartnerGroup membership so future reports can consolidate
     them. The suggestion call is best-effort — never breaks accept.
+
+    When the link is a **parcela** (matched_fields contains
+    ``parcela_X/Y``) and ``allocated_amount`` isn't supplied, we fill
+    it with ``|tx.amount|`` so the audit trail records that this Tx
+    covers exactly its own slice of ``nf.valor_nota``. Caller-supplied
+    ``allocated_amount`` always wins.
     """
     if link.review_status == NFTransactionLink.REVIEW_ACCEPTED:
         return link
     link.review_status = NFTransactionLink.REVIEW_ACCEPTED
     link.reviewed_by = user
     link.reviewed_at = timezone.now()
+    if allocated_amount is not None:
+        try:
+            link.allocated_amount = Decimal(allocated_amount)
+        except Exception:
+            pass
+    elif link.allocated_amount is None:
+        # Auto-fill for parcelas only -- a one-shot full match doesn't
+        # need allocated_amount (NF total = Tx amount = full coverage).
+        is_parcela = any(
+            isinstance(t, str) and t.startswith("parcela_")
+            for t in (link.matched_fields or [])
+        )
+        if is_parcela:
+            tx = link.transaction
+            tx_amt = getattr(tx, "amount", None) if tx else None
+            if tx_amt is not None:
+                try:
+                    link.allocated_amount = abs(Decimal(tx_amt))
+                except Exception:
+                    pass
     if notes:
         link.notes = (link.notes + "\n" + notes).strip() if link.notes else notes
     link.save()
@@ -636,6 +747,129 @@ def reject_link(link: NFTransactionLink, *, user=None, notes: str = "") -> NFTra
         link.notes = (link.notes + "\n" + notes).strip() if link.notes else notes
     link.save()
     return link
+
+
+def audit_suggested_links(
+    company,
+    *,
+    date_window_days: int = 7,
+    amount_tolerance: Decimal = Decimal("0.01"),
+    min_confidence: Decimal = Decimal("0.5"),
+    dry_run: bool = False,
+) -> dict:
+    """Re-score every ``suggested`` link for ``company`` against the
+    current scoring logic. Three outcomes per row:
+
+      * **rejected (sign_mismatch)** -- the new score returns 0 because
+        Tx.amount sign disagrees with the NF tipo_operacao/finalidade
+        (chargebacks, fee reversals snared on nf_number alone).
+      * **rejected (below_min_confidence)** -- new score < min_confidence
+        and the row carries no protected status. Catches stale matches
+        where the underlying Tx or NF data has shifted enough to
+        invalidate the original suggestion.
+      * **updated** -- new score is HIGHER than the stored one (e.g.
+        the parcela detector kicked in and added +0.10 / a new dimension
+        was matched). Updates ``confidence`` and ``matched_fields``.
+
+    Used by ``rescan_nf_links --audit-existing`` to clean up the
+    suggested queue after a scoring change without scanning fresh
+    candidates. Read-only against accounting; only writes to
+    ``NFTransactionLink``.
+    """
+    counters = {
+        "scanned": 0,
+        "rejected_sign_mismatch": 0,
+        "rejected_low_confidence": 0,
+        "updated_higher": 0,
+        "unchanged": 0,
+    }
+
+    qs = (
+        NFTransactionLink.objects
+        .filter(company=company, review_status=NFTransactionLink.REVIEW_SUGGESTED)
+        .select_related("nota_fiscal", "transaction")
+    )
+    rows = list(qs)
+    counters["scanned"] = len(rows)
+    if not rows:
+        return counters
+
+    bumped = False
+    with db_transaction.atomic():
+        for row in rows:
+            tx = row.transaction
+            nf = row.nota_fiscal
+            if tx is None or nf is None:
+                continue
+            cnpj_tx = _digits_only(getattr(tx, "cnpj", "") or "")
+            base = (
+                Decimal("0.50")
+                if row.method == NFTransactionLink.METHOD_NF_NUMBER
+                else Decimal("0.30")
+                if row.method == NFTransactionLink.METHOD_DESCRIPTION_REGEX
+                else Decimal("0.25")
+            )
+            initial = [row.method] if row.method else []
+            new = _score(
+                tx, nf,
+                base=base,
+                method=row.method or NFTransactionLink.METHOD_NF_NUMBER,
+                cnpj_tx=cnpj_tx,
+                matched_initial=initial,
+                date_window_days=date_window_days,
+                amount_tolerance=amount_tolerance,
+            )
+            new_conf = Decimal(new.confidence)
+            old_conf = Decimal(row.confidence)
+            sign_bad = "sign_mismatch" in (new.matched_fields or [])
+
+            if sign_bad:
+                counters["rejected_sign_mismatch"] += 1
+                if not dry_run:
+                    row.review_status = NFTransactionLink.REVIEW_REJECTED
+                    row.reviewed_at = timezone.now()
+                    row.notes = (
+                        (row.notes + "\n" if row.notes else "")
+                        + "Auto-rejected: Tx sign does not match NF tipo_operacao/finalidade."
+                    )
+                    row.matched_fields = list(new.matched_fields)
+                    row.save()
+                continue
+
+            if new_conf < min_confidence:
+                counters["rejected_low_confidence"] += 1
+                if not dry_run:
+                    row.review_status = NFTransactionLink.REVIEW_REJECTED
+                    row.reviewed_at = timezone.now()
+                    row.notes = (
+                        (row.notes + "\n" if row.notes else "")
+                        + f"Auto-rejected: new score {new_conf} < min_confidence {min_confidence}."
+                    )
+                    row.confidence = new_conf
+                    row.matched_fields = list(new.matched_fields)
+                    row.save()
+                continue
+
+            if new_conf > old_conf or set(new.matched_fields or []) != set(row.matched_fields or []):
+                counters["updated_higher"] += 1
+                if not dry_run:
+                    row.confidence = new_conf
+                    row.matched_fields = list(new.matched_fields)
+                    row.save()
+            else:
+                counters["unchanged"] += 1
+
+    if not dry_run and (counters["rejected_sign_mismatch"] or counters["rejected_low_confidence"]):
+        bumped = True
+
+    if bumped:
+        try:
+            from accounting.services.report_cache import bump_version
+            bump_version(company.id)
+        except Exception:
+            logger.exception("nf_link_service: bump_version failed for company_id=%s", company.id)
+
+    return counters
 
 
 def rescan_for_nf(nota_fiscal: NotaFiscal, **kwargs) -> dict:

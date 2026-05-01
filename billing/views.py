@@ -494,7 +494,15 @@ class NFTransactionLinkViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     def accept(self, request, pk=None, **kwargs):
         link = self.get_object()
         from billing.services.nf_link_service import accept_link
-        accept_link(link, user=request.user, notes=request.data.get('notes', ''))
+        # ``allocated_amount`` is optional; when omitted the service
+        # auto-fills it for parcela links so the partial-coverage audit
+        # trail stays correct without operator effort.
+        accept_link(
+            link,
+            user=request.user,
+            notes=request.data.get('notes', ''),
+            allocated_amount=request.data.get('allocated_amount'),
+        )
         link.refresh_from_db()
         return Response(NFTransactionLinkSerializer(link).data)
 

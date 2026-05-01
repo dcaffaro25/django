@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { useSearchParams } from "react-router-dom"
 import {
   CheckCircle2, XCircle, Search, Wand2, RefreshCw,
@@ -31,6 +31,7 @@ import {
 } from "./components/DimensionScores"
 import { GroupDetailModal } from "./components/GroupDetailModal"
 import { useUserRole } from "@/features/auth/useUserRole"
+import { useDebounced } from "@/lib/useDebounced"
 import { cn, formatCurrency } from "@/lib/utils"
 
 const TAB_TO_STATUS: Record<string, LinkReviewStatus> = {
@@ -430,7 +431,11 @@ function FilterChip({
 export function NfLinkReviewPage() {
   const [params, setParams] = useSearchParams()
   const tab = params.get("tab") || "suggested"
-  const search = params.get("q") || ""
+  // Local input + debounced filter so typing stays smooth even on
+  // accepted/rejected tabs that can hold thousands of links.
+  const initialSearch = useMemo(() => params.get("q") || "", []) // eslint-disable-line react-hooks/exhaustive-deps
+  const [searchInput, setSearchInput] = useState(initialSearch)
+  const search = useDebounced(searchInput, 200)
   const status = TAB_TO_STATUS[tab] ?? "suggested"
   const { canWrite } = useUserRole()
   const isSuggestedTab = tab === "suggested"
@@ -488,11 +493,16 @@ export function NfLinkReviewPage() {
     setParams(next, { replace: true })
     setSelected(new Set())
   }
-  const setSearch = (q: string) => {
+  // Push the debounced search back to the URL so deep-links stay
+  // in sync (and query-keyed React Query caches can land on it).
+  const skipFirstSync = useRef(true)
+  useEffect(() => {
+    if (skipFirstSync.current) { skipFirstSync.current = false; return }
     const next = new URLSearchParams(params)
-    if (q) next.set("q", q); else next.delete("q")
+    if (search) next.set("q", search); else next.delete("q")
     setParams(next, { replace: true })
-  }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search])
 
   const visibleIds = useMemo(
     () => filteredAndSorted.map((l) => l.id),
@@ -584,8 +594,8 @@ export function NfLinkReviewPage() {
           <div className="relative flex-1 min-w-[200px]">
             <Search className="pointer-events-none absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
             <Input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
               placeholder="Buscar por número de NF, descrição, CNPJ…"
               className="pl-8"
             />

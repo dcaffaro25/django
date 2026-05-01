@@ -112,7 +112,16 @@ export function computeDimensions(link: NFTransactionLink): DimensionInfo[] {
   }
 
   // --- Amount dimension ---
+  // Two ways the amount can score full credit:
+  //   1. ``amount`` matched_field — the Tx amount equals NF.valor_nota
+  //      within the configured tolerance.
+  //   2. ``parcela_X/Y`` matched_field — the Tx is one installment of
+  //      a multi-Tx settlement and equals NF.valor_nota / Y. Common
+  //      Brazilian "parcelado em N" cards / boletos. We render this
+  //      as a "full" amount match with a "Parcela X/Y" detail so
+  //      operators understand why a 66% delta is actually correct.
   const pct = pctDiff(link.transaction_amount, link.nf_valor_nota)
+  const parcelaTag = Array.from(fields).find((t) => t.startsWith("parcela_"))
   let amountInfo: DimensionInfo
   if (fields.has("amount")) {
     amountInfo = {
@@ -120,6 +129,16 @@ export function computeDimensions(link: NFTransactionLink): DimensionInfo[] {
       label: "Valor",
       match: "full",
       detail: pct == null ? "exato" : `Δ ${(pct * 100).toFixed(2)}%`,
+      weight: 0.1,
+    }
+  } else if (parcelaTag) {
+    // Strip the "parcela_" prefix so the chip reads "Parcela 2/3".
+    const tag = parcelaTag.replace(/^parcela_/, "")
+    amountInfo = {
+      key: "amount",
+      label: "Valor",
+      match: "full",
+      detail: `Parcela ${tag}`,
       weight: 0.1,
     }
   } else if (pct == null) {

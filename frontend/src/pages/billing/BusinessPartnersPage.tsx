@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { useSearchParams } from "react-router-dom"
 import {
   RefreshCw, Search, Plus, Pencil, Trash2, Tag, Users,
@@ -17,6 +17,7 @@ import type { BusinessPartner } from "@/features/billing"
 import { BusinessPartnerEditDrawer } from "./BusinessPartnerEditDrawer"
 import { BusinessPartnerCategoriesModal } from "./BusinessPartnerCategoriesModal"
 import { useUserRole } from "@/features/auth/useUserRole"
+import { useDebounced } from "@/lib/useDebounced"
 import { cn } from "@/lib/utils"
 
 const PARTNER_TYPE_LABEL: Record<BusinessPartner["partner_type"], string> = {
@@ -54,7 +55,12 @@ function buildRootIndex(partners: BusinessPartner[]): Map<string, BusinessPartne
 
 export function BusinessPartnersPage() {
   const [params, setParams] = useSearchParams()
-  const search = params.get("q") || ""
+  // See ``NotasFiscaisPage`` for the rationale: input is local for
+  // typing, debounced copy drives URL writes + filtering so a fast
+  // typist doesn't pay re-render cost per keystroke.
+  const initialSearch = useMemo(() => params.get("q") || "", []) // eslint-disable-line react-hooks/exhaustive-deps
+  const [searchInput, setSearchInput] = useState(initialSearch)
+  const search = useDebounced(searchInput, 200)
   const ptype = params.get("partner_type") || "all"
   const active = params.get("is_active") || "all"
 
@@ -64,6 +70,13 @@ export function BusinessPartnersPage() {
     else next.set(key, value)
     setParams(next, { replace: true })
   }
+
+  const skipFirstSync = useRef(true)
+  useEffect(() => {
+    if (skipFirstSync.current) { skipFirstSync.current = false; return }
+    setFilter("q", search)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search])
 
   const { data, isLoading, isFetching, refetch } = useBusinessPartners()
   const cats = useBusinessPartnerCategories()
@@ -125,8 +138,8 @@ export function BusinessPartnersPage() {
         <div className="relative min-w-[240px] flex-1">
           <Search className="pointer-events-none absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
-            value={search}
-            onChange={(e) => setFilter("q", e.target.value)}
+            value={searchInput}
+            onChange={(e) => setSearchInput(e.target.value)}
             placeholder="Buscar nome, CNPJ, e-mail, ERP id…"
             className="pl-8"
           />
