@@ -172,6 +172,28 @@ def _score(
                         matched.append("cnpj_group")
             except Exception:
                 pass
+    elif (not cnpj_tx) and (nf.emitente_id or nf.destinatario_id):
+        # Name-alias fallback: the Tx side has no CNPJ at all (foreign
+        # customer, informal PIX, e-commerce gateway settlement). The
+        # only counterparty signal is in tx.description; if any of the
+        # extracted name tokens has been learned (via accepted prior
+        # NF↔Tx links) to resolve to the NF's emitente or destinatario,
+        # boost the score. ``+0.18`` mirrors cnpj_alias because the
+        # learned-evidence quality is the same.
+        try:
+            from billing.services.bp_alias_service import (
+                _extract_name_tokens, resolve_name_alias,
+            )
+            nf_partner_ids = {nf.emitente_id, nf.destinatario_id}
+            nf_partner_ids.discard(None)
+            for tok in _extract_name_tokens(getattr(tx, "description", "") or ""):
+                aliased_bp = resolve_name_alias(tx.company, tok)
+                if aliased_bp is not None and aliased_bp.id in nf_partner_ids:
+                    score += Decimal("0.18")
+                    matched.append("name_alias")
+                    break
+        except Exception:
+            pass
 
     if tx.date and nf.data_emissao:
         try:
@@ -703,6 +725,19 @@ def accept_link(
     except Exception:
         logger.exception(
             "nf_link_service: bp_group suggest failed for link_id=%s", link.id,
+        )
+    # Name-alias learning: when the Tx side has no CNPJ, the
+    # group-suggestion hook above silently exits (resolve_bp_by_cnpj
+    # returns None for an empty string). The Tx description carries
+    # the only signal we have for the counterparty in that case --
+    # capture it as a name alias so the next no-CNPJ Tx with similar
+    # description tokens auto-resolves.
+    try:
+        from billing.services.bp_alias_service import suggest_name_aliases_from_link
+        suggest_name_aliases_from_link(link)
+    except Exception:
+        logger.exception(
+            "nf_link_service: name-alias suggest failed for link_id=%s", link.id,
         )
     return link
 

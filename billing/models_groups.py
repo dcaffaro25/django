@@ -210,20 +210,42 @@ class BusinessPartnerAlias(TenantAwareBaseModel):
     ]
 
     SOURCE_BANK_RECONCILIATION = 'bank_reconciliation'
+    SOURCE_NF_TX_LINK = 'nf_tx_link'
     SOURCE_MANUAL = 'manual'
+
+    KIND_CNPJ = 'cnpj'
+    KIND_NAME = 'name'
+    KIND_CHOICES = [
+        (KIND_CNPJ, 'CNPJ/CPF'),
+        (KIND_NAME, 'Nome'),
+    ]
 
     business_partner = models.ForeignKey(
         'billing.BusinessPartner',
         on_delete=models.CASCADE,
         related_name='aliases',
     )
-    alias_identifier = models.CharField(
-        max_length=32,
+    kind = models.CharField(
+        max_length=8,
+        choices=KIND_CHOICES,
+        default=KIND_CNPJ,
         db_index=True,
         help_text=(
-            "Dígitos do CNPJ/CPF observado externamente (extrato/descrição) "
-            "que devem resolver para este BP. Sempre normalizado para apenas "
-            "dígitos antes de gravar."
+            "Tipo de string aprendida. ``cnpj`` → dígitos de CNPJ/CPF "
+            "(legacy, padrão). ``name`` → token de nome normalizado "
+            "extraído da descrição da transação, para casos em que "
+            "o lado banco não traz CNPJ (exportações, PIX informal, "
+            "gateways e-commerce sem CPF do cliente, etc.)."
+        ),
+    )
+    alias_identifier = models.CharField(
+        max_length=80,
+        db_index=True,
+        help_text=(
+            "String identificadora que deve resolver para este BP. "
+            "Para ``kind=cnpj``: apenas dígitos do CNPJ/CPF. "
+            "Para ``kind=name``: token de nome normalizado (lower, sem "
+            "acentos, espaços colapsados, máx 80 chars)."
         ),
     )
     review_status = models.CharField(
@@ -255,21 +277,23 @@ class BusinessPartnerAlias(TenantAwareBaseModel):
         verbose_name_plural = "Apelidos de Parceiros"
         constraints = [
             # Mesma string só pode resolver para um BP por tenant (caso
-            # contrário o boost ficaria ambíguo).
+            # contrário o boost ficaria ambíguo). Compound em ``kind``
+            # para que um CNPJ "12345678000199" e um nome com a mesma
+            # forma (improvável, mas possível) coexistam sem conflito.
             models.UniqueConstraint(
-                fields=['company', 'alias_identifier'],
+                fields=['company', 'kind', 'alias_identifier'],
                 condition=Q(review_status='accepted'),
                 name='bpalias_one_accepted_per_identifier',
             ),
-            # Uma linha por (BP, identifier) — re-sugestões atualizam evidence.
+            # Uma linha por (BP, kind, identifier) — re-sugestões atualizam evidence.
             models.UniqueConstraint(
-                fields=['business_partner', 'alias_identifier'],
+                fields=['business_partner', 'kind', 'alias_identifier'],
                 name='bpalias_unique_bp_identifier',
             ),
         ]
         indexes = [
             models.Index(
-                fields=['company', 'alias_identifier', 'review_status'],
+                fields=['company', 'kind', 'alias_identifier', 'review_status'],
                 name='bpalias_lookup_idx',
             ),
         ]
