@@ -739,6 +739,24 @@ def accept_link(
         logger.exception(
             "nf_link_service: name-alias suggest failed for link_id=%s", link.id,
         )
+    # Invoice-status auto-update: if the NF this Tx now points to is
+    # attached to one or more Invoices, re-evaluate each Invoice's
+    # payment evidence. When every linked Tx for the Invoice is now
+    # reconciled, status flips from ``issued`` / ``partially_paid``
+    # to ``paid`` -- the ``Invoice.status`` field stays current
+    # without anyone running the backfill.
+    try:
+        from billing.services.invoice_payment_evidence import (
+            reevaluate_invoice_status_from_evidence,
+        )
+        nf = link.nota_fiscal
+        if nf is not None:
+            for inv in nf.invoices.all():
+                reevaluate_invoice_status_from_evidence(inv)
+    except Exception:
+        logger.exception(
+            "nf_link_service: invoice-status reeval failed for link_id=%s", link.id,
+        )
     return link
 
 

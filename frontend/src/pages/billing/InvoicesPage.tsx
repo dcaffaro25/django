@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { useSearchParams } from "react-router-dom"
 import {
   RefreshCw, Search, ArrowDownToLine, ArrowUpFromLine, Eye,
-  Receipt as ReceiptIcon, AlertTriangle, Sparkles,
+  Receipt as ReceiptIcon, AlertTriangle, Sparkles, Wallet,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { Button } from "@/components/ui/button"
@@ -11,7 +11,10 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select"
 import { Checkbox } from "@/components/ui/checkbox"
-import { useInvoices } from "@/features/billing"
+import {
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+} from "@/components/ui/dialog"
+import { billingApi, useBackfillInvoiceStatusFromRecon, useInvoices } from "@/features/billing"
 import type { Invoice, InvoiceFiscalStatus, InvoiceStatus } from "@/features/billing"
 import { FiscalStatusBadge } from "./components/FiscalStatusBadge"
 import { CriticsAuditModal } from "./components/CriticsAuditModal"
@@ -150,6 +153,17 @@ export function InvoicesPage() {
 
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [auditOpen, setAuditOpen] = useState(false)
+  // Backfill modal state -- two-step flow:
+  //   1) operator clicks "Atualizar status" → we fetch a dry-run preview
+  //   2) modal shows the preview ("would_promote N faturas, R$ X")
+  //   3) operator clicks "Aplicar" → we POST again with dry_run=false
+  // The preview reuses the same response shape as the real run, so the
+  // modal is shape-stable across both phases.
+  type BackfillPreview = Awaited<ReturnType<typeof billingApi.backfillInvoiceStatusFromRecon>>
+  const [backfillOpen, setBackfillOpen] = useState(false)
+  const [backfillPreview, setBackfillPreview] = useState<BackfillPreview | null>(null)
+  const [backfillIncludeNonOpen, setBackfillIncludeNonOpen] = useState(false)
+  const backfill = useBackfillInvoiceStatusFromRecon()
 
   return (
     <div className="space-y-4">
@@ -175,6 +189,27 @@ export function InvoicesPage() {
               >
                 <Sparkles className="h-4 w-4" />
                 Auditar críticas
+              </Button>
+            ) : null}
+            {canWrite ? (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={async () => {
+                  // Fetch the dry-run preview, open the modal so the
+                  // operator can confirm before we promote anything.
+                  const preview = await backfill.mutateAsync({
+                    dry_run: true,
+                    include_non_open: backfillIncludeNonOpen,
+                  })
+                  setBackfillPreview(preview)
+                  setBackfillOpen(true)
+                }}
+                disabled={backfill.isPending}
+                title="Marcar como pagas as faturas com Tx vinculado conciliado"
+              >
+                <Wallet className="h-4 w-4" />
+                Atualizar status
               </Button>
             ) : null}
           </>
@@ -371,6 +406,124 @@ export function InvoicesPage() {
         onClose={() => setAuditOpen(false)}
         onJumpToInvoice={(id) => setSelectedId(id)}
       />
+
+      {/* Backfill confirmation modal — shows the dry-run preview the
+          operator triggered, then applies on confirm. */}
+      <Dialog open={backfillOpen} onOpenChange={(o) => { if (!o) setBackfillOpen(false) }}>
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle>Atualizar status das faturas</DialogTitle>
+            <DialogDescription>
+              Marca como <strong>pagas</strong> as faturas cuja evidência mostra
+              que o caixa entrou: NF vinculada → Transação vinculada conciliada.
+              Reversível alterando o status manualmente.
+            </DialogDescription>
+          </DialogHeader>
+
+          {backfillPreview ? (
+            <div className="space-y-3 text-sm">
+              <div className="rounded-md border border-border bg-muted/30 p-3">
+                <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
+                  Pré-visualização
+                </div>
+                <div className="mt-1 grid grid-cols-3 gap-3">
+                  <div>
+                    <div className="text-[10px] text-muted-foreground">Analisadas</div>
+                    <div className="text-base font-medium tabular-nums">
+                      {backfillPreview.scanned}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-muted-foreground">A promover</div>
+                    <div className="text-base font-bold tabular-nums text-success">
+                      {backfillPreview.would_promote}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-muted-foreground">Valor</div>
+                    <div className="text-base font-medium tabular-nums">
+                      R$ {backfillPreview.promoted_amount}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">
+                  Distribuição da evidência
+                </div>
+                <div className="space-y-1">
+                  {Object.entries(backfillPreview.by_evidence).map(([k, v]) => (
+                    <div key={k} className="flex items-center justify-between text-[12px]">
+                      <span className="text-muted-foreground">{k}</span>
+                      <span className="tabular-nums">{v}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {backfillPreview.samples.length > 0 ? (
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">
+                    Amostra ({backfillPreview.samples.length} de {backfillPreview.would_promote})
+                  </div>
+                  <div className="space-y-1 max-h-40 overflow-y-auto rounded-md border border-border/60 bg-muted/20 p-2">
+                    {backfillPreview.samples.map((s) => (
+                      <div key={s.invoice_id} className="text-[11px] flex items-center gap-2">
+                        <span className="font-mono text-muted-foreground">#{s.invoice_id}</span>
+                        <span className="font-mono">{s.invoice_number}</span>
+                        <span className="tabular-nums">R$ {s.amount}</span>
+                        <span className="text-muted-foreground">{s.old_status} → paid</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              <label className="flex items-start gap-2 text-[12px] text-muted-foreground">
+                <Checkbox
+                  checked={backfillIncludeNonOpen}
+                  onCheckedChange={(v) => setBackfillIncludeNonOpen(v === true)}
+                  className="mt-0.5"
+                />
+                <span>
+                  Reavaliar todas as faturas de venda (não apenas
+                  ``issued`` / ``partially_paid``). Use apenas após uma
+                  migração de modelo ou para conferir linhas já pagas.
+                </span>
+              </label>
+            </div>
+          ) : (
+            <div className="py-8 text-center text-muted-foreground">Carregando…</div>
+          )}
+
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setBackfillOpen(false)}>
+              Cancelar
+            </Button>
+            <Button
+              variant="default"
+              disabled={
+                backfill.isPending ||
+                !backfillPreview ||
+                backfillPreview.would_promote === 0
+              }
+              onClick={async () => {
+                await backfill.mutateAsync({
+                  dry_run: false,
+                  include_non_open: backfillIncludeNonOpen,
+                })
+                setBackfillOpen(false)
+                setBackfillPreview(null)
+                refetch()
+              }}
+            >
+              <Wallet className="h-4 w-4 mr-1" />
+              Aplicar ({backfillPreview?.would_promote ?? 0})
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

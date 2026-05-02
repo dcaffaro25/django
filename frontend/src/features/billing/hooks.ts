@@ -158,6 +158,26 @@ export function useAuditCritics() {
   })
 }
 
+export function useBackfillInvoiceStatusFromRecon() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: (body?: Parameters<typeof billingApi.backfillInvoiceStatusFromRecon>[0]) =>
+      billingApi.backfillInvoiceStatusFromRecon(body),
+    onSuccess: (res, vars) => {
+      const dry = vars?.dry_run ?? true
+      if (!dry) {
+        qc.invalidateQueries({ queryKey: ["billing", sub, "invoices"] })
+        qc.invalidateQueries({ queryKey: ["billing", sub, "dso-report"] })
+        toast.success(
+          `Backfill: ${res.promoted} faturas marcadas como pagas (R$ ${res.promoted_amount}).`,
+        )
+      }
+    },
+    onError: (e) => showError("Falha no backfill", e),
+  })
+}
+
 export function useRefreshFiscalStatus() {
   const qc = useQueryClient()
   const sub = useSub()

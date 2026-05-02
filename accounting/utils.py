@@ -222,12 +222,47 @@ def recalculate_transaction_and_journal_entry_status(transaction_ids=None, compa
             if tx.is_reconciled != new_is_reconciled:
                 tx.is_reconciled = new_is_reconciled
                 updated = True
-            
+
             # Save transaction if updated
             if updated:
                 tx.save(update_fields=['is_balanced', 'is_reconciled', 'state', 'is_posted'])
                 stats['transactions_updated'] += 1
-    
+
+                # When a Tx flips to is_reconciled=True, walk forward to
+                # any Invoice linked through the NF chain and re-evaluate
+                # its payment status. This is the inverse of the
+                # accept_link hook (which fires when an NF↔Tx link is
+                # accepted on a Tx that's already reconciled): here we
+                # cover the case where the link was accepted earlier
+                # and the reconciliation just landed. Both paths defer
+                # to the same idempotent service, so re-runs are safe.
+                if new_is_reconciled:
+                    try:
+                        from billing.services.invoice_payment_evidence import (
+                            reevaluate_invoice_status_from_evidence,
+                        )
+                        from billing.models import Invoice, NFTransactionLink
+                        nf_ids = list(
+                            NFTransactionLink.objects
+                            .filter(transaction_id=tx.id, review_status='accepted')
+                            .values_list('nota_fiscal_id', flat=True)
+                        )
+                        if nf_ids:
+                            inv_ids = list(
+                                Invoice.objects
+                                .filter(notas_fiscais__id__in=nf_ids)
+                                .distinct()
+                                .values_list('id', flat=True)
+                            )
+                            for inv in Invoice.objects.filter(id__in=inv_ids):
+                                reevaluate_invoice_status_from_evidence(inv)
+                    except Exception:
+                        # The hook is best-effort -- it must never
+                        # break the reconciliation finalize. The
+                        # backfill mgmt command catches anything we
+                        # missed.
+                        pass
+
     return stats
 
 def decode_ofx_content(data_dict):

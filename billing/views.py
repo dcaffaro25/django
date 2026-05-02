@@ -556,6 +556,49 @@ class InvoiceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         )
         return Response(result)
 
+    @action(methods=['post'], detail=False, url_path='backfill-status-from-recon')
+    def backfill_status_from_recon(self, request, **kwargs):
+        """Promote ``Invoice.status`` to ``paid`` for sale invoices
+        whose linked NF↔Tx evidence shows the cash moved.
+
+        Body:
+          ``{ "dry_run": bool, "include_non_open": bool }``
+
+        Mirrors the ``bring_invoice_status_current`` mgmt command but
+        callable from the UI -- the Faturas page button posts here.
+
+        Returns the same counter dict the service emits, including
+        ``would_promote``, ``promoted``, ``by_evidence`` breakdown,
+        and a small sample of affected invoices for the operator's
+        confirmation modal.
+        """
+        from billing.services.invoice_payment_evidence import (
+            backfill_invoice_status_from_recon,
+        )
+
+        tenant = getattr(request, 'tenant', None)
+        if tenant is None or tenant == 'all':
+            return Response(
+                {'detail': 'Operação requer tenant explícito.'},
+                status=400,
+            )
+        body = request.data or {}
+        try:
+            dry_run = bool(body.get('dry_run', True))
+            include_non_open = bool(body.get('include_non_open', False))
+        except Exception:
+            return Response(
+                {'detail': 'Corpo inválido. Esperado dry_run / include_non_open booleanos.'},
+                status=400,
+            )
+
+        result = backfill_invoice_status_from_recon(
+            tenant,
+            only_open=not include_non_open,
+            dry_run=dry_run,
+        )
+        return Response(result)
+
     @action(methods=['get'], detail=False, url_path='dso-report')
     def dso_report(self, request, **kwargs):
         """Days Sales Outstanding (DSO) + aging buckets + per-partner

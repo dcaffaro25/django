@@ -81,6 +81,28 @@ export const billingApi = {
   }): Promise<CriticAuditResponse> =>
     api.tenant.post<CriticAuditResponse>(`/api/invoices/audit-critics/`, body ?? {}),
 
+  // Backfill ``Invoice.status`` from NF↔Tx reconciliation evidence.
+  // The backend returns the same counter shape for dry-run and real
+  // run; the UI shows a confirm modal between the two.
+  backfillInvoiceStatusFromRecon: (body?: {
+    dry_run?: boolean;
+    include_non_open?: boolean;
+  }): Promise<{
+    scanned: number;
+    would_promote: number;
+    promoted: number;
+    by_evidence: Record<string, number>;
+    promoted_amount: string;
+    samples: Array<{
+      invoice_id: number;
+      invoice_number: string;
+      amount: string;
+      old_status: string;
+      tx_ids: number[];
+    }>;
+  }> =>
+    api.tenant.post(`/api/invoices/backfill-status-from-recon/`, body ?? { dry_run: true }),
+
   // ============================================================
   // NotaFiscal (read-only listing for picking)
   // ============================================================
