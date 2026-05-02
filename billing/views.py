@@ -196,6 +196,96 @@ class ProductServiceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     def bulk_delete(self, request, **kwargs):
         return generic_bulk_delete(self, request.data)
 
+    @action(methods=['get'], detail=False, url_path='revenue-cogs-report')
+    def revenue_cogs_report(self, request, **kwargs):
+        """Per-product revenue / volume / estimated-COGS / margin
+        report for a date window.
+
+        Query params:
+          * ``date_from``, ``date_to`` — inclusive (default: last 90d).
+          * ``group_by`` — ``product`` | ``consolidated`` (default) |
+            ``category``.
+          * ``tipo_operacao`` — 1=Saída (default), 0=Entrada.
+          * ``finalidades`` — comma-separated NF finalidade ints
+            counted as primary rows (default: ``1``=Normal). Devoluções
+            (``finalidade=4``) always aggregate into ``returns_*``
+            regardless of this filter.
+          * ``min_revenue`` — float; drop rows below this revenue.
+          * ``limit`` — int (default 200, max 500).
+
+        Returns: ``{period, group_by, tipo_operacao, totals, rows[],
+        notes}``.  See ``billing.services.product_pnl_service.compute_product_pnl``
+        for the row shape.
+        """
+        from datetime import date as _date, timedelta
+        from billing.services.product_pnl_service import compute_product_pnl
+        from rest_framework.response import Response
+
+        params = request.query_params
+
+        def _parse_date(name, default):
+            v = params.get(name)
+            if not v:
+                return default
+            try:
+                return _date.fromisoformat(v[:10])
+            except ValueError:
+                return default
+
+        today = _date.today()
+        date_from = _parse_date("date_from", today - timedelta(days=90))
+        date_to = _parse_date("date_to", today)
+        group_by = params.get("group_by") or "consolidated"
+        if group_by not in ("product", "consolidated", "category"):
+            return Response({"detail": "group_by inválido."}, status=400)
+        try:
+            tipo_operacao = int(params.get("tipo_operacao") or 1)
+        except (TypeError, ValueError):
+            tipo_operacao = 1
+        finalidades_raw = (params.get("finalidades") or "1").split(",")
+        finalidades: list[int] = []
+        for f in finalidades_raw:
+            try:
+                finalidades.append(int(f.strip()))
+            except (TypeError, ValueError):
+                continue
+        if not finalidades:
+            finalidades = [1]
+        try:
+            min_revenue = float(params.get("min_revenue") or 0)
+        except (TypeError, ValueError):
+            min_revenue = 0
+        try:
+            limit = max(1, min(int(params.get("limit") or 200), 500))
+        except (TypeError, ValueError):
+            limit = 200
+
+        tenant = getattr(request, 'tenant', None)
+        if tenant is None or tenant == 'all':
+            return Response(
+                {"detail": "revenue-cogs-report requer tenant explícito."},
+                status=400,
+            )
+
+        result = compute_product_pnl(
+            tenant,
+            date_from=date_from,
+            date_to=date_to,
+            group_by=group_by,
+            tipo_operacao=tipo_operacao,
+            finalidades=finalidades,
+        )
+        # Apply min_revenue filter + limit at the API edge.
+        rows = result.get("rows") or []
+        if min_revenue > 0:
+            rows = [
+                r for r in rows
+                if float(r.get("revenue") or 0) >= min_revenue
+            ]
+        result["rows"] = rows[:limit]
+        result["truncated"] = len(rows) > limit
+        return Response(result)
+
     @action(methods=['get'], detail=False, url_path='consolidated-summary')
     def consolidated_summary(self, request, **kwargs):
         """Return one row per canonical product (group primary or
