@@ -2,7 +2,7 @@ import { useState } from "react"
 import {
   CheckCircle2, XCircle, ChevronRight, ChevronDown,
   GitMerge, Crown, Network, Tag, RefreshCw, Sparkles, GitBranch,
-  Trash2, Lock,
+  Trash2, Lock, Package, Wrench,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { Button } from "@/components/ui/button"
@@ -18,17 +18,25 @@ import {
   useGroupMemberships,
   useAcceptAlias,
   useAcceptMembership,
+  useAcceptProductMembership,
+  useDeleteProductMembership,
   useMaterializeCnpjRoot,
   useMergeGroup,
   usePromoteGroupPrimary,
+  usePromoteProductGroupPrimary,
+  useProductGroupMemberships,
+  useProductServiceGroups,
   useRejectAlias,
   useRejectMembership,
+  useRejectProductMembership,
 } from "@/features/billing"
 import type {
   BusinessPartnerAlias,
   BusinessPartnerGroup,
   BusinessPartnerGroupMembership,
   CnpjRootCluster,
+  ProductServiceGroup,
+  ProductServiceGroupMembership,
 } from "@/features/billing"
 import { ConfidenceBadge } from "./components/ConfidenceBadge"
 import { cn } from "@/lib/utils"
@@ -555,6 +563,281 @@ function AliasesSection() {
 }
 
 // =====================================================
+// Section 4: ProductServiceGroup review
+// Mirrors the BP groups UI above. Same review_status state machine,
+// same accept / reject / promote-primary semantics.
+// =====================================================
+
+function isAutoNameMembership(m: ProductServiceGroupMembership): boolean {
+  return (m.evidence ?? []).some((e) => e?.method === "auto_name")
+}
+
+function isAutoHeadMembership(m: ProductServiceGroupMembership): boolean {
+  return (m.evidence ?? []).some((e) => e?.method === "auto_head")
+}
+
+function ProductGroupRow({ group }: { group: ProductServiceGroup }) {
+  const [open, setOpen] = useState(false)
+  const promote = usePromoteProductGroupPrimary()
+  const accept = useAcceptProductMembership()
+  const reject = useRejectProductMembership()
+  const remove = useDeleteProductMembership()
+
+  const accepted = (group.memberships ?? []).filter((m) => m.review_status === "accepted")
+  const suggested = (group.memberships ?? []).filter((m) => m.review_status === "suggested")
+
+  return (
+    <div className="rounded-lg border border-border bg-card">
+      <button
+        type="button"
+        className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-muted/30"
+        onClick={() => setOpen(!open)}
+      >
+        {open ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+        <Package className="h-4 w-4 text-amber-500" />
+        <div className="flex-1 min-w-0">
+          <div className="font-medium truncate">{group.name}</div>
+          <div className="font-mono text-[11px] text-muted-foreground">
+            {group.primary_product_code}
+          </div>
+        </div>
+        <span className="text-xs text-muted-foreground">
+          {group.accepted_member_count} aceitos · {group.member_count} total
+        </span>
+      </button>
+
+      {open ? (
+        <div className="border-t border-border/60 p-3 space-y-2">
+          <div className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Membros
+          </div>
+          {accepted.map((m) => {
+            const isPrimary = m.role === "primary"
+            const auto = isAutoNameMembership(m)
+            return (
+              <div
+                key={m.id}
+                className="flex items-center gap-2 rounded border border-border/60 bg-muted/20 px-2 py-1.5 text-sm"
+              >
+                {isPrimary ? (
+                  <Crown className="h-3.5 w-3.5 text-amber-500" />
+                ) : (
+                  <span className="h-3.5 w-3.5" />
+                )}
+                {m.product_service_item_type === "service" ? (
+                  <Wrench className="h-3 w-3 text-muted-foreground" />
+                ) : (
+                  <Package className="h-3 w-3 text-muted-foreground" />
+                )}
+                <span className="flex-1 truncate">{m.product_service_name}</span>
+                <span className="font-mono text-[11px] text-muted-foreground">
+                  {m.product_service_code}
+                </span>
+                {auto ? (
+                  <span
+                    className="inline-flex items-center gap-1 rounded-full bg-info/10 px-1.5 py-0.5 text-[10px] uppercase text-info"
+                    title="Auto-aceito por nome idêntico"
+                  >
+                    <Lock className="h-3 w-3" />
+                    auto-nome
+                  </span>
+                ) : null}
+                {!isPrimary ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() =>
+                      promote.mutate({ groupId: group.id, membershipId: m.id })
+                    }
+                    title="Promover a primary"
+                    disabled={promote.isPending}
+                  >
+                    <Crown className="h-3.5 w-3.5" />
+                  </Button>
+                ) : null}
+                {!isPrimary ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => remove.mutate(m.id)}
+                    title="Remover do grupo"
+                    disabled={remove.isPending}
+                    className="text-destructive hover:bg-destructive/10"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                ) : null}
+              </div>
+            )
+          })}
+
+          {suggested.length > 0 ? (
+            <>
+              <div className="pt-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                Sugestões pendentes
+              </div>
+              {suggested.map((m) => {
+                const head = isAutoHeadMembership(m)
+                return (
+                  <div
+                    key={m.id}
+                    className={cn(
+                      "flex items-center gap-2 rounded border px-2 py-1.5 text-sm",
+                      head ? "border-warning/40 bg-warning/5" : "border-info/40 bg-info/5",
+                    )}
+                  >
+                    {head ? (
+                      <GitBranch className="h-3.5 w-3.5 text-warning" />
+                    ) : (
+                      <Network className="h-3.5 w-3.5 text-info" />
+                    )}
+                    <span className="flex-1 truncate">{m.product_service_name}</span>
+                    <span className="font-mono text-[11px] text-muted-foreground">
+                      {m.product_service_code}
+                    </span>
+                    <ConfidenceBadge value={m.confidence} />
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => accept.mutate(m.id)}
+                      disabled={accept.isPending}
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => reject.mutate(m.id)}
+                      disabled={reject.isPending}
+                    >
+                      <XCircle className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                )
+              })}
+            </>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function ProductGroupsSection() {
+  const groups = useProductServiceGroups({ is_active: 1 })
+  if (groups.isLoading) {
+    return <div className="py-8 text-center text-muted-foreground">Carregando…</div>
+  }
+  const items = groups.data ?? []
+  if (items.length === 0) {
+    return (
+      <div className="py-8 text-center text-muted-foreground">
+        Nenhum grupo de produtos cadastrado. Rode{" "}
+        <code className="px-1 rounded bg-muted">manage.py suggest_product_groups --tenant &lt;sub&gt;</code>{" "}
+        para popular as sugestões automáticas a partir do nome dos produtos.
+      </div>
+    )
+  }
+  return (
+    <div className="space-y-2">
+      {items.map((g) => (
+        <ProductGroupRow key={g.id} group={g} />
+      ))}
+    </div>
+  )
+}
+
+function ProductSuggestionsSection() {
+  const memberships = useProductGroupMemberships({ review_status: "suggested" })
+  const accept = useAcceptProductMembership()
+  const reject = useRejectProductMembership()
+  if (memberships.isLoading) {
+    return <div className="py-8 text-center text-muted-foreground">Carregando…</div>
+  }
+  const items = memberships.data ?? []
+  if (items.length === 0) {
+    return (
+      <div className="py-8 text-center text-muted-foreground">
+        Nenhuma sugestão de produto pendente.
+      </div>
+    )
+  }
+  return (
+    <div className="space-y-2">
+      {items.map((m) => {
+        const head = isAutoHeadMembership(m)
+        return (
+          <div
+            key={m.id}
+            className={cn(
+              "rounded-lg border bg-card p-3",
+              head ? "border-warning/40" : "border-info/40",
+            )}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 text-sm">
+                  {head ? (
+                    <span className="inline-flex items-center gap-1 rounded bg-warning/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-warning">
+                      <GitBranch className="h-3 w-3" /> head-token
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 rounded bg-info/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-info">
+                      <Network className="h-3 w-3" /> grupo
+                    </span>
+                  )}
+                  <ConfidenceBadge value={m.confidence} />
+                  <span className="text-xs text-muted-foreground">hits {m.hit_count}</span>
+                </div>
+                <div className="mt-1 grid grid-cols-1 gap-1 sm:grid-cols-2">
+                  <div className="rounded border border-border/60 bg-muted/30 p-2">
+                    <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                      adicionar a
+                    </div>
+                    <div className="font-medium text-sm truncate">{m.group_name}</div>
+                  </div>
+                  <div className="rounded border border-border/60 bg-muted/30 p-2">
+                    <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                      produto
+                    </div>
+                    <div className="flex items-center gap-2 text-sm">
+                      <span className="font-medium truncate">{m.product_service_name}</span>
+                    </div>
+                    <div className="mt-0.5 font-mono text-[11px] text-muted-foreground">
+                      {m.product_service_code}
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div className="flex shrink-0 flex-col gap-1.5">
+                <Button
+                  size="sm"
+                  variant="default"
+                  disabled={accept.isPending}
+                  onClick={() => accept.mutate(m.id)}
+                >
+                  <CheckCircle2 className="h-4 w-4 mr-1" />
+                  Aceitar
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={reject.isPending}
+                  onClick={() => reject.mutate(m.id)}
+                >
+                  <XCircle className="h-4 w-4 mr-1" />
+                  Rejeitar
+                </Button>
+              </div>
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+// =====================================================
 // Page
 // =====================================================
 
@@ -562,15 +845,19 @@ export function GroupsPage() {
   const memberships = useGroupMemberships({ review_status: "suggested" })
   const groupsHook = useBusinessPartnerGroups({ is_active: 1 })
   const clusters = useCnpjRootClusters()
+  const productGroupsHook = useProductServiceGroups({ is_active: 1 })
+  const productSuggestionsHook = useProductGroupMemberships({ review_status: "suggested" })
   const suggestionCount = (memberships.data ?? []).length
   const groupCount = (groupsHook.data ?? []).length
   const clusterCount = clusters.data?.count ?? 0
+  const productGroupCount = (productGroupsHook.data ?? []).length
+  const productSuggestionCount = (productSuggestionsHook.data ?? []).length
 
   return (
     <div>
       <SectionHeader
-        title="Grupos de Parceiros"
-        subtitle="Consolide branches, CNPJs distintos e CPFs de um mesmo ator econômico. Matriz/filial são materializados automaticamente; cross-CNPJ aprende com vínculos NF↔Tx e conciliações."
+        title="Grupos"
+        subtitle="Consolide parceiros e produtos equivalentes. Para parceiros: matriz/filial materializa automaticamente; cross-CNPJ aprende com vínculos NF↔Tx. Para produtos: clusters por nome são auto-aceitos quando idênticos; head-token vai para revisão."
         actions={
           <Button
             size="sm"
@@ -579,6 +866,8 @@ export function GroupsPage() {
               memberships.refetch()
               groupsHook.refetch()
               clusters.refetch()
+              productGroupsHook.refetch()
+              productSuggestionsHook.refetch()
             }}
           >
             <RefreshCw className="h-4 w-4 mr-1" />
@@ -590,7 +879,7 @@ export function GroupsPage() {
       <Tabs defaultValue="groups" className="mt-4">
         <TabsList>
           <TabsTrigger value="groups">
-            Grupos {groupCount > 0 ? `(${groupCount})` : ""}
+            Parceiros {groupCount > 0 ? `(${groupCount})` : ""}
           </TabsTrigger>
           <TabsTrigger value="suggestions">
             Sugestões {suggestionCount > 0 ? `(${suggestionCount})` : ""}
@@ -600,6 +889,12 @@ export function GroupsPage() {
             Raiz CNPJ {clusterCount > 0 ? `(${clusterCount})` : ""}
           </TabsTrigger>
           <TabsTrigger value="aliases">Apelidos</TabsTrigger>
+          <TabsTrigger value="products">
+            Produtos {productGroupCount > 0 ? `(${productGroupCount})` : ""}
+          </TabsTrigger>
+          <TabsTrigger value="product-suggestions">
+            Sug. Produtos {productSuggestionCount > 0 ? `(${productSuggestionCount})` : ""}
+          </TabsTrigger>
         </TabsList>
 
         <TabsContent value="groups" className="mt-4">
@@ -616,6 +911,12 @@ export function GroupsPage() {
         </TabsContent>
         <TabsContent value="aliases" className="mt-4">
           <AliasesSection />
+        </TabsContent>
+        <TabsContent value="products" className="mt-4">
+          <ProductGroupsSection />
+        </TabsContent>
+        <TabsContent value="product-suggestions" className="mt-4">
+          <ProductSuggestionsSection />
         </TabsContent>
       </Tabs>
     </div>

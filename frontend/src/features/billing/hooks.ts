@@ -783,3 +783,88 @@ export function useMaterializeCnpjRoot() {
     onError: (e) => showError("Falha ao materializar grupo", e),
   })
 }
+
+// ============================================================
+// ProductServiceGroup / Membership / Alias
+// Mirror of the BP equivalents above. Same review_status state
+// machine, same accept / reject / promote-primary semantics --
+// just on the product side.
+// ============================================================
+
+export function useProductServiceGroups(params?: Record<string, string | number | boolean | undefined>) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["billing", sub, "ps-groups", params],
+    queryFn: () => billingApi.listProductServiceGroups(params),
+    enabled: !!sub,
+  })
+}
+
+export function useProductGroupMemberships(params?: Record<string, string | number | boolean | undefined>) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["billing", sub, "ps-group-memberships", params],
+    queryFn: () => billingApi.listProductGroupMemberships(params),
+    enabled: !!sub,
+  })
+}
+
+export function useAcceptProductMembership() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: (id: number) => billingApi.acceptProductMembership(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "ps-groups"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "ps-group-memberships"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "products"] })
+      toast.success("Membership de produto aceito.")
+    },
+    onError: (e) => showError("Falha ao aceitar membership de produto", e),
+  })
+}
+
+export function useRejectProductMembership() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: (id: number) => billingApi.rejectProductMembership(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "ps-group-memberships"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "ps-groups"] })
+      toast.success("Membership de produto rejeitado.")
+    },
+    onError: (e) => showError("Falha ao rejeitar membership de produto", e),
+  })
+}
+
+export function useDeleteProductMembership() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: (id: number) => billingApi.deleteProductMembership(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "ps-groups"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "ps-group-memberships"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "products"] })
+      toast.success("Produto removido do grupo.")
+    },
+    onError: (e) => showError("Falha ao remover produto do grupo", e),
+  })
+}
+
+export function usePromoteProductGroupPrimary() {
+  const qc = useQueryClient()
+  const sub = useSub()
+  return useMutation({
+    mutationFn: ({ groupId, membershipId }: { groupId: number; membershipId: number }) =>
+      billingApi.promoteProductGroupPrimary(groupId, membershipId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["billing", sub, "ps-groups"] })
+      qc.invalidateQueries({ queryKey: ["billing", sub, "products"] })
+      toast.success("Primário do grupo de produtos atualizado.")
+    },
+    onError: (e) => showError("Falha ao promover primary do grupo de produtos", e),
+  })
+}
+

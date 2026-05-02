@@ -17,7 +17,10 @@ import type {
   NotaFiscal,
   PaginatedListResponse,
   ProductService,
+  ProductServiceAlias,
   ProductServiceCategory,
+  ProductServiceGroup,
+  ProductServiceGroupMembership,
   ScanResponse,
 } from "./types"
 
@@ -328,4 +331,52 @@ export const billingApi = {
       `/api/business_partners/consolidated/${qs}`,
     )
   },
+
+  // ============================================================
+  // ProductServiceGroup -- mirror of BP groups for the product side.
+  // Auto-discovered by ``manage.py suggest_product_groups``; the UI
+  // here is just for review (accept / reject suggested members).
+  // ============================================================
+  listProductServiceGroups: async (params?: AnyParams): Promise<ProductServiceGroup[]> => {
+    const qs = toQueryString(params)
+    const data = await api.tenant.get<ProductServiceGroup[] | PaginatedListResponse<ProductServiceGroup>>(
+      `/api/product-service-groups/${qs}`,
+    )
+    return unwrapList(data as never)
+  },
+  promoteProductGroupPrimary: (groupId: number, membershipId: number): Promise<ProductServiceGroup> =>
+    api.tenant.post<ProductServiceGroup>(
+      `/api/product-service-groups/${groupId}/promote-primary/`,
+      { membership_id: membershipId },
+    ),
+
+  listProductGroupMemberships: async (params?: AnyParams): Promise<ProductServiceGroupMembership[]> => {
+    const qs = toQueryString(params)
+    const data = await api.tenant.get<ProductServiceGroupMembership[] | PaginatedListResponse<ProductServiceGroupMembership>>(
+      `/api/product-service-group-memberships/${qs}`,
+    )
+    return unwrapList(data as never)
+  },
+  acceptProductMembership: (id: number): Promise<ProductServiceGroupMembership> =>
+    api.tenant.post<ProductServiceGroupMembership>(
+      `/api/product-service-group-memberships/${id}/accept/`, {},
+    ),
+  rejectProductMembership: (id: number): Promise<ProductServiceGroupMembership> =>
+    api.tenant.post<ProductServiceGroupMembership>(
+      `/api/product-service-group-memberships/${id}/reject/`, {},
+    ),
+  deleteProductMembership: (id: number) =>
+    api.tenant.delete(`/api/product-service-group-memberships/${id}/`),
+
+  listProductServiceAliases: async (params?: AnyParams): Promise<ProductServiceAlias[]> => {
+    const qs = toQueryString(params)
+    const data = await api.tenant.get<ProductServiceAlias[] | PaginatedListResponse<ProductServiceAlias>>(
+      `/api/product-service-aliases/${qs}`,
+    )
+    return unwrapList(data as never)
+  },
+  acceptProductAlias: (id: number): Promise<ProductServiceAlias> =>
+    api.tenant.post<ProductServiceAlias>(`/api/product-service-aliases/${id}/accept/`, {}),
+  rejectProductAlias: (id: number): Promise<ProductServiceAlias> =>
+    api.tenant.post<ProductServiceAlias>(`/api/product-service-aliases/${id}/reject/`, {}),
 }

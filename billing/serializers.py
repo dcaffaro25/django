@@ -386,10 +386,110 @@ class BusinessPartnerAliasSerializer(serializers.ModelSerializer):
     class Meta:
         model = BusinessPartnerAlias
         fields = [
-            'id', 'company', 'business_partner', 'alias_identifier',
+            'id', 'company', 'business_partner', 'kind', 'alias_identifier',
             'review_status', 'source', 'confidence', 'hit_count',
             'last_used_at', 'evidence', 'reviewed_by', 'reviewed_at',
             'business_partner_name', 'business_partner_identifier',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = [
+            'reviewed_by', 'reviewed_at', 'hit_count', 'evidence',
+            'last_used_at',
+        ]
+
+
+# =====================================================================
+# ProductServiceGroup serializers — mirror BusinessPartnerGroup* on
+# the product side.
+# =====================================================================
+
+
+class ProductServiceGroupMembershipSerializer(serializers.ModelSerializer):
+    """One membership row with enough product context for the review UI.
+
+    Mirrors ``BusinessPartnerGroupMembershipSerializer`` — flat fields
+    inlined so the suggestion cards never have to follow up with N+1
+    requests for product name / code.
+    """
+    product_service_name = serializers.CharField(
+        source='product_service.name', read_only=True,
+    )
+    product_service_code = serializers.CharField(
+        source='product_service.code', read_only=True,
+    )
+    product_service_item_type = serializers.CharField(
+        source='product_service.item_type', read_only=True,
+    )
+    group_name = serializers.CharField(source='group.name', read_only=True)
+    group_primary_product_id = serializers.IntegerField(
+        source='group.primary_product_id', read_only=True,
+    )
+
+    class Meta:
+        from billing.models_product_groups import ProductServiceGroupMembership
+        model = ProductServiceGroupMembership
+        fields = [
+            'id', 'company', 'group', 'product_service',
+            'role', 'review_status', 'confidence', 'hit_count',
+            'evidence', 'reviewed_by', 'reviewed_at',
+            'product_service_name', 'product_service_code',
+            'product_service_item_type',
+            'group_name', 'group_primary_product_id',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = [
+            'reviewed_by', 'reviewed_at', 'hit_count', 'evidence',
+        ]
+
+
+class ProductServiceGroupSerializer(serializers.ModelSerializer):
+    """Group + memberships embedded, enough to render expansion on the UI."""
+    primary_product_name = serializers.CharField(
+        source='primary_product.name', read_only=True,
+    )
+    primary_product_code = serializers.CharField(
+        source='primary_product.code', read_only=True,
+    )
+    memberships = ProductServiceGroupMembershipSerializer(many=True, read_only=True)
+    member_count = serializers.SerializerMethodField()
+    accepted_member_count = serializers.SerializerMethodField()
+
+    class Meta:
+        from billing.models_product_groups import ProductServiceGroup
+        model = ProductServiceGroup
+        fields = [
+            'id', 'company', 'name', 'description', 'is_active',
+            'primary_product', 'primary_product_name', 'primary_product_code',
+            'memberships', 'member_count', 'accepted_member_count',
+            'created_at', 'updated_at',
+        ]
+
+    def get_member_count(self, obj):
+        return obj.memberships.count()
+
+    def get_accepted_member_count(self, obj):
+        from billing.models_product_groups import ProductServiceGroupMembership
+        return obj.memberships.filter(
+            review_status=ProductServiceGroupMembership.REVIEW_ACCEPTED,
+        ).count()
+
+
+class ProductServiceAliasSerializer(serializers.ModelSerializer):
+    product_service_name = serializers.CharField(
+        source='product_service.name', read_only=True,
+    )
+    product_service_code = serializers.CharField(
+        source='product_service.code', read_only=True,
+    )
+
+    class Meta:
+        from billing.models_product_groups import ProductServiceAlias
+        model = ProductServiceAlias
+        fields = [
+            'id', 'company', 'product_service', 'kind', 'alias_identifier',
+            'review_status', 'source', 'confidence', 'hit_count',
+            'last_used_at', 'evidence', 'reviewed_by', 'reviewed_at',
+            'product_service_name', 'product_service_code',
             'created_at', 'updated_at',
         ]
         read_only_fields = [

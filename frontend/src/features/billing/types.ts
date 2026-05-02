@@ -438,6 +438,78 @@ export interface BusinessPartnerAlias {
   updated_at: string
 }
 
+export type AliasKind = "cnpj" | "name"
+export type ProductAliasKind = "code" | "name"
+
+export interface ProductServiceGroupMembership {
+  id: number
+  company: number
+  group: number
+  product_service: number
+  role: GroupRole
+  review_status: GroupReviewStatus
+  confidence: string
+  hit_count: number
+  evidence: Array<{
+    method?: string
+    source?: string
+    source_id?: number | null
+    at?: string
+    confidence?: string
+    kind?: string
+  }>
+  reviewed_by: number | null
+  reviewed_at: string | null
+  product_service_name: string
+  product_service_code: string
+  product_service_item_type: "product" | "service"
+  group_name: string
+  group_primary_product_id: number
+  created_at: string
+  updated_at: string
+}
+
+export interface ProductServiceGroup {
+  id: number
+  company: number
+  name: string
+  description: string
+  is_active: boolean
+  primary_product: number
+  primary_product_name: string
+  primary_product_code: string
+  memberships: ProductServiceGroupMembership[]
+  member_count: number
+  accepted_member_count: number
+  created_at: string
+  updated_at: string
+}
+
+export interface ProductServiceAlias {
+  id: number
+  company: number
+  product_service: number
+  kind: ProductAliasKind
+  alias_identifier: string
+  review_status: AliasReviewStatus
+  source: string
+  confidence: string
+  hit_count: number
+  last_used_at: string | null
+  evidence: Array<{
+    source?: string
+    source_id?: number | null
+    at?: string
+    confidence?: string
+  }>
+  reviewed_by: number | null
+  reviewed_at: string | null
+  product_service_name: string
+  product_service_code: string
+  created_at: string
+  updated_at: string
+}
+
 export interface ConsolidatedBPRow {
   kind: "group" | "standalone"
   primary: BusinessPartner

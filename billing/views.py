@@ -1053,6 +1053,9 @@ class BusinessPartnerAliasViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         rs = params.get('review_status')
         if rs:
             qs = qs.filter(review_status=rs)
+        kind = params.get('kind')
+        if kind:
+            qs = qs.filter(kind=kind)
         bp = params.get('business_partner')
         if bp:
             try:
@@ -1068,11 +1071,15 @@ class BusinessPartnerAliasViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         alias = self.get_object()
         if alias.review_status == BusinessPartnerAlias.REVIEW_ACCEPTED:
             return Response(BusinessPartnerAliasSerializer(alias).data)
-        # Refuse if a different BP already owns this identifier as accepted.
+        # Refuse if a different BP already owns this (kind, identifier)
+        # as accepted -- conflict is per-kind, mirroring the unique
+        # constraint on ``BusinessPartnerAlias`` (company, kind,
+        # alias_identifier) where review_status='accepted'.
         conflict = (
             BusinessPartnerAlias.objects
             .filter(
                 company=alias.company,
+                kind=alias.kind,
                 alias_identifier=alias.alias_identifier,
                 review_status=BusinessPartnerAlias.REVIEW_ACCEPTED,
             )
@@ -1101,3 +1108,234 @@ class BusinessPartnerAliasViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         alias.reviewed_at = timezone.now()
         alias.save()
         return Response(BusinessPartnerAliasSerializer(alias).data)
+
+
+# =====================================================================
+# ProductServiceGroup viewsets — mirror the BP equivalents above.
+# =====================================================================
+
+
+class ProductServiceGroupViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
+    """CRUD on ProductServiceGroup. Memberships are managed via the
+    ``ProductServiceGroupMembershipViewSet`` plus the higher-level
+    actions on this viewset (``promote-primary``, ``merge``)."""
+    from billing.models_product_groups import ProductServiceGroup
+    from billing.serializers import ProductServiceGroupSerializer
+    queryset = ProductServiceGroup.objects.all().select_related(
+        'primary_product',
+    ).prefetch_related(
+        'memberships__product_service',
+    )
+    serializer_class = ProductServiceGroupSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = getattr(self.request, 'query_params', None)
+        if params is None:
+            return qs
+        if params.get('is_active') is not None:
+            qs = qs.filter(is_active=params.get('is_active') in ('1', 'true', 'True'))
+        ps_id = params.get('product_service')
+        if ps_id:
+            try:
+                qs = qs.filter(memberships__product_service_id=int(ps_id)).distinct()
+            except (TypeError, ValueError):
+                pass
+        return qs.order_by('name', 'id')
+
+    @action(methods=['post'], detail=True, url_path='promote-primary')
+    def promote_primary(self, request, pk=None, **kwargs):
+        """Move 'primary' role to another accepted membership of this group.
+        Body: { membership_id }."""
+        from django.db import transaction as db_transaction
+        from billing.models_product_groups import ProductServiceGroupMembership
+        group = self.get_object()
+        membership_id = request.data.get('membership_id')
+        if not membership_id:
+            return Response({'detail': 'membership_id é obrigatório.'}, status=400)
+        try:
+            new_primary = group.memberships.get(pk=int(membership_id))
+        except ProductServiceGroupMembership.DoesNotExist:
+            return Response(
+                {'detail': 'Membership não pertence a este grupo.'}, status=404,
+            )
+        if new_primary.review_status != ProductServiceGroupMembership.REVIEW_ACCEPTED:
+            return Response(
+                {'detail': 'Membership precisa estar aceito antes de virar primary.'},
+                status=400,
+            )
+        with db_transaction.atomic():
+            current_primary = group.memberships.filter(
+                role=ProductServiceGroupMembership.ROLE_PRIMARY,
+            ).first()
+            if current_primary is not None:
+                current_primary.role = ProductServiceGroupMembership.ROLE_MEMBER
+                current_primary.save(update_fields=['role', 'updated_at'])
+            new_primary.role = ProductServiceGroupMembership.ROLE_PRIMARY
+            new_primary.save(update_fields=['role', 'updated_at'])
+            group.primary_product = new_primary.product_service
+            group.name = new_primary.product_service.name
+            group.save(update_fields=['primary_product', 'name', 'updated_at'])
+        return Response(self.get_serializer(group).data)
+
+
+class ProductServiceGroupMembershipViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
+    """CRUD + accept/reject actions on product-group memberships."""
+    from billing.models_product_groups import ProductServiceGroupMembership
+    from billing.serializers import ProductServiceGroupMembershipSerializer
+    queryset = ProductServiceGroupMembership.objects.all().select_related(
+        'group', 'group__primary_product', 'product_service', 'reviewed_by',
+    )
+    serializer_class = ProductServiceGroupMembershipSerializer
+
+    def perform_destroy(self, instance):
+        from rest_framework.exceptions import ValidationError
+        from billing.models_product_groups import ProductServiceGroupMembership
+        if instance.role == ProductServiceGroupMembership.ROLE_PRIMARY:
+            raise ValidationError({
+                'detail': (
+                    "Não é possível remover o primary do grupo. Promova "
+                    "outro membro a primary antes."
+                ),
+            })
+        super().perform_destroy(instance)
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = getattr(self.request, 'query_params', None)
+        if params is None:
+            return qs
+        rs = params.get('review_status')
+        if rs:
+            qs = qs.filter(review_status=rs)
+        group = params.get('group')
+        if group:
+            try:
+                qs = qs.filter(group_id=int(group))
+            except (TypeError, ValueError):
+                pass
+        ps = params.get('product_service')
+        if ps:
+            try:
+                qs = qs.filter(product_service_id=int(ps))
+            except (TypeError, ValueError):
+                pass
+        ordering = params.get('ordering') or '-confidence'
+        return qs.order_by(ordering, '-id')
+
+    @action(methods=['post'], detail=True, url_path='accept')
+    def accept(self, request, pk=None, **kwargs):
+        from django.db import transaction as db_transaction
+        from django.utils import timezone
+        from billing.models_product_groups import ProductServiceGroupMembership
+        from billing.serializers import ProductServiceGroupMembershipSerializer
+        membership = self.get_object()
+        if membership.review_status == ProductServiceGroupMembership.REVIEW_ACCEPTED:
+            return Response(ProductServiceGroupMembershipSerializer(membership).data)
+        with db_transaction.atomic():
+            membership.review_status = ProductServiceGroupMembership.REVIEW_ACCEPTED
+            membership.reviewed_by = request.user if request.user.is_authenticated else None
+            membership.reviewed_at = timezone.now()
+            membership.save()
+            # Reject conflicting suggestions for this product in other groups.
+            (
+                ProductServiceGroupMembership.objects
+                .filter(
+                    product_service=membership.product_service,
+                    review_status=ProductServiceGroupMembership.REVIEW_SUGGESTED,
+                )
+                .exclude(group_id=membership.group_id)
+                .update(
+                    review_status=ProductServiceGroupMembership.REVIEW_REJECTED,
+                    reviewed_at=timezone.now(),
+                )
+            )
+        membership.refresh_from_db()
+        return Response(ProductServiceGroupMembershipSerializer(membership).data)
+
+    @action(methods=['post'], detail=True, url_path='reject')
+    def reject(self, request, pk=None, **kwargs):
+        from django.utils import timezone
+        from billing.models_product_groups import ProductServiceGroupMembership
+        from billing.serializers import ProductServiceGroupMembershipSerializer
+        membership = self.get_object()
+        if membership.review_status == ProductServiceGroupMembership.REVIEW_REJECTED:
+            return Response(ProductServiceGroupMembershipSerializer(membership).data)
+        membership.review_status = ProductServiceGroupMembership.REVIEW_REJECTED
+        membership.reviewed_by = request.user if request.user.is_authenticated else None
+        membership.reviewed_at = timezone.now()
+        membership.save()
+        return Response(ProductServiceGroupMembershipSerializer(membership).data)
+
+
+class ProductServiceAliasViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
+    from billing.models_product_groups import ProductServiceAlias
+    from billing.serializers import ProductServiceAliasSerializer
+    queryset = ProductServiceAlias.objects.all().select_related(
+        'product_service', 'reviewed_by',
+    )
+    serializer_class = ProductServiceAliasSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        params = getattr(self.request, 'query_params', None)
+        if params is None:
+            return qs
+        rs = params.get('review_status')
+        if rs:
+            qs = qs.filter(review_status=rs)
+        kind = params.get('kind')
+        if kind:
+            qs = qs.filter(kind=kind)
+        ps = params.get('product_service')
+        if ps:
+            try:
+                qs = qs.filter(product_service_id=int(ps))
+            except (TypeError, ValueError):
+                pass
+        ordering = params.get('ordering') or '-hit_count'
+        return qs.order_by(ordering, '-id')
+
+    @action(methods=['post'], detail=True, url_path='accept')
+    def accept(self, request, pk=None, **kwargs):
+        from django.utils import timezone
+        from billing.models_product_groups import ProductServiceAlias
+        from billing.serializers import ProductServiceAliasSerializer
+        alias = self.get_object()
+        if alias.review_status == ProductServiceAlias.REVIEW_ACCEPTED:
+            return Response(ProductServiceAliasSerializer(alias).data)
+        conflict = (
+            ProductServiceAlias.objects
+            .filter(
+                company=alias.company,
+                kind=alias.kind,
+                alias_identifier=alias.alias_identifier,
+                review_status=ProductServiceAlias.REVIEW_ACCEPTED,
+            )
+            .exclude(pk=alias.pk)
+            .exists()
+        )
+        if conflict:
+            return Response(
+                {'detail': 'Outro alias aceito já reivindica este identificador.'},
+                status=409,
+            )
+        alias.review_status = ProductServiceAlias.REVIEW_ACCEPTED
+        alias.reviewed_by = request.user if request.user.is_authenticated else None
+        alias.reviewed_at = timezone.now()
+        alias.save()
+        return Response(ProductServiceAliasSerializer(alias).data)
+
+    @action(methods=['post'], detail=True, url_path='reject')
+    def reject(self, request, pk=None, **kwargs):
+        from django.utils import timezone
+        from billing.models_product_groups import ProductServiceAlias
+        from billing.serializers import ProductServiceAliasSerializer
+        alias = self.get_object()
+        if alias.review_status == ProductServiceAlias.REVIEW_REJECTED:
+            return Response(ProductServiceAliasSerializer(alias).data)
+        alias.review_status = ProductServiceAlias.REVIEW_REJECTED
+        alias.reviewed_by = request.user if request.user.is_authenticated else None
+        alias.reviewed_at = timezone.now()
+        alias.save()
+        return Response(ProductServiceAliasSerializer(alias).data)
