@@ -44,6 +44,11 @@ from typing import Dict, Iterable, List, Optional
 from django.db.models import Q, Sum, Count
 
 from billing.models import BusinessPartner, Invoice
+from billing.services.invoice_payment_evidence import (
+    EVIDENCE_CASH_MATCHED_FULL, EVIDENCE_CASH_MATCHED_PARTIAL,
+    EVIDENCE_LINKED_NO_RECON, EVIDENCE_NF_LINKED_NO_TX,
+    EVIDENCE_UNLINKED, classify_many,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -166,30 +171,62 @@ def compute_dso(
     if partner_id is not None:
         ar_qs = ar_qs.filter(partner_id=partner_id)
 
-    ar_rows = list(
-        ar_qs.values(
-            "id", "partner_id", "total_amount", "invoice_date", "due_date",
-        )
+    ar_invoices = list(
+        ar_qs.only("id", "partner_id", "total_amount", "invoice_date", "due_date")
     )
+    # Payment-evidence walk: which AR invoices already have linked
+    # reconciled Tx? Operators see "we say open but cash matched" so
+    # the headline DSO doesn't mislead while ``Invoice.status`` is
+    # being kept current by the auto-update hook + backfill.
+    evidence_by_inv = classify_many(ar_invoices)
+
     ar_total = Decimal("0")
-    ar_by_partner = defaultdict(lambda: {"amount": Decimal("0"), "weighted_age": Decimal("0"), "count": 0})
+    # Per-partner aggregation expanded with the four evidence buckets
+    # so the per-partner table can show "of this partner's R$ X open,
+    # R$ Y already shows cash evidence". Keys mirror EVIDENCE_*.
+    ar_by_partner = defaultdict(
+        lambda: {
+            "amount": Decimal("0"),
+            "weighted_age": Decimal("0"),
+            "count": 0,
+            "amount_cash_matched_full": Decimal("0"),
+            "amount_cash_matched_partial": Decimal("0"),
+            "amount_linked_no_recon": Decimal("0"),
+            "amount_nf_linked_no_tx": Decimal("0"),
+            "amount_unlinked": Decimal("0"),
+            "count_cash_matched_full": 0,
+        }
+    )
+    # Tenant-wide evidence breakdown.
+    by_evidence_amount = {k: Decimal("0") for k in (
+        EVIDENCE_CASH_MATCHED_FULL, EVIDENCE_CASH_MATCHED_PARTIAL,
+        EVIDENCE_LINKED_NO_RECON, EVIDENCE_NF_LINKED_NO_TX,
+        EVIDENCE_UNLINKED,
+    )}
+    by_evidence_count = {k: 0 for k in by_evidence_amount}
+
     buckets = _new_buckets()
     today = _date.today()  # for live aging
-    for r in ar_rows:
-        amt = Decimal(r["total_amount"] or 0)
+    for inv in ar_invoices:
+        amt = Decimal(inv.total_amount or 0)
         if amt == 0:
             continue
         ar_total += amt
-        # Aging anchored on invoice_date — conventional DSO basis.
-        age = (today - r["invoice_date"]).days if r["invoice_date"] else 0
+        age = (today - inv.invoice_date).days if inv.invoice_date else 0
         b = _bucket_for_age(buckets, max(0, age))
         b.count += 1
         b.amount += amt
-        # Per-partner accumulation
-        pp = ar_by_partner[r["partner_id"]]
+        pp = ar_by_partner[inv.partner_id]
         pp["amount"] += amt
         pp["weighted_age"] += amt * Decimal(age)
         pp["count"] += 1
+        ev = evidence_by_inv.get(inv.id)
+        if ev is not None:
+            by_evidence_amount[ev.status] += amt
+            by_evidence_count[ev.status] += 1
+            pp[f"amount_{ev.status}"] += amt
+            if ev.status == EVIDENCE_CASH_MATCHED_FULL:
+                pp["count_cash_matched_full"] += 1
 
     # ---- DSO totals ----
     dso_days: Optional[Decimal] = None
@@ -222,7 +259,7 @@ def compute_dso(
                 # report as None so caller can render '—'.
                 dso_p = None
             avg_age = None
-            if ar_p > 0 and ar_p_data["count"] > 0:
+            if ar_p > 0 and ar_p_data.get("count", 0) > 0:
                 avg_age = (ar_p_data["weighted_age"] / ar_p).quantize(Decimal("0.01"))
             meta = partner_meta.get(pid, {})
             per_partner.append({
@@ -231,9 +268,20 @@ def compute_dso(
                 "partner_identifier": meta.get("identifier", ""),
                 "sales": str(sales_p),
                 "ar_open": str(ar_p),
-                "ar_invoice_count": ar_p_data["count"],
+                "ar_invoice_count": ar_p_data.get("count", 0),
                 "dso_days": str(dso_p) if dso_p is not None else None,
                 "weighted_avg_age_days": str(avg_age) if avg_age is not None else None,
+                # Payment-evidence breakdown for the per-partner table.
+                # ``ar_likely_paid`` = portion the auto-promotion hook
+                # / backfill would mark as paid right now.
+                "ar_likely_paid": str(ar_p_data.get("amount_cash_matched_full", Decimal("0"))),
+                "ar_partial_evidence": str(ar_p_data.get("amount_cash_matched_partial", Decimal("0"))),
+                "ar_no_evidence": str(
+                    ar_p_data.get("amount_linked_no_recon", Decimal("0"))
+                    + ar_p_data.get("amount_nf_linked_no_tx", Decimal("0"))
+                    + ar_p_data.get("amount_unlinked", Decimal("0"))
+                ),
+                "ar_likely_paid_count": ar_p_data.get("count_cash_matched_full", 0),
             })
         # Sort by AR desc (the "who do we need to chase" lens), then
         # by DSO desc (slowest payers within similar AR).
@@ -246,6 +294,18 @@ def compute_dso(
         )
         per_partner = per_partner[:top_n_partners]
 
+    # ---- Adjusted DSO: subtract invoices with cash_matched_full
+    #      evidence from open AR (those would be promoted to ``paid``
+    #      by the backfill / auto-update hook). Lets operators see
+    #      "real" DSO once the status-update plumbing catches up.
+    likely_paid_amount = by_evidence_amount[EVIDENCE_CASH_MATCHED_FULL]
+    ar_adjusted = ar_total - likely_paid_amount
+    dso_adjusted: Optional[Decimal] = None
+    if sales_total > 0:
+        dso_adjusted = (ar_adjusted / sales_total * Decimal(days_in_period)).quantize(Decimal("0.01"))
+    elif ar_adjusted == 0:
+        dso_adjusted = Decimal("0.00")
+
     return {
         "period": {
             "date_from": date_from.isoformat(),
@@ -257,9 +317,41 @@ def compute_dso(
             "ar_open": str(ar_total),
             "dso_days": str(dso_days) if dso_days is not None else None,
             "days_in_period": days_in_period,
-            "open_invoice_count": len([r for r in ar_rows if Decimal(r["total_amount"] or 0) > 0]),
+            "open_invoice_count": len([
+                inv for inv in ar_invoices if Decimal(inv.total_amount or 0) > 0
+            ]),
+            # Adjusted view that excludes invoices the backfill /
+            # hook would mark as paid right now.
+            "ar_adjusted": str(ar_adjusted),
+            "dso_days_adjusted": str(dso_adjusted) if dso_adjusted is not None else None,
+            "ar_likely_paid_amount": str(likely_paid_amount),
+            "ar_likely_paid_count": by_evidence_count[EVIDENCE_CASH_MATCHED_FULL],
         },
         "aging": [b.to_dict() for b in buckets],
+        "payment_evidence": {
+            # Mutually exclusive buckets (each invoice in exactly one).
+            # Use these to drive a stacked bar / donut on the dashboard.
+            "cash_matched_full": {
+                "count": by_evidence_count[EVIDENCE_CASH_MATCHED_FULL],
+                "amount": str(by_evidence_amount[EVIDENCE_CASH_MATCHED_FULL]),
+            },
+            "cash_matched_partial": {
+                "count": by_evidence_count[EVIDENCE_CASH_MATCHED_PARTIAL],
+                "amount": str(by_evidence_amount[EVIDENCE_CASH_MATCHED_PARTIAL]),
+            },
+            "linked_no_recon": {
+                "count": by_evidence_count[EVIDENCE_LINKED_NO_RECON],
+                "amount": str(by_evidence_amount[EVIDENCE_LINKED_NO_RECON]),
+            },
+            "nf_linked_no_tx": {
+                "count": by_evidence_count[EVIDENCE_NF_LINKED_NO_TX],
+                "amount": str(by_evidence_amount[EVIDENCE_NF_LINKED_NO_TX]),
+            },
+            "unlinked": {
+                "count": by_evidence_count[EVIDENCE_UNLINKED],
+                "amount": str(by_evidence_amount[EVIDENCE_UNLINKED]),
+            },
+        },
         "per_partner": per_partner,
         "notes": (
             "AR snapshot is taken at the *current* invoice status "
@@ -269,7 +361,11 @@ def compute_dso(
             "count their full ``total_amount`` toward AR -- payment "
             "tracking by JE matching isn't denormalized on Invoice. "
             "Aging is anchored on ``invoice_date`` (conventional "
-            "DSO basis); separate ``days_past_due`` is exposed by "
-            "the Tx-status endpoint when needed."
+            "DSO basis). ``payment_evidence`` shows how much of "
+            "open AR already has matched-and-reconciled cash on "
+            "the bank side -- those invoices would be promoted to "
+            "``paid`` by the backfill / auto-update hook; "
+            "``dso_days_adjusted`` is the headline DSO with that "
+            "amount subtracted from AR."
         ),
     }
