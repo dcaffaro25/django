@@ -158,6 +158,17 @@ export function useAuditCritics() {
   })
 }
 
+export function useDsoReport(
+  params?: Parameters<typeof billingApi.dsoReport>[0],
+) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["billing", sub, "dso-report", params],
+    queryFn: () => billingApi.dsoReport(params),
+    enabled: !!sub,
+  })
+}
+
 export function useBackfillInvoiceStatusFromRecon() {
   const qc = useQueryClient()
   const sub = useSub()

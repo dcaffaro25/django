@@ -10,6 +10,7 @@ import type {
   ConsolidatedBPResponse,
   CriticAuditResponse,
   CriticsResponse,
+  DsoReportResponse,
   Invoice,
   InvoiceDetail,
   InvoiceNFLink,
@@ -80,6 +81,17 @@ export const billingApi = {
     persist?: boolean;
   }): Promise<CriticAuditResponse> =>
     api.tenant.post<CriticAuditResponse>(`/api/invoices/audit-critics/`, body ?? {}),
+
+  // DSO + aging + per-partner + payment-evidence report.
+  dsoReport: (params?: {
+    date_from?: string
+    date_to?: string
+    partner?: number
+    top_n_partners?: number
+  }): Promise<DsoReportResponse> =>
+    api.tenant.get<DsoReportResponse>(
+      `/api/invoices/dso-report/${toQueryString(params)}`,
+    ),
 
   // Backfill ``Invoice.status`` from NF↔Tx reconciliation evidence.
   // The backend returns the same counter shape for dry-run and real

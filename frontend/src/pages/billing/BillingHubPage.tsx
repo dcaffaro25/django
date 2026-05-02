@@ -1,7 +1,7 @@
 import { Outlet } from "react-router-dom"
 import {
   FileText, Receipt, Link as LinkIcon, Settings as SettingsIcon,
-  Users, Package, Network,
+  Users, Package, Network, Clock,
 } from "lucide-react"
 import { TabbedShell } from "@/components/layout/TabbedShell"
 import { useGroupMemberships, useNfTxLinks } from "@/features/billing"
@@ -47,6 +47,7 @@ export function BillingHubPage() {
           icon: Network,
           badge: groupSuggestionCount > 0 ? groupSuggestionCount : null,
         },
+        { to: "/billing/dso", label: "DSO", icon: Clock },
         { to: "/billing/settings", label: "Configurações", icon: SettingsIcon },
       ]}
     >

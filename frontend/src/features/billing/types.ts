@@ -510,6 +510,64 @@ export interface ProductServiceAlias {
   updated_at: string
 }
 
+/**
+ * DSO (Days Sales Outstanding) report payload returned by
+ * ``GET /api/invoices/dso-report/``. Mirrors
+ * ``billing.services.dso_report_service.compute_dso``.
+ */
+export interface DsoReportPaymentEvidenceBucket {
+  count: number
+  amount: string
+}
+
+export interface DsoReportAgingBucket {
+  label: string
+  days_min: number
+  days_max: number | null
+  count: number
+  amount: string
+}
+
+export interface DsoReportPartnerRow {
+  partner_id: number
+  partner_name: string
+  partner_identifier: string
+  sales: string
+  ar_open: string
+  ar_invoice_count: number
+  dso_days: string | null
+  weighted_avg_age_days: string | null
+  ar_likely_paid: string
+  ar_partial_evidence: string
+  ar_no_evidence: string
+  ar_likely_paid_count: number
+}
+
+export interface DsoReportResponse {
+  period: { date_from: string; date_to: string; days: number }
+  totals: {
+    sales: string
+    ar_open: string
+    dso_days: string | null
+    days_in_period: number
+    open_invoice_count: number
+    ar_adjusted: string
+    dso_days_adjusted: string | null
+    ar_likely_paid_amount: string
+    ar_likely_paid_count: number
+  }
+  aging: DsoReportAgingBucket[]
+  payment_evidence: {
+    cash_matched_full: DsoReportPaymentEvidenceBucket
+    cash_matched_partial: DsoReportPaymentEvidenceBucket
+    linked_no_recon: DsoReportPaymentEvidenceBucket
+    nf_linked_no_tx: DsoReportPaymentEvidenceBucket
+    unlinked: DsoReportPaymentEvidenceBucket
+  }
+  per_partner: DsoReportPartnerRow[]
+  notes: string
+}
+
 export interface ConsolidatedBPRow {
   kind: "group" | "standalone"
   primary: BusinessPartner
