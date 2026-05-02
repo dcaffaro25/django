@@ -78,11 +78,53 @@ class ProductServiceCategorySerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 class ProductServiceSerializer(serializers.ModelSerializer):
-    category = serializers.PrimaryKeyRelatedField(queryset=ProductServiceCategory.objects.all(), allow_null=True)
+    category = serializers.PrimaryKeyRelatedField(
+        queryset=ProductServiceCategory.objects.all(), allow_null=True,
+    )
+    # Denormalized read-only fields so list-page rendering can show
+    # the consolidated group + family without N+1 follow-ups.
+    category_name = serializers.CharField(
+        source='category.name', read_only=True, allow_null=True,
+    )
+    # Group context (consolidation rollup). When this product belongs
+    # to an accepted ProductServiceGroup, ``consolidated_product_id``
+    # is the group's primary product; otherwise it falls back to the
+    # row's own id. Reports / list-aggregations should
+    # ``GROUP BY consolidated_product_id`` to deduplicate at display
+    # time without rewriting historical FK columns.
+    group_id = serializers.SerializerMethodField()
+    group_primary_product_id = serializers.SerializerMethodField()
+    group_role = serializers.SerializerMethodField()
+    consolidated_product_id = serializers.SerializerMethodField()
 
     class Meta:
         model = ProductService
         fields = '__all__'
+
+    def _accepted_membership(self, obj):
+        from billing.models_product_groups import ProductServiceGroupMembership
+        # Iterates the prefetched manager when the viewset prefetches
+        # ``group_memberships``; otherwise falls back to a single query.
+        for m in obj.group_memberships.all():
+            if m.review_status == ProductServiceGroupMembership.REVIEW_ACCEPTED:
+                return m
+        return None
+
+    def get_group_id(self, obj):
+        m = self._accepted_membership(obj)
+        return m.group_id if m else None
+
+    def get_group_primary_product_id(self, obj):
+        m = self._accepted_membership(obj)
+        return m.group.primary_product_id if m else None
+
+    def get_group_role(self, obj):
+        m = self._accepted_membership(obj)
+        return m.role if m else None
+
+    def get_consolidated_product_id(self, obj):
+        m = self._accepted_membership(obj)
+        return m.group.primary_product_id if m else obj.id
 
 class InvoiceLineSerializer(serializers.ModelSerializer):
     class Meta:

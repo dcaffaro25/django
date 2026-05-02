@@ -173,7 +173,15 @@ class ProductServiceCategoryViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return generic_bulk_delete(self, request.data)
 
 class ProductServiceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
-    queryset = ProductService.objects.all()
+    # Prefetch ``group_memberships`` so the serializer's
+    # ``_accepted_membership`` walk doesn't fan out to N+1. Same
+    # reason ``BusinessPartnerViewSet`` prefetches its memberships.
+    queryset = ProductService.objects.all().select_related(
+        'category',
+    ).prefetch_related(
+        'group_memberships',
+        'group_memberships__group',
+    )
     serializer_class = ProductServiceSerializer
 
     @action(methods=['post'], detail=False)
@@ -187,6 +195,67 @@ class ProductServiceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     @action(methods=['delete'], detail=False)
     def bulk_delete(self, request, **kwargs):
         return generic_bulk_delete(self, request.data)
+
+    @action(methods=['get'], detail=False, url_path='consolidated-summary')
+    def consolidated_summary(self, request, **kwargs):
+        """Return one row per canonical product (group primary or
+        standalone) with counts of group members and the family
+        category. Light-weight read for the dashboard / Produtos
+        page header KPIs.
+
+        Response shape:
+        {
+          "total_rows": <ProductService row count>,
+          "canonical_count": <distinct primary_product_id + standalone count>,
+          "in_groups": <rows that have an accepted membership>,
+          "categorized": <rows with a non-null category>,
+          "by_category": [
+            {"category_id": int|null, "category_name": str|null, "count": int},
+            ...
+          ]
+        }
+        """
+        from collections import defaultdict
+        from billing.models_product_groups import (
+            ProductServiceGroupMembership,
+        )
+        from rest_framework.response import Response
+
+        qs = self.filter_queryset(self.get_queryset())
+        rows = list(
+            qs.values('id', 'category_id', 'category__name', 'is_active')
+        )
+        accepted_membership_ps_ids = set(
+            ProductServiceGroupMembership.objects
+            .filter(
+                product_service__in=[r['id'] for r in rows],
+                review_status=ProductServiceGroupMembership.REVIEW_ACCEPTED,
+                role=ProductServiceGroupMembership.ROLE_MEMBER,
+            )
+            .values_list('product_service_id', flat=True)
+        )
+        canonical_count = len(rows) - len(accepted_membership_ps_ids)
+        categorized = sum(1 for r in rows if r['category_id'])
+        by_cat = defaultdict(lambda: {'count': 0, 'name': None})
+        for r in rows:
+            cid = r['category_id']
+            by_cat[cid]['count'] += 1
+            if r['category__name']:
+                by_cat[cid]['name'] = r['category__name']
+        return Response({
+            'total_rows': len(rows),
+            'canonical_count': canonical_count,
+            'in_groups': len(accepted_membership_ps_ids),
+            'categorized': categorized,
+            'uncategorized': len(rows) - categorized,
+            'by_category': [
+                {'category_id': cid, 'category_name': data['name'], 'count': data['count']}
+                for cid, data in sorted(
+                    by_cat.items(),
+                    key=lambda kv: (-kv[1]['count'], kv[0] or 0),
+                )
+            ],
+        })
 
 class InvoiceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = Invoice.objects.all().select_related('partner', 'contract', 'currency')
