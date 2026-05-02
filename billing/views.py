@@ -556,6 +556,69 @@ class InvoiceViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         )
         return Response(result)
 
+    @action(methods=['get'], detail=False, url_path='dso-report')
+    def dso_report(self, request, **kwargs):
+        """Days Sales Outstanding (DSO) + aging buckets + per-partner
+        breakdown for ``[date_from, date_to]``.
+
+        See ``billing.services.dso_report_service.compute_dso`` for the
+        full payload shape. Query params:
+          * ``date_from`` / ``date_to`` (default last 90d)
+          * ``partner`` — restrict to one BusinessPartner id
+            (single-partner mode; ``per_partner`` is then suppressed).
+          * ``top_n_partners`` — cap on the per-partner block
+            (default 10, max 100).
+        """
+        from datetime import date as _date, timedelta
+        from billing.services.dso_report_service import compute_dso
+
+        tenant = getattr(request, 'tenant', None)
+        if tenant is None or tenant == 'all':
+            return Response(
+                {"detail": "dso-report requer tenant explícito."},
+                status=400,
+            )
+
+        params = request.query_params
+
+        def _parse_date(name, default):
+            v = params.get(name)
+            if not v:
+                return default
+            try:
+                return _date.fromisoformat(v[:10])
+            except ValueError:
+                return default
+
+        today = _date.today()
+        date_from = _parse_date("date_from", today - timedelta(days=90))
+        date_to = _parse_date("date_to", today)
+        if date_from > date_to:
+            return Response(
+                {"detail": "date_from deve ser <= date_to."},
+                status=400,
+            )
+
+        partner_id = None
+        if params.get('partner'):
+            try:
+                partner_id = int(params['partner'])
+            except (TypeError, ValueError):
+                pass
+        try:
+            top_n = max(1, min(int(params.get('top_n_partners') or 10), 100))
+        except (TypeError, ValueError):
+            top_n = 10
+
+        return Response(compute_dso(
+            tenant,
+            date_from=date_from,
+            date_to=date_to,
+            partner_id=partner_id,
+            top_n_partners=top_n,
+        ))
+
+
 class InvoiceLineViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
     queryset = InvoiceLine.objects.all().select_related('invoice', 'product_service', 'invoice__partner')
     serializer_class = InvoiceLineSerializer
