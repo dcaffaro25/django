@@ -231,8 +231,21 @@ def _resolve_destinatario(company, dest_cnpj, dest_nome="", dest_uf=""):
 
 def _resolve_produto(company, codigo_produto, ean, descricao="", valor_unitario=None):
     """
-    Retorna ProductService: 1) direto por code/EAN, 2) via SubstitutionRule (ProductService.code),
-    3) cria novo com dados do item da NFe.
+    Retorna ProductService usando, em ordem:
+      1. Match direto por ``code`` / EAN.
+      2. SubstitutionRule (operator-curated rename).
+      3. Accepted ``ProductServiceAlias(kind=code)`` — código observado
+         em import anterior que já foi aprendido como apelido de um
+         produto canônico.
+      4. Accepted ``ProductServiceAlias(kind=name)`` — nome normalizado
+         do item (descrição na NF) que já resolve para um produto.
+      5. Cria novo ``ProductService`` com os dados do item.
+
+    O passo 3 + 4 são a "trava" que impede a multiplicação de SKUs
+    duplicados quando o mesmo produto físico aparece em NFs com
+    códigos diferentes (vendor distinto, migração de ERP, etc.).
+    Sem isso, cada nova variação de código gera uma linha nova e
+    o catálogo cresce sem parar.
     """
     if not company:
         return None
@@ -251,6 +264,29 @@ def _resolve_produto(company, codigo_produto, ean, descricao="", valor_unitario=
             p = qs.filter(code=substituted).first()
             if p:
                 return p
+    # Code-alias path: any of the candidate codes (codigo_produto / EAN)
+    # may have been learned as an alias for a canonical product.
+    try:
+        from billing.services.ps_group_service import (
+            resolve_ps_by_code, resolve_ps_by_name,
+        )
+        for code_candidate in (codigo_produto, ean):
+            if not code_candidate:
+                continue
+            p = resolve_ps_by_code(company, code_candidate)
+            if p is not None:
+                return p
+        # Name-alias path: the NF item descricao might already be a
+        # known canonical product even when the code is brand-new.
+        if descricao:
+            p = resolve_ps_by_name(company, descricao)
+            if p is not None:
+                return p
+    except Exception:
+        # Alias resolution must NEVER break the import — fall through
+        # to the create branch on any failure.
+        pass
+
     code_final = (codigo_produto or ean or "").strip()[:100]
     if not code_final:
         return None

@@ -1227,7 +1227,10 @@ class ProductServiceGroupMembershipViewSet(ScopedQuerysetMixin, viewsets.ModelVi
     def accept(self, request, pk=None, **kwargs):
         from django.db import transaction as db_transaction
         from django.utils import timezone
-        from billing.models_product_groups import ProductServiceGroupMembership
+        from decimal import Decimal
+        from billing.models_product_groups import (
+            ProductServiceAlias, ProductServiceGroupMembership,
+        )
         from billing.serializers import ProductServiceGroupMembershipSerializer
         membership = self.get_object()
         if membership.review_status == ProductServiceGroupMembership.REVIEW_ACCEPTED:
@@ -1250,6 +1253,36 @@ class ProductServiceGroupMembershipViewSet(ScopedQuerysetMixin, viewsets.ModelVi
                     reviewed_at=timezone.now(),
                 )
             )
+            # Self-healing dedup: when a member is accepted, teach the
+            # import pipeline that the member's code (and EAN if any)
+            # should resolve to the GROUP'S PRIMARY product going
+            # forward. Next time an NF item arrives with that code,
+            # ``_resolve_produto`` will hit the alias and skip
+            # creating a new ProductService row. Idempotent via
+            # get_or_create on (company, kind, alias_identifier).
+            primary = membership.group.primary_product
+            member = membership.product_service
+            if primary is not None and member is not None and primary.id != member.id:
+                if member.code:
+                    ProductServiceAlias.objects.get_or_create(
+                        company=membership.company,
+                        kind=ProductServiceAlias.KIND_CODE,
+                        alias_identifier=str(member.code).strip()[:80],
+                        defaults={
+                            'product_service': primary,
+                            'review_status': ProductServiceAlias.REVIEW_ACCEPTED,
+                            'source': ProductServiceAlias.SOURCE_NF_ITEM,
+                            'confidence': Decimal('1.0'),
+                            'hit_count': 1,
+                            'evidence': [{
+                                'method': 'auto_from_membership_accept',
+                                'source_id': membership.id,
+                                'at': timezone.now().isoformat(),
+                            }],
+                            'reviewed_at': timezone.now(),
+                            'reviewed_by': membership.reviewed_by,
+                        },
+                    )
         membership.refresh_from_db()
         return Response(ProductServiceGroupMembershipSerializer(membership).data)
 
