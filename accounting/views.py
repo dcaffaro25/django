@@ -1727,7 +1727,76 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         if self.action in ('list', 'unmatched'):
             return TransactionListSerializer
         return TransactionSerializer
-    
+
+    @action(detail=False, methods=['get'], url_path='status-summary')
+    def status_summary(self, request, tenant_id=None):
+        """Consolidated status / due-date / reconciliation overview
+        for transactions in a date window.
+
+        See ``accounting.services.tx_status_service.compute_tx_status``
+        for the row + aggregate shape.
+
+        Query params:
+          * ``date_from`` / ``date_to`` (default last 90d)
+          * ``entity`` — Transaction.entity_id filter
+          * ``cnpj`` — Transaction.cnpj exact match (digits-normalized)
+          * ``statuses`` — comma-separated chips
+            (``reconciled,partial,open,unposted,unbalanced,paid,upcoming,overdue``)
+            Returns rows that match at least one of these in their
+            ``status_chips``. Aggregates always cover the full window.
+          * ``limit`` (default 200, max 500). ``0`` returns aggregates
+            only with ``rows: []`` -- useful for dashboard headers.
+        """
+        from datetime import date as _date, timedelta
+        from accounting.services.tx_status_service import compute_tx_status
+
+        tenant = getattr(request, 'tenant', None)
+        if tenant is None or tenant == 'all':
+            return Response(
+                {"detail": "status-summary requer tenant explícito."},
+                status=400,
+            )
+        params = request.query_params
+
+        def _parse_date(name, default):
+            v = params.get(name)
+            if not v:
+                return default
+            try:
+                return _date.fromisoformat(v[:10])
+            except ValueError:
+                return default
+
+        today = _date.today()
+        date_from = _parse_date('date_from', today - timedelta(days=90))
+        date_to = _parse_date('date_to', today)
+
+        entity_id = None
+        if params.get('entity'):
+            try:
+                entity_id = int(params['entity'])
+            except (TypeError, ValueError):
+                pass
+
+        cnpj = params.get('cnpj') or None
+        statuses_raw = params.get('statuses') or ''
+        statuses = [s.strip() for s in statuses_raw.split(',') if s.strip()] or None
+
+        try:
+            limit = max(0, min(int(params.get('limit') or 200), 500))
+        except (TypeError, ValueError):
+            limit = 200
+
+        return Response(compute_tx_status(
+            tenant,
+            date_from=date_from,
+            date_to=date_to,
+            entity_id=entity_id,
+            cnpj=cnpj,
+            statuses=statuses,
+            limit=limit,
+        ))
+
     @action(detail=False, methods=['get'], url_path='unmatched')
     def unmatched(self, request, tenant_id=None):
         """
