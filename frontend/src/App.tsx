@@ -140,6 +140,12 @@ export default function App() {
                     <Route path="saude" element={<DataHealthPage />} />
                     <Route path="settings" element={<BillingSettingsPage />} />
                   </Route>
+                  {/* Operação meta-tools. Saúde dos Dados is cross-domain
+                      (covers accounting + billing + recon pipeline gaps),
+                      so it lives here rather than under /billing. The
+                      /billing/saude route above stays as an alias so any
+                      existing bookmarks / CTA URLs keep working. */}
+                  <Route path="/operacao/saude" element={<DataHealthPage />} />
                   <Route path="/hr/*" element={<PlaceholderPage title="RH" />} />
                   <Route path="/inventory/*" element={<PlaceholderPage title="Estoque" />} />
                   <Route path="/integrations/sandbox" element={<ApiSandboxPage />} />

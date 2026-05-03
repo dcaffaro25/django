@@ -688,6 +688,142 @@ def check_no_recent_nf_imports(company, *, fresh_days: int = 7) -> HealthCheckRe
 
 
 # ---------------------------------------------------------------------
+# Check 9: Stale (still-open) Reconciliation tasks
+# ---------------------------------------------------------------------
+def check_stale_reconciliations(
+    company, *, age_days: int = 14,
+) -> HealthCheckResult:
+    """``Reconciliation`` rows in a non-closed status that have been
+    sitting around longer than ``age_days``.
+
+    Closed = ``matched`` / ``approved``. Anything else (``pending``,
+    ``open``, ``review``, ``unmatched``) is the operator's queue. A
+    bunch of these getting old usually means: matches that need
+    manual attention but nobody is looking, or the workflow stalled
+    after suggestions were raised but never approved.
+    """
+    from accounting.models import Reconciliation
+
+    cutoff_dt = _date.today() - timedelta(days=age_days)
+    qs = Reconciliation.objects.filter(
+        company=company,
+        is_deleted=False,
+    ).exclude(status__in=("matched", "approved"))
+    qs = qs.filter(created_at__date__lt=cutoff_dt)
+
+    count = qs.count()
+    oldest = qs.aggregate(d=Min("created_at")).get("d")
+    oldest_at = oldest.date().isoformat() if oldest else None
+    oldest_days = (_date.today() - oldest.date()).days if oldest else None
+
+    sample = list(
+        qs.order_by("created_at", "id")
+        .values("id", "created_at", "status", "reference")[:5]
+    )
+    sample_payload = [
+        {
+            "id": s["id"],
+            "created_at": s["created_at"].date().isoformat() if s["created_at"] else None,
+            "status": s["status"],
+            "reference": (s["reference"] or "")[:60],
+        }
+        for s in sample
+    ]
+
+    severity = _severity_by_age(oldest_days) if count > 0 else SEVERITY_INFO
+
+    return HealthCheckResult(
+        key="stale_reconciliations",
+        title=f"Reconciliações abertas (> {age_days}d)",
+        severity=severity,
+        count=count,
+        oldest_at=oldest_at,
+        sample=sample_payload,
+        cta_label="Abrir bancada" if count > 0 else None,
+        cta_url="/recon/workbench" if count > 0 else None,
+        hint=(
+            "Reconciliations que NÃO estão em ``matched`` / ``approved`` "
+            "e foram criadas há mais de 14 dias. Indica fila parada de "
+            "candidatos do matcher esperando revisão."
+        ),
+        notes=(
+            "Status considerados abertos: pending / open / review / "
+            "unmatched. Soft-deletes excluídos."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------
+# Check 10: BP groups with primary pointing to inactive partner
+# ---------------------------------------------------------------------
+def check_bp_groups_inactive_primary(company) -> HealthCheckResult:
+    """``BusinessPartnerGroup`` rows whose ``primary_partner`` was
+    flagged inactive after the group was assembled.
+
+    The primary is the BP that represents the group across reports
+    and consolidations. If it's inactive (``is_active=False``), the
+    group is in a half-broken state: queries that join via active BPs
+    will silently drop the group's headline name. The fix is to
+    promote a different active member to primary, or reactivate the
+    primary.
+    """
+    from billing.models_groups import BusinessPartnerGroup
+
+    qs = BusinessPartnerGroup.objects.filter(
+        company=company,
+        is_active=True,
+        primary_partner__is_active=False,
+    ).select_related("primary_partner")
+
+    count = qs.count()
+    sample = list(
+        qs.order_by("name")[:5]
+        .values(
+            "id", "name",
+            "primary_partner_id", "primary_partner__name",
+            "primary_partner__identifier",
+        )
+    )
+    sample_payload = [
+        {
+            "id": s["id"],
+            "name": (s["name"] or "")[:60],
+            "primary_partner_id": s["primary_partner_id"],
+            "primary_partner_name": (s["primary_partner__name"] or "")[:60],
+            "primary_partner_identifier": s["primary_partner__identifier"],
+        }
+        for s in sample
+    ]
+
+    if count == 0:
+        severity = SEVERITY_INFO
+    elif count > 20:
+        severity = SEVERITY_DANGER
+    else:
+        severity = SEVERITY_WARNING
+
+    return HealthCheckResult(
+        key="bp_groups_inactive_primary",
+        title="Grupos com primário inativo",
+        severity=severity,
+        count=count,
+        sample=sample_payload,
+        cta_label="Abrir grupos" if count > 0 else None,
+        cta_url="/billing/grupos?primary_inactive=1" if count > 0 else None,
+        hint=(
+            "Grupos econômicos cujo BP primário foi desativado depois "
+            "do grupo ser criado. O primário aparece em todas as "
+            "consolidações por ele -- se está inativo, o nome some."
+        ),
+        notes=(
+            "Conserto: promover outro membro ativo a primário, ou "
+            "reativar o BP atual. O grupo continua tecnicamente "
+            "funcional até lá, só com o nome 'errado' nas listagens."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------
 # Registry + driver
 # ---------------------------------------------------------------------
 ALL_CHECKS: List[Callable[..., HealthCheckResult]] = [
@@ -696,9 +832,11 @@ ALL_CHECKS: List[Callable[..., HealthCheckResult]] = [
     check_stale_invoice_status,
     check_unmatched_nfs,
     check_stale_bank_transactions,
+    check_stale_reconciliations,
     check_pending_suggestions,
     check_no_recent_nf_imports,
     check_orphan_product_services,
+    check_bp_groups_inactive_primary,
 ]
 
 

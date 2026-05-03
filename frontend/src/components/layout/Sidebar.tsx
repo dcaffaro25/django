@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next"
 import {
   LayoutDashboard, FileBarChart, FileCog, CreditCard, Users, Boxes,
   Settings, ChevronLeft, PanelLeftOpen, Zap, UploadCloud, Wallet,
+  Activity,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/stores/app-store"
@@ -51,6 +52,10 @@ const GROUPS: NavGroup[] = [
       { key: "reconciliation", label: "Conciliação", path: "/recon", icon: LayoutDashboard },
       { key: "accounting", label: "Contabilidade", path: "/accounting/accounts", icon: Wallet },
       { key: "reports", label: "Demonstrativos", path: "/reports", icon: FileBarChart },
+      // Cross-domain "what's broken in our pipelines" dashboard. Lives
+      // under /operacao/saude (top-level), with /billing/saude kept as
+      // a bookmark-compatible alias.
+      { key: "data_health", label: "Saúde dos Dados", path: "/operacao/saude", icon: Activity },
       { key: "imports", label: "Importações", path: "/imports", icon: UploadCloud, requiresWrite: true },
     ],
   },
