@@ -188,6 +188,7 @@ INSTALLED_APPS = [
     'knowledge_base',   # NotebookLM-like document Q&A with Gemini File Search
     'erp_integrations', # ERP integration pipeline (Omie, etc.)
     'api_meta',         # Introspection / Meta-API for OpenClaw agent
+    'mcp_server',       # Stdio MCP server exposing read-only tools (run via mgmt cmd)
 ]
 
 MIDDLEWARE = [
@@ -560,3 +561,21 @@ if not DEBUG:
 # Rate limiting for the OpenClaw token (advisory — enforce via reverse proxy
 # or django-ratelimit in production).
 OPENCLAW_RATE_LIMIT = os.getenv("OPENCLAW_RATE_LIMIT", "600/hour")  # 10 req/min
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation Agent thresholds
+# ---------------------------------------------------------------------------
+# Read by ``accounting/services/reconciliation_agent_service.py``. Each can be
+# overridden per-call (mgmt command flags). Tuned conservatively so v1 only
+# auto-accepts the no-regret cohort; raise after observing the false-positive
+# rate over a populated set of decisions.
+RECONCILIATION_AGENT_AUTO_ACCEPT_THRESHOLD = os.getenv(
+    "RECONCILIATION_AGENT_AUTO_ACCEPT_THRESHOLD", "0.95"
+)
+RECONCILIATION_AGENT_AMBIGUITY_GAP = os.getenv(
+    "RECONCILIATION_AGENT_AMBIGUITY_GAP", "0.10"
+)
+RECONCILIATION_AGENT_MIN_CONFIDENCE = os.getenv(
+    "RECONCILIATION_AGENT_MIN_CONFIDENCE", "0.50"
+)

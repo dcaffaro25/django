@@ -1533,3 +1533,136 @@ class ReconciliationRule(TenantAwareBaseModel):
 
     def __str__(self):
         return f"ReconciliationRule(id={self.id}, {self.name}, type={self.rule_type}, status={self.status})"
+
+
+class ReconciliationAgentRun(TenantAwareBaseModel):
+    """Audit row for one execution of the reconciliation agent.
+
+    The agent is the autonomous companion to the manual reconciliation flow:
+    it iterates over unreconciled ``BankTransaction`` rows, calls
+    ``BankTransactionSuggestionService``, and either auto-accepts a high-
+    confidence match or flags ambiguity for a human. Every run gets a row
+    here; per-bank-tx outcomes go in :class:`ReconciliationAgentDecision`.
+    """
+
+    STATUS_CHOICES = [
+        ("running", "Running"),
+        ("completed", "Completed"),
+        ("failed", "Failed"),
+    ]
+
+    started_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(
+        max_length=16, choices=STATUS_CHOICES, default="running", db_index=True
+    )
+
+    # Knobs that produced this run, captured for replay/audit
+    auto_accept_threshold = models.DecimalField(max_digits=5, decimal_places=4)
+    ambiguity_gap = models.DecimalField(max_digits=5, decimal_places=4)
+    min_confidence = models.DecimalField(max_digits=5, decimal_places=4)
+    dry_run = models.BooleanField(default=False)
+
+    # Scope filters (optional)
+    bank_account_id = models.IntegerField(null=True, blank=True)
+    date_from = models.DateField(null=True, blank=True)
+    date_to = models.DateField(null=True, blank=True)
+    bank_tx_limit = models.IntegerField(null=True, blank=True)
+
+    # Triggered_by: management command / celery / api. Free-text on purpose
+    # — the agent isn't restricted to one entry point.
+    triggered_by = models.CharField(max_length=64, blank=True, default="")
+    triggered_by_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="reconciliation_agent_runs",
+    )
+
+    # Aggregate counters (populated as decisions are recorded)
+    n_candidates = models.IntegerField(default=0)
+    n_auto_accepted = models.IntegerField(default=0)
+    n_ambiguous = models.IntegerField(default=0)
+    n_no_match = models.IntegerField(default=0)
+    n_errors = models.IntegerField(default=0)
+
+    error_message = models.TextField(blank=True, default="")
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["company", "-started_at"]),
+            models.Index(fields=["company", "status"]),
+        ]
+
+    def __str__(self):
+        return (
+            f"ReconciliationAgentRun(id={self.id}, company={self.company_id}, "
+            f"status={self.status}, "
+            f"auto={self.n_auto_accepted}/amb={self.n_ambiguous}/none={self.n_no_match})"
+        )
+
+
+class ReconciliationAgentDecision(TenantAwareBaseModel):
+    """One decision the agent took for one BankTransaction in a run.
+
+    Even when no action is taken (e.g. ``no_match``), we still write a row so
+    the operator can audit *why* a transaction was left untouched.
+    """
+
+    OUTCOME_CHOICES = [
+        ("auto_accepted", "Auto-accepted match"),
+        ("ambiguous", "Ambiguous — human review needed"),
+        ("no_match", "No suggestion above min_confidence"),
+        ("not_applicable", "Top suggestion not auto-acceptable (e.g. unbalanced)"),
+        ("error", "Tool/service error"),
+    ]
+
+    run = models.ForeignKey(
+        ReconciliationAgentRun,
+        related_name="decisions",
+        on_delete=models.CASCADE,
+    )
+    bank_transaction = models.ForeignKey(
+        "BankTransaction",
+        related_name="agent_decisions",
+        on_delete=models.CASCADE,
+    )
+    outcome = models.CharField(
+        max_length=24, choices=OUTCOME_CHOICES, db_index=True
+    )
+
+    # Best-suggestion snapshot for audit. Stored even on auto-accept so a
+    # later policy change can be replayed.
+    top_confidence = models.DecimalField(
+        max_digits=6, decimal_places=4, null=True, blank=True
+    )
+    second_confidence = models.DecimalField(
+        max_digits=6, decimal_places=4, null=True, blank=True
+    )
+    suggestion_payload = models.JSONField(default=dict, blank=True)
+
+    # Set on auto_accepted only.
+    reconciliation = models.ForeignKey(
+        "Reconciliation",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="agent_decisions",
+    )
+
+    error_message = models.TextField(blank=True, default="")
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["company", "outcome"]),
+            models.Index(fields=["run", "outcome"]),
+            models.Index(fields=["bank_transaction"]),
+        ]
+
+    def __str__(self):
+        return (
+            f"AgentDecision(id={self.id}, run={self.run_id}, "
+            f"bank_tx={self.bank_transaction_id}, outcome={self.outcome})"
+        )
+
