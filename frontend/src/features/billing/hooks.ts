@@ -158,6 +158,18 @@ export function useAuditCritics() {
   })
 }
 
+export function useHealthChecks() {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["billing", sub, "health-checks"],
+    queryFn: () => billingApi.healthChecks(),
+    enabled: !!sub,
+    // Re-fetch every 5 minutes so a dashboard left open catches new
+    // gaps as data flows in. Cheap query (3 small DB reads).
+    refetchInterval: 5 * 60 * 1000,
+  })
+}
+
 export function useDsoReport(
   params?: Parameters<typeof billingApi.dsoReport>[0],
 ) {

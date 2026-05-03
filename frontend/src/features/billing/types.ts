@@ -568,6 +568,36 @@ export interface DsoReportResponse {
   notes: string
 }
 
+/**
+ * Operations / data-health dashboard payload returned by
+ * ``GET /api/operacao/health-checks/``.
+ */
+export type HealthCheckSeverity = "info" | "warning" | "danger"
+
+export interface HealthCheck {
+  key: string
+  title: string
+  severity: HealthCheckSeverity
+  count: number
+  amount: string | null
+  oldest_at: string | null
+  sample: Array<Record<string, unknown>>
+  cta_label: string | null
+  cta_action: string | null
+  cta_url: string | null
+  hint: string
+  notes: string
+}
+
+export interface HealthChecksResponse {
+  as_of: string
+  tenant_subdomain: string
+  tenant_name: string
+  checks: HealthCheck[]
+  by_severity: Record<HealthCheckSeverity, number>
+  n_checks: number
+}
+
 export interface ConsolidatedBPRow {
   kind: "group" | "standalone"
   primary: BusinessPartner

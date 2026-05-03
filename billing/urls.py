@@ -18,6 +18,7 @@ from .views import (
     ProductServiceGroupViewSet,
     ProductServiceGroupMembershipViewSet,
     ProductServiceAliasViewSet,
+    HealthChecksView,
 )
 from .views_nfe import (
     NFeImportView,
@@ -52,5 +53,6 @@ router.register('product-service-aliases', ProductServiceAliasViewSet)
 urlpatterns = [
     re_path(r'api/nfe/import/?$', NFeImportView.as_view(), name='nfe-import'),
     re_path(r'api/nfe/eventos/import/?$', NFeImportView.as_view(), name='nfe-eventos-import'),  # alias: mesmo endpoint
+    re_path(r'api/operacao/health-checks/?$', HealthChecksView.as_view(), name='operacao-health-checks'),
     re_path(r'api/', include(router.urls)),
 ]

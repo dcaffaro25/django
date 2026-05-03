@@ -11,6 +11,7 @@ import type {
   CriticAuditResponse,
   CriticsResponse,
   DsoReportResponse,
+  HealthChecksResponse,
   Invoice,
   InvoiceDetail,
   InvoiceNFLink,
@@ -81,6 +82,11 @@ export const billingApi = {
     persist?: boolean;
   }): Promise<CriticAuditResponse> =>
     api.tenant.post<CriticAuditResponse>(`/api/invoices/audit-critics/`, body ?? {}),
+
+  // Operations / data-health dashboard. Runs the registered
+  // pipeline-gap checks and returns one row per check.
+  healthChecks: (): Promise<HealthChecksResponse> =>
+    api.tenant.get<HealthChecksResponse>(`/api/operacao/health-checks/`),
 
   // DSO + aging + per-partner + payment-evidence report.
   dsoReport: (params?: {

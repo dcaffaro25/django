@@ -1637,3 +1637,38 @@ class ProductServiceAliasViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         alias.reviewed_at = timezone.now()
         alias.save()
         return Response(ProductServiceAliasSerializer(alias).data)
+
+# =====================================================================
+# Operations / Data-health dashboard endpoint.
+# =====================================================================
+
+from rest_framework.views import APIView
+from rest_framework.permissions import IsAuthenticated
+
+
+class HealthChecksView(APIView):
+    """``GET /api/operacao/health-checks/`` — runs the registered
+    pipeline-gap checks for the active tenant and returns the
+    aggregated payload.
+
+    Read-only and side-effect free: each check inspects its slice of
+    the data and returns count + sample + suggested CTA. The dashboard
+    page calls this on every load + manual refresh; checks are
+    independently try/excepted so one bad check doesn't blank the
+    page.
+
+    See ``billing.services.health_check_service`` for the per-check
+    implementations and how to register a new one.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, tenant_id=None):
+        from billing.services.health_check_service import run_health_checks
+
+        tenant = getattr(request, 'tenant', None)
+        if tenant is None or tenant == 'all':
+            return Response(
+                {'detail': 'health-checks requer tenant explícito.'},
+                status=400,
+            )
+        return Response(run_health_checks(tenant))

@@ -1,10 +1,10 @@
 import { Outlet } from "react-router-dom"
 import {
   FileText, Receipt, Link as LinkIcon, Settings as SettingsIcon,
-  Users, Package, Network, Clock,
+  Users, Package, Network, Clock, Activity,
 } from "lucide-react"
 import { TabbedShell } from "@/components/layout/TabbedShell"
-import { useGroupMemberships, useNfTxLinks } from "@/features/billing"
+import { useGroupMemberships, useHealthChecks, useNfTxLinks } from "@/features/billing"
 
 /**
  * Hub page for the Faturamento module.
@@ -25,6 +25,12 @@ export function BillingHubPage() {
   // Same idea for the Grupos tab — surface pending suggestions count.
   const groupSuggestions = useGroupMemberships({ review_status: "suggested" })
   const groupSuggestionCount = groupSuggestions.data?.length ?? 0
+  // Saúde tab badge: total of warning + danger checks. Operators see
+  // the count without opening the page; the page itself ranks them.
+  const health = useHealthChecks()
+  const healthBadge =
+    (health.data?.by_severity.danger ?? 0) +
+    (health.data?.by_severity.warning ?? 0)
 
   return (
     <TabbedShell
@@ -48,6 +54,12 @@ export function BillingHubPage() {
           badge: groupSuggestionCount > 0 ? groupSuggestionCount : null,
         },
         { to: "/billing/dso", label: "DSO", icon: Clock },
+        {
+          to: "/billing/saude",
+          label: "Saúde",
+          icon: Activity,
+          badge: healthBadge > 0 ? healthBadge : null,
+        },
         { to: "/billing/settings", label: "Configurações", icon: SettingsIcon },
       ]}
     >
