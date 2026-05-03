@@ -310,12 +310,382 @@ def check_unmatched_nfs(
 
 
 # ---------------------------------------------------------------------
+# Check 4: Unbalanced transactions
+# ---------------------------------------------------------------------
+def check_unbalanced_transactions(company) -> HealthCheckResult:
+    """Tx where ``is_balanced=False``. Means debit ≠ credit on the
+    JE rows -- a data integrity issue (the GL won't balance unless
+    every Tx balances). Often surfaces import bugs or partial
+    JE entry."""
+    from accounting.models import Transaction
+
+    qs = Transaction.objects.filter(
+        company=company,
+        is_balanced=False,
+    ).exclude(state="canceled")
+    count = qs.count()
+    oldest = qs.aggregate(d=Min("date")).get("d")
+    today = _date.today()
+    oldest_days = (today - oldest).days if oldest else None
+
+    sample = list(
+        qs.order_by("date", "id")
+        .values("id", "date", "amount", "description", "total_amount_discrepancy")[:5]
+    )
+    sample_payload = [
+        {
+            "id": s["id"],
+            "date": s["date"].isoformat() if s["date"] else None,
+            "amount": str(s["amount"]) if s["amount"] is not None else None,
+            "discrepancy": str(s.get("total_amount_discrepancy") or 0),
+            "description": (s["description"] or "")[:60],
+        }
+        for s in sample
+    ]
+
+    if count == 0:
+        severity = SEVERITY_INFO
+    elif (oldest_days or 0) >= 60 or count > 100:
+        severity = SEVERITY_DANGER
+    else:
+        severity = SEVERITY_WARNING
+
+    return HealthCheckResult(
+        key="unbalanced_transactions",
+        title="Transações desbalanceadas",
+        severity=severity,
+        count=count,
+        oldest_at=oldest.isoformat() if oldest else None,
+        sample=sample_payload,
+        cta_label="Investigar" if count > 0 else None,
+        cta_url="/accounting/transactions?is_balanced=false" if count > 0 else None,
+        hint=(
+            "Transações com soma de débitos diferente da soma de créditos. "
+            "Indica entrada parcial de JEs (importação travada, edição "
+            "manual incompleta) ou bug de pipeline."
+        ),
+        notes=(
+            "O razão NÃO fecha enquanto houver Tx desbalanceada. Resolver "
+            "manualmente caso a caso ou via importação corretiva."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------
+# Check 5: Pending suggestions across the four review queues
+# ---------------------------------------------------------------------
+def check_pending_suggestions(company) -> HealthCheckResult:
+    """Cross-domain suggestion-queue total: NF↔Tx links, BP groups,
+    product groups, BP aliases, product aliases. A reminder that the
+    review queues need attention; severity scales with total count
+    so a small backlog is info, a large one is warning."""
+    from billing.models import (
+        BusinessPartnerAlias, BusinessPartnerGroupMembership,
+        NFTransactionLink, ProductServiceAlias,
+        ProductServiceGroupMembership,
+    )
+
+    counts = {
+        "nf_tx_links": NFTransactionLink.objects.filter(
+            company=company, review_status="suggested",
+        ).count(),
+        "bp_group_memberships": BusinessPartnerGroupMembership.objects.filter(
+            company=company, review_status="suggested",
+        ).count(),
+        "ps_group_memberships": ProductServiceGroupMembership.objects.filter(
+            company=company, review_status="suggested",
+        ).count(),
+        "bp_aliases": BusinessPartnerAlias.objects.filter(
+            company=company, review_status="suggested",
+        ).count(),
+        "ps_aliases": ProductServiceAlias.objects.filter(
+            company=company, review_status="suggested",
+        ).count(),
+    }
+    total = sum(counts.values())
+
+    sample_payload = [
+        {"queue": q, "count": c}
+        for q, c in counts.items() if c > 0
+    ]
+
+    if total == 0:
+        severity = SEVERITY_INFO
+    elif total > 500:
+        severity = SEVERITY_DANGER
+    elif total > 50:
+        severity = SEVERITY_WARNING
+    else:
+        severity = SEVERITY_INFO
+
+    # Pick the largest queue's deep-link as the primary CTA.
+    cta_url = None
+    cta_label = None
+    if total > 0:
+        biggest = max(counts.items(), key=lambda kv: kv[1])[0]
+        if biggest == "nf_tx_links":
+            cta_url = "/billing/links?tab=suggested"
+        elif biggest in ("bp_group_memberships", "bp_aliases"):
+            cta_url = "/billing/grupos"
+        elif biggest == "ps_group_memberships":
+            cta_url = "/billing/grupos"  # same hub, Produtos tab
+        elif biggest == "ps_aliases":
+            cta_url = "/billing/grupos"
+        cta_label = "Revisar maior fila"
+
+    return HealthCheckResult(
+        key="pending_suggestions",
+        title="Sugestões pendentes (todas as filas)",
+        severity=severity,
+        count=total,
+        sample=sample_payload,
+        cta_label=cta_label,
+        cta_url=cta_url,
+        hint=(
+            "Soma dos itens em ``review_status=suggested`` em todas as "
+            "filas curadas pelo operador (NF↔Tx, grupos de parceiros, "
+            "grupos de produtos, apelidos)."
+        ),
+        notes=(
+            "O detalhamento por fila aparece em ``sample``. Filas grandes "
+            "podem indicar que a auto-promoção está conservadora demais "
+            "ou que o operador não está revisando."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------
+# Check 6: Stale bank transactions (unreconciled > 30 days)
+# ---------------------------------------------------------------------
+def check_stale_bank_transactions(
+    company, *, age_days: int = 30,
+) -> HealthCheckResult:
+    """Bank transactions older than ``age_days`` not part of any
+    closed (matched / approved) Reconciliation. Either the matcher
+    hasn't found a counterpart or the operator hasn't approved the
+    suggestion."""
+    from accounting.models import BankTransaction, Reconciliation
+
+    cutoff = _date.today() - timedelta(days=age_days)
+    closed_recon_bt_ids = (
+        Reconciliation.objects
+        .filter(
+            company=company,
+            status__in=("matched", "approved"),
+            is_deleted=False,
+        )
+        .values_list("bank_transactions__id", flat=True)
+    )
+    qs = BankTransaction.objects.filter(
+        company=company,
+        is_deleted=False,
+        date__lt=cutoff,
+    ).exclude(id__in=list(set(closed_recon_bt_ids)))
+
+    count = qs.count()
+    oldest = qs.aggregate(d=Min("date")).get("d")
+    oldest_at = oldest.isoformat() if oldest else None
+    oldest_days = (_date.today() - oldest).days if oldest else None
+
+    sample = list(
+        qs.order_by("date", "id")
+        .values("id", "date", "amount", "description")[:5]
+    )
+    sample_payload = [
+        {
+            "id": s["id"],
+            "date": s["date"].isoformat() if s["date"] else None,
+            "amount": str(s["amount"]) if s["amount"] is not None else None,
+            "description": (s["description"] or "")[:60],
+        }
+        for s in sample
+    ]
+
+    severity = _severity_by_age(oldest_days) if count > 0 else SEVERITY_INFO
+
+    return HealthCheckResult(
+        key="stale_bank_transactions",
+        title=f"Bancárias não conciliadas (> {age_days}d)",
+        severity=severity,
+        count=count,
+        oldest_at=oldest_at,
+        sample=sample_payload,
+        cta_label="Abrir bancada" if count > 0 else None,
+        cta_url="/recon/workbench" if count > 0 else None,
+        hint=(
+            "BankTransactions com mais de 30 dias sem fazer parte de "
+            "uma Reconciliation matched/approved. Indica acúmulo na fila "
+            "do conciliador ou caixa que não está sendo casado com livro."
+        ),
+        notes=(
+            "Soft-deletes excluídos. Use a Bancada (``/recon/workbench``) "
+            "para revisar os candidatos do matcher e aceitar / rejeitar."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------
+# Check 7: Orphan ProductService rows
+# ---------------------------------------------------------------------
+def check_orphan_product_services(
+    company, *, age_days: int = 90,
+) -> HealthCheckResult:
+    """``ProductService`` rows with ``is_active=True`` that haven't
+    been referenced by any ``NotaFiscalItem`` in the last ``age_days``.
+    Cleanup hint, not an integrity issue: catalog rot accumulates as
+    SKUs go end-of-life but the active flag never flips.
+
+    Guard: if the tenant has zero NFs in the window at all, the
+    "0 references" finding is meaningless — surface that as info+0
+    rather than tagging every active product as orphan. The
+    ``check_no_recent_nf_imports`` check covers the import-stalled
+    case directly.
+    """
+    from billing.models import ProductService
+    from billing.models_nfe import NotaFiscal, NotaFiscalItem
+
+    cutoff = _date.today() - timedelta(days=age_days)
+    has_recent_nfs = NotaFiscal.objects.filter(
+        company=company,
+        data_emissao__date__gte=cutoff,
+    ).exists()
+    if not has_recent_nfs:
+        return HealthCheckResult(
+            key="orphan_product_services",
+            title=f"Produtos sem movimentação ({age_days}d)",
+            severity=SEVERITY_INFO,
+            count=0,
+            hint=(
+                "Sem NFs nos últimos 90 dias para basear a checagem. "
+                "Veja ``no_recent_nf_imports`` para o pipeline de "
+                "importação."
+            ),
+            notes="",
+        )
+    referenced_ids = (
+        NotaFiscalItem.objects
+        .filter(
+            company=company,
+            nota_fiscal__data_emissao__date__gte=cutoff,
+        )
+        .values_list("produto_id", flat=True)
+        .distinct()
+    )
+    qs = ProductService.objects.filter(
+        company=company, is_active=True,
+    ).exclude(id__in=list(set(filter(None, referenced_ids))))
+
+    count = qs.count()
+    sample = list(
+        qs.order_by("name")[:5].values("id", "code", "name", "item_type")
+    )
+    sample_payload = [
+        {
+            "id": s["id"],
+            "code": s["code"],
+            "name": (s["name"] or "")[:60],
+            "type": s["item_type"],
+        }
+        for s in sample
+    ]
+
+    # Always informational -- this is cleanup, not an integrity issue.
+    severity = SEVERITY_INFO
+    if count > 200:
+        severity = SEVERITY_WARNING
+
+    return HealthCheckResult(
+        key="orphan_product_services",
+        title=f"Produtos sem movimentação ({age_days}d)",
+        severity=severity,
+        count=count,
+        sample=sample_payload,
+        cta_label="Listar produtos" if count > 0 else None,
+        cta_url="/billing/produtos?is_active=true" if count > 0 else None,
+        hint=(
+            "Produtos / serviços ativos que não aparecem em nenhum item "
+            "de NF nos últimos 90 dias. Considere desativar para reduzir "
+            "ruído no catálogo."
+        ),
+        notes=(
+            "Não é integridade -- só housekeeping. Produtos de catálogo "
+            "sazonal ou que ainda não tiveram primeira venda também caem "
+            "aqui. Revise antes de desativar em massa."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------
+# Check 8: Latest NF import age
+# ---------------------------------------------------------------------
+def check_no_recent_nf_imports(company, *, fresh_days: int = 7) -> HealthCheckResult:
+    """How long since the most recent NF was imported?
+
+    Tenants on a live SEFAZ feed expect a few NFs / day. A gap of
+    >7 days is a good early warning that the import pipeline (XML
+    drop folder, SEFAZ poll, partner integration) is stuck.
+    """
+    from billing.models import NotaFiscal
+    from django.db.models import Max
+
+    latest = (
+        NotaFiscal.objects
+        .filter(company=company)
+        .aggregate(d=Max("data_emissao")).get("d")
+    )
+    if latest is None:
+        return HealthCheckResult(
+            key="no_recent_nf_imports",
+            title="Importação de NF",
+            severity=SEVERITY_INFO,
+            count=0,
+            hint="Nenhuma NF importada ainda neste tenant.",
+        )
+
+    today = _date.today()
+    days_since = (today - latest.date()).days
+
+    if days_since <= fresh_days:
+        severity = SEVERITY_INFO
+    elif days_since <= 30:
+        severity = SEVERITY_WARNING
+    else:
+        severity = SEVERITY_DANGER
+
+    return HealthCheckResult(
+        key="no_recent_nf_imports",
+        title="Importação de NF",
+        severity=severity,
+        # ``count`` is days-since here -- the dashboard renders it as
+        # the headline metric and the title carries the meaning.
+        count=days_since,
+        oldest_at=latest.date().isoformat(),
+        hint=(
+            f"Última NF importada há {days_since} dias. Se o pipeline "
+            "está vivo, isto deveria ser ≤ alguns dias."
+        ),
+        cta_label="Abrir importações" if severity != SEVERITY_INFO else None,
+        cta_url="/imports" if severity != SEVERITY_INFO else None,
+        notes=(
+            "Use a aba Importações para ver tarefas em fila ou erros. "
+            "Em test/staging tenants este check pode ficar vermelho "
+            "permanentemente; ignore conforme o caso."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------
 # Registry + driver
 # ---------------------------------------------------------------------
 ALL_CHECKS: List[Callable[..., HealthCheckResult]] = [
     check_unposted_transactions,
+    check_unbalanced_transactions,
     check_stale_invoice_status,
     check_unmatched_nfs,
+    check_stale_bank_transactions,
+    check_pending_suggestions,
+    check_no_recent_nf_imports,
+    check_orphan_product_services,
 ]
 
 
