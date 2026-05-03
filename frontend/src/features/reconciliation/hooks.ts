@@ -789,6 +789,22 @@ export function useTransactionAction() {
   })
 }
 
+export function useBulkPostBalancedTransactions() {
+  const sub = useSub()
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (body?: Parameters<typeof reconApi.bulkPostBalancedTransactions>[0]) =>
+      reconApi.bulkPostBalancedTransactions(body),
+    onSuccess: (_res, vars) => {
+      const dry = vars?.dry_run ?? true
+      if (!dry) {
+        qc.invalidateQueries({ queryKey: ["recon", sub, "transactions"] })
+        qc.invalidateQueries({ queryKey: ["billing", sub, "health-checks"] })
+      }
+    },
+  })
+}
+
 // ---- Journal Entries CRUD ----
 export function useSaveJournalEntry() {
   const sub = useSub()

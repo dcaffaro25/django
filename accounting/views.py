@@ -1728,6 +1728,45 @@ class TransactionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
             return TransactionListSerializer
         return TransactionSerializer
 
+    @action(detail=False, methods=['post'], url_path='bulk-post-balanced')
+    def bulk_post_balanced(self, request, tenant_id=None):
+        """Promote every balanced + pending Tx in this tenant to
+        ``state='posted'``.
+
+        Body:
+          ``{ "dry_run": bool, "limit": int }``
+
+        Mirrors the ``post_balanced_transactions`` mgmt command; the
+        UI button on /accounting/transactions hits this endpoint
+        with a dry-run preview → confirm → real-run flow.
+
+        Returns the same counter dict the service emits, including
+        a ``samples`` array for the operator's confirmation modal.
+        """
+        from accounting.services.transaction_service import (
+            bulk_post_balanced_transactions,
+        )
+
+        tenant = getattr(request, 'tenant', None)
+        if tenant is None or tenant == 'all':
+            return Response(
+                {'detail': 'Operação requer tenant explícito.'},
+                status=400,
+            )
+        body = request.data or {}
+        dry_run = bool(body.get('dry_run', True))
+        try:
+            limit = int(body.get('limit') or 0)
+        except (TypeError, ValueError):
+            limit = 0
+
+        result = bulk_post_balanced_transactions(
+            tenant,
+            dry_run=dry_run,
+            limit=max(0, limit),
+        )
+        return Response(result)
+
     @action(detail=False, methods=['get'], url_path='status-summary')
     def status_summary(self, request, tenant_id=None):
         """Consolidated status / due-date / reconciliation overview

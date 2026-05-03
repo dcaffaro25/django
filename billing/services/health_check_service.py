@@ -97,11 +97,13 @@ def _severity_by_age(oldest_days: Optional[int]) -> str:
 # Check 1: Unposted transactions
 # ---------------------------------------------------------------------
 def check_unposted_transactions(company) -> HealthCheckResult:
-    """Tx with ``is_posted=False`` AND ``state != 'posted'``.
+    """Tx with ``state='pending'`` (not yet posted to the GL).
 
-    On Evolat this is currently 100% of the catalog (5,845 / 5,845)
-    -- a smoking gun that the posting pipeline is dormant or never
-    flipped. Either way, the operator should know.
+    Splits the headline count by ``is_balanced`` so the operator can
+    see what's mechanically postable right now (balanced) vs what
+    needs data fixing first (unbalanced — handled by a separate
+    check). The CTA deep-links to the bulk-post UI we ship alongside
+    the recent backfill pattern.
     """
     from accounting.models import Transaction
 
@@ -109,19 +111,22 @@ def check_unposted_transactions(company) -> HealthCheckResult:
         company=company,
     ).filter(Q(is_posted=False) & ~Q(state="posted"))
     count = qs.count()
+    n_balanced = qs.filter(is_balanced=True).count()
+    n_unbalanced = count - n_balanced
     oldest = qs.aggregate(d=Min("date")).get("d")
     today = _date.today()
     oldest_days = (today - oldest).days if oldest else None
 
     sample = list(
         qs.order_by("date", "id")
-        .values("id", "date", "amount", "description")[:5]
+        .values("id", "date", "amount", "description", "is_balanced")[:5]
     )
     sample_payload = [
         {
             "id": s["id"],
             "date": s["date"].isoformat() if s["date"] else None,
             "amount": str(s["amount"]) if s["amount"] is not None else None,
+            "balanced": bool(s.get("is_balanced")),
             "description": (s["description"] or "")[:80],
         }
         for s in sample
@@ -129,10 +134,15 @@ def check_unposted_transactions(company) -> HealthCheckResult:
 
     severity = SEVERITY_INFO if count == 0 else _severity_by_age(oldest_days)
     if count > 0 and severity == SEVERITY_INFO:
-        # Even fresh unposted Txs deserve a warning if there are any --
-        # the question is whether *posting* is wired at all on this
-        # tenant. ``danger`` is reserved for >60-day staleness.
         severity = SEVERITY_WARNING
+
+    cta_label = None
+    cta_url = None
+    if n_balanced > 0:
+        cta_label = f"Postar {n_balanced} balanceadas"
+        # The Transactions page hosts the confirm modal; deep-link
+        # there with a hash flag the page picks up to auto-open it.
+        cta_url = "/accounting/transactions#bulk-post"
 
     return HealthCheckResult(
         key="unposted_transactions",
@@ -141,17 +151,20 @@ def check_unposted_transactions(company) -> HealthCheckResult:
         count=count,
         oldest_at=oldest.isoformat() if oldest else None,
         sample=sample_payload,
-        cta_label="Investigar" if count > 0 else None,
-        cta_url="/accounting/transactions?state=pending" if count > 0 else None,
+        cta_label=cta_label,
+        cta_url=cta_url,
         hint=(
-            "Transações com ``is_posted=False`` ainda não foram lançadas no "
-            "razão. Em tenants com posting automático, isto deve ser zero "
-            "ou estar próximo de zero."
+            f"Transações com ``state='pending'``. {n_balanced} estão "
+            f"balanceadas (postáveis agora) e {n_unbalanced} desbalanceadas "
+            f"(precisam ser corrigidas antes — veja o card de "
+            f"desbalanceadas)."
         ),
         notes=(
-            "Pendentes (``state=pending``) podem ser intencionais até o "
-            "fechamento do período. Se o pipeline de posting está "
-            "configurado, conte e idade > 30d indicam stall."
+            "O pipeline de posting per-Tx existe (``post_transaction``) "
+            "mas não tem trigger automático no codebase atual. Use o "
+            "botão ``Postar balanceadas`` na página Transações para "
+            "rodar o backfill em massa, ou rode "
+            "``manage.py post_balanced_transactions --tenant <sub>``."
         ),
     )
 

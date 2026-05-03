@@ -5,7 +5,11 @@ import { Drawer } from "vaul"
 import {
   Plus, Trash2, Save, X, Receipt, Copy, Search, Filter, RotateCcw,
   CheckCircle2, PlayCircle, XCircle, ChevronRight, ChevronDown, Loader2, RefreshCw,
+  CheckSquare,
 } from "lucide-react"
+import {
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+} from "@/components/ui/dialog"
 import { SectionHeader } from "@/components/ui/section-header"
 import { ColumnMenu } from "@/components/ui/column-menu"
 import { DownloadXlsxButton } from "@/components/ui/download-xlsx-button"
@@ -17,6 +21,7 @@ import { useColumnVisibility, type ColumnDef } from "@/stores/column-visibility"
 import { useSortable } from "@/lib/use-sortable"
 import { useRowSelection } from "@/lib/use-row-selection"
 import {
+  useBulkPostBalancedTransactions,
   useCurrencies, useDeleteTransaction, useEntities, useSaveTransaction,
   useTransactionAction, useTransactionJournalEntries, useTransactions,
 } from "@/features/reconciliation"
@@ -48,6 +53,17 @@ export function TransactionsPage() {
   const [dateTo, setDateTo] = useState(isoDaysAgo(0))
   const [entityFilter, setEntityFilter] = useState<number | "">("")
   const [search, setSearch] = useState("")
+
+  // Bulk-post backfill modal state — same dry-run → confirm pattern as
+  // the invoice-status backfill (see InvoicesPage). Operator clicks
+  // "Postar balanceadas", we fire a dry-run to populate the preview,
+  // then a real run on confirm. Limit lets the operator throttle the
+  // first apply on large tenants (0 = unlimited).
+  type BulkPostPreview = Awaited<ReturnType<typeof reconApi.bulkPostBalancedTransactions>>
+  const [backfillOpen, setBackfillOpen] = useState(false)
+  const [backfillPreview, setBackfillPreview] = useState<BulkPostPreview | null>(null)
+  const [backfillLimit, setBackfillLimit] = useState<number>(0)
+  const bulkPost = useBulkPostBalancedTransactions()
 
   const { data: entities = [] } = useEntities()
   const { data: txs = [], isLoading, isFetching, refetch } = useTransactions({
@@ -121,6 +137,26 @@ export function TransactionsPage() {
 
   const selection = useRowSelection<number>()
   const sortedIds = sorted.map((r) => r.id)
+
+  // Auto-open the bulk-post modal when navigated with #bulk-post (the
+  // CTA on the Saúde dos Dados "Transações sem posting" check links
+  // here). One-shot: we strip the hash so a manual refresh doesn't
+  // re-trigger.
+  useEffect(() => {
+    if (typeof window === "undefined") return
+    if (window.location.hash !== "#bulk-post") return
+    void (async () => {
+      try {
+        const preview = await bulkPost.mutateAsync({ dry_run: true, limit: 0 })
+        setBackfillPreview(preview)
+        setBackfillOpen(true)
+        history.replaceState(null, "", window.location.pathname + window.location.search)
+      } catch (err: unknown) {
+        toast.error(err instanceof Error ? err.message : "Falha ao carregar prévia")
+      }
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
   const onBulkDelete = async () => {
     const ids = Array.from(selection.selected)
     if (!ids.length) return
@@ -168,6 +204,27 @@ export function TransactionsPage() {
               <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} />
               {t("actions.refresh", { ns: "common" })}
             </button>
+            {canWrite && (
+              <button
+                onClick={async () => {
+                  try {
+                    const preview = await bulkPost.mutateAsync({ dry_run: true, limit: 0 })
+                    setBackfillPreview(preview)
+                    setBackfillOpen(true)
+                  } catch (err: unknown) {
+                    toast.error(err instanceof Error ? err.message : "Falha ao carregar prévia")
+                  }
+                }}
+                disabled={bulkPost.isPending}
+                title="Postar transações em pending que já estão balanceadas"
+                className={cn(
+                  "inline-flex h-8 items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent",
+                  bulkPost.isPending && "opacity-60",
+                )}
+              >
+                <CheckSquare className="h-3.5 w-3.5" /> Postar balanceadas
+              </button>
+            )}
             {canWrite && (
               <button
                 onClick={() => setEditing("new")}
@@ -377,6 +434,135 @@ export function TransactionsPage() {
         transaction={editing === "new" ? null : editing}
         onClose={() => setEditing(null)}
       />
+
+      {/* Bulk-post confirmation modal — dry-run preview, then apply.
+          Mirrors the invoice-status backfill flow on InvoicesPage. */}
+      <Dialog open={backfillOpen} onOpenChange={(o) => { if (!o) setBackfillOpen(false) }}>
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle>Postar transações balanceadas</DialogTitle>
+            <DialogDescription>
+              Promove <strong>state=pending → posted</strong> em todas as
+              transações que já estão balanceadas (débitos = créditos).
+              Reversível por linha via "Despostar" ou no editor.
+            </DialogDescription>
+          </DialogHeader>
+
+          {backfillPreview ? (
+            <div className="space-y-3 text-sm">
+              <div className="rounded-md border border-border bg-muted/30 p-3">
+                <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
+                  Pré-visualização
+                </div>
+                <div className="mt-1 grid grid-cols-3 gap-3">
+                  <div>
+                    <div className="text-[10px] text-muted-foreground">Pending balanceadas</div>
+                    <div className="text-base font-medium tabular-nums">
+                      {backfillPreview.scanned_pending_balanced}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-muted-foreground">A postar</div>
+                    <div className="text-base font-bold tabular-nums text-success">
+                      {backfillPreview.would_post}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-muted-foreground">Limite atual</div>
+                    <div className="text-base font-medium tabular-nums">
+                      {backfillLimit > 0 ? backfillLimit : "∞"}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {backfillPreview.samples.length > 0 ? (
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">
+                    Amostra ({backfillPreview.samples.length} de {backfillPreview.would_post})
+                  </div>
+                  <div className="max-h-40 space-y-1 overflow-y-auto rounded-md border border-border/60 bg-muted/20 p-2">
+                    {backfillPreview.samples.map((s) => (
+                      <div key={s.id} className="flex items-center gap-2 text-[11px]">
+                        <span className="font-mono text-muted-foreground">#{s.id}</span>
+                        <span className="text-muted-foreground">{s.date ?? "—"}</span>
+                        <span className="tabular-nums">R$ {s.amount ?? "—"}</span>
+                        <span className="truncate">{s.description}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              <label className="flex items-center gap-2 text-[12px] text-muted-foreground">
+                <span>Limitar a</span>
+                <input
+                  type="number"
+                  min={0}
+                  step={100}
+                  value={backfillLimit || ""}
+                  onChange={(e) => setBackfillLimit(Number(e.target.value) || 0)}
+                  placeholder="0 = sem limite"
+                  className="h-7 w-[120px] rounded-md border border-border bg-background px-2 text-[12px] outline-none focus:border-ring"
+                />
+                <span>linhas (0 = todas)</span>
+              </label>
+
+              <div className="rounded-md border border-warning/30 bg-warning/5 p-2 text-[11px] text-muted-foreground">
+                Cada Tx é postada via o serviço por-linha
+                <code className="mx-1 rounded bg-muted px-1 font-mono">post_transaction</code>
+                — guardas existentes (saldo, account_direction) continuam aplicando.
+                Linhas que falharem ficam em pending e são listadas no resultado.
+              </div>
+            </div>
+          ) : (
+            <div className="py-8 text-center text-muted-foreground">Carregando prévia…</div>
+          )}
+
+          <DialogFooter>
+            <button
+              onClick={() => setBackfillOpen(false)}
+              className="inline-flex h-8 items-center rounded-md border border-border bg-background px-3 text-[12px] font-medium hover:bg-accent"
+            >
+              Cancelar
+            </button>
+            <button
+              disabled={
+                bulkPost.isPending ||
+                !backfillPreview ||
+                backfillPreview.would_post === 0
+              }
+              onClick={async () => {
+                try {
+                  const res = await bulkPost.mutateAsync({
+                    dry_run: false,
+                    limit: backfillLimit > 0 ? backfillLimit : undefined,
+                  })
+                  setBackfillOpen(false)
+                  setBackfillPreview(null)
+                  void refetch()
+                  if (res.failed > 0) {
+                    toast.warning(
+                      `${res.posted} postadas · ${res.failed} falharam`,
+                    )
+                  } else {
+                    toast.success(`${res.posted} transações postadas`)
+                  }
+                } catch (err: unknown) {
+                  toast.error(err instanceof Error ? err.message : "Erro")
+                }
+              }}
+              className={cn(
+                "inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:bg-primary/90",
+                (bulkPost.isPending || !backfillPreview || backfillPreview.would_post === 0) && "opacity-60",
+              )}
+            >
+              <CheckSquare className="h-3.5 w-3.5" />
+              Aplicar ({backfillPreview?.would_post ?? 0})
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

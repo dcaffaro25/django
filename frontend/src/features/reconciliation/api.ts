@@ -181,6 +181,25 @@ export const reconApi = {
   unpostTransaction: (id: number) => api.tenant.post<import("./types").Transaction>(`/transactions/${id}/unpost/`, {}),
   cancelTransaction: (id: number) => api.tenant.post<import("./types").Transaction>(`/transactions/${id}/cancel/`, {}),
 
+  // Bulk-post every Tx in state='pending' AND is_balanced=True. Same
+  // dry-run / apply pattern as the invoice-status backfill: first
+  // call with ``dry_run: true`` to populate a confirmation modal,
+  // then call again with ``dry_run: false`` to apply.
+  bulkPostBalancedTransactions: (body?: { dry_run?: boolean; limit?: number }) =>
+    api.tenant.post<{
+      scanned_pending_balanced: number
+      would_post: number
+      posted: number
+      failed: number
+      samples: Array<{
+        id: number
+        date: string | null
+        amount: string | null
+        description: string
+      }>
+      failures: Array<{ id: number; error: string }>
+    }>(`/api/transactions/bulk-post-balanced/`, body ?? { dry_run: true }),
+
   // Journal entries CRUD
   getJournalEntry: (id: number) => api.tenant.get<JournalEntry>(`/api/journal_entries/${id}/`),
   createJournalEntry: (body: Partial<JournalEntry>) =>
