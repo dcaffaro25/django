@@ -1378,7 +1378,15 @@ def call_erp_api(
         parsed = raw.decode("utf-8", errors="replace")
 
     # Surface Omie-style error envelopes as ``ok=False`` for clarity.
-    is_error_envelope = isinstance(parsed, dict) and ("faultcode" in parsed or "faultstring" in parsed)
+    # Different Omie modules return errors in slightly different shapes:
+    # * SOAP-ish: {"faultcode", "faultstring"}
+    # * Newer JSON: {"status": "error", "message": "..."}
+    # * Method-missing: HTTP 500 + {"status": "error", "message": "Method X not exists"}
+    is_error_envelope = isinstance(parsed, dict) and (
+        "faultcode" in parsed
+        or "faultstring" in parsed
+        or (parsed.get("status") == "error" and "message" in parsed)
+    )
 
     return {
         "ok": resp.status_code < 400 and not is_error_envelope,
