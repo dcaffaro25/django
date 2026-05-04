@@ -180,11 +180,17 @@ class AgentConversationViewSet(viewsets.ModelViewSet):
     def chat(self, request, pk=None):
         """Send a user message and receive the agent's reply.
 
-        Phase 1 stub: persists the user turn but returns 501 because the
-        agent runtime (LLM + tool loop) lands in Phase 2. Frontend can
-        already build against this shape — request: ``{"content": "..."}``,
-        response: ``{"messages": [<user>, <assistant>], ...}``.
+        Persists the user turn, runs the LLM ↔ tools loop synchronously,
+        and returns the full set of new messages produced (user +
+        intermediate tool turns + final assistant). The frontend renders
+        them in order; intermediate messages are useful as "thinking…"
+        affordances ("agent is reading transactions…").
         """
+        from .services.agent_runtime import (
+            AgentRuntimeError,
+            SysnordAgent,
+        )
+
         conversation = self.get_object()
         content = (request.data or {}).get("content", "").strip()
         if not content:
@@ -199,17 +205,32 @@ class AgentConversationViewSet(viewsets.ModelViewSet):
                 role=AgentMessage.ROLE_USER,
                 content=content,
             )
+            # Auto-title from the first user message; bounded to 80 chars.
+            if not conversation.title:
+                conversation.title = content[:80]
+                conversation.save(update_fields=["title", "updated_at"])
 
-        # Phase 2 will run the agent loop here. For now, return a 501 so
-        # the frontend can render an "agent runtime not deployed" hint
-        # without crashing.
-        return Response(
-            {
-                "detail": "Agent runtime not yet deployed (Phase 2). User message saved.",
-                "messages": [AgentMessageSerializer(user_msg).data],
-            },
-            status=status.HTTP_501_NOT_IMPLEMENTED,
-        )
+        try:
+            result = SysnordAgent(conversation).run_turn(user_message=user_msg)
+        except AgentRuntimeError as exc:
+            log.warning(
+                "agent.chat.runtime_error conv=%s user=%s: %s",
+                conversation.id, request.user.id, exc,
+            )
+            return Response(
+                {
+                    "detail": str(exc),
+                    "messages": [AgentMessageSerializer(user_msg).data],
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        new_messages = [user_msg, *result.intermediate_messages, result.final_message]
+        return Response({
+            "iterations": result.iterations,
+            "truncated": result.truncated,
+            "messages": AgentMessageSerializer(new_messages, many=True).data,
+        })
 
 
 # ---------------------------------------------------------------------------
