@@ -88,8 +88,9 @@ O usuário está atualmente em **{title}** (rota `{route}`). {summary}
 """
 
 
-# Tools that don't need company_id — list_companies is the only one.
-TOOLS_WITHOUT_COMPANY_ID = {"list_companies"}
+# Tools that don't need company_id — these are tenant-agnostic by design
+# (cross-tenant for ``list_companies``, fully external for the receita lookup).
+TOOLS_WITHOUT_COMPANY_ID = {"list_companies", "fetch_cnpj_from_receita"}
 
 
 @dataclass
@@ -167,6 +168,20 @@ class SysnordAgent:
             assistant_text_items = [
                 item for item in output_items if item.get("type") == "message"
             ]
+
+            # Hosted web_search calls arrive as their own item type. They're
+            # handled entirely upstream — the model already gets the results
+            # back inline before we see the response. We only log so the
+            # operator can confirm the experiment is firing.
+            web_search_calls = [
+                item for item in output_items if item.get("type") == "web_search_call"
+            ]
+            if web_search_calls:
+                log.info(
+                    "agent.web_search_invoked conv=%s queries=%s",
+                    self.conversation.id,
+                    [c.get("query") or c.get("action", {}).get("query") for c in web_search_calls],
+                )
 
             # Diagnostic: Codex occasionally returns only reasoning items
             # (no message, no function_call) — usually with reasoning models
@@ -374,11 +389,16 @@ class SysnordAgent:
     def _build_tool_catalog(self) -> list[dict[str, Any]]:
         """Combine MCP data tools with the virtual UI tools. The Codex
         Responses API treats them uniformly — only the runtime cares
-        about which is which (we short-circuit on UI tools)."""
+        about which is which (we short-circuit on UI tools).
+
+        Also appends the hosted ``web_search`` tool when
+        ``AGENT_ENABLE_WEB_SEARCH`` is set. The Codex backend may 400 on
+        unsupported hosted tools depending on plan/originator — see the
+        setting's docstring."""
         from mcp_server.tools import TOOLS as MCP_TOOLS
 
         tool_defs = list(MCP_TOOLS) + list(ui_tools.UI_TOOLS)
-        return [
+        catalog: list[dict[str, Any]] = [
             {
                 "type": "function",
                 "name": t.name,
@@ -388,6 +408,9 @@ class SysnordAgent:
             }
             for t in tool_defs
         ]
+        if getattr(settings, "AGENT_ENABLE_WEB_SEARCH", False):
+            catalog.append({"type": "web_search"})
+        return catalog
 
     def _touch_conversation(self) -> None:
         AgentConversation.objects.filter(id=self.conversation.id).update(

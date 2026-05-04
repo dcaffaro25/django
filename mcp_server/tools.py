@@ -311,6 +311,109 @@ def get_nota_fiscal(company_id: int, nf_id: int) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Tool: fetch_cnpj_from_receita
+# ---------------------------------------------------------------------------
+_CNPJ_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_CNPJ_CACHE_TTL_SECONDS = 3600  # 1 hour — Receita data changes rarely
+
+
+def fetch_cnpj_from_receita(cnpj: str) -> dict[str, Any]:
+    """Look up a Brazilian CNPJ in the Receita Federal public registry.
+
+    Backed by `BrasilAPI <https://brasilapi.com.br/docs#tag/CNPJ>`_'s
+    public endpoint (no API key needed). Accepts CNPJ with or without
+    punctuation; strips non-digits before the call. Cached for 1h to
+    avoid hammering the upstream service.
+
+    Returns a curated subset of the upstream payload — razão social,
+    fantasia, situação cadastral, CNAE primário + secundárias, endereço,
+    capital social, sócios. Tenant-agnostic (no ``company_id`` —
+    pure external lookup)."""
+    import re
+    import time
+
+    import requests
+
+    digits = re.sub(r"\D", "", cnpj or "")
+    if len(digits) != 14:
+        return {
+            "error": (
+                f"CNPJ must be 14 digits — got {len(digits)} after stripping "
+                "punctuation. Pass e.g. '12.345.678/0001-90' or '12345678000190'."
+            )
+        }
+
+    cached = _CNPJ_CACHE.get(digits)
+    if cached and (time.time() - cached[0]) < _CNPJ_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    url = f"https://brasilapi.com.br/api/cnpj/v1/{digits}"
+    try:
+        resp = requests.get(url, timeout=8.0)
+    except requests.RequestException as exc:
+        return {"error": f"BrasilAPI unreachable: {exc}"}
+
+    if resp.status_code == 404:
+        return {"error": f"CNPJ {digits} not found in the Receita Federal registry."}
+    if resp.status_code == 429:
+        return {"error": "BrasilAPI rate-limited this request. Try again in a minute."}
+    if resp.status_code >= 400:
+        return {
+            "error": f"BrasilAPI returned {resp.status_code}: {resp.text[:200]}"
+        }
+
+    try:
+        raw = resp.json()
+    except ValueError:
+        return {"error": "BrasilAPI returned non-JSON response."}
+
+    # Curate — full payload is ~50 fields; agent rarely needs all of them.
+    cnaes_secundarias = [
+        {"codigo": c.get("codigo"), "descricao": c.get("descricao")}
+        for c in (raw.get("cnaes_secundarios") or [])[:10]
+    ]
+    socios = [
+        {
+            "nome": q.get("nome_socio"),
+            "qualificacao": q.get("qualificacao_socio"),
+            "data_entrada": q.get("data_entrada_sociedade"),
+        }
+        for q in (raw.get("qsa") or [])[:10]
+    ]
+    curated = {
+        "cnpj": raw.get("cnpj"),
+        "razao_social": raw.get("razao_social"),
+        "nome_fantasia": raw.get("nome_fantasia"),
+        "situacao_cadastral": raw.get("descricao_situacao_cadastral"),
+        "data_situacao_cadastral": raw.get("data_situacao_cadastral"),
+        "data_inicio_atividade": raw.get("data_inicio_atividade"),
+        "natureza_juridica": raw.get("natureza_juridica"),
+        "porte": raw.get("porte"),
+        "capital_social": raw.get("capital_social"),
+        "cnae_principal": {
+            "codigo": raw.get("cnae_fiscal"),
+            "descricao": raw.get("cnae_fiscal_descricao"),
+        },
+        "cnaes_secundarias": cnaes_secundarias,
+        "endereco": {
+            "logradouro": raw.get("logradouro"),
+            "numero": raw.get("numero"),
+            "complemento": raw.get("complemento"),
+            "bairro": raw.get("bairro"),
+            "municipio": raw.get("municipio"),
+            "uf": raw.get("uf"),
+            "cep": raw.get("cep"),
+        },
+        "telefone": raw.get("ddd_telefone_1"),
+        "email": raw.get("email"),
+        "socios": socios,
+        "matriz_filial": "matriz" if raw.get("identificador_matriz_filial") == 1 else "filial",
+    }
+    _CNPJ_CACHE[digits] = (time.time(), curated)
+    return _to_jsonable(curated)
+
+
+# ---------------------------------------------------------------------------
 # Tool: financial_statements
 # ---------------------------------------------------------------------------
 def financial_statements(
@@ -502,6 +605,26 @@ TOOLS: list[ToolDef] = [
                 "nf_id": {"type": "integer"},
             },
             "required": ["company_id", "nf_id"],
+        },
+    ),
+    ToolDef(
+        name="fetch_cnpj_from_receita",
+        description="Look up a Brazilian CNPJ in the Receita Federal public registry "
+                    "(via BrasilAPI). Returns razão social, situação, CNAE, endereço, "
+                    "capital, sócios. Use it to verify a counterparty, classify a partner "
+                    "by economic activity (CNAE), or check whether a CNPJ is active. "
+                    "Tenant-agnostic — no company_id needed.",
+        handler=fetch_cnpj_from_receita,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "cnpj": {
+                    "type": "string",
+                    "description": "Brazilian CNPJ. Punctuation optional "
+                                   "('12.345.678/0001-90' or '12345678000190').",
+                },
+            },
+            "required": ["cnpj"],
         },
     ),
     ToolDef(

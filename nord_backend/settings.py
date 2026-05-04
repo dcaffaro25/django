@@ -612,6 +612,16 @@ OPENAI_OAUTH_SCOPES = os.getenv("OPENAI_OAUTH_SCOPES", "")
 OPENAI_OAUTH_ORIGINATOR = os.getenv("OPENAI_OAUTH_ORIGINATOR", "")
 OPENAI_OAUTH_HTTP_TIMEOUT = float(os.getenv("OPENAI_OAUTH_HTTP_TIMEOUT", "15"))
 
+# Experimental: append the Codex Responses API's hosted ``web_search`` tool to
+# the agent's tool catalog so the model can answer questions that need fresh
+# external info (regulatory updates, market data, news). Default off — the
+# Codex backend at ``chatgpt.com/backend-api/codex`` may reject hosted tools
+# depending on the originator and the connected ChatGPT plan, and we don't
+# want a 400 to block the regular function-tool flow.
+AGENT_ENABLE_WEB_SEARCH = os.getenv("AGENT_ENABLE_WEB_SEARCH", "false").lower() in (
+    "1", "true", "yes",
+)
+
 # Codex Responses API runtime — endpoint, headers, defaults.
 OPENAI_CODEX_BASE_URL = os.getenv(
     "OPENAI_CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex",
