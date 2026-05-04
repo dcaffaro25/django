@@ -44,6 +44,14 @@ export interface AgentMessage {
   prompt_tokens: number | null
   completion_tokens: number | null
   created_at: string
+  attachments?: Array<{
+    id: number
+    kind: "nfe_xml" | "ofx" | "pdf" | "image" | "other"
+    filename: string
+    content_type: string
+    size_bytes: number
+    created_at: string
+  }>
 }
 
 export type ReasoningEffort = "" | "minimal" | "low" | "medium" | "high"
@@ -98,6 +106,16 @@ export interface ChatRequestBody {
   reasoning_effort?: ReasoningEffort
   include_page_context?: boolean
   page_context?: PageContextPayload
+  attachment_ids?: number[]
+}
+
+/** Returned by ``POST /conversations/{id}/attachments/`` — Phase 2. */
+export interface AgentAttachment {
+  id: number
+  kind: "nfe_xml" | "ofx" | "pdf" | "image" | "other"
+  filename: string
+  content_type: string
+  size_bytes: number
 }
 
 export interface AgentConversationDetail extends AgentConversation {
@@ -142,6 +160,21 @@ export const agentApi = {
     api.tenant.delete<void>(`/api/agent/conversations/${id}/`),
   chat: (id: number, body: ChatRequestBody) =>
     api.tenant.post<AgentChatResponse>(`/api/agent/conversations/${id}/chat/`, body),
+
+  /** Upload a single file as a chat attachment — Phase 2. The conversation
+   * scopes the file to the right tenant; the chat endpoint then references
+   * the returned ID via ``attachment_ids: [...]``. */
+  uploadAttachment: (conversationId: number, file: File) => {
+    const fd = new FormData()
+    fd.append("file", file)
+    return api.tenant.post<AgentAttachment>(
+      `/api/agent/conversations/${conversationId}/attachments/`,
+      fd,
+      // Let the browser set the multipart boundary by removing the
+      // default JSON Content-Type the api-client interceptor stamps.
+      { headers: { "Content-Type": "multipart/form-data" } },
+    )
+  },
 
   // -- platform (read-only, any authenticated user)
   listTools: () => api.get<{ count: number; tools: AgentTool[] }>("/api/agent/tools/"),

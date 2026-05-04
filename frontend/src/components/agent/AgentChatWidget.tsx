@@ -27,7 +27,8 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import { toast } from "sonner"
 import {
-  ChevronLeft, Eye, Loader2, MessageCircle, Plus, Send, Sparkles, Trash2, Wrench, X,
+  ChevronLeft, Eye, FileText, Image as ImageIcon, Loader2, MessageCircle, Paperclip,
+  Plus, Send, Sparkles, Trash2, Wrench, X,
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
@@ -43,8 +44,10 @@ import {
   useDeleteAgentConversation,
   usePatchAgentConversation,
   useSendAgentMessage,
+  useUploadAgentAttachment,
 } from "@/features/agent/hooks"
 import {
+  type AgentAttachment,
   type AgentConversation,
   type AgentMessage,
   type AgentModelInfo,
@@ -226,9 +229,28 @@ function MessageRow(props: {
   }
 
   const isUser = msg.role === "user"
+  const attachments = msg.attachments ?? []
   return (
     <div className={cn("flex w-full", isUser ? "justify-end" : "justify-start")}>
-      <div className="flex max-w-[85%] flex-col">
+      <div className={cn("flex max-w-[85%] flex-col gap-1", isUser ? "items-end" : "items-start")}>
+        {attachments.length > 0 && (
+          <div className={cn("flex flex-wrap gap-1.5", isUser ? "justify-end" : "justify-start")}>
+            {attachments.map((a) => {
+              const Icon = a.kind === "image" ? ImageIcon : FileText
+              return (
+                <div
+                  key={a.id}
+                  className="flex max-w-[200px] items-center gap-1.5 rounded-md border border-zinc-200 bg-white px-2 py-1 text-[11px] text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800/60 dark:text-zinc-200"
+                  title={`${a.filename} (${a.kind})`}
+                >
+                  <Icon className="h-3.5 w-3.5 shrink-0" />
+                  <span className="truncate font-medium">{a.filename}</span>
+                  <span className="text-[10px] opacity-60">· {fmtBytes(a.size_bytes)}</span>
+                </div>
+              )
+            })}
+          </div>
+        )}
         <div
           className={cn(
             "whitespace-pre-wrap rounded-2xl px-3.5 py-2 text-sm shadow-sm",
@@ -457,10 +479,66 @@ function ComposerToolbar(props: {
 // ---------------------------------------------------------------------------
 // Chat thread
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Attachment chip — shown below the textarea while files are pending or being
+// uploaded. ``status`` distinguishes the in-flight pre-upload state from the
+// "ready to send" state where ``id`` is populated.
+// ---------------------------------------------------------------------------
+type PendingAttachment =
+  | { localId: string; status: "uploading"; file: File }
+  | { localId: string; status: "ready"; file: File; attachment: AgentAttachment }
+  | { localId: string; status: "error"; file: File; error: string }
+
+function attachmentIcon(att: PendingAttachment) {
+  const kind = att.status === "ready" ? att.attachment.kind : null
+  if (kind === "image") return <ImageIcon className="h-3.5 w-3.5 shrink-0" />
+  return <FileText className="h-3.5 w-3.5 shrink-0" />
+}
+
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n}B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)}KB`
+  return `${(n / 1024 / 1024).toFixed(1)}MB`
+}
+
+function AttachmentChip(props: { att: PendingAttachment; onRemove: () => void }) {
+  const { att } = props
+  const tone =
+    att.status === "uploading" ? "border-zinc-300 bg-zinc-50 text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+    : att.status === "ready"   ? "border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800/50 dark:bg-emerald-900/30 dark:text-emerald-200"
+    : "border-red-300 bg-red-50 text-red-800 dark:border-red-800/50 dark:bg-red-900/30 dark:text-red-200"
+  return (
+    <div className={cn(
+      "flex max-w-[220px] items-center gap-1.5 rounded-md border px-2 py-1 text-[11px]",
+      tone,
+    )}>
+      {att.status === "uploading"
+        ? <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+        : attachmentIcon(att)}
+      <span className="truncate font-medium" title={att.file.name}>{att.file.name}</span>
+      <span className="text-[10px] opacity-70">· {fmtBytes(att.file.size)}</span>
+      <button
+        type="button"
+        onClick={props.onRemove}
+        className="ml-1 -mr-1 rounded p-0.5 opacity-60 hover:opacity-100"
+        aria-label={`Remover ${att.file.name}`}
+      >
+        <X className="h-3 w-3" />
+      </button>
+    </div>
+  )
+}
+
+
 function ChatThread(props: { conversationId: number }) {
   const conversation = useAgentConversation(props.conversationId)
   const sendMut = useSendAgentMessage(props.conversationId)
+  const uploadMut = useUploadAgentAttachment(props.conversationId)
   const [draft, setDraft] = useState("")
+  const [attachments, setAttachments] = useState<PendingAttachment[]>([])
+  const [dragOver, setDragOver] = useState(false)
+  const dragCounter = useRef(0)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const scroller = useRef<HTMLDivElement>(null)
   const pageContext = usePageContextStore((s) => s.context)
 
@@ -472,13 +550,85 @@ function ChatThread(props: { conversationId: number }) {
   const conv = conversation.data
   const includeContext = conv?.include_page_context ?? false
 
+  // Upload one file. Adds an "uploading" chip immediately, then transitions
+  // to "ready" or "error" once the server replies.
+  const uploadFile = async (file: File) => {
+    const localId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    setAttachments((prev) => [...prev, { localId, status: "uploading", file }])
+    try {
+      const attachment = await uploadMut.mutateAsync(file)
+      setAttachments((prev) =>
+        prev.map((a) =>
+          a.localId === localId
+            ? { localId, status: "ready", file, attachment }
+            : a,
+        ),
+      )
+    } catch (e) {
+      const msg = extractApiErrorMessage(e) ?? "Falha ao subir o arquivo."
+      setAttachments((prev) =>
+        prev.map((a) =>
+          a.localId === localId
+            ? { localId, status: "error", file, error: msg }
+            : a,
+        ),
+      )
+      toast.error(`${file.name}: ${msg}`)
+    }
+  }
+
+  const handleFiles = (fileList: FileList | File[] | null) => {
+    if (!fileList) return
+    const arr = Array.from(fileList)
+    for (const f of arr) void uploadFile(f)
+  }
+
+  // Drag-and-drop overlay state. We need a counter (not a flag) because the
+  // browser fires dragenter/dragleave for every nested element — without
+  // counting, hovering over a child element flickers the overlay off.
+  const onDragEnter = (e: React.DragEvent) => {
+    e.preventDefault()
+    if (e.dataTransfer.types.includes("Files")) {
+      dragCounter.current += 1
+      setDragOver(true)
+    }
+  }
+  const onDragLeave = (e: React.DragEvent) => {
+    e.preventDefault()
+    dragCounter.current = Math.max(0, dragCounter.current - 1)
+    if (dragCounter.current === 0) setDragOver(false)
+  }
+  const onDragOver = (e: React.DragEvent) => {
+    e.preventDefault()
+    if (e.dataTransfer.types.includes("Files")) {
+      e.dataTransfer.dropEffect = "copy"
+    }
+  }
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault()
+    dragCounter.current = 0
+    setDragOver(false)
+    handleFiles(e.dataTransfer.files)
+  }
+
+  const removeAttachment = (localId: string) => {
+    setAttachments((prev) => prev.filter((a) => a.localId !== localId))
+  }
+
   const sendMessage = async (content: string) => {
-    if (!content.trim() || sendMut.isPending) return
+    if (sendMut.isPending) return
+    const ready = attachments.filter((a) => a.status === "ready")
+    if (!content.trim() && ready.length === 0) return
     try {
       await sendMut.mutateAsync({
         content: content.trim(),
         page_context: includeContext && pageContext ? pageContext : undefined,
+        attachment_ids: ready.map((a) => (a as { attachment: AgentAttachment }).attachment.id),
       })
+      // Clear pending attachments after a successful send. Errored chips
+      // are also cleared — they're not worth re-trying without the user
+      // re-attaching the file.
+      setAttachments([])
     } catch (e) {
       toast.error(extractApiErrorMessage(e) ?? "Falha ao falar com o agente.")
     }
@@ -487,15 +637,32 @@ function ChatThread(props: { conversationId: number }) {
   const handleSubmit = async (e?: React.FormEvent) => {
     e?.preventDefault()
     const content = draft.trim()
-    if (!content) return
     setDraft("")
     await sendMessage(content)
   }
 
   const messages = conv?.messages ?? []
+  const hasReadyAttachment = attachments.some((a) => a.status === "ready")
+  const isUploading = attachments.some((a) => a.status === "uploading")
 
   return (
-    <div className="flex h-full flex-col">
+    <div
+      className="relative flex h-full flex-col"
+      onDragEnter={onDragEnter}
+      onDragLeave={onDragLeave}
+      onDragOver={onDragOver}
+      onDrop={onDrop}
+    >
+      {/* Drop-zone overlay — visible only while a file is being dragged. */}
+      {dragOver && (
+        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-primary/5 backdrop-blur-[1px]">
+          <div className="flex flex-col items-center gap-2 rounded-lg border-2 border-dashed border-primary/60 bg-white/90 px-6 py-4 text-sm font-medium text-primary shadow-sm dark:bg-zinc-900/90">
+            <Paperclip className="h-5 w-5" />
+            Solte os arquivos para anexar
+          </div>
+        </div>
+      )}
+
       <div ref={scroller} className="flex-1 space-y-2 overflow-y-auto p-3">
         {conversation.isLoading ? (
           <div className="flex h-full items-center justify-center">
@@ -509,8 +676,8 @@ function ChatThread(props: { conversationId: number }) {
             </div>
             <div className="text-xs">
               Posso consultar contas, transações, NFs, faturas, sugestões de
-              conciliação e demonstrativos do tenant atual. Ainda não realizo
-              alterações nesta versão.
+              conciliação e demonstrativos do tenant atual. Anexe NF-e XML,
+              OFX, PDFs ou imagens para que eu analise junto.
             </div>
           </div>
         ) : (
@@ -532,6 +699,17 @@ function ChatThread(props: { conversationId: number }) {
       </div>
 
       <form onSubmit={handleSubmit} className="border-t border-zinc-200 px-2 pt-2 dark:border-zinc-800">
+        {attachments.length > 0 && (
+          <div className="mb-1.5 flex flex-wrap gap-1.5">
+            {attachments.map((att) => (
+              <AttachmentChip
+                key={att.localId}
+                att={att}
+                onRemove={() => removeAttachment(att.localId)}
+              />
+            ))}
+          </div>
+        )}
         <div className="flex items-end gap-2">
           <textarea
             value={draft}
@@ -542,11 +720,46 @@ function ChatThread(props: { conversationId: number }) {
                 void handleSubmit()
               }
             }}
-            placeholder="Pergunte algo sobre seus dados…"
+            placeholder={
+              attachments.length > 0
+                ? "Adicione uma instrução ou aperte Enter para enviar…"
+                : "Pergunte algo sobre seus dados…"
+            }
             rows={2}
             className="flex-1 resize-none rounded-md border border-zinc-200 bg-white px-2.5 py-2 text-sm shadow-sm focus:outline-none focus:ring-1 focus:ring-primary dark:border-zinc-800 dark:bg-zinc-900"
           />
-          <Button type="submit" size="sm" disabled={sendMut.isPending || !draft.trim()}>
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            accept=".xml,.ofx,.pdf,image/*,application/xml,text/xml,application/pdf"
+            className="hidden"
+            onChange={(e) => {
+              handleFiles(e.target.files)
+              // Reset so re-selecting the same file fires onChange again.
+              e.target.value = ""
+            }}
+          />
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            disabled={sendMut.isPending}
+            onClick={() => fileInputRef.current?.click()}
+            title="Anexar arquivo"
+            aria-label="Anexar arquivo"
+          >
+            <Paperclip className="h-4 w-4" />
+          </Button>
+          <Button
+            type="submit"
+            size="sm"
+            disabled={
+              sendMut.isPending
+              || isUploading
+              || (!draft.trim() && !hasReadyAttachment)
+            }
+          >
             <Send className="h-4 w-4" />
           </Button>
         </div>

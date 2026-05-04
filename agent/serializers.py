@@ -42,7 +42,23 @@ class OpenAIConnectionStatusSerializer(serializers.ModelSerializer):
         return getattr(obj.connected_by, "username", None)
 
 
+class AgentMessageAttachmentSerializer(serializers.ModelSerializer):
+    """Compact attachment view returned alongside a message — Phase 2.
+
+    No file URL is exposed; the agent operates on attachments by ID
+    (via ``ingest_document``) and the chat widget only needs filename
+    + kind + size for the UI chip."""
+
+    class Meta:
+        from .models import AgentMessageAttachment
+        model = AgentMessageAttachment
+        fields = ["id", "kind", "filename", "content_type", "size_bytes", "created_at"]
+        read_only_fields = fields
+
+
 class AgentMessageSerializer(serializers.ModelSerializer):
+    attachments = AgentMessageAttachmentSerializer(many=True, read_only=True)
+
     class Meta:
         model = AgentMessage
         fields = [
@@ -56,6 +72,7 @@ class AgentMessageSerializer(serializers.ModelSerializer):
             "prompt_tokens",
             "completion_tokens",
             "created_at",
+            "attachments",
         ]
         read_only_fields = fields
 

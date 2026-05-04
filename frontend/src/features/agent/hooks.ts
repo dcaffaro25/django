@@ -147,3 +147,18 @@ export function useSendAgentMessage(conversationId: number) {
     },
   })
 }
+
+
+/**
+ * Upload one file to an agent conversation — Phase 2. Returns the new
+ * attachment row's metadata; the caller then passes ``attachment.id``
+ * to ``useSendAgentMessage`` via ``attachment_ids: [...]``.
+ *
+ * No cache invalidation here — attachments are referenced by message,
+ * not surfaced as a top-level list.
+ */
+export function useUploadAgentAttachment(conversationId: number) {
+  return useMutation({
+    mutationFn: (file: File) => agentApi.uploadAttachment(conversationId, file),
+  })
+}
