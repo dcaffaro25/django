@@ -2178,6 +2178,267 @@ def run_agent_playbook(
 
 
 # ---------------------------------------------------------------------------
+# Tools: accept / reject ambiguous recon decisions — Phase 1 wave 2
+# ---------------------------------------------------------------------------
+def accept_recon_decision(
+    company_id: int,
+    decision_id: int,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Promote an ambiguous :class:`ReconciliationAgentDecision` into a
+    real :class:`Reconciliation` by accepting its top suggestion.
+
+    Reuses :meth:`ReconciliationAgent._auto_accept` so the produced
+    Reconciliation row is byte-identical to one created by the agent's
+    own auto-accept tier — same JE flips, same ``balance_validated``,
+    same cache invalidation. The decision row's ``reconciliation`` FK
+    is updated to point at the new row.
+
+    ``dry_run=True`` (default) returns the projected payload without
+    writing. Live writes additionally require
+    ``settings.AGENT_ALLOW_WRITES`` to be on. Every attempt — dry-run
+    or applied — writes an :class:`agent.models.AgentWriteAudit` row
+    with an ``undo_token`` (live) for ``undo_via_audit`` to reverse.
+    """
+    import uuid as _uuid
+
+    from django.conf import settings as _django_settings
+
+    from accounting.models import ReconciliationAgentDecision
+    from accounting.services.reconciliation_agent_service import (
+        ReconciliationAgent,
+    )
+
+    from agent.models import AgentWriteAudit
+    from multitenancy.models import Company
+
+    try:
+        decision = ReconciliationAgentDecision.objects.select_related(
+            "bank_transaction", "run",
+        ).get(id=decision_id, company_id=company_id)
+    except ReconciliationAgentDecision.DoesNotExist:
+        return {
+            "error": (
+                f"ReconciliationAgentDecision {decision_id} not found in "
+                f"company {company_id}."
+            )
+        }
+
+    if decision.outcome != "ambiguous":
+        return {
+            "error": (
+                f"Decision {decision_id} has outcome={decision.outcome!r}; "
+                f"only ambiguous decisions can be manually accepted."
+            )
+        }
+    if decision.reconciliation_id:
+        return {
+            "ok": True,
+            "already_accepted": True,
+            "decision_id": decision_id,
+            "reconciliation_id": decision.reconciliation_id,
+        }
+
+    suggestion = dict(decision.suggestion_payload or {})
+    je_data = suggestion.get("existing_journal_entry") or {}
+    if not je_data.get("id"):
+        return {
+            "error": (
+                "Decision's suggestion_payload has no existing_journal_entry. "
+                "This usually means the suggestion proposed a new JE rather "
+                "than matching an existing one — out of scope for the "
+                "manual-accept path."
+            )
+        }
+
+    requested_dry_run = bool(dry_run)
+    writes_enabled = bool(getattr(_django_settings, "AGENT_ALLOW_WRITES", False))
+    effective_dry_run = requested_dry_run or not writes_enabled
+    blocked_by_policy = (not requested_dry_run) and (not writes_enabled)
+
+    args_summary = {
+        "decision_id": decision_id,
+        "bank_tx_id": decision.bank_transaction_id,
+        "je_id": je_data.get("id"),
+        "confidence": str(decision.top_confidence) if decision.top_confidence is not None else None,
+        "dry_run_requested": requested_dry_run,
+    }
+
+    reconciliation_id: int | None = None
+    error_msg = ""
+
+    if not effective_dry_run:
+        try:
+            agent = ReconciliationAgent(company_id=company_id, dry_run=False)
+            reconciliation_id = agent._auto_accept(
+                bank_tx=decision.bank_transaction,
+                suggestion=suggestion,
+            )
+            decision.reconciliation_id = reconciliation_id
+            decision.save(update_fields=["reconciliation_id", "updated_at"])
+            agent._bump_cache_version()
+        except Exception as exc:
+            error_msg = f"{type(exc).__name__}: {exc}"
+
+    audit_status = (
+        AgentWriteAudit.STATUS_FAILED if error_msg
+        else (AgentWriteAudit.STATUS_DRY_RUN if effective_dry_run
+              else AgentWriteAudit.STATUS_APPLIED)
+    )
+    undo_token = "" if (effective_dry_run or error_msg) else _uuid.uuid4().hex
+
+    audit_row_id: int | None = None
+    try:
+        audit = AgentWriteAudit.objects.create(
+            company=Company.objects.get(id=company_id),
+            tool_name="accept_recon_decision",
+            target_model="accounting.Reconciliation",
+            target_ids=[reconciliation_id] if reconciliation_id else [],
+            args_summary=str(args_summary)[:380],
+            before_state={
+                "decision_id": decision_id,
+                "decision_outcome": decision.outcome,
+                "writes_enabled": writes_enabled,
+                "blocked_by_policy": blocked_by_policy,
+            },
+            after_state={
+                "reconciliation_id": reconciliation_id,
+                "decision_id": decision_id,
+                "je_id": je_data.get("id"),
+                "bank_tx_id": decision.bank_transaction_id,
+            },
+            status=audit_status,
+            error_type=error_msg.split(":")[0] if error_msg else "",
+            error_message=error_msg[:480] if error_msg else "",
+            undo_token=undo_token,
+        )
+        audit_row_id = audit.id
+    except Exception as exc:  # pragma: no cover
+        log.warning("agent.write_audit.failed: %s", exc)
+
+    if error_msg:
+        return {"ok": False, "error": error_msg, "audit_id": audit_row_id}
+
+    return {
+        "ok": True,
+        "dry_run_effective": effective_dry_run,
+        "blocked_by_policy": blocked_by_policy,
+        "policy_note": (
+            "Live writes are disabled. The Reconciliation was NOT created — "
+            "the proposal is in the audit row for review."
+        ) if blocked_by_policy else None,
+        "decision_id": decision_id,
+        "reconciliation_id": reconciliation_id,
+        "audit_id": audit_row_id,
+        "undo_token": undo_token or None,
+        "preview": {
+            "bank_tx_id": decision.bank_transaction_id,
+            "bank_tx_amount": str(getattr(decision.bank_transaction, "amount", "")),
+            "je_id": je_data.get("id"),
+            "confidence": str(decision.top_confidence) if decision.top_confidence is not None else None,
+        },
+    }
+
+
+def reject_recon_decision(
+    company_id: int,
+    decision_id: int,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Capture a human rejection of an ambiguous decision.
+
+    Doesn't mutate the decision row — the agent might have been right
+    to flag it. Just records the human's "no" via
+    :class:`agent.models.AgentWriteAudit` (status=rejected) so future
+    runs can avoid re-suggesting the same match and the operator has
+    a paper trail of what was discarded.
+    """
+    from accounting.models import ReconciliationAgentDecision
+
+    from agent.models import AgentWriteAudit
+    from multitenancy.models import Company
+
+    try:
+        decision = ReconciliationAgentDecision.objects.get(
+            id=decision_id, company_id=company_id,
+        )
+    except ReconciliationAgentDecision.DoesNotExist:
+        return {
+            "error": (
+                f"ReconciliationAgentDecision {decision_id} not found in "
+                f"company {company_id}."
+            )
+        }
+
+    if decision.outcome != "ambiguous":
+        return {
+            "error": (
+                f"Decision {decision_id} has outcome={decision.outcome!r}; "
+                f"only ambiguous decisions are subject to manual rejection."
+            )
+        }
+
+    audit_row_id: int | None = None
+    try:
+        audit = AgentWriteAudit.objects.create(
+            company=Company.objects.get(id=company_id),
+            tool_name="reject_recon_decision",
+            target_model="accounting.ReconciliationAgentDecision",
+            target_ids=[decision_id],
+            args_summary=str({"decision_id": decision_id, "reason": reason})[:380],
+            before_state={
+                "decision_id": decision_id,
+                "decision_outcome": decision.outcome,
+            },
+            after_state={"rejected": True, "reason": (reason or "")[:200]},
+            status=AgentWriteAudit.STATUS_REJECTED,
+        )
+        audit_row_id = audit.id
+    except Exception as exc:  # pragma: no cover
+        log.warning("agent.write_audit.failed: %s", exc)
+
+    return {
+        "ok": True,
+        "decision_id": decision_id,
+        "audit_id": audit_row_id,
+        "reason": reason or None,
+    }
+
+
+def _undo_accept_recon_decision(audit, *, dry_run: bool) -> dict[str, Any]:
+    """Reverse a manual ``accept_recon_decision`` by soft-deleting the
+    Reconciliation it created and clearing the decision's
+    ``reconciliation`` FK so it returns to ``ambiguous`` for re-review.
+    """
+    from accounting.models import (
+        Reconciliation, ReconciliationAgentDecision,
+    )
+
+    after = audit.after_state or {}
+    recon_ids = audit.target_ids or []
+    decision_id = after.get("decision_id")
+
+    if dry_run:
+        return {
+            "would_soft_delete_reconciliation_ids": recon_ids,
+            "would_clear_decision_id": decision_id,
+        }
+
+    if recon_ids:
+        Reconciliation.objects.filter(
+            id__in=recon_ids, company=audit.company,
+        ).update(is_deleted=True)
+    if decision_id:
+        ReconciliationAgentDecision.objects.filter(
+            id=decision_id, company=audit.company,
+        ).update(reconciliation=None)
+    return {
+        "soft_deleted_reconciliation_ids": recon_ids,
+        "cleared_decision_id": decision_id,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool: list_recon_decisions — Phase 1 expansion (read)
 # ---------------------------------------------------------------------------
 def list_recon_decisions(
@@ -2375,6 +2636,7 @@ def _undo_run_reconciliation_agent(audit, *, dry_run: bool) -> dict[str, Any]:
 _UNDO_REVERSERS = {
     "run_reconciliation_agent": _undo_run_reconciliation_agent,
     "apply_document_mapping": _undo_apply_document_mapping,
+    "accept_recon_decision": _undo_accept_recon_decision,
 }
 
 
@@ -3178,6 +3440,42 @@ TOOLS: list[ToolDef] = [
         },
     ),
     ToolDef(
+        name="accept_recon_decision",
+        description="Promote one ambiguous ReconciliationAgentDecision into a "
+                    "live Reconciliation by accepting its top suggestion. Same "
+                    "JE flips + cache invalidation as the agent's auto-accept. "
+                    "Dry-run by default; live writes need AGENT_ALLOW_WRITES. "
+                    "Audited; reversible via undo_via_audit.",
+        handler=accept_recon_decision,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "company_id": {"type": "integer"},
+                "decision_id": {"type": "integer"},
+                "dry_run": {"type": "boolean", "default": True},
+            },
+            "required": ["company_id", "decision_id"],
+        },
+    ),
+    ToolDef(
+        name="reject_recon_decision",
+        description="Capture a human rejection of an ambiguous decision (with "
+                    "an optional reason). Doesn't mutate the decision row — "
+                    "writes an AgentWriteAudit row with status=rejected so "
+                    "future runs and operators can see what was deliberately "
+                    "discarded.",
+        handler=reject_recon_decision,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "company_id": {"type": "integer"},
+                "decision_id": {"type": "integer"},
+                "reason": {"type": "string"},
+            },
+            "required": ["company_id", "decision_id"],
+        },
+    ),
+    ToolDef(
         name="list_recon_decisions",
         description="List per-bank-tx decisions from past reconciliation-agent "
                     "runs. Filter by run_id, outcome (auto_accepted/ambiguous/"
@@ -3301,6 +3599,8 @@ _TOOL_DOMAINS: dict[str, str] = {
     "list_agent_playbooks": "recon",
     "save_agent_playbook": "recon",
     "run_agent_playbook": "recon",
+    "accept_recon_decision": "recon",
+    "reject_recon_decision": "recon",
     "get_invoice": "billing",
     "list_invoice_critics": "billing",
     "get_nota_fiscal": "fiscal",
