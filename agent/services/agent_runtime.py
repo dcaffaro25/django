@@ -88,9 +88,23 @@ O usuário está atualmente em **{title}** (rota `{route}`). {summary}
 """
 
 
-# Tools that don't need company_id — these are tenant-agnostic by design
-# (cross-tenant for ``list_companies``, fully external for the receita lookup).
-TOOLS_WITHOUT_COMPANY_ID = {"list_companies", "fetch_cnpj_from_receita"}
+# Tools that don't need company_id — tenant-agnostic by design.
+# ``list_companies`` is cross-tenant; the rest hit external public APIs
+# (Receita Federal via BrasilAPI, BCB SGS, IBGE) or are pure local
+# lookups (CFOP, Simples Nacional anexos).
+TOOLS_WITHOUT_COMPANY_ID = {
+    "list_companies",
+    "fetch_cnpj_from_receita",
+    "fetch_bcb_indicator",
+    "fetch_ptax",
+    "fetch_cep",
+    "fetch_holidays_brazil",
+    "fetch_bank_by_code",
+    "fetch_ncm",
+    "fetch_cnae_info",
+    "validate_cfop",
+    "simples_nacional_annex_for_cnae",
+}
 
 
 @dataclass

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Callable
 
@@ -414,6 +414,531 @@ def fetch_cnpj_from_receita(cnpj: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Tools: BCB Olinda / SGS — official Brazilian Central Bank time series
+# ---------------------------------------------------------------------------
+# Curated alias map. The agent shouldn't have to memorise SGS series IDs;
+# it picks a friendly name and we resolve. Add as-needed.
+_BCB_SERIES = {
+    "selic":         {"id": 11,    "label": "Selic over (% a.d.)",      "unit": "% diário"},
+    "selic_meta":    {"id": 432,   "label": "Selic meta (% a.a.)",      "unit": "% anual"},
+    "cdi":           {"id": 12,    "label": "CDI (% a.d.)",             "unit": "% diário"},
+    "ipca":          {"id": 433,   "label": "IPCA (% mês)",             "unit": "% mensal"},
+    "igpm":          {"id": 189,   "label": "IGP-M (% mês)",            "unit": "% mensal"},
+    "incc":          {"id": 192,   "label": "INCC-DI (% mês)",          "unit": "% mensal"},
+    "ipca_15":       {"id": 7478,  "label": "IPCA-15 (% mês)",          "unit": "% mensal"},
+    "tr":            {"id": 226,   "label": "TR (% mês)",               "unit": "% mensal"},
+    "tjlp":          {"id": 256,   "label": "TJLP (% a.a.)",            "unit": "% anual"},
+    "ptax_usd":      {"id": 1,     "label": "USD/BRL PTAX (compra)",    "unit": "R$"},
+    "ptax_usd_venda":{"id": 10813, "label": "USD/BRL PTAX (venda)",     "unit": "R$"},
+    "ptax_eur":      {"id": 21619, "label": "EUR/BRL PTAX (venda)",     "unit": "R$"},
+}
+
+
+def fetch_bcb_indicator(
+    indicator: str,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    last_n: int | None = None,
+) -> dict[str, Any]:
+    """Fetch a Brazilian Central Bank time series (SGS/Olinda).
+
+    Friendly indicator names: ``selic``, ``selic_meta``, ``cdi``,
+    ``ipca``, ``igpm``, ``incc``, ``ipca_15``, ``tr``, ``tjlp``,
+    ``ptax_usd``, ``ptax_usd_venda``, ``ptax_eur``. Pass either a date
+    range (ISO YYYY-MM-DD) OR ``last_n`` to retrieve the most-recent
+    N observations. If neither is supplied, defaults to ``last_n=1``
+    (current value).
+
+    No auth, no rate limit (BCB is generous), free."""
+    import requests
+
+    spec = _BCB_SERIES.get((indicator or "").lower())
+    if not spec:
+        return {
+            "error": (
+                f"Unknown indicator '{indicator}'. Valid: "
+                + ", ".join(sorted(_BCB_SERIES.keys()))
+            )
+        }
+
+    series_id = spec["id"]
+    base = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados"
+
+    if date_from or date_to:
+        params: dict[str, str] = {"formato": "json"}
+        if date_from:
+            try:
+                params["dataInicial"] = date.fromisoformat(date_from).strftime("%d/%m/%Y")
+            except ValueError as exc:
+                return {"error": f"Invalid date_from: {exc}"}
+        if date_to:
+            try:
+                params["dataFinal"] = date.fromisoformat(date_to).strftime("%d/%m/%Y")
+            except ValueError as exc:
+                return {"error": f"Invalid date_to: {exc}"}
+        url = base
+    else:
+        n = last_n if last_n and last_n > 0 else 1
+        url = f"{base}/ultimos/{n}"
+        params = {"formato": "json"}
+
+    try:
+        resp = requests.get(url, params=params, timeout=8.0)
+    except requests.RequestException as exc:
+        return {"error": f"BCB Olinda unreachable: {exc}"}
+    if resp.status_code >= 400:
+        return {"error": f"BCB Olinda returned {resp.status_code}: {resp.text[:200]}"}
+
+    try:
+        rows = resp.json()
+    except ValueError:
+        return {"error": "BCB Olinda returned non-JSON."}
+
+    return {
+        "indicator": indicator,
+        "series_id": series_id,
+        "label": spec["label"],
+        "unit": spec["unit"],
+        "count": len(rows),
+        "observations": [
+            {"date": r.get("data"), "value": r.get("valor")} for r in rows
+        ],
+    }
+
+
+def fetch_ptax(currency: str, on_date: str | None = None) -> dict[str, Any]:
+    """Fetch the BCB PTAX exchange rate for ``currency`` (e.g. ``USD``,
+    ``EUR``, ``GBP``) on a given ISO date. If ``on_date`` omitted,
+    returns the most-recent business-day quote.
+
+    Returns bid + ask. Used by the BCB itself for accounting closes,
+    so this is the canonical reference rate for revaluations.
+
+    Source: BrasilAPI cambio (proxies BCB Olinda)."""
+    import requests
+
+    moeda = (currency or "").upper().strip()
+    if not moeda or len(moeda) > 4:
+        return {"error": f"currency must be a 3-letter code (e.g. 'USD', 'EUR'); got {currency!r}"}
+
+    if on_date:
+        try:
+            d = date.fromisoformat(on_date)
+        except ValueError as exc:
+            return {"error": f"Invalid on_date: {exc}"}
+        url = f"https://brasilapi.com.br/api/cambio/v1/cotacao/{moeda}/{d.isoformat()}"
+    else:
+        # Walk back up to 7 days to find the latest business-day quote.
+        for back in range(0, 7):
+            d = datetime.now().date() - timedelta(days=back)
+            try_url = f"https://brasilapi.com.br/api/cambio/v1/cotacao/{moeda}/{d.isoformat()}"
+            try:
+                r = requests.get(try_url, timeout=6.0)
+            except requests.RequestException:
+                continue
+            if r.status_code == 200:
+                url = try_url
+                break
+        else:
+            return {"error": f"No PTAX quote for {moeda} found in the last 7 days."}
+
+    try:
+        resp = requests.get(url, timeout=6.0)
+    except requests.RequestException as exc:
+        return {"error": f"BrasilAPI cambio unreachable: {exc}"}
+    if resp.status_code == 404:
+        return {"error": f"No PTAX quote for {moeda} on {d.isoformat()}."}
+    if resp.status_code >= 400:
+        return {"error": f"BrasilAPI cambio returned {resp.status_code}: {resp.text[:200]}"}
+
+    raw = resp.json()
+    # Response shape: {"cotacoes": [{"cotacao_compra", "cotacao_venda",
+    # "data_hora_cotacao", "tipo_boletim"}, ...]} — multiple intraday
+    # quotes. Prefer FECHAMENTO (closing PTAX); else fall back to the
+    # last quote in the array (latest INTERMEDIÁRIO of the day).
+    cotacoes = raw.get("cotacoes") or []
+    if not cotacoes:
+        return {"error": f"No PTAX quotes returned for {moeda} on {d.isoformat()}."}
+    fechamento = next(
+        (c for c in cotacoes if (c.get("tipo_boletim") or "").upper() == "FECHAMENTO"),
+        None,
+    )
+    pick = fechamento or cotacoes[-1]
+    return {
+        "currency": moeda,
+        "date": d.isoformat(),
+        "bid": pick.get("cotacao_compra"),
+        "ask": pick.get("cotacao_venda"),
+        "official_date": pick.get("data_hora_cotacao"),
+        "boletim": pick.get("tipo_boletim"),
+        "intraday_quote_count": len(cotacoes),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: fetch_cep
+# ---------------------------------------------------------------------------
+def fetch_cep(cep: str) -> dict[str, Any]:
+    """Resolve a Brazilian CEP (postal code) to its address.
+
+    Source: BrasilAPI (which fans out to multiple providers — Correios,
+    ViaCEP, etc. — for resilience). Free, no auth."""
+    import re
+
+    import requests
+
+    digits = re.sub(r"\D", "", cep or "")
+    if len(digits) != 8:
+        return {"error": f"CEP must be 8 digits — got {len(digits)} after stripping."}
+
+    url = f"https://brasilapi.com.br/api/cep/v2/{digits}"
+    try:
+        resp = requests.get(url, timeout=6.0)
+    except requests.RequestException as exc:
+        return {"error": f"BrasilAPI CEP unreachable: {exc}"}
+    if resp.status_code == 404:
+        return {"error": f"CEP {digits} not found."}
+    if resp.status_code >= 400:
+        return {"error": f"BrasilAPI CEP returned {resp.status_code}: {resp.text[:200]}"}
+
+    raw = resp.json()
+    return {
+        "cep": raw.get("cep"),
+        "uf": raw.get("state"),
+        "city": raw.get("city"),
+        "neighborhood": raw.get("neighborhood"),
+        "street": raw.get("street"),
+        "service": raw.get("service"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: fetch_holidays_brazil
+# ---------------------------------------------------------------------------
+def fetch_holidays_brazil(year: int) -> dict[str, Any]:
+    """Return federal holidays for the given year. Useful for working-day
+    arithmetic (NF-e prazos, payment due dates, fiscal calendar).
+
+    Source: BrasilAPI (national holidays only — state/municipal not
+    included). Free, no auth."""
+    import requests
+
+    if not isinstance(year, int) or year < 1900 or year > 2100:
+        return {"error": "year must be an integer between 1900 and 2100."}
+
+    url = f"https://brasilapi.com.br/api/feriados/v1/{year}"
+    try:
+        resp = requests.get(url, timeout=6.0)
+    except requests.RequestException as exc:
+        return {"error": f"BrasilAPI feriados unreachable: {exc}"}
+    if resp.status_code >= 400:
+        return {"error": f"BrasilAPI feriados returned {resp.status_code}: {resp.text[:200]}"}
+
+    rows = resp.json()
+    return {
+        "year": year,
+        "count": len(rows),
+        "holidays": [
+            {"date": r.get("date"), "name": r.get("name"), "type": r.get("type")}
+            for r in rows
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: fetch_bank_by_code
+# ---------------------------------------------------------------------------
+def fetch_bank_by_code(code: str) -> dict[str, Any]:
+    """Look up a Brazilian bank by COMPE code (3-digit, e.g. ``341``
+    for Itaú) or ISPB (8-digit). Returns the official name, ISPB,
+    COMPE, and full corporate name.
+
+    Source: BrasilAPI banks (mirrors the BCB STR participants registry).
+    Free, no auth."""
+    import requests
+
+    raw_code = (code or "").strip()
+    if not raw_code:
+        return {"error": "code is required (COMPE 3-digit or ISPB 8-digit)."}
+
+    url = f"https://brasilapi.com.br/api/banks/v1/{raw_code}"
+    try:
+        resp = requests.get(url, timeout=6.0)
+    except requests.RequestException as exc:
+        return {"error": f"BrasilAPI banks unreachable: {exc}"}
+    if resp.status_code == 404:
+        return {"error": f"Bank {raw_code} not found."}
+    if resp.status_code >= 400:
+        return {"error": f"BrasilAPI banks returned {resp.status_code}: {resp.text[:200]}"}
+
+    raw = resp.json()
+    return {
+        "ispb": raw.get("ispb"),
+        "compe": raw.get("code"),
+        "name": raw.get("name"),
+        "full_name": raw.get("fullName"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: fetch_ncm
+# ---------------------------------------------------------------------------
+def fetch_ncm(code: str) -> dict[str, Any]:
+    """Look up an NCM (Nomenclatura Comum do Mercosul) code. Used to
+    classify products on NFes and determine tax incidence (IPI, ICMS-ST).
+
+    Source: BrasilAPI NCM (mirrors Receita Federal). Free, no auth."""
+    import re
+
+    import requests
+
+    digits = re.sub(r"\D", "", code or "")
+    if len(digits) < 2 or len(digits) > 8:
+        return {"error": f"NCM code should be 2-8 digits — got {len(digits)}."}
+
+    url = f"https://brasilapi.com.br/api/ncm/v1/{digits}"
+    try:
+        resp = requests.get(url, timeout=6.0)
+    except requests.RequestException as exc:
+        return {"error": f"BrasilAPI NCM unreachable: {exc}"}
+    if resp.status_code == 404:
+        return {"error": f"NCM {digits} not found."}
+    if resp.status_code >= 400:
+        return {"error": f"BrasilAPI NCM returned {resp.status_code}: {resp.text[:200]}"}
+
+    raw = resp.json()
+    return {
+        "codigo": raw.get("codigo"),
+        "descricao": raw.get("descricao"),
+        "data_inicio": raw.get("data_inicio"),
+        "data_fim": raw.get("data_fim"),
+        "tipo_ato": raw.get("tipo_ato"),
+        "numero_ato": raw.get("numero_ato"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: fetch_cnae_info
+# ---------------------------------------------------------------------------
+def fetch_cnae_info(code: str) -> dict[str, Any]:
+    """Look up a CNAE (Classificação Nacional de Atividades Econômicas)
+    subclasse by 7-digit code (e.g. ``4711301`` for hipermercados).
+
+    Returns the description, the divisão/grupo/classe hierarchy, and
+    flags whether it's eligible for Simples Nacional (best-effort
+    based on the IBGE classification only — final eligibility is in
+    LC 123/2006 and Resolução CGSN 140/2018).
+
+    Source: IBGE Servicos de Dados (concla)."""
+    import re
+
+    import requests
+
+    digits = re.sub(r"\D", "", code or "")
+    if len(digits) != 7:
+        return {"error": f"CNAE subclasse must be 7 digits — got {len(digits)}."}
+
+    url = f"https://servicodados.ibge.gov.br/api/v2/cnae/subclasses/{digits}"
+    try:
+        resp = requests.get(url, timeout=8.0)
+    except requests.RequestException as exc:
+        return {"error": f"IBGE CNAE unreachable: {exc}"}
+    if resp.status_code == 404:
+        return {"error": f"CNAE {digits} not found."}
+    if resp.status_code >= 400:
+        return {"error": f"IBGE CNAE returned {resp.status_code}: {resp.text[:200]}"}
+
+    raw = resp.json()
+    if isinstance(raw, list):
+        if not raw:
+            return {"error": f"CNAE {digits} not found (empty response)."}
+        raw = raw[0]
+
+    classe = raw.get("classe") or {}
+    grupo = classe.get("grupo") or {}
+    divisao = grupo.get("divisao") or {}
+    secao = divisao.get("secao") or {}
+    return {
+        "codigo": raw.get("id"),
+        "descricao": raw.get("descricao"),
+        "classe": {"id": classe.get("id"), "descricao": classe.get("descricao")},
+        "grupo": {"id": grupo.get("id"), "descricao": grupo.get("descricao")},
+        "divisao": {"id": divisao.get("id"), "descricao": divisao.get("descricao")},
+        "secao": {"id": secao.get("id"), "descricao": secao.get("descricao")},
+        "observacoes": raw.get("observacoes") or [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: validate_cfop
+# ---------------------------------------------------------------------------
+# CFOP first digit semantics — fixed structure defined by Convênio S/Nº/70.
+_CFOP_FIRST_DIGIT = {
+    "1": ("entrada", "operações dentro do estado"),
+    "2": ("entrada", "operações de outros estados"),
+    "3": ("entrada", "operações do exterior"),
+    "5": ("saída",   "operações dentro do estado"),
+    "6": ("saída",   "operações para outros estados"),
+    "7": ("saída",   "operações para o exterior"),
+}
+# Common-use slice — the full CFOP table has ~700 codes; this covers
+# the ones the agent will see on >95% of NFes for trade/services in
+# Brazil. Extend as the corpus grows.
+_CFOP_COMMON = {
+    "1101": "Compra para industrialização ou produção rural",
+    "1102": "Compra para comercialização",
+    "1124": "Industrialização efetuada por outra empresa",
+    "1202": "Devolução de venda de mercadoria adquirida ou recebida de terceiros",
+    "1411": "Devolução de venda de produção do estabelecimento em operação com produto sujeito a ST",
+    "1551": "Compra de bem para o ativo imobilizado",
+    "1556": "Compra de material para uso ou consumo",
+    "1908": "Entrada de bem por conta de contrato de comodato",
+    "1949": "Outra entrada de mercadoria ou prestação de serviço não especificada",
+    "2101": "Compra para industrialização (interestadual)",
+    "2102": "Compra para comercialização (interestadual)",
+    "2202": "Devolução de venda (interestadual)",
+    "2551": "Compra de bem para o ativo imobilizado (interestadual)",
+    "3101": "Compra para industrialização (importação)",
+    "3102": "Compra para comercialização (importação)",
+    "5101": "Venda de produção do estabelecimento",
+    "5102": "Venda de mercadoria adquirida ou recebida de terceiros",
+    "5202": "Devolução de compra para industrialização",
+    "5401": "Venda de produção do estabelecimento em operação com produto sujeito a ST",
+    "5403": "Venda de mercadoria adquirida ou recebida de terceiros em operação com ST",
+    "5405": "Venda sujeita a ST cuja retenção foi feita anteriormente",
+    "5551": "Venda de bem do ativo imobilizado",
+    "5556": "Venda de material de uso ou consumo",
+    "5910": "Remessa em bonificação, doação ou brinde",
+    "5949": "Outra saída de mercadoria ou prestação de serviço não especificada",
+    "6101": "Venda de produção (interestadual)",
+    "6102": "Venda de mercadoria de terceiros (interestadual)",
+    "6202": "Devolução de compra (interestadual)",
+    "6401": "Venda em operação com ST (interestadual)",
+    "6551": "Venda de bem do ativo imobilizado (interestadual)",
+    "7101": "Venda de produção (exportação)",
+    "7102": "Venda de mercadoria de terceiros (exportação)",
+}
+
+
+def validate_cfop(code: str) -> dict[str, Any]:
+    """Validate a Brazilian CFOP code and decode its semantics.
+
+    Returns: ``valid`` flag, ``operation`` (entrada/saída), ``scope``
+    (in-state / interstate / external), and a description if it's in
+    the curated common set. Codes not in the common set return
+    ``valid=True`` (assuming the format is right) but
+    ``description=None`` — the agent should treat unknown codes as
+    plausible-but-unverified.
+
+    Pure local function; no network."""
+    import re
+
+    digits = re.sub(r"\D", "", code or "")
+    if len(digits) != 4:
+        return {
+            "valid": False,
+            "error": f"CFOP must be 4 digits — got {len(digits)}.",
+        }
+
+    first = digits[0]
+    spec = _CFOP_FIRST_DIGIT.get(first)
+    if not spec:
+        return {
+            "valid": False,
+            "error": f"CFOP first digit must be 1/2/3 (entrada) or 5/6/7 (saída); got {first}.",
+        }
+
+    operation, scope = spec
+    description = _CFOP_COMMON.get(digits)
+    return {
+        "valid": True,
+        "code": digits,
+        "operation": operation,
+        "scope": scope,
+        "description": description,
+        "is_common": description is not None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: simples_nacional_annex_for_cnae
+# ---------------------------------------------------------------------------
+# Mapping of CNAE prefix → Anexo Simples Nacional (LC 123/2006 + LC 155/2016).
+# This is a curated partial list; the canonical source is the Receita Federal
+# tabela "Tabela CNAE x Simples Nacional". Anexos:
+#   I   — Comércio
+#   II  — Indústria
+#   III — Serviços (regra geral, fator R não aplica)
+#   IV  — Serviços (escritórios contábeis, advocatícios, etc.)
+#   V   — Serviços (intelectuais, sujeitos a fator R)
+_CNAE_ANEXO_RULES = (
+    # Industria — divisões CNAE 05–33
+    (("05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16",
+      "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28",
+      "29", "30", "31", "32", "33"), "II", "Indústria"),
+    # Comércio — divisões 45–47
+    (("45", "46", "47"), "I", "Comércio"),
+    # Construção civil — anexo IV
+    (("41", "42", "43"), "IV", "Construção civil"),
+    # Serviços contábeis / advocatícios / vigilância / limpeza — anexo IV
+    (("69", "692", "801", "802", "812", "813"), "IV", "Serviços profissionais (anexo IV)"),
+    # Serviços de tecnologia, saúde, ensino, engenharia — anexo III ou V
+    # (depende de fator R; pre-LC 155 tinha distinção rígida)
+    (("62", "63", "71", "72", "73", "74", "85", "86"), "III/V", "Serviços (sujeito a fator R)"),
+    # Demais serviços → III
+    (("49", "50", "51", "52", "53", "55", "56",
+      "58", "59", "60", "61", "64", "65", "66", "68",
+      "75", "77", "78", "79", "80", "81", "82",
+      "84", "87", "88", "90", "91", "92", "93", "94", "95", "96", "97"), "III", "Serviços"),
+)
+
+
+def simples_nacional_annex_for_cnae(cnae: str) -> dict[str, Any]:
+    """Best-effort: map a CNAE to the Simples Nacional anexo (I-V).
+
+    Heuristic — based on CNAE divisão (first 2 digits). Some CNAEs have
+    company-specific exceptions (escritórios de software started anexo
+    III after LC 155, scientific consultancies anexo V…) that this map
+    can't capture. Treat the result as a starting hint, not a final
+    enquadramento. Pure local function, no network.
+
+    Returns ``annex`` (one of 'I', 'II', 'III', 'IV', 'V', 'III/V', or
+    null) and a ``rationale`` string."""
+    import re
+
+    digits = re.sub(r"\D", "", cnae or "")
+    if len(digits) < 2:
+        return {"error": f"CNAE must have at least 2 digits — got {len(digits)}."}
+
+    div = digits[:2]
+    for prefixes, annex, label in _CNAE_ANEXO_RULES:
+        if div in prefixes or any(digits.startswith(p) for p in prefixes if len(p) > 2):
+            return {
+                "cnae": digits,
+                "divisao": div,
+                "annex": annex,
+                "label": label,
+                "note": (
+                    "Heurística baseada na divisão CNAE. Verifique fator R, "
+                    "atividade-fim e atividades vedadas (LC 123/2006, art. 17) "
+                    "antes do enquadramento final."
+                ),
+            }
+
+    return {
+        "cnae": digits,
+        "divisao": div,
+        "annex": None,
+        "label": "Não mapeado",
+        "note": (
+            f"Divisão {div} não está na tabela curada. Pode estar entre as "
+            "atividades vedadas, ou requer enquadramento manual. Consulte a "
+            "Receita Federal."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool: financial_statements
 # ---------------------------------------------------------------------------
 def financial_statements(
@@ -625,6 +1150,132 @@ TOOLS: list[ToolDef] = [
                 },
             },
             "required": ["cnpj"],
+        },
+    ),
+    ToolDef(
+        name="fetch_bcb_indicator",
+        description="Fetch a Brazilian Central Bank time-series indicator (Selic, CDI, "
+                    "IPCA, IGP-M, INCC, TR, TJLP, USD/BRL PTAX, EUR/BRL PTAX). "
+                    "Pass a friendly name and either a date range or last_n=N. "
+                    "Use it to update receivables by CDI, validate a Selic-based "
+                    "fine, compute FX revaluations, etc. No tenant scoping.",
+        handler=fetch_bcb_indicator,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "indicator": {
+                    "type": "string",
+                    "description": "selic | selic_meta | cdi | ipca | igpm | incc | "
+                                   "ipca_15 | tr | tjlp | ptax_usd | ptax_usd_venda | ptax_eur",
+                },
+                "date_from": {"type": "string", "format": "date"},
+                "date_to": {"type": "string", "format": "date"},
+                "last_n": {"type": "integer", "description": "Last N observations (alternative to date range)"},
+            },
+            "required": ["indicator"],
+        },
+    ),
+    ToolDef(
+        name="fetch_ptax",
+        description="Fetch the BCB PTAX exchange rate (bid + ask) for a currency on a "
+                    "specific date — or the most recent business-day quote if date is "
+                    "omitted. Canonical reference for revaluation/exposure reporting.",
+        handler=fetch_ptax,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "currency": {"type": "string", "description": "3-letter code (USD, EUR, GBP, JPY, …)"},
+                "on_date": {"type": "string", "format": "date"},
+            },
+            "required": ["currency"],
+        },
+    ),
+    ToolDef(
+        name="fetch_cep",
+        description="Resolve a Brazilian CEP (postal code) to its address (UF, city, "
+                    "neighborhood, street). Useful when filling a partner endereço or "
+                    "validating delivery info.",
+        handler=fetch_cep,
+        input_schema={
+            "type": "object",
+            "properties": {"cep": {"type": "string"}},
+            "required": ["cep"],
+        },
+    ),
+    ToolDef(
+        name="fetch_holidays_brazil",
+        description="Federal holidays for a given year. Used by the agent for "
+                    "working-day arithmetic (NF-e prazos, payment due dates, fiscal "
+                    "calendar). National only — state/municipal holidays not included.",
+        handler=fetch_holidays_brazil,
+        input_schema={
+            "type": "object",
+            "properties": {"year": {"type": "integer", "minimum": 1900, "maximum": 2100}},
+            "required": ["year"],
+        },
+    ),
+    ToolDef(
+        name="fetch_bank_by_code",
+        description="Look up a Brazilian bank by COMPE 3-digit code (e.g. '341' = Itaú) "
+                    "or 8-digit ISPB. Returns name, ISPB, full corporate name. Sourced "
+                    "from BrasilAPI which mirrors the BCB STR participants registry.",
+        handler=fetch_bank_by_code,
+        input_schema={
+            "type": "object",
+            "properties": {"code": {"type": "string"}},
+            "required": ["code"],
+        },
+    ),
+    ToolDef(
+        name="fetch_ncm",
+        description="Look up an NCM (Mercosul tariff) code → description. Used to "
+                    "classify products on NF-e and check IPI/ICMS-ST incidence. "
+                    "Accepts 2-8 digit codes (broader codes return the parent class).",
+        handler=fetch_ncm,
+        input_schema={
+            "type": "object",
+            "properties": {"code": {"type": "string"}},
+            "required": ["code"],
+        },
+    ),
+    ToolDef(
+        name="fetch_cnae_info",
+        description="Look up a CNAE 7-digit subclasse on the IBGE registry. Returns the "
+                    "description plus the classe/grupo/divisão/seção hierarchy. Used "
+                    "alongside fetch_cnpj_from_receita to understand a counterparty's "
+                    "economic activity.",
+        handler=fetch_cnae_info,
+        input_schema={
+            "type": "object",
+            "properties": {"code": {"type": "string", "description": "7-digit CNAE subclasse"}},
+            "required": ["code"],
+        },
+    ),
+    ToolDef(
+        name="validate_cfop",
+        description="Validate a 4-digit CFOP code and decode its operation type "
+                    "(entrada/saída) and scope (in-state, interstate, foreign). "
+                    "Common CFOPs return a description; unknown-but-formally-valid "
+                    "codes return valid=true with description=null. Pure local lookup; "
+                    "no network.",
+        handler=validate_cfop,
+        input_schema={
+            "type": "object",
+            "properties": {"code": {"type": "string"}},
+            "required": ["code"],
+        },
+    ),
+    ToolDef(
+        name="simples_nacional_annex_for_cnae",
+        description="Heuristic mapping CNAE → Simples Nacional anexo (I/II/III/IV/V). "
+                    "Use as a starting hint for enquadramento; final classification "
+                    "depends on fator R, atividade-fim, and LC 123/2006 vedações. "
+                    "Pure local function, no network.",
+        handler=simples_nacional_annex_for_cnae,
+        input_schema={
+            "type": "object",
+            "properties": {"cnae": {"type": "string"}},
+            "required": ["cnae"],
         },
     ),
     ToolDef(
