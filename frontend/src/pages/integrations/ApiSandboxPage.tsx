@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react"
 import { toast } from "sonner"
-import { Play, Plus, Save, Trash2, ChevronRight, ArrowDown, Zap } from "lucide-react"
+import { Play, Plus, Save, Trash2, ChevronRight, ArrowDown, Zap, Link2 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import {
   useErpApiDefinitions,
@@ -13,6 +13,8 @@ import {
   type SandboxStep,
 } from "@/features/integrations"
 import { cn } from "@/lib/utils"
+import { StepStructurePanel } from "./components/StepStructurePanel"
+import { JoinedResultView } from "./components/JoinedResultView"
 
 type UIStep = {
   localId: number
@@ -213,18 +215,41 @@ export function ApiSandboxPage() {
             </div>
           </div>
 
-          {steps.map((st, idx) => (
-            <StepCard
-              key={st.localId}
-              step={st}
-              isFirst={idx === 0}
-              apiDefs={apiDefs}
-              apiDefsLoading={apiDefsLoading}
-              priorSteps={steps.filter((s) => s.order < st.order).map((s) => s.order)}
-              onChange={(patch) => updateStep(st.localId, patch)}
-              onRemove={() => removeStep(st.localId)}
-            />
-          ))}
+          {steps.map((st, idx) => {
+            const nextStep = steps.find((s) => s.order === st.order + 1)
+            // Phase-3: clicking a column in step N's structure adds a
+            // jmespath binding to step N+1 with source_step=N and the
+            // column path as expression — operator just fills ``into``.
+            const onBindToNext = nextStep
+              ? (path: string) => {
+                  const newBinding: SandboxBinding = {
+                    mode: "jmespath",
+                    into: "",
+                    source_step: st.order,
+                    expression: path,
+                  }
+                  updateStep(nextStep.localId, {
+                    param_bindings: [...nextStep.param_bindings, newBinding],
+                  })
+                  toast.success(`Binding adicionado ao Passo ${nextStep.order} — preencha o "into".`)
+                }
+              : undefined
+            return (
+              <StepCard
+                key={st.localId}
+                step={st}
+                isFirst={idx === 0}
+                apiDefs={apiDefs}
+                apiDefsLoading={apiDefsLoading}
+                priorSteps={steps.filter((s) => s.order < st.order).map((s) => s.order)}
+                onChange={(patch) => updateStep(st.localId, patch)}
+                onRemove={() => removeStep(st.localId)}
+                connectionId={connectionId}
+                onBindColumnToNext={onBindToNext}
+                hasNextStep={!!nextStep}
+              />
+            )
+          })}
 
           <button
             onClick={addStep}
@@ -289,6 +314,9 @@ function StepCard({
   priorSteps,
   onChange,
   onRemove,
+  connectionId,
+  onBindColumnToNext,
+  hasNextStep,
 }: {
   step: UIStep
   isFirst: boolean
@@ -297,7 +325,23 @@ function StepCard({
   priorSteps: number[]
   onChange: (patch: Partial<UIStep>) => void
   onRemove: () => void
+  connectionId: number | null
+  onBindColumnToNext?: (path: string) => void
+  hasNextStep: boolean
 }) {
+  // Parse extra_params for the structure probe — silently treat invalid
+  // JSON as empty so probing keeps working while the operator types.
+  const extraParamsForProbe = useMemo(() => {
+    try {
+      const parsed = JSON.parse(step.extra_params_text || "{}")
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : {}
+    } catch {
+      return {}
+    }
+  }, [step.extra_params_text])
+
   return (
     <div className="card-elevated p-4">
       <div className="mb-3 flex items-center justify-between">
@@ -341,6 +385,17 @@ function StepCard({
             className="w-full rounded-md border border-border bg-background px-2 py-1.5 font-mono text-[12px] outline-none focus:border-ring"
           />
         </Field>
+
+        {/* Phase-3: auto-probed structure of the API's response. Clicking
+            a column wires a binding into the next step (when one exists). */}
+        <StepStructurePanel
+          connectionId={connectionId}
+          apiDefinitionId={step.api_definition_id}
+          stepOrder={step.order}
+          extraParams={extraParamsForProbe}
+          onBindColumn={onBindColumnToNext}
+          hasNextStep={hasNextStep}
+        />
 
         <Field label="Select fields (JMESPath, opcional — só preview)">
           <input
@@ -478,6 +533,10 @@ function ResultPane({ result }: { result: SandboxResult }) {
   const hasError = !!result.error || (result.errors && result.errors.length > 0)
   const previews = result.preview_by_step ?? []
   const [activeOrder, setActiveOrder] = useState<number | null>(previews[0]?.order ?? null)
+  // Phase-3: tab toggles between per-step view and the consolidated
+  // joined view. Picking a step (per-step button) flips this back to
+  // "step"; the Resultado button flips it to "joined".
+  const [activeTab, setActiveTab] = useState<"step" | "joined">("step")
   const active = previews.find((p) => p.order === activeOrder) ?? previews[0] ?? null
 
   return (
@@ -556,14 +615,14 @@ function ResultPane({ result }: { result: SandboxResult }) {
 
       {previews.length > 0 && (
         <div className="card-elevated p-4">
-          <div className="mb-2 flex items-center gap-1">
+          <div className="mb-2 flex flex-wrap items-center gap-1">
             {previews.map((p) => (
               <button
                 key={p.order}
-                onClick={() => setActiveOrder(p.order)}
+                onClick={() => { setActiveOrder(p.order); setActiveTab("step") }}
                 className={cn(
                   "rounded-md px-2 py-1 text-[12px] font-medium",
-                  (active?.order ?? previews[0].order) === p.order
+                  activeTab === "step" && (active?.order ?? previews[0].order) === p.order
                     ? "bg-primary/15 text-foreground"
                     : "text-muted-foreground hover:bg-accent hover:text-foreground",
                 )}
@@ -572,8 +631,28 @@ function ResultPane({ result }: { result: SandboxResult }) {
                 <span className="text-[10px] opacity-60">({p.row_count})</span>
               </button>
             ))}
+            {/* Phase-3: consolidated tab — shows the join across steps. */}
+            {previews.length > 1 ? (
+              <button
+                onClick={() => setActiveTab("joined")}
+                className={cn(
+                  "ml-1 rounded-md px-2 py-1 text-[12px] font-medium",
+                  activeTab === "joined"
+                    ? "bg-primary/15 text-foreground"
+                    : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                )}
+                title="Tabela única juntando colunas de todos os passos"
+              >
+                <Link2 className="mr-1 inline h-3 w-3" />
+                Resultado
+              </button>
+            ) : null}
           </div>
-          {active && <PreviewTable rows={active.rows} projected={active.projected} />}
+          {activeTab === "joined" && previews.length > 1 ? (
+            <JoinedResultView result={result} />
+          ) : (
+            active && <PreviewTable rows={active.rows} projected={active.projected} />
+          )}
         </div>
       )}
 
