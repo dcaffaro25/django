@@ -13,7 +13,16 @@ import django.db.models.deletion
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("agent", "0007_merge_20260504_1229"),
+        # Originally depended on the local-only ``0007_merge_20260504_1229``
+        # which was generated when ``makemigrations --merge`` was run
+        # locally to reconcile the BaseModel rollout migrations
+        # (``0003_rename_…``) with this branch's ``0003_conversation_config``.
+        # That merge migration is intentionally untracked because Railway
+        # already has the BaseModel fields applied out-of-band; depending
+        # on it here breaks deploys with NodeNotFoundError. Pointing
+        # straight at ``0006`` lets the new model land cleanly without
+        # entangling the merge graph.
+        ("agent", "0006_agentmessageattachment"),
         ("multitenancy", "0001_initial"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
