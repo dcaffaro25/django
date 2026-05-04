@@ -429,6 +429,17 @@ CELERY_BEAT_SCHEDULE = {
         "options": {"queue": "celery"},
         "kwargs": {"days": 7},
     },
+    # Agent playbooks — Phase 1 wave 3. The task scans active
+    # AgentPlaybook rows whose ``schedule_cron`` has fired since
+    # ``last_run_at`` and dispatches them via run_agent_playbook
+    # (which honours the AGENT_ALLOW_WRITES kill-switch downstream).
+    # 1-minute beat resolution is sufficient — the cron expressions
+    # users write rarely need sub-minute precision.
+    "agent-playbooks-poll": {
+        "task": "agent.tasks.run_due_playbooks",
+        "schedule": crontab(minute="*"),
+        "options": {"queue": "celery"},
+    },
 }
 
 if not os.getenv("REDIS_URL"):
