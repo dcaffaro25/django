@@ -82,19 +82,22 @@ export const agentApi = {
   revokeConnection: () =>
     api.delete<{ detail: string }>("/api/agent/connection/"),
 
-  // -- chat
+  // -- chat (tenant-scoped — server mounts these under /<tenant>/api/agent/
+  // and the api.tenant.* helpers prepend the active tenant subdomain)
   listConversations: () =>
-    api.get<AgentConversation[] | { results: AgentConversation[] }>(
+    api.tenant.get<AgentConversation[] | { results: AgentConversation[] }>(
       "/api/agent/conversations/",
     ),
   getConversation: (id: number) =>
-    api.get<AgentConversationDetail>(`/api/agent/conversations/${id}/`),
+    api.tenant.get<AgentConversationDetail>(`/api/agent/conversations/${id}/`),
   createConversation: (title?: string) =>
-    api.post<AgentConversation>("/api/agent/conversations/", { title: title ?? "" }),
+    api.tenant.post<AgentConversation>("/api/agent/conversations/", { title: title ?? "" }),
   deleteConversation: (id: number) =>
-    api.delete<void>(`/api/agent/conversations/${id}/`),
+    api.tenant.delete<void>(`/api/agent/conversations/${id}/`),
   chat: (id: number, content: string) =>
-    api.post<AgentChatResponse>(`/api/agent/conversations/${id}/chat/`, { content }),
+    api.tenant.post<AgentChatResponse>(
+      `/api/agent/conversations/${id}/chat/`, { content },
+    ),
 
   // -- catalog (informational; widget uses it for "what can the agent do")
   listTools: () => api.get<{ count: number; tools: AgentTool[] }>("/api/agent/tools/"),

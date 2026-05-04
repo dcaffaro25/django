@@ -53,6 +53,12 @@ class TenantMiddleware:
             request.path.startswith('/api/logout') or
             request.path.startswith('/api/core') or
             request.path.startswith('/api/meta') or
+            # Agent /connection/ + /tools/ are platform-wide (superuser
+            # admin + read-only catalog). Conversations + chat live under
+            # /<tenant>/api/agent/ and DO need tenant resolution — this
+            # bypass only matches the platform routes.
+            request.path.startswith('/api/agent/connection') or
+            request.path.startswith('/api/agent/tools') or
             request.path.startswith('/docs') or
             '/knowledge-base' in request.path
         ):
