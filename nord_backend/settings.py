@@ -189,6 +189,7 @@ INSTALLED_APPS = [
     'erp_integrations', # ERP integration pipeline (Omie, etc.)
     'api_meta',         # Introspection / Meta-API for OpenClaw agent
     'mcp_server',       # Stdio MCP server exposing read-only tools (run via mgmt cmd)
+    'agent',            # Internal Sysnord agent (OAuth → OpenAI, chat history)
 ]
 
 MIDDLEWARE = [
@@ -579,3 +580,51 @@ RECONCILIATION_AGENT_AMBIGUITY_GAP = os.getenv(
 RECONCILIATION_AGENT_MIN_CONFIDENCE = os.getenv(
     "RECONCILIATION_AGENT_MIN_CONFIDENCE", "0.50"
 )
+
+
+# ---------------------------------------------------------------------------
+# Internal Sysnord agent (OAuth → OpenAI ChatGPT subscription)
+# ---------------------------------------------------------------------------
+# The ``agent`` app holds **one** OAuth tokenset shared across all tenants
+# and users — that's the singleton in ``agent.models.OpenAITokenStore``.
+# Encryption at rest uses Fernet; the key MUST be set in production. Generate
+# with::
+#
+#     python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+#
+# Rotating it requires re-encrypting the existing token (or just disconnecting
+# and reconnecting via the admin UI).
+AGENT_TOKEN_ENCRYPTION_KEY = os.getenv("AGENT_TOKEN_ENCRYPTION_KEY", "")
+
+# OAuth provider config. The agent app is provider-agnostic — point these
+# at OpenAI's authorization + token endpoints. ``client_secret`` is empty
+# for public clients (PKCE-only); ``scopes`` defaults to OIDC + offline_access
+# so we get a refresh_token + an id_token (for the email/sub displayed in
+# the admin UI).
+OPENAI_OAUTH_AUTH_URL = os.getenv("OPENAI_OAUTH_AUTH_URL", "")
+OPENAI_OAUTH_TOKEN_URL = os.getenv("OPENAI_OAUTH_TOKEN_URL", "")
+OPENAI_OAUTH_CLIENT_ID = os.getenv("OPENAI_OAUTH_CLIENT_ID", "")
+OPENAI_OAUTH_CLIENT_SECRET = os.getenv("OPENAI_OAUTH_CLIENT_SECRET", "")
+OPENAI_OAUTH_REDIRECT_URI = os.getenv(
+    "OPENAI_OAUTH_REDIRECT_URI",
+    "http://localhost:8000/api/agent/connection/callback/",
+)
+OPENAI_OAUTH_SCOPES = os.getenv(
+    "OPENAI_OAUTH_SCOPES",
+    "openid email profile offline_access",
+)
+OPENAI_OAUTH_HTTP_TIMEOUT = float(os.getenv("OPENAI_OAUTH_HTTP_TIMEOUT", "15"))
+
+# Where to send the user's browser after a successful (or failed) OAuth
+# callback — the SPA's "agent connection" page reads ``?connected=1`` /
+# ``?error=…`` from the query string and renders the result.
+OPENAI_OAUTH_POST_CONNECT_REDIRECT = os.getenv(
+    "OPENAI_OAUTH_POST_CONNECT_REDIRECT",
+    "",
+)
+
+# Chat-completion runtime knobs (consumed by Phase 2's OpenAI client).
+OPENAI_API_BASE_URL = os.getenv("OPENAI_API_BASE_URL", "https://api.openai.com")
+OPENAI_DEFAULT_MODEL = os.getenv("OPENAI_DEFAULT_MODEL", "gpt-4o-mini")
+OPENAI_REQUEST_TIMEOUT = float(os.getenv("OPENAI_REQUEST_TIMEOUT", "60"))
+AGENT_MAX_TOOL_ITERATIONS = int(os.getenv("AGENT_MAX_TOOL_ITERATIONS", "8"))
