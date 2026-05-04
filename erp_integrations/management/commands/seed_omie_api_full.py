@@ -397,10 +397,30 @@ _N_PAGINATION_CALLS = {
 
 
 def _build_param_schema(call: str, extra: list) -> list:
+    """Compose the param_schema for a call.
+
+    Consultar* / Obter* / Resumir* endpoints don't paginate — they use
+    chave-style request structures (single record by id, summary blob)
+    that 500 if ``pagina`` is included. So we skip the default
+    pagination block for those prefixes and only stamp ``extra``.
+
+    Listar* / Pesquisar* get the right pagination convention based on
+    whether the call is in ``_N_PAGINATION_CALLS`` (CamelCase) or the
+    default snake_case.
+    """
     by_name: dict[str, dict] = {}
-    pagination = N_PAGINATION_PARAMS if call in _N_PAGINATION_CALLS else PAGINATION_PARAMS
-    for p in pagination:
-        by_name[p["name"]] = dict(p)
+    skip_pagination = (
+        call.startswith("Consultar")
+        or call.startswith("Obter")
+        or call.startswith("Resumir")
+    )
+    if not skip_pagination:
+        pagination = (
+            N_PAGINATION_PARAMS if call in _N_PAGINATION_CALLS
+            else PAGINATION_PARAMS
+        )
+        for p in pagination:
+            by_name[p["name"]] = dict(p)
     for p in extra or []:
         by_name[p["name"]] = dict(p)
     return list(by_name.values())

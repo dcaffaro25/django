@@ -30,7 +30,10 @@ from erp_integrations.services.transform_engine import (
 logger = logging.getLogger(__name__)
 
 MAX_PAGES = 200
-MAX_RETRIES_CONSUMO = 3
+# Bumped from 3 to 5 so we ride out Omie's 425 throttle window without
+# bubbling. With base=2 the wait sequence is 2s, 4s, 8s, 16s, 32s — the
+# typical consumo-redundante window is well under that final attempt.
+MAX_RETRIES_CONSUMO = 5
 RETRY_BASE_SECONDS = 2
 REDACT_PLACEHOLDER = "***REDACTED***"
 
@@ -63,7 +66,18 @@ def _unwrap_omie_response(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _is_consumo_redundante_error(response: requests.Response) -> bool:
-    """Check if response indicates Omie 'consumo redundante' rate limit."""
+    """Check if response indicates an Omie rate-limit error worth retrying.
+
+    Two cases:
+      * **HTTP 500 + ``consumo redundante`` faultstring** — Omie's
+        SOAP-style "you called the same thing too quickly" response.
+      * **HTTP 425 Too Early** — Omie's newer numeric rate-limit code,
+        used in particular when fanout pipelines cascade many calls
+        to the same endpoint in rapid succession.
+    Both deserve the exponential backoff that the caller applies.
+    """
+    if response.status_code == 425:
+        return True
     if response.status_code != 500:
         return False
     try:
