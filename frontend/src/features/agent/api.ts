@@ -51,6 +51,7 @@ export interface AgentMessage {
     content_type: string
     size_bytes: number
     created_at: string
+    summary?: string
   }>
 }
 

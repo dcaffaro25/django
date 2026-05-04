@@ -27,8 +27,8 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import { toast } from "sonner"
 import {
-  ChevronLeft, Eye, FileText, Image as ImageIcon, Loader2, MessageCircle, Paperclip,
-  Plus, Send, Sparkles, Trash2, Wrench, X,
+  AlertCircle, CheckCircle2, ChevronLeft, Eye, FileText, Image as ImageIcon, Loader2,
+  MessageCircle, Paperclip, Plus, Send, Sparkles, Trash2, Wrench, X,
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
@@ -151,11 +151,108 @@ function ActionButtons(props: {
 
 
 // ---------------------------------------------------------------------------
-// Tool-call sidecar (non-UI tools: just a "running tool X" pill)
+// Tool-call sidecar
+//
+// For "calling" rows: just the tool name pill (the agent's about to run it).
+// For "result" rows: parse the tool's JSON response and surface a
+// domain-aware chip — write tools get a "X applied · undo" affordance,
+// reads stay as the simple pill.
 // ---------------------------------------------------------------------------
+
+/** Pull the tool result blob out of a ROLE_TOOL message. The runtime
+ *  stores it as a JSON string in ``content``; bad JSON falls back to
+ *  null. */
+function parseToolResult(msg: AgentMessage): Record<string, unknown> | null {
+  if (msg.role !== "tool") return null
+  const raw = msg.content || ""
+  if (!raw.trim().startsWith("{")) return null
+  try {
+    return JSON.parse(raw) as Record<string, unknown>
+  } catch {
+    return null
+  }
+}
+
+/** Detect a "write tool result" by the audit_id field the runtime
+ *  attaches. Used to choose the rich chip vs the simple one. */
+function isWriteToolResult(parsed: Record<string, unknown> | null): boolean {
+  return !!parsed && typeof parsed["audit_id"] === "number"
+}
+
+function fmtCounter(value: unknown): string {
+  if (typeof value === "number") return value.toLocaleString("pt-BR")
+  return String(value ?? "?")
+}
+
+function WriteResultChip({ msg, parsed }: { msg: AgentMessage; parsed: Record<string, unknown> }) {
+  const tool = msg.tool_name
+  const ok = parsed["ok"] !== false
+  const dryRun = !!parsed["dry_run_effective"]
+  const blocked = !!parsed["blocked_by_policy"]
+  const auditId = parsed["audit_id"] as number | null
+  const undoToken = parsed["undo_token"] as string | null
+  const counters = (parsed["counters"] || {}) as Record<string, unknown>
+  const errorStr = (parsed["error"] || "") as string
+
+  // Domain-specific summary line.
+  let summary = ""
+  if (tool === "run_reconciliation_agent") {
+    const auto = counters["n_auto_accepted"] ?? 0
+    const amb = counters["n_ambiguous"] ?? 0
+    const cand = counters["n_candidates"] ?? 0
+    summary = `${fmtCounter(auto)} aceitos · ${fmtCounter(amb)} ambíguos · ${fmtCounter(cand)} candidatos`
+  } else if (tool === "apply_document_mapping") {
+    const inv = parsed["invoice_id"] as number | null
+    const lines = ((parsed["line_ids"] as unknown[]) || []).length
+    summary = inv ? `Invoice #${inv} criada · ${lines} linha(s)` : `${lines} linha(s) propostas`
+  } else if (tool === "accept_recon_decision") {
+    const reconId = parsed["reconciliation_id"] as number | null
+    summary = reconId ? `Reconciliation #${reconId} criada` : "decisão aceita (proposta)"
+  } else if (tool === "reject_recon_decision") {
+    summary = "rejeição registrada"
+  } else if (tool === "undo_via_audit") {
+    summary = "reversão executada"
+  }
+
+  const tone =
+    !ok          ? "border-red-300 bg-red-50 text-red-800 dark:border-red-800/50 dark:bg-red-900/30 dark:text-red-200"
+    : blocked    ? "border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-800/50 dark:bg-amber-900/30 dark:text-amber-200"
+    : dryRun     ? "border-zinc-300 bg-zinc-50 text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+    : "border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-800/50 dark:bg-emerald-900/30 dark:text-emerald-200"
+
+  const Icon = !ok ? AlertCircle : (dryRun || blocked) ? Eye : CheckCircle2
+
+  return (
+    <div className={cn("my-1 flex max-w-[90%] items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs", tone)}>
+      <Icon className="h-3.5 w-3.5 shrink-0" />
+      <span className="font-mono text-[11px]">{tool}</span>
+      {summary && <span>· {summary}</span>}
+      {dryRun && !blocked && <span className="text-[10px] uppercase opacity-70">· dry-run</span>}
+      {blocked && <span className="text-[10px] uppercase opacity-70">· bloqueado</span>}
+      {!ok && errorStr && (
+        <span className="truncate text-[10px] opacity-80" title={errorStr}>· {errorStr.slice(0, 60)}</span>
+      )}
+      {auditId != null && (
+        <span className="ml-auto text-[10px] opacity-50" title={undoToken ? `undo_token: ${undoToken}` : undefined}>
+          audit #{auditId}{undoToken ? " · ↶" : ""}
+        </span>
+      )}
+    </div>
+  )
+}
+
 function ToolPill({ msg, isResult }: { msg: AgentMessage; isResult: boolean }) {
   const calls = msg.tool_calls ?? []
   const label = isResult ? msg.tool_name : calls[0]?.function?.name ?? "tool"
+
+  // For result rows on write tools, render the rich chip.
+  if (isResult) {
+    const parsed = parseToolResult(msg)
+    if (isWriteToolResult(parsed)) {
+      return <WriteResultChip msg={msg} parsed={parsed!} />
+    }
+  }
+
   return (
     <div className="my-1 flex items-center gap-2 rounded-md border border-zinc-200 bg-zinc-50 px-2.5 py-1.5 text-xs text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900/60 dark:text-zinc-300">
       <Wrench className="h-3.5 w-3.5 shrink-0 text-zinc-500" />
@@ -234,18 +331,26 @@ function MessageRow(props: {
     <div className={cn("flex w-full", isUser ? "justify-end" : "justify-start")}>
       <div className={cn("flex max-w-[85%] flex-col gap-1", isUser ? "items-end" : "items-start")}>
         {attachments.length > 0 && (
-          <div className={cn("flex flex-wrap gap-1.5", isUser ? "justify-end" : "justify-start")}>
+          <div className={cn("flex flex-col gap-1", isUser ? "items-end" : "items-start")}>
             {attachments.map((a) => {
               const Icon = a.kind === "image" ? ImageIcon : FileText
+              const summary = a.summary?.trim()
               return (
                 <div
                   key={a.id}
-                  className="flex max-w-[200px] items-center gap-1.5 rounded-md border border-zinc-200 bg-white px-2 py-1 text-[11px] text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800/60 dark:text-zinc-200"
+                  className="flex max-w-[280px] flex-col gap-0.5 rounded-md border border-zinc-200 bg-white px-2 py-1 text-[11px] text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800/60 dark:text-zinc-200"
                   title={`${a.filename} (${a.kind})`}
                 >
-                  <Icon className="h-3.5 w-3.5 shrink-0" />
-                  <span className="truncate font-medium">{a.filename}</span>
-                  <span className="text-[10px] opacity-60">· {fmtBytes(a.size_bytes)}</span>
+                  <div className="flex items-center gap-1.5">
+                    <Icon className="h-3.5 w-3.5 shrink-0" />
+                    <span className="truncate font-medium">{a.filename}</span>
+                    <span className="text-[10px] opacity-60">· {fmtBytes(a.size_bytes)}</span>
+                  </div>
+                  {summary && (
+                    <div className="ml-5 truncate text-[10px] text-zinc-500 dark:text-zinc-400" title={summary}>
+                      {summary}
+                    </div>
+                  )}
                 </div>
               )
             })}

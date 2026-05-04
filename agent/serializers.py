@@ -47,13 +47,57 @@ class AgentMessageAttachmentSerializer(serializers.ModelSerializer):
 
     No file URL is exposed; the agent operates on attachments by ID
     (via ``ingest_document``) and the chat widget only needs filename
-    + kind + size for the UI chip."""
+    + kind + size + an optional ``summary`` line derived from the
+    cached parser output (e.g. "NF 41651/1 · R$ 173,45 · MAGALU")."""
+
+    summary = serializers.SerializerMethodField()
 
     class Meta:
         from .models import AgentMessageAttachment
         model = AgentMessageAttachment
-        fields = ["id", "kind", "filename", "content_type", "size_bytes", "created_at"]
+        fields = [
+            "id", "kind", "filename", "content_type", "size_bytes",
+            "created_at", "summary",
+        ]
         read_only_fields = fields
+
+    def get_summary(self, obj) -> str:
+        """One-line summary derived from the cached ``extracted_text``.
+
+        Returns "" until ``ingest_document`` has run on the attachment.
+        Each kind has a different shape — this peels the first
+        meaningful line and drops the verbose tail.
+        """
+        from .models import AgentMessageAttachment
+        text = (obj.extracted_text or "").strip()
+        if not text:
+            return ""
+        if obj.kind == AgentMessageAttachment.KIND_NFE_XML:
+            # First three lines of _ingest_nfe_xml's text are:
+            # NF-e <num>/<serie>
+            # Chave: ...
+            # Emissão: ...
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            head = lines[0] if lines else ""
+            valor = next(
+                (l for l in lines if l.lower().startswith("valor total:")), "",
+            ).replace("Valor total:", "").strip()
+            dest = next(
+                (l for l in lines if l.lower().startswith("destinatário:")), "",
+            ).replace("Destinatário:", "").strip()
+            # Truncate counterparty after the corporate name (drop CNPJ).
+            dest_short = dest.split(" (")[0][:40]
+            parts = [head]
+            if valor:
+                parts.append(valor)
+            if dest_short:
+                parts.append(dest_short)
+            return " · ".join(parts)
+        if obj.kind == AgentMessageAttachment.KIND_OFX:
+            # First line: "OFX com N extrato(s):"
+            first = text.splitlines()[0] if text else ""
+            return first.strip()
+        return ""
 
 
 class AgentMessageSerializer(serializers.ModelSerializer):
