@@ -59,6 +59,7 @@ class TenantMiddleware:
             # bypass only matches the platform routes.
             request.path.startswith('/api/agent/connection') or
             request.path.startswith('/api/agent/tools') or
+            request.path.startswith('/api/agent/models') or
             request.path.startswith('/docs') or
             '/knowledge-base' in request.path
         ):

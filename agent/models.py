@@ -239,7 +239,20 @@ class AgentConversation(TenantAwareBaseModel):
     Privacy contract: ``(user, company)`` scopes the row. The list/detail
     endpoints filter on both, so a user switching tenants in the same
     browser session sees a different set of threads.
+
+    Per-conversation knobs (``model``, ``reasoning_effort``,
+    ``include_page_context``) override the global defaults. Empty / False
+    means "fall back to system default" so changing the platform default
+    immediately applies to threads that never opted into a specific value.
     """
+
+    REASONING_EFFORT_CHOICES = [
+        ("", "Default"),
+        ("minimal", "Minimal"),
+        ("low", "Low"),
+        ("medium", "Medium"),
+        ("high", "High"),
+    ]
 
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -248,6 +261,21 @@ class AgentConversation(TenantAwareBaseModel):
     )
     title = models.CharField(max_length=255, blank=True, default="")
     is_archived = models.BooleanField(default=False, db_index=True)
+
+    # Per-conversation overrides — empty = inherit from settings.
+    model = models.CharField(
+        max_length=64, blank=True, default="",
+        help_text="Codex model slug (e.g. gpt-5.5). Empty = OPENAI_DEFAULT_MODEL.",
+    )
+    reasoning_effort = models.CharField(
+        max_length=16, blank=True, default="",
+        choices=REASONING_EFFORT_CHOICES,
+        help_text="Reasoning effort. Empty = no reasoning param sent.",
+    )
+    include_page_context = models.BooleanField(
+        default=False,
+        help_text="If True, the chat endpoint accepts a page_context blob and the runtime injects it into the system prompt.",
+    )
 
     class Meta:
         indexes = [

@@ -122,6 +122,7 @@ class OpenAIClient:
         tools: list[dict[str, Any]] | None = None,
         model: str | None = None,
         session_id: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         """Make one Codex Responses call. Returns a normalised dict::
 
@@ -150,8 +151,9 @@ class OpenAIClient:
                 "Stored token has no chatgpt_account_id — re-run the OAuth login."
             )
 
+        resolved_model = model or getattr(settings, "OPENAI_DEFAULT_MODEL", "gpt-5.5")
         body: dict[str, Any] = {
-            "model": model or getattr(settings, "OPENAI_DEFAULT_MODEL", "gpt-5.5"),
+            "model": resolved_model,
             "store": False,
             "stream": True,
             "instructions": instructions,
@@ -164,6 +166,12 @@ class OpenAIClient:
             body["tools"] = tools
         if session_id:
             body["prompt_cache_key"] = session_id
+        if reasoning_effort:
+            # Silently drop on models that don't accept the reasoning param;
+            # the catalog tells us which do (see models_catalog.supports_reasoning).
+            from agent.services.models_catalog import supports_reasoning
+            if supports_reasoning(resolved_model):
+                body["reasoning"] = {"effort": reasoning_effort, "summary": "auto"}
 
         # First attempt
         response_or_status = self._stream_call(store, body, session_id=session_id)

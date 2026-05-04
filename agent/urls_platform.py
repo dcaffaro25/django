@@ -14,6 +14,7 @@ under the ``/<tenant>/`` prefix so ``TenantMiddleware`` populates
 from django.urls import path
 
 from .views import (
+    AgentModelsCatalogView,
     AgentToolCatalogView,
     OpenAIConnectionImportTokensView,
     OpenAIConnectionView,
@@ -27,4 +28,5 @@ urlpatterns = [
         name="agent-connection-import-tokens",
     ),
     path("tools/", AgentToolCatalogView.as_view(), name="agent-tools"),
+    path("models/", AgentModelsCatalogView.as_view(), name="agent-models"),
 ]
