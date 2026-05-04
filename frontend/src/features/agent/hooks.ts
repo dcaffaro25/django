@@ -154,11 +154,17 @@ export function useSendAgentMessage(conversationId: number) {
  * attachment row's metadata; the caller then passes ``attachment.id``
  * to ``useSendAgentMessage`` via ``attachment_ids: [...]``.
  *
+ * The ``onProgress`` callback fires with 0..100 as bytes are sent —
+ * the widget surfaces it as a real percentage on the attachment chip.
+ *
  * No cache invalidation here — attachments are referenced by message,
  * not surfaced as a top-level list.
  */
 export function useUploadAgentAttachment(conversationId: number) {
   return useMutation({
-    mutationFn: (file: File) => agentApi.uploadAttachment(conversationId, file),
+    mutationFn: ({ file, onProgress }: {
+      file: File
+      onProgress?: (pct: number) => void
+    }) => agentApi.uploadAttachment(conversationId, file, { onProgress }),
   })
 }

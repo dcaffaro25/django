@@ -485,7 +485,7 @@ function ComposerToolbar(props: {
 // "ready to send" state where ``id`` is populated.
 // ---------------------------------------------------------------------------
 type PendingAttachment =
-  | { localId: string; status: "uploading"; file: File }
+  | { localId: string; status: "uploading"; file: File; progress: number }
   | { localId: string; status: "ready"; file: File; attachment: AgentAttachment }
   | { localId: string; status: "error"; file: File; error: string }
 
@@ -509,14 +509,18 @@ function AttachmentChip(props: { att: PendingAttachment; onRemove: () => void })
     : "border-red-300 bg-red-50 text-red-800 dark:border-red-800/50 dark:bg-red-900/30 dark:text-red-200"
   return (
     <div className={cn(
-      "flex max-w-[220px] items-center gap-1.5 rounded-md border px-2 py-1 text-[11px]",
+      "relative flex max-w-[220px] items-center gap-1.5 overflow-hidden rounded-md border px-2 py-1 text-[11px]",
       tone,
     )}>
       {att.status === "uploading"
         ? <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
         : attachmentIcon(att)}
       <span className="truncate font-medium" title={att.file.name}>{att.file.name}</span>
-      <span className="text-[10px] opacity-70">· {fmtBytes(att.file.size)}</span>
+      <span className="text-[10px] opacity-70">
+        {att.status === "uploading"
+          ? `· ${att.progress}%`
+          : `· ${fmtBytes(att.file.size)}`}
+      </span>
       <button
         type="button"
         onClick={props.onRemove}
@@ -525,6 +529,13 @@ function AttachmentChip(props: { att: PendingAttachment; onRemove: () => void })
       >
         <X className="h-3 w-3" />
       </button>
+      {/* Progress fill — narrow strip at the bottom of the chip while uploading */}
+      {att.status === "uploading" && (
+        <div
+          className="absolute bottom-0 left-0 h-[2px] bg-primary/70 transition-all"
+          style={{ width: `${att.progress}%` }}
+        />
+      )}
     </div>
   )
 }
@@ -551,12 +562,22 @@ function ChatThread(props: { conversationId: number }) {
   const includeContext = conv?.include_page_context ?? false
 
   // Upload one file. Adds an "uploading" chip immediately, then transitions
-  // to "ready" or "error" once the server replies.
+  // to "ready" or "error" once the server replies. Progress events update
+  // the chip's strip in real time.
   const uploadFile = async (file: File) => {
     const localId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-    setAttachments((prev) => [...prev, { localId, status: "uploading", file }])
+    setAttachments((prev) => [...prev, { localId, status: "uploading", file, progress: 0 }])
+    const onProgress = (pct: number) => {
+      setAttachments((prev) =>
+        prev.map((a) =>
+          a.localId === localId && a.status === "uploading"
+            ? { ...a, progress: pct }
+            : a,
+        ),
+      )
+    }
     try {
-      const attachment = await uploadMut.mutateAsync(file)
+      const attachment = await uploadMut.mutateAsync({ file, onProgress })
       setAttachments((prev) =>
         prev.map((a) =>
           a.localId === localId

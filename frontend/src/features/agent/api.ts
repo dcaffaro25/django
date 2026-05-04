@@ -163,16 +163,30 @@ export const agentApi = {
 
   /** Upload a single file as a chat attachment — Phase 2. The conversation
    * scopes the file to the right tenant; the chat endpoint then references
-   * the returned ID via ``attachment_ids: [...]``. */
-  uploadAttachment: (conversationId: number, file: File) => {
+   * the returned ID via ``attachment_ids: [...]``.
+   *
+   * Optional ``onProgress`` callback receives a number 0..100 each time
+   * Axios fires its upload-progress event — used by the chip UI to show
+   * a real percentage instead of an indeterminate spinner. */
+  uploadAttachment: (
+    conversationId: number,
+    file: File,
+    opts?: { onProgress?: (pct: number) => void },
+  ) => {
     const fd = new FormData()
     fd.append("file", file)
     return api.tenant.post<AgentAttachment>(
       `/api/agent/conversations/${conversationId}/attachments/`,
       fd,
-      // Let the browser set the multipart boundary by removing the
-      // default JSON Content-Type the api-client interceptor stamps.
-      { headers: { "Content-Type": "multipart/form-data" } },
+      {
+        // Let the browser set the multipart boundary by removing the
+        // default JSON Content-Type the api-client interceptor stamps.
+        headers: { "Content-Type": "multipart/form-data" },
+        onUploadProgress: (event) => {
+          if (!opts?.onProgress || !event.total) return
+          opts.onProgress(Math.round((event.loaded / event.total) * 100))
+        },
+      },
     )
   },
 
