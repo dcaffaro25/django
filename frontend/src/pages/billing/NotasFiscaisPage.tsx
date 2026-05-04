@@ -9,6 +9,7 @@ import {
 } from "@/components/ui/select"
 import { useNotasFiscais } from "@/features/billing"
 import { useDebounced } from "@/lib/useDebounced"
+import { usePageContext } from "@/stores/page-context-store"
 import { cn, formatCurrency, formatDate } from "@/lib/utils"
 
 const FINALIDADE_LABEL: Record<number, string> = {
@@ -86,6 +87,23 @@ export function NotasFiscaisPage() {
     }
     return items
   }, [data, search, finalidade, tipo])
+
+  usePageContext({
+    route: "/billing/nfe",
+    title: "Notas Fiscais",
+    summary: (
+      `Lista de NFs com ${filtered.length} resultados visíveis ` +
+      `(de ${data?.length ?? 0} carregadas).`
+    ),
+    data: {
+      filters: {
+        search: search || undefined,
+        finalidade: finalidade !== "all" ? finalidade : undefined,
+        tipo_operacao: tipo !== "all" ? tipo : undefined,
+      },
+      visible_count: filtered.length,
+    },
+  })
 
   return (
     <div className="space-y-4">

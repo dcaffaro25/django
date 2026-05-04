@@ -63,6 +63,8 @@ class AgentMessageSerializer(serializers.ModelSerializer):
 class AgentConversationSerializer(serializers.ModelSerializer):
     last_message_at = serializers.DateTimeField(source="updated_at", read_only=True)
     message_count = serializers.SerializerMethodField()
+    total_input_tokens = serializers.SerializerMethodField()
+    total_output_tokens = serializers.SerializerMethodField()
 
     class Meta:
         model = AgentConversation
@@ -70,17 +72,37 @@ class AgentConversationSerializer(serializers.ModelSerializer):
             "id",
             "title",
             "is_archived",
+            "model",
+            "reasoning_effort",
+            "include_page_context",
             "created_at",
             "updated_at",
             "last_message_at",
             "message_count",
+            "total_input_tokens",
+            "total_output_tokens",
         ]
-        read_only_fields = ["id", "created_at", "updated_at", "last_message_at", "message_count"]
+        read_only_fields = [
+            "id", "created_at", "updated_at", "last_message_at",
+            "message_count", "total_input_tokens", "total_output_tokens",
+        ]
 
     def get_message_count(self, obj):
-        # The viewset prefetches ``messages_count`` via ``annotate``; fall
-        # back to a query when the annotation isn't there (admin / shell).
         return getattr(obj, "messages_count", obj.messages.count())
+
+    def get_total_input_tokens(self, obj):
+        agg = getattr(obj, "_token_totals", None)
+        if agg is not None:
+            return agg.get("prompt") or 0
+        from django.db.models import Sum
+        return obj.messages.aggregate(s=Sum("prompt_tokens"))["s"] or 0
+
+    def get_total_output_tokens(self, obj):
+        agg = getattr(obj, "_token_totals", None)
+        if agg is not None:
+            return agg.get("completion") or 0
+        from django.db.models import Sum
+        return obj.messages.aggregate(s=Sum("completion_tokens"))["s"] or 0
 
 
 class AgentConversationDetailSerializer(AgentConversationSerializer):

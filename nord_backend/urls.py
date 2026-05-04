@@ -26,7 +26,7 @@ urlpatterns = [
     re_path(r'^admin/?', admin.site.urls),
     re_path(r'^home/?$', views.index, name='index'),
     path('api/meta/', include('api_meta.urls')),
-    path('api/agent/', include('agent.urls')),
+    path('api/agent/', include('agent.urls_platform')),
     # Platform-admin API (NOT the Django /admin/ panel — these are React-
     # facing DRF endpoints at /api/admin/*, gated by IsSuperUser). No
     # tenant prefix on purpose: dcaffaro needs to see every user /
@@ -42,6 +42,10 @@ urlpatterns = [
     re_path(r'^(?P<tenant_id>[^/]+)/', include('inventory.urls')),
     re_path(r'^(?P<tenant_id>[^/]+)/', include('ML.urls')),
     re_path(r'^(?P<tenant_id>[^/]+)/', include('knowledge_base.urls')),
+    # Agent conversations + chat are tenant-scoped — middleware resolves
+    # ``<tenant_id>`` to ``request.tenant``. The /connection/* surface is
+    # platform-wide and lives at /api/agent/connection/* (above).
+    re_path(r'^(?P<tenant_id>[^/]+)/api/agent/', include('agent.urls_tenant')),
     # ERP API routes are merged under accounting/urls.py (api/) so they resolve; a standalone include here never runs.
     #path('api/', include('accounting.urls')),
     # POST /api/token/ → DRF obtain_auth_token: returns {token} for the

@@ -1,35 +1,16 @@
-"""URL configuration for the Sysnord agent app.
+"""Aggregated URL config for the Sysnord agent app.
 
-Mounted under ``/api/agent/`` from :mod:`nord_backend.urls`:
+The actual URL definitions live in two sibling modules:
 
-* ``connection/``                — superuser-only OAuth lifecycle.
-  - GET  → status
-  - DELETE → disconnect
-* ``connection/import-tokens/``  — superuser-only POST that accepts the
-  tokens produced by ``python manage.py openai_oauth_login``.
-* ``conversations/*``            — tenant-user-scoped chat (CRUD + chat).
-* ``tools/``                     — read-only MCP tool catalog.
+* :mod:`agent.urls_platform` — platform-wide endpoints (connection,
+  tools). Mounted at ``/api/agent/`` from ``nord_backend.urls``.
+* :mod:`agent.urls_tenant` — tenant-scoped endpoints (conversations,
+  chat). Mounted at ``/<tenant_id>/api/agent/`` from
+  ``nord_backend.urls`` so ``TenantMiddleware`` resolves the tenant.
+
+This module is kept around for backwards compatibility — anything that
+used to ``include('agent.urls')`` now gets the platform routes. The
+tenant routes must be wired separately in ``nord_backend/urls.py`` to
+get ``request.tenant``.
 """
-from django.urls import include, path
-from rest_framework.routers import DefaultRouter
-
-from .views import (
-    AgentConversationViewSet,
-    AgentToolCatalogView,
-    OpenAIConnectionImportTokensView,
-    OpenAIConnectionView,
-)
-
-router = DefaultRouter()
-router.register(r"conversations", AgentConversationViewSet, basename="agent-conversation")
-
-urlpatterns = [
-    path("connection/", OpenAIConnectionView.as_view(), name="agent-connection"),
-    path(
-        "connection/import-tokens/",
-        OpenAIConnectionImportTokensView.as_view(),
-        name="agent-connection-import-tokens",
-    ),
-    path("tools/", AgentToolCatalogView.as_view(), name="agent-tools"),
-    path("", include(router.urls)),
-]
+from .urls_platform import urlpatterns  # noqa: F401

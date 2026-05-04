@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next"
 import { useVirtualizer } from "@tanstack/react-virtual"
 import { useHotkeys } from "react-hotkeys-hook"
 import { useUrlFilters } from "@/lib/use-url-state"
+import { usePageContext } from "@/stores/page-context-store"
 import { ShortcutHelp } from "@/components/ui/shortcut-help"
 import { SavedFiltersMenu } from "@/components/ui/saved-filters-menu"
 import { toast } from "sonner"
@@ -486,6 +487,27 @@ export function WorkbenchPage() {
     () => rawBankTxs.reduce((s, b) => s + Number(b.amount), 0),
     [rawBankTxs],
   )
+
+  usePageContext({
+    route: "/recon/workbench",
+    title: "Workbench de Conciliação",
+    summary: (
+      `Workbench com ${rawBankTxs.length} transações bancárias e ` +
+      `${(rawJournalEntries ?? []).length} lançamentos contábeis a conciliar.`
+    ),
+    data: {
+      filters: {
+        bank_account_id: filters.bankAccount || undefined,
+        bank_date_from: filters.bankDateFrom || undefined,
+        bank_date_to: filters.bankDateTo || undefined,
+        book_bank_account_id: filters.bookBankAccount || undefined,
+        book_date_from: filters.bookDateFrom || undefined,
+        book_date_to: filters.bookDateTo || undefined,
+      },
+      bank_count: rawBankTxs.length,
+      book_count: (rawJournalEntries ?? []).length,
+    },
+  })
   const bookSumVisible = useMemo(
     () => journalEntries.reduce((s, je) => s + Number(je.transaction_value), 0),
     [journalEntries],

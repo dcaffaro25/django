@@ -153,9 +153,17 @@ class AgentConversationViewSet(viewsets.ModelViewSet):
             raise ValueError("Cannot create conversation without an active tenant.")
         serializer.save(user=self.request.user, company=tenant)
 
+    def get_serializer_context(self):
+        return {**super().get_serializer_context(), "request": self.request}
+
     @action(detail=True, methods=["post"], url_path="chat")
-    def chat(self, request, pk=None):
+    def chat(self, request, pk=None, **kwargs):
         """Send a user message and receive the agent's reply.
+
+        ``**kwargs`` swallows the ``tenant_id`` URL capture that
+        ``TenantMiddleware`` relies on — without it DRF raises
+        ``TypeError: chat() got an unexpected keyword argument 'tenant_id'``
+        when the route is mounted under ``/<tenant_id>/api/agent/``.
 
         Persists the user turn, runs the LLM ↔ tools loop synchronously,
         and returns the full set of new messages produced (user +
@@ -169,26 +177,47 @@ class AgentConversationViewSet(viewsets.ModelViewSet):
         )
 
         conversation = self.get_object()
-        content = (request.data or {}).get("content", "").strip()
+        body = request.data or {}
+        content = (body.get("content") or "").strip()
         if not content:
             return Response(
                 {"detail": "content is required"}, status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Optional per-turn overrides for the conversation's persisted
+        # config. Useful when the user changes the model in the widget
+        # mid-thread without committing it to the conversation row.
+        config_changed_fields: list[str] = []
+        for fname in ("model", "reasoning_effort"):
+            if fname in body and body.get(fname) != getattr(conversation, fname):
+                setattr(conversation, fname, body.get(fname) or "")
+                config_changed_fields.append(fname)
+        if "include_page_context" in body and bool(body["include_page_context"]) != conversation.include_page_context:
+            conversation.include_page_context = bool(body["include_page_context"])
+            config_changed_fields.append("include_page_context")
+
+        # ``page_context``: only honoured if the conversation opts in. The
+        # runtime double-checks via the conversation flag; we forward the
+        # blob unconditionally and let it decide.
+        page_context = body.get("page_context") if conversation.include_page_context else None
+
         with transaction.atomic():
+            if config_changed_fields:
+                conversation.save(update_fields=config_changed_fields + ["updated_at"])
             user_msg = AgentMessage.objects.create(
                 company=conversation.company,
                 conversation=conversation,
                 role=AgentMessage.ROLE_USER,
                 content=content,
             )
-            # Auto-title from the first user message; bounded to 80 chars.
             if not conversation.title:
                 conversation.title = content[:80]
                 conversation.save(update_fields=["title", "updated_at"])
 
         try:
-            result = SysnordAgent(conversation).run_turn(user_message=user_msg)
+            result = SysnordAgent(
+                conversation, page_context=page_context,
+            ).run_turn(user_message=user_msg)
         except AgentRuntimeError as exc:
             log.warning(
                 "agent.chat.runtime_error conv=%s user=%s: %s",
@@ -232,3 +261,23 @@ class AgentToolCatalogView(APIView):
                 for t in TOOLS
             ],
         })
+
+
+class AgentModelsCatalogView(APIView):
+    """GET /api/agent/models/ — what the model dropdown shows.
+
+    Read-only, any authenticated user. The list is curated in
+    :mod:`agent.services.models_catalog`; we don't auto-discover from
+    OpenAI because the Codex API doesn't expose the metadata we want
+    (context window, reasoning support).
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from django.conf import settings as _settings
+        from agent.services.models_catalog import catalog_payload
+
+        return Response(catalog_payload(
+            default_model=getattr(_settings, "OPENAI_DEFAULT_MODEL", "gpt-5.5"),
+        ))
