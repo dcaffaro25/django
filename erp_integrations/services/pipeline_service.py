@@ -649,12 +649,21 @@ def _run_steps(
 def execute_pipeline(
     pipeline_id: int,
     dry_run: bool = False,
+    param_overrides_by_step: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Run a persisted ERPSyncPipeline. Creates an ERPSyncPipelineRun row.
 
     dry_run=True behaves like ERPSyncJob.dry_run: one page per step, no DB
     writes to ERPRawRecord, but still creates a pipeline run record for audit.
+
+    ``param_overrides_by_step``: optional ``{step_order: {field: value}}``.
+    Each override merges INTO the step's stored ``extra_params`` (overrides
+    win on conflict). Used by scheduled tasks that need to inject a
+    rolling date window for incremental sync — e.g.
+    ``{1: {"filtrar_por_alteracao_de": "01/05/2026"}}`` for ListarPedidos.
+    The persisted step's stored params stay unchanged; the override is
+    per-run only.
     """
     pipeline = (
         ERPSyncPipeline.objects.select_related("connection", "connection__provider")
@@ -671,6 +680,14 @@ def execute_pipeline(
         steps = _load_db_steps(pipeline)
     except PipelineConfigError as exc:
         return {"success": False, "error": str(exc)}
+
+    # Apply per-step param overrides if provided. Each StepSpec has
+    # mutable ``extra_params`` we shallow-merge into.
+    if param_overrides_by_step:
+        for step in steps:
+            extra_for_this = param_overrides_by_step.get(step.order)
+            if extra_for_this:
+                step.extra_params = {**(step.extra_params or {}), **extra_for_this}
 
     caps = _PipelineCaps(
         max_pages_per_step=1 if dry_run else MAX_PAGES,

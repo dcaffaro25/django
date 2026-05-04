@@ -440,6 +440,21 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": crontab(minute="*"),
         "options": {"queue": "celery"},
     },
+    # ERP — Omie incremental refresh. Every 4 hours each active Omie
+    # pipeline gets a fresh pass with a date-modified window
+    # (filtrar_por_alteracao_de = last_run.started_at - 1d). The
+    # unique_id_config on each Listar* upserts rows in place — temp
+    # DB stays bounded at the count of distinct external_ids in Omie.
+    # 4h cadence: 6 runs/day, ~24 Omie HTTP calls/day per pipeline,
+    # well under the per-account quota for evolat-scale tenants.
+    # Runs are dispatched in parallel so a slow pipeline doesn't
+    # block the others, but each pipeline self-skips if a run is
+    # already running.
+    "erp-omie-pipelines-refresh": {
+        "task": "erp_integrations.tasks.refresh_all_omie_pipelines",
+        "schedule": crontab(minute=0, hour="*/4"),
+        "options": {"queue": "celery"},
+    },
 }
 
 if not os.getenv("REDIS_URL"):
