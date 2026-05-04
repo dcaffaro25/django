@@ -336,6 +336,56 @@ class AgentMessage(TenantAwareBaseModel):
         return f"AgentMessage(id={self.id}, role={self.role}, conv={self.conversation_id})"
 
 
+class AgentPlaybook(TenantAwareBaseModel):
+    """A saved configuration for a recurring agent action.
+
+    First class of playbook: ``recon`` — saves the knobs for a
+    ``run_reconciliation_agent`` invocation (auto-accept threshold,
+    ambiguity gap, min confidence, scope filters) under a name the
+    agent can recall later. The same row is intended to back an
+    eventual scheduled-task surface (cron-driven monthly close, etc.).
+
+    The action's parameters live in ``params`` as JSON so different
+    playbook kinds can share one model without column proliferation.
+    """
+
+    KIND_RECON = "recon"
+    KIND_CHOICES = [(KIND_RECON, "Reconciliation auto-accept")]
+
+    name = models.CharField(max_length=80)
+    kind = models.CharField(
+        max_length=16, choices=KIND_CHOICES, default=KIND_RECON, db_index=True,
+    )
+    description = models.CharField(max_length=255, blank=True, default="")
+    params = models.JSONField(
+        default=dict, blank=True,
+        help_text=(
+            "Kind-specific params. For 'recon': "
+            "auto_accept_threshold, ambiguity_gap, min_confidence, "
+            "bank_account_id, date_from, date_to, limit."
+        ),
+    )
+    is_active = models.BooleanField(default=True, db_index=True)
+
+    # Optional schedule expression — free-form for now; surfaced through a
+    # follow-up scheduled-tasks integration. Not enforced at the model level.
+    schedule_cron = models.CharField(max_length=64, blank=True, default="")
+
+    last_run_at = models.DateTimeField(null=True, blank=True)
+    last_run_summary = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        unique_together = ("company", "name")
+        indexes = [
+            models.Index(fields=["company", "kind", "is_active"]),
+            models.Index(fields=["company", "-last_run_at"]),
+        ]
+        ordering = ["company", "kind", "name"]
+
+    def __str__(self):
+        return f"AgentPlaybook({self.kind}/{self.name}, company={self.company_id})"
+
+
 class AgentMessageAttachment(TenantAwareBaseModel):
     """A file uploaded by the user inside an agent conversation — Phase 2.
 

@@ -345,6 +345,125 @@ class AgentToolCatalogView(APIView):
         })
 
 
+class AgentAuditToolCallsView(APIView):
+    """GET /api/agent/audit/tool-calls/ — read-only view onto
+    :class:`agent.models.AgentToolCallLog`.
+
+    Filters via query string:
+      * ``conversation`` (id)
+      * ``tool`` (name, exact)
+      * ``status`` (ok/warn/error/rejected)
+      * ``since`` (ISO datetime, returns rows newer than this)
+      * ``limit`` (default 100, max 500)
+
+    Tenant-scoped via ``request.tenant``. Args summaries are already
+    truncated at write time (PII risk bounded), so this surface can
+    safely surface them to operators without further sanitisation.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, **kwargs):
+        from .models import AgentToolCallLog
+
+        tenant = getattr(request, "tenant", None)
+        if tenant is None:
+            return Response({"detail": "tenant not set"}, status=400)
+
+        qs = AgentToolCallLog.objects.filter(company=tenant)
+        conv_id = request.query_params.get("conversation")
+        if conv_id:
+            qs = qs.filter(conversation_id=conv_id)
+        tool = request.query_params.get("tool")
+        if tool:
+            qs = qs.filter(tool_name=tool)
+        st = request.query_params.get("status")
+        if st:
+            qs = qs.filter(status=st)
+        since = request.query_params.get("since")
+        if since:
+            try:
+                from django.utils.dateparse import parse_datetime
+                dt = parse_datetime(since)
+                if dt:
+                    qs = qs.filter(created_at__gte=dt)
+            except Exception:
+                pass
+        limit = min(int(request.query_params.get("limit", 100) or 100), 500)
+
+        rows = [
+            {
+                "id": r.id,
+                "tool_name": r.tool_name,
+                "tool_domain": r.tool_domain,
+                "status": r.status,
+                "args_summary": r.args_summary,
+                "error_type": r.error_type,
+                "error_message": r.error_message,
+                "latency_ms": r.latency_ms,
+                "response_size_bytes": r.response_size_bytes,
+                "iteration": r.iteration,
+                "conversation_id": r.conversation_id,
+                "user_id": r.user_id,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in qs.order_by("-created_at", "-id")[:limit]
+        ]
+        return Response({"count": len(rows), "tool_calls": rows})
+
+
+class AgentAuditWritesView(APIView):
+    """GET /api/agent/audit/writes/ — read-only view onto
+    :class:`agent.models.AgentWriteAudit`.
+
+    Same filter shape as the tool-calls view. Includes
+    ``before_state`` and ``after_state`` JSON blobs for full replay
+    context — these can grow large, so use pagination.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, **kwargs):
+        from .models import AgentWriteAudit
+
+        tenant = getattr(request, "tenant", None)
+        if tenant is None:
+            return Response({"detail": "tenant not set"}, status=400)
+
+        qs = AgentWriteAudit.objects.filter(company=tenant)
+        conv_id = request.query_params.get("conversation")
+        if conv_id:
+            qs = qs.filter(conversation_id=conv_id)
+        tool = request.query_params.get("tool")
+        if tool:
+            qs = qs.filter(tool_name=tool)
+        st = request.query_params.get("status")
+        if st:
+            qs = qs.filter(status=st)
+        limit = min(int(request.query_params.get("limit", 50) or 50), 200)
+
+        rows = [
+            {
+                "id": r.id,
+                "tool_name": r.tool_name,
+                "target_model": r.target_model,
+                "target_ids": r.target_ids,
+                "args_summary": r.args_summary,
+                "before_state": r.before_state,
+                "after_state": r.after_state,
+                "status": r.status,
+                "error_type": r.error_type,
+                "error_message": r.error_message,
+                "undo_token": r.undo_token,
+                "conversation_id": r.conversation_id,
+                "user_id": r.user_id,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in qs.order_by("-created_at", "-id")[:limit]
+        ]
+        return Response({"count": len(rows), "writes": rows})
+
+
 class AgentModelsCatalogView(APIView):
     """GET /api/agent/models/ — what the model dropdown shows.
 

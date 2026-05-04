@@ -1484,11 +1484,19 @@ def run_reconciliation_agent(
         audit_status = "applied"
         undo_token = _uuid.uuid4().hex
 
-    accepted_decision_ids = [
-        d.get("decision_id") for d in (result.decisions or [])
-        if d.get("auto_accept_decision") == "accepted"
-        and d.get("decision_id") is not None
-    ]
+    # Pull the auto-accepted decision IDs from the DB — the in-memory
+    # decision dicts don't include them (the recon service only writes
+    # rows, doesn't echo the PKs back to the result struct).
+    accepted_decision_ids: list[int] = []
+    try:
+        from accounting.models import ReconciliationAgentDecision
+        accepted_decision_ids = list(
+            ReconciliationAgentDecision.objects
+            .filter(run_id=result.run_id, outcome="auto_accepted")
+            .values_list("id", flat=True)
+        )
+    except Exception as exc:
+        log.warning("agent.recon.fetch_decision_ids_failed: %s", exc)
 
     try:
         from agent.models import AgentWriteAudit
@@ -1507,9 +1515,9 @@ def run_reconciliation_agent(
             },
             after_state={
                 "n_auto_accepted": result.n_auto_accepted,
-                "n_proposed": result.n_proposed,
-                "n_review_required": result.n_review_required,
-                "n_skipped": result.n_skipped,
+                "n_ambiguous": result.n_ambiguous,
+                "n_no_match": result.n_no_match,
+                "n_not_applicable": result.n_not_applicable,
             },
             status=audit_status,
             undo_token=undo_token,
@@ -1534,17 +1542,18 @@ def run_reconciliation_agent(
         "counters": {
             "n_candidates": result.n_candidates,
             "n_auto_accepted": result.n_auto_accepted,
-            "n_proposed": result.n_proposed,
-            "n_review_required": result.n_review_required,
-            "n_skipped": result.n_skipped,
+            "n_ambiguous": result.n_ambiguous,
+            "n_no_match": result.n_no_match,
+            "n_not_applicable": result.n_not_applicable,
             "n_errors": result.n_errors,
         },
         "decisions_preview": [
             {
                 "bank_tx_id": d.get("bank_transaction_id"),
-                "decision": d.get("auto_accept_decision"),
-                "confidence": d.get("top_confidence"),
-                "reason": d.get("reason"),
+                "outcome": d.get("outcome"),
+                "top_confidence": d.get("top_confidence"),
+                "second_confidence": d.get("second_confidence"),
+                "reason": d.get("reason") or d.get("error"),
             }
             for d in (result.decisions or [])[:20]
         ],
@@ -2014,6 +2023,158 @@ def _undo_apply_document_mapping(audit, *, dry_run: bool) -> dict[str, Any]:
         "soft_deleted_invoice_ids": invoice_ids,
         "soft_deleted_line_ids": line_ids,
     }
+
+
+# ---------------------------------------------------------------------------
+# Tools: agent playbooks — saved, reusable agent configurations
+# ---------------------------------------------------------------------------
+def list_agent_playbooks(
+    company_id: int,
+    kind: str | None = None,
+    only_active: bool = True,
+) -> dict[str, Any]:
+    """List saved playbooks for the tenant — configurations the agent
+    can replay by name. Filter by ``kind`` (currently only ``recon``)
+    and ``only_active`` to hide soft-deactivated rows.
+
+    Returns name, description, last-run summary, and the params blob
+    so the agent can reason about whether to run-as-is or tweak first."""
+    from agent.models import AgentPlaybook
+
+    qs = AgentPlaybook.objects.filter(company_id=company_id)
+    if only_active:
+        qs = qs.filter(is_active=True)
+    if kind:
+        qs = qs.filter(kind=kind)
+
+    rows = []
+    for p in qs.order_by("kind", "name"):
+        rows.append({
+            "id": p.id,
+            "name": p.name,
+            "kind": p.kind,
+            "description": p.description,
+            "params": p.params or {},
+            "is_active": p.is_active,
+            "schedule_cron": p.schedule_cron,
+            "last_run_at": p.last_run_at.isoformat() if p.last_run_at else None,
+            "last_run_summary": p.last_run_summary or {},
+        })
+    return {"count": len(rows), "playbooks": rows}
+
+
+def save_agent_playbook(
+    company_id: int,
+    name: str,
+    kind: str = "recon",
+    description: str = "",
+    params: dict[str, Any] | None = None,
+    schedule_cron: str = "",
+    is_active: bool = True,
+) -> dict[str, Any]:
+    """Create or update a playbook by ``(company, name)`` — upsert.
+
+    For ``kind='recon'``, ``params`` accepts:
+      auto_accept_threshold, ambiguity_gap, min_confidence,
+      bank_account_id, date_from (ISO), date_to (ISO), limit.
+
+    No live action runs here; this only persists the config. Use
+    ``run_agent_playbook`` to execute, or eventually let the
+    scheduled-tasks layer do it cron-driven.
+    """
+    from agent.models import AgentPlaybook
+    from multitenancy.models import Company
+
+    if not name or not isinstance(name, str):
+        return {"error": "name is required."}
+    if kind not in ("recon",):
+        return {"error": f"Unsupported kind {kind!r}. Supported: 'recon'."}
+
+    try:
+        company = Company.objects.get(id=company_id)
+    except Company.DoesNotExist:
+        return {"error": f"Company {company_id} not found."}
+
+    obj, created = AgentPlaybook.objects.update_or_create(
+        company=company, name=name,
+        defaults={
+            "kind": kind,
+            "description": description[:255],
+            "params": params or {},
+            "schedule_cron": schedule_cron[:64],
+            "is_active": is_active,
+        },
+    )
+    return {
+        "ok": True,
+        "id": obj.id,
+        "created": created,
+        "name": obj.name,
+        "kind": obj.kind,
+    }
+
+
+def run_agent_playbook(
+    company_id: int,
+    name_or_id: str,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Execute a saved playbook. Resolves params from the row and
+    dispatches to the right action handler:
+
+    * ``kind='recon'`` → calls :func:`run_reconciliation_agent` with
+      the saved knobs.
+
+    Honours the same ``AGENT_ALLOW_WRITES`` kill-switch as the
+    underlying tool. Updates the playbook's ``last_run_at`` /
+    ``last_run_summary`` cache after each invocation.
+    """
+    from django.utils import timezone as _tz
+
+    from agent.models import AgentPlaybook
+
+    qs = AgentPlaybook.objects.filter(company_id=company_id, is_active=True)
+    obj: AgentPlaybook | None = None
+    if isinstance(name_or_id, int) or (isinstance(name_or_id, str) and name_or_id.isdigit()):
+        obj = qs.filter(id=int(name_or_id)).first()
+    else:
+        obj = qs.filter(name=name_or_id).first()
+    if obj is None:
+        return {"error": f"No active playbook with name_or_id={name_or_id!r}."}
+
+    if obj.kind == "recon":
+        params = dict(obj.params or {})
+        # Only pass keys that run_reconciliation_agent accepts; ignore
+        # extras to be forgiving with old playbooks.
+        accepted = {
+            "bank_account_id", "date_from", "date_to", "limit",
+            "auto_accept_threshold", "ambiguity_gap", "min_confidence",
+        }
+        clean = {k: v for k, v in params.items() if k in accepted}
+        result = run_reconciliation_agent(
+            company_id=company_id, dry_run=dry_run, **clean,
+        )
+        # Cache a small summary on the playbook so list_agent_playbooks
+        # can show it without re-running.
+        try:
+            obj.last_run_at = _tz.now()
+            obj.last_run_summary = {
+                "dry_run_effective": result.get("dry_run_effective"),
+                "ok": result.get("ok"),
+                "counters": result.get("counters") or {},
+                "audit_id": result.get("audit_id"),
+            }
+            obj.save(update_fields=["last_run_at", "last_run_summary", "updated_at"])
+        except Exception as exc:  # pragma: no cover
+            log.warning("agent.playbook.last_run_save_failed: %s", exc)
+        return {
+            "ok": True,
+            "playbook_id": obj.id,
+            "playbook_name": obj.name,
+            "result": result,
+        }
+
+    return {"error": f"Unknown playbook kind {obj.kind!r}."}
 
 
 # ---------------------------------------------------------------------------
@@ -2914,6 +3075,61 @@ TOOLS: list[ToolDef] = [
         },
     ),
     ToolDef(
+        name="list_agent_playbooks",
+        description="List saved playbooks (named, reusable agent configurations) "
+                    "for the tenant. First kind: 'recon' — pre-configured params "
+                    "for run_reconciliation_agent. Each row shows last_run_summary "
+                    "so the agent can decide whether to re-run or tweak.",
+        handler=list_agent_playbooks,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "company_id": {"type": "integer"},
+                "kind": {"type": "string", "enum": ["recon"]},
+                "only_active": {"type": "boolean", "default": True},
+            },
+            "required": ["company_id"],
+        },
+    ),
+    ToolDef(
+        name="save_agent_playbook",
+        description="Create or update a playbook (upsert by (company, name)). "
+                    "Use it to remember a tuning the user liked — e.g. "
+                    "'monthly_close' with auto_accept_threshold=0.9 — so future "
+                    "turns can run it by name.",
+        handler=save_agent_playbook,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "company_id": {"type": "integer"},
+                "name": {"type": "string"},
+                "kind": {"type": "string", "enum": ["recon"]},
+                "description": {"type": "string"},
+                "params": {"type": "object"},
+                "schedule_cron": {"type": "string"},
+                "is_active": {"type": "boolean", "default": True},
+            },
+            "required": ["company_id", "name"],
+        },
+    ),
+    ToolDef(
+        name="run_agent_playbook",
+        description="Execute a saved playbook by name (or numeric id). For 'recon' "
+                    "kind, runs run_reconciliation_agent with the saved knobs and "
+                    "honours AGENT_ALLOW_WRITES. Updates the playbook's "
+                    "last_run_summary cache.",
+        handler=run_agent_playbook,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "company_id": {"type": "integer"},
+                "name_or_id": {"type": "string"},
+                "dry_run": {"type": "boolean", "default": True},
+            },
+            "required": ["company_id", "name_or_id"],
+        },
+    ),
+    ToolDef(
         name="apply_document_mapping",
         description="Create an Invoice from an ingested NF-e XML attachment, "
                     "using the partner_id resolved by propose_mapping_from_document. "
@@ -3082,6 +3298,9 @@ _TOOL_DOMAINS: dict[str, str] = {
     "undo_via_audit": "recon",
     "propose_mapping_from_document": "billing",
     "apply_document_mapping": "billing",
+    "list_agent_playbooks": "recon",
+    "save_agent_playbook": "recon",
+    "run_agent_playbook": "recon",
     "get_invoice": "billing",
     "list_invoice_critics": "billing",
     "get_nota_fiscal": "fiscal",

@@ -9,11 +9,17 @@ conversation viewset filters its queryset by both ``request.user`` and
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
-from .views import AgentConversationViewSet
+from .views import (
+    AgentAuditToolCallsView,
+    AgentAuditWritesView,
+    AgentConversationViewSet,
+)
 
 router = DefaultRouter()
 router.register(r"conversations", AgentConversationViewSet, basename="agent-conversation")
 
 urlpatterns = [
     path("", include(router.urls)),
+    path("audit/tool-calls/", AgentAuditToolCallsView.as_view(), name="agent-audit-tool-calls"),
+    path("audit/writes/", AgentAuditWritesView.as_view(), name="agent-audit-writes"),
 ]
