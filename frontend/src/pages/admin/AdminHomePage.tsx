@@ -2,7 +2,7 @@ import { useEffect, useState } from "react"
 import { Link } from "react-router-dom"
 import { toast } from "sonner"
 import {
-  Activity, AlertTriangle, Bug, GitBranch, Loader2, Mail, Scale, Server, ShieldCheck, Users,
+  Activity, AlertTriangle, Bug, GitBranch, Loader2, Mail, PlugZap, Scale, Server, ShieldCheck, Users,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { useAuth } from "@/providers/AuthProvider"
@@ -158,6 +158,12 @@ export function AdminHomePage() {
           icon={<Server className="h-4 w-4" />}
           title="Runtime config"
           subtitle="O que os serviços web / worker / beat carregaram ao subir. Atualiza ao vivo."
+        />
+        <AdminCard
+          to="/admin/agent"
+          icon={<PlugZap className="h-4 w-4" />}
+          title="Agente Sysnord"
+          subtitle="Conecta a conta OpenAI compartilhada (OAuth + PKCE) que alimenta o widget de chat."
         />
         <AdminCard
           to="/admin/audit"

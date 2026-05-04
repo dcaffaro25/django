@@ -188,6 +188,8 @@ INSTALLED_APPS = [
     'knowledge_base',   # NotebookLM-like document Q&A with Gemini File Search
     'erp_integrations', # ERP integration pipeline (Omie, etc.)
     'api_meta',         # Introspection / Meta-API for OpenClaw agent
+    'mcp_server',       # Stdio MCP server exposing read-only tools (run via mgmt cmd)
+    'agent',            # Internal Sysnord agent (OAuth → OpenAI, chat history)
 ]
 
 MIDDLEWARE = [
@@ -560,3 +562,67 @@ if not DEBUG:
 # Rate limiting for the OpenClaw token (advisory — enforce via reverse proxy
 # or django-ratelimit in production).
 OPENCLAW_RATE_LIMIT = os.getenv("OPENCLAW_RATE_LIMIT", "600/hour")  # 10 req/min
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation Agent thresholds
+# ---------------------------------------------------------------------------
+# Read by ``accounting/services/reconciliation_agent_service.py``. Each can be
+# overridden per-call (mgmt command flags). Tuned conservatively so v1 only
+# auto-accepts the no-regret cohort; raise after observing the false-positive
+# rate over a populated set of decisions.
+RECONCILIATION_AGENT_AUTO_ACCEPT_THRESHOLD = os.getenv(
+    "RECONCILIATION_AGENT_AUTO_ACCEPT_THRESHOLD", "0.95"
+)
+RECONCILIATION_AGENT_AMBIGUITY_GAP = os.getenv(
+    "RECONCILIATION_AGENT_AMBIGUITY_GAP", "0.10"
+)
+RECONCILIATION_AGENT_MIN_CONFIDENCE = os.getenv(
+    "RECONCILIATION_AGENT_MIN_CONFIDENCE", "0.50"
+)
+
+
+# ---------------------------------------------------------------------------
+# Internal Sysnord agent (OAuth → OpenAI ChatGPT subscription via Codex API)
+# ---------------------------------------------------------------------------
+# Replicates OpenClaw / Codex CLI's auth + API flow — see
+# ``agent/services/oauth_service.py`` and ``openai_client.py`` for the full
+# explanation. Defaults are hardcoded to OpenAI's published Codex constants;
+# everything below is overridable via env for testing or if OpenAI ever
+# changes the values.
+#
+# The OAuth dance happens on the operator's laptop (loopback redirect to
+# ``http://localhost:1455/auth/callback`` is locked into OpenAI's
+# ``client_id``); resulting tokens are POSTed to
+# ``/api/agent/connection/import-tokens/`` for storage.
+
+# Encryption at rest for the singleton ``OpenAITokenStore`` (Fernet).
+# Generate with::
+#
+#     python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+AGENT_TOKEN_ENCRYPTION_KEY = os.getenv("AGENT_TOKEN_ENCRYPTION_KEY", "")
+
+# OAuth (auth.openai.com) — empty values fall back to OpenClaw/Codex
+# CLI defaults inside ``oauth_service``.
+OPENAI_OAUTH_CLIENT_ID = os.getenv("OPENAI_OAUTH_CLIENT_ID", "")
+OPENAI_OAUTH_AUTH_URL = os.getenv("OPENAI_OAUTH_AUTH_URL", "")
+OPENAI_OAUTH_TOKEN_URL = os.getenv("OPENAI_OAUTH_TOKEN_URL", "")
+OPENAI_OAUTH_REDIRECT_URI = os.getenv("OPENAI_OAUTH_REDIRECT_URI", "")
+OPENAI_OAUTH_SCOPES = os.getenv("OPENAI_OAUTH_SCOPES", "")
+OPENAI_OAUTH_ORIGINATOR = os.getenv("OPENAI_OAUTH_ORIGINATOR", "")
+OPENAI_OAUTH_HTTP_TIMEOUT = float(os.getenv("OPENAI_OAUTH_HTTP_TIMEOUT", "15"))
+
+# Codex Responses API runtime — endpoint, headers, defaults.
+OPENAI_CODEX_BASE_URL = os.getenv(
+    "OPENAI_CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex",
+)
+OPENAI_CODEX_RESPONSES_PATH = os.getenv("OPENAI_CODEX_RESPONSES_PATH", "/responses")
+# Must be one of OpenAI's whitelisted originator values
+# (``codex_cli_rs`` / ``codex_vscode`` / ``codex_sdk_ts`` / ``Codex*``);
+# anything else returns 403.
+OPENAI_CODEX_ORIGINATOR = os.getenv("OPENAI_CODEX_ORIGINATOR", "codex_cli_rs")
+OPENAI_CODEX_BETA = os.getenv("OPENAI_CODEX_BETA", "responses=experimental")
+OPENAI_CODEX_USER_AGENT = os.getenv("OPENAI_CODEX_USER_AGENT", "sysnord-agent/1.0")
+OPENAI_DEFAULT_MODEL = os.getenv("OPENAI_DEFAULT_MODEL", "gpt-5")
+OPENAI_REQUEST_TIMEOUT = float(os.getenv("OPENAI_REQUEST_TIMEOUT", "120"))
+AGENT_MAX_TOOL_ITERATIONS = int(os.getenv("AGENT_MAX_TOOL_ITERATIONS", "8"))
