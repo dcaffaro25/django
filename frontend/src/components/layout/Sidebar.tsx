@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next"
 import {
   LayoutDashboard, FileBarChart, FileCog, CreditCard, Users, Boxes,
   Settings, ChevronLeft, PanelLeftOpen, Zap, UploadCloud, Wallet,
-  Activity,
+  Activity, ShoppingBag,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/stores/app-store"
@@ -77,6 +77,8 @@ const GROUPS: NavGroup[] = [
       // Billing visible to viewers (they may want to see invoices).
       // HR / Inventory are write-heavy modules; hide for viewers.
       { key: "billing", label: "Faturamento", path: "/billing", icon: CreditCard },
+      // ERP-side reports backed by Omie pipelines (raw data lake → in-memory join).
+      { key: "erp_pedidos", label: "Pedidos (Omie)", path: "/erp/pedidos", icon: ShoppingBag },
       { key: "hr", label: "RH", path: "/hr", icon: Users, requiresWrite: true },
       { key: "inventory", label: "Estoque", path: "/inventory", icon: Boxes, requiresWrite: true },
     ],
