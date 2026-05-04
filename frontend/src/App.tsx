@@ -52,6 +52,7 @@ import { ActivityAreaDetailPage } from "@/pages/admin/activity/ActivityAreaDetai
 import { ActivityFunnelsPage } from "@/pages/admin/activity/ActivityFunnelsPage"
 import { ActivityFrictionPage } from "@/pages/admin/activity/ActivityFrictionPage"
 import { ErrorsPage as AdminErrorsPage } from "@/pages/admin/activity/ErrorsPage"
+import { AgentConnectionPage } from "@/pages/admin/AgentConnectionPage"
 
 function Protected({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuth()
@@ -161,6 +162,7 @@ export default function App() {
                   <Route path="/admin/activity/users/:id" element={<SuperuserGuard><ActivityUserDetailPage /></SuperuserGuard>} />
                   <Route path="/admin/activity/areas/:id" element={<SuperuserGuard><ActivityAreaDetailPage /></SuperuserGuard>} />
                   <Route path="/admin/runtime" element={<SuperuserGuard><AdminRuntimePage /></SuperuserGuard>} />
+                  <Route path="/admin/agent" element={<SuperuserGuard><AgentConnectionPage /></SuperuserGuard>} />
                   <Route path="/admin/*" element={<SuperuserGuard><AdminHomePage /></SuperuserGuard>} />
                   <Route path="*" element={<Navigate to="/recon" replace />} />
                 </Routes>

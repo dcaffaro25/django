@@ -5,6 +5,7 @@ import { Topbar } from "./Topbar"
 import { CommandPalette } from "./CommandPalette"
 import { ViewAsViewerBanner } from "./ViewAsViewerBanner"
 import { ErrorBoundary } from "@/components/ErrorBoundary"
+import { AgentChatWidget } from "@/components/agent/AgentChatWidget"
 import { useAppStore } from "@/stores/app-store"
 import { useActivityBeacon } from "@/hooks/useActivityBeacon"
 import { installErrorCapture } from "@/lib/error-capture"
@@ -39,6 +40,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         </main>
       </div>
       <CommandPalette />
+      <AgentChatWidget />
     </div>
   )
 }
