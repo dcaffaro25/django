@@ -27,6 +27,7 @@ class OpenAIConnectionStatusSerializer(serializers.ModelSerializer):
             "is_expired",
             "account_email",
             "account_subject",
+            "chatgpt_account_id",
             "scopes",
             "connected_by_username",
             "connected_at",

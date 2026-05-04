@@ -583,48 +583,46 @@ RECONCILIATION_AGENT_MIN_CONFIDENCE = os.getenv(
 
 
 # ---------------------------------------------------------------------------
-# Internal Sysnord agent (OAuth → OpenAI ChatGPT subscription)
+# Internal Sysnord agent (OAuth → OpenAI ChatGPT subscription via Codex API)
 # ---------------------------------------------------------------------------
-# The ``agent`` app holds **one** OAuth tokenset shared across all tenants
-# and users — that's the singleton in ``agent.models.OpenAITokenStore``.
-# Encryption at rest uses Fernet; the key MUST be set in production. Generate
-# with::
+# Replicates OpenClaw / Codex CLI's auth + API flow — see
+# ``agent/services/oauth_service.py`` and ``openai_client.py`` for the full
+# explanation. Defaults are hardcoded to OpenAI's published Codex constants;
+# everything below is overridable via env for testing or if OpenAI ever
+# changes the values.
+#
+# The OAuth dance happens on the operator's laptop (loopback redirect to
+# ``http://localhost:1455/auth/callback`` is locked into OpenAI's
+# ``client_id``); resulting tokens are POSTed to
+# ``/api/agent/connection/import-tokens/`` for storage.
+
+# Encryption at rest for the singleton ``OpenAITokenStore`` (Fernet).
+# Generate with::
 #
 #     python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-#
-# Rotating it requires re-encrypting the existing token (or just disconnecting
-# and reconnecting via the admin UI).
 AGENT_TOKEN_ENCRYPTION_KEY = os.getenv("AGENT_TOKEN_ENCRYPTION_KEY", "")
 
-# OAuth provider config. The agent app is provider-agnostic — point these
-# at OpenAI's authorization + token endpoints. ``client_secret`` is empty
-# for public clients (PKCE-only); ``scopes`` defaults to OIDC + offline_access
-# so we get a refresh_token + an id_token (for the email/sub displayed in
-# the admin UI).
+# OAuth (auth.openai.com) — empty values fall back to OpenClaw/Codex
+# CLI defaults inside ``oauth_service``.
+OPENAI_OAUTH_CLIENT_ID = os.getenv("OPENAI_OAUTH_CLIENT_ID", "")
 OPENAI_OAUTH_AUTH_URL = os.getenv("OPENAI_OAUTH_AUTH_URL", "")
 OPENAI_OAUTH_TOKEN_URL = os.getenv("OPENAI_OAUTH_TOKEN_URL", "")
-OPENAI_OAUTH_CLIENT_ID = os.getenv("OPENAI_OAUTH_CLIENT_ID", "")
-OPENAI_OAUTH_CLIENT_SECRET = os.getenv("OPENAI_OAUTH_CLIENT_SECRET", "")
-OPENAI_OAUTH_REDIRECT_URI = os.getenv(
-    "OPENAI_OAUTH_REDIRECT_URI",
-    "http://localhost:8000/api/agent/connection/callback/",
-)
-OPENAI_OAUTH_SCOPES = os.getenv(
-    "OPENAI_OAUTH_SCOPES",
-    "openid email profile offline_access",
-)
+OPENAI_OAUTH_REDIRECT_URI = os.getenv("OPENAI_OAUTH_REDIRECT_URI", "")
+OPENAI_OAUTH_SCOPES = os.getenv("OPENAI_OAUTH_SCOPES", "")
+OPENAI_OAUTH_ORIGINATOR = os.getenv("OPENAI_OAUTH_ORIGINATOR", "")
 OPENAI_OAUTH_HTTP_TIMEOUT = float(os.getenv("OPENAI_OAUTH_HTTP_TIMEOUT", "15"))
 
-# Where to send the user's browser after a successful (or failed) OAuth
-# callback — the SPA's "agent connection" page reads ``?connected=1`` /
-# ``?error=…`` from the query string and renders the result.
-OPENAI_OAUTH_POST_CONNECT_REDIRECT = os.getenv(
-    "OPENAI_OAUTH_POST_CONNECT_REDIRECT",
-    "",
+# Codex Responses API runtime — endpoint, headers, defaults.
+OPENAI_CODEX_BASE_URL = os.getenv(
+    "OPENAI_CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex",
 )
-
-# Chat-completion runtime knobs (consumed by Phase 2's OpenAI client).
-OPENAI_API_BASE_URL = os.getenv("OPENAI_API_BASE_URL", "https://api.openai.com")
-OPENAI_DEFAULT_MODEL = os.getenv("OPENAI_DEFAULT_MODEL", "gpt-4o-mini")
-OPENAI_REQUEST_TIMEOUT = float(os.getenv("OPENAI_REQUEST_TIMEOUT", "60"))
+OPENAI_CODEX_RESPONSES_PATH = os.getenv("OPENAI_CODEX_RESPONSES_PATH", "/responses")
+# Must be one of OpenAI's whitelisted originator values
+# (``codex_cli_rs`` / ``codex_vscode`` / ``codex_sdk_ts`` / ``Codex*``);
+# anything else returns 403.
+OPENAI_CODEX_ORIGINATOR = os.getenv("OPENAI_CODEX_ORIGINATOR", "codex_cli_rs")
+OPENAI_CODEX_BETA = os.getenv("OPENAI_CODEX_BETA", "responses=experimental")
+OPENAI_CODEX_USER_AGENT = os.getenv("OPENAI_CODEX_USER_AGENT", "sysnord-agent/1.0")
+OPENAI_DEFAULT_MODEL = os.getenv("OPENAI_DEFAULT_MODEL", "gpt-5")
+OPENAI_REQUEST_TIMEOUT = float(os.getenv("OPENAI_REQUEST_TIMEOUT", "120"))
 AGENT_MAX_TOOL_ITERATIONS = int(os.getenv("AGENT_MAX_TOOL_ITERATIONS", "8"))

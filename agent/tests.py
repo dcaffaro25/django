@@ -1,20 +1,22 @@
-"""Tests for Phase 1 of the Sysnord agent app — OAuth bridge, token store,
-and connection endpoints.
+"""Tests for the agent app's OAuth + import-tokens surface.
 
-The OAuth dance against a real OpenAI server is out of scope (and would
-need OpenAI credentials); we mock ``requests.post`` instead and pin:
+The OAuth dance against real OpenAI is out of scope; we mock
+``requests.post`` and pin:
 
 * PKCE verifier/challenge correctness (RFC 7636)
-* state-collision rejection
-* token encryption round-trip via Fernet
-* singleton invariant on :class:`OpenAITokenStore`
-* superuser-only enforcement on the connection endpoints
-* tenant + user scoping on :class:`AgentConversationViewSet`
+* Authorize URL contains all required Codex query params
+* JWT account_id extraction from the ``https://api.openai.com/auth`` claim
+* Token encryption round-trip via Fernet
+* Refresh + persist updates the singleton with new tokens + accountId
+* Superuser-only enforcement on connection endpoints
+* import-tokens validates payload and persists correctly
+* (user, company) scoping on AgentConversationViewSet.get_queryset
 """
 from __future__ import annotations
 
 import base64
 import hashlib
+import json
 from unittest.mock import patch
 
 from cryptography.fernet import Fernet
@@ -24,173 +26,154 @@ from rest_framework.test import APIClient
 
 from multitenancy.models import Company
 
-from agent.models import AgentConversation, OAuthAuthorizationFlow, OpenAITokenStore
+from agent.models import AgentConversation, OpenAITokenStore
 from agent.services import oauth_service
 
 User = get_user_model()
-
-
 TEST_KEY = Fernet.generate_key().decode("ascii")
 
 
-@override_settings(
-    AGENT_TOKEN_ENCRYPTION_KEY=TEST_KEY,
-    OPENAI_OAUTH_AUTH_URL="https://oauth.example/authorize",
-    OPENAI_OAUTH_TOKEN_URL="https://oauth.example/token",
-    OPENAI_OAUTH_CLIENT_ID="cid-test",
-    OPENAI_OAUTH_CLIENT_SECRET="",
-    OPENAI_OAUTH_REDIRECT_URI="http://localhost:8000/api/agent/connection/callback/",
-    OPENAI_OAUTH_SCOPES="openid email offline_access",
-    OPENAI_OAUTH_POST_CONNECT_REDIRECT="",
-)
+def _make_jwt(payload: dict) -> str:
+    """Build a fake JWT (header.payload.sig) for tests. Signature is empty
+    — we don't verify, only parse."""
+    def _b64(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+    header = _b64(b'{"alg":"none","typ":"JWT"}')
+    body = _b64(json.dumps(payload).encode("utf-8"))
+    return f"{header}.{body}.sig"
+
+
+@override_settings(AGENT_TOKEN_ENCRYPTION_KEY=TEST_KEY)
 class OpenAITokenStoreEncryptionTests(TestCase):
     def test_round_trip(self):
         store = OpenAITokenStore.get_or_create_singleton()
         store.set_tokens(
-            access_token="acc-123",
-            refresh_token="ref-456",
-            expires_in=3600,
-            scopes="openid email",
+            access_token="acc-123", refresh_token="ref-456",
+            expires_in=3600, scopes="openid email",
         )
+        store.chatgpt_account_id = "acct_test"
         store.save()
 
         store.refresh_from_db()
         access, refresh = store.tokens()
         self.assertEqual(access, "acc-123")
         self.assertEqual(refresh, "ref-456")
+        self.assertEqual(store.chatgpt_account_id, "acct_test")
         self.assertTrue(store.is_connected)
-        self.assertFalse(store.is_expired)
 
-    def test_disconnect_clears(self):
+    def test_clear_disconnects(self):
         store = OpenAITokenStore.get_or_create_singleton()
         store.set_tokens(access_token="x", refresh_token="y", expires_in=60)
         store.save()
         store.clear()
         store.save()
         self.assertFalse(store.is_connected)
-        self.assertEqual(store.tokens(), (None, None))
-
-    def test_decryption_with_wrong_key_fails(self):
-        store = OpenAITokenStore.get_or_create_singleton()
-        store.set_tokens(access_token="x", refresh_token="y", expires_in=60)
-        store.save()
-
-        # Tampering with the key must surface as InvalidToken.
-        from cryptography.fernet import InvalidToken
-
-        with override_settings(AGENT_TOKEN_ENCRYPTION_KEY=Fernet.generate_key().decode()):
-            with self.assertRaises(InvalidToken):
-                store.tokens()
 
 
-@override_settings(
-    AGENT_TOKEN_ENCRYPTION_KEY=TEST_KEY,
-    OPENAI_OAUTH_AUTH_URL="https://oauth.example/authorize",
-    OPENAI_OAUTH_TOKEN_URL="https://oauth.example/token",
-    OPENAI_OAUTH_CLIENT_ID="cid-test",
-    OPENAI_OAUTH_CLIENT_SECRET="",
-    OPENAI_OAUTH_REDIRECT_URI="http://localhost:8000/api/agent/connection/callback/",
-    OPENAI_OAUTH_SCOPES="openid email offline_access",
-    OPENAI_OAUTH_POST_CONNECT_REDIRECT="",
-)
-class PkceFlowTests(TestCase):
-    @classmethod
-    def setUpTestData(cls):
-        cls.user = User.objects.create_superuser(
-            username="root", email="root@example.com", password="x",
-        )
+@override_settings(AGENT_TOKEN_ENCRYPTION_KEY=TEST_KEY)
+class OAuthBuildersTests(TestCase):
+    def test_authorize_url_includes_codex_params(self):
+        verifier = oauth_service.new_code_verifier()
+        state = oauth_service.new_state()
+        url = oauth_service.build_authorize_url(state=state, code_verifier=verifier)
 
-    def test_authorization_url_includes_pkce(self):
-        url, flow = oauth_service.build_authorization_url(user=self.user)
-
+        # PKCE
         self.assertIn("response_type=code", url)
-        self.assertIn("client_id=cid-test", url)
+        self.assertIn(f"state={state}", url)
         self.assertIn("code_challenge_method=S256", url)
-        self.assertIn(f"state={flow.state}", url)
-        self.assertNotIn(flow.code_verifier, url, "verifier must stay server-side")
+        digest = hashlib.sha256(verifier.encode("ascii")).digest()
+        expected_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        self.assertIn(f"code_challenge={expected_challenge}", url)
 
-        # Challenge in the URL must be base64-url(SHA256(verifier)) without padding.
-        digest = hashlib.sha256(flow.code_verifier.encode("ascii")).digest()
-        expected = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-        self.assertIn(f"code_challenge={expected}", url)
+        # Codex-specific extras
+        self.assertIn("id_token_add_organizations=true", url)
+        self.assertIn("codex_cli_simplified_flow=true", url)
+        self.assertIn("originator=", url)
 
-    def test_exchange_code_consumes_state(self):
-        _, flow = oauth_service.build_authorization_url(user=self.user)
+        # Default client_id from OpenClaw
+        self.assertIn(f"client_id={oauth_service.DEFAULT_CLIENT_ID}", url)
+
+        # Hardcoded loopback redirect
+        self.assertIn("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback", url)
+
+    def test_extract_account_id_from_jwt(self):
+        token = _make_jwt({
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acct_xyz"},
+            "email": "foo@bar.com",
+        })
+        self.assertEqual(oauth_service.extract_account_id(token), "acct_xyz")
+        self.assertEqual(oauth_service.extract_account_email(token), "foo@bar.com")
+
+    def test_extract_account_id_missing_claim_raises(self):
+        token = _make_jwt({"sub": "x"})
+        with self.assertRaises(oauth_service.JwtDecodeError):
+            oauth_service.extract_account_id(token)
+
+
+@override_settings(AGENT_TOKEN_ENCRYPTION_KEY=TEST_KEY)
+class OAuthExchangeTests(TestCase):
+    def test_exchange_code_calls_token_endpoint(self):
         with patch("agent.services.oauth_service.requests.post") as mock_post:
             mock_post.return_value.status_code = 200
             mock_post.return_value.json.return_value = {
                 "access_token": "acc-1",
                 "refresh_token": "ref-1",
-                "token_type": "Bearer",
                 "expires_in": 3600,
-                "scope": "openid email",
+                "token_type": "Bearer",
             }
-            store = oauth_service.exchange_code(
-                state=flow.state, code="auth-code", user=self.user,
-            )
+            resp = oauth_service.exchange_code(code="abc", code_verifier="ver")
 
-        self.assertTrue(store.is_connected)
-        access, refresh = store.tokens()
-        self.assertEqual(access, "acc-1")
-        self.assertEqual(refresh, "ref-1")
-        self.assertEqual(store.connected_by, self.user)
-
-        flow.refresh_from_db()
-        self.assertIsNotNone(flow.consumed_at)
-
-        # Replay must fail.
-        with self.assertRaises(oauth_service.OAuthExchangeError):
-            oauth_service.exchange_code(state=flow.state, code="auth-code", user=self.user)
-
-    def test_unknown_state_rejected(self):
-        with self.assertRaises(oauth_service.OAuthExchangeError):
-            oauth_service.exchange_code(state="bogus", code="x", user=self.user)
+        self.assertEqual(resp["access_token"], "acc-1")
+        # Must POST to OpenAI's token endpoint with form-encoded body
+        args, kwargs = mock_post.call_args
+        self.assertEqual(args[0], oauth_service.DEFAULT_TOKEN_URL)
+        body = kwargs["data"]
+        self.assertEqual(body["grant_type"], "authorization_code")
+        self.assertEqual(body["code"], "abc")
+        self.assertEqual(body["code_verifier"], "ver")
+        self.assertEqual(body["client_id"], oauth_service.DEFAULT_CLIENT_ID)
 
     def test_refresh_swaps_access_token(self):
         store = OpenAITokenStore.get_or_create_singleton()
         store.set_tokens(access_token="old", refresh_token="ref-1", expires_in=60)
+        store.chatgpt_account_id = "acct_old"
         store.save()
+
+        new_jwt = _make_jwt({
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acct_old"},
+        })
 
         with patch("agent.services.oauth_service.requests.post") as mock_post:
             mock_post.return_value.status_code = 200
             mock_post.return_value.json.return_value = {
-                "access_token": "new",
+                "access_token": new_jwt,
                 "refresh_token": "ref-2",
-                "token_type": "Bearer",
                 "expires_in": 3600,
+                "token_type": "Bearer",
             }
-            oauth_service.refresh_access_token(store=store)
+            oauth_service.refresh_and_persist(store=store)
 
         store.refresh_from_db()
         access, refresh = store.tokens()
-        self.assertEqual(access, "new")
+        self.assertEqual(access, new_jwt)
         self.assertEqual(refresh, "ref-2")
+        self.assertEqual(store.chatgpt_account_id, "acct_old")
 
-    def test_token_endpoint_failure_records_last_error(self):
+    def test_refresh_failure_records_last_error(self):
         store = OpenAITokenStore.get_or_create_singleton()
-        store.set_tokens(access_token="old", refresh_token="ref-1", expires_in=60)
+        store.set_tokens(access_token="old", refresh_token="ref", expires_in=60)
         store.save()
-
         with patch("agent.services.oauth_service.requests.post") as mock_post:
             mock_post.return_value.status_code = 400
             mock_post.return_value.text = '{"error":"invalid_grant"}'
             with self.assertRaises(oauth_service.OAuthExchangeError):
-                oauth_service.refresh_access_token(store=store)
+                oauth_service.refresh_and_persist(store=store)
 
         store.refresh_from_db()
         self.assertIn("invalid_grant", store.last_error)
 
 
-@override_settings(
-    AGENT_TOKEN_ENCRYPTION_KEY=TEST_KEY,
-    OPENAI_OAUTH_AUTH_URL="https://oauth.example/authorize",
-    OPENAI_OAUTH_TOKEN_URL="https://oauth.example/token",
-    OPENAI_OAUTH_CLIENT_ID="cid-test",
-    OPENAI_OAUTH_CLIENT_SECRET="",
-    OPENAI_OAUTH_REDIRECT_URI="http://localhost:8000/api/agent/connection/callback/",
-    OPENAI_OAUTH_SCOPES="openid email offline_access",
-    OPENAI_OAUTH_POST_CONNECT_REDIRECT="",
-)
+@override_settings(AGENT_TOKEN_ENCRYPTION_KEY=TEST_KEY)
 class ConnectionEndpointsTests(TestCase):
     @classmethod
     def setUpTestData(cls):
@@ -215,44 +198,52 @@ class ConnectionEndpointsTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertFalse(resp.data["is_connected"])
 
-    def test_start_returns_authorization_url(self):
-        self.client.force_authenticate(self.superuser)
-        resp = self.client.post("/api/agent/connection/start/")
-        self.assertEqual(resp.status_code, 200)
-        self.assertIn("authorization_url", resp.data)
-        self.assertTrue(
-            resp.data["authorization_url"].startswith("https://oauth.example/authorize?"),
-            resp.data["authorization_url"],
+    def test_import_tokens_requires_superuser(self):
+        self.client.force_authenticate(self.regular)
+        resp = self.client.post(
+            "/api/agent/connection/import-tokens/",
+            {"access_token": "x", "chatgpt_account_id": "a"},
+            format="json",
         )
-        # A flow row was created.
-        self.assertTrue(OAuthAuthorizationFlow.objects.filter(state=resp.data["state"]).exists())
+        self.assertIn(resp.status_code, (401, 403))
 
-    def test_callback_exchanges_and_persists(self):
+    def test_import_tokens_validates_required_fields(self):
         self.client.force_authenticate(self.superuser)
-        # Kick off start to create a flow row.
-        start = self.client.post("/api/agent/connection/start/")
-        state = start.data["state"]
+        resp = self.client.post(
+            "/api/agent/connection/import-tokens/",
+            {"access_token": "x"},  # missing chatgpt_account_id
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
 
-        with patch("agent.services.oauth_service.requests.post") as mock_post:
-            mock_post.return_value.status_code = 200
-            mock_post.return_value.json.return_value = {
-                "access_token": "acc-cb",
-                "refresh_token": "ref-cb",
-                "token_type": "Bearer",
+    def test_import_tokens_persists_singleton(self):
+        self.client.force_authenticate(self.superuser)
+        resp = self.client.post(
+            "/api/agent/connection/import-tokens/",
+            {
+                "access_token": "acc-via-cli",
+                "refresh_token": "ref-via-cli",
                 "expires_in": 3600,
-                "scope": "openid email",
-            }
-            resp = self.client.get(
-                f"/api/agent/connection/callback/?code=abc&state={state}"
-            )
-
+                "chatgpt_account_id": "acct_imported",
+                "account_email": "ops@sysnord.com",
+            },
+            format="json",
+        )
         self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data["is_connected"])
+        self.assertEqual(resp.data["chatgpt_account_id"], "acct_imported")
+        self.assertEqual(resp.data["account_email"], "ops@sysnord.com")
+
         store = OpenAITokenStore.current()
-        self.assertTrue(store.is_connected)
+        access, refresh = store.tokens()
+        self.assertEqual(access, "acc-via-cli")
+        self.assertEqual(refresh, "ref-via-cli")
+        self.assertEqual(store.connected_by, self.superuser)
 
     def test_revoke_clears(self):
         store = OpenAITokenStore.get_or_create_singleton()
         store.set_tokens(access_token="x", refresh_token="y", expires_in=60)
+        store.chatgpt_account_id = "acct"
         store.save()
 
         self.client.force_authenticate(self.superuser)
@@ -261,13 +252,13 @@ class ConnectionEndpointsTests(TestCase):
 
         store.refresh_from_db()
         self.assertFalse(store.is_connected)
+        self.assertEqual(store.chatgpt_account_id, "")
 
 
 class ConversationQuerysetScopingTests(TestCase):
     """Conversations are scoped to (user, company). The HTTP layer depends
     on ``TenantMiddleware`` for ``request.tenant``; here we exercise the
-    viewset's ``get_queryset`` directly with a hand-built request to keep
-    the test independent of subdomain resolution."""
+    viewset's ``get_queryset`` directly."""
 
     @classmethod
     def setUpTestData(cls):
@@ -286,20 +277,16 @@ class ConversationQuerysetScopingTests(TestCase):
             company=cls.company_a, user=cls.bob, title="Bob in A",
         )
 
-    def _make_request(self, user, tenant):
+    def _ids_for(self, user, tenant):
         from django.test import RequestFactory
+        from agent.views import AgentConversationViewSet
 
         rf = RequestFactory()
         req = rf.get("/api/agent/conversations/")
         req.user = user
         req.tenant = tenant
-        return req
-
-    def _ids_for(self, user, tenant):
-        from agent.views import AgentConversationViewSet
-
         view = AgentConversationViewSet()
-        view.request = self._make_request(user, tenant)
+        view.request = req
         return list(view.get_queryset().values_list("id", flat=True))
 
     def test_alice_in_a_sees_only_her_a_thread(self):

@@ -15,17 +15,13 @@ export interface AgentConnectionStatus {
   is_expired: boolean
   account_email: string
   account_subject: string
+  chatgpt_account_id: string
   scopes: string
   connected_by_username: string | null
   connected_at: string | null
   last_refreshed_at: string | null
   expires_at: string | null
   last_error: string
-}
-
-export interface AgentConnectionStartResponse {
-  authorization_url: string
-  state: string
 }
 
 // ---------------------------------------------------------------------------
@@ -83,8 +79,6 @@ export const agentApi = {
   // -- connection
   getConnectionStatus: () =>
     api.get<AgentConnectionStatus>("/api/agent/connection/"),
-  startConnection: () =>
-    api.post<AgentConnectionStartResponse>("/api/agent/connection/start/"),
   revokeConnection: () =>
     api.delete<{ detail: string }>("/api/agent/connection/"),
 

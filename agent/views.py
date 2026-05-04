@@ -2,26 +2,21 @@
 
 Two clusters:
 
-1. **Connection** — superuser-only. ``/api/agent/connection/{status,start,
-   callback,revoke}/``. Manages the singleton :class:`OpenAITokenStore`.
+1. **Connection** — superuser-only. ``/api/agent/connection/{,/import-tokens}``.
+   Manages the singleton :class:`OpenAITokenStore`. The OAuth dance itself
+   happens client-side (``python manage.py openai_oauth_login``); this
+   surface only accepts the resulting tokens for storage.
 2. **Chat** — any authenticated tenant user. ``/api/agent/conversations/``
    list/detail + ``.../chat/`` to send a message and receive the agent's
    reply. Scoped to ``(request.user, request.tenant)``.
-
-The chat surface lives in this file but the actual agent loop is in
-:mod:`agent.services.agent_runtime` (Phase 2). For now (Phase 1) the chat
-endpoints reject with a clear message until the runtime ships, so the
-frontend can be built against a known-good API shape.
 """
 from __future__ import annotations
 
 import logging
 
-from django.conf import settings
 from django.db import transaction
 from django.db.models import Count
-from django.http import HttpResponseRedirect
-from rest_framework import permissions, status, viewsets
+from rest_framework import permissions, serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -45,13 +40,7 @@ log = logging.getLogger(__name__)
 # Connection (superuser-only)
 # ---------------------------------------------------------------------------
 class OpenAIConnectionView(APIView):
-    """GET = status, DELETE = revoke. Superuser-only.
-
-    The two POSTs (start + callback) are sibling :class:`APIView` classes
-    because the OAuth callback is hit by the user's browser following a
-    redirect, not by our SPA — keeping it on a separate route makes the
-    URLconf clearer.
-    """
+    """GET = status, DELETE = revoke. Superuser-only."""
 
     permission_classes = [IsSuperUser]
 
@@ -67,81 +56,69 @@ class OpenAIConnectionView(APIView):
         store.clear()
         store.connected_by = None
         store.connected_at = None
+        store.chatgpt_account_id = ""
         store.last_error = ""
         store.save()
         log.info("agent.oauth.revoked by user=%s", request.user.id)
         return Response({"detail": "Disconnected."})
 
 
-class OpenAIConnectionStartView(APIView):
-    """POST: start the PKCE flow, return the OpenAI authorization URL.
+class _ImportTokensSerializer(serializers.Serializer):
+    """Payload accepted by :class:`OpenAIConnectionImportTokensView`.
 
-    The frontend should ``window.open(url)`` (or full-redirect) so the user
-    lands on OpenAI's consent screen. After consent OpenAI sends them to
-    :class:`OpenAIConnectionCallbackView`.
-    """
+    Mirrors the dict the ``openai_oauth_login`` mgmt command POSTs after
+    completing the loopback OAuth dance. ``chatgpt_account_id`` is the
+    only true secret-derived field we care about beyond the tokens
+    themselves; ``account_email`` is cosmetic."""
+
+    access_token = serializers.CharField(max_length=8192)
+    refresh_token = serializers.CharField(max_length=8192, required=False, allow_blank=True)
+    expires_in = serializers.IntegerField(required=False, allow_null=True, min_value=0)
+    chatgpt_account_id = serializers.CharField(max_length=255)
+    account_email = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    id_token = serializers.CharField(max_length=8192, required=False, allow_blank=True)
+
+
+class OpenAIConnectionImportTokensView(APIView):
+    """POST: accept tokens obtained client-side via the loopback OAuth flow.
+
+    The CLI (``python manage.py openai_oauth_login``) does the dance against
+    OpenAI's auth server, then POSTs the result here. Superuser-only.
+
+    We never see the OAuth code or PKCE verifier — only the final tokens
+    the OAuth server granted them. This keeps Sysnord out of the OAuth
+    redirect path entirely (which is needed because OpenAI's Codex
+    ``client_id`` is locked to ``http://localhost:1455/auth/callback``)."""
 
     permission_classes = [IsSuperUser]
 
     def post(self, request):
+        ser = _ImportTokensSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        v = ser.validated_data
+
         try:
-            url, flow = oauth_service.build_authorization_url(user=request.user)
-        except oauth_service.OAuthConfigError as exc:
-            return Response(
-                {"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE
+            store = oauth_service.persist_tokens(
+                access_token=v["access_token"],
+                refresh_token=v.get("refresh_token") or None,
+                expires_in=v.get("expires_in"),
+                chatgpt_account_id=v["chatgpt_account_id"],
+                account_email=v.get("account_email", ""),
+                id_token=v.get("id_token") or None,
+                connected_by=request.user,
             )
-        return Response({"authorization_url": url, "state": flow.state})
+        except Exception as exc:
+            log.exception("agent.oauth.import_tokens failed: %s", exc)
+            return Response(
+                {"detail": f"Failed to persist tokens: {exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
-
-class OpenAIConnectionCallbackView(APIView):
-    """GET handler for the OAuth redirect.
-
-    OpenAI sends the user back to this URL with ``?code=…&state=…``. We
-    exchange the code for tokens and then redirect the browser to the
-    admin page configured in ``settings.OPENAI_OAUTH_POST_CONNECT_REDIRECT``
-    (or return JSON if no redirect target is set, useful for tests).
-
-    Auth note: this endpoint cannot rely on the SPA's Authorization header
-    — the browser is following a 302 from OpenAI. We require an
-    authenticated session via Django's session middleware. ``IsSuperUser``
-    is still enforced; if the cookie is gone we return 403 and the
-    operator has to reconnect.
-    """
-
-    permission_classes = [IsSuperUser]
-
-    def get(self, request):
-        code = request.GET.get("code")
-        state = request.GET.get("state")
-        error = request.GET.get("error")
-        error_desc = request.GET.get("error_description", "")
-
-        if error:
-            return self._fail(f"OpenAI returned error: {error} — {error_desc}")
-        if not code or not state:
-            return self._fail("Missing code/state in OAuth callback.")
-
-        try:
-            store = oauth_service.exchange_code(state=state, code=code, user=request.user)
-        except oauth_service.OAuthExchangeError as exc:
-            return self._fail(str(exc))
-        except oauth_service.OAuthConfigError as exc:
-            return self._fail(str(exc))
-
-        log.info("agent.oauth.connected account=%s by user=%s", store.account_email, request.user.id)
-
-        target = getattr(settings, "OPENAI_OAUTH_POST_CONNECT_REDIRECT", "")
-        if target:
-            return HttpResponseRedirect(f"{target}?connected=1")
-        return Response({"detail": "Connected.", "account_email": store.account_email})
-
-    def _fail(self, msg: str):
-        target = getattr(settings, "OPENAI_OAUTH_POST_CONNECT_REDIRECT", "")
-        if target:
-            from urllib.parse import quote
-
-            return HttpResponseRedirect(f"{target}?connected=0&error={quote(msg)}")
-        return Response({"detail": msg}, status=status.HTTP_400_BAD_REQUEST)
+        log.info(
+            "agent.oauth.connected_via_cli account=%s by user=%s",
+            store.account_email or store.chatgpt_account_id, request.user.id,
+        )
+        return Response(OpenAIConnectionStatusSerializer(store).data)
 
 
 # ---------------------------------------------------------------------------
@@ -234,15 +211,10 @@ class AgentConversationViewSet(viewsets.ModelViewSet):
 
 
 # ---------------------------------------------------------------------------
-# Tool catalog (read-only, useful to the frontend so the widget can show
-# what the agent is *capable* of without hitting the LLM).
+# Tool catalog (read-only)
 # ---------------------------------------------------------------------------
 class AgentToolCatalogView(APIView):
-    """GET /api/agent/tools/ — exposes the MCP tool registry to the frontend.
-
-    The widget uses this to render the "skills" hint above the chat input
-    (e.g. "I can read accounts, list invoices, suggest reconciliations…").
-    """
+    """GET /api/agent/tools/ — exposes the MCP tool registry."""
 
     permission_classes = [IsAuthenticated]
 

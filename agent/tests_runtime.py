@@ -1,22 +1,23 @@
-"""Tests for the agent runtime (Phase 2).
+"""Tests for the agent runtime against the Codex Responses API.
 
-OpenAI is mocked at the ``OpenAIClient.chat_completions`` boundary so we
-exercise the full LLM ↔ tools loop without a real API call. Tool dispatch
-goes through the real :func:`mcp_server.tools.call_tool` so a regression
-in either layer is caught.
+OpenAI is mocked at the ``OpenAIClient.respond`` boundary so we exercise
+the full LLM ↔ tools loop without a real API call. Tool dispatch goes
+through the real :func:`mcp_server.tools.call_tool` so a regression in
+either layer is caught.
 
-What's pinned:
-
-* tool-call → tool-result → assistant happy path
-* multi-iteration loops still terminate at AGENT_MAX_TOOL_ITERATIONS
-* tenant guardrail: ``company_id`` injected even when the LLM omits it /
-  passes a different value
-* tool-not-found returns ``{"error": …}`` to the LLM, not an exception
-* OpenAINotConnected surfaces as a 503 from the chat endpoint
+Pinned behaviours:
+* function_call → function_call_output → final assistant happy path
+* multi-iteration loops still terminate at ``AGENT_MAX_TOOL_ITERATIONS``
+* tenant guardrail: ``company_id`` injected even if the LLM passes a
+  different value
+* tool-not-found returns ``{"error": …}`` to the LLM (not exception)
+* ``OpenAINotConnected`` surfaces as a 503 from the chat endpoint
+* SSE assembly: response.completed event yields the full output array
 """
 from __future__ import annotations
 
 import datetime as dt
+import json
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -28,7 +29,6 @@ from accounting.models import (
     Account,
     Bank,
     BankAccount,
-    BankTransaction,
     Currency,
 )
 from agent.models import AgentConversation, AgentMessage, OpenAITokenStore
@@ -39,6 +39,8 @@ from agent.services.agent_runtime import (
 from agent.services.openai_client import (
     OpenAINotConnected,
     OpenAIReconnectRequired,
+    _assemble_sse_response,
+    _iter_sse_events,
 )
 from multitenancy.models import Company, Entity
 
@@ -46,13 +48,43 @@ User = get_user_model()
 TEST_KEY = Fernet.generate_key().decode("ascii")
 
 
-def _connected_token_store():
-    """Helper: put a fresh tokenset in the singleton so ``OpenAINotConnected``
-    isn't raised by the runtime under test."""
+def _connect_store():
+    """Helper: put a fresh tokenset + accountId in the singleton."""
     store = OpenAITokenStore.get_or_create_singleton()
     store.set_tokens(access_token="acc", refresh_token="ref", expires_in=3600)
+    store.chatgpt_account_id = "acct_test"
     store.save()
     return store
+
+
+def _function_call_response(*, name: str, args: dict, call_id: str = "c1"):
+    """Build a Responses-API-shaped result with one function_call."""
+    return {
+        "model": "gpt-test",
+        "output": [
+            {
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": json.dumps(args),
+            },
+        ],
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+
+
+def _final_message_response(text: str):
+    return {
+        "model": "gpt-test",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            },
+        ],
+        "usage": {"input_tokens": 20, "output_tokens": 8},
+    }
 
 
 @override_settings(
@@ -78,7 +110,7 @@ class AgentRuntimeTests(TestCase):
         )
 
     def setUp(self):
-        _connected_token_store()
+        _connect_store()
         self.conversation = AgentConversation.objects.create(
             company=self.company, user=self.user, title="t",
         )
@@ -86,52 +118,19 @@ class AgentRuntimeTests(TestCase):
             company=self.company,
             conversation=self.conversation,
             role=AgentMessage.ROLE_USER,
-            content="liste 5 contas",
+            content="liste as contas",
         )
 
     # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-    def _llm_tool_call(self, *, name: str, args: dict, call_id: str = "c1"):
-        import json
-
-        return {
-            "model": "gpt-test",
-            "choices": [{
-                "finish_reason": "tool_calls",
-                "message": {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [{
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": json.dumps(args)},
-                    }],
-                },
-            }],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
-        }
-
-    def _llm_final(self, content: str):
-        return {
-            "model": "gpt-test",
-            "choices": [{
-                "finish_reason": "stop",
-                "message": {"role": "assistant", "content": content},
-            }],
-            "usage": {"prompt_tokens": 20, "completion_tokens": 8},
-        }
-
-    # ------------------------------------------------------------------
-    # Happy path: tool call → tool result → final
-    # ------------------------------------------------------------------
     def test_one_tool_call_then_final(self):
         side = [
-            self._llm_tool_call(name="list_accounts", args={"company_id": self.company.id}),
-            self._llm_final("Aqui estão as 1 conta."),
+            _function_call_response(
+                name="list_accounts", args={"company_id": self.company.id},
+            ),
+            _final_message_response("Aqui está a 1 conta."),
         ]
         with patch(
-            "agent.services.agent_runtime.OpenAIClient.chat_completions",
+            "agent.services.agent_runtime.OpenAIClient.respond",
             side_effect=side,
         ):
             result = SysnordAgent(self.conversation).run_turn(user_message=self.user_msg)
@@ -141,74 +140,61 @@ class AgentRuntimeTests(TestCase):
         self.assertEqual(result.final_message.role, "assistant")
         self.assertIn("conta", result.final_message.content)
 
-        # 1 assistant tool-request + 1 tool result + 1 final assistant = 3 new rows
-        # plus the 1 user message that already existed = 4 in conversation.
         rows = list(self.conversation.messages.order_by("id"))
         self.assertEqual([r.role for r in rows], ["user", "assistant", "tool", "assistant"])
         self.assertEqual(rows[2].tool_name, "list_accounts")
 
     # ------------------------------------------------------------------
-    # Tenant guardrail: LLM trying to read another tenant gets clamped
-    # ------------------------------------------------------------------
-    def test_company_id_is_overridden_to_conversation_tenant(self):
+    def test_company_id_overridden_to_conversation_tenant(self):
         other = Company.objects.create(name="Other", subdomain="other")
         Account.objects.create(
             company=other, account_code="9.9", name="Other Caixa",
-            account_direction=1, balance=Decimal("0"), balance_date=dt.date(2026, 1, 1),
-            currency=self.currency,
+            account_direction=1, balance=Decimal("0"),
+            balance_date=dt.date(2026, 1, 1), currency=self.currency,
         )
 
-        # LLM asks for company_id=other.id; agent must overwrite.
         side = [
-            self._llm_tool_call(
-                name="list_accounts",
-                args={"company_id": other.id, "limit": 10},
+            _function_call_response(
+                name="list_accounts", args={"company_id": other.id, "limit": 10},
             ),
-            self._llm_final("ok"),
+            _final_message_response("ok"),
         ]
         with patch(
-            "agent.services.agent_runtime.OpenAIClient.chat_completions",
+            "agent.services.agent_runtime.OpenAIClient.respond",
             side_effect=side,
         ):
             SysnordAgent(self.conversation).run_turn(user_message=self.user_msg)
 
         tool_msg = self.conversation.messages.filter(role="tool").first()
-        # The tool result is JSON; the names listed should belong to ``self.company``,
-        # not ``other``. Easiest assertion: 'Other Caixa' must NOT appear.
         self.assertNotIn("Other Caixa", tool_msg.content)
         self.assertIn("Caixa", tool_msg.content)
 
     # ------------------------------------------------------------------
-    # Iteration cap: looping LLM is bounded
-    # ------------------------------------------------------------------
     def test_iteration_cap_terminates_with_synthetic_message(self):
-        # Always-tool-calling LLM
         side = [
-            self._llm_tool_call(
+            _function_call_response(
                 name="list_accounts", args={}, call_id=f"c{i}",
             )
             for i in range(10)
         ]
         with patch(
-            "agent.services.agent_runtime.OpenAIClient.chat_completions",
+            "agent.services.agent_runtime.OpenAIClient.respond",
             side_effect=side,
         ):
             result = SysnordAgent(self.conversation).run_turn(user_message=self.user_msg)
 
         self.assertTrue(result.truncated)
-        self.assertEqual(result.iterations, 3)  # AGENT_MAX_TOOL_ITERATIONS=3 above
+        self.assertEqual(result.iterations, 3)
         self.assertIn("limite de iterações", result.final_message.content)
 
     # ------------------------------------------------------------------
-    # Tool not found returns error to LLM
-    # ------------------------------------------------------------------
-    def test_unknown_tool_returns_error_blob_not_exception(self):
+    def test_unknown_tool_returns_error_blob(self):
         side = [
-            self._llm_tool_call(name="this_does_not_exist", args={}),
-            self._llm_final("desculpe, ferramenta inválida"),
+            _function_call_response(name="this_does_not_exist", args={}),
+            _final_message_response("desculpe, ferramenta inválida"),
         ]
         with patch(
-            "agent.services.agent_runtime.OpenAIClient.chat_completions",
+            "agent.services.agent_runtime.OpenAIClient.respond",
             side_effect=side,
         ):
             result = SysnordAgent(self.conversation).run_turn(user_message=self.user_msg)
@@ -218,21 +204,16 @@ class AgentRuntimeTests(TestCase):
         self.assertEqual(result.final_message.role, "assistant")
 
     # ------------------------------------------------------------------
-    # OpenAINotConnected surfaces as runtime error
-    # ------------------------------------------------------------------
     def test_disconnected_token_store_raises_runtime_error(self):
         OpenAITokenStore.objects.all().delete()
-
         with self.assertRaises(AgentRuntimeError) as ctx:
             SysnordAgent(self.conversation).run_turn(user_message=self.user_msg)
         self.assertIn("OpenAI is not connected", str(ctx.exception))
 
     # ------------------------------------------------------------------
-    # Reconnect-required surfaces clearly
-    # ------------------------------------------------------------------
     def test_reconnect_required_surfaces_clearly(self):
         with patch(
-            "agent.services.agent_runtime.OpenAIClient.chat_completions",
+            "agent.services.agent_runtime.OpenAIClient.respond",
             side_effect=OpenAIReconnectRequired("token revoked upstream"),
         ):
             with self.assertRaises(AgentRuntimeError) as ctx:
@@ -240,12 +221,66 @@ class AgentRuntimeTests(TestCase):
         self.assertIn("token revoked upstream", str(ctx.exception))
 
 
+# ---------------------------------------------------------------------------
+# SSE parser tests — pure-function, no DB
+# ---------------------------------------------------------------------------
+class _FakeStreamResponse:
+    """Mimics requests.Response.iter_lines() for tests."""
+    def __init__(self, lines):
+        self._lines = lines
+
+    def iter_lines(self, decode_unicode=True):  # noqa: D401
+        return iter(self._lines)
+
+
+class SseParserTests(TestCase):
+    def test_assembles_response_completed_event(self):
+        events = [
+            'data: {"type":"response.created","response":{"id":"r1"}}',
+            "",
+            'data: {"type":"response.output_item.added"}',
+            "",
+            'data: {"type":"response.completed","response":{"model":"gpt-x","output":'
+            '[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi"}]}],'
+            '"usage":{"input_tokens":1,"output_tokens":2}}}',
+            "",
+        ]
+        result = _assemble_sse_response(_iter_sse_events(_FakeStreamResponse(events)))
+        self.assertEqual(result["model"], "gpt-x")
+        self.assertEqual(result["usage"]["output_tokens"], 2)
+        self.assertEqual(len(result["output"]), 1)
+        self.assertEqual(result["output"][0]["role"], "assistant")
+
+    def test_falls_back_to_per_item_done_events(self):
+        events = [
+            'data: {"type":"response.output_item.done","item":{"type":"function_call",'
+            '"call_id":"c1","name":"foo","arguments":"{}"}}',
+            "",
+            'data: {"type":"response.output_item.done","item":{"type":"message",'
+            '"role":"assistant","content":[{"type":"output_text","text":"done"}]}}',
+            "",
+        ]
+        result = _assemble_sse_response(_iter_sse_events(_FakeStreamResponse(events)))
+        self.assertEqual(len(result["output"]), 2)
+        self.assertEqual(result["output"][0]["type"], "function_call")
+        self.assertEqual(result["output"][1]["type"], "message")
+
+    def test_failed_event_raises(self):
+        from agent.services.openai_client import OpenAIClientError
+        events = [
+            'data: {"type":"response.failed","response":{"error":{"message":"bad"}}}',
+            "",
+        ]
+        with self.assertRaises(OpenAIClientError):
+            _assemble_sse_response(_iter_sse_events(_FakeStreamResponse(events)))
+
+
 @override_settings(
     AGENT_TOKEN_ENCRYPTION_KEY=TEST_KEY,
     AGENT_MAX_TOOL_ITERATIONS=3,
 )
 class AgentChatEndpointTests(TestCase):
-    """End-to-end through the DRF view, mocking the OpenAI client."""
+    """End-to-end through the DRF view, mocking OpenAIClient.respond."""
 
     @classmethod
     def setUpTestData(cls):
@@ -255,25 +290,22 @@ class AgentChatEndpointTests(TestCase):
     def setUp(self):
         from rest_framework.test import APIClient
 
-        _connected_token_store()
+        _connect_store()
         self.conversation = AgentConversation.objects.create(
             company=self.company, user=self.user,
         )
         self.client = APIClient()
         self.client.force_authenticate(self.user)
 
-        # Pin request.tenant on the test client by patching the view's
-        # get_queryset — simpler than wiring TenantMiddleware here.
+        # Pin tenant on the viewset since TenantMiddleware doesn't run here.
         from agent import views
         self._orig_get_qs = views.AgentConversationViewSet.get_queryset
 
-        def patched_get_qs(view_self):
+        def patched(view_self):
             return AgentConversation.objects.filter(
                 user=view_self.request.user, company=self._test_company(),
             )
-
-        # bind class-level
-        views.AgentConversationViewSet.get_queryset = patched_get_qs
+        views.AgentConversationViewSet.get_queryset = patched
 
     def tearDown(self):
         from agent import views
@@ -282,20 +314,10 @@ class AgentChatEndpointTests(TestCase):
     def _test_company(self):
         return self.company
 
-    def test_chat_returns_200_with_messages_on_success(self):
-        side = [
-            {
-                "model": "gpt-test",
-                "choices": [{
-                    "finish_reason": "stop",
-                    "message": {"role": "assistant", "content": "Olá!"},
-                }],
-                "usage": {"prompt_tokens": 5, "completion_tokens": 2},
-            },
-        ]
+    def test_chat_returns_200_on_success(self):
         with patch(
-            "agent.services.agent_runtime.OpenAIClient.chat_completions",
-            side_effect=side,
+            "agent.services.agent_runtime.OpenAIClient.respond",
+            side_effect=[_final_message_response("Olá!")],
         ):
             resp = self.client.post(
                 f"/api/agent/conversations/{self.conversation.id}/chat/",
@@ -309,7 +331,6 @@ class AgentChatEndpointTests(TestCase):
 
     def test_chat_returns_503_when_disconnected(self):
         OpenAITokenStore.objects.all().delete()
-
         resp = self.client.post(
             f"/api/agent/conversations/{self.conversation.id}/chat/",
             {"content": "ping"}, format="json",

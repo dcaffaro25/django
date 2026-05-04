@@ -53,6 +53,12 @@ class OpenAITokenStore(BaseModel):
     account_email = models.CharField(max_length=255, blank=True, default="")
     account_subject = models.CharField(max_length=255, blank=True, default="")
 
+    # ``chatgpt_account_id`` extracted from the access_token's
+    # ``https://api.openai.com/auth`` claim. Required as the
+    # ``chatgpt-account-id`` header on every Codex Responses API call —
+    # without it the upstream returns 403/404. Re-derived on every refresh.
+    chatgpt_account_id = models.CharField(max_length=255, blank=True, default="")
+
     connected_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         null=True,

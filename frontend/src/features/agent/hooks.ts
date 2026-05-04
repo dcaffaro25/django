@@ -29,12 +29,6 @@ export function useAgentConnectionStatus(opts: { enabled?: boolean } = {}) {
   })
 }
 
-export function useStartAgentConnection() {
-  return useMutation({
-    mutationFn: agentApi.startConnection,
-  })
-}
-
 export function useRevokeAgentConnection() {
   const qc = useQueryClient()
   return useMutation({
