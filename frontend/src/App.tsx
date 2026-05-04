@@ -47,6 +47,7 @@ import { AdminHomePage } from "@/pages/admin/AdminHomePage"
 import { UsersPage as AdminUsersPage } from "@/pages/admin/UsersPage"
 import { RuntimePage as AdminRuntimePage } from "@/pages/admin/RuntimePage"
 import { AgentAuditPage } from "@/pages/admin/AgentAuditPage"
+import { PedidoVendasReportPage } from "@/pages/erp/PedidoVendasReportPage"
 import { SuperuserGuard } from "@/pages/admin/SuperuserGuard"
 import { ActivityHeatmapPage } from "@/pages/admin/activity/ActivityHeatmapPage"
 import { ActivityUserDetailPage } from "@/pages/admin/activity/ActivityUserDetailPage"
@@ -152,6 +153,9 @@ export default function App() {
                   <Route path="/inventory/*" element={<PlaceholderPage title="Estoque" />} />
                   <Route path="/integrations/sandbox" element={<ApiSandboxPage />} />
                   <Route path="/integrations/*" element={<PlaceholderPage title="Integrações" />} />
+
+                  {/* ERP — Omie reports powered by ApiPipeline snapshots. */}
+                  <Route path="/erp/pedidos" element={<PedidoVendasReportPage />} />
 
                   {/* Importações hub. */}
                   <Route path="/imports" element={<ImportsHubWrapper />}>

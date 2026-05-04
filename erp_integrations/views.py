@@ -518,3 +518,110 @@ class PipelineSandboxView(APIView):
         if result.get("error") and not result.get("diagnostics"):
             return Response(result, status=status.HTTP_400_BAD_REQUEST)
         return Response(result, status=status.HTTP_200_OK)
+
+
+class PedidoVendasReportView(APIView):
+    """
+    GET /<tenant>/api/erp/reports/pedidos/
+
+    Read-side report on PedidoVendas, powered by the latest snapshot
+    in ERPRawRecord (populated by the ``evolat_omie_pedidos_full``
+    pipeline). Joins pedidos with clientes and produtos in memory —
+    no fanout, no extra HTTP.
+
+    Query params:
+      * ``date_from`` / ``date_to`` — ISO YYYY-MM-DD
+      * ``etapa`` — exact match (e.g. ``50`` for "Faturado")
+      * ``codigo_cliente`` — Omie cliente id
+      * ``search`` — substring match across numero, cliente, CNPJ
+      * ``limit`` — default 200, hard cap 1000
+
+    POST body: ``{"refresh": true}`` runs the pipeline first (live;
+    persists ERPRawRecord upsert via unique_id_config) then returns
+    the report.
+    """
+
+    def _coerce_date(self, value):
+        from datetime import date as _date
+        if not value:
+            return None
+        try:
+            return _date.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _build(self, request, tenant_id=None):
+        tenant = getattr(request, "tenant", None)
+        company_id = getattr(tenant, "id", None) if tenant and tenant != "all" else None
+        if not company_id:
+            return Response(
+                {"detail": "Tenant required for this report."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        from .services.pedido_report_service import get_pedido_report
+        params = request.query_params if request.method == "GET" else request.data
+
+        try:
+            limit = max(1, min(int(params.get("limit", 200)), 1000))
+        except (TypeError, ValueError):
+            limit = 200
+
+        codigo_cliente = params.get("codigo_cliente")
+        try:
+            codigo_cliente = int(codigo_cliente) if codigo_cliente else None
+        except (TypeError, ValueError):
+            codigo_cliente = None
+
+        report = get_pedido_report(
+            company_id=company_id,
+            date_from=self._coerce_date(params.get("date_from")),
+            date_to=self._coerce_date(params.get("date_to")),
+            etapa=(params.get("etapa") or None),
+            codigo_cliente=codigo_cliente,
+            search=(params.get("search") or None),
+            limit=limit,
+        )
+        return Response(report, status=status.HTTP_200_OK)
+
+    def get(self, request, tenant_id=None):
+        return self._build(request, tenant_id=tenant_id)
+
+    def post(self, request, tenant_id=None):
+        # POST with ``{"refresh": true}`` triggers a live pipeline run
+        # (upserts ERPRawRecord via unique_id_config) before returning
+        # the latest snapshot.
+        if request.data.get("refresh"):
+            tenant = getattr(request, "tenant", None)
+            company_id = getattr(tenant, "id", None) if tenant and tenant != "all" else None
+            if not company_id:
+                return Response(
+                    {"detail": "Tenant required to refresh."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            from .models import ERPSyncPipeline
+            from .services.pipeline_service import execute_pipeline
+
+            pipeline = ERPSyncPipeline.objects.filter(
+                company_id=company_id, name="evolat_omie_pedidos_full",
+                is_active=True,
+            ).first()
+            if not pipeline:
+                return Response(
+                    {"detail": "Pipeline 'evolat_omie_pedidos_full' not configured for this tenant."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            run_result = execute_pipeline(pipeline_id=pipeline.id, dry_run=False)
+            if run_result.get("status") == "failed":
+                return Response(
+                    {
+                        "detail": "Pipeline run failed; report shows previous snapshot.",
+                        "run_result": run_result,
+                        "report": self._build(request, tenant_id=tenant_id).data,
+                    },
+                    status=status.HTTP_502_BAD_GATEWAY,
+                )
+
+        return self._build(request, tenant_id=tenant_id)

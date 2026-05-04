@@ -18,6 +18,7 @@ from .views import (
     ERPSyncRunViewSet,
     BuildPayloadView,
     ErpEtlImportView,
+    PedidoVendasReportView,
     PipelineSandboxView,
 )
 
@@ -40,4 +41,9 @@ urlpatterns = [
     re_path(r"^build-payload/?$", BuildPayloadView.as_view(), name="erp-integrations-build-payload"),
     re_path(r"^etl-import/?$", ErpEtlImportView.as_view(), name="erp-etl-import"),
     re_path(r"^pipeline-sandbox/?$", PipelineSandboxView.as_view(), name="erp-pipeline-sandbox"),
+    re_path(
+        r"^erp/reports/pedidos/?$",
+        PedidoVendasReportView.as_view(),
+        name="erp-pedidos-report",
+    ),
 ]

@@ -445,6 +445,37 @@ def _transform_config_for(list_key: str) -> dict:
     }
 
 
+# Per-call unique_id_config so re-runs of the same pipeline upsert
+# instead of accumulating duplicate ERPRawRecord rows. Without this
+# the temp DB grows unboundedly. With ``on_duplicate=update``,
+# omie_sync_service._store_record:
+#   1. computes record_hash
+#   2. looks up existing row by (company, api_call, external_id)
+#   3. if hash matches → skipped
+#   4. if hash differs → updates in place + bumps fetched_at
+# So the report layer always sees the latest snapshot per pedido.
+_UNIQUE_ID_BY_CALL: dict[str, dict] = {
+    "ListarPedidos": {"mode": "single_path", "path": "cabecalho.codigo_pedido", "on_duplicate": "update"},
+    "ListarClientes": {"mode": "single_path", "path": "codigo_cliente_omie", "on_duplicate": "update"},
+    "ListarProdutos": {"mode": "single_path", "path": "codigo_produto", "on_duplicate": "update"},
+    "ListarMovimentos": {"mode": "single_path", "path": "detalhes.nCodTitulo", "on_duplicate": "update"},
+    "ListarContasReceber": {"mode": "single_path", "path": "codigo_lancamento_omie", "on_duplicate": "update"},
+    "ListarContasPagar": {"mode": "single_path", "path": "codigo_lancamento_omie", "on_duplicate": "update"},
+    "ListarCategorias": {"mode": "single_path", "path": "codigo", "on_duplicate": "update"},
+    "ListarCategorias_alt": {"mode": "single_path", "path": "codigo_categoria", "on_duplicate": "update"},  # fallback
+    "ListarVendedores": {"mode": "single_path", "path": "codigo", "on_duplicate": "update"},
+    "ListarBancos": {"mode": "single_path", "path": "codigo", "on_duplicate": "update"},
+    "ListarDepartamentos": {"mode": "single_path", "path": "codigo", "on_duplicate": "update"},
+    "ListarEmpresas": {"mode": "single_path", "path": "nCodEmp", "on_duplicate": "update"},
+    "ListarParcelas": {"mode": "single_path", "path": "cCodigo", "on_duplicate": "update"},
+}
+
+
+def _unique_id_config_for(call: str):
+    """Returns the dict config for ``call``, or None if not configured."""
+    return _UNIQUE_ID_BY_CALL.get(call)
+
+
 class Command(BaseCommand):
     help = "Seed the read-only Omie API catalog into ERPAPIDefinition."
 
@@ -478,10 +509,12 @@ class Command(BaseCommand):
         for call, url, description, list_key, extra, verified in seen.values():
             param_schema = _build_param_schema(call, extra)
             transform_config = _transform_config_for(list_key)
+            unique_id_config = _unique_id_config_for(call)
             defaults = {
                 "url": url, "method": "POST", "description": description,
                 "param_schema": param_schema,
                 "transform_config": transform_config,
+                "unique_id_config": unique_id_config,
                 "is_active": verified,
             }
             obj, was_created = ERPAPIDefinition.objects.get_or_create(
