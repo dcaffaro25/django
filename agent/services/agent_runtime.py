@@ -164,6 +164,34 @@ class SysnordAgent:
     def run_turn(self, *, user_message: AgentMessage) -> AgentTurnResult:
         intermediates: list[AgentMessage] = []
 
+        # Token-budget gate — Phase 0 expansion. Reject the new turn
+        # cleanly before we burn another LLM call.
+        budget = int(getattr(settings, "AGENT_TOKEN_BUDGET_PER_CONVERSATION", 0) or 0)
+        if budget > 0:
+            from django.db.models import Sum
+            agg = self.conversation.messages.aggregate(
+                p=Sum("prompt_tokens"), c=Sum("completion_tokens"),
+            )
+            used = (agg.get("p") or 0) + (agg.get("c") or 0)
+            if used >= budget:
+                cap_msg = self._persist_assistant_final(
+                    assistant_text_items=[],
+                    content_override=(
+                        f"Esta conversa já consumiu {used:,} tokens, acima do "
+                        f"orçamento configurado de {budget:,}. Comece uma nova "
+                        f"conversa para continuar — o histórico ficará disponível "
+                        f"aqui mas não será mais expandido."
+                    ),
+                    model_used="", usage={},
+                )
+                self._touch_conversation()
+                return AgentTurnResult(
+                    final_message=cap_msg,
+                    intermediate_messages=intermediates,
+                    iterations=0,
+                    truncated=True,
+                )
+
         for iteration in range(1, self._max_iterations + 1):
             input_items = self._build_input_items()
             tools = self._build_tool_catalog()
@@ -343,6 +371,8 @@ class SysnordAgent:
             args["_tenant_slug"] = getattr(self.company, "subdomain", "") or ""
             args["_acting_user_id"] = self.conversation.user_id
 
+        from agent.services.rate_limit import check_rate_limit
+
         with log_tool_call(
             company=self.company,
             conversation=self.conversation,
@@ -352,13 +382,20 @@ class SysnordAgent:
             args=args,
             iteration=iteration,
         ) as audit_ctx:
-            try:
-                result = call_tool(name, args)
-            except KeyError:
-                result = {"error": f"Tool '{name}' is not available."}
-            except Exception as exc:  # pragma: no cover — defensive net
-                log.exception("agent.tool_failed name=%s: %s", name, exc)
-                result = {"error": f"{type(exc).__name__}: {exc}"}
+            # Rate limit check first — keeps a runaway loop bounded
+            # without consuming the actual tool's compute budget.
+            limit_err = check_rate_limit(tool_name=name, company_id=self.company.id)
+            if limit_err is not None:
+                result = limit_err
+                audit_ctx["status_override"] = "rejected"
+            else:
+                try:
+                    result = call_tool(name, args)
+                except KeyError:
+                    result = {"error": f"Tool '{name}' is not available."}
+                except Exception as exc:  # pragma: no cover — defensive net
+                    log.exception("agent.tool_failed name=%s: %s", name, exc)
+                    result = {"error": f"{type(exc).__name__}: {exc}"}
             audit_ctx["result"] = result
 
         return AgentMessage.objects.create(
@@ -443,20 +480,40 @@ class SysnordAgent:
         Also appends the hosted ``web_search`` tool when
         ``AGENT_ENABLE_WEB_SEARCH`` is set. The Codex backend may 400 on
         unsupported hosted tools depending on plan/originator — see the
-        setting's docstring."""
+        setting's docstring.
+
+        Tool catalog is filtered by ``AGENT_DISABLED_TOOLS`` and
+        ``AGENT_DISABLED_DOMAINS`` to keep token cost down and let
+        operators feature-gate at the env-var level. UI tools are
+        never filtered — they're load-bearing for the
+        request_user_choice / confirmation pattern."""
         from mcp_server.tools import TOOLS as MCP_TOOLS
 
-        tool_defs = list(MCP_TOOLS) + list(ui_tools.UI_TOOLS)
-        catalog: list[dict[str, Any]] = [
-            {
+        disabled_tools = set(getattr(settings, "AGENT_DISABLED_TOOLS", []) or [])
+        disabled_domains = set(getattr(settings, "AGENT_DISABLED_DOMAINS", []) or [])
+
+        catalog: list[dict[str, Any]] = []
+        for t in MCP_TOOLS:
+            if t.name in disabled_tools:
+                continue
+            if getattr(t, "domain", "") in disabled_domains:
+                continue
+            catalog.append({
                 "type": "function",
                 "name": t.name,
                 "description": t.description,
                 "parameters": t.input_schema,
                 "strict": False,
-            }
-            for t in tool_defs
-        ]
+            })
+        # UI tools are unconditional.
+        for t in ui_tools.UI_TOOLS:
+            catalog.append({
+                "type": "function",
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.input_schema,
+                "strict": False,
+            })
         if getattr(settings, "AGENT_ENABLE_WEB_SEARCH", False):
             catalog.append({"type": "web_search"})
         return catalog

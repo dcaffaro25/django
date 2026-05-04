@@ -646,6 +646,50 @@ AGENT_ALLOW_WRITES = os.getenv("AGENT_ALLOW_WRITES", "false").lower() in (
 # ``call_internal_api`` and ``call_erp_api`` (bytes).
 AGENT_API_RESPONSE_BYTE_CAP = int(os.getenv("AGENT_API_RESPONSE_BYTE_CAP", "30000"))
 
+# Per-conversation token budget. When the cumulative input+output
+# exceeds this, new turns are refused with a clear UI message instead
+# of silently lopping context. Set to 0 to disable (default 500_000 —
+# about 1.5x the 256k context window of gpt-5.4).
+AGENT_TOKEN_BUDGET_PER_CONVERSATION = int(os.getenv(
+    "AGENT_TOKEN_BUDGET_PER_CONVERSATION", "500000",
+))
+
+# Per-tool rate limits — comma-separated ``name:N/window`` rules where
+# window is one of s/m/h. Default lets external lookups breathe but
+# caps the tightest call sites. Values are advisory and enforced
+# in-process via the AgentToolCallLog table.
+AGENT_TOOL_RATE_LIMITS = os.getenv(
+    "AGENT_TOOL_RATE_LIMITS",
+    # Counterparty + central-bank lookups: 60/min. Heavy enough to
+    # catch a runaway loop, generous enough for real research.
+    "fetch_cnpj_from_receita:60/m,"
+    "fetch_bcb_indicator:60/m,"
+    "fetch_ptax:60/m,"
+    "fetch_cep:60/m,"
+    "fetch_bank_by_code:60/m,"
+    "fetch_ncm:60/m,"
+    "fetch_cnae_info:60/m,"
+    "fetch_holidays_brazil:60/m,"
+    # ERP calls — Omie has its own quota; cap to 30/min agent-side as
+    # belt-and-suspenders.
+    "call_erp_api:30/m,"
+    # Internal API caller — 120/min keeps a researching agent alive
+    # without letting it loop forever.
+    "call_internal_api:120/m,"
+    # Recon agent runs are heavy (embedding scoring etc.) — 6/min cap.
+    "run_reconciliation_agent:6/m"
+)
+
+# Comma-separated list of tool names to hide from the agent. Useful in
+# staging / per-tenant feature gating. Domain-level disables also work
+# via AGENT_DISABLED_DOMAINS (e.g. "erp,external").
+AGENT_DISABLED_TOOLS = [
+    n.strip() for n in os.getenv("AGENT_DISABLED_TOOLS", "").split(",") if n.strip()
+]
+AGENT_DISABLED_DOMAINS = [
+    n.strip() for n in os.getenv("AGENT_DISABLED_DOMAINS", "").split(",") if n.strip()
+]
+
 # Codex Responses API runtime — endpoint, headers, defaults.
 OPENAI_CODEX_BASE_URL = os.getenv(
     "OPENAI_CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex",
