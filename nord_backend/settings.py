@@ -623,6 +623,11 @@ OPENAI_CODEX_RESPONSES_PATH = os.getenv("OPENAI_CODEX_RESPONSES_PATH", "/respons
 OPENAI_CODEX_ORIGINATOR = os.getenv("OPENAI_CODEX_ORIGINATOR", "codex_cli_rs")
 OPENAI_CODEX_BETA = os.getenv("OPENAI_CODEX_BETA", "responses=experimental")
 OPENAI_CODEX_USER_AGENT = os.getenv("OPENAI_CODEX_USER_AGENT", "sysnord-agent/1.0")
-OPENAI_DEFAULT_MODEL = os.getenv("OPENAI_DEFAULT_MODEL", "gpt-5")
+# Codex Responses model slugs valid as of 2026-05 with a ChatGPT
+# subscription: ``gpt-5.5`` (newest, recommended for complex reasoning),
+# ``gpt-5.4`` (CLI default), ``gpt-5.4-mini`` (cheapest), ``gpt-5.3-codex``
+# (coding specialist). The plain ``gpt-5`` slug is NOT accepted on this
+# endpoint.
+OPENAI_DEFAULT_MODEL = os.getenv("OPENAI_DEFAULT_MODEL", "gpt-5.5")
 OPENAI_REQUEST_TIMEOUT = float(os.getenv("OPENAI_REQUEST_TIMEOUT", "120"))
 AGENT_MAX_TOOL_ITERATIONS = int(os.getenv("AGENT_MAX_TOOL_ITERATIONS", "8"))

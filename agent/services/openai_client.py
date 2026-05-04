@@ -151,7 +151,7 @@ class OpenAIClient:
             )
 
         body: dict[str, Any] = {
-            "model": model or getattr(settings, "OPENAI_DEFAULT_MODEL", "gpt-5"),
+            "model": model or getattr(settings, "OPENAI_DEFAULT_MODEL", "gpt-5.5"),
             "store": False,
             "stream": True,
             "instructions": instructions,
