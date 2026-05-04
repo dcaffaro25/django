@@ -474,19 +474,35 @@ class SysnordAgent:
 
         Each prior history row becomes one or more typed items::
 
-            user msg          → {"role":"user","content":[{"type":"input_text","text":"..."}]}
+            user msg          → {"role":"user","content":[{"type":"input_text","text":"..."}, ...]}
             assistant text    → {"role":"assistant","content":[{"type":"output_text","text":"..."}]}
             assistant tool    → list of {"type":"function_call","call_id","name","arguments"}
             tool result       → {"type":"function_call_output","call_id","output":"<json>"}
+
+        User messages can carry attachments — Phase 2. Each attachment
+        becomes an additional content part on the same user item:
+        ``input_image`` for PDFs/images, ``input_text`` for parsed XML
+        and OFX (the structured fields are easier for the LLM than raw
+        markup).
 
         Note: the system prompt is sent via the top-level ``instructions``
         field (not in the input list) per the Responses API spec.
         """
         out: list[dict[str, Any]] = []
 
+        # Pre-fetch attachments grouped by message id so we don't N+1
+        # the history loop. Only inspect user messages — assistant
+        # turns never carry attachments.
+        from agent.models import AgentMessageAttachment
+        attachments_by_msg: dict[int, list[AgentMessageAttachment]] = {}
+        for att in AgentMessageAttachment.objects.filter(
+            conversation=self.conversation, message__isnull=False,
+        ).order_by("created_at", "id"):
+            attachments_by_msg.setdefault(att.message_id, []).append(att)
+
         history = list(
             self.conversation.messages.order_by("created_at", "id").values(
-                "role", "content", "tool_calls", "tool_call_id", "tool_name",
+                "id", "role", "content", "tool_calls", "tool_call_id", "tool_name",
             )
         )
         for row in history:
@@ -494,10 +510,12 @@ class SysnordAgent:
             content = row["content"] or ""
 
             if role == AgentMessage.ROLE_USER:
-                out.append({
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": content}],
-                })
+                parts: list[dict[str, Any]] = [{"type": "input_text", "text": content}]
+                for att in attachments_by_msg.get(row["id"], []):
+                    part = self._attachment_to_content_part(att)
+                    if part is not None:
+                        parts.append(part)
+                out.append({"role": "user", "content": parts})
                 continue
 
             if role == AgentMessage.ROLE_ASSISTANT:
@@ -529,6 +547,64 @@ class SysnordAgent:
 
             # ROLE_SYSTEM is sent via instructions; ignore here.
         return out
+
+    def _attachment_to_content_part(self, attachment) -> dict[str, Any] | None:
+        """Convert an ``AgentMessageAttachment`` row into a Responses-API
+        content part — Phase 2.
+
+        * NF-e XML / OFX  → ``input_text`` containing the cached
+          ``extracted_text`` (set by the ``ingest_document`` tool the
+          first time it runs against this attachment). If extraction
+          hasn't happened yet, the part is a short hint asking the
+          model to call ``ingest_document``.
+        * PDF / image     → ``input_image`` with a base64 data-URL.
+          Codex multimodal handles OCR + layout.
+        * Other           → None (skipped, with a hint emitted as text).
+        """
+        from agent.models import AgentMessageAttachment
+
+        if attachment.kind in (
+            AgentMessageAttachment.KIND_NFE_XML,
+            AgentMessageAttachment.KIND_OFX,
+        ):
+            text = attachment.extracted_text or (
+                f"[Anexo {attachment.filename!r} ({attachment.kind}) ainda não "
+                f"foi processado. Chame ingest_document(attachment_id="
+                f"{attachment.id}) para extrair o conteúdo.]"
+            )
+            return {"type": "input_text", "text": text}
+
+        if attachment.kind in (AgentMessageAttachment.KIND_PDF, AgentMessageAttachment.KIND_IMAGE):
+            try:
+                import base64
+                with attachment.file.open("rb") as fh:
+                    raw = fh.read()
+                ct = attachment.content_type or (
+                    "application/pdf" if attachment.kind == AgentMessageAttachment.KIND_PDF
+                    else "image/png"
+                )
+                data_url = f"data:{ct};base64,{base64.b64encode(raw).decode('ascii')}"
+                return {"type": "input_image", "image_url": data_url}
+            except Exception as exc:
+                log.warning(
+                    "agent.attachment.read_failed id=%s err=%s",
+                    attachment.id, exc,
+                )
+                return {
+                    "type": "input_text",
+                    "text": (
+                        f"[Falha ao ler o anexo {attachment.filename!r}: {exc}]"
+                    ),
+                }
+
+        # KIND_OTHER or unknown — surface as a tiny hint.
+        return {
+            "type": "input_text",
+            "text": (
+                f"[Anexo {attachment.filename!r} ({attachment.content_type or '?'}) "
+                f"não é suportado.]"
+            ),
+        }
 
     def _system_prompt(self) -> str:
         return SYSTEM_PROMPT_TEMPLATE.format(

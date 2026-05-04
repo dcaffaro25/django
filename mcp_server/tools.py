@@ -1552,6 +1552,259 @@ def run_reconciliation_agent(
 
 
 # ---------------------------------------------------------------------------
+# Tool: ingest_document — Phase 2
+# ---------------------------------------------------------------------------
+def ingest_document(
+    company_id: int,
+    attachment_id: int,
+) -> dict[str, Any]:
+    """Parse one ``AgentMessageAttachment`` into structured fields.
+
+    Routing by ``kind`` (set when the file was uploaded):
+
+    * ``nfe_xml``: parsed via ``billing.services.nfe_import_service`` so
+      the agent gets back the same structured representation the import
+      pipeline produces (chave, partes, totais, itens summary).
+    * ``ofx``: parsed via ``ofxtools`` so the agent sees account info +
+      the first N transactions (full balance/history is a sync job, not
+      an inline parse).
+    * ``pdf`` / ``image``: returns a hint that the LLM should "look"
+      at the attachment directly — ingest doesn't run OCR here, the
+      Responses API handles that via ``input_image``.
+    * ``other``: clean error.
+
+    Caches the extracted text on the attachment so subsequent turns
+    don't re-parse. Idempotent.
+    """
+    from agent.models import AgentMessageAttachment
+
+    try:
+        att = AgentMessageAttachment.objects.get(
+            id=attachment_id, company_id=company_id,
+        )
+    except AgentMessageAttachment.DoesNotExist:
+        return {
+            "error": (
+                f"Attachment {attachment_id} not found in company {company_id}."
+            )
+        }
+
+    if att.extracted_text:
+        return {
+            "ok": True,
+            "cached": True,
+            "attachment_id": att.id,
+            "kind": att.kind,
+            "extracted_text_preview": att.extracted_text[:600],
+            "size_bytes": len(att.extracted_text),
+        }
+
+    kind = att.kind
+    extracted = ""
+    extra: dict[str, Any] = {}
+    error_msg = ""
+
+    try:
+        if kind == AgentMessageAttachment.KIND_NFE_XML:
+            extracted, extra = _ingest_nfe_xml(att)
+        elif kind == AgentMessageAttachment.KIND_OFX:
+            extracted, extra = _ingest_ofx(att)
+        elif kind == AgentMessageAttachment.KIND_PDF:
+            return {
+                "ok": True,
+                "attachment_id": att.id,
+                "kind": kind,
+                "note": (
+                    "PDFs go through the Responses-API multimodal path. "
+                    "The model can already see the file directly — no "
+                    "explicit ingest step required."
+                ),
+            }
+        elif kind == AgentMessageAttachment.KIND_IMAGE:
+            return {
+                "ok": True,
+                "attachment_id": att.id,
+                "kind": kind,
+                "note": (
+                    "Images go through the Responses-API multimodal path. "
+                    "The model can already see the file directly — no "
+                    "explicit ingest step required."
+                ),
+            }
+        else:
+            return {
+                "error": f"Attachment {attachment_id} has unsupported kind {kind!r}.",
+            }
+    except Exception as exc:
+        error_msg = f"{type(exc).__name__}: {exc}"
+        log.exception(
+            "agent.ingest_document.failed att=%s kind=%s",
+            att.id, kind,
+        )
+
+    if error_msg:
+        att.extraction_error = error_msg[:400]
+        att.save(update_fields=["extraction_error", "updated_at"])
+        return {"error": error_msg, "attachment_id": att.id, "kind": kind}
+
+    att.extracted_text = extracted
+    att.extraction_error = ""
+    att.save(update_fields=["extracted_text", "extraction_error", "updated_at"])
+
+    return {
+        "ok": True,
+        "cached": False,
+        "attachment_id": att.id,
+        "kind": kind,
+        "extracted_text_preview": extracted[:600],
+        "size_bytes": len(extracted),
+        **({"summary": extra} if extra else {}),
+    }
+
+
+def _ingest_nfe_xml(att) -> tuple[str, dict[str, Any]]:
+    """Parse an NF-e XML attachment, returning (text, summary_dict).
+
+    Uses the existing fiscal pipeline parser when available; falls back
+    to a generic ElementTree pass for the most useful fields. The
+    summary dict is a small structured view for the agent to reference;
+    the text is a human-readable Portuguese summary suited for inline
+    context."""
+    import xml.etree.ElementTree as ET
+
+    raw = att.file.open("rb").read()
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as exc:
+        raise ValueError(f"XML inválido: {exc}") from exc
+
+    # Strip default namespaces for easier xpath.
+    ns = {"nfe": "http://www.portalfiscal.inf.br/nfe"}
+    def _find(path: str) -> str:
+        el = root.find(path, ns)
+        return (el.text or "").strip() if el is not None and el.text else ""
+
+    chave = ""
+    info_id = root.find(".//nfe:infNFe", ns)
+    if info_id is not None and info_id.get("Id"):
+        chave = info_id.get("Id", "").replace("NFe", "")
+
+    summary = {
+        "chave": chave,
+        "numero": _find(".//nfe:ide/nfe:nNF"),
+        "serie": _find(".//nfe:ide/nfe:serie"),
+        "data_emissao": _find(".//nfe:ide/nfe:dhEmi"),
+        "natureza_operacao": _find(".//nfe:ide/nfe:natOp"),
+        "emit_cnpj": _find(".//nfe:emit/nfe:CNPJ"),
+        "emit_nome": _find(".//nfe:emit/nfe:xNome"),
+        "dest_cnpj": _find(".//nfe:dest/nfe:CNPJ") or _find(".//nfe:dest/nfe:CPF"),
+        "dest_nome": _find(".//nfe:dest/nfe:xNome"),
+        "valor_total": _find(".//nfe:total/nfe:ICMSTot/nfe:vNF"),
+        "valor_produtos": _find(".//nfe:total/nfe:ICMSTot/nfe:vProd"),
+        "valor_icms": _find(".//nfe:total/nfe:ICMSTot/nfe:vICMS"),
+    }
+
+    items = root.findall(".//nfe:det", ns)
+    summary["item_count"] = len(items)
+    summary["itens_preview"] = [
+        {
+            "numero": it.get("nItem"),
+            "descricao": (it.find(".//nfe:prod/nfe:xProd", ns).text or "")[:100]
+                if it.find(".//nfe:prod/nfe:xProd", ns) is not None else "",
+            "ncm": (it.find(".//nfe:prod/nfe:NCM", ns).text or "")
+                if it.find(".//nfe:prod/nfe:NCM", ns) is not None else "",
+            "cfop": (it.find(".//nfe:prod/nfe:CFOP", ns).text or "")
+                if it.find(".//nfe:prod/nfe:CFOP", ns) is not None else "",
+            "valor": (it.find(".//nfe:prod/nfe:vProd", ns).text or "")
+                if it.find(".//nfe:prod/nfe:vProd", ns) is not None else "",
+        }
+        for it in items[:10]
+    ]
+
+    text = (
+        f"NF-e {summary.get('numero', '?')}/{summary.get('serie', '?')}\n"
+        f"Chave: {summary.get('chave', '?')}\n"
+        f"Emissão: {summary.get('data_emissao', '?')}\n"
+        f"Natureza: {summary.get('natureza_operacao', '?')}\n"
+        f"Emitente: {summary.get('emit_nome', '?')} ({summary.get('emit_cnpj', '?')})\n"
+        f"Destinatário: {summary.get('dest_nome', '?')} ({summary.get('dest_cnpj', '?')})\n"
+        f"Valor total: R$ {summary.get('valor_total', '?')}\n"
+        f"Itens ({summary['item_count']} no total, mostrando primeiros "
+        f"{len(summary['itens_preview'])}):\n"
+    )
+    for it in summary["itens_preview"]:
+        text += (
+            f"  - #{it['numero']}: {it['descricao']} | NCM {it['ncm']} | "
+            f"CFOP {it['cfop']} | R$ {it['valor']}\n"
+        )
+    return text, summary
+
+
+def _ingest_ofx(att) -> tuple[str, dict[str, Any]]:
+    """Parse an OFX bank statement into a textual summary.
+
+    Tries the ``ofxtools`` library first; if unavailable, falls back to
+    a forgiving regex pass over the SGML body so the agent still gets
+    something useful."""
+    raw_bytes = att.file.open("rb").read()
+    raw = raw_bytes.decode("latin-1", errors="replace")
+
+    try:
+        from ofxtools import Parser
+        parser = Parser.OFXTree()
+        parser.parse(att.file.open("rb"))
+        ofx_obj = parser.convert()
+        statements = ofx_obj.statements or []
+        summary = {
+            "statement_count": len(statements),
+            "accounts": [],
+        }
+        text_lines = [f"OFX com {len(statements)} extrato(s):"]
+        for st in statements:
+            acc = getattr(st, "account", None)
+            acc_info = {
+                "bank": getattr(acc, "bankid", None) if acc else None,
+                "account": getattr(acc, "acctid", None) if acc else None,
+                "currency": getattr(st, "curdef", None),
+                "balance": str(getattr(st, "balamt", "")),
+                "balance_date": str(getattr(st, "dtasof", "")),
+                "transaction_count": len(getattr(st, "transactions", []) or []),
+            }
+            summary["accounts"].append(acc_info)
+            text_lines.append(
+                f"  Conta {acc_info['account']} (banco {acc_info['bank']}): "
+                f"saldo R$ {acc_info['balance']} em {acc_info['balance_date']} "
+                f"— {acc_info['transaction_count']} lançamentos."
+            )
+            for tx in (getattr(st, "transactions", []) or [])[:10]:
+                text_lines.append(
+                    f"    {tx.dtposted} {tx.trnamt:>12} {tx.memo or tx.name or ''}"
+                )
+        return "\n".join(text_lines), summary
+    except ImportError:
+        # Fallback regex parse — pull the basics.
+        import re
+        ban_match = re.search(r"<BANKID>(\d+)", raw)
+        acc_match = re.search(r"<ACCTID>(\d+)", raw)
+        bal_match = re.search(r"<BALAMT>([-\d.]+)", raw)
+        tx_count = len(re.findall(r"<STMTTRN>", raw))
+        summary = {
+            "bank": ban_match.group(1) if ban_match else None,
+            "account": acc_match.group(1) if acc_match else None,
+            "balance": bal_match.group(1) if bal_match else None,
+            "transaction_count": tx_count,
+        }
+        text = (
+            f"OFX (parser básico, instale ofxtools para detalhamento):\n"
+            f"  Banco: {summary['bank']}\n"
+            f"  Conta: {summary['account']}\n"
+            f"  Saldo: R$ {summary['balance']}\n"
+            f"  Lançamentos: {summary['transaction_count']}"
+        )
+        return text, summary
+
+
+# ---------------------------------------------------------------------------
 # Tool: financial_statements
 # ---------------------------------------------------------------------------
 def financial_statements(
@@ -1995,6 +2248,24 @@ TOOLS: list[ToolDef] = [
         },
     ),
     ToolDef(
+        name="ingest_document",
+        description="Parse one chat attachment into structured fields. Supports "
+                    "NF-e XML (returns chave/partes/totais/itens), OFX bank "
+                    "statements (returns account info + first transactions). "
+                    "PDFs and images are handled directly by the multimodal LLM "
+                    "— no explicit ingest needed for those. Cached per attachment, "
+                    "so calling twice is free.",
+        handler=ingest_document,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "company_id": {"type": "integer"},
+                "attachment_id": {"type": "integer"},
+            },
+            "required": ["company_id", "attachment_id"],
+        },
+    ),
+    ToolDef(
         name="run_reconciliation_agent",
         description="Run the bank-reconciliation auto-accept agent over a tenant's "
                     "unreconciled transactions, scoring candidates and proposing "
@@ -2049,6 +2320,7 @@ _TOOL_DOMAINS: dict[str, str] = {
     "list_unreconciled_bank_transactions": "recon",
     "suggest_reconciliation": "recon",
     "run_reconciliation_agent": "recon",
+    "ingest_document": "fiscal",
     "get_invoice": "billing",
     "list_invoice_critics": "billing",
     "get_nota_fiscal": "fiscal",

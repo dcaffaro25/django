@@ -514,6 +514,17 @@ STATIC_URL = 'static/'
 STATICFILES_DIRS = [os.path.join(BASE_DIR, "static")]
 STATIC_ROOT = os.path.join(BASE_DIR, "staticfiles")
 
+# Uploaded files (chat attachments, etc.). On Railway, set MEDIA_ROOT
+# to the mount path of an attached Volume (e.g. "/data") so files
+# survive redeploys. Locally falls back to <BASE_DIR>/media which is
+# git-ignored.
+MEDIA_URL = "/media/"
+MEDIA_ROOT = os.getenv("MEDIA_ROOT", os.path.join(BASE_DIR, "media"))
+# Cap one upload at 25MB by default — adjust if PDFs/photos start
+# being larger in practice. Total request budget is the same; ten
+# images would mean ten requests, not one heavy one.
+AGENT_ATTACHMENT_MAX_BYTES = int(os.getenv("AGENT_ATTACHMENT_MAX_BYTES", str(25 * 1024 * 1024)))
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.0/ref/settings/#default-auto-field
 

@@ -156,6 +156,68 @@ class AgentConversationViewSet(viewsets.ModelViewSet):
     def get_serializer_context(self):
         return {**super().get_serializer_context(), "request": self.request}
 
+    @action(detail=True, methods=["post"], url_path="attachments")
+    def upload_attachment(self, request, pk=None, **kwargs):
+        """Accept one file per call (multipart/form-data, field 'file').
+
+        Stores it on the configured ``MEDIA_ROOT`` (Railway Volume in
+        production), classifies by extension/content-type, and returns
+        ``{id, kind, content_type, size_bytes, filename}``. The chat
+        endpoint then references the returned ``id`` via
+        ``attachment_ids: [...]``.
+        """
+        from django.conf import settings as _settings
+
+        from .models import AgentMessageAttachment
+
+        conversation = self.get_object()
+        file_obj = request.FILES.get("file")
+        if file_obj is None:
+            return Response(
+                {"detail": "file field is required (multipart/form-data)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        max_bytes = int(getattr(_settings, "AGENT_ATTACHMENT_MAX_BYTES", 25 * 1024 * 1024))
+        if file_obj.size > max_bytes:
+            return Response(
+                {"detail": f"File too large ({file_obj.size} > {max_bytes} bytes)."},
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            )
+
+        ct = (file_obj.content_type or "").lower()
+        name_lower = (file_obj.name or "").lower()
+        # Classify by content-type and filename. Be liberal with NF-e XML
+        # since some browsers report ``text/xml``, others ``application/xml``,
+        # OFX is sometimes ``text/plain``.
+        if "xml" in ct or name_lower.endswith(".xml"):
+            kind = AgentMessageAttachment.KIND_NFE_XML
+        elif name_lower.endswith(".ofx") or "ofx" in ct:
+            kind = AgentMessageAttachment.KIND_OFX
+        elif ct == "application/pdf" or name_lower.endswith(".pdf"):
+            kind = AgentMessageAttachment.KIND_PDF
+        elif ct.startswith("image/") or any(name_lower.endswith(e) for e in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            kind = AgentMessageAttachment.KIND_IMAGE
+        else:
+            kind = AgentMessageAttachment.KIND_OTHER
+
+        att = AgentMessageAttachment.objects.create(
+            company=conversation.company,
+            conversation=conversation,
+            file=file_obj,
+            filename=file_obj.name[:255],
+            content_type=ct[:128],
+            size_bytes=file_obj.size,
+            kind=kind,
+        )
+        return Response({
+            "id": att.id,
+            "kind": att.kind,
+            "filename": att.filename,
+            "content_type": att.content_type,
+            "size_bytes": att.size_bytes,
+        }, status=status.HTTP_201_CREATED)
+
     @action(detail=True, methods=["post"], url_path="chat")
     def chat(self, request, pk=None, **kwargs):
         """Send a user message and receive the agent's reply.
@@ -201,6 +263,24 @@ class AgentConversationViewSet(viewsets.ModelViewSet):
         # blob unconditionally and let it decide.
         page_context = body.get("page_context") if conversation.include_page_context else None
 
+        # Optional list of pre-uploaded attachment IDs to bind to this turn.
+        # Uploads happen via the dedicated ``/attachments/`` endpoint and
+        # return ``{id, ...}``; the chat call references them so the
+        # runtime can wire each one into the LLM's input items.
+        attachment_ids = body.get("attachment_ids") or []
+        if attachment_ids and not isinstance(attachment_ids, list):
+            return Response(
+                {"detail": "attachment_ids must be a list of integers"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        from .models import AgentMessageAttachment
+        attachments_qs = AgentMessageAttachment.objects.filter(
+            id__in=attachment_ids,
+            conversation=conversation,
+            message__isnull=True,  # only un-bound attachments
+        )
+
         with transaction.atomic():
             if config_changed_fields:
                 conversation.save(update_fields=config_changed_fields + ["updated_at"])
@@ -210,6 +290,8 @@ class AgentConversationViewSet(viewsets.ModelViewSet):
                 role=AgentMessage.ROLE_USER,
                 content=content,
             )
+            # Bind attachments to this turn's user message.
+            attachments_qs.update(message=user_msg)
             if not conversation.title:
                 conversation.title = content[:80]
                 conversation.save(update_fields=["title", "updated_at"])

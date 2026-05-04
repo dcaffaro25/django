@@ -134,3 +134,7 @@ pyrightconfig.json
 
 # Local credentials (contains sensitive API keys)
 local_credentials.ini
+
+# Uploaded media (agent attachments etc.). On Railway this path is
+# the mount of a persistent Volume; locally it's transient.
+/media/

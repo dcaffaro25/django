@@ -336,6 +336,73 @@ class AgentMessage(TenantAwareBaseModel):
         return f"AgentMessage(id={self.id}, role={self.role}, conv={self.conversation_id})"
 
 
+class AgentMessageAttachment(TenantAwareBaseModel):
+    """A file uploaded by the user inside an agent conversation — Phase 2.
+
+    The agent runtime converts each attachment into the right input
+    item for the LLM:
+
+    * NF-e XML / NFCe XML  → parsed with the existing fiscal pipeline
+      and surfaced as ``input_text`` containing the structured fields
+      so the model doesn't need to read raw XML.
+    * OFX                  → parsed with the existing OFX importer.
+    * PDF / image          → wrapped as ``input_image`` so the Codex
+      multimodal pipeline can OCR and understand layout.
+    * Anything else        → ignored with a warning log; the agent is
+      told the attachment couldn't be processed.
+
+    ``extracted_text`` caches the parser/OCR output so re-asking about
+    the same attachment doesn't re-process. Stored on a Railway Volume
+    in production (``settings.MEDIA_ROOT`` mounted at the volume path).
+    """
+
+    KIND_NFE_XML = "nfe_xml"
+    KIND_OFX = "ofx"
+    KIND_PDF = "pdf"
+    KIND_IMAGE = "image"
+    KIND_OTHER = "other"
+    KIND_CHOICES = [
+        (KIND_NFE_XML, "NF-e / NFCe XML"),
+        (KIND_OFX, "OFX bank statement"),
+        (KIND_PDF, "PDF document"),
+        (KIND_IMAGE, "Image (PNG/JPEG/etc.)"),
+        (KIND_OTHER, "Other / unsupported"),
+    ]
+
+    message = models.ForeignKey(
+        "AgentMessage",
+        related_name="attachments",
+        on_delete=models.CASCADE,
+        null=True, blank=True,
+        help_text="Null while the file is uploaded but not yet attached to a message.",
+    )
+    conversation = models.ForeignKey(
+        "AgentConversation",
+        related_name="attachments",
+        on_delete=models.CASCADE,
+    )
+    file = models.FileField(upload_to="agent/attachments/%Y/%m/")
+    filename = models.CharField(max_length=255)
+    content_type = models.CharField(max_length=128, blank=True, default="")
+    size_bytes = models.PositiveIntegerField(default=0)
+    kind = models.CharField(max_length=16, choices=KIND_CHOICES, default=KIND_OTHER, db_index=True)
+    extracted_text = models.TextField(
+        blank=True, default="",
+        help_text="Cached output of the parser/OCR step. Empty until ingest_document runs.",
+    )
+    extraction_error = models.CharField(max_length=400, blank=True, default="")
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["conversation", "-created_at"]),
+            models.Index(fields=["company", "kind"]),
+        ]
+        ordering = ["created_at", "id"]
+
+    def __str__(self):
+        return f"AgentMessageAttachment(id={self.id}, kind={self.kind}, conv={self.conversation_id})"
+
+
 class AgentToolCallLog(TenantAwareBaseModel):
     """One row per tool invocation by the agent runtime — Phase 0 audit log.
 
