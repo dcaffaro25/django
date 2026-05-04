@@ -20,6 +20,7 @@ import { FiscalStatusBadge } from "./components/FiscalStatusBadge"
 import { CriticsAuditModal } from "./components/CriticsAuditModal"
 import { InvoiceDetailDrawer } from "./InvoiceDetailDrawer"
 import { useDebounced } from "@/lib/useDebounced"
+import { usePageContext } from "@/stores/page-context-store"
 import { cn, formatCurrency, formatDate } from "@/lib/utils"
 import { useUserRole } from "@/features/auth/useUserRole"
 
@@ -150,6 +151,29 @@ export function InvoicesPage() {
         .some((s) => s.toLowerCase().includes(q)),
     )
   }, [data, search])
+
+  // Page context for the agent widget — updates when filters or counts
+  // change so the agent has the latest snapshot when the user opts in.
+  usePageContext({
+    route: "/billing/invoices",
+    title: "Faturas",
+    summary: (
+      `Lista de faturas com ${filtered.length} resultados visíveis ` +
+      `(de ${data?.length ?? 0} carregadas).`
+    ),
+    data: {
+      filters: {
+        search: search || undefined,
+        status: statusFilter !== "all" ? statusFilter : undefined,
+        fiscal_status: fiscalFilter !== "all" ? fiscalFilter : undefined,
+        has_critics: hasCritics || undefined,
+        date_from: dateFrom || undefined,
+        date_to: dateTo || undefined,
+      },
+      visible_count: filtered.length,
+      total_loaded: data?.length ?? 0,
+    },
+  })
 
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [auditOpen, setAuditOpen] = useState(false)

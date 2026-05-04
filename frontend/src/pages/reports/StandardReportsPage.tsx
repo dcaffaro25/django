@@ -1,5 +1,6 @@
 import { useMemo, useEffect, useRef, useState } from "react"
-import { Link, Outlet, useSearchParams } from "react-router-dom"
+import { Link, Outlet, useLocation, useSearchParams } from "react-router-dom"
+import { usePageContext } from "@/stores/page-context-store"
 import { FileBarChart, Sparkles, Wallet, Receipt, ListChecks, ChevronLeft, ChevronRight, ChevronDown, Pencil, FileDown } from "lucide-react"
 import { toast } from "sonner"
 import { DownloadXlsxButton } from "@/components/ui/download-xlsx-button"
@@ -77,9 +78,45 @@ function useReportFilters() {
  */
 export function StandardReportsPage() {
   const [params, setParams] = useSearchParams()
+  const location = useLocation()
   const { includePending, date_from, date_to, entity, basis, granularity, compare } =
     useReportFilters()
   const { data: entities = [] } = useEntities()
+
+  // Active sub-tab inferred from the URL — /reports → DRE, /reports/balanco
+  // → Balanço, etc. Used in the page-context summary so the agent knows
+  // which statement the user is staring at.
+  const activeTab = (() => {
+    const last = location.pathname.replace(/\/+$/, "").split("/").pop() || ""
+    if (last === "balanco") return "Balanço"
+    if (last === "dfc") return "DFC"
+    if (last === "custom") return "Personalizados"
+    if (last === "history") return "Histórico"
+    return "DRE"
+  })()
+
+  usePageContext({
+    route: location.pathname,
+    title: `Demonstrativos — ${activeTab}`,
+    summary: (
+      `Demonstrativos: aba ${activeTab}, basis=${basis}, ` +
+      `período ${date_from || "?"}..${date_to || "?"}, ` +
+      `${includePending ? "incluindo pendentes" : "só posted"}, ` +
+      `entity=${entity || "all"}.`
+    ),
+    data: {
+      tab: activeTab,
+      filters: {
+        basis,
+        date_from,
+        date_to,
+        entity,
+        granularity,
+        compare,
+        include_pending: includePending,
+      },
+    },
+  })
 
   // Single-place mutator: copy the current params, set/delete one
   // key, replace. ``replace: true`` keeps the back button useful

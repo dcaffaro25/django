@@ -32,6 +32,7 @@ import {
 import { GroupDetailModal } from "./components/GroupDetailModal"
 import { useUserRole } from "@/features/auth/useUserRole"
 import { useDebounced } from "@/lib/useDebounced"
+import { usePageContext } from "@/stores/page-context-store"
 import { cn, formatCurrency } from "@/lib/utils"
 
 const TAB_TO_STATUS: Record<string, LinkReviewStatus> = {
@@ -545,6 +546,29 @@ export function NfLinkReviewPage() {
   const totalCount = data?.length ?? 0
   const filteredCount = filteredAndSorted.length
   const selectedCount = selected.size
+
+  usePageContext({
+    route: "/billing/links",
+    title: "Vínculos NF↔Tx",
+    summary: (
+      `Aba "${tab}" com ${filteredCount} vínculos visíveis ` +
+      `de ${totalCount} carregados. ${selectedCount} selecionados.`
+    ),
+    data: {
+      tab,
+      filters: {
+        search: search || undefined,
+        min_confidence: minConfidence !== "0" ? minConfidence : undefined,
+        hide_stale: hideStale || undefined,
+        ...Object.fromEntries(
+          Object.entries(dimFilters).filter(([, v]) => v !== "any"),
+        ),
+      },
+      filtered_count: filteredCount,
+      total_count: totalCount,
+      selected_count: selectedCount,
+    },
+  })
 
   const anyFilterActive =
     minConfidence !== "0" ||
