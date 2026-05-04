@@ -270,11 +270,25 @@ def _iter_sse_events(resp: requests.Response) -> Iterable[dict[str, Any]]:
 
     The Responses API encodes one JSON object per SSE event. We ignore
     other SSE fields (event:, id:, retry:) since the payload itself
-    carries the event ``type``."""
+    carries the event ``type``.
+
+    ``requests.iter_lines(decode_unicode=True)`` is supposed to return
+    ``str``, but the SSE response from chatgpt.com/backend-api/codex
+    arrives without an explicit charset on ``Content-Type:
+    text/event-stream``. In that case requests can fall back to a path
+    where ``decode_unicode=True`` is silently ignored and we get
+    ``bytes`` — which then crashes ``line.rstrip("\\r")`` with the
+    classic ``TypeError: a bytes-like object is required, not 'str'``.
+    Decode defensively here so the parser is robust to either."""
     buffer: list[str] = []
-    for raw_line in resp.iter_lines(decode_unicode=True):
+    for raw_line in resp.iter_lines(decode_unicode=False):
         if raw_line is None:
             continue
+        if isinstance(raw_line, bytes):
+            try:
+                raw_line = raw_line.decode("utf-8")
+            except UnicodeDecodeError:
+                raw_line = raw_line.decode("utf-8", errors="replace")
         line = raw_line.rstrip("\r")
         if line == "":
             if not buffer:
