@@ -14,8 +14,7 @@
  */
 import { useMemo, useState } from "react"
 import {
-  AlertCircle, CheckCircle2, Clock, Database, FileText, Loader2,
-  RotateCcw, Wrench,
+  AlertCircle, CheckCircle2, Database, Loader2, Wrench,
 } from "lucide-react"
 
 import { Card } from "@/components/ui/card"
@@ -349,7 +348,7 @@ export function AgentAuditPage() {
     <div className="space-y-4 p-4">
       <SectionHeader
         title="Auditoria do agente"
-        description="Histórico de tool calls e escritas do agente para o tenant atual."
+        subtitle="Histórico de tool calls e escritas do agente para o tenant atual."
       />
       <div className="flex gap-2 border-b border-zinc-200 dark:border-zinc-800">
         <button
