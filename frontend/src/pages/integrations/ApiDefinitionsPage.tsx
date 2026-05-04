@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react"
+import { useNavigate } from "react-router-dom"
 import { toast } from "sonner"
 import {
   Plus, RefreshCw, Search, Pencil, Trash2, Play, CheckCircle2,
-  XCircle, AlertTriangle, Lock,
+  XCircle, AlertTriangle, Lock, Sparkles,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { Button } from "@/components/ui/button"
@@ -69,6 +70,7 @@ const OUTCOME_TONE: Record<TestOutcome, string> = {
 // Page
 // ---------------------------------------------------------------------
 export function ApiDefinitionsPage() {
+  const navigate = useNavigate()
   const { canWrite } = useUserRole()
   const [providerFilter, setProviderFilter] = useState<string>("all")
   const [search, setSearch] = useState("")
@@ -123,6 +125,16 @@ export function ApiDefinitionsPage() {
             <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isFetching}>
               <RefreshCw className={cn("h-4 w-4", isFetching && "animate-spin")} /> Atualizar
             </Button>
+            {canWrite ? (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => navigate("/integrations/api-definitions/discover")}
+                title="Descobrir APIs a partir de URL de documentação"
+              >
+                <Sparkles className="h-4 w-4" /> Descobrir
+              </Button>
+            ) : null}
             {canWrite ? (
               <Button size="sm" onClick={() => setEditing("new")}>
                 <Plus className="h-4 w-4" /> Nova definição

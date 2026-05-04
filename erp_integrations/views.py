@@ -100,6 +100,131 @@ class ERPAPIDefinitionViewSet(SoftDeleteQuerysetMixin, viewsets.ModelViewSet):
                 qs = qs.filter(provider_id=provider_id)
         return qs
 
+    @action(detail=False, methods=["post"], url_path="discover")
+    def discover(self, request, tenant_id=None):
+        """Phase-2: discover candidate APIs from a documentation URL.
+
+        Body: ``{ url: str, provider?: int, allow_llm?: bool }``.
+
+        Doesn't persist anything — returns ``{strategy_used,
+        candidates: [...]}`` for the operator to review and import
+        via ``import_discovered`` below. ``provider`` is informational
+        only at this layer; gets set on each candidate at import time.
+
+        ``allow_llm`` requires the tenant's billing config to enable
+        ``allow_llm_doc_parse`` (mirrors the plan's safety guard).
+        """
+        from .services.api_discovery_service import discover_from_url
+
+        url = (request.data or {}).get("url", "").strip()
+        if not url:
+            return Response(
+                {"detail": "url é obrigatório."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        allow_llm_requested = bool((request.data or {}).get("allow_llm"))
+        # Tenant gate: only honour allow_llm when the tenant's billing
+        # config explicitly opts in. Falls back to disabled silently.
+        allow_llm = False
+        if allow_llm_requested:
+            tenant = getattr(request, "tenant", None)
+            try:
+                from billing.models_config import BillingTenantConfig
+                if tenant and tenant != "all":
+                    cfg = BillingTenantConfig.objects.filter(company=tenant).first()
+                    if cfg and getattr(cfg, "allow_llm_doc_parse", False):
+                        allow_llm = True
+            except Exception:
+                allow_llm = False
+
+        # We don't ship a default LLM caller here — the wiring would
+        # need an Anthropic SDK config that isn't always present. The
+        # operator can stick to the OpenAPI / Postman / HTML strategies
+        # which cover most cases; LLM is plumbed but inert by default.
+        result = discover_from_url(url, allow_llm=allow_llm, llm_caller=None)
+        return Response(result.to_dict())
+
+    @action(detail=False, methods=["post"], url_path="import-discovered")
+    def import_discovered(self, request, tenant_id=None):
+        """Persist a list of operator-selected candidates as
+        ``ERPAPIDefinition`` rows, sourced as ``discovered``.
+
+        Body: ``{ provider: int, candidates: [{call, method, url,
+        description, param_schema, ...}, ...] }``. Each candidate is
+        validated; failures are reported per-row but don't block the
+        rest from importing.
+        """
+        from .services.api_definition_service import (
+            validate_param_schema, validate_pagination_spec,
+        )
+
+        body = request.data or {}
+        provider_id = body.get("provider")
+        candidates = body.get("candidates") or []
+        if not provider_id:
+            return Response({"detail": "provider é obrigatório."}, status=400)
+        if not isinstance(candidates, list) or not candidates:
+            return Response({"detail": "candidates não pode ser vazio."}, status=400)
+
+        created: list = []
+        failed: list = []
+        for i, cand in enumerate(candidates):
+            if not isinstance(cand, dict):
+                failed.append({"index": i, "error": "candidate must be an object"})
+                continue
+            row_errors: list = []
+            ps_errors = validate_param_schema(cand.get("param_schema") or [])
+            if ps_errors:
+                row_errors.extend([f"param_schema: {e}" for e in ps_errors])
+            pg_errors = validate_pagination_spec(cand.get("pagination_spec"))
+            if pg_errors:
+                row_errors.extend([f"pagination_spec: {e}" for e in pg_errors])
+            if row_errors:
+                failed.append({"index": i, "call": cand.get("call"), "errors": row_errors})
+                continue
+
+            # Skip if (provider, call) already exists — operator can edit
+            # the existing one rather than creating a duplicate.
+            existing = ERPAPIDefinition.objects.filter(
+                provider_id=provider_id, call=cand.get("call"),
+            ).first()
+            if existing:
+                failed.append({
+                    "index": i, "call": cand.get("call"),
+                    "errors": [f"já existe (id={existing.id}). Edite-a manualmente."],
+                })
+                continue
+
+            try:
+                obj = ERPAPIDefinition.objects.create(
+                    provider_id=provider_id,
+                    call=cand.get("call") or f"discovered_{i}",
+                    method=(cand.get("method") or "GET").upper(),
+                    url=cand.get("url") or "",
+                    description=(cand.get("description") or "")[:255],
+                    param_schema=cand.get("param_schema") or [],
+                    auth_strategy=cand.get("auth_strategy") or "provider_default",
+                    pagination_spec=cand.get("pagination_spec") or None,
+                    records_path=cand.get("records_path") or "",
+                    documentation_url=cand.get("documentation_url") or None,
+                    source=ERPAPIDefinition.SOURCE_DISCOVERED,
+                    is_active=False,  # operator promotes to active after review
+                )
+                created.append({"id": obj.id, "call": obj.call})
+            except Exception as exc:
+                failed.append({
+                    "index": i, "call": cand.get("call"),
+                    "errors": [f"{type(exc).__name__}: {exc}"],
+                })
+
+        return Response({
+            "created": created,
+            "created_count": len(created),
+            "failed": failed,
+            "failed_count": len(failed),
+        })
+
     @action(detail=False, methods=["post"], url_path="validate")
     def validate_definition(self, request, tenant_id=None):
         """Run validators against the supplied payload without saving.

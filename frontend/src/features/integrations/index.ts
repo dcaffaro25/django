@@ -8,6 +8,8 @@ export {
   useDeleteApiDefinition,
   useValidateApiDefinition,
   useTestCallApiDefinition,
+  useDiscoverApis,
+  useImportDiscovered,
   useRunSandbox,
   useSavePipeline,
 } from "./hooks"

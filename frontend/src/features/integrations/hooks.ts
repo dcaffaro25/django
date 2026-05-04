@@ -95,6 +95,24 @@ export function useTestCallApiDefinition() {
   })
 }
 
+// ---- Phase 2: discovery ----
+export function useDiscoverApis() {
+  return useMutation({
+    mutationFn: integrationsApi.discoverApis,
+  })
+}
+
+export function useImportDiscovered() {
+  const sub = useSub()
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: integrationsApi.importDiscovered,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["integrations", sub, "api-definitions"] })
+    },
+  })
+}
+
 export function useRunSandbox() {
   return useMutation({
     mutationFn: integrationsApi.runSandbox,

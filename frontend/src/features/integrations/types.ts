@@ -110,6 +110,40 @@ export interface ApiDefinitionTestCallResult {
   first_payload_redacted?: Record<string, unknown> | null
 }
 
+// ---- Phase 2: discovery ----
+
+export type DiscoveryStrategy = "openapi" | "postman" | "html" | "llm"
+
+export interface DiscoveryCandidate {
+  call: string
+  method: string
+  url: string
+  description: string
+  param_schema: ParamSpec[]
+  pagination_spec?: PaginationSpec | null
+  records_path: string
+  auth_strategy: AuthStrategy
+  documentation_url: string
+  confidence: number
+  source_strategy: DiscoveryStrategy
+  notes: string
+}
+
+export interface DiscoveryResult {
+  url: string
+  strategies_tried: DiscoveryStrategy[]
+  strategy_used: DiscoveryStrategy | null
+  candidates: DiscoveryCandidate[]
+  errors: Array<{ strategy: string; message: string }>
+}
+
+export interface ImportDiscoveredResult {
+  created: Array<{ id: number; call: string }>
+  created_count: number
+  failed: Array<{ index: number; call?: string; errors?: string[]; error?: string }>
+  failed_count: number
+}
+
 export type SandboxBindingMode = "static" | "jmespath" | "fanout"
 
 export interface SandboxBinding {

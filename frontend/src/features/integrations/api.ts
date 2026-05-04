@@ -2,10 +2,13 @@ import { api, unwrapList } from "@/lib/api-client"
 import type {
   ApiDefinitionTestCallResult,
   ApiDefinitionValidateResult,
+  DiscoveryCandidate,
+  DiscoveryResult,
   ERPAPIDefinition,
   ERPAPIDefinitionWrite,
   ERPConnection,
   ERPSyncPipelineWrite,
+  ImportDiscoveredResult,
   SandboxRequest,
   SandboxResult,
 } from "./types"
@@ -47,6 +50,13 @@ export const integrationsApi = {
     max_pages?: number
   }) =>
     api.tenant.post<ApiDefinitionTestCallResult>(`/api/api-definitions/${id}/test-call/`, body),
+
+  // Phase-2: discovery
+  discoverApis: (body: { url: string; allow_llm?: boolean }) =>
+    api.tenant.post<DiscoveryResult>("/api/api-definitions/discover/", body),
+
+  importDiscovered: (body: { provider: number; candidates: DiscoveryCandidate[] }) =>
+    api.tenant.post<ImportDiscoveredResult>("/api/api-definitions/import-discovered/", body),
 
   runSandbox: (body: SandboxRequest) =>
     api.tenant.post<SandboxResult>("/api/pipeline-sandbox/", body),
