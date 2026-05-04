@@ -154,8 +154,13 @@ class AgentConversationViewSet(viewsets.ModelViewSet):
         serializer.save(user=self.request.user, company=tenant)
 
     @action(detail=True, methods=["post"], url_path="chat")
-    def chat(self, request, pk=None):
+    def chat(self, request, pk=None, **kwargs):
         """Send a user message and receive the agent's reply.
+
+        ``**kwargs`` swallows the ``tenant_id`` URL capture that
+        ``TenantMiddleware`` relies on — without it DRF raises
+        ``TypeError: chat() got an unexpected keyword argument 'tenant_id'``
+        when the route is mounted under ``/<tenant_id>/api/agent/``.
 
         Persists the user turn, runs the LLM ↔ tools loop synchronously,
         and returns the full set of new messages produced (user +
