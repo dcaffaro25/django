@@ -316,10 +316,15 @@ def _assemble_sse_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     Codex Responses emits events of types like ``response.created``,
     ``response.output_item.added``, ``response.output_item.done``, and
     finally ``response.completed``. We accept either:
+      * incremental ``response.output_item.done`` events collected in
+        order (preferred — always reliable), or
       * a single ``response.completed`` event whose ``response`` object
-        carries the full ``output`` array (preferred), or
-      * incremental ``response.output_item.done`` events that we collect
-        in order (fallback for transports that don't bundle the final).
+        carries the full ``output`` array (fallback).
+
+    With ``store: false`` set on the request, Codex often sends
+    ``response.completed`` with ``output: []`` while the real items only
+    arrive via per-item events — so per-item is the trustworthy source
+    when both are present.
     """
     final_response: dict[str, Any] | None = None
     items_in_order: list[dict[str, Any]] = []
@@ -338,13 +343,18 @@ def _assemble_sse_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 f"Codex API streamed a failure: {err.get('message') or err}"
             )
 
-    if final_response and isinstance(final_response.get("output"), list):
-        out = final_response
+    # Pick the source with content: per-item events first (always populated
+    # when items stream), fall back to the final_response.output array.
+    final_output = (final_response or {}).get("output") if final_response else None
+    if items_in_order:
+        chosen_output = items_in_order
+    elif isinstance(final_output, list):
+        chosen_output = final_output
     else:
-        out = {"output": items_in_order}
+        chosen_output = []
 
     return {
         "model": (final_response or {}).get("model", ""),
-        "output": out.get("output") or [],
+        "output": chosen_output,
         "usage": (final_response or {}).get("usage") or {},
     }

@@ -168,6 +168,19 @@ class SysnordAgent:
                 item for item in output_items if item.get("type") == "message"
             ]
 
+            # Diagnostic: Codex occasionally returns only reasoning items
+            # (no message, no function_call) — usually with reasoning models
+            # on trivial prompts. Without this log, the only symptom is a
+            # blank assistant bubble with token counts populated, which is
+            # genuinely confusing. Log the item shape so we can tell.
+            if not tool_calls_in_turn and not assistant_text_items and output_items:
+                log.warning(
+                    "agent.empty_assistant_response conv=%s types=%s usage=%s",
+                    self.conversation.id,
+                    [it.get("type") for it in output_items],
+                    usage,
+                )
+
             if tool_calls_in_turn:
                 # Persist the assistant turn that requested the tool calls
                 # so the next iteration picks them up from history.
@@ -207,10 +220,26 @@ class SysnordAgent:
                     )
                 continue  # only normal data tools — loop back to the LLM
 
-            # No tool calls → this is the final assistant turn.
+            # No tool calls → this is the final assistant turn. If the
+            # message items don't yield text (or there are none at all),
+            # surface the reasoning summary or a clear fallback so the
+            # user never sees the empty "..." bubble that consumed tokens.
+            extracted = _extract_text_from_items(assistant_text_items)
+            content_override: str | None = None
+            if not extracted and output_items:
+                reasoning_text = _extract_reasoning_summary(output_items)
+                if reasoning_text:
+                    content_override = reasoning_text
+                else:
+                    content_override = (
+                        "(O modelo não retornou texto. Tente reformular a pergunta "
+                        "ou trocar o modelo.)"
+                    )
+
             final = self._persist_assistant_final(
                 assistant_text_items=assistant_text_items,
                 model_used=model_used, usage=usage,
+                content_override=content_override,
             )
             self._touch_conversation()
             return AgentTurnResult(
@@ -480,3 +509,27 @@ def _extract_text_from_items(items: list[dict[str, Any]]) -> str:
             if ptype in ("output_text", "text", "input_text") and text:
                 chunks.append(text)
     return "".join(chunks)
+
+
+def _extract_reasoning_summary(items: list[dict[str, Any]]) -> str:
+    """Last-resort text extraction from ``reasoning`` items.
+
+    When Codex returns only reasoning (no ``message``) we'd otherwise
+    persist an empty assistant bubble. Reasoning items carry a
+    ``summary`` array of ``{type:"summary_text", text:"..."}`` parts;
+    surfacing that gives the user *something* visible while keeping
+    the turn shape unchanged. Joined with newlines if multiple."""
+    chunks: list[str] = []
+    for item in items:
+        if item.get("type") != "reasoning":
+            continue
+        summary = item.get("summary")
+        if not isinstance(summary, list):
+            continue
+        for part in summary:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text") or ""
+            if text and part.get("type") in ("summary_text", "text", "output_text"):
+                chunks.append(text)
+    return "\n".join(chunks)

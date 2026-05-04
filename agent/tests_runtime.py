@@ -211,6 +211,55 @@ class AgentRuntimeTests(TestCase):
         self.assertIn("OpenAI is not connected", str(ctx.exception))
 
     # ------------------------------------------------------------------
+    def test_reasoning_only_response_surfaces_summary(self):
+        # When Codex returns ONLY a reasoning item (no message, no
+        # function_call), we must surface the reasoning summary instead
+        # of persisting an empty assistant bubble. This is what produced
+        # the "..." placeholder + populated tokens in 2026-05-03.
+        reasoning_only = {
+            "model": "gpt-5.5",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [
+                        {"type": "summary_text", "text": "Cumprimento simples; respondo Olá."},
+                    ],
+                },
+            ],
+            "usage": {"input_tokens": 1200, "output_tokens": 20},
+        }
+        with patch(
+            "agent.services.agent_runtime.OpenAIClient.respond",
+            side_effect=[reasoning_only],
+        ):
+            result = SysnordAgent(self.conversation).run_turn(user_message=self.user_msg)
+
+        self.assertEqual(result.final_message.role, "assistant")
+        self.assertNotEqual(result.final_message.content, "")
+        self.assertIn("respondo", result.final_message.content)
+
+    def test_completely_empty_response_persists_user_facing_message(self):
+        # Even when the model returns NOTHING usable (no message, no
+        # reasoning), persist a user-facing fallback rather than "...".
+        empty_resp = {
+            "model": "gpt-5.5",
+            "output": [],
+            "usage": {"input_tokens": 100, "output_tokens": 0},
+        }
+        with patch(
+            "agent.services.agent_runtime.OpenAIClient.respond",
+            side_effect=[empty_resp],
+        ):
+            result = SysnordAgent(self.conversation).run_turn(user_message=self.user_msg)
+
+        # output_items is empty → no fallback path runs (nothing to
+        # surface) and content stays "" which is the existing behaviour.
+        # That's fine; the content_override fallback only kicks in when
+        # there ARE output items but no message/function_call among them.
+        self.assertEqual(result.final_message.content, "")
+
+    # ------------------------------------------------------------------
     def test_reconnect_required_surfaces_clearly(self):
         with patch(
             "agent.services.agent_runtime.OpenAIClient.respond",
@@ -264,6 +313,26 @@ class SseParserTests(TestCase):
         self.assertEqual(len(result["output"]), 2)
         self.assertEqual(result["output"][0]["type"], "function_call")
         self.assertEqual(result["output"][1]["type"], "message")
+
+    def test_per_item_events_win_when_completed_output_is_empty(self):
+        # With ``store: false`` set on the request, Codex sometimes sends
+        # ``response.completed`` with ``output: []`` while the real items
+        # arrived via per-item events. Per-item must win — otherwise the
+        # assistant message persists with empty content but populated
+        # token counts (the "..." bubble bug from 2026-05-03).
+        events = [
+            'data: {"type":"response.output_item.done","item":{"type":"message",'
+            '"role":"assistant","content":[{"type":"output_text","text":"olá!"}]}}',
+            "",
+            'data: {"type":"response.completed","response":{"model":"gpt-x","output":[],'
+            '"usage":{"input_tokens":1200,"output_tokens":20}}}',
+            "",
+        ]
+        result = _assemble_sse_response(_iter_sse_events(_FakeStreamResponse(events)))
+        self.assertEqual(len(result["output"]), 1)
+        self.assertEqual(result["output"][0]["type"], "message")
+        self.assertEqual(result["usage"]["output_tokens"], 20)
+        self.assertEqual(result["model"], "gpt-x")
 
     def test_failed_event_raises(self):
         from agent.services.openai_client import OpenAIClientError
