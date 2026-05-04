@@ -939,6 +939,460 @@ def simples_nacional_annex_for_cnae(cnae: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Tools: API meta — let the agent discover + call the full Sysnord REST API
+# ---------------------------------------------------------------------------
+# The ``api_meta`` app exposes /api/meta/* endpoints with model + endpoint
+# + enum + filter introspection. We let the agent (a) discover the surface
+# via discover_api, then (b) call it via call_internal_api. This avoids
+# hand-crafting an MCP tool per DRF endpoint (the codebase has 1k+).
+#
+# Tenant + user context are injected by ``agent_runtime`` (similar to how
+# ``company_id`` is force-overridden) so the agent can't escape the
+# conversation's scope by passing a different tenant in the path.
+
+# Cap the response body size to keep agent context manageable. Tunable
+# via ``settings.AGENT_API_RESPONSE_BYTE_CAP``.
+_API_RESPONSE_DEFAULT_CAP = 30_000
+
+
+def discover_api(
+    category: str,
+    name: str | None = None,
+    search: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Browse the Sysnord API surface via ``api_meta`` introspection.
+
+    Categories:
+      * ``capabilities`` — auth, pagination, multi-tenancy, error format.
+        No further args needed.
+      * ``models`` — list every model. Optional ``search`` filters by name.
+      * ``model_detail`` — full schema (fields, FKs, indexes, constraints).
+        Pass ``name='Invoice'`` (case-insensitive).
+      * ``model_relationships`` — direct + transitive relations for a model.
+        Pass ``name='BankTransaction'``.
+      * ``endpoints`` — every DRF route. ``search`` filters by path or name.
+      * ``enums`` — every choices field. ``search`` filters by name/values.
+      * ``filters`` — every FilterSet's accepted query params.
+
+    Use this to figure out *what* you can ask before calling
+    ``call_internal_api``. Pure read; no network."""
+    from api_meta.registry import (
+        get_all_endpoints,
+        get_all_enums,
+        get_all_filters,
+        get_all_models,
+        get_capabilities,
+        get_model_detail,
+        get_model_relationships,
+    )
+
+    cat = (category or "").lower()
+    s = (search or "").lower()
+
+    if cat == "capabilities":
+        return {"category": "capabilities", "data": get_capabilities()}
+
+    if cat == "models":
+        rows = [
+            {"name": m["name"], "app": m["app"], "table": m["table"],
+             "field_count": len(m.get("fields") or []),
+             "description": (m.get("description") or "")[:160]}
+            for m in get_all_models()
+        ]
+        if s:
+            rows = [r for r in rows if s in r["name"].lower() or s in r["app"].lower()]
+        return {"category": "models", "count": len(rows), "models": rows[:limit]}
+
+    if cat == "model_detail":
+        if not name:
+            return {"error": "name is required for model_detail."}
+        d = get_model_detail(name)
+        if not d:
+            return {"error": f"Model {name!r} not found."}
+        return {"category": "model_detail", "data": d}
+
+    if cat == "model_relationships":
+        if not name:
+            return {"error": "name is required for model_relationships."}
+        d = get_model_relationships(name)
+        if not d:
+            return {"error": f"Model {name!r} not found."}
+        return {"category": "model_relationships", "data": d}
+
+    if cat == "endpoints":
+        rows = get_all_endpoints()
+        if s:
+            rows = [
+                r for r in rows
+                if s in (r.get("path") or "").lower()
+                or s in (r.get("name") or "").lower()
+                or any(s in (t or "").lower() for t in (r.get("tags") or []))
+            ]
+        # Trim — agent doesn't need every detail per row in a list view.
+        compact = [
+            {
+                "method": r.get("method"),
+                "path": r.get("path"),
+                "name": r.get("name"),
+                "summary": r.get("summary"),
+                "auth_required": r.get("auth_required"),
+                "filterset": r.get("filterset"),
+                "search_fields": r.get("search_fields"),
+                "ordering_fields": r.get("ordering_fields"),
+            }
+            for r in rows
+        ]
+        return {"category": "endpoints", "count": len(compact), "endpoints": compact[:limit]}
+
+    if cat == "enums":
+        all_enums = get_all_enums()
+        if s:
+            all_enums = {
+                k: v for k, v in all_enums.items()
+                if s in k.lower()
+                or any(s in str(val).lower() for val in (v.get("values") or []))
+            }
+        items = list(all_enums.items())[:limit]
+        return {"category": "enums", "count": len(items), "enums": dict(items)}
+
+    if cat == "filters":
+        return {"category": "filters", "data": get_all_filters()}
+
+    return {
+        "error": (
+            f"Unknown category {category!r}. Valid: capabilities | models | "
+            f"model_detail | model_relationships | endpoints | enums | filters."
+        )
+    }
+
+
+def call_internal_api(
+    method: str,
+    path: str,
+    query: dict[str, Any] | None = None,
+    body: dict[str, Any] | None = None,
+    _tenant_slug: str = "",
+    _acting_user_id: int | None = None,
+) -> dict[str, Any]:
+    """Dispatch an in-process call to any Sysnord REST endpoint as the
+    conversation's user, scoped to the conversation's tenant.
+
+    Currently **read-only** — only ``GET`` and ``HEAD`` accepted. Writes
+    (POST/PUT/PATCH/DELETE) are gated; track the dedicated write-tool
+    roadmap (Phase 1) to enable them with audit + confirmation.
+
+    The ``_tenant_slug`` and ``_acting_user_id`` parameters are injected
+    by the agent runtime — agent-supplied values are ignored, so the
+    tenant boundary cannot be crossed via a crafted path.
+
+    Path conventions:
+      * ``/api/meta/...`` — global meta endpoints; called as-is.
+      * ``/api/...`` — the agent runtime auto-prefixes the tenant slug.
+      * ``/{slug}/api/...`` — the leading slug is replaced with the
+        conversation's tenant (defence in depth).
+
+    Returns ``{status_code, data, truncated, content_type}``. Response
+    body is capped at ``settings.AGENT_API_RESPONSE_BYTE_CAP`` bytes
+    (default 30_000) — if truncated, ask for narrower filters."""
+    import re
+
+    from django.conf import settings as django_settings
+    from django.contrib.auth import get_user_model
+    from rest_framework.test import APIClient
+
+    method_u = (method or "").upper().strip()
+    if method_u not in ("GET", "HEAD"):
+        return {
+            "error": (
+                f"Method {method_u} is not yet allowed. Only GET/HEAD are "
+                "enabled — write tools land in a separate phase with audit + "
+                "confirmation gates."
+            )
+        }
+    if not path or not isinstance(path, str):
+        return {"error": "path is required."}
+
+    # Normalise path: enforce leading slash, strip query (we pass via params).
+    p = path if path.startswith("/") else "/" + path
+    p = p.split("?", 1)[0]
+
+    # Tenant injection.
+    if p.startswith("/api/meta/") or p == "/api/meta":
+        # Global meta endpoints — no tenant prefix.
+        final_path = p
+    else:
+        # Strip any leading /{slug}/ that the agent supplied.
+        m = re.match(r"^/([\w-]+)/(api/.*)$", p)
+        if m:
+            inner = "/" + m.group(2)
+        elif p.startswith("/api/"):
+            inner = p
+        else:
+            return {
+                "error": (
+                    f"path must be either /api/meta/... or /{{tenant}}/api/... "
+                    f"or /api/... (got {p!r})."
+                )
+            }
+        if not _tenant_slug:
+            return {"error": "Internal: tenant_slug not injected by runtime."}
+        final_path = f"/{_tenant_slug}{inner}"
+
+    User = get_user_model()
+    user = None
+    if _acting_user_id:
+        try:
+            user = User.objects.get(pk=_acting_user_id)
+        except User.DoesNotExist:
+            return {"error": f"acting user id={_acting_user_id} not found."}
+
+    client = APIClient()
+    if user is not None:
+        client.force_authenticate(user=user)
+
+    try:
+        if method_u == "GET":
+            resp = client.get(final_path, data=query or {}, format="json")
+        else:  # HEAD
+            resp = client.head(final_path, data=query or {})
+    except Exception as exc:
+        return {
+            "error": f"In-process dispatch failed: {type(exc).__name__}: {exc}",
+            "path": final_path,
+        }
+
+    cap = int(getattr(django_settings, "AGENT_API_RESPONSE_BYTE_CAP", _API_RESPONSE_DEFAULT_CAP))
+    raw = resp.content or b""
+    truncated = False
+    if len(raw) > cap:
+        raw = raw[:cap]
+        truncated = True
+
+    # Try to parse JSON; fall back to a string preview for HTML/plain.
+    content_type = resp.get("Content-Type", "")
+    parsed: Any
+    if "application/json" in content_type:
+        try:
+            import json as _json
+            parsed = _json.loads(raw.decode("utf-8", errors="replace"))
+        except (ValueError, UnicodeDecodeError):
+            parsed = raw.decode("utf-8", errors="replace")
+    else:
+        parsed = raw.decode("utf-8", errors="replace")
+
+    return {
+        "status_code": resp.status_code,
+        "path": final_path,
+        "content_type": content_type,
+        "truncated": truncated,
+        "byte_cap": cap,
+        "data": parsed,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tools: ERP API definitions (Omie etc.) — list, describe, invoke
+# ---------------------------------------------------------------------------
+# Each tenant has zero-or-more ``ERPConnection`` rows (credentials per
+# provider) and the provider exposes a registry of ``ERPAPIDefinition``
+# rows (one per call: ``ListarContasPagar``, ``ConsultarNF``, …) with
+# ``url`` + ``method`` + ``param_schema`` (defaults derived from schema).
+#
+# Only read-style calls are exposed to the agent: name prefixes
+# ``Listar``, ``Consultar``, ``Pesquisar``, ``Obter``, ``Get``. Writes
+# (``Incluir``, ``Alterar``, ``Excluir``, ``Cancelar``) are blocked here
+# and tracked with the broader write-tool roadmap.
+
+_ERP_READ_PREFIXES = ("Listar", "Consultar", "Pesquisar", "Obter", "Get")
+
+
+def list_erp_apis(
+    company_id: int,
+    provider: str | None = None,
+    search: str | None = None,
+) -> dict[str, Any]:
+    """List the ERP API calls the tenant has access to (i.e. there's an
+    active ``ERPConnection`` for the provider AND the call is registered
+    in ``ERPAPIDefinition``).
+
+    Filters: ``provider`` slug (e.g. 'omie') and a substring ``search``
+    over the call name."""
+    from erp_integrations.models import ERPAPIDefinition, ERPConnection
+
+    conns = ERPConnection.objects.filter(company_id=company_id, is_active=True)
+    if provider:
+        conns = conns.filter(provider__slug=provider)
+    provider_ids = list(conns.values_list("provider_id", flat=True).distinct())
+    if not provider_ids:
+        return {
+            "count": 0, "apis": [],
+            "note": (
+                f"No active ERPConnection for tenant company_id={company_id}"
+                + (f" provider={provider!r}" if provider else "")
+                + ". Configure one in the admin first."
+            ),
+        }
+
+    qs = ERPAPIDefinition.objects.filter(
+        provider_id__in=provider_ids, is_active=True,
+    ).select_related("provider")
+    if search:
+        qs = qs.filter(call__icontains=search)
+
+    rows = []
+    for a in qs.order_by("provider__slug", "call"):
+        rows.append({
+            "id": a.id,
+            "provider": a.provider.slug,
+            "call": a.call,
+            "method": a.method,
+            "url": a.url,
+            "description": a.description or "",
+            "param_count": len(a.param_schema or []),
+            "is_read_only": a.call.startswith(_ERP_READ_PREFIXES),
+        })
+    return {"count": len(rows), "apis": rows}
+
+
+def describe_erp_api(
+    company_id: int,
+    call: str,
+    provider: str | None = None,
+) -> dict[str, Any]:
+    """Return the full param_schema for one ERP API call so the agent
+    knows which fields to pass when calling ``call_erp_api``.
+
+    Each param spec carries name, type, description, required, and a
+    default. Compose call_erp_api ``params={...}`` overriding only what
+    you need; the rest fall back to defaults from the schema."""
+    from erp_integrations.models import ERPAPIDefinition, ERPConnection
+
+    conns = ERPConnection.objects.filter(company_id=company_id, is_active=True)
+    if provider:
+        conns = conns.filter(provider__slug=provider)
+    provider_ids = list(conns.values_list("provider_id", flat=True).distinct())
+    if not provider_ids:
+        return {"error": f"No active ERPConnection for company_id={company_id}."}
+
+    api = (
+        ERPAPIDefinition.objects
+        .filter(provider_id__in=provider_ids, call__iexact=call, is_active=True)
+        .select_related("provider")
+        .first()
+    )
+    if not api:
+        return {
+            "error": (
+                f"ERP API call {call!r} not found for company_id={company_id}. "
+                "Use list_erp_apis to see what's available."
+            )
+        }
+
+    return {
+        "provider": api.provider.slug,
+        "call": api.call,
+        "method": api.method,
+        "url": api.url,
+        "description": api.description or "",
+        "is_read_only": api.call.startswith(_ERP_READ_PREFIXES),
+        "param_schema": api.param_schema or [],
+    }
+
+
+def call_erp_api(
+    company_id: int,
+    call: str,
+    params: dict[str, Any] | None = None,
+    provider: str | None = None,
+) -> dict[str, Any]:
+    """Invoke a registered ERP API call for the conversation's tenant,
+    using its stored ``app_key``/``app_secret`` credentials.
+
+    Read-only: name prefixes ``Listar``/``Consultar``/``Pesquisar``/
+    ``Obter``/``Get``. Writes are rejected here and tracked separately.
+
+    ``params`` overrides keys in the schema-derived default param
+    object — e.g. ``{"pagina": 2, "registros_por_pagina": 50}``.
+
+    Returns ``{status_code, ok, response, truncated, byte_cap}`` —
+    response is the unwrapped JSON (top-level key auto-stripped if Omie
+    wraps the payload). Capped at ~30KB. If your call paginates, ask
+    for the next page explicitly."""
+    import json as _json
+
+    import requests
+    from django.conf import settings as django_settings
+
+    from erp_integrations.models import ERPAPIDefinition, ERPConnection
+    from erp_integrations.services.payload_builder import build_payload
+
+    if not call or not call.startswith(_ERP_READ_PREFIXES):
+        return {
+            "error": (
+                f"ERP call {call!r} is not allowed via the agent. Only "
+                "read-style calls (Listar / Consultar / Pesquisar / Obter / "
+                "Get prefixes) are enabled. Writes need the dedicated write "
+                "tools (separate phase)."
+            )
+        }
+
+    conn_qs = ERPConnection.objects.filter(company_id=company_id, is_active=True)
+    if provider:
+        conn_qs = conn_qs.filter(provider__slug=provider)
+    conn = conn_qs.select_related("provider").first()
+    if not conn:
+        return {"error": f"No active ERPConnection for company_id={company_id}."}
+
+    api = (
+        ERPAPIDefinition.objects
+        .filter(provider=conn.provider, call__iexact=call, is_active=True)
+        .first()
+    )
+    if not api:
+        return {"error": f"ERP API call {call!r} not registered for {conn.provider.slug}."}
+
+    payload = build_payload(connection=conn, api_definition=api, param_overrides=params or {})
+
+    try:
+        resp = requests.post(
+            api.url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=30.0,
+        )
+    except requests.RequestException as exc:
+        return {"error": f"ERP call failed: {exc}"}
+
+    cap = int(getattr(django_settings, "AGENT_API_RESPONSE_BYTE_CAP", _API_RESPONSE_DEFAULT_CAP))
+    raw = resp.content or b""
+    truncated = False
+    if len(raw) > cap:
+        raw = raw[:cap]
+        truncated = True
+
+    parsed: Any
+    try:
+        parsed = _json.loads(raw.decode("utf-8", errors="replace"))
+    except (ValueError, UnicodeDecodeError):
+        parsed = raw.decode("utf-8", errors="replace")
+
+    # Surface Omie-style error envelopes as ``ok=False`` for clarity.
+    is_error_envelope = isinstance(parsed, dict) and ("faultcode" in parsed or "faultstring" in parsed)
+
+    return {
+        "ok": resp.status_code < 400 and not is_error_envelope,
+        "status_code": resp.status_code,
+        "provider": conn.provider.slug,
+        "call": api.call,
+        "params_sent": params or {},
+        "truncated": truncated,
+        "byte_cap": cap,
+        "response": parsed,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool: financial_statements
 # ---------------------------------------------------------------------------
 def financial_statements(
@@ -1276,6 +1730,104 @@ TOOLS: list[ToolDef] = [
             "type": "object",
             "properties": {"cnae": {"type": "string"}},
             "required": ["cnae"],
+        },
+    ),
+    ToolDef(
+        name="discover_api",
+        description="Browse the Sysnord REST API surface via api_meta introspection. "
+                    "Use it to find which endpoint, model, enum, or filter to use "
+                    "before calling call_internal_api. Categories: capabilities | "
+                    "models | model_detail | model_relationships | endpoints | enums | "
+                    "filters. Combine with 'search' to narrow.",
+        handler=discover_api,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "enum": ["capabilities", "models", "model_detail",
+                             "model_relationships", "endpoints", "enums", "filters"],
+                },
+                "name": {"type": "string", "description": "Required for *_detail / relationships."},
+                "search": {"type": "string", "description": "Substring filter for list categories."},
+                "limit": {"type": "integer", "default": 50},
+            },
+            "required": ["category"],
+        },
+    ),
+    ToolDef(
+        name="call_internal_api",
+        description="Dispatch a GET/HEAD request to any Sysnord REST endpoint, "
+                    "scoped to the conversation's tenant and user. Use it after "
+                    "discover_api when no specialised tool fits. Auto-prefixes the "
+                    "tenant in /api/... paths; /api/meta/ is global. Response body "
+                    "capped at ~30KB — use filters to narrow if truncated. "
+                    "Read-only for now (POST/PUT/PATCH/DELETE rejected).",
+        handler=call_internal_api,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "method": {"type": "string", "enum": ["GET", "HEAD"]},
+                "path": {
+                    "type": "string",
+                    "description": "Endpoint path. Either /api/meta/... (global) or /api/... (auto-tenanted).",
+                },
+                "query": {"type": "object", "description": "Query string params."},
+                "body": {"type": "object", "description": "Request body (ignored for GET/HEAD)."},
+            },
+            "required": ["method", "path"],
+        },
+    ),
+    ToolDef(
+        name="list_erp_apis",
+        description="List ERP API calls (Omie etc.) the tenant has access to. "
+                    "Filtered to providers with an active ERPConnection for the "
+                    "tenant. Use it to discover what external ERP data the agent "
+                    "can pull (e.g. ListarContasPagar, ConsultarNF, ListarPedidos).",
+        handler=list_erp_apis,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "company_id": {"type": "integer"},
+                "provider": {"type": "string", "description": "e.g. 'omie' (optional)"},
+                "search": {"type": "string"},
+            },
+            "required": ["company_id"],
+        },
+    ),
+    ToolDef(
+        name="describe_erp_api",
+        description="Return the full param_schema for one ERP API call. Each entry "
+                    "has name + type + description + required + default. Use this "
+                    "right before call_erp_api to compose the params dict.",
+        handler=describe_erp_api,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "company_id": {"type": "integer"},
+                "call": {"type": "string", "description": "API method name, e.g. 'ListarContasPagar'"},
+                "provider": {"type": "string"},
+            },
+            "required": ["company_id", "call"],
+        },
+    ),
+    ToolDef(
+        name="call_erp_api",
+        description="Invoke a registered read-style ERP API call (Omie etc.) for "
+                    "the conversation's tenant, using its stored credentials. "
+                    "params overrides schema defaults — e.g. {'pagina': 1, "
+                    "'registros_por_pagina': 50}. Read-only: only Listar/Consultar/"
+                    "Pesquisar/Obter/Get prefixes are allowed; writes are blocked.",
+        handler=call_erp_api,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "company_id": {"type": "integer"},
+                "call": {"type": "string"},
+                "params": {"type": "object"},
+                "provider": {"type": "string"},
+            },
+            "required": ["company_id", "call"],
         },
     ),
     ToolDef(

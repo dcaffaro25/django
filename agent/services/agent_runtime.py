@@ -104,7 +104,17 @@ TOOLS_WITHOUT_COMPANY_ID = {
     "fetch_cnae_info",
     "validate_cfop",
     "simples_nacional_annex_for_cnae",
+    # Meta-API tools — they take ``method``/``path``, not ``company_id``.
+    # Tenant + acting-user context are injected separately below.
+    "discover_api",
+    "call_internal_api",
 }
+
+# Tools that need the conversation's tenant slug and acting user injected.
+# We force-override these to prevent the agent from passing a different
+# tenant in the URL path (and to spare the LLM from having to remember
+# which user it is).
+TOOLS_REQUIRING_AGENT_CONTEXT = {"call_internal_api"}
 
 
 @dataclass
@@ -317,6 +327,14 @@ class SysnordAgent:
         # Tenant guardrail: overwrite company_id before invoking.
         if name not in TOOLS_WITHOUT_COMPANY_ID:
             args["company_id"] = self.company.id
+
+        # Inject conversation context for tools that need to dispatch as
+        # the user inside the conversation's tenant. Force-overrides any
+        # value the LLM may have supplied for these underscore-prefixed
+        # parameters — they're internal contract, not user-facing args.
+        if name in TOOLS_REQUIRING_AGENT_CONTEXT:
+            args["_tenant_slug"] = getattr(self.company, "subdomain", "") or ""
+            args["_acting_user_id"] = self.conversation.user_id
 
         try:
             result = call_tool(name, args)
