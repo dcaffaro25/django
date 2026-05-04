@@ -61,25 +61,29 @@ def list_companies() -> dict[str, Any]:
 def list_accounts(
     company_id: int,
     search: str | None = None,
-    account_type: str | None = None,
+    report_category: str | None = None,
     only_active: bool = True,
     limit: int = 100,
 ) -> dict[str, Any]:
     """Return Chart-of-Accounts rows for a tenant. Filters: name/code search,
-    type (asset/liability/equity/revenue/expense), active-only."""
+    report_category (e.g. ``ativo_circulante``, ``receita_operacional``),
+    active-only.
+
+    Note: this model has no ``account_type`` column — taxonomy lives in
+    ``report_category`` (set via the demonstrativos pipeline) and ``tags``."""
     from accounting.models import Account
 
     qs = Account.objects.filter(company_id=company_id)
     if only_active:
         qs = qs.filter(is_active=True)
-    if account_type:
-        qs = qs.filter(account_type=account_type)
+    if report_category:
+        qs = qs.filter(report_category=report_category)
     if search:
         qs = qs.filter(Q(name__icontains=search) | Q(account_code__icontains=search))
 
     rows = list(
         qs.order_by("account_code").values(
-            "id", "account_code", "name", "account_type", "account_direction",
+            "id", "account_code", "name", "report_category", "account_direction",
             "is_active", "balance", "balance_date",
         )[:limit]
     )
@@ -101,7 +105,6 @@ def get_account(company_id: int, account_id: int) -> dict[str, Any]:
         "id": a.id,
         "account_code": a.account_code,
         "name": a.name,
-        "account_type": a.account_type,
         "account_direction": a.account_direction,
         "parent_id": a.parent_id,
         "is_active": a.is_active,
@@ -325,8 +328,14 @@ def financial_statements(
         compute_financial_statements_cached,
     )
 
-    df = date.fromisoformat(date_from) if isinstance(date_from, str) else date_from
-    dt = date.fromisoformat(date_to) if isinstance(date_to, str) else date_to
+    try:
+        df = date.fromisoformat(date_from) if isinstance(date_from, str) else date_from
+        dt = date.fromisoformat(date_to) if isinstance(date_to, str) else date_to
+    except (TypeError, ValueError) as exc:
+        return {"error": f"Invalid date — use ISO YYYY-MM-DD. ({exc})"}
+
+    if df > dt:
+        return {"error": f"date_from ({df.isoformat()}) is after date_to ({dt.isoformat()})."}
 
     result = compute_financial_statements_cached(
         company_id=company_id,
@@ -336,10 +345,19 @@ def financial_statements(
         basis=basis,
         include_pending=include_pending,
     )
-    # Strip per-account drilldown to keep response small for the agent
+    # Strip per-account drilldown to keep response small for the agent.
+    # The pipeline returns each category as
+    # ``{"key", "label", "amount", "accounts", "account_count"}``.
     trimmed = {
+        "period": result.get("period"),
+        "basis": result.get("basis"),
         "categories": [
-            {"name": c.get("name"), "total": c.get("total")}
+            {
+                "key": c.get("key"),
+                "label": c.get("label"),
+                "amount": c.get("amount"),
+                "account_count": c.get("account_count"),
+            }
             for c in (result.get("categories") or [])
         ],
         "cashflow": result.get("cashflow"),
@@ -369,14 +387,15 @@ TOOLS: list[ToolDef] = [
     ToolDef(
         name="list_accounts",
         description="List Chart-of-Accounts rows for a tenant. Supports search by name/code, "
-                    "filter by account_type (asset/liability/equity/revenue/expense), and active-only.",
+                    "filter by report_category (e.g. 'ativo_circulante', 'receita_operacional'), "
+                    "and active-only.",
         handler=list_accounts,
         input_schema={
             "type": "object",
             "properties": {
                 "company_id": {"type": "integer"},
                 "search": {"type": "string"},
-                "account_type": {"type": "string"},
+                "report_category": {"type": "string"},
                 "only_active": {"type": "boolean", "default": True},
                 "limit": {"type": "integer", "default": 100},
             },

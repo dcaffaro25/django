@@ -402,8 +402,12 @@ class BankTransactionSuggestionService:
             if abs(difference) > bank_amount * 2:  # Don't suggest if difference is more than 2x the bank amount
                 continue
             
-            # Calculate confidence based on similarity and amount match
-            amount_match_score = 1.0 - (abs(difference) / bank_amount) if bank_amount > 0 else 0.0
+            # Calculate confidence based on similarity and amount match.
+            # Cast to float — `difference` and `bank_amount` are Decimals;
+            # mixing 1.0 (float) with Decimal raises TypeError.
+            amount_match_score = (
+                1.0 - float(abs(difference) / bank_amount) if bank_amount > 0 else 0.0
+            )
             amount_match_score = max(0.0, min(1.0, amount_match_score))
             
             confidence = (0.6 * similarity) + (0.4 * amount_match_score)
