@@ -1552,6 +1552,385 @@ def run_reconciliation_agent(
 
 
 # ---------------------------------------------------------------------------
+# Tool: propose_mapping_from_document — Phase 2 wave 2
+# ---------------------------------------------------------------------------
+def propose_mapping_from_document(
+    company_id: int,
+    attachment_id: int,
+) -> dict[str, Any]:
+    """Look at an ingested document (NF-e XML) and propose how it
+    should land in Sysnord — a draft Invoice that the user can review
+    and confirm.
+
+    Logic:
+      1. Pull ``extracted_text`` summary from ``ingest_document``
+         (re-runs ingest if not cached yet).
+      2. Resolve the counterparty: BusinessPartner by exact CNPJ first,
+         then by CNPJ root (matriz/filial), then by name fuzzy match.
+      3. Suggest the posting account: BP's
+         ``receivable_account``/``payable_account`` if set, otherwise
+         most-frequently-used account from past Invoices for that BP.
+      4. Surface the totals + itens for the LLM to summarise.
+
+    Read-only — does not create the Invoice. Pair with
+    ``apply_document_mapping`` for the actual write."""
+    from billing.models import BusinessPartner, Invoice
+
+    from agent.models import AgentMessageAttachment
+
+    try:
+        att = AgentMessageAttachment.objects.get(
+            id=attachment_id, company_id=company_id,
+        )
+    except AgentMessageAttachment.DoesNotExist:
+        return {"error": f"Attachment {attachment_id} not found in company {company_id}."}
+
+    if att.kind not in (AgentMessageAttachment.KIND_NFE_XML,):
+        return {
+            "error": (
+                f"Only NF-e XML attachments are supported by this tool today. "
+                f"Got kind={att.kind!r}."
+            )
+        }
+
+    # Trigger ingest if not yet run (idempotent, reuses cache).
+    ingest_result = ingest_document(
+        company_id=company_id, attachment_id=attachment_id,
+    )
+    if "error" in ingest_result:
+        return ingest_result
+
+    # Re-parse to get the structured summary (we need fields the cached
+    # plain-text representation doesn't expose).
+    try:
+        _, nfe_summary = _ingest_nfe_xml(att)
+    except Exception as exc:
+        return {"error": f"Could not parse NF-e for mapping: {exc}"}
+
+    # Determine direction from the perspective of this tenant.
+    # Find which side (emit or dest) is the tenant by matching the
+    # tenant's company CNPJ (if available) — fall back to "unknown".
+    import re
+
+    tenant_cnpjs: set[str] = set()
+    try:
+        from multitenancy.models import Company
+        tenant = Company.objects.get(id=company_id)
+        for fld in ("cnpj", "identifier", "tax_id"):
+            v = getattr(tenant, fld, "") or ""
+            if v:
+                tenant_cnpjs.add(re.sub(r"\D", "", v))
+    except Exception:
+        pass
+
+    emit = re.sub(r"\D", "", nfe_summary.get("emit_cnpj") or "")
+    dest = re.sub(r"\D", "", nfe_summary.get("dest_cnpj") or "")
+    if tenant_cnpjs and emit in tenant_cnpjs:
+        direction = "sale"
+        counterparty_cnpj = dest
+        counterparty_name = nfe_summary.get("dest_nome") or ""
+    elif tenant_cnpjs and dest in tenant_cnpjs:
+        direction = "purchase"
+        counterparty_cnpj = emit
+        counterparty_name = nfe_summary.get("emit_nome") or ""
+    else:
+        # No tenant-cnpj match — fall back to assuming the dest is the
+        # counterparty (typical sale).
+        direction = "unknown"
+        counterparty_cnpj = dest or emit
+        counterparty_name = nfe_summary.get("dest_nome") or nfe_summary.get("emit_nome") or ""
+
+    # Resolve the BusinessPartner.
+    bp_match: dict[str, Any] | None = None
+    bp = None
+    if counterparty_cnpj and len(counterparty_cnpj) == 14:
+        # 1) exact CNPJ
+        bp = BusinessPartner.objects.filter(
+            company_id=company_id, identifier=counterparty_cnpj, is_active=True,
+        ).first()
+        if bp:
+            bp_match = {"strategy": "exact_cnpj", "match_strength": 1.0}
+        else:
+            # 2) CNPJ root (matriz/filial)
+            bp = BusinessPartner.objects.filter(
+                company_id=company_id, cnpj_root=counterparty_cnpj[:8], is_active=True,
+            ).first()
+            if bp:
+                bp_match = {"strategy": "cnpj_root", "match_strength": 0.85}
+    if bp is None and counterparty_name:
+        # 3) fuzzy name (icontains)
+        bp = BusinessPartner.objects.filter(
+            company_id=company_id, name__icontains=counterparty_name[:40], is_active=True,
+        ).first()
+        if bp:
+            bp_match = {"strategy": "name_icontains", "match_strength": 0.5}
+
+    # Suggest the account.
+    suggested_account = None
+    suggested_account_source = None
+    if bp:
+        if direction == "sale" and bp.receivable_account_id:
+            suggested_account = {
+                "id": bp.receivable_account_id,
+                "name": bp.receivable_account.name if bp.receivable_account else None,
+            }
+            suggested_account_source = "bp.receivable_account"
+        elif direction == "purchase" and bp.payable_account_id:
+            suggested_account = {
+                "id": bp.payable_account_id,
+                "name": bp.payable_account.name if bp.payable_account else None,
+            }
+            suggested_account_source = "bp.payable_account"
+        else:
+            # Look at past Invoices for this BP — most-used line account.
+            from collections import Counter
+            past_inv_qs = Invoice.objects.filter(
+                company_id=company_id, partner=bp,
+            ).prefetch_related("lines")[:25]
+            account_counter: Counter = Counter()
+            for inv in past_inv_qs:
+                for line in inv.lines.all():
+                    if getattr(line, "account_id", None):
+                        account_counter[line.account_id] += 1
+            if account_counter:
+                top_acc_id, hits = account_counter.most_common(1)[0]
+                from accounting.models import Account
+                acc = Account.objects.filter(id=top_acc_id).first()
+                if acc:
+                    suggested_account = {"id": acc.id, "name": acc.name}
+                    suggested_account_source = f"history_top:{hits}_invoices"
+
+    return {
+        "ok": True,
+        "attachment_id": att.id,
+        "direction": direction,
+        "counterparty": {
+            "cnpj": counterparty_cnpj,
+            "name": counterparty_name,
+            "matched_partner_id": bp.id if bp else None,
+            "matched_partner_name": bp.name if bp else None,
+            "match": bp_match,
+        },
+        "suggested_account": suggested_account,
+        "suggested_account_source": suggested_account_source,
+        "nfe_summary": {
+            "chave": nfe_summary.get("chave"),
+            "numero": nfe_summary.get("numero"),
+            "serie": nfe_summary.get("serie"),
+            "data_emissao": nfe_summary.get("data_emissao"),
+            "valor_total": nfe_summary.get("valor_total"),
+            "item_count": nfe_summary.get("item_count"),
+            "natureza_operacao": nfe_summary.get("natureza_operacao"),
+        },
+        "note": (
+            "This is a proposal — review the suggested partner + account "
+            "before calling apply_document_mapping. apply is also gated by "
+            "settings.AGENT_ALLOW_WRITES."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: list_recon_decisions — Phase 1 expansion (read)
+# ---------------------------------------------------------------------------
+def list_recon_decisions(
+    company_id: int,
+    run_id: int | None = None,
+    outcome: str | None = None,
+    bank_account_id: int | None = None,
+    limit: int = 25,
+) -> dict[str, Any]:
+    """List per-bank-tx decisions from past reconciliation-agent runs.
+
+    Use this to inspect what the agent decided after a
+    ``run_reconciliation_agent`` call: ``auto_accepted`` matches that
+    landed, ``ambiguous`` ones still awaiting human review,
+    ``no_match`` / ``not_applicable`` / ``error`` for observability.
+
+    Filters: ``run_id`` (one specific run), ``outcome`` (one of
+    auto_accepted/ambiguous/no_match/not_applicable/error),
+    ``bank_account_id``."""
+    from accounting.models import ReconciliationAgentDecision
+
+    qs = ReconciliationAgentDecision.objects.filter(
+        company_id=company_id
+    ).select_related("bank_transaction", "run")
+
+    if run_id is not None:
+        qs = qs.filter(run_id=run_id)
+    if outcome:
+        qs = qs.filter(outcome=outcome)
+    if bank_account_id is not None:
+        qs = qs.filter(bank_transaction__bank_account_id=bank_account_id)
+
+    rows = []
+    for d in qs.order_by("-created_at", "-id")[:limit]:
+        suggestion = d.suggestion_payload or {}
+        # Top suggestion summary so the agent can describe the choice
+        # without having to look up the bank tx separately.
+        rows.append({
+            "decision_id": d.id,
+            "run_id": d.run_id,
+            "bank_transaction_id": d.bank_transaction_id,
+            "bank_tx": {
+                "date": str(getattr(d.bank_transaction, "date", "")),
+                "amount": str(getattr(d.bank_transaction, "amount", "")),
+                "description": (getattr(d.bank_transaction, "description", "") or "")[:120],
+            },
+            "outcome": d.outcome,
+            "top_confidence": str(d.top_confidence) if d.top_confidence is not None else None,
+            "second_confidence": str(d.second_confidence) if d.second_confidence is not None else None,
+            "reconciliation_id": d.reconciliation_id,
+            "error_message": d.error_message[:200] if d.error_message else "",
+            "top_suggestion_summary": {
+                "score": suggestion.get("score") or suggestion.get("top_confidence"),
+                "kind": suggestion.get("kind") or suggestion.get("type"),
+                "candidate_journal_entry_ids": suggestion.get("journal_entry_ids", [])[:5],
+            },
+            "created_at": d.created_at.isoformat() if d.created_at else None,
+        })
+
+    return {"count": len(rows), "decisions": rows}
+
+
+# ---------------------------------------------------------------------------
+# Tool: undo_via_audit — Phase 1 expansion (write reversal)
+# ---------------------------------------------------------------------------
+def undo_via_audit(
+    company_id: int,
+    undo_token: str,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Reverse a write the agent performed earlier, identified by the
+    ``undo_token`` returned alongside the original tool's response.
+
+    Looks up the ``AgentWriteAudit`` row, dispatches per ``tool_name``
+    to the right reversal logic, and (on success) flips the audit row
+    status to ``undone``. Idempotent: trying to undo an already-undone
+    row returns a clean no-op message.
+
+    Currently supports:
+      * ``run_reconciliation_agent`` — soft-deletes the
+        ``ReconciliationAgentDecision`` rows + linked ``Reconciliation``
+        rows from that run.
+
+    Other write tools surface a clear "no reverser registered" message
+    so the operator knows manual cleanup is needed.
+
+    Gated by ``settings.AGENT_ALLOW_WRITES`` — even with a valid
+    undo_token, the reversal is dry-run-only when the kill-switch is
+    off."""
+    from django.conf import settings as _django_settings
+    from django.db import transaction as _txn
+
+    from agent.models import AgentWriteAudit
+
+    if not undo_token or not isinstance(undo_token, str):
+        return {"error": "undo_token is required."}
+
+    try:
+        audit = AgentWriteAudit.objects.get(
+            company_id=company_id, undo_token=undo_token,
+        )
+    except AgentWriteAudit.DoesNotExist:
+        return {"error": f"No audit row with undo_token={undo_token!r} for this tenant."}
+
+    if audit.status == AgentWriteAudit.STATUS_UNDONE:
+        return {
+            "ok": True,
+            "already_undone": True,
+            "audit_id": audit.id,
+            "tool_name": audit.tool_name,
+        }
+    if audit.status != AgentWriteAudit.STATUS_APPLIED:
+        return {
+            "error": (
+                f"Audit row status is {audit.status!r}; only 'applied' rows "
+                f"can be undone."
+            ),
+            "audit_id": audit.id,
+        }
+
+    writes_enabled = bool(getattr(_django_settings, "AGENT_ALLOW_WRITES", False))
+    effective_dry_run = bool(dry_run) or not writes_enabled
+
+    # Reversal dispatch by tool name.
+    reverser = _UNDO_REVERSERS.get(audit.tool_name)
+    if reverser is None:
+        return {
+            "error": (
+                f"No reverser registered for tool {audit.tool_name!r}. "
+                f"Manual cleanup is required. Audit row id={audit.id}."
+            ),
+            "audit_id": audit.id,
+        }
+
+    try:
+        with _txn.atomic():
+            preview = reverser(audit, dry_run=effective_dry_run)
+            if not effective_dry_run:
+                audit.status = AgentWriteAudit.STATUS_UNDONE
+                audit.save(update_fields=["status", "updated_at"])
+    except Exception as exc:
+        return {
+            "error": f"Reversal failed: {type(exc).__name__}: {exc}",
+            "audit_id": audit.id,
+        }
+
+    return {
+        "ok": True,
+        "dry_run_effective": effective_dry_run,
+        "blocked_by_policy": (not writes_enabled) and not bool(dry_run),
+        "audit_id": audit.id,
+        "tool_name": audit.tool_name,
+        "preview": preview,
+    }
+
+
+def _undo_run_reconciliation_agent(audit, *, dry_run: bool) -> dict[str, Any]:
+    """Reverse a ``run_reconciliation_agent`` audit row.
+
+    Soft-deletes the run's decisions + linked reconciliations. We
+    don't reverse the cache invalidation (it'll naturally rebuild on
+    the next read). The operator gets back a count summary.
+    """
+    from accounting.models import ReconciliationAgentDecision, Reconciliation
+
+    decision_ids = audit.target_ids or []
+    decisions = ReconciliationAgentDecision.objects.filter(
+        id__in=decision_ids, company=audit.company,
+    ).select_related("reconciliation")
+
+    n_decisions = decisions.count()
+    recon_ids = [d.reconciliation_id for d in decisions if d.reconciliation_id]
+
+    if dry_run:
+        return {
+            "would_soft_delete_decisions": n_decisions,
+            "would_soft_delete_reconciliations": len(recon_ids),
+            "decision_ids": decision_ids,
+            "reconciliation_ids": recon_ids,
+        }
+
+    # Soft delete via the BaseModel ``is_deleted`` flag — preserves
+    # the audit trail. A hard delete would orphan FKs from the agent
+    # runtime's history reads.
+    Reconciliation.objects.filter(id__in=recon_ids).update(is_deleted=True)
+    decisions.update(is_deleted=True)
+    return {
+        "soft_deleted_decisions": n_decisions,
+        "soft_deleted_reconciliations": len(recon_ids),
+        "decision_ids": decision_ids,
+        "reconciliation_ids": recon_ids,
+    }
+
+
+_UNDO_REVERSERS = {
+    "run_reconciliation_agent": _undo_run_reconciliation_agent,
+}
+
+
+# ---------------------------------------------------------------------------
 # Tool: ingest_document — Phase 2
 # ---------------------------------------------------------------------------
 def ingest_document(
@@ -2248,6 +2627,67 @@ TOOLS: list[ToolDef] = [
         },
     ),
     ToolDef(
+        name="propose_mapping_from_document",
+        description="Given an NF-e XML attachment that's been ingested, propose "
+                    "how it should land in Sysnord: counterparty (BusinessPartner) "
+                    "matched by CNPJ → CNPJ root → name fuzzy; suggested posting "
+                    "account from BP's receivable/payable_account or from past "
+                    "invoice history. Read-only — pair with apply_document_mapping "
+                    "(when that lands) for the actual write.",
+        handler=propose_mapping_from_document,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "company_id": {"type": "integer"},
+                "attachment_id": {"type": "integer"},
+            },
+            "required": ["company_id", "attachment_id"],
+        },
+    ),
+    ToolDef(
+        name="list_recon_decisions",
+        description="List per-bank-tx decisions from past reconciliation-agent "
+                    "runs. Filter by run_id, outcome (auto_accepted/ambiguous/"
+                    "no_match/not_applicable/error), or bank_account_id. Useful "
+                    "for follow-up questions like 'show me the ambiguous matches "
+                    "from the last run' before any human acceptance.",
+        handler=list_recon_decisions,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "company_id": {"type": "integer"},
+                "run_id": {"type": "integer"},
+                "outcome": {
+                    "type": "string",
+                    "enum": ["auto_accepted", "ambiguous", "no_match",
+                             "not_applicable", "error"],
+                },
+                "bank_account_id": {"type": "integer"},
+                "limit": {"type": "integer", "default": 25},
+            },
+            "required": ["company_id"],
+        },
+    ),
+    ToolDef(
+        name="undo_via_audit",
+        description="Reverse an earlier write tool's run using the undo_token "
+                    "returned with the original response. Looks up the "
+                    "AgentWriteAudit row and dispatches per tool to the right "
+                    "reverser. Currently supports run_reconciliation_agent "
+                    "(soft-deletes decisions + reconciliations). dry_run=true "
+                    "by default — flip with explicit consent.",
+        handler=undo_via_audit,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "company_id": {"type": "integer"},
+                "undo_token": {"type": "string"},
+                "dry_run": {"type": "boolean", "default": True},
+            },
+            "required": ["company_id", "undo_token"],
+        },
+    ),
+    ToolDef(
         name="ingest_document",
         description="Parse one chat attachment into structured fields. Supports "
                     "NF-e XML (returns chave/partes/totais/itens), OFX bank "
@@ -2321,6 +2761,9 @@ _TOOL_DOMAINS: dict[str, str] = {
     "suggest_reconciliation": "recon",
     "run_reconciliation_agent": "recon",
     "ingest_document": "fiscal",
+    "list_recon_decisions": "recon",
+    "undo_via_audit": "recon",
+    "propose_mapping_from_document": "billing",
     "get_invoice": "billing",
     "list_invoice_critics": "billing",
     "get_nota_fiscal": "fiscal",
