@@ -118,6 +118,49 @@ export interface AgentAttachment {
   size_bytes: number
 }
 
+/** Audit-log row from ``/audit/tool-calls/`` — Phase 0. */
+export interface AgentToolCallLogRow {
+  id: number
+  tool_name: string
+  tool_domain: string
+  status: "ok" | "warn" | "error" | "rejected"
+  args_summary: string
+  error_type: string
+  error_message: string
+  latency_ms: number | null
+  response_size_bytes: number | null
+  iteration: number | null
+  conversation_id: number | null
+  user_id: number | null
+  created_at: string
+}
+
+/** Audit-log row from ``/audit/writes/`` — Phase 1. */
+export interface AgentWriteAuditRow {
+  id: number
+  tool_name: string
+  target_model: string
+  target_ids: (number | string)[]
+  args_summary: string
+  before_state: Record<string, unknown>
+  after_state: Record<string, unknown>
+  status: "dry_run" | "proposed" | "applied" | "rejected" | "failed" | "undone"
+  error_type: string
+  error_message: string
+  undo_token: string
+  conversation_id: number | null
+  user_id: number | null
+  created_at: string
+}
+
+export interface AuditFilters {
+  conversation?: number
+  tool?: string
+  status?: string
+  since?: string
+  limit?: number
+}
+
 export interface AgentConversationDetail extends AgentConversation {
   messages: AgentMessage[]
 }
@@ -193,4 +236,14 @@ export const agentApi = {
   // -- platform (read-only, any authenticated user)
   listTools: () => api.get<{ count: number; tools: AgentTool[] }>("/api/agent/tools/"),
   listModels: () => api.get<AgentModelsCatalog>("/api/agent/models/"),
+
+  // -- audit (tenant-scoped, read-only)
+  listToolCallLog: (filters: AuditFilters = {}) =>
+    api.tenant.get<{ count: number; tool_calls: AgentToolCallLogRow[] }>(
+      "/api/agent/audit/tool-calls/", { params: filters as Record<string, unknown> },
+    ),
+  listWriteAudit: (filters: AuditFilters = {}) =>
+    api.tenant.get<{ count: number; writes: AgentWriteAuditRow[] }>(
+      "/api/agent/audit/writes/", { params: filters as Record<string, unknown> },
+    ),
 }

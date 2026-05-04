@@ -168,3 +168,31 @@ export function useUploadAgentAttachment(conversationId: number) {
     }) => agentApi.uploadAttachment(conversationId, file, { onProgress }),
   })
 }
+
+
+/** Audit-log readers — Phase 0/1 visibility surface. Tenant-scoped via
+ *  the api.tenant.* helpers. Refetches every 15s by default since the
+ *  audit log is append-only and operators usually want fresh data. */
+export function useAgentToolCallLog(
+  filters: import("./api").AuditFilters = {},
+  options: { enabled?: boolean; refetchIntervalMs?: number } = {},
+) {
+  return useQuery({
+    queryKey: ["agent", "audit", "tool-calls", filters] as const,
+    queryFn: () => agentApi.listToolCallLog(filters),
+    enabled: options.enabled ?? true,
+    refetchInterval: options.refetchIntervalMs ?? 15_000,
+  })
+}
+
+export function useAgentWriteAudit(
+  filters: import("./api").AuditFilters = {},
+  options: { enabled?: boolean; refetchIntervalMs?: number } = {},
+) {
+  return useQuery({
+    queryKey: ["agent", "audit", "writes", filters] as const,
+    queryFn: () => agentApi.listWriteAudit(filters),
+    enabled: options.enabled ?? true,
+    refetchInterval: options.refetchIntervalMs ?? 15_000,
+  })
+}

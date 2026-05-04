@@ -46,6 +46,7 @@ import { DataHealthPage } from "@/pages/billing/DataHealthPage"
 import { AdminHomePage } from "@/pages/admin/AdminHomePage"
 import { UsersPage as AdminUsersPage } from "@/pages/admin/UsersPage"
 import { RuntimePage as AdminRuntimePage } from "@/pages/admin/RuntimePage"
+import { AgentAuditPage } from "@/pages/admin/AgentAuditPage"
 import { SuperuserGuard } from "@/pages/admin/SuperuserGuard"
 import { ActivityHeatmapPage } from "@/pages/admin/activity/ActivityHeatmapPage"
 import { ActivityUserDetailPage } from "@/pages/admin/activity/ActivityUserDetailPage"
@@ -171,6 +172,7 @@ export default function App() {
                   <Route path="/admin/activity/areas/:id" element={<SuperuserGuard><ActivityAreaDetailPage /></SuperuserGuard>} />
                   <Route path="/admin/runtime" element={<SuperuserGuard><AdminRuntimePage /></SuperuserGuard>} />
                   <Route path="/admin/agent" element={<SuperuserGuard><AgentConnectionPage /></SuperuserGuard>} />
+                  <Route path="/admin/agent/audit" element={<SuperuserGuard><AgentAuditPage /></SuperuserGuard>} />
                   <Route path="/admin/*" element={<SuperuserGuard><AdminHomePage /></SuperuserGuard>} />
                   <Route path="*" element={<Navigate to="/recon" replace />} />
                 </Routes>
