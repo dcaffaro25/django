@@ -240,7 +240,7 @@ class SysnordAgent:
                         ui_calls.append(call)
                         intermediates.append(self._persist_ui_placeholder(call))
                     else:
-                        intermediates.append(self._dispatch_tool_call(call))
+                        intermediates.append(self._dispatch_tool_call(call, iteration=iteration))
 
                 if ui_calls:
                     # Terminal: hand control to the user. The "final"
@@ -309,11 +309,18 @@ class SysnordAgent:
     # ------------------------------------------------------------------
     # Tool dispatch
     # ------------------------------------------------------------------
-    def _dispatch_tool_call(self, call: dict[str, Any]) -> AgentMessage:
+    def _dispatch_tool_call(self, call: dict[str, Any], *, iteration: int = 0) -> AgentMessage:
         """Execute one tool call and persist the result. The Responses API
         wraps each tool request as ``{type:"function_call", call_id, name,
-        arguments: "<json string>"}``."""
-        from mcp_server.tools import call_tool
+        arguments: "<json string>"}``.
+
+        Each call is audited via :func:`agent.services.audit.log_tool_call`
+        — Phase 0. The audit row captures latency, status, error type +
+        truncated message, response size, and iteration number. PII risk
+        is bounded by ``args_summary`` truncation; full args are not
+        persisted."""
+        from mcp_server.tools import call_tool, get_tool_domain
+        from agent.services.audit import log_tool_call
 
         call_id = call.get("call_id") or call.get("id") or ""
         name = call.get("name") or ""
@@ -336,13 +343,23 @@ class SysnordAgent:
             args["_tenant_slug"] = getattr(self.company, "subdomain", "") or ""
             args["_acting_user_id"] = self.conversation.user_id
 
-        try:
-            result = call_tool(name, args)
-        except KeyError:
-            result = {"error": f"Tool '{name}' is not available."}
-        except Exception as exc:  # pragma: no cover — defensive net
-            log.exception("agent.tool_failed name=%s: %s", name, exc)
-            result = {"error": f"{type(exc).__name__}: {exc}"}
+        with log_tool_call(
+            company=self.company,
+            conversation=self.conversation,
+            user=getattr(self.conversation, "user", None),
+            tool_name=name,
+            tool_domain=get_tool_domain(name),
+            args=args,
+            iteration=iteration,
+        ) as audit_ctx:
+            try:
+                result = call_tool(name, args)
+            except KeyError:
+                result = {"error": f"Tool '{name}' is not available."}
+            except Exception as exc:  # pragma: no cover — defensive net
+                log.exception("agent.tool_failed name=%s: %s", name, exc)
+                result = {"error": f"{type(exc).__name__}: {exc}"}
+            audit_ctx["result"] = result
 
         return AgentMessage.objects.create(
             company=self.company,

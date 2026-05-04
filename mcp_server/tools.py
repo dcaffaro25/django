@@ -1393,6 +1393,165 @@ def call_erp_api(
 
 
 # ---------------------------------------------------------------------------
+# Tool: run_reconciliation_agent (Phase 1 — first write tool; dry-run gated)
+# ---------------------------------------------------------------------------
+def run_reconciliation_agent(
+    company_id: int,
+    bank_account_id: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int | None = None,
+    auto_accept_threshold: float | None = None,
+    ambiguity_gap: float | None = None,
+    min_confidence: float | None = None,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Execute one pass of the bank-reconciliation auto-accept agent.
+
+    Wraps the existing :class:`accounting.services.reconciliation_agent_service.ReconciliationAgent`
+    so the LLM can drive the same code path the recon cron uses. Each
+    candidate bank transaction gets scored; matches above
+    ``auto_accept_threshold`` are queued for acceptance — and *only*
+    persisted if ``dry_run=False`` AND ``settings.AGENT_ALLOW_WRITES``
+    is True. Otherwise the run is read-only: candidates are scored and
+    proposals returned without any DB mutation.
+
+    Every invocation, real or dry-run, also writes an
+    :class:`agent.models.AgentWriteAudit` row so the operator has a
+    paper trail of *what would have been done* before the kill-switch
+    flips.
+
+    Returns aggregate counters + the per-bank-tx decisions array. Use
+    this to answer "reconcile what you can with confidence ≥ X."
+    """
+    import uuid as _uuid
+    from datetime import date as _date
+
+    from django.conf import settings as _django_settings
+
+    # Parse date strings.
+    try:
+        df = _date.fromisoformat(date_from) if date_from else None
+        dt = _date.fromisoformat(date_to) if date_to else None
+    except (TypeError, ValueError) as exc:
+        return {"error": f"Invalid date — use ISO YYYY-MM-DD. ({exc})"}
+
+    # Effective dry_run: honour the kill-switch even if the LLM passed
+    # dry_run=False. This protects against runaway automation while we
+    # bed in the audit pipeline.
+    requested_dry_run = bool(dry_run)
+    writes_enabled = bool(getattr(_django_settings, "AGENT_ALLOW_WRITES", False))
+    effective_dry_run = requested_dry_run or not writes_enabled
+    blocked_by_policy = (not requested_dry_run) and (not writes_enabled)
+
+    from accounting.services.reconciliation_agent_service import ReconciliationAgent
+
+    args_summary_input = {
+        "bank_account_id": bank_account_id,
+        "date_from": date_from, "date_to": date_to, "limit": limit,
+        "auto_accept_threshold": auto_accept_threshold,
+        "ambiguity_gap": ambiguity_gap,
+        "min_confidence": min_confidence,
+        "dry_run_requested": requested_dry_run,
+    }
+
+    agent_service = ReconciliationAgent(
+        company_id=company_id,
+        auto_accept_threshold=auto_accept_threshold,
+        ambiguity_gap=ambiguity_gap,
+        min_confidence=min_confidence,
+        dry_run=effective_dry_run,
+        triggered_by="agent_chat",
+    )
+    try:
+        result = agent_service.run(
+            bank_account_id=bank_account_id,
+            date_from=df, date_to=dt, limit=limit,
+        )
+    except Exception as exc:
+        return {
+            "error": f"Reconciliation run failed: {type(exc).__name__}: {exc}",
+            "dry_run_effective": effective_dry_run,
+        }
+
+    # Persist the audit row.
+    audit_row_id: int | None = None
+    audit_status: str
+    undo_token = ""
+    if effective_dry_run:
+        audit_status = "dry_run"
+    else:
+        audit_status = "applied"
+        undo_token = _uuid.uuid4().hex
+
+    accepted_decision_ids = [
+        d.get("decision_id") for d in (result.decisions or [])
+        if d.get("auto_accept_decision") == "accepted"
+        and d.get("decision_id") is not None
+    ]
+
+    try:
+        from agent.models import AgentWriteAudit
+        from multitenancy.models import Company
+        company = Company.objects.get(id=company_id)
+        audit = AgentWriteAudit.objects.create(
+            company=company,
+            tool_name="run_reconciliation_agent",
+            target_model="accounting.ReconciliationAgentDecision",
+            target_ids=accepted_decision_ids,
+            args_summary=str(args_summary_input)[:380],
+            before_state={
+                "n_candidates": result.n_candidates,
+                "writes_enabled": writes_enabled,
+                "blocked_by_policy": blocked_by_policy,
+            },
+            after_state={
+                "n_auto_accepted": result.n_auto_accepted,
+                "n_proposed": result.n_proposed,
+                "n_review_required": result.n_review_required,
+                "n_skipped": result.n_skipped,
+            },
+            status=audit_status,
+            undo_token=undo_token,
+        )
+        audit_row_id = audit.id
+    except Exception as exc:  # pragma: no cover — audit must not break tools
+        log.warning("agent.write_audit.failed: %s", exc)
+
+    return {
+        "ok": True,
+        "dry_run_effective": effective_dry_run,
+        "blocked_by_policy": blocked_by_policy,
+        "policy_note": (
+            "Live writes are disabled (AGENT_ALLOW_WRITES=false). The run "
+            "scored candidates and proposed acceptances, but did not modify "
+            "the database. To enable, set AGENT_ALLOW_WRITES=true on the "
+            "deployment."
+        ) if blocked_by_policy else None,
+        "run_id": result.run_id,
+        "audit_id": audit_row_id,
+        "undo_token": undo_token or None,
+        "counters": {
+            "n_candidates": result.n_candidates,
+            "n_auto_accepted": result.n_auto_accepted,
+            "n_proposed": result.n_proposed,
+            "n_review_required": result.n_review_required,
+            "n_skipped": result.n_skipped,
+            "n_errors": result.n_errors,
+        },
+        "decisions_preview": [
+            {
+                "bank_tx_id": d.get("bank_transaction_id"),
+                "decision": d.get("auto_accept_decision"),
+                "confidence": d.get("top_confidence"),
+                "reason": d.get("reason"),
+            }
+            for d in (result.decisions or [])[:20]
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool: financial_statements
 # ---------------------------------------------------------------------------
 def financial_statements(
@@ -1457,6 +1616,11 @@ class ToolDef:
     description: str
     handler: Callable[..., dict[str, Any]]
     input_schema: dict[str, Any]
+    # Domain tag — used for audit aggregation, observability, and
+    # eventually for catalog filtering. Free-form string; suggested
+    # values: ``recon``, ``fiscal``, ``finance``, ``billing``,
+    # ``external``, ``meta``, ``erp``, ``internal``, ``general``.
+    domain: str = "general"
 
 
 TOOLS: list[ToolDef] = [
@@ -1831,6 +1995,31 @@ TOOLS: list[ToolDef] = [
         },
     ),
     ToolDef(
+        name="run_reconciliation_agent",
+        description="Run the bank-reconciliation auto-accept agent over a tenant's "
+                    "unreconciled transactions, scoring candidates and proposing "
+                    "matches. **Dry-run by default**: no DB writes happen unless "
+                    "(a) the user passes dry_run=False AND (b) AGENT_ALLOW_WRITES "
+                    "is enabled on the deployment. Every run is captured in "
+                    "AgentWriteAudit. Returns counters + a preview of decisions.",
+        handler=run_reconciliation_agent,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "company_id": {"type": "integer"},
+                "bank_account_id": {"type": "integer"},
+                "date_from": {"type": "string", "format": "date"},
+                "date_to": {"type": "string", "format": "date"},
+                "limit": {"type": "integer"},
+                "auto_accept_threshold": {"type": "number", "description": "0-1 (e.g. 0.95)"},
+                "ambiguity_gap": {"type": "number", "description": "Min gap between top-1 and top-2"},
+                "min_confidence": {"type": "number"},
+                "dry_run": {"type": "boolean", "default": True},
+            },
+            "required": ["company_id"],
+        },
+    ),
+    ToolDef(
         name="financial_statements",
         description="Compute DRE/Balanço/DFC totals for a period. Basis = accrual (default) or cash.",
         handler=financial_statements,
@@ -1849,6 +2038,54 @@ TOOLS: list[ToolDef] = [
 ]
 
 
+# Domain tags for each tool — central, easy to audit. Keep in sync when
+# adding new tools above.
+_TOOL_DOMAINS: dict[str, str] = {
+    # Internal Sysnord DB reads
+    "list_companies": "internal",
+    "list_accounts": "internal",
+    "get_account": "internal",
+    "get_transaction": "internal",
+    "list_unreconciled_bank_transactions": "recon",
+    "suggest_reconciliation": "recon",
+    "run_reconciliation_agent": "recon",
+    "get_invoice": "billing",
+    "list_invoice_critics": "billing",
+    "get_nota_fiscal": "fiscal",
+    "financial_statements": "finance",
+    # External — counterparty / fiscal lookups
+    "fetch_cnpj_from_receita": "external",
+    # External — Brazilian central bank, FX, regional registries
+    "fetch_bcb_indicator": "external",
+    "fetch_ptax": "external",
+    "fetch_cep": "external",
+    "fetch_holidays_brazil": "external",
+    "fetch_bank_by_code": "external",
+    "fetch_ncm": "external",
+    "fetch_cnae_info": "external",
+    # Local lookups (no network)
+    "validate_cfop": "fiscal",
+    "simples_nacional_annex_for_cnae": "fiscal",
+    # Sysnord meta + dynamic API access
+    "discover_api": "meta",
+    "call_internal_api": "meta",
+    # Tenant-mapped ERP integrations
+    "list_erp_apis": "erp",
+    "describe_erp_api": "erp",
+    "call_erp_api": "erp",
+}
+
+# Apply tags. ``replace`` since ToolDef is a frozen dataclass.
+TOOLS = [
+    type(t)(
+        name=t.name,
+        description=t.description,
+        handler=t.handler,
+        input_schema=t.input_schema,
+        domain=_TOOL_DOMAINS.get(t.name, "general"),
+    )
+    for t in TOOLS
+]
 TOOLS_BY_NAME: dict[str, ToolDef] = {t.name: t for t in TOOLS}
 
 
@@ -1856,3 +2093,9 @@ def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Dispatch a tool call. Raises KeyError on unknown tool."""
     tool = TOOLS_BY_NAME[name]
     return tool.handler(**(arguments or {}))
+
+
+def get_tool_domain(name: str) -> str:
+    """Look up a tool's domain tag (or 'general' if unknown)."""
+    tool = TOOLS_BY_NAME.get(name)
+    return tool.domain if tool else "general"

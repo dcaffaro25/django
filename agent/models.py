@@ -334,3 +334,145 @@ class AgentMessage(TenantAwareBaseModel):
 
     def __str__(self):
         return f"AgentMessage(id={self.id}, role={self.role}, conv={self.conversation_id})"
+
+
+class AgentToolCallLog(TenantAwareBaseModel):
+    """One row per tool invocation by the agent runtime — Phase 0 audit log.
+
+    Captures *what happened* without storing full args/responses (PII risk).
+    The redacted ``args_summary`` keeps the first ~200 chars of the JSON
+    representation, which is enough to debug "what did the agent do at 14:32"
+    without leaking customer data into observability tooling.
+
+    Indexed for two main queries:
+      * "what's the agent doing today?" → (company, -created_at)
+      * "which tool errors recurrently?" → (tool_name, status, -created_at)
+    """
+
+    STATUS_OK = "ok"
+    STATUS_ERROR = "error"
+    STATUS_WARN = "warn"  # tool returned an {"error": ...} blob (handled)
+    STATUS_REJECTED = "rejected"  # write blocked by policy
+    STATUS_CHOICES = [
+        (STATUS_OK, "OK"),
+        (STATUS_ERROR, "Exception"),
+        (STATUS_WARN, "Handled error"),
+        (STATUS_REJECTED, "Rejected by policy"),
+    ]
+
+    conversation = models.ForeignKey(
+        AgentConversation,
+        related_name="tool_calls",
+        on_delete=models.CASCADE,
+        null=True, blank=True,
+        help_text="Null for tool calls outside a chat conversation (raw MCP, mgmt cmd).",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="agent_tool_calls",
+    )
+    tool_name = models.CharField(max_length=128, db_index=True)
+    tool_domain = models.CharField(
+        max_length=32, blank=True, default="",
+        help_text="Domain tag from the ToolDef (recon/fiscal/external/meta/erp/internal).",
+    )
+    args_summary = models.CharField(
+        max_length=400, blank=True, default="",
+        help_text="Truncated JSON of args; never store full args (PII).",
+    )
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, db_index=True)
+    error_type = models.CharField(max_length=128, blank=True, default="")
+    error_message = models.CharField(max_length=500, blank=True, default="")
+    latency_ms = models.IntegerField(null=True, blank=True)
+    response_size_bytes = models.IntegerField(null=True, blank=True)
+    iteration = models.IntegerField(
+        null=True, blank=True,
+        help_text="Which agent_runtime iteration this call belongs to (1..AGENT_MAX_TOOL_ITERATIONS).",
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["company", "-created_at"]),
+            models.Index(fields=["tool_name", "status", "-created_at"]),
+            models.Index(fields=["conversation", "-created_at"]),
+        ]
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return f"AgentToolCallLog({self.tool_name} {self.status} conv={self.conversation_id})"
+
+
+class AgentWriteAudit(TenantAwareBaseModel):
+    """One row per attempted write by the agent — Phase 1 confirmation pattern.
+
+    Even before live writes are enabled, every dry_run goes through this
+    table so the operator can see *what the agent would have done* before
+    flipping the kill-switch. When live writes turn on, the same row gets
+    promoted from dry_run=True to dry_run=False with the actual side
+    effects recorded.
+
+    ``before_state`` and ``after_state`` are JSON snapshots of the rows
+    touched, capped at ~10KB each. Sufficient for "was the agent right?"
+    review and for the eventual undo path (replay before_state).
+    """
+
+    STATUS_DRY_RUN = "dry_run"
+    STATUS_PROPOSED = "proposed"   # awaiting user confirmation
+    STATUS_APPLIED = "applied"
+    STATUS_REJECTED = "rejected"
+    STATUS_FAILED = "failed"
+    STATUS_UNDONE = "undone"
+    STATUS_CHOICES = [
+        (STATUS_DRY_RUN, "Dry-run only (no DB change)"),
+        (STATUS_PROPOSED, "Awaiting user confirmation"),
+        (STATUS_APPLIED, "Applied"),
+        (STATUS_REJECTED, "Rejected"),
+        (STATUS_FAILED, "Failed during apply"),
+        (STATUS_UNDONE, "Undone"),
+    ]
+
+    conversation = models.ForeignKey(
+        AgentConversation,
+        related_name="write_audits",
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name="agent_write_audits",
+    )
+    tool_name = models.CharField(max_length=128, db_index=True)
+    target_model = models.CharField(
+        max_length=128, blank=True, default="",
+        help_text="e.g. 'accounting.JournalEntry'",
+    )
+    target_ids = models.JSONField(
+        default=list, blank=True,
+        help_text="PKs touched by the write — empty list means 'creating new'.",
+    )
+    args_summary = models.CharField(max_length=400, blank=True, default="")
+    before_state = models.JSONField(default=dict, blank=True)
+    after_state = models.JSONField(default=dict, blank=True)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, db_index=True)
+    error_type = models.CharField(max_length=128, blank=True, default="")
+    error_message = models.CharField(max_length=500, blank=True, default="")
+    undo_token = models.CharField(
+        max_length=64, blank=True, default="",
+        help_text="Random token the user can pass to undo_* tools to reverse this write.",
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["company", "-created_at"]),
+            models.Index(fields=["tool_name", "status", "-created_at"]),
+            models.Index(fields=["conversation", "-created_at"]),
+            models.Index(fields=["target_model", "status"]),
+        ]
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return f"AgentWriteAudit({self.tool_name} {self.status} ids={self.target_ids})"

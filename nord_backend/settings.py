@@ -622,6 +622,19 @@ AGENT_ENABLE_WEB_SEARCH = os.getenv("AGENT_ENABLE_WEB_SEARCH", "false").lower() 
     "1", "true", "yes",
 )
 
+# Phase 1 — write-tool kill switch. When False (default), every write tool
+# refuses to apply mutations even if the agent passes ``dry_run=False``;
+# the call still returns the *proposed* changes so the user can preview.
+# Flip to True only after operators are comfortable with the audit trail
+# in ``AgentWriteAudit`` and the per-tenant policy layer.
+AGENT_ALLOW_WRITES = os.getenv("AGENT_ALLOW_WRITES", "false").lower() in (
+    "1", "true", "yes",
+)
+
+# Default response-body cap for in-process API calls made via
+# ``call_internal_api`` and ``call_erp_api`` (bytes).
+AGENT_API_RESPONSE_BYTE_CAP = int(os.getenv("AGENT_API_RESPONSE_BYTE_CAP", "30000"))
+
 # Codex Responses API runtime — endpoint, headers, defaults.
 OPENAI_CODEX_BASE_URL = os.getenv(
     "OPENAI_CODEX_BASE_URL", "https://chatgpt.com/backend-api/codex",
