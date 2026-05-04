@@ -20,6 +20,7 @@ import { AccountingHubPage } from "@/pages/accounting/AccountingHubPage"
 import { EntitiesPage } from "@/pages/settings/EntitiesPage"
 import { TenantConfigPage } from "@/pages/settings/TenantConfigPage"
 import { ApiSandboxPage } from "@/pages/integrations/ApiSandboxPage"
+import { ApiDefinitionsPage } from "@/pages/integrations/ApiDefinitionsPage"
 import { ImportsHubPage } from "@/pages/imports/ImportsHubPage"
 import { ImportsHubWrapper } from "@/pages/imports/ImportsHubWrapper"
 import { SubstitutionRulesPage } from "@/pages/imports/SubstitutionRulesPage"
@@ -152,6 +153,10 @@ export default function App() {
                   <Route path="/hr/*" element={<PlaceholderPage title="RH" />} />
                   <Route path="/inventory/*" element={<PlaceholderPage title="Estoque" />} />
                   <Route path="/integrations/sandbox" element={<ApiSandboxPage />} />
+                  {/* Phase-1 do plano Sandbox API: catálogo estruturado das
+                      definições de API. O sandbox e as rotinas (futuras)
+                      consomem o que é cadastrado aqui. */}
+                  <Route path="/integrations/api-definitions" element={<ApiDefinitionsPage />} />
                   <Route path="/integrations/*" element={<PlaceholderPage title="Integrações" />} />
 
                   {/* ERP — Omie reports powered by ApiPipeline snapshots. */}

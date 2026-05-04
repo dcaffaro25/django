@@ -23,6 +23,7 @@ from .models import (
     ERPSyncRun,
 )
 from .serializers import (
+    APIDefinitionTestCallRequestSerializer,
     BuildPayloadRequestSerializer,
     ERPAPIDefinitionSerializer,
     ERPConnectionListSerializer,
@@ -56,10 +57,33 @@ class ERPConnectionViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         return ERPConnectionSerializer
 
 
-class ERPAPIDefinitionViewSet(SoftDeleteQuerysetMixin, viewsets.ReadOnlyModelViewSet):
-    """Read-only list of API definitions (global, not tenant-scoped)."""
+class ERPAPIDefinitionViewSet(SoftDeleteQuerysetMixin, viewsets.ModelViewSet):
+    """CRUD for API definitions (global, not tenant-scoped).
 
-    queryset = ERPAPIDefinition.objects.filter(is_active=True).select_related("provider").order_by("provider__slug", "call")
+    Phase-1 of the Sandbox API plan promoted this viewset from
+    ReadOnly to full CRUD so the structured editor can create / update
+    definitions through the UI instead of the Django admin. Backwards-
+    compatible: ``list`` / ``retrieve`` payload shape is unchanged
+    (just gains the new metadata fields).
+
+    Two custom actions:
+
+    * ``POST /api-definitions/validate/`` — runs validators against a
+      hypothetical payload without persisting. Used by the editor to
+      light up errors next to fields as the operator types.
+    * ``POST /api-definitions/{id}/test-call/`` — fires a single real
+      call against the chosen connection, redacts the response, and
+      returns ``infer_response_columns`` output for the auto-probe
+      surface. Updates ``last_tested_at`` / ``last_test_outcome`` on
+      the definition.
+    """
+
+    queryset = (
+        ERPAPIDefinition.objects
+        .filter(is_active=True)
+        .select_related("provider")
+        .order_by("provider__slug", "call")
+    )
     serializer_class = ERPAPIDefinitionSerializer
 
     def get_queryset(self):
@@ -67,7 +91,125 @@ class ERPAPIDefinitionViewSet(SoftDeleteQuerysetMixin, viewsets.ReadOnlyModelVie
         provider_id = self.request.query_params.get("provider")
         if provider_id:
             qs = qs.filter(provider_id=provider_id)
+        # Show inactive too when the editor explicitly asks for them
+        # (the ``is_active=False`` filter at the queryset top is the
+        # default for callers that want only-active rows).
+        if self.request.query_params.get("include_inactive") == "1":
+            qs = ERPAPIDefinition.objects.select_related("provider").order_by("provider__slug", "call")
+            if provider_id:
+                qs = qs.filter(provider_id=provider_id)
         return qs
+
+    @action(detail=False, methods=["post"], url_path="validate")
+    def validate_definition(self, request, tenant_id=None):
+        """Run validators against the supplied payload without saving.
+
+        Returns ``{"ok": bool, "errors": {field: [msg, ...]}}`` so the
+        UI can paint inline indicators. Helpful while iterating on a
+        new definition before committing it.
+        """
+        from .services.api_definition_service import (
+            validate_param_schema, validate_pagination_spec,
+        )
+        body = request.data or {}
+        errors = {}
+        ps_errors = validate_param_schema(body.get("param_schema"))
+        if ps_errors:
+            errors["param_schema"] = ps_errors
+        pg_errors = validate_pagination_spec(body.get("pagination_spec"))
+        if pg_errors:
+            errors["pagination_spec"] = pg_errors
+        ok = not errors
+        return Response({"ok": ok, "errors": errors})
+
+    @action(detail=True, methods=["post"], url_path="test-call")
+    def test_call(self, request, pk=None, tenant_id=None):
+        """Make one real call and return the response shape.
+
+        Body: ``{connection_id, param_values?, max_pages?}`` (validated
+        by ``APIDefinitionTestCallRequestSerializer``).
+
+        Reuses ``execute_pipeline_spec`` from the existing pipeline
+        executor so retries / unwrapping stay identical to production
+        runs. Wraps the single api_definition into a 1-step inline
+        pipeline; caps at ``max_pages`` and 1 fanout.
+        """
+        from django.utils import timezone as dj_tz
+        from .services.api_definition_service import infer_response_columns
+        from .services.pipeline_service import (
+            _PipelineCaps, execute_pipeline_spec,
+        )
+
+        api_def = self.get_object()
+        req = APIDefinitionTestCallRequestSerializer(data=request.data)
+        req.is_valid(raise_exception=True)
+        data = req.validated_data
+
+        tenant = getattr(request, "tenant", None)
+        company_id = None
+        if tenant and tenant != "all" and hasattr(tenant, "id"):
+            company_id = tenant.id
+        if not company_id:
+            return Response(
+                {"detail": "test-call requires an explicit tenant."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        caps = _PipelineCaps(
+            max_steps=1,
+            max_pages_per_step=int(data.get("max_pages") or 1),
+            max_fanout=1,
+        )
+        spec_result = execute_pipeline_spec(
+            connection_id=data["connection_id"],
+            steps=[{
+                "order": 1,
+                "api_definition_id": api_def.id,
+                "extra_params": data.get("param_values") or {},
+                "param_bindings": [],
+                "select_fields": None,
+            }],
+            company_id=company_id,
+            caps=caps,
+        )
+
+        outcome = ERPAPIDefinition.OUTCOME_SUCCESS
+        last_error = ""
+        if not spec_result.get("success"):
+            err_text = (spec_result.get("error") or "").lower()
+            if "auth" in err_text or "unauthorized" in err_text or "401" in err_text:
+                outcome = ERPAPIDefinition.OUTCOME_AUTH_FAIL
+            else:
+                outcome = ERPAPIDefinition.OUTCOME_ERROR
+            last_error = (spec_result.get("error") or "")[:2000]
+
+        ERPAPIDefinition.objects.filter(pk=api_def.pk).update(
+            last_tested_at=dj_tz.now(),
+            last_test_outcome=outcome,
+            last_test_error=last_error,
+        )
+
+        # Pull the first preview rows + first redacted payload so the
+        # operator can see the actual response shape immediately.
+        preview = (spec_result.get("preview_by_step") or [{}])[0] if spec_result.get("preview_by_step") else {}
+        preview_rows = preview.get("rows") or []
+        # Build the canonical "columns" view either from the redacted
+        # payload (if available) or the extracted rows.
+        first_payload = spec_result.get("first_payload_redacted")
+        if first_payload:
+            shape = infer_response_columns(first_payload, api_def.records_path or None)
+        else:
+            shape = infer_response_columns(preview_rows[0] if preview_rows else None)
+
+        return Response({
+            "ok": spec_result.get("success", False),
+            "outcome": outcome,
+            "error": spec_result.get("error"),
+            "diagnostics": spec_result.get("diagnostics"),
+            "preview_rows": preview_rows[:5],
+            "shape": shape,
+            "first_payload_redacted": first_payload,
+        })
 
 
 class BuildPayloadView(APIView):

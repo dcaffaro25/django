@@ -70,7 +70,13 @@ class ERPConnectionListSerializer(serializers.ModelSerializer):
 
 
 class ERPAPIDefinitionSerializer(serializers.ModelSerializer):
-    """Joined provider + API definition: url, method, param_schema, payload (defaults from schema)."""
+    """Joined provider + API definition: url, method, param_schema, payload (defaults from schema).
+
+    Phase-1 fields exposed: version, source, documentation_url,
+    last_tested_at, last_test_outcome, last_test_error, auth_strategy,
+    pagination_spec, records_path. All optional / default-ed so the
+    serializer is backward compatible with existing callers.
+    """
 
     provider_display = serializers.CharField(source="provider.name", read_only=True)
     payload = serializers.SerializerMethodField()
@@ -86,13 +92,66 @@ class ERPAPIDefinitionSerializer(serializers.ModelSerializer):
             "method",
             "param_schema",
             "payload",
+            "transform_config",
             "unique_id_config",
             "description",
             "is_active",
+            # Phase-1 metadata.
+            "version",
+            "source",
+            "documentation_url",
+            "last_tested_at",
+            "last_test_outcome",
+            "last_test_error",
+            "auth_strategy",
+            "pagination_spec",
+            "records_path",
+        ]
+        read_only_fields = [
+            "version",
+            "last_tested_at",
+            "last_test_outcome",
+            "last_test_error",
         ]
 
     def get_payload(self, obj):
         return payload_from_param_schema(obj.param_schema or [])
+
+    def validate_param_schema(self, value):
+        from .services.api_definition_service import validate_param_schema
+        errors = validate_param_schema(value)
+        if errors:
+            raise serializers.ValidationError(errors)
+        return value
+
+    def validate_pagination_spec(self, value):
+        from .services.api_definition_service import validate_pagination_spec
+        errors = validate_pagination_spec(value)
+        if errors:
+            raise serializers.ValidationError(errors)
+        return value
+
+    def update(self, instance, validated_data):
+        # Bump version on every successful update through the structured
+        # editor. Read-only fields (last_tested_*) are managed by the
+        # /test-call action, not by save().
+        instance = super().update(instance, validated_data)
+        ERPAPIDefinition.objects.filter(pk=instance.pk).update(version=instance.version + 1)
+        instance.refresh_from_db(fields=["version"])
+        return instance
+
+
+class APIDefinitionTestCallRequestSerializer(serializers.Serializer):
+    """Body for ``POST /api-definitions/{id}/test-call/``.
+
+    The connection supplies credentials; ``param_values`` overrides
+    individual param defaults; ``max_pages`` caps the call so the
+    operator can't accidentally pull a million rows from the editor.
+    """
+
+    connection_id = serializers.IntegerField()
+    param_values = serializers.JSONField(required=False, default=dict)
+    max_pages = serializers.IntegerField(required=False, default=1, min_value=1, max_value=5)
 
 
 class BuildPayloadRequestSerializer(serializers.Serializer):

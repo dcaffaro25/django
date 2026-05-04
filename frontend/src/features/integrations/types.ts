@@ -10,6 +10,42 @@ export interface ERPConnection {
   is_active: boolean
 }
 
+export type ParamLocation = "body" | "query" | "path" | "header"
+export type ParamType =
+  | "string" | "int" | "number" | "boolean" | "date" | "datetime"
+  | "enum" | "object" | "array"
+
+export interface ParamSpec {
+  name: string
+  type?: ParamType
+  description?: string
+  default?: unknown
+  required?: boolean
+  location?: ParamLocation
+  options?: string[]
+}
+
+export type AuthStrategy =
+  | "provider_default" | "query_params" | "bearer_header" | "basic" | "custom_template"
+
+export type ApiDefinitionSource = "manual" | "imported" | "discovered"
+
+export type TestOutcome = "" | "success" | "error" | "auth_fail"
+
+export type PaginationMode = "none" | "page_number" | "cursor" | "offset"
+
+export interface PaginationSpec {
+  mode: PaginationMode
+  page_param?: string
+  page_size_param?: string
+  page_size?: number
+  cursor_path?: string
+  next_cursor_param?: string
+  offset_param?: string
+  limit_param?: string
+  max_pages?: number
+}
+
 export interface ERPAPIDefinition {
   id: number
   provider: number
@@ -17,11 +53,61 @@ export interface ERPAPIDefinition {
   call: string
   url: string
   method: string
-  param_schema: Array<{ name: string; type?: string; description?: string; default?: unknown; required?: boolean }>
+  param_schema: ParamSpec[]
   payload?: Record<string, unknown>
+  transform_config?: Record<string, unknown> | null
   unique_id_config?: Record<string, unknown> | null
   description?: string | null
   is_active: boolean
+  // Phase-1 metadata
+  version: number
+  source: ApiDefinitionSource
+  documentation_url?: string | null
+  last_tested_at?: string | null
+  last_test_outcome: TestOutcome
+  last_test_error?: string
+  auth_strategy: AuthStrategy
+  pagination_spec?: PaginationSpec | null
+  records_path?: string
+}
+
+/** Body for POST /api-definitions/ (create) and PATCH /:id/ (update). */
+export type ERPAPIDefinitionWrite = Partial<
+  Omit<ERPAPIDefinition,
+    "id" | "provider_display" | "payload" | "version"
+    | "last_tested_at" | "last_test_outcome" | "last_test_error"
+  >
+> & {
+  provider: number
+  call: string
+  url: string
+  method?: string
+}
+
+export interface ApiDefinitionValidateResult {
+  ok: boolean
+  errors: Record<string, Array<string | { row?: number; field?: string; message?: string }>>
+}
+
+export interface InferredColumn {
+  path: string
+  type: string
+  samples: unknown[]
+}
+
+export interface InferredShape {
+  items_found: number
+  columns: InferredColumn[]
+}
+
+export interface ApiDefinitionTestCallResult {
+  ok: boolean
+  outcome: TestOutcome
+  error?: string | null
+  diagnostics?: Record<string, unknown>
+  preview_rows: Array<Record<string, unknown>>
+  shape: InferredShape
+  first_payload_redacted?: Record<string, unknown> | null
 }
 
 export type SandboxBindingMode = "static" | "jmespath" | "fanout"

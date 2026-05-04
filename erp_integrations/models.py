@@ -61,7 +61,63 @@ class ERPAPIDefinition(BaseModel):
     for ListarContasPagar). param_schema documents each field (name, type,
     description, required, default). Default payload is built from param_schema
     defaults.
+
+    Phase-1 metadata (Sandbox API plan):
+        * ``source``: where this definition came from (manual / imported /
+          discovered via the Phase-2 URL discovery service).
+        * ``version``: incremented on each save through the new structured
+          API; lets the UI show a small history and a rollback button.
+        * ``documentation_url``: the page that produced the definition (if
+          discovered) or a reference link the operator pinned.
+        * ``last_tested_at`` / ``last_test_outcome``: last time the
+          ``test-call`` endpoint hit this definition. Surfaced in the
+          listing as a "saúde" indicator so operators see at a glance which
+          definitions are stale or broken.
+        * ``auth_strategy``: how the request authenticates. Defaults to
+          ``provider_default`` (current behaviour: app_key / app_secret in
+          payload as Omie expects). Other strategies plug in different
+          builders so we can support APIs outside Omie without forking the
+          executor.
+        * ``pagination_spec``: structured pagination config that replaces
+          the hard-coded paging in ``omie_sync_service``. Optional during
+          rollout; ``None`` keeps current behaviour.
+        * ``records_path``: JMESPath expression telling the executor where
+          to find the array of items in the response. Optional; falls
+          back to the existing transform_engine extraction.
     """
+
+    SOURCE_MANUAL = "manual"
+    SOURCE_IMPORTED = "imported"
+    SOURCE_DISCOVERED = "discovered"
+    SOURCE_CHOICES = [
+        (SOURCE_MANUAL, "Criada manualmente"),
+        (SOURCE_IMPORTED, "Importada de arquivo"),
+        (SOURCE_DISCOVERED, "Descoberta via URL"),
+    ]
+
+    OUTCOME_UNKNOWN = ""
+    OUTCOME_SUCCESS = "success"
+    OUTCOME_ERROR = "error"
+    OUTCOME_AUTH_FAIL = "auth_fail"
+    OUTCOME_CHOICES = [
+        (OUTCOME_UNKNOWN, "—"),
+        (OUTCOME_SUCCESS, "Sucesso"),
+        (OUTCOME_ERROR, "Erro"),
+        (OUTCOME_AUTH_FAIL, "Falha de autenticação"),
+    ]
+
+    AUTH_PROVIDER_DEFAULT = "provider_default"
+    AUTH_QUERY_PARAMS = "query_params"
+    AUTH_BEARER_HEADER = "bearer_header"
+    AUTH_BASIC = "basic"
+    AUTH_CUSTOM_TEMPLATE = "custom_template"
+    AUTH_CHOICES = [
+        (AUTH_PROVIDER_DEFAULT, "Padrão do provedor"),
+        (AUTH_QUERY_PARAMS, "Query params"),
+        (AUTH_BEARER_HEADER, "Bearer (Authorization header)"),
+        (AUTH_BASIC, "Basic auth"),
+        (AUTH_CUSTOM_TEMPLATE, "Template customizado"),
+    ]
 
     provider = models.ForeignKey(
         ERPProvider,
@@ -105,6 +161,65 @@ class ERPAPIDefinition(BaseModel):
         ),
     )
 
+    # Phase-1 metadata fields. All optional / nullable to keep the
+    # migration purely additive — every existing definition continues
+    # to work without touching them.
+    version = models.PositiveIntegerField(
+        default=1,
+        help_text="Bumped on each save through the structured editor.",
+    )
+    source = models.CharField(
+        max_length=16,
+        choices=SOURCE_CHOICES,
+        default=SOURCE_MANUAL,
+        help_text="Where this definition came from.",
+    )
+    documentation_url = models.URLField(
+        max_length=512,
+        blank=True,
+        null=True,
+        help_text="Link to the API's official documentation page.",
+    )
+    last_tested_at = models.DateTimeField(blank=True, null=True)
+    last_test_outcome = models.CharField(
+        max_length=16,
+        choices=OUTCOME_CHOICES,
+        blank=True,
+        default=OUTCOME_UNKNOWN,
+    )
+    last_test_error = models.TextField(
+        blank=True,
+        default="",
+        help_text="Most recent test-call error message (if any).",
+    )
+    auth_strategy = models.CharField(
+        max_length=24,
+        choices=AUTH_CHOICES,
+        default=AUTH_PROVIDER_DEFAULT,
+        help_text="How requests against this definition are authenticated.",
+    )
+    pagination_spec = models.JSONField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=(
+            "Structured pagination config. Schema: "
+            "{mode: 'none'|'page_number'|'cursor'|'offset', page_param, "
+            "page_size_param, page_size, cursor_path, next_cursor_param, "
+            "max_pages}. None keeps the hard-coded behaviour from "
+            "omie_sync_service."
+        ),
+    )
+    records_path = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text=(
+            "JMESPath expression to the array of items in the response. "
+            "Optional: falls back to transform_engine extraction when blank."
+        ),
+    )
+
     def clean(self):
         from django.core.exceptions import ValidationError
         from .services.transform_engine import (
@@ -129,9 +244,14 @@ class ERPAPIDefinition(BaseModel):
                         "unique_id_config": [f"{e.get('field', 'config')}: {e.get('message', '')}" for e in errors]
                     }
                 )
+        if self.pagination_spec:
+            from .services.api_definition_service import validate_pagination_spec
+            errors = validate_pagination_spec(self.pagination_spec)
+            if errors:
+                raise ValidationError({"pagination_spec": errors})
 
     def __str__(self):
-        return f"{self.provider.slug} / {self.call}"
+        return f"{self.provider.slug} / {self.call} (v{self.version})"
 
     class Meta:
         unique_together = ("provider", "call")

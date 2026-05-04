@@ -66,6 +66,8 @@ const GROUPS: NavGroup[] = [
     visible: ({ canWrite }) => canWrite,
     items: [
       { key: "integrations_sandbox", label: "Sandbox de API", path: "/integrations/sandbox", icon: Zap, requiresWrite: true },
+      // Phase-1 do plano Sandbox API: catálogo estruturado.
+      { key: "integrations_api_defs", label: "Definições de API", path: "/integrations/api-definitions", icon: FileCog, requiresWrite: true },
     ],
   },
   {
