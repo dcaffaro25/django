@@ -1731,6 +1731,292 @@ def propose_mapping_from_document(
 
 
 # ---------------------------------------------------------------------------
+# Tool: apply_document_mapping — Phase 2 wave 2 (write)
+# ---------------------------------------------------------------------------
+def apply_document_mapping(
+    company_id: int,
+    attachment_id: int,
+    partner_id: int,
+    invoice_type: str,
+    invoice_date: str | None = None,
+    due_date: str | None = None,
+    product_service_id: int | None = None,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Create an :class:`Invoice` from an ingested NF-e attachment.
+
+    Reads the cached NFe summary, resolves currency from the partner,
+    creates an Invoice header with totals from the NFe, and (if
+    ``product_service_id`` is provided) creates one
+    :class:`InvoiceLine` per NFe item using that single ProductService
+    as a catch-all. Without a product_service_id, the Invoice is
+    header-only — the user can fill lines manually later.
+
+    Wrapped in the standard write-tool pattern: ``dry_run=True`` by
+    default (returns the proposed payload), real writes only when
+    ``settings.AGENT_ALLOW_WRITES`` is on AND the caller passes
+    ``dry_run=False``. Every attempt — dry-run or applied — captures
+    an :class:`agent.models.AgentWriteAudit` row with an
+    ``undo_token`` that ``undo_via_audit`` can use to reverse the
+    Invoice + lines.
+    """
+    import uuid as _uuid
+    from datetime import date as _date
+
+    from django.conf import settings as _django_settings
+    from django.db import transaction as _txn
+
+    from agent.models import AgentMessageAttachment, AgentWriteAudit
+    from billing.models import BusinessPartner, Invoice, InvoiceLine, ProductService
+    from multitenancy.models import Company
+
+    # 1. Validate inputs / resolve dependencies.
+    if invoice_type not in ("sale", "purchase"):
+        return {"error": "invoice_type must be 'sale' or 'purchase'."}
+
+    try:
+        att = AgentMessageAttachment.objects.get(
+            id=attachment_id, company_id=company_id,
+        )
+    except AgentMessageAttachment.DoesNotExist:
+        return {"error": f"Attachment {attachment_id} not found in company {company_id}."}
+
+    if att.kind != AgentMessageAttachment.KIND_NFE_XML:
+        return {
+            "error": (
+                f"apply_document_mapping currently supports NF-e XML only. "
+                f"Got kind={att.kind!r}."
+            )
+        }
+
+    try:
+        partner = BusinessPartner.objects.get(id=partner_id, company_id=company_id)
+    except BusinessPartner.DoesNotExist:
+        return {"error": f"BusinessPartner {partner_id} not found in company {company_id}."}
+
+    product_service = None
+    if product_service_id is not None:
+        try:
+            product_service = ProductService.objects.get(
+                id=product_service_id, company_id=company_id,
+            )
+        except ProductService.DoesNotExist:
+            return {
+                "error": (
+                    f"ProductService {product_service_id} not found. Pass a valid "
+                    "product_service_id to create lines, or omit it for a "
+                    "header-only Invoice."
+                )
+            }
+
+    # 2. Re-parse the NFe summary (cheap; the cached extracted_text is a
+    # human-readable string, but we need the structured fields here).
+    try:
+        _, nfe_summary = _ingest_nfe_xml(att)
+    except Exception as exc:
+        return {"error": f"Could not parse NF-e for apply: {exc}"}
+
+    # 3. Defaults.
+    parsed_invoice_date: _date | None = None
+    if invoice_date:
+        try:
+            parsed_invoice_date = _date.fromisoformat(invoice_date)
+        except ValueError as exc:
+            return {"error": f"Invalid invoice_date: {exc}"}
+    elif nfe_summary.get("data_emissao"):
+        try:
+            parsed_invoice_date = _date.fromisoformat(
+                nfe_summary["data_emissao"][:10]
+            )
+        except ValueError:
+            parsed_invoice_date = None
+
+    parsed_due_date: _date | None = None
+    if due_date:
+        try:
+            parsed_due_date = _date.fromisoformat(due_date)
+        except ValueError as exc:
+            return {"error": f"Invalid due_date: {exc}"}
+    else:
+        parsed_due_date = parsed_invoice_date
+
+    if not parsed_invoice_date:
+        return {"error": "invoice_date is required (NFe data_emissao not parseable)."}
+
+    # 4. Build the proposed payload (used for both dry-run preview and
+    # the actual create).
+    items = nfe_summary.get("itens_preview") or []
+    invoice_payload = {
+        "company_id": company_id,
+        "partner_id": partner.id,
+        "invoice_type": invoice_type,
+        "invoice_number": str(nfe_summary.get("numero") or ""),
+        "invoice_date": parsed_invoice_date.isoformat(),
+        "due_date": parsed_due_date.isoformat() if parsed_due_date else None,
+        "currency_id": getattr(partner, "currency_id", None),
+        "total_amount": str(nfe_summary.get("valor_total") or "0"),
+        "tax_amount": str(nfe_summary.get("valor_icms") or "0"),
+        "discount_amount": "0",
+        "description": (
+            f"NF-e {nfe_summary.get('numero', '?')}/{nfe_summary.get('serie', '?')} — "
+            f"chave {nfe_summary.get('chave', '?')[-8:] or '?'}"
+        ),
+    }
+    line_payloads = []
+    if product_service is not None:
+        for it in items:
+            try:
+                qty = Decimal("1")
+                unit = Decimal(str(it.get("valor") or "0"))
+            except Exception:
+                qty = Decimal("1")
+                unit = Decimal("0")
+            line_payloads.append({
+                "product_service_id": product_service.id,
+                "description": (it.get("descricao") or "")[:255],
+                "quantity": str(qty),
+                "unit_price": str(unit),
+                "total_price": str(qty * unit),
+            })
+
+    # 5. Effective dry_run honours the kill-switch.
+    requested_dry_run = bool(dry_run)
+    writes_enabled = bool(getattr(_django_settings, "AGENT_ALLOW_WRITES", False))
+    effective_dry_run = requested_dry_run or not writes_enabled
+    blocked_by_policy = (not requested_dry_run) and (not writes_enabled)
+
+    args_summary = {
+        "attachment_id": attachment_id, "partner_id": partner_id,
+        "invoice_type": invoice_type, "invoice_date": str(parsed_invoice_date),
+        "product_service_id": product_service_id,
+        "dry_run_requested": requested_dry_run,
+    }
+
+    invoice_id: int | None = None
+    line_ids: list[int] = []
+    error_msg = ""
+
+    if not effective_dry_run:
+        try:
+            with _txn.atomic():
+                inv = Invoice.objects.create(
+                    company=Company.objects.get(id=company_id),
+                    partner=partner,
+                    invoice_type=invoice_type,
+                    invoice_number=invoice_payload["invoice_number"],
+                    invoice_date=parsed_invoice_date,
+                    due_date=parsed_due_date or parsed_invoice_date,
+                    currency_id=invoice_payload["currency_id"],
+                    total_amount=invoice_payload["total_amount"],
+                    tax_amount=invoice_payload["tax_amount"],
+                    discount_amount=invoice_payload["discount_amount"],
+                    description=invoice_payload["description"],
+                    status="draft",
+                )
+                invoice_id = inv.id
+                for lp in line_payloads:
+                    line = InvoiceLine.objects.create(
+                        company_id=company_id,
+                        invoice=inv,
+                        product_service_id=lp["product_service_id"],
+                        description=lp["description"],
+                        quantity=Decimal(lp["quantity"]),
+                        unit_price=Decimal(lp["unit_price"]),
+                    )
+                    line_ids.append(line.id)
+        except Exception as exc:
+            error_msg = f"{type(exc).__name__}: {exc}"
+
+    # 6. Persist the audit row regardless of dry-run / success / failure.
+    audit_status = (
+        AgentWriteAudit.STATUS_FAILED if error_msg
+        else (AgentWriteAudit.STATUS_DRY_RUN if effective_dry_run
+              else AgentWriteAudit.STATUS_APPLIED)
+    )
+    undo_token = "" if (effective_dry_run or error_msg) else _uuid.uuid4().hex
+    audit_row_id: int | None = None
+    try:
+        audit = AgentWriteAudit.objects.create(
+            company=Company.objects.get(id=company_id),
+            tool_name="apply_document_mapping",
+            target_model="billing.Invoice",
+            target_ids=[invoice_id] if invoice_id else [],
+            args_summary=str(args_summary)[:380],
+            before_state={
+                "writes_enabled": writes_enabled,
+                "blocked_by_policy": blocked_by_policy,
+            },
+            after_state={
+                "invoice_payload": invoice_payload,
+                "line_payloads": line_payloads,
+                "invoice_id": invoice_id,
+                "line_ids": line_ids,
+            },
+            status=audit_status,
+            error_type=error_msg.split(":")[0] if error_msg else "",
+            error_message=error_msg[:480] if error_msg else "",
+            undo_token=undo_token,
+        )
+        audit_row_id = audit.id
+    except Exception as exc:  # pragma: no cover — audit must not break tools
+        log.warning("agent.write_audit.failed: %s", exc)
+
+    if error_msg:
+        return {
+            "ok": False,
+            "error": error_msg,
+            "audit_id": audit_row_id,
+        }
+
+    return {
+        "ok": True,
+        "dry_run_effective": effective_dry_run,
+        "blocked_by_policy": blocked_by_policy,
+        "policy_note": (
+            "Live writes are disabled (AGENT_ALLOW_WRITES=false). The Invoice "
+            "and lines were NOT created — the proposal is in the audit row "
+            "for review."
+        ) if blocked_by_policy else None,
+        "audit_id": audit_row_id,
+        "undo_token": undo_token or None,
+        "invoice_id": invoice_id,
+        "line_ids": line_ids,
+        "preview": {
+            "invoice": invoice_payload,
+            "lines": line_payloads,
+            "header_only": product_service is None,
+        },
+    }
+
+
+def _undo_apply_document_mapping(audit, *, dry_run: bool) -> dict[str, Any]:
+    """Reverse an ``apply_document_mapping`` audit row by soft-deleting
+    the created Invoice (lines cascade via FK)."""
+    from billing.models import Invoice, InvoiceLine
+
+    invoice_ids = audit.target_ids or []
+    after = audit.after_state or {}
+    line_ids = after.get("line_ids") or []
+
+    if dry_run:
+        return {
+            "would_soft_delete_invoice_ids": invoice_ids,
+            "would_soft_delete_line_ids": line_ids,
+        }
+
+    InvoiceLine.objects.filter(
+        id__in=line_ids, company=audit.company,
+    ).update(is_deleted=True)
+    Invoice.objects.filter(
+        id__in=invoice_ids, company=audit.company,
+    ).update(is_deleted=True)
+    return {
+        "soft_deleted_invoice_ids": invoice_ids,
+        "soft_deleted_line_ids": line_ids,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool: list_recon_decisions — Phase 1 expansion (read)
 # ---------------------------------------------------------------------------
 def list_recon_decisions(
@@ -1927,6 +2213,7 @@ def _undo_run_reconciliation_agent(audit, *, dry_run: bool) -> dict[str, Any]:
 
 _UNDO_REVERSERS = {
     "run_reconciliation_agent": _undo_run_reconciliation_agent,
+    "apply_document_mapping": _undo_apply_document_mapping,
 }
 
 
@@ -2627,6 +2914,36 @@ TOOLS: list[ToolDef] = [
         },
     ),
     ToolDef(
+        name="apply_document_mapping",
+        description="Create an Invoice from an ingested NF-e XML attachment, "
+                    "using the partner_id resolved by propose_mapping_from_document. "
+                    "Pass product_service_id to also create one InvoiceLine per "
+                    "NFe item (catch-all product); omit it for a header-only "
+                    "Invoice. **Dry-run by default**: no DB writes happen unless "
+                    "(a) dry_run=False AND (b) AGENT_ALLOW_WRITES is enabled. "
+                    "Every attempt writes an AgentWriteAudit row with an undo_token "
+                    "that undo_via_audit can use to soft-delete the Invoice + lines.",
+        handler=apply_document_mapping,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "company_id": {"type": "integer"},
+                "attachment_id": {"type": "integer"},
+                "partner_id": {"type": "integer"},
+                "invoice_type": {"type": "string", "enum": ["sale", "purchase"]},
+                "invoice_date": {"type": "string", "format": "date"},
+                "due_date": {"type": "string", "format": "date"},
+                "product_service_id": {
+                    "type": "integer",
+                    "description": "Optional catch-all ProductService used for all "
+                                   "lines. Omit for a header-only Invoice.",
+                },
+                "dry_run": {"type": "boolean", "default": True},
+            },
+            "required": ["company_id", "attachment_id", "partner_id", "invoice_type"],
+        },
+    ),
+    ToolDef(
         name="propose_mapping_from_document",
         description="Given an NF-e XML attachment that's been ingested, propose "
                     "how it should land in Sysnord: counterparty (BusinessPartner) "
@@ -2764,6 +3081,7 @@ _TOOL_DOMAINS: dict[str, str] = {
     "list_recon_decisions": "recon",
     "undo_via_audit": "recon",
     "propose_mapping_from_document": "billing",
+    "apply_document_mapping": "billing",
     "get_invoice": "billing",
     "list_invoice_critics": "billing",
     "get_nota_fiscal": "fiscal",
