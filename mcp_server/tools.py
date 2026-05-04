@@ -1300,11 +1300,28 @@ def describe_erp_api(
     }
 
 
+# In-process cache for ``call_erp_api`` results. Keyed on (company_id,
+# provider, call, canonical_args). Bounded by max entries + TTL. Not
+# shared across processes (Celery workers, dev shells); good enough for
+# de-duplicating within one pipeline run or one agent turn, which is
+# where the throttle pain shows up.
+_ERP_CACHE: dict[tuple, tuple[float, dict[str, Any]]] = {}
+_ERP_CACHE_MAX_ENTRIES = 256
+
+
+def _erp_cache_key(company_id: int, call: str, params: dict[str, Any] | None,
+                   provider: str | None) -> tuple:
+    import json as _json
+    canon = _json.dumps(params or {}, sort_keys=True, default=str)
+    return (company_id, provider or "", call, canon)
+
+
 def call_erp_api(
     company_id: int,
     call: str,
     params: dict[str, Any] | None = None,
     provider: str | None = None,
+    cache_ttl_seconds: int = 0,
 ) -> dict[str, Any]:
     """Invoke a registered ERP API call for the conversation's tenant,
     using its stored ``app_key``/``app_secret`` credentials.
@@ -1314,6 +1331,14 @@ def call_erp_api(
 
     ``params`` overrides keys in the schema-derived default param
     object — e.g. ``{"pagina": 2, "registros_por_pagina": 50}``.
+
+    ``cache_ttl_seconds``: when >0, the result is memoised in-process
+    keyed on ``(company_id, provider, call, canonical_args)``. Same
+    inputs within the TTL window return the cached response without
+    re-hitting Omie. Useful for avoiding rate-limit cascades when the
+    agent or pipeline naturally re-fetches the same lookup data
+    (e.g. ``ListarClientes`` consulted by multiple downstream steps).
+    Default 0 means caching is off — backwards-compatible.
 
     Returns ``{status_code, ok, response, truncated, byte_cap}`` —
     response is the unwrapped JSON (top-level key auto-stripped if Omie
@@ -1327,6 +1352,8 @@ def call_erp_api(
     from erp_integrations.models import ERPAPIDefinition, ERPConnection
     from erp_integrations.services.payload_builder import build_payload
 
+    import time as _time
+
     if not call or not call.startswith(_ERP_READ_PREFIXES):
         return {
             "error": (
@@ -1336,6 +1363,17 @@ def call_erp_api(
                 "tools (separate phase)."
             )
         }
+
+    # Cache lookup. Misses fall through to the live HTTP call.
+    cache_key: tuple | None = None
+    if cache_ttl_seconds and cache_ttl_seconds > 0:
+        cache_key = _erp_cache_key(company_id, call, params, provider)
+        cached = _ERP_CACHE.get(cache_key)
+        if cached is not None:
+            stored_at, payload = cached
+            if (_time.time() - stored_at) < cache_ttl_seconds:
+                # Annotate so callers can tell cache hits apart from fresh.
+                return {**payload, "from_cache": True}
 
     conn_qs = ERPConnection.objects.filter(company_id=company_id, is_active=True)
     if provider:
@@ -1388,7 +1426,7 @@ def call_erp_api(
         or (parsed.get("status") == "error" and "message" in parsed)
     )
 
-    return {
+    out = {
         "ok": resp.status_code < 400 and not is_error_envelope,
         "status_code": resp.status_code,
         "provider": conn.provider.slug,
@@ -1398,6 +1436,21 @@ def call_erp_api(
         "byte_cap": cap,
         "response": parsed,
     }
+
+    # Store in the cache only on success — caching errors would mask
+    # transient issues that should retry.
+    if cache_key is not None and out["ok"]:
+        # Bound the cache size; oldest entries get evicted if we
+        # exceed the limit.
+        if len(_ERP_CACHE) >= _ERP_CACHE_MAX_ENTRIES:
+            try:
+                oldest_key = min(_ERP_CACHE, key=lambda k: _ERP_CACHE[k][0])
+                _ERP_CACHE.pop(oldest_key, None)
+            except ValueError:
+                pass
+        _ERP_CACHE[cache_key] = (_time.time(), out)
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -3331,7 +3384,11 @@ TOOLS: list[ToolDef] = [
                     "the conversation's tenant, using its stored credentials. "
                     "params overrides schema defaults — e.g. {'pagina': 1, "
                     "'registros_por_pagina': 50}. Read-only: only Listar/Consultar/"
-                    "Pesquisar/Obter/Get prefixes are allowed; writes are blocked.",
+                    "Pesquisar/Obter/Get prefixes are allowed; writes are blocked. "
+                    "Pass cache_ttl_seconds=N (e.g. 60) to memoise identical "
+                    "(call, params) results in-process — useful when the agent "
+                    "would otherwise re-fetch the same Listar* data multiple "
+                    "times in one turn.",
         handler=call_erp_api,
         input_schema={
             "type": "object",
@@ -3340,6 +3397,11 @@ TOOLS: list[ToolDef] = [
                 "call": {"type": "string"},
                 "params": {"type": "object"},
                 "provider": {"type": "string"},
+                "cache_ttl_seconds": {
+                    "type": "integer",
+                    "description": "0 = no cache (default). >0 = reuse identical results within window.",
+                    "default": 0,
+                },
             },
             "required": ["company_id", "call"],
         },

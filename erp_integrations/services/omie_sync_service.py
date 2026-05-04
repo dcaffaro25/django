@@ -68,13 +68,21 @@ def _unwrap_omie_response(raw: Dict[str, Any]) -> Dict[str, Any]:
 def _is_consumo_redundante_error(response: requests.Response) -> bool:
     """Check if response indicates an Omie rate-limit error worth retrying.
 
-    Two cases:
+    Three cases that all map to "wait and retry":
+
       * **HTTP 500 + ``consumo redundante`` faultstring** — Omie's
         SOAP-style "you called the same thing too quickly" response.
+        Short window (~30s).
       * **HTTP 425 Too Early** — Omie's newer numeric rate-limit code,
-        used in particular when fanout pipelines cascade many calls
-        to the same endpoint in rapid succession.
-    Both deserve the exponential backoff that the caller applies.
+        used when fanout pipelines cascade calls in rapid succession.
+        Short-to-medium window.
+      * **HTTP 425/500 + "consumo indevido" + "Tente novamente em N
+        segundos"** — Omie's per-account block, triggered when too
+        many calls hit a single endpoint in a short window. Window
+        can be 3-4 minutes; outside the retry budget here, but the
+        caller can still observe and surface the hint.
+
+    Returns True for any of these so the caller's backoff loop fires.
     """
     if response.status_code == 425:
         return True
@@ -87,7 +95,12 @@ def _is_consumo_redundante_error(response: requests.Response) -> bool:
             fault = body.get("faultstring", "") or body.get("fault", {})
             if isinstance(fault, dict):
                 fault = fault.get("faultstring", "")
-            return "consumo redundante" in str(fault).lower()
+            fault_str = str(fault).lower()
+            return (
+                "consumo redundante" in fault_str
+                or "consumo indevido" in fault_str
+                or "api bloqueada" in fault_str
+            )
     except Exception:
         pass
     return False
