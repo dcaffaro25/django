@@ -721,6 +721,87 @@ class ERPSyncPipelineViewSet(ScopedQuerysetMixin, viewsets.ModelViewSet):
         out = execute_pipeline(pipeline.id, dry_run=True)
         return Response(out)
 
+    # ---- Phase-4: scheduled routines ----
+
+    @action(detail=True, methods=["post"])
+    def pause(self, request, pk=None, tenant_id=None):
+        """Soft-disable scheduled fires without losing the schedule."""
+        pipeline = self.get_object()
+        pipeline.is_paused = True
+        pipeline.save(update_fields=["is_paused"])
+        return Response({"is_paused": True})
+
+    @action(detail=True, methods=["post"])
+    def resume(self, request, pk=None, tenant_id=None):
+        """Re-enable scheduled fires."""
+        pipeline = self.get_object()
+        pipeline.is_paused = False
+        pipeline.save(update_fields=["is_paused"])
+        return Response({"is_paused": False})
+
+    @action(detail=True, methods=["post"], url_path="run-now")
+    def run_now(self, request, pk=None, tenant_id=None):
+        """Synchronously fire the scheduled-runner for this pipeline.
+
+        Body: ``{ force_full_dump?: bool, window_start?, window_end? }``.
+        Returns the ``ScheduledRunOutcome`` dict so the UI can show what
+        window was used and whether the run advanced the high-watermark.
+
+        Distinct from the existing ``/run/`` action which queues via
+        Celery — this one runs inline so the operator sees the outcome
+        immediately. For long pipelines, prefer the queued path.
+        """
+        from .services.pipeline_scheduler import run_scheduled_pipeline
+
+        pipeline = self.get_object()
+        body = request.data or {}
+        explicit_window = None
+        ws = body.get("window_start")
+        we = body.get("window_end")
+        if ws and we:
+            from django.utils.dateparse import parse_datetime
+            explicit_window = (parse_datetime(ws), parse_datetime(we))
+
+        outcome = run_scheduled_pipeline(
+            pipeline.id,
+            triggered_by="manual",
+            force_full_dump=bool(body.get("force_full_dump")),
+            explicit_window=explicit_window,
+        )
+        return Response(outcome.to_dict())
+
+    @action(detail=True, methods=["get"], url_path="history")
+    def history(self, request, pk=None, tenant_id=None):
+        """Recent runs for this pipeline. Default 50, ordered by most
+        recent. Operators land here from the routines detail page."""
+        pipeline = self.get_object()
+        qs = (
+            ERPSyncPipelineRun.objects
+            .filter(pipeline=pipeline)
+            .order_by("-started_at")[:50]
+        )
+        data = [{
+            "id": r.id,
+            "status": r.status,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "completed_at": r.completed_at.isoformat() if r.completed_at else None,
+            "duration_seconds": r.duration_seconds,
+            "records_extracted": r.records_extracted,
+            "records_stored": r.records_stored,
+            "records_skipped": r.records_skipped,
+            "records_updated": r.records_updated,
+            "failed_step_order": r.failed_step_order,
+            "errors": r.errors,
+            "triggered_by": r.triggered_by,
+            "incremental_window_start": (
+                r.incremental_window_start.isoformat() if r.incremental_window_start else None
+            ),
+            "incremental_window_end": (
+                r.incremental_window_end.isoformat() if r.incremental_window_end else None
+            ),
+        } for r in qs]
+        return Response(data)
+
 
 class ERPSyncPipelineRunViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
     """Read-only list/detail of pipeline runs."""

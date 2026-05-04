@@ -22,6 +22,7 @@ import { TenantConfigPage } from "@/pages/settings/TenantConfigPage"
 import { ApiSandboxPage } from "@/pages/integrations/ApiSandboxPage"
 import { ApiDefinitionsPage } from "@/pages/integrations/ApiDefinitionsPage"
 import { ApiDiscoveryPage } from "@/pages/integrations/ApiDiscoveryPage"
+import { PipelineRoutinesPage } from "@/pages/integrations/PipelineRoutinesPage"
 import { ImportsHubPage } from "@/pages/imports/ImportsHubPage"
 import { ImportsHubWrapper } from "@/pages/imports/ImportsHubWrapper"
 import { SubstitutionRulesPage } from "@/pages/imports/SubstitutionRulesPage"
@@ -160,6 +161,8 @@ export default function App() {
                   <Route path="/integrations/api-definitions" element={<ApiDefinitionsPage />} />
                   {/* Phase-2: descoberta de APIs a partir de URL de docs. */}
                   <Route path="/integrations/api-definitions/discover" element={<ApiDiscoveryPage />} />
+                  {/* Phase-4: rotinas agendadas. */}
+                  <Route path="/integrations/rotinas" element={<PipelineRoutinesPage />} />
                   <Route path="/integrations/*" element={<PlaceholderPage title="Integrações" />} />
 
                   {/* ERP — Omie reports powered by ApiPipeline snapshots. */}

@@ -601,6 +601,27 @@ class ERPSyncPipeline(TenantAwareBaseModel):
     )
     last_run_record_count = models.IntegerField(default=0)
 
+    # Phase-4: scheduled routines.
+    is_paused = models.BooleanField(
+        default=False,
+        help_text="When true, the scheduler skips this pipeline. Distinct from is_active so an operator can pause without losing the agendamento.",
+    )
+    incremental_config = models.JSONField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=(
+            "Schema: {field, operator, param_name, format, lookback_seconds}. "
+            "Tells the scheduler how to inject a 'changed since X' filter on "
+            "the first step. Optional — pipelines without it run full-dump."
+        ),
+    )
+    last_high_watermark = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Latest 'change date' the scheduler successfully imported. The next scheduled run uses (this - lookback_seconds) as the from-date.",
+    )
+
     class Meta:
         ordering = ["name"]
         verbose_name = "ERP Sync Pipeline"
@@ -710,6 +731,30 @@ class ERPSyncPipelineRun(TenantAwareBaseModel):
     is_sandbox = models.BooleanField(
         default=False,
         help_text="True for ad-hoc sandbox runs (preview-only, not persisted raw records).",
+    )
+
+    # Phase-4: scheduled run telemetry.
+    TRIGGERED_BY_CHOICES = [
+        ("schedule", "Scheduled (Celery beat)"),
+        ("manual", "Manual (UI)"),
+        ("api", "API (programmatic)"),
+        ("sandbox", "Sandbox preview"),
+    ]
+    triggered_by = models.CharField(
+        max_length=16,
+        choices=TRIGGERED_BY_CHOICES,
+        default="manual",
+        help_text="Which surface fired this run.",
+    )
+    incremental_window_start = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Start of the incremental window the scheduler used (if any).",
+    )
+    incremental_window_end = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="End of the incremental window the scheduler used (if any).",
     )
 
     class Meta:

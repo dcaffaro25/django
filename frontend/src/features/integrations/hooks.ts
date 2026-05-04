@@ -113,6 +113,89 @@ export function useImportDiscovered() {
   })
 }
 
+// ---- Phase 4: scheduled routines ----
+
+export function useErpPipelines(params?: { connection?: number }) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["integrations", sub, "pipelines", params?.connection ?? null],
+    queryFn: () => integrationsApi.listPipelines(params),
+    enabled: !!sub,
+    staleTime: 30 * 1000,
+  })
+}
+
+export function useErpPipeline(id: number | null) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["integrations", sub, "pipeline", id],
+    queryFn: () => integrationsApi.getPipeline(id as number),
+    enabled: !!sub && id != null,
+    staleTime: 30 * 1000,
+  })
+}
+
+export function useUpdateErpPipeline() {
+  const sub = useSub()
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (args: { id: number; body: Partial<Parameters<typeof integrationsApi.updatePipeline>[1]> }) =>
+      integrationsApi.updatePipeline(args.id, args.body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["integrations", sub, "pipelines"] })
+      qc.invalidateQueries({ queryKey: ["integrations", sub, "pipeline"] })
+    },
+  })
+}
+
+export function usePauseErpPipeline() {
+  const sub = useSub()
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: integrationsApi.pausePipeline,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["integrations", sub, "pipelines"] })
+      qc.invalidateQueries({ queryKey: ["integrations", sub, "pipeline"] })
+    },
+  })
+}
+
+export function useResumeErpPipeline() {
+  const sub = useSub()
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: integrationsApi.resumePipeline,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["integrations", sub, "pipelines"] })
+      qc.invalidateQueries({ queryKey: ["integrations", sub, "pipeline"] })
+    },
+  })
+}
+
+export function useRunPipelineNow() {
+  const sub = useSub()
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (args: { id: number; body?: Parameters<typeof integrationsApi.runPipelineNow>[1] }) =>
+      integrationsApi.runPipelineNow(args.id, args.body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["integrations", sub, "pipelines"] })
+      qc.invalidateQueries({ queryKey: ["integrations", sub, "pipeline"] })
+      qc.invalidateQueries({ queryKey: ["integrations", sub, "pipeline-history"] })
+    },
+  })
+}
+
+export function useErpPipelineHistory(id: number | null) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["integrations", sub, "pipeline-history", id],
+    queryFn: () => integrationsApi.pipelineHistory(id as number),
+    enabled: !!sub && id != null,
+    staleTime: 15 * 1000,
+  })
+}
+
 export function useRunSandbox() {
   return useMutation({
     mutationFn: integrationsApi.runSandbox,

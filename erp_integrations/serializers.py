@@ -285,6 +285,16 @@ class ERPSyncPipelineSerializer(serializers.ModelSerializer):
             "last_run_status",
             "last_run_record_count",
             "steps",
+            # Phase-4 metadata
+            "is_paused",
+            "incremental_config",
+            "last_high_watermark",
+        ]
+        read_only_fields = [
+            "last_run_at",
+            "last_run_status",
+            "last_run_record_count",
+            "last_high_watermark",
         ]
 
     def _validate_step_payload(self, step_data, pipeline_provider_id):

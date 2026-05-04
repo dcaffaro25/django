@@ -650,6 +650,9 @@ def execute_pipeline(
     pipeline_id: int,
     dry_run: bool = False,
     param_overrides_by_step: Optional[Dict[int, Dict[str, Any]]] = None,
+    *,
+    triggered_by: str = "manual",
+    incremental_window: Optional[tuple] = None,
 ) -> Dict[str, Any]:
     """
     Run a persisted ERPSyncPipeline. Creates an ERPSyncPipelineRun row.
@@ -664,6 +667,15 @@ def execute_pipeline(
     ``{1: {"filtrar_por_alteracao_de": "01/05/2026"}}`` for ListarPedidos.
     The persisted step's stored params stay unchanged; the override is
     per-run only.
+
+    ``triggered_by`` (Phase 4): stamped onto the ``ERPSyncPipelineRun``
+    so the history surface can show who fired this run. One of
+    ``manual`` / ``schedule`` / ``api`` / ``sandbox``.
+
+    ``incremental_window`` (Phase 4): ``(start, end)`` datetimes recorded
+    on the run for visibility. Pure metadata — the actual filter has
+    to be on ``param_overrides_by_step`` because that's what reaches the
+    upstream API.
     """
     pipeline = (
         ERPSyncPipeline.objects.select_related("connection", "connection__provider")
@@ -694,11 +706,18 @@ def execute_pipeline(
         max_fanout=SANDBOX_DEFAULT_MAX_FANOUT if dry_run else 10000,
     )
 
+    window_start = window_end = None
+    if incremental_window:
+        window_start, window_end = incremental_window
+
     run = ERPSyncPipelineRun.objects.create(
         pipeline=pipeline,
         company_id=company_id,
         status="running",
         is_sandbox=False,
+        triggered_by=triggered_by or "manual",
+        incremental_window_start=window_start,
+        incremental_window_end=window_end,
     )
 
     try:

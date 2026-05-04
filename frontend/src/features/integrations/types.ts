@@ -144,6 +144,74 @@ export interface ImportDiscoveredResult {
   failed_count: number
 }
 
+// ---- Phase 4: scheduled routines ----
+
+export type PipelineLastRunStatus = "never" | "completed" | "failed" | "partial" | "running"
+
+export interface IncrementalConfig {
+  field?: string
+  operator?: ">=" | ">"
+  param_name?: string
+  format?: "iso8601" | "br_date" | "br_datetime" | "epoch_seconds"
+  lookback_seconds?: number
+}
+
+export interface ERPSyncPipeline {
+  id: number
+  connection: number
+  connection_name?: string
+  provider: number
+  name: string
+  description?: string | null
+  is_active: boolean
+  is_paused: boolean
+  schedule_rrule?: string | null
+  last_run_at?: string | null
+  last_run_status: PipelineLastRunStatus
+  last_run_record_count: number
+  steps: Array<{
+    id?: number
+    order: number
+    api_definition: number
+    extra_params?: Record<string, unknown>
+    param_bindings?: SandboxBinding[]
+    select_fields?: string | null
+  }>
+  incremental_config?: IncrementalConfig | null
+  last_high_watermark?: string | null
+}
+
+export type PipelineRunStatus =
+  | "pending" | "running" | "completed" | "failed" | "partial"
+
+export type PipelineRunTriggeredBy = "schedule" | "manual" | "api" | "sandbox"
+
+export interface PipelineRunHistoryRow {
+  id: number
+  status: PipelineRunStatus
+  started_at: string | null
+  completed_at: string | null
+  duration_seconds: number | null
+  records_extracted: number
+  records_stored: number
+  records_skipped: number
+  records_updated: number
+  failed_step_order: number | null
+  errors: string[]
+  triggered_by: PipelineRunTriggeredBy
+  incremental_window_start: string | null
+  incremental_window_end: string | null
+}
+
+export interface ScheduledRunOutcome {
+  status: "ran" | "locked" | "paused" | "disabled" | "no_pipeline" | "error"
+  pipeline_id: number
+  pipeline_run_id: number | null
+  window_start: string | null
+  window_end: string | null
+  detail: string
+}
+
 export type SandboxBindingMode = "static" | "jmespath" | "fanout"
 
 export interface SandboxBinding {

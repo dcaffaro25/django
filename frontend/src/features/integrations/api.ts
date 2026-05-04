@@ -7,10 +7,13 @@ import type {
   ERPAPIDefinition,
   ERPAPIDefinitionWrite,
   ERPConnection,
+  ERPSyncPipeline,
   ERPSyncPipelineWrite,
   ImportDiscoveredResult,
+  PipelineRunHistoryRow,
   SandboxRequest,
   SandboxResult,
+  ScheduledRunOutcome,
 } from "./types"
 
 export const integrationsApi = {
@@ -57,6 +60,36 @@ export const integrationsApi = {
 
   importDiscovered: (body: { provider: number; candidates: DiscoveryCandidate[] }) =>
     api.tenant.post<ImportDiscoveredResult>("/api/api-definitions/import-discovered/", body),
+
+  // Phase-4: scheduled routines
+  listPipelines: (params?: { connection?: number }) =>
+    api.tenant
+      .get<ERPSyncPipeline[] | { results: ERPSyncPipeline[] }>("/api/sync-pipelines/", {
+        params,
+      })
+      .then(unwrapList<ERPSyncPipeline>),
+
+  getPipeline: (id: number) =>
+    api.tenant.get<ERPSyncPipeline>(`/api/sync-pipelines/${id}/`),
+
+  updatePipeline: (id: number, body: Partial<ERPSyncPipeline>) =>
+    api.tenant.patch<ERPSyncPipeline>(`/api/sync-pipelines/${id}/`, body),
+
+  pausePipeline: (id: number) =>
+    api.tenant.post<{ is_paused: boolean }>(`/api/sync-pipelines/${id}/pause/`, {}),
+
+  resumePipeline: (id: number) =>
+    api.tenant.post<{ is_paused: boolean }>(`/api/sync-pipelines/${id}/resume/`, {}),
+
+  runPipelineNow: (id: number, body?: {
+    force_full_dump?: boolean
+    window_start?: string
+    window_end?: string
+  }) =>
+    api.tenant.post<ScheduledRunOutcome>(`/api/sync-pipelines/${id}/run-now/`, body ?? {}),
+
+  pipelineHistory: (id: number) =>
+    api.tenant.get<PipelineRunHistoryRow[]>(`/api/sync-pipelines/${id}/history/`),
 
   runSandbox: (body: SandboxRequest) =>
     api.tenant.post<SandboxResult>("/api/pipeline-sandbox/", body),
