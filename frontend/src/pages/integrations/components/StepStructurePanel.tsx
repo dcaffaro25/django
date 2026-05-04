@@ -2,7 +2,6 @@ import { useEffect, useState } from "react"
 import { Loader2, RefreshCw, Link2 } from "lucide-react"
 import { useRunSandbox } from "@/features/integrations"
 import type { SandboxStep } from "@/features/integrations"
-import { cn } from "@/lib/utils"
 
 /**
  * Phase-3 Sandbox enhancement: auto-probe.
