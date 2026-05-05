@@ -722,6 +722,14 @@ export interface ReconUnreconciledSide {
   amount_abs: string
   oldest_age_days: number | null
   oldest_date: string | null
+  /** Bank side: optional date filter echoed by the backend so the UI
+   *  can render an accurate disclaimer ("até {date_to}" vs unbounded). */
+  date_from?: string | null
+  date_to?: string | null
+  /** Book side: cutoff for "expected settlement date". Defaults to D-1
+   *  (today - 1 day) -- future-dated entries that haven't settled yet
+   *  are excluded so they don't inflate the open-book alarm. */
+  settlement_cutoff?: string | null
 }
 
 export interface ReconKPIs {

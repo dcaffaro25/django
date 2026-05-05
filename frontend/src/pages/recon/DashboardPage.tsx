@@ -143,6 +143,17 @@ export function DashboardPage() {
   // ``book`` block).
   const unreconciledBookCount = kpis?.unreconciled.book?.count ?? 0
   const unreconciledBookAmount = kpis ? Number(kpis.unreconciled.book?.amount_abs ?? 0) : 0
+  // Disclaimer for the book card: the backend cuts off at D-1 by
+  // default so future-dated JEs don't inflate the alarm. Format as
+  // dd/mm so it reads naturally in pt-BR.
+  const bookSettlementCutoff = kpis?.unreconciled.book?.settlement_cutoff ?? null
+  const formatBrDate = (iso: string | null | undefined): string | null => {
+    if (!iso) return null
+    const [y, m, d] = iso.split("-")
+    if (!y || !m || !d) return null
+    return `${d}/${m}/${y}`
+  }
+  const bookCutoffLabel = formatBrDate(bookSettlementCutoff)
   const autoRate = kpis?.tasks_30d.automatch_rate != null ? kpis.tasks_30d.automatch_rate * 100 : null
   const completedTasks = kpis?.tasks_30d.completed ?? 0
 
@@ -207,11 +218,16 @@ export function DashboardPage() {
             icon={<Banknote className="h-4 w-4" />}
             tone="default"
             hint={
-              <span className="text-muted-foreground/70">
-                {t("dashboard.kpi_open_bank_hint", {
-                  count: unreconciledCount,
-                  defaultValue: "{{count}} transações →",
-                })}
+              <span className="flex flex-col gap-0.5">
+                <span className="text-muted-foreground/70">
+                  {t("dashboard.kpi_open_bank_hint", {
+                    count: unreconciledCount,
+                    defaultValue: "{{count}} transações →",
+                  })}
+                </span>
+                <span className="text-[10px] text-muted-foreground/60">
+                  Σ |valor| das tx não conciliadas (bate com a bancada).
+                </span>
               </span>
             }
           />
@@ -223,11 +239,18 @@ export function DashboardPage() {
             icon={<BookOpen className="h-4 w-4" />}
             tone="default"
             hint={
-              <span className="text-muted-foreground/70">
-                {t("dashboard.kpi_open_book_hint", {
-                  count: unreconciledBookCount,
-                  defaultValue: "{{count}} lançamentos →",
-                })}
+              <span className="flex flex-col gap-0.5">
+                <span className="text-muted-foreground/70">
+                  {t("dashboard.kpi_open_book_hint", {
+                    count: unreconciledBookCount,
+                    defaultValue: "{{count}} lançamentos →",
+                  })}
+                </span>
+                <span className="text-[10px] text-muted-foreground/60">
+                  {bookCutoffLabel
+                    ? `Liquidação esperada até ${bookCutoffLabel} (D-1).`
+                    : "Liquidação esperada até D-1 da data atual."}
+                </span>
               </span>
             }
           />
@@ -563,6 +586,9 @@ function PerAccountKpiTable() {
           <h3 className="text-[13px] font-semibold">{t("dashboard.kpi_per_account_title", "Conciliação por conta")}</h3>
           <p className="text-[11px] text-muted-foreground">
             {t("dashboard.kpi_per_account_subtitle", "Ordenado pelo maior valor pendente")}
+            <span className="ml-1 text-muted-foreground/70">
+              · "Restante a conciliar" = Σ |valor| das tx ainda fora de uma reconciliação fechada.
+            </span>
           </p>
         </div>
         <button
@@ -576,12 +602,17 @@ function PerAccountKpiTable() {
         <thead className="bg-surface-3 text-left text-[10px] uppercase tracking-wider text-muted-foreground">
           <tr>
             <th className="h-8 px-3">Conta</th>
-            <th className="h-8 px-3 text-right">Saldo</th>
-            <th className="h-8 px-3 text-right">Restante a conciliar</th>
-            <th className="h-8 px-3 text-right">% conc. (total)</th>
-            <th className="h-8 px-3 text-right">% conc. (30d)</th>
-            <th className="h-8 px-3 text-right">Net 30d</th>
-            <th className="h-8 px-3 text-right">Burn 3m/mês</th>
+            <th className="h-8 px-3 text-right" title="Saldo corrente da conta (anchor + soma de bank tx posteriores).">Saldo</th>
+            <th
+              className="h-8 px-3 text-right"
+              title="Σ |valor| das transações bancárias dessa conta que ainda não estão em uma reconciliação status matched/approved (lifetime, sem filtro de data)."
+            >
+              Restante a conciliar
+            </th>
+            <th className="h-8 px-3 text-right" title="% de tx conciliadas no histórico completo da conta.">% conc. (total)</th>
+            <th className="h-8 px-3 text-right" title="% de tx conciliadas nos últimos 30 dias.">% conc. (30d)</th>
+            <th className="h-8 px-3 text-right" title="Soma sinalizada de amount nos últimos 30 dias (entradas - saídas).">Net 30d</th>
+            <th className="h-8 px-3 text-right" title="Saída líquida média mensal (últimos 3 meses calendário).">Burn 3m/mês</th>
           </tr>
         </thead>
         <tbody>

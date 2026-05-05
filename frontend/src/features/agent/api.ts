@@ -5,7 +5,10 @@
  * surface is platform-wide and the chat surface scopes by ``request.tenant``
  * server-side via the multitenancy middleware).
  */
-import { api } from "@/lib/api-client"
+import { api, getStoredTenant, getStoredToken } from "@/lib/api-client"
+
+const FETCH_BASE_URL =
+  (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? "http://localhost:8000"
 
 // ---------------------------------------------------------------------------
 // Connection (superuser-only)
@@ -172,6 +175,20 @@ export interface AgentChatResponse {
   messages: AgentMessage[]
 }
 
+/** Server-Sent Event payloads emitted by ``/conversations/{id}/chat/stream/``.
+ *  Each is a discriminated-union variant on ``type``. */
+export type AgentStreamEvent =
+  | { type: "started"; user_message: AgentMessage }
+  | { type: "iteration"; n: number }
+  | { type: "message"; message: AgentMessage }
+  | { type: "final"; iterations: number; truncated: boolean }
+  | { type: "error"; detail: string }
+
+export interface AgentStreamHandlers {
+  onEvent: (event: AgentStreamEvent) => void
+  signal?: AbortSignal
+}
+
 export interface AgentTool {
   name: string
   description: string
@@ -204,6 +221,90 @@ export const agentApi = {
     api.tenant.delete<void>(`/api/agent/conversations/${id}/`),
   chat: (id: number, body: ChatRequestBody) =>
     api.tenant.post<AgentChatResponse>(`/api/agent/conversations/${id}/chat/`, body),
+
+  /**
+   * Streaming variant of ``chat``. Uses ``fetch`` (not axios) because
+   * axios doesn't expose the body as a ``ReadableStream`` in the
+   * browser. The server emits SSE-framed events; we parse them line by
+   * line and call ``onEvent`` for each one. The promise resolves once
+   * the server closes the stream (or rejects if the network fails).
+   *
+   * Falls through to the caller's ``onEvent`` for the ``error`` SSE
+   * event -- the caller decides whether to toast/log/abort. The promise
+   * itself only rejects on transport-level failures.
+   */
+  chatStream: async (
+    id: number,
+    body: ChatRequestBody,
+    handlers: AgentStreamHandlers,
+  ): Promise<void> => {
+    const tenant = getStoredTenant()
+    if (!tenant) throw new Error("No tenant selected. Set one via TenantProvider.")
+    const token = getStoredToken()
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    }
+    if (token) headers["Authorization"] = `Token ${token}`
+    const url = `${FETCH_BASE_URL}/${tenant}/api/agent/conversations/${id}/chat/stream/`
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: handlers.signal,
+      credentials: "include",
+    })
+
+    if (!res.ok || !res.body) {
+      // Best-effort error parse: the server emits JSON DRF errors for
+      // pre-stream failures (auth, validation). Only after we start
+      // yielding SSE does the connection switch to text/event-stream.
+      let detail = `Falha ao iniciar streaming (HTTP ${res.status}).`
+      try {
+        const data = await res.json()
+        if (typeof data?.detail === "string") detail = data.detail
+      } catch {
+        // body was not JSON; keep the generic message.
+      }
+      handlers.onEvent({ type: "error", detail })
+      return
+    }
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder("utf-8")
+    let buffer = ""
+
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      // SSE: events are separated by blank lines (``\n\n``). Each event
+      // is one or more ``data: <json>`` lines; we only emit a single
+      // ``data:`` line per event, so the parser is intentionally
+      // simple. Anything else (comments, retry hints) is ignored.
+      let sepIdx = buffer.indexOf("\n\n")
+      while (sepIdx !== -1) {
+        const raw = buffer.slice(0, sepIdx).trim()
+        buffer = buffer.slice(sepIdx + 2)
+        if (raw.startsWith("data:")) {
+          const json = raw.slice(5).trim()
+          if (json) {
+            try {
+              const parsed = JSON.parse(json) as AgentStreamEvent
+              handlers.onEvent(parsed)
+            } catch (err) {
+              // A malformed event shouldn't break the rest of the
+              // stream — log it and keep reading.
+              // eslint-disable-next-line no-console
+              console.warn("agent.stream.parse_failed", err, json)
+            }
+          }
+        }
+        sepIdx = buffer.indexOf("\n\n")
+      }
+    }
+  },
 
   /** Upload a single file as a chat attachment — Phase 2. The conversation
    * scopes the file to the right tenant; the chat endpoint then references

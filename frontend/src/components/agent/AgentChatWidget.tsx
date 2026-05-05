@@ -43,7 +43,7 @@ import {
   useCreateAgentConversation,
   useDeleteAgentConversation,
   usePatchAgentConversation,
-  useSendAgentMessage,
+  useSendAgentMessageStream,
   useUploadAgentAttachment,
 } from "@/features/agent/hooks"
 import {
@@ -78,7 +78,10 @@ function parseInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
     const key = `${keyPrefix}-${match.index}`
     if (token.startsWith("`")) {
       nodes.push(
-        <code key={key} className="rounded bg-black/5 px-1 py-0.5 font-mono text-[0.92em] dark:bg-white/10">
+        <code
+          key={key}
+          className="rounded bg-black/5 px-1 py-0.5 font-mono text-[0.92em] [overflow-wrap:anywhere] dark:bg-white/10"
+        >
           {token.slice(1, -1)}
         </code>,
       )
@@ -124,7 +127,10 @@ function MarkdownMessage({ content }: { content: string }) {
       }
       if (i < lines.length) i += 1
       blocks.push(
-        <pre key={`code-${i}`} className="my-1 max-w-full overflow-auto rounded-md bg-black/5 px-2.5 py-2 font-mono text-xs leading-relaxed dark:bg-white/10">
+        <pre
+          key={`code-${i}`}
+          className="my-1 max-w-full whitespace-pre-wrap break-words rounded-md bg-black/5 px-2.5 py-2 font-mono text-xs leading-relaxed [overflow-wrap:anywhere] dark:bg-white/10"
+        >
           {codeLines.join("\n")}
         </pre>,
       )
@@ -573,7 +579,14 @@ function MessageRow(props: {
         )}
         <div
           className={cn(
-            "max-w-full break-words rounded-2xl px-3.5 py-2 text-sm shadow-sm",
+            // ``[overflow-wrap:anywhere]`` is critical: ``break-words``
+            // alone doesn't split tokens that don't have natural break
+            // opportunities (long boleto numbers, base64 chunks, URLs
+            // without query separators), causing the bubble to push past
+            // the parent's ``max-w-[85%]`` and produce horizontal scroll
+            // on the whole chat. ``anywhere`` forces a break inside any
+            // run of non-whitespace, even if it's all letters/digits.
+            "max-w-full overflow-hidden break-words rounded-2xl px-3.5 py-2 text-sm shadow-sm [overflow-wrap:anywhere]",
             isUser && "whitespace-pre-wrap",
             isUser
               ? "bg-primary text-primary-foreground"
@@ -864,7 +877,18 @@ function AttachmentChip(props: { att: PendingAttachment; onRemove: () => void })
 
 function ChatThread(props: { conversationId: number }) {
   const conversation = useAgentConversation(props.conversationId)
-  const sendMut = useSendAgentMessage(props.conversationId)
+  // Streaming variant: each persisted message (tool call / tool result /
+  // final assistant) is upserted onto the cache as soon as the SSE
+  // event arrives -- the operator sees the agent's "linha de raciocínio"
+  // unfold instead of waiting for a single blocking response.
+  const sendMut = useSendAgentMessageStream(props.conversationId)
+  // Surface stream-level errors as a toast; the streaming hook captures
+  // them as state instead of throwing so the UI can decide how to react.
+  useEffect(() => {
+    if (sendMut.error) {
+      toast.error(sendMut.error)
+    }
+  }, [sendMut.error])
   const uploadMut = useUploadAgentAttachment(props.conversationId)
   const [draft, setDraft] = useState("")
   const [attachments, setAttachments] = useState<PendingAttachment[]>([])
@@ -961,19 +985,19 @@ function ChatThread(props: { conversationId: number }) {
     if (sendMut.isPending) return
     const ready = attachments.filter((a) => a.status === "ready")
     if (!content.trim() && ready.length === 0) return
-    try {
-      await sendMut.mutateAsync({
-        content: content.trim(),
-        page_context: includeContext && pageContext ? pageContext : undefined,
-        attachment_ids: ready.map((a) => (a as { attachment: AgentAttachment }).attachment.id),
-      })
-      // Clear pending attachments after a successful send. Errored chips
-      // are also cleared — they're not worth re-trying without the user
-      // re-attaching the file.
-      setAttachments([])
-    } catch (e) {
-      toast.error(extractApiErrorMessage(e) ?? "Falha ao falar com o agente.")
-    }
+    // Clear attachment chips eagerly. The streaming hook captures
+    // network errors via its ``error`` state (we surface them as a
+    // toast in the parent ``useEffect``); the previous mutation-based
+    // path needed a try/except because ``mutateAsync`` rejected on
+    // failure. The streaming hook does not -- and that's intentional,
+    // since a transport failure mid-stream may have already produced
+    // valid intermediate messages we want to keep.
+    setAttachments([])
+    await sendMut.send({
+      content: content.trim(),
+      page_context: includeContext && pageContext ? pageContext : undefined,
+      attachment_ids: ready.map((a) => (a as { attachment: AgentAttachment }).attachment.id),
+    })
   }
 
   const handleSubmit = async (e?: React.FormEvent) => {
@@ -1184,7 +1208,7 @@ export function AgentChatWidget() {
   const showBack = pane !== "list"
 
   return (
-    <div className="fixed bottom-5 right-5 z-40 flex h-[640px] max-h-[85vh] w-[440px] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-zinc-950">
+    <div className="fixed bottom-5 right-5 z-40 flex h-[640px] max-h-[85vh] w-[440px] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border-2 border-primary/40 bg-white shadow-2xl ring-1 ring-black/5 dark:border-primary/30 dark:bg-zinc-950 dark:ring-white/5">
       <div className="flex items-center justify-between gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-800">
         <div className="flex items-center gap-2 text-sm font-medium">
           {showBack && (

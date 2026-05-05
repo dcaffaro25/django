@@ -9,11 +9,13 @@
  * don't accidentally bust unrelated queries.
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useCallback, useRef, useState } from "react"
 
 import {
   agentApi,
   type AgentConversationPatch,
   type AgentMessage,
+  type AgentStreamEvent,
   type ChatRequestBody,
 } from "./api"
 
@@ -146,6 +148,102 @@ export function useSendAgentMessage(conversationId: number) {
       qc.invalidateQueries({ queryKey: KEY_CONVERSATIONS })
     },
   })
+}
+
+/**
+ * Streaming variant of {@link useSendAgentMessage}. Pushes each persisted
+ * message onto the conversation cache as soon as the SSE event arrives,
+ * so the operator sees tool calls / tool results / final assistant turn
+ * appear progressively (the agent's "linha de raciocínio") instead of
+ * waiting for the whole turn to finish.
+ *
+ * Returns a stable shape mirroring a mutation:
+ *  - ``send(body)``    -- start streaming a turn
+ *  - ``cancel()``      -- abort the in-flight turn
+ *  - ``isPending``     -- whether a turn is in progress
+ *  - ``error``         -- last error message (set on ``error`` SSE or on transport failure)
+ *
+ * The cache update is conservative: each ``message`` SSE upserts by id,
+ * so re-renders are O(messages) per event but the total work mirrors
+ * the non-streaming path.
+ */
+export function useSendAgentMessageStream(conversationId: number) {
+  const qc = useQueryClient()
+  const [isPending, setPending] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
+
+  const upsertMessage = useCallback(
+    (msg: AgentMessage) => {
+      qc.setQueryData(
+        conversationKey(conversationId),
+        (prev: { messages: AgentMessage[] } | undefined) => {
+          if (!prev) return prev
+          const idx = prev.messages.findIndex((m) => m.id === msg.id)
+          if (idx >= 0) {
+            const next = prev.messages.slice()
+            next[idx] = msg
+            return { ...prev, messages: next }
+          }
+          return { ...prev, messages: [...prev.messages, msg] }
+        },
+      )
+    },
+    [qc, conversationId],
+  )
+
+  const send = useCallback(
+    async (body: ChatRequestBody) => {
+      // Abort any in-flight stream first — the user just sent a new
+      // message, the previous turn is no longer the "current one".
+      abortRef.current?.abort()
+      const ctl = new AbortController()
+      abortRef.current = ctl
+      setError(null)
+      setPending(true)
+      try {
+        await agentApi.chatStream(conversationId, body, {
+          signal: ctl.signal,
+          onEvent: (event: AgentStreamEvent) => {
+            switch (event.type) {
+              case "started":
+                upsertMessage(event.user_message)
+                break
+              case "message":
+                upsertMessage(event.message)
+                break
+              case "iteration":
+                // No-op for now; could surface a "iteration N/8" hint.
+                break
+              case "final":
+                qc.invalidateQueries({ queryKey: KEY_CONVERSATIONS })
+                break
+              case "error":
+                setError(event.detail)
+                break
+            }
+          },
+        })
+      } catch (err: unknown) {
+        // AbortError is expected when the user sends a new turn or
+        // navigates away — don't surface it as a failure.
+        if ((err as { name?: string })?.name === "AbortError") return
+        setError(err instanceof Error ? err.message : "Falha de rede.")
+      } finally {
+        setPending(false)
+        if (abortRef.current === ctl) abortRef.current = null
+      }
+    },
+    [conversationId, qc, upsertMessage],
+  )
+
+  const cancel = useCallback(() => {
+    abortRef.current?.abort()
+    abortRef.current = null
+    setPending(false)
+  }, [])
+
+  return { send, cancel, isPending, error }
 }
 
 

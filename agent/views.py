@@ -12,15 +12,40 @@ Two clusters:
 """
 from __future__ import annotations
 
+import json
 import logging
 
 from django.db import transaction
 from django.db.models import Count
-from rest_framework import permissions, serializers, status, viewsets
+from django.http import StreamingHttpResponse
+from rest_framework import permissions, renderers, serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+
+class _SSERenderer(renderers.BaseRenderer):
+    """Minimal renderer so DRF's content negotiation accepts an
+    ``Accept: text/event-stream`` request without 406'ing.
+
+    The action returns a :class:`django.http.StreamingHttpResponse`
+    directly, so this renderer's ``render()`` is never invoked --
+    declaring the media type alone is enough to pass negotiation.
+    """
+
+    media_type = "text/event-stream"
+    format = "sse"
+    charset = "utf-8"
+
+    def render(self, data, accepted_media_type=None, renderer_context=None):
+        # Bytes if already encoded, str otherwise -- we never reach
+        # this path for the streaming action, but a sensible default
+        # keeps the renderer well-behaved if a non-streaming caller
+        # ever resolves it.
+        if isinstance(data, bytes):
+            return data
+        return str(data).encode(self.charset)
 
 from multitenancy.permissions import IsSuperUser
 
@@ -319,6 +344,133 @@ class AgentConversationViewSet(viewsets.ModelViewSet):
             "truncated": result.truncated,
             "messages": AgentMessageSerializer(new_messages, many=True).data,
         })
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="chat/stream",
+        # Add SSE alongside the default JSON renderer so DRF's content
+        # negotiation passes when the client sends
+        # ``Accept: text/event-stream``. The default renderer stays so
+        # error responses (validation, auth) still emit JSON.
+        renderer_classes=[_SSERenderer, renderers.JSONRenderer],
+    )
+    def chat_stream(self, request, pk=None, **kwargs):
+        """Streaming variant of :meth:`chat` -- emits Server-Sent Events
+        (``Content-Type: text/event-stream``) so the widget can render
+        each tool call / tool result / final message as it's persisted,
+        instead of waiting for the whole turn.
+
+        Event shapes (all JSON-encoded after the ``data: `` SSE prefix)::
+
+            {"type": "started", "user_message": <serialized>}
+            {"type": "iteration", "n": <int>}
+            {"type": "message",   "message": <serialized AgentMessage>}
+            {"type": "final",     "iterations": <int>, "truncated": <bool>}
+            {"type": "error",     "detail": "..."}
+
+        The ``message`` events fire for every persisted row -- assistant
+        tool-request, tool result, ui placeholder, final assistant. The
+        client appends them to the conversation cache in order, giving
+        operators a live view of the agent's tool sequence ("linha de
+        raciocínio") instead of a long blocking spinner.
+
+        ``**kwargs`` swallows the ``tenant_id`` URL capture, mirroring
+        :meth:`chat` for the same DRF-routing reason.
+        """
+        from .services.agent_runtime import AgentRuntimeError, SysnordAgent
+
+        conversation = self.get_object()
+        body = request.data or {}
+        content = (body.get("content") or "").strip()
+        if not content:
+            return Response(
+                {"detail": "content is required"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        config_changed_fields: list[str] = []
+        for fname in ("model", "reasoning_effort"):
+            if fname in body and body.get(fname) != getattr(conversation, fname):
+                setattr(conversation, fname, body.get(fname) or "")
+                config_changed_fields.append(fname)
+        if "include_page_context" in body and bool(body["include_page_context"]) != conversation.include_page_context:
+            conversation.include_page_context = bool(body["include_page_context"])
+            config_changed_fields.append("include_page_context")
+
+        page_context = body.get("page_context") if conversation.include_page_context else None
+
+        attachment_ids = body.get("attachment_ids") or []
+        if attachment_ids and not isinstance(attachment_ids, list):
+            return Response(
+                {"detail": "attachment_ids must be a list of integers"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        from .models import AgentMessageAttachment
+        attachments_qs = AgentMessageAttachment.objects.filter(
+            id__in=attachment_ids,
+            conversation=conversation,
+            message__isnull=True,
+        )
+
+        with transaction.atomic():
+            if config_changed_fields:
+                conversation.save(update_fields=config_changed_fields + ["updated_at"])
+            user_msg = AgentMessage.objects.create(
+                company=conversation.company,
+                conversation=conversation,
+                role=AgentMessage.ROLE_USER,
+                content=content,
+            )
+            attachments_qs.update(message=user_msg)
+            if not conversation.title:
+                conversation.title = content[:80]
+                conversation.save(update_fields=["title", "updated_at"])
+
+        agent = SysnordAgent(conversation, page_context=page_context)
+        conversation_id = conversation.id
+        user_id = request.user.id
+
+        def event_stream():
+            """Yield SSE-framed events for the duration of the turn.
+
+            Wrapped in a single try/except so any runtime failure becomes
+            a final ``error`` event instead of breaking the connection
+            mid-stream (which would surface to the client as a generic
+            network error -- the explicit event lets the UI render a
+            useful toast).
+            """
+            yield _sse({"type": "started", "user_message": AgentMessageSerializer(user_msg).data})
+            try:
+                for event in agent.run_turn_stream(user_message=user_msg):
+                    payload = dict(event)
+                    msg = payload.pop("_message", None)
+                    if msg is not None:
+                        payload["message"] = AgentMessageSerializer(msg).data
+                    yield _sse(payload)
+            except AgentRuntimeError as exc:
+                log.warning(
+                    "agent.chat_stream.runtime_error conv=%s user=%s: %s",
+                    conversation_id, user_id, exc,
+                )
+                yield _sse({"type": "error", "detail": str(exc)})
+            except Exception as exc:  # pragma: no cover -- defensive
+                log.exception("agent.chat_stream.unhandled conv=%s: %s", conversation_id, exc)
+                yield _sse({"type": "error", "detail": "Falha inesperada no agente."})
+
+        response = StreamingHttpResponse(event_stream(), content_type="text/event-stream")
+        # Disable proxies' buffering so events flush immediately. Both
+        # the X-Accel header (nginx) and the Cache-Control hint are
+        # belt-and-suspenders -- omitting either still works on most
+        # local dev setups but bites in production behind nginx.
+        response["Cache-Control"] = "no-cache, no-transform"
+        response["X-Accel-Buffering"] = "no"
+        return response
+
+
+def _sse(payload: dict) -> bytes:
+    """Serialize one SSE event with ``data: <json>`` framing."""
+    return f"data: {json.dumps(payload, default=str)}\n\n".encode("utf-8")
 
 
 # ---------------------------------------------------------------------------

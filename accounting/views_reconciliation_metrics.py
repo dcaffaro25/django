@@ -322,8 +322,8 @@ class ReconciliationKPIsView(APIView):
     def get(self, request, tenant_id=None):
         from decimal import Decimal
         from datetime import timedelta
-        from django.db.models import Sum, Count, Q, F, Min
-        from django.db.models.functions import Abs, TruncDate
+        from django.db.models import Sum, Count, Q, F, Min, Value, DecimalField
+        from django.db.models.functions import Abs, Coalesce, TruncDate
         from multitenancy.utils import resolve_tenant
         from accounting.models import (
             BankTransaction,
@@ -338,7 +338,12 @@ class ReconciliationKPIsView(APIView):
             return Response({"error": "invalid tenant"}, status=status.HTTP_400_BAD_REQUEST)
 
         today = date.today()
-        date_to = parse_date(request.query_params.get("date_to") or "") or today
+        # Optional explicit window. When omitted, the bank side is
+        # unbounded so the KPI matches what the Workbench (Bancada)
+        # shows -- previously we defaulted ``date_to`` to today, which
+        # silently dropped future-dated bank tx and produced a number
+        # the operator couldn't reconcile against the workbench list.
+        date_to = parse_date(request.query_params.get("date_to") or "")
         date_from = parse_date(request.query_params.get("date_from") or "")
         try:
             lookback_days = int(request.query_params.get("lookback_days") or 30)
@@ -348,6 +353,14 @@ class ReconciliationKPIsView(APIView):
 
         lookback_start = today - timedelta(days=lookback_days)
         trend_start = today - timedelta(days=trend_days - 1)
+
+        # The book side is anchored to D-1 (yesterday) when no explicit
+        # ``date_to`` is supplied: the Painel sums book entries whose
+        # expected settlement date has already passed. Future-dated JEs
+        # (next-day boletos, scheduled payments) are excluded because
+        # they're not late yet and including them would inflate the
+        # "em aberto" alarm bar with normal future activity.
+        book_settlement_cutoff = date_to or (today - timedelta(days=1))
 
         # --- Unreconciled bank transactions ---
         # A bank tx is unreconciled if it has NO reconciliation record with a "closed" status.
@@ -375,17 +388,20 @@ class ReconciliationKPIsView(APIView):
         oldest_age = (today - oldest_date).days if oldest_date else None
 
         # --- Unreconciled BOOK side (journal entries on cash/bank legs) ---
-        # The dashboard's "Valores abertos" was bank-only, which painted
-        # half the picture: a tenant can also have plenty of recorded
-        # cash JEs that nobody has tied to a bank transaction yet (e.g.
-        # imported invoices waiting for payment matching). We surface
-        # the book counterpart so the Painel can show both sides.
-        #
-        # Filters mirror the bank query: cash-side legs only
-        # (``account.bank_account`` set), exclude canceled, exclude
-        # already-reconciled. Pending state is included to match the
-        # bank side's lack of a state filter -- "open book" means
-        # anything not yet resolved.
+        # Filter rationale:
+        #   * ``account__bank_account__isnull=False`` -- structural
+        #     definition of a cash leg: the JE's GL account points to a
+        #     BankAccount row. We tried switching to ``is_cash=True``
+        #     (the maintained flag), but in tenants where the metrics
+        #     recompute pipeline hasn't run on every JE the flag is
+        #     under-set and the KPI collapses by orders of magnitude.
+        #     The structural join is consistent across tenants.
+        #   * ``is_reconciled=False`` -- not yet tied to a bank tx.
+        #   * ``state != canceled``   -- ignore retracted lines.
+        #   * ``date__lte = D-1``     -- only legs whose expected
+        #     settlement date has passed. The card disclaimer surfaces
+        #     this cutoff to the operator so they can reconcile it
+        #     against what they see in other reports.
         je_qs = JournalEntry.objects.filter(
             company_id=company_id,
             is_reconciled=False,
@@ -393,12 +409,22 @@ class ReconciliationKPIsView(APIView):
         ).exclude(state="canceled")
         if date_from:
             je_qs = je_qs.filter(date__gte=date_from)
-        if date_to:
-            je_qs = je_qs.filter(date__lte=date_to)
+        je_qs = je_qs.filter(date__lte=book_settlement_cutoff)
 
+        # Coalesce both legs to 0 before subtracting -- ``debit_amount``
+        # and ``credit_amount`` are nullable on JournalEntry, and SQL's
+        # ``NULL - <number> = NULL`` would otherwise null-out the whole
+        # row. ``Sum`` then drops NULLs, so the historical query was
+        # silently summing only the (rare) JEs with both legs filled,
+        # producing R$ 0.00 on tenants where the convention is one-leg-
+        # per-row. ``DecimalField`` on the Value() keeps PostgreSQL
+        # happy when none of the inputs constrain the type.
+        _zero = Value(Decimal("0"), output_field=DecimalField(max_digits=12, decimal_places=2))
         je_agg = je_qs.aggregate(
             count=Count("id", distinct=True),
-            amount_abs=Sum(Abs(F("debit_amount") - F("credit_amount"))),
+            amount_abs=Sum(
+                Abs(Coalesce(F("debit_amount"), _zero) - Coalesce(F("credit_amount"), _zero))
+            ),
             oldest_date=Min("date"),
         )
         book_count = int(je_agg.get("count") or 0)
@@ -477,12 +503,21 @@ class ReconciliationKPIsView(APIView):
                         "amount_abs": str(amount_abs),
                         "oldest_age_days": oldest_age,
                         "oldest_date": oldest_date.isoformat() if oldest_date else None,
+                        # Echo the filter so the frontend can render an
+                        # accurate disclaimer ("any unreconciled, no date
+                        # ceiling" vs. "up to {date_to}").
+                        "date_to": date_to.isoformat() if date_to else None,
+                        "date_from": date_from.isoformat() if date_from else None,
                     },
                     "book": {
                         "count": book_count,
                         "amount_abs": str(book_amount_abs),
                         "oldest_age_days": book_oldest_age,
                         "oldest_date": book_oldest_date.isoformat() if book_oldest_date else None,
+                        # Settlement cutoff drives the card disclaimer.
+                        # Defaults to D-1 (today - 1 day); operators can
+                        # widen with explicit ``?date_to=`` if needed.
+                        "settlement_cutoff": book_settlement_cutoff.isoformat(),
                     },
                 },
                 "tasks_30d": {

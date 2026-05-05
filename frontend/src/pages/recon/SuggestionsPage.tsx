@@ -7,6 +7,7 @@ import {
   Check,
   X,
   ChevronDown,
+  ChevronUp,
   PlayCircle,
   TrendingUp,
   Hash,
@@ -650,6 +651,29 @@ export function TaskSuggestionsView({
 
   const [accepted, setAccepted] = useState<Set<string>>(new Set())
 
+  // Collapsing the execution panel (banner + filters + stats + bulk-accept
+  // bar) lets the operator focus on the suggestion cards. Persisted via
+  // ``localStorage`` so the choice survives a page reload — the panel is
+  // mostly informational once the operator has dialed in their filters and
+  // is just clicking through accepts. Default = expanded.
+  const [panelCollapsed, setPanelCollapsed] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem("recon.suggestions.panelCollapsed") === "1"
+    } catch {
+      return false
+    }
+  })
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        "recon.suggestions.panelCollapsed",
+        panelCollapsed ? "1" : "0",
+      )
+    } catch {
+      // Storage may be disabled (private mode); silently ignore.
+    }
+  }, [panelCollapsed])
+
   const payloads = useMemo<TaskSuggestionPayload[]>(
     () =>
       (taskSuggestions.data?.suggestions ?? []).map((p) =>
@@ -999,7 +1023,9 @@ export function TaskSuggestionsView({
         />
       )}
 
-      {/* Task banner */}
+      {/* Task banner — always visible, even when the rest of the panel is
+          collapsed, so the operator can still see *which* execution is loaded
+          and toggle the panel back on. */}
       <div className="card-elevated flex flex-wrap items-center gap-3 px-3 py-2 text-[12px]">
         <Hash className="h-3.5 w-3.5 text-primary" />
         <span>
@@ -1028,27 +1054,59 @@ export function TaskSuggestionsView({
         {taskSuggestions.isError && (
           <span className="text-danger">Falha ao carregar. Tente novamente.</span>
         )}
-        {embedded && (
+        <div className="ml-auto flex items-center gap-1.5">
           <button
             type="button"
-            onClick={clearTaskId}
-            className="ml-auto inline-flex h-6 items-center gap-1 rounded-md border border-border bg-background px-2 text-[11px] font-medium text-muted-foreground hover:bg-accent"
-            title="Fechar execução"
+            onClick={() => setPanelCollapsed((v) => !v)}
+            className="inline-flex h-6 items-center gap-1 rounded-md border border-border bg-background px-2 text-[11px] font-medium text-muted-foreground hover:bg-accent"
+            title={panelCollapsed ? "Mostrar filtros e controles" : "Ocultar painel para revisar sugestões com mais espaço"}
+            aria-expanded={!panelCollapsed}
           >
-            <X className="h-3 w-3" /> Fechar
+            {panelCollapsed ? (
+              <>
+                <ChevronDown className="h-3 w-3" /> Mostrar painel
+              </>
+            ) : (
+              <>
+                <ChevronUp className="h-3 w-3" /> Ocultar painel
+              </>
+            )}
           </button>
-        )}
+          {embedded && (
+            <button
+              type="button"
+              onClick={clearTaskId}
+              className="inline-flex h-6 items-center gap-1 rounded-md border border-border bg-background px-2 text-[11px] font-medium text-muted-foreground hover:bg-accent"
+              title="Fechar execução"
+            >
+              <X className="h-3 w-3" /> Fechar
+            </button>
+          )}
+        </div>
       </div>
 
+      {/* Filters / stats / accept controls — collapsible. The whole
+          subsection hides on the operator's request (see ``panelCollapsed``)
+          so the suggestion cards get the full vertical real estate. The
+          task banner above keeps showing the toggle so the panel can be
+          recalled at any time. */}
+      {!panelCollapsed && (
+        <>
       {/* Filters — sticky so the operator can scroll a long list of
           suggestions without losing the filter / sort / reset
           controls. ``z-20`` keeps it above the suggestion cards
           which sit at the default z-index. ``card-elevated`` already
           paints an opaque background; if that ever changes, add
-          ``bg-background`` here to prevent bleed-through. */}
-      <div className="card-elevated sticky top-0 z-20 space-y-3 p-3">
-        <div className="flex flex-wrap items-end gap-3">
-          <div className="flex flex-col gap-0.5">
+          ``bg-background`` here to prevent bleed-through.
+
+          Single-row layout: ``flex flex-nowrap overflow-x-auto`` keeps every
+          control in one line; on a narrow viewport the row scrolls
+          horizontally rather than wrapping, which preserved a stable
+          information density for operators used to a fixed layout. The
+          "Tipo" pills sit at the end of the same row when there's space. */}
+      <div className="card-elevated sticky top-0 z-20 p-3">
+        <div className="flex flex-nowrap items-end gap-3 overflow-x-auto pb-1">
+          <div className="flex shrink-0 flex-col gap-0.5">
             <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
               Buscar
             </span>
@@ -1059,7 +1117,7 @@ export function TaskSuggestionsView({
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
                 placeholder="descrição, conta, entidade…"
-                className="h-8 w-64 rounded-md border border-border bg-background pl-7 pr-2 text-[12px] outline-none focus:border-ring"
+                className="h-8 w-48 rounded-md border border-border bg-background pl-7 pr-2 text-[12px] outline-none focus:border-ring"
               />
             </div>
           </div>
@@ -1067,40 +1125,44 @@ export function TaskSuggestionsView({
           {/* Confidence / per-component score minimums — grouped in a boxed
               cluster so the user can tell they're all "pass above X%"
               thresholds and can be reasoned about together. */}
-          <div className="flex items-end gap-2 rounded-md border border-border/70 bg-muted/20 px-2 pb-1.5 pt-1">
-            <PctFloorField label="Confiança mín." value={minConfPct} onChange={setMinConfPct} />
+          <div className="flex shrink-0 items-end gap-2 rounded-md border border-border/70 bg-muted/20 px-2 pb-1.5 pt-1">
+            <PctFloorField label="Confiança" value={minConfPct} onChange={setMinConfPct} />
             {available.dateScore && (
-              <PctFloorField label="Data mín." value={minDateScorePct} onChange={setMinDateScorePct} />
+              <PctFloorField label="Data" value={minDateScorePct} onChange={setMinDateScorePct} />
             )}
             {(available.descScore || available.embedSim) && (
-              <PctFloorField label="Descrição mín." value={minDescScorePct} onChange={setMinDescScorePct} />
+              <PctFloorField label="Descrição" value={minDescScorePct} onChange={setMinDescScorePct} />
             )}
             {available.amountScore && (
-              <PctFloorField label="Valor mín." value={minAmountScorePct} onChange={setMinAmountScorePct} />
+              <PctFloorField label="Valor" value={minAmountScorePct} onChange={setMinAmountScorePct} />
             )}
           </div>
 
-          <NumField
-            label="Δ valor máx."
-            value={maxDiff}
-            step={1}
-            min={0}
-            onChange={setMaxDiff}
-            allowNull
-          />
-
-          {available.dateDiff && (
+          <div className="shrink-0">
             <NumField
-              label="Δ dias máx."
-              value={maxDateDiffDays}
+              label="Δ valor máx."
+              value={maxDiff}
               step={1}
               min={0}
-              onChange={setMaxDateDiffDays}
+              onChange={setMaxDiff}
               allowNull
             />
+          </div>
+
+          {available.dateDiff && (
+            <div className="shrink-0">
+              <NumField
+                label="Δ dias máx."
+                value={maxDateDiffDays}
+                step={1}
+                min={0}
+                onChange={setMaxDateDiffDays}
+                allowNull
+              />
+            </div>
           )}
 
-          <div className="flex flex-col gap-0.5">
+          <div className="flex shrink-0 flex-col gap-0.5">
             <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
               <ArrowDownUp className="inline h-3 w-3" /> Ordenar
             </span>
@@ -1121,9 +1183,53 @@ export function TaskSuggestionsView({
             </select>
           </div>
 
-          <div className="ml-auto flex items-center gap-2 text-[11px] text-muted-foreground">
+          {availableMatchTypes.length > 0 && (
+            <div className="flex shrink-0 flex-col gap-0.5">
+              <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                Tipo
+              </span>
+              <div className="flex h-8 items-center gap-1">
+                {availableMatchTypes.map((mt) => {
+                  const active = matchTypes.has(mt)
+                  return (
+                    <button
+                      key={mt}
+                      type="button"
+                      onClick={() =>
+                        setMatchTypes((prev) => {
+                          const next = new Set(prev)
+                          if (next.has(mt)) next.delete(mt)
+                          else next.add(mt)
+                          return next
+                        })
+                      }
+                      className={cn(
+                        "inline-flex h-6 items-center rounded-full border px-2 text-[11px] transition-colors",
+                        active
+                          ? "border-primary/40 bg-primary/15 text-primary"
+                          : "border-border bg-background text-muted-foreground hover:bg-accent",
+                      )}
+                    >
+                      {mt}
+                    </button>
+                  )
+                })}
+                {matchTypes.size > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setMatchTypes(new Set())}
+                    className="ml-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+                  >
+                    limpar
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          <div className="ml-auto flex shrink-0 items-center gap-2 text-[11px] text-muted-foreground">
             <FilterIcon className="h-3 w-3" />
-            {stats.count} / {payloads.length}
+            <span className="tabular-nums">{stats.count} / {payloads.length}</span>
             <button
               type="button"
               onClick={resetFilters}
@@ -1135,48 +1241,6 @@ export function TaskSuggestionsView({
             </button>
           </div>
         </div>
-
-        {availableMatchTypes.length > 0 && (
-          <div className="flex flex-wrap items-center gap-2 border-t border-border/60 pt-2 text-[11px]">
-            <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-              Tipo
-            </span>
-            {availableMatchTypes.map((mt) => {
-              const active = matchTypes.has(mt)
-              return (
-                <button
-                  key={mt}
-                  type="button"
-                  onClick={() =>
-                    setMatchTypes((prev) => {
-                      const next = new Set(prev)
-                      if (next.has(mt)) next.delete(mt)
-                      else next.add(mt)
-                      return next
-                    })
-                  }
-                  className={cn(
-                    "inline-flex h-6 items-center rounded-full border px-2 transition-colors",
-                    active
-                      ? "border-primary/40 bg-primary/15 text-primary"
-                      : "border-border bg-background text-muted-foreground hover:bg-accent",
-                  )}
-                >
-                  {mt}
-                </button>
-              )
-            })}
-            {matchTypes.size > 0 && (
-              <button
-                type="button"
-                onClick={() => setMatchTypes(new Set())}
-                className="ml-1 text-[10px] text-muted-foreground hover:text-foreground"
-              >
-                limpar
-              </button>
-            )}
-          </div>
-        )}
       </div>
 
       {/* Stats strip */}
@@ -1231,6 +1295,44 @@ export function TaskSuggestionsView({
           </button>
         </div>
       </div>
+        </>
+      )}
+
+      {/* When the panel is collapsed we still surface the most-needed
+          actions inline so the operator can finalize selections without
+          having to expand. The bar collapses into a compact row that
+          shows the running selected count + the "Finalizar" CTA. */}
+      {panelCollapsed && (accepted.size > 0 || stats.count > 0) && (
+        <div className="card-elevated flex flex-wrap items-center gap-2 p-2 text-[11px]">
+          <span className="text-muted-foreground">{stats.count} sugestões visíveis</span>
+          {accepted.size > 0 && (
+            <>
+              <span className="text-muted-foreground">·</span>
+              <span className="font-medium text-foreground">
+                {accepted.size} selecionada(s)
+              </span>
+              <button
+                type="button"
+                onClick={clearAccepted}
+                className="inline-flex h-6 items-center gap-1 rounded-md border border-border bg-background px-2 font-medium text-muted-foreground hover:bg-accent"
+              >
+                <X className="h-3 w-3" /> Limpar
+              </button>
+            </>
+          )}
+          <div className="ml-auto">
+            <button
+              type="button"
+              onClick={submit}
+              disabled={accepted.size === 0 || finalize.isPending}
+              className="inline-flex h-6 items-center gap-1.5 rounded-md bg-foreground px-3 font-semibold text-background shadow-sm hover:bg-foreground/90 disabled:opacity-40"
+            >
+              <PlayCircle className="h-3 w-3" />
+              {finalize.isPending ? "Aplicando…" : "Finalizar reconciliações"}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Cards */}
       {taskSuggestions.isLoading ? (
@@ -1592,18 +1694,29 @@ function SideSummary({
     if (!range.max || range.min === range.max) return formatDate(range.min)
     return `${formatDate(range.min)} → ${formatDate(range.max)}`
   })()
+  // Two-row layout: row 1 keeps the metric columns aligned (label / amount /
+  // date), row 2 dedicates the *full* card width to the description with
+  // ``line-clamp-2`` + ``break-words`` so long bank/book narratives can wrap
+  // to a second line instead of being clipped to a sliver of the card.
+  // ``[overflow-wrap:anywhere]`` forces wrapping inside long unbroken
+  // sequences (e.g. URLs, boletos) that ``break-words`` alone won't split.
   return (
-    <div className="flex min-w-0 items-center gap-2">
-      <span className="inline-flex w-14 shrink-0 items-center gap-1 text-muted-foreground">
-        {icon} {label}
-      </span>
-      <span className="w-24 shrink-0 tabular-nums font-semibold">{formatCurrency(amount)}</span>
-      {dateLabel && (
-        <span className="w-36 shrink-0 text-[11px] text-muted-foreground">{dateLabel}</span>
-      )}
-      <span className="min-w-0 flex-1 truncate text-[11px]">
+    <div className="flex min-w-0 flex-col gap-0.5">
+      <div className="flex min-w-0 items-center gap-2">
+        <span className="inline-flex w-14 shrink-0 items-center gap-1 text-muted-foreground">
+          {icon} {label}
+        </span>
+        <span className="w-24 shrink-0 tabular-nums font-semibold">{formatCurrency(amount)}</span>
+        {dateLabel && (
+          <span className="shrink-0 text-[11px] text-muted-foreground">{dateLabel}</span>
+        )}
+      </div>
+      <div
+        className="ml-[3.75rem] line-clamp-2 break-words text-[11px] leading-snug text-muted-foreground [overflow-wrap:anywhere]"
+        title={combined || undefined}
+      >
         <Highlighted text={combined || "—"} shared={shared} />
-      </span>
+      </div>
     </div>
   )
 }

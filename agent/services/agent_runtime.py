@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -336,6 +337,172 @@ class SysnordAgent:
             iterations=self._max_iterations,
             truncated=True,
         )
+
+    # ------------------------------------------------------------------
+    # Streaming entrypoint -- mirrors :meth:`run_turn` but yields one
+    # event per persisted message + lifecycle marker. The view layer
+    # frames each event as Server-Sent Events. The shape mirrors the
+    # eventual cache shape on the client (every event carries the
+    # serialized AgentMessage in ``_message`` for the view to swap with
+    # the serializer output -- keeps the runtime free of DRF imports).
+    # ------------------------------------------------------------------
+    def run_turn_stream(
+        self, *, user_message: AgentMessage,
+    ) -> Iterator[dict[str, Any]]:
+        # Token-budget gate -- same as :meth:`run_turn`.
+        enforce_cumulative_budget = bool(
+            getattr(settings, "AGENT_ENFORCE_CUMULATIVE_TOKEN_BUDGET", False)
+        )
+        budget = int(getattr(settings, "AGENT_TOKEN_BUDGET_PER_CONVERSATION", 0) or 0)
+        if enforce_cumulative_budget and budget > 0:
+            from django.db.models import Sum
+            agg = self.conversation.messages.aggregate(
+                p=Sum("prompt_tokens"), c=Sum("completion_tokens"),
+            )
+            used = (agg.get("p") or 0) + (agg.get("c") or 0)
+            if used >= budget:
+                cap_msg = self._persist_assistant_final(
+                    assistant_text_items=[],
+                    content_override=(
+                        f"Esta conversa já consumiu {used:,} tokens, acima do "
+                        f"orçamento configurado de {budget:,}. Comece uma nova "
+                        f"conversa para continuar — o histórico ficará disponível "
+                        f"aqui mas não será mais expandido."
+                    ),
+                    model_used="", usage={},
+                )
+                self._touch_conversation()
+                yield {"type": "message", "_message": cap_msg}
+                yield {"type": "final", "iterations": 0, "truncated": True}
+                return
+
+        for iteration in range(1, self._max_iterations + 1):
+            yield {"type": "iteration", "n": iteration}
+            input_items = self._build_input_items()
+            tools = self._build_tool_catalog()
+
+            try:
+                response = self.client.respond(
+                    instructions=self._system_prompt(),
+                    input_items=input_items,
+                    tools=tools,
+                    session_id=self._session_id,
+                    model=self.conversation.model or None,
+                    reasoning_effort=self.conversation.reasoning_effort or None,
+                )
+            except (OpenAINotConnected, OpenAIReconnectRequired) as exc:
+                raise AgentRuntimeError(str(exc)) from exc
+            except OpenAIClientError as exc:
+                raise AgentRuntimeError(f"OpenAI call failed: {exc}") from exc
+
+            output_items = response.get("output") or []
+            usage = response.get("usage") or {}
+            model_used = response.get("model") or ""
+
+            tool_calls_in_turn = [
+                item for item in output_items if item.get("type") == "function_call"
+            ]
+            assistant_text_items = [
+                item for item in output_items if item.get("type") == "message"
+            ]
+            web_search_calls = [
+                item for item in output_items if item.get("type") == "web_search_call"
+            ]
+            if web_search_calls:
+                log.info(
+                    "agent.web_search_invoked conv=%s queries=%s",
+                    self.conversation.id,
+                    [c.get("query") or c.get("action", {}).get("query") for c in web_search_calls],
+                )
+
+            if not tool_calls_in_turn and not assistant_text_items and output_items:
+                log.warning(
+                    "agent.empty_assistant_response conv=%s types=%s usage=%s",
+                    self.conversation.id,
+                    [it.get("type") for it in output_items],
+                    usage,
+                )
+
+            if tool_calls_in_turn:
+                request_msg = self._persist_assistant_tool_request(
+                    assistant_text_items=assistant_text_items,
+                    tool_calls=tool_calls_in_turn,
+                    model_used=model_used,
+                    usage=usage,
+                )
+
+                ui_calls: list[dict[str, Any]] = []
+                ui_request_msg: AgentMessage | None = None
+                # Surface the tool-request as a streamed event so the UI
+                # can render the "calling tool" pill before the result
+                # arrives. For UI-tool turns we hold off until after the
+                # placeholder so the operator sees the question and the
+                # placeholder atomically.
+                if any(ui_tools.is_ui_tool(call.get("name", "")) for call in tool_calls_in_turn):
+                    ui_request_msg = request_msg
+                else:
+                    yield {"type": "message", "_message": request_msg}
+
+                placeholders: list[AgentMessage] = []
+                for call in tool_calls_in_turn:
+                    if ui_tools.is_ui_tool(call.get("name", "")):
+                        placeholder = self._persist_ui_placeholder(call)
+                        placeholders.append(placeholder)
+                        ui_calls.append(call)
+                    else:
+                        result_msg = self._dispatch_tool_call(call, iteration=iteration)
+                        yield {"type": "message", "_message": result_msg}
+
+                if ui_calls:
+                    # The "final" message in this branch is the assistant
+                    # turn carrying the function_call(s), not a placeholder
+                    # -- the widget renders action buttons on it. Emit it
+                    # last so the client picks up the placeholders first
+                    # (keeps the OpenAI API contract intact for the next
+                    # turn) and then sees the actionable assistant turn.
+                    for placeholder in placeholders:
+                        yield {"type": "message", "_message": placeholder}
+                    if ui_request_msg is not None:
+                        yield {"type": "message", "_message": ui_request_msg}
+                    self._touch_conversation()
+                    yield {"type": "final", "iterations": iteration, "truncated": False}
+                    return
+                continue  # only data tools — loop back to the LLM
+
+            extracted = _extract_text_from_items(assistant_text_items)
+            content_override: str | None = None
+            if not extracted and output_items:
+                reasoning_text = _extract_reasoning_summary(output_items)
+                if reasoning_text:
+                    content_override = reasoning_text
+                else:
+                    content_override = (
+                        "(O modelo não retornou texto. Tente reformular a pergunta "
+                        "ou trocar o modelo.)"
+                    )
+
+            final = self._persist_assistant_final(
+                assistant_text_items=assistant_text_items,
+                model_used=model_used, usage=usage,
+                content_override=content_override,
+            )
+            self._touch_conversation()
+            yield {"type": "message", "_message": final}
+            yield {"type": "final", "iterations": iteration, "truncated": False}
+            return
+
+        cap_msg = self._persist_assistant_final(
+            assistant_text_items=[],
+            content_override=(
+                "Atingi o limite de iterações de ferramentas sem produzir "
+                "uma resposta final. Refine sua pergunta ou aumente "
+                "AGENT_MAX_TOOL_ITERATIONS."
+            ),
+            model_used="", usage={},
+        )
+        self._touch_conversation()
+        yield {"type": "message", "_message": cap_msg}
+        yield {"type": "final", "iterations": self._max_iterations, "truncated": True}
 
     # ------------------------------------------------------------------
     # Tool dispatch
