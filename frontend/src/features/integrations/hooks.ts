@@ -196,6 +196,16 @@ export function useErpPipelineHistory(id: number | null) {
   })
 }
 
+export function useErpRawRecords(params?: Parameters<typeof integrationsApi.listRawRecords>[0]) {
+  const sub = useSub()
+  return useQuery({
+    queryKey: ["integrations", sub, "raw-records", params],
+    queryFn: () => integrationsApi.listRawRecords(params),
+    enabled: !!sub,
+    staleTime: 15 * 1000,
+  })
+}
+
 export function useRunSandbox() {
   return useMutation({
     mutationFn: integrationsApi.runSandbox,

@@ -45,10 +45,24 @@ RESERVED_QUERY_KEYS = frozenset(
         "ordering",
         "search",
         "format",
+        "advanced_filter",
     }
 )
 
 JSON_FIELD_PREFIXES = ("data__", "page_response_header__")
+
+ADVANCED_SCALAR_FIELDS = {
+    "id": "id",
+    "api_call": "api_call",
+    "external_id": "external_id",
+    "page_number": "page_number",
+    "record_index": "record_index",
+    "global_index": "global_index",
+    "is_duplicate": "is_duplicate",
+    "fetched_at": "fetched_at",
+}
+
+ADVANCED_LOOKUPS = JSON_LOOKUP_SUFFIXES | {"neq"}
 
 
 class NumberInFilter(filters.BaseInFilter, filters.NumberFilter):
@@ -179,6 +193,73 @@ def apply_json_field_filters(queryset: QuerySet, query_params: QueryDict) -> Que
     return qs
 
 
+def apply_advanced_raw_record_filter(queryset: QuerySet, raw_filter: str | None) -> QuerySet:
+    """Apply a structured AND/OR filter tree for ERPRawRecord list views."""
+    if not raw_filter:
+        return queryset
+    try:
+        payload = json.loads(raw_filter)
+    except json.JSONDecodeError as e:
+        raise ValidationError(f"Invalid advanced_filter JSON: {e}") from e
+    q = _advanced_node_to_q(payload)
+    return queryset.filter(q)
+
+
+def _advanced_node_to_q(node: Any):
+    from django.db.models import Q
+
+    if not isinstance(node, dict):
+        raise ValidationError("advanced_filter must be an object.")
+    if "rules" in node:
+        logic = str(node.get("logic") or "and").lower()
+        if logic not in ("and", "or"):
+            raise ValidationError("advanced_filter logic must be 'and' or 'or'.")
+        rules = node.get("rules") or []
+        if not isinstance(rules, list):
+            raise ValidationError("advanced_filter rules must be a list.")
+        q = Q()
+        first = True
+        for child in rules:
+            child_q = _advanced_node_to_q(child)
+            if first:
+                q = child_q
+                first = False
+            elif logic == "or":
+                q |= child_q
+            else:
+                q &= child_q
+        return q
+
+    field = str(node.get("field") or "").strip()
+    op = str(node.get("op") or "exact").strip().lower()
+    value = node.get("value")
+    if not field:
+        raise ValidationError("advanced_filter rule is missing field.")
+    if op not in ADVANCED_LOOKUPS:
+        raise ValidationError(f"Unsupported advanced_filter op: {op}")
+
+    orm_field, root = _advanced_field_to_orm(field)
+    lookup = "exact" if op == "neq" else op
+    orm_lookup = orm_field if lookup == "exact" else f"{orm_field}__{lookup}"
+    coerced = _coerce_value(str(value), lookup) if value is not None else None
+
+    q = Q(**{orm_lookup: coerced})
+    if op == "neq":
+        return ~q
+    return q
+
+
+def _advanced_field_to_orm(field: str) -> tuple[str, str | None]:
+    normalized = field.replace(".", "__")
+    if normalized.startswith("data__") or normalized.startswith("page_response_header__"):
+        root = "data" if normalized.startswith("data__") else "page_response_header"
+        orm_lookup, _lookup = _parse_json_param_key(normalized, root)
+        return orm_lookup, root
+    if field in ADVANCED_SCALAR_FIELDS:
+        return ADVANCED_SCALAR_FIELDS[field], None
+    raise ValidationError(f"Unsupported advanced_filter field: {field}")
+
+
 class ERPRawRecordFilter(filters.FilterSet):
     """Filters on ERPRawRecord scalar / FK fields (not dynamic JSON paths)."""
 
@@ -214,7 +295,10 @@ class ERPRawRecordFilter(filters.FilterSet):
             ("fetched_at", "fetched_at"),
             ("global_index", "global_index"),
             ("api_call", "api_call"),
+            ("external_id", "external_id"),
+            ("is_duplicate", "is_duplicate"),
             ("page_number", "page_number"),
+            ("record_index", "record_index"),
         )
     )
 

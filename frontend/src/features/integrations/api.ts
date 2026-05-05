@@ -10,6 +10,9 @@ import type {
   ERPSyncPipeline,
   ERPSyncPipelineWrite,
   ImportDiscoveredResult,
+  ERPRawRecord,
+  ERPRawRecordListParams,
+  PaginatedResponse,
   PipelineRunHistoryRow,
   SandboxRequest,
   SandboxResult,
@@ -58,7 +61,11 @@ export const integrationsApi = {
   discoverApis: (body: { url: string; allow_llm?: boolean }) =>
     api.tenant.post<DiscoveryResult>("/api/api-definitions/discover/", body),
 
-  importDiscovered: (body: { provider: number; candidates: DiscoveryCandidate[] }) =>
+  importDiscovered: (body: {
+    provider: number
+    candidates: DiscoveryCandidate[]
+    mode?: "create_only" | "enrich_existing" | "upsert"
+  }) =>
     api.tenant.post<ImportDiscoveredResult>("/api/api-definitions/import-discovered/", body),
 
   // Phase-4: scheduled routines
@@ -90,6 +97,15 @@ export const integrationsApi = {
 
   pipelineHistory: (id: number) =>
     api.tenant.get<PipelineRunHistoryRow[]>(`/api/sync-pipelines/${id}/history/`),
+
+  listRawRecords: (params?: ERPRawRecordListParams) =>
+    api.tenant
+      .get<PaginatedResponse<ERPRawRecord> | ERPRawRecord[]>("/api/raw-records/", { params })
+      .then((data) =>
+        Array.isArray(data)
+          ? { count: data.length, next: null, previous: null, results: data }
+          : data,
+      ),
 
   runSandbox: (body: SandboxRequest) =>
     api.tenant.post<SandboxResult>("/api/pipeline-sandbox/", body),

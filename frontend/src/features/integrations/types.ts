@@ -12,7 +12,7 @@ export interface ERPConnection {
 
 export type ParamLocation = "body" | "query" | "path" | "header"
 export type ParamType =
-  | "string" | "int" | "number" | "boolean" | "date" | "datetime"
+  | "string" | "text" | "int" | "integer" | "number" | "decimal" | "boolean" | "date" | "datetime"
   | "enum" | "object" | "array"
 
 export interface ParamSpec {
@@ -140,8 +140,52 @@ export interface DiscoveryResult {
 export interface ImportDiscoveredResult {
   created: Array<{ id: number; call: string }>
   created_count: number
+  enriched?: Array<{ id: number; call: string; fields?: string[] }>
+  enriched_count?: number
   failed: Array<{ index: number; call?: string; errors?: string[]; error?: string }>
   failed_count: number
+}
+
+export interface PaginatedResponse<T> {
+  count: number
+  next: string | null
+  previous: string | null
+  results: T[]
+}
+
+export interface ERPRawRecord {
+  id: number
+  sync_run: number | null
+  pipeline_run: number | null
+  pipeline_step_order: number | null
+  api_call: string
+  page_number: number
+  record_index: number
+  global_index: number | null
+  page_records_count: number | null
+  total_pages: number | null
+  total_records: number | null
+  page_response_header: Record<string, unknown> | null
+  data: Record<string, unknown>
+  record_hash: string
+  external_id: string | null
+  is_duplicate: boolean
+  fetched_at: string
+}
+
+export interface ERPRawRecordListParams {
+  page?: number
+  page_size?: number
+  api_call?: string
+  api_call__icontains?: string
+  external_id?: string
+  external_id__isnull?: boolean
+  is_duplicate?: boolean
+  fetched_at__gte?: string
+  fetched_at__lte?: string
+  sync_run?: number
+  ordering?: string
+  [key: string]: string | number | boolean | undefined
 }
 
 // ---- Phase 4: scheduled routines ----

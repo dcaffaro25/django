@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react"
 import { toast } from "sonner"
 import {
   RefreshCw, Play, Pause, PlayCircle, Search, ChevronRight,
-  CheckCircle2, AlertTriangle, XCircle, Clock, History,
+  CheckCircle2, AlertTriangle, XCircle, Clock, History, ArrowUpDown,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { Button } from "@/components/ui/button"
@@ -54,6 +54,13 @@ export function PipelineRoutinesPage() {
   const { canWrite } = useUserRole()
   const [search, setSearch] = useState("")
   const [connectionFilter, setConnectionFilter] = useState<string>("all")
+  const [statusFilter, setStatusFilter] = useState<string>("all")
+  const [scheduleFilter, setScheduleFilter] = useState("")
+  const [lastRunFilter, setLastRunFilter] = useState<string>("all")
+  const [sort, setSort] = useState<{ key: "name" | "connection" | "schedule" | "last_run" | "status"; dir: "asc" | "desc" }>({
+    key: "name",
+    dir: "asc",
+  })
   const [openId, setOpenId] = useState<number | null>(null)
 
   const { data: connections = [] } = useErpConnections()
@@ -63,17 +70,33 @@ export function PipelineRoutinesPage() {
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
-    if (!q) return pipelines
-    return pipelines.filter((p) =>
-      [p.name, p.description, p.connection_name].filter(Boolean).some((s) => s!.toLowerCase().includes(q)),
-    )
-  }, [pipelines, search])
+    return pipelines.filter((p) => {
+      if (statusFilter !== "all" && p.last_run_status !== statusFilter) return false
+      if (scheduleFilter.trim() && !(p.schedule_rrule ?? "").toLowerCase().includes(scheduleFilter.trim().toLowerCase())) return false
+      if (lastRunFilter === "never" && p.last_run_at) return false
+      if (lastRunFilter === "has_run" && !p.last_run_at) return false
+      if (!q) return true
+      return [p.name, p.description, p.connection_name].filter(Boolean).some((s) => s!.toLowerCase().includes(q))
+    })
+  }, [pipelines, search, statusFilter, scheduleFilter, lastRunFilter])
+
+  const sorted = useMemo(() => {
+    const factor = sort.dir === "asc" ? 1 : -1
+    return [...filtered].sort((a, b) => factor * comparePipeline(a, b, sort.key))
+  }, [filtered, sort])
+
+  const toggleSort = (key: typeof sort.key) => {
+    setSort((current) => ({
+      key,
+      dir: current.key === key && current.dir === "asc" ? "desc" : "asc",
+    }))
+  }
 
   return (
     <div className="space-y-4">
       <SectionHeader
-        title="Rotinas de importação"
-        subtitle="Pipelines que rodam em agenda. Crie/edite no Sandbox; aqui se agenda, pausa e replica."
+        title="Automações de integração"
+        subtitle="Agende pipelines completos ou regras individuais de uma etapa. Crie e valide no Sandbox; aqui se acompanha, pausa e roda sob demanda."
         actions={
           <Button variant="outline" size="sm" onClick={() => refetch()} disabled={isFetching}>
             <RefreshCw className={cn("h-4 w-4", isFetching && "animate-spin")} /> Atualizar
@@ -81,55 +104,84 @@ export function PipelineRoutinesPage() {
         }
       />
 
-      {/* Filters */}
-      <div className="flex flex-wrap items-end gap-2">
-        <div className="relative min-w-[260px] flex-1">
-          <Search className="pointer-events-none absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Buscar nome, descrição…"
-            className="pl-8"
-          />
-        </div>
-        <div className="flex flex-col gap-1">
-          <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-            Conexão
-          </span>
-          <Select value={connectionFilter} onValueChange={setConnectionFilter}>
-            <SelectTrigger className="h-9 w-[220px]"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">Todas</SelectItem>
-              {connections.map((c) => (
-                <SelectItem key={c.id} value={String(c.id)}>
-                  {c.name ?? `Connection #${c.id}`}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-      </div>
-
       {/* Table */}
-      <div className="rounded-lg border border-border bg-card">
+      <div className="max-h-[70vh] overflow-auto rounded-lg border border-border bg-card">
         <table className="w-full text-[12px]">
-          <thead className="border-b border-border bg-muted/30 text-left text-[11px] font-medium text-muted-foreground">
+          <thead className="sticky top-0 z-10 border-b border-border bg-card text-left text-[11px] font-medium text-muted-foreground shadow-sm">
             <tr>
-              <th className="px-3 py-2">Pipeline</th>
-              <th className="px-3 py-2">Conexão</th>
-              <th className="px-3 py-2">Agendamento</th>
-              <th className="px-3 py-2">Último run</th>
-              <th className="px-3 py-2">Estado</th>
+              <th className="px-3 py-2"><SortButton active={sort.key === "name"} dir={sort.dir} onClick={() => toggleSort("name")}>Pipeline</SortButton></th>
+              <th className="px-3 py-2"><SortButton active={sort.key === "connection"} dir={sort.dir} onClick={() => toggleSort("connection")}>Conexao</SortButton></th>
+              <th className="px-3 py-2"><SortButton active={sort.key === "schedule"} dir={sort.dir} onClick={() => toggleSort("schedule")}>Agendamento</SortButton></th>
+              <th className="px-3 py-2"><SortButton active={sort.key === "last_run"} dir={sort.dir} onClick={() => toggleSort("last_run")}>Ultimo run</SortButton></th>
+              <th className="px-3 py-2"><SortButton active={sort.key === "status"} dir={sort.dir} onClick={() => toggleSort("status")}>Estado</SortButton></th>
+              <th className="px-3 py-2"></th>
+            </tr>
+            <tr className="border-t border-border/60 bg-muted/20">
+              <th className="px-3 py-2">
+                <div className="relative">
+                  <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder="Nome ou descricao"
+                    className="h-8 pl-7 text-[12px]"
+                  />
+                </div>
+              </th>
+              <th className="px-3 py-2">
+                <Select value={connectionFilter} onValueChange={setConnectionFilter}>
+                  <SelectTrigger className="h-8 w-full min-w-[160px] text-[12px]"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">Todas</SelectItem>
+                    {connections.map((c) => (
+                      <SelectItem key={c.id} value={String(c.id)}>
+                        {c.name ?? `Connection #${c.id}`}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </th>
+              <th className="px-3 py-2">
+                <Input
+                  value={scheduleFilter}
+                  onChange={(e) => setScheduleFilter(e.target.value)}
+                  placeholder="Agenda contem"
+                  className="h-8 text-[12px]"
+                />
+              </th>
+              <th className="px-3 py-2">
+                <Select value={lastRunFilter} onValueChange={setLastRunFilter}>
+                  <SelectTrigger className="h-8 w-full min-w-[130px] text-[12px]"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">Todos</SelectItem>
+                    <SelectItem value="has_run">Com run</SelectItem>
+                    <SelectItem value="never">Sem run</SelectItem>
+                  </SelectContent>
+                </Select>
+              </th>
+              <th className="px-3 py-2">
+                <Select value={statusFilter} onValueChange={setStatusFilter}>
+                  <SelectTrigger className="h-8 w-full min-w-[130px] text-[12px]"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">Todos</SelectItem>
+                    <SelectItem value="never">Nunca rodou</SelectItem>
+                    <SelectItem value="completed">Sucesso</SelectItem>
+                    <SelectItem value="failed">Falha</SelectItem>
+                    <SelectItem value="partial">Parcial</SelectItem>
+                    <SelectItem value="running">Rodando</SelectItem>
+                  </SelectContent>
+                </Select>
+              </th>
               <th className="px-3 py-2"></th>
             </tr>
           </thead>
           <tbody>
             {isLoading ? (
               <tr><td colSpan={6} className="px-3 py-6 text-center text-muted-foreground">Carregando…</td></tr>
-            ) : filtered.length === 0 ? (
+            ) : sorted.length === 0 ? (
               <tr><td colSpan={6} className="px-3 py-6 text-center text-muted-foreground">Nenhuma rotina encontrada.</td></tr>
             ) : (
-              filtered.map((p) => (
+              sorted.map((p) => (
                 <PipelineRow
                   key={p.id}
                   pipeline={p}
@@ -148,6 +200,42 @@ export function PipelineRoutinesPage() {
         onClose={() => setOpenId(null)}
       />
     </div>
+  )
+}
+
+function comparePipeline(
+  a: ERPSyncPipeline,
+  b: ERPSyncPipeline,
+  key: "name" | "connection" | "schedule" | "last_run" | "status",
+) {
+  if (key === "name") return a.name.localeCompare(b.name)
+  if (key === "connection") return (a.connection_name ?? "").localeCompare(b.connection_name ?? "")
+  if (key === "schedule") return (a.schedule_rrule ?? "").localeCompare(b.schedule_rrule ?? "")
+  if (key === "last_run") return (a.last_run_at ?? "").localeCompare(b.last_run_at ?? "")
+  return a.last_run_status.localeCompare(b.last_run_status)
+}
+
+function SortButton({
+  active,
+  dir,
+  onClick,
+  children,
+}: {
+  active: boolean
+  dir: "asc" | "desc"
+  onClick: () => void
+  children: React.ReactNode
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn("inline-flex items-center gap-1 font-medium hover:text-foreground", active && "text-foreground")}
+    >
+      {children}
+      <ArrowUpDown className={cn("h-3 w-3", active ? "opacity-100" : "opacity-40")} />
+      {active ? <span className="text-[9px] uppercase">{dir}</span> : null}
+    </button>
   )
 }
 
@@ -207,9 +295,9 @@ function PipelineRow({
       onClick={onOpen}
     >
       <td className="px-3 py-2">
-        <div className="font-medium">{pipeline.name}</div>
+        <div className="font-medium break-words">{pipeline.name}</div>
         {pipeline.description ? (
-          <div className="text-[11px] text-muted-foreground truncate" title={pipeline.description}>
+          <div className="mt-0.5 max-w-[360px] whitespace-normal break-words text-[11px] leading-snug text-muted-foreground" title={pipeline.description}>
             {pipeline.description}
           </div>
         ) : null}

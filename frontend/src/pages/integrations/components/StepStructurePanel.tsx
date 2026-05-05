@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { Loader2, RefreshCw, Link2 } from "lucide-react"
 import { useRunSandbox } from "@/features/integrations"
 import type { SandboxStep } from "@/features/integrations"
@@ -43,8 +43,11 @@ export function StepStructurePanel({
   const probe = useRunSandbox()
   const [columns, setColumns] = useState<InferredColumn[] | null>(null)
   const [rowCount, setRowCount] = useState<number | null>(null)
+  const [sampledParamsKey, setSampledParamsKey] = useState("")
 
   const canProbe = connectionId != null && apiDefinitionId != null
+  const paramsKey = useMemo(() => JSON.stringify(extraParams), [extraParams])
+  const isStale = columns != null && sampledParamsKey !== paramsKey
 
   // Trigger probe automatically when the API selection becomes valid.
   useEffect(() => {
@@ -79,10 +82,12 @@ export function StepStructurePanel({
           const rows = res.preview_by_step?.[0]?.rows ?? []
           setRowCount(rows.length)
           setColumns(inferColumns(rows))
+          setSampledParamsKey(paramsKey)
         },
         onError: () => {
           setColumns([])
           setRowCount(0)
+          setSampledParamsKey(paramsKey)
         },
       },
     )
@@ -101,22 +106,29 @@ export function StepStructurePanel({
   return (
     <div className="rounded-md border border-border bg-muted/20 p-2">
       <div className="mb-1 flex items-center justify-between">
-        <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-          Estrutura inferida
-          {rowCount != null ? (
-            <span className="ml-2 font-normal normal-case">
-              ({rowCount} linha{rowCount === 1 ? "" : "s"} amostradas)
-            </span>
+        <div>
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+            Campos encontrados
+            {rowCount != null ? (
+              <span className="ml-2 font-normal normal-case">
+                ({rowCount} linha{rowCount === 1 ? "" : "s"} amostradas)
+              </span>
+            ) : null}
+          </span>
+          {isStale ? (
+            <div className="mt-0.5 text-[11px] text-amber-500">
+              Os filtros mudaram. Reamostre para atualizar estes campos.
+            </div>
           ) : null}
-        </span>
+        </div>
         <button
           onClick={runProbe}
           disabled={isPending}
           className="inline-flex h-6 items-center gap-1 rounded px-2 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
-          title="Re-amostrar"
+          title="Reamostrar campos com os filtros atuais"
         >
           {isPending ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
-          {isPending ? "Amostrando…" : "Re-amostrar"}
+          {isPending ? "Amostrando..." : "Reamostrar"}
         </button>
       </div>
 
@@ -126,7 +138,7 @@ export function StepStructurePanel({
         <div className="py-3 text-center text-[11px] text-muted-foreground">Aguardando…</div>
       ) : columns.length === 0 ? (
         <div className="py-3 text-center text-[11px] text-muted-foreground">
-          Sem colunas detectadas. Verifique o records_path da definição.
+          Sem colunas detectadas. Verifique a definicao desta API.
         </div>
       ) : (
         <div className="max-h-48 overflow-y-auto">
@@ -152,11 +164,12 @@ export function StepStructurePanel({
                       {onBindColumn ? (
                         <button
                           onClick={() => onBindColumn(c.path)}
+                          aria-label={`Usar campo ${c.path} no proximo passo`}
                           className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-primary hover:bg-primary/10"
-                          title={`Vincular ao próximo passo (binding com source_step=${stepOrder}, expression=${c.path})`}
+                          title={`Usar este campo no proximo passo (passo ${stepOrder})`}
                         >
                           <Link2 className="h-3 w-3" />
-                          Vincular
+                          Usar
                         </button>
                       ) : null}
                     </td>

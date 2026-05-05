@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next"
 import {
   LayoutDashboard, FileBarChart, FileCog, CreditCard, Users, Boxes,
   Settings, ChevronLeft, PanelLeftOpen, Zap, UploadCloud, Wallet,
-  Activity, ShoppingBag, Sparkles, Repeat,
+  Activity, ShoppingBag,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/stores/app-store"
@@ -62,16 +62,10 @@ const GROUPS: NavGroup[] = [
   {
     key: "tools",
     label: "Ferramentas",
-    // Sandbox is a developer tool — only show to operators+.
+    // ERP integrations are operator tools — only show to operators+.
     visible: ({ canWrite }) => canWrite,
     items: [
-      { key: "integrations_sandbox", label: "Sandbox de API", path: "/integrations/sandbox", icon: Zap, requiresWrite: true },
-      // Phase-1 do plano Sandbox API: catálogo estruturado.
-      { key: "integrations_api_defs", label: "Definições de API", path: "/integrations/api-definitions", icon: FileCog, requiresWrite: true },
-      // Phase-2: descoberta a partir de URL.
-      { key: "integrations_discover", label: "Descobrir APIs", path: "/integrations/api-definitions/discover", icon: Sparkles, requiresWrite: true },
-      // Phase-4: rotinas agendadas.
-      { key: "integrations_rotinas", label: "Rotinas", path: "/integrations/rotinas", icon: Repeat, requiresWrite: true },
+      { key: "integrations", label: "Integrações ERP", path: "/integrations", icon: Zap, requiresWrite: true },
     ],
   },
   {

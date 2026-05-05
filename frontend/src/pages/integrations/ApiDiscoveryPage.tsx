@@ -59,6 +59,7 @@ export function ApiDiscoveryPage() {
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [filterStrategy, setFilterStrategy] = useState<string>("all")
   const [search, setSearch] = useState("")
+  const [importMode, setImportMode] = useState<"create_only" | "enrich_existing" | "upsert">("upsert")
 
   const discover = useDiscoverApis()
   const imp = useImportDiscovered()
@@ -103,16 +104,19 @@ export function ApiDiscoveryPage() {
     if (selected.size === 0) { toast.warning("Selecione ao menos uma candidata."); return }
     const cands = filtered.filter((_, i) => selected.has(i))
     imp.mutate(
-      { provider: Number(providerId), candidates: cands },
+      { provider: Number(providerId), candidates: cands, mode: importMode },
       {
         onSuccess: (res) => {
           if (res.created_count > 0) {
             toast.success(`${res.created_count} definição(ões) importada(s) como inativas — revise antes de ativar.`)
           }
+          if ((res.enriched_count ?? 0) > 0) {
+            toast.success(`${res.enriched_count} definicao(oes) enriquecida(s) com filtros/metadados.`)
+          }
           if (res.failed_count > 0) {
             toast.warning(`${res.failed_count} falharam (${res.failed.map(f => f.call ?? `#${f.index}`).slice(0, 3).join(", ")})`)
           }
-          if (res.created_count > 0) {
+          if (res.created_count > 0 || (res.enriched_count ?? 0) > 0) {
             navigate("/integrations/api-definitions")
           }
         },
@@ -124,8 +128,8 @@ export function ApiDiscoveryPage() {
   return (
     <div className="space-y-4">
       <SectionHeader
-        title="Descobrir APIs"
-        subtitle="Cole a URL da documentação (OpenAPI / Postman / HTML) e o sistema gera definições candidatas."
+        title="Descobrir e enriquecer APIs"
+        subtitle="Cole uma referencia de API para criar novas definicoes ou completar filtros, paginacao e records path das APIs cadastradas."
         actions={
           <Button variant="outline" size="sm" onClick={() => navigate("/integrations/api-definitions")}>
             Ver definições
@@ -135,6 +139,20 @@ export function ApiDiscoveryPage() {
 
       {/* Form */}
       <div className="rounded-lg border border-border bg-card p-4 space-y-3">
+        <div className="grid gap-2 text-[12px] text-muted-foreground md:grid-cols-3">
+          <div className="rounded-md border border-border bg-muted/20 p-2">
+            <span className="font-medium text-foreground">1. Cole a referencia</span>
+            <div>OpenAPI, Postman ou pagina HTML de documentacao.</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/20 p-2">
+            <span className="font-medium text-foreground">2. Revise candidatas</span>
+            <div>Confira calls, filtros, paginacao e caminho dos registros.</div>
+          </div>
+          <div className="rounded-md border border-border bg-muted/20 p-2">
+            <span className="font-medium text-foreground">3. Aplique no catalogo</span>
+            <div>Crie novas APIs ou complete as existentes sem apagar ajustes manuais.</div>
+          </div>
+        </div>
         <div className="grid grid-cols-12 gap-2">
           <div className="col-span-12 sm:col-span-7">
             <label className="text-[10px] font-semibold uppercase text-muted-foreground">URL</label>
@@ -159,7 +177,7 @@ export function ApiDiscoveryPage() {
           <div className="col-span-6 sm:col-span-2 flex items-end">
             <Button onClick={onDiscover} disabled={discover.isPending} className="w-full">
               <Sparkles className="h-4 w-4" />
-              {discover.isPending ? "Buscando…" : "Descobrir"}
+              {discover.isPending ? "Buscando..." : "Analisar"}
             </Button>
           </div>
         </div>
@@ -197,6 +215,8 @@ export function ApiDiscoveryPage() {
           onImport={onImport}
           importing={imp.isPending}
           providerId={providerId}
+          importMode={importMode}
+          setImportMode={setImportMode}
         />
       ) : null}
     </div>
@@ -209,6 +229,7 @@ export function ApiDiscoveryPage() {
 function DiscoveryResultView({
   result, filtered, selected, setSelected, toggleAll, search, setSearch,
   filterStrategy, setFilterStrategy, onImport, importing, providerId,
+  importMode, setImportMode,
 }: {
   result: DiscoveryResult
   filtered: DiscoveryCandidate[]
@@ -222,6 +243,8 @@ function DiscoveryResultView({
   onImport: () => void
   importing: boolean
   providerId: string
+  importMode: "create_only" | "enrich_existing" | "upsert"
+  setImportMode: (mode: "create_only" | "enrich_existing" | "upsert") => void
 }) {
   const strategyCounts = useMemo(() => {
     const m = new Map<DiscoveryStrategy, number>()
@@ -283,6 +306,21 @@ function DiscoveryResultView({
             ))}
           </SelectContent>
         </Select>
+        <Select value={importMode} onValueChange={(v) => setImportMode(v as typeof importMode)}>
+          <SelectTrigger className="h-9 w-[220px]"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="upsert">Criar e enriquecer</SelectItem>
+            <SelectItem value="create_only">Criar somente novas</SelectItem>
+            <SelectItem value="enrich_existing">Enriquecer existentes</SelectItem>
+          </SelectContent>
+        </Select>
+        <div className="basis-full text-[11px] text-muted-foreground">
+          {importMode === "upsert"
+            ? "Cria APIs novas e enriquece as ja cadastradas quando a call coincide."
+            : importMode === "create_only"
+              ? "Importa apenas chamadas ainda nao cadastradas."
+              : "Completa apenas chamadas que ja existem no catalogo."}
+        </div>
         <div className="ml-auto flex items-center gap-2">
           <span className="text-[11px] text-muted-foreground">
             {selected.size} de {filtered.length} selecionadas
@@ -299,7 +337,7 @@ function DiscoveryResultView({
             onClick={onImport}
             disabled={importing || selected.size === 0 || !providerId}
           >
-            Importar selecionadas ({selected.size})
+            {importMode === "enrich_existing" ? "Enriquecer selecionadas" : "Importar selecionadas"} ({selected.size})
           </Button>
         </div>
       </div>

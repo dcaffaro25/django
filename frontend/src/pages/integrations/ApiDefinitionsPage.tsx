@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from "react"
-import { useNavigate } from "react-router-dom"
+import { useNavigate, useSearchParams } from "react-router-dom"
 import { toast } from "sonner"
 import {
   Plus, RefreshCw, Search, Pencil, Trash2, Play, CheckCircle2,
-  XCircle, AlertTriangle, Lock, Sparkles,
+  XCircle, AlertTriangle, Lock, Sparkles, ArrowUpDown,
 } from "lucide-react"
 import { SectionHeader } from "@/components/ui/section-header"
 import { Button } from "@/components/ui/button"
@@ -71,9 +71,15 @@ const OUTCOME_TONE: Record<TestOutcome, string> = {
 // ---------------------------------------------------------------------
 export function ApiDefinitionsPage() {
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const { canWrite } = useUserRole()
   const [providerFilter, setProviderFilter] = useState<string>("all")
   const [search, setSearch] = useState("")
+  const [outcomeFilter, setOutcomeFilter] = useState<string>("all")
+  const [sort, setSort] = useState<{ key: "provider" | "call" | "method" | "url" | "auth" | "health" | "version"; dir: "asc" | "desc" }>({
+    key: "call",
+    dir: "asc",
+  })
   const [showInactive, setShowInactive] = useState(false)
   const [editing, setEditing] = useState<ERPAPIDefinition | "new" | null>(null)
   const [confirmDelete, setConfirmDelete] = useState<ERPAPIDefinition | null>(null)
@@ -94,15 +100,44 @@ export function ApiDefinitionsPage() {
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
-    if (!q) return defs
-    return defs.filter((d) =>
-      [d.call, d.description, d.url, d.provider_display]
+    return defs.filter((d) => {
+      if (outcomeFilter === "__untested" && d.last_test_outcome !== "") return false
+      if (outcomeFilter !== "all" && outcomeFilter !== "__untested" && d.last_test_outcome !== outcomeFilter) return false
+      if (!q) return true
+      return [d.call, d.description, d.url, d.provider_display]
         .filter(Boolean)
-        .some((s) => s!.toLowerCase().includes(q)),
-    )
-  }, [defs, search])
+        .some((s) => s!.toLowerCase().includes(q))
+    })
+  }, [defs, search, outcomeFilter])
+
+  const sorted = useMemo(() => {
+    const factor = sort.dir === "asc" ? 1 : -1
+    return [...filtered].sort((a, b) => factor * compareDefinition(a, b, sort.key))
+  }, [filtered, sort])
+
+  const toggleSort = (key: typeof sort.key) => {
+    setSort((current) => ({
+      key,
+      dir: current.key === key && current.dir === "asc" ? "desc" : "asc",
+    }))
+  }
 
   const del = useDeleteApiDefinition()
+
+  useEffect(() => {
+    const editId = Number(searchParams.get("edit"))
+    if (!editId || defs.length === 0) return
+    const target = defs.find((d) => d.id === editId)
+    if (!target) return
+    setEditing(target)
+    const next = new URLSearchParams(searchParams)
+    next.delete("edit")
+    setSearchParams(next, { replace: true })
+  }, [defs, searchParams, setSearchParams])
+
+  const openInSandbox = (definition: ERPAPIDefinition) => {
+    navigate(sandboxUrlForDefinition(definition, connections))
+  }
 
   const onConfirmDelete = () => {
     if (!confirmDelete) return
@@ -132,7 +167,7 @@ export function ApiDefinitionsPage() {
                 onClick={() => navigate("/integrations/api-definitions/discover")}
                 title="Descobrir APIs a partir de URL de documentação"
               >
-                <Sparkles className="h-4 w-4" /> Descobrir
+                <Sparkles className="h-4 w-4" /> Descobrir/enriquecer
               </Button>
             ) : null}
             {canWrite ? (
@@ -144,64 +179,69 @@ export function ApiDefinitionsPage() {
         }
       />
 
-      {/* Filters */}
-      <div className="flex flex-wrap items-end gap-2">
-        <div className="relative min-w-[240px] flex-1">
-          <Search className="pointer-events-none absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Buscar call, descrição, URL…"
-            className="pl-8"
-          />
-        </div>
-        <div className="flex flex-col gap-1">
-          <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-            Provedor
-          </span>
-          <Select value={providerFilter} onValueChange={setProviderFilter}>
-            <SelectTrigger className="h-9 w-[200px]"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">Todos</SelectItem>
-              {providers.map((p) => (
-                <SelectItem key={p.id} value={String(p.id)}>{p.name}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <label className="flex h-9 cursor-pointer items-center gap-2 rounded-md border border-border bg-background px-3 text-[12px] font-medium">
-          <input
-            type="checkbox"
-            checked={showInactive}
-            onChange={(e) => setShowInactive(e.target.checked)}
-            className="h-3.5 w-3.5"
-          />
-          Mostrar inativas
-        </label>
-      </div>
-
       {/* Table */}
-      <div className="rounded-lg border border-border bg-card">
+      <div className="max-h-[70vh] overflow-auto rounded-lg border border-border bg-card">
         <table className="w-full text-[12px]">
-          <thead className="border-b border-border bg-muted/30 text-left text-[11px] font-medium text-muted-foreground">
+          <thead className="sticky top-0 z-10 border-b border-border bg-card text-left text-[11px] font-medium text-muted-foreground shadow-sm">
             <tr>
-              <th className="px-3 py-2">Provedor</th>
-              <th className="px-3 py-2">Call</th>
+              <th className="px-3 py-2"><SortButton active={sort.key === "provider"} dir={sort.dir} onClick={() => toggleSort("provider")}>Provedor</SortButton></th>
+              <th className="px-3 py-2"><SortButton active={sort.key === "call"} dir={sort.dir} onClick={() => toggleSort("call")}>Call</SortButton></th>
               <th className="px-3 py-2">Método</th>
-              <th className="px-3 py-2">URL</th>
-              <th className="px-3 py-2">Auth</th>
+              <th className="px-3 py-2"><SortButton active={sort.key === "url"} dir={sort.dir} onClick={() => toggleSort("url")}>URL</SortButton></th>
+              <th className="px-3 py-2"><SortButton active={sort.key === "auth"} dir={sort.dir} onClick={() => toggleSort("auth")}>Auth</SortButton></th>
               <th className="px-3 py-2">Saúde</th>
-              <th className="px-3 py-2">v</th>
+              <th className="px-3 py-2"><SortButton active={sort.key === "version"} dir={sort.dir} onClick={() => toggleSort("version")}>v</SortButton></th>
+              <th className="px-3 py-2"></th>
+            </tr>
+            <tr className="border-t border-border/60 bg-muted/20">
+              <th className="px-3 py-2">
+                <Select value={providerFilter} onValueChange={setProviderFilter}>
+                  <SelectTrigger className="h-8 w-full min-w-[140px] text-[12px]"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">Todos</SelectItem>
+                    {providers.map((p) => (
+                      <SelectItem key={p.id} value={String(p.id)}>{p.name}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </th>
+              <th className="px-3 py-2">
+                <div className="relative">
+                  <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Call, URL ou descricao" className="h-8 pl-7 text-[12px]" />
+                </div>
+              </th>
+              <th className="px-3 py-2"></th>
+              <th className="px-3 py-2"></th>
+              <th className="px-3 py-2"></th>
+              <th className="px-3 py-2">
+                <Select value={outcomeFilter} onValueChange={setOutcomeFilter}>
+                  <SelectTrigger className="h-8 w-full min-w-[130px] text-[12px]"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">Todas</SelectItem>
+                    <SelectItem value="success">Sucesso</SelectItem>
+                    <SelectItem value="error">Erro</SelectItem>
+                    <SelectItem value="auth_fail">Falha auth</SelectItem>
+                    <SelectItem value="__untested">Nao testada</SelectItem>
+                  </SelectContent>
+                </Select>
+              </th>
+              <th className="px-3 py-2">
+                <label className="flex h-8 items-center gap-2 rounded-md border border-border bg-background px-2 text-[11px]">
+                  <input type="checkbox" checked={showInactive} onChange={(e) => setShowInactive(e.target.checked)} className="h-3.5 w-3.5" />
+                  Inativas
+                </label>
+              </th>
               <th className="px-3 py-2"></th>
             </tr>
           </thead>
           <tbody>
             {isLoading ? (
               <tr><td colSpan={8} className="px-3 py-6 text-center text-muted-foreground">Carregando…</td></tr>
-            ) : filtered.length === 0 ? (
+            ) : sorted.length === 0 ? (
               <tr><td colSpan={8} className="px-3 py-6 text-center text-muted-foreground">Nenhuma definição encontrada.</td></tr>
             ) : (
-              filtered.map((d) => (
+              sorted.map((d) => (
                 <tr
                   key={d.id}
                   className={cn(
@@ -223,6 +263,14 @@ export function ApiDefinitionsPage() {
                   <td className="px-3 py-2 font-mono text-muted-foreground">v{d.version}</td>
                   <td className="px-3 py-2 text-right">
                     <div className="flex justify-end gap-1">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        title="Abrir no sandbox"
+                        onClick={(e) => { e.stopPropagation(); openInSandbox(d) }}
+                      >
+                        <Play className="h-3.5 w-3.5" />
+                      </Button>
                       <Button
                         variant="ghost"
                         size="icon"
@@ -255,6 +303,7 @@ export function ApiDefinitionsPage() {
         open={editing !== null}
         definition={editing === "new" ? null : editing}
         onClose={() => setEditing(null)}
+        onOpenSandbox={(definition) => openInSandbox(definition)}
       />
 
       {/* Delete confirm */}
@@ -282,6 +331,44 @@ export function ApiDefinitionsPage() {
 // ---------------------------------------------------------------------
 // Health pill
 // ---------------------------------------------------------------------
+function compareDefinition(
+  a: ERPAPIDefinition,
+  b: ERPAPIDefinition,
+  key: "provider" | "call" | "method" | "url" | "auth" | "health" | "version",
+) {
+  if (key === "provider") return a.provider_display.localeCompare(b.provider_display)
+  if (key === "call") return a.call.localeCompare(b.call)
+  if (key === "method") return a.method.localeCompare(b.method)
+  if (key === "url") return a.url.localeCompare(b.url)
+  if (key === "auth") return a.auth_strategy.localeCompare(b.auth_strategy)
+  if (key === "health") return a.last_test_outcome.localeCompare(b.last_test_outcome)
+  return a.version - b.version
+}
+
+function SortButton({
+  active,
+  dir,
+  onClick,
+  children,
+}: {
+  active: boolean
+  dir: "asc" | "desc"
+  onClick: () => void
+  children: React.ReactNode
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn("inline-flex items-center gap-1 font-medium hover:text-foreground", active && "text-foreground")}
+    >
+      {children}
+      <ArrowUpDown className={cn("h-3 w-3", active ? "opacity-100" : "opacity-40")} />
+      {active ? <span className="text-[9px] uppercase">{dir}</span> : null}
+    </button>
+  )
+}
+
 function HealthPill({ outcome, testedAt }: { outcome: TestOutcome; testedAt: string | null }) {
   const Icon =
     outcome === "success" ? CheckCircle2 :
@@ -295,6 +382,13 @@ function HealthPill({ outcome, testedAt }: { outcome: TestOutcome; testedAt: str
       {testedAt ? <span className="text-muted-foreground">· {formatDateTime(testedAt)}</span> : null}
     </span>
   )
+}
+
+function sandboxUrlForDefinition(definition: ERPAPIDefinition, connections: Array<{ id: number; provider: number }>): string {
+  const connection = connections.find((c) => c.provider === definition.provider)
+  const params = new URLSearchParams({ api_definition_id: String(definition.id) })
+  if (connection) params.set("connection_id", String(connection.id))
+  return `/integrations/sandbox?${params.toString()}`
 }
 
 // ---------------------------------------------------------------------
@@ -318,11 +412,12 @@ function emptyDefinition(providerId: number): ERPAPIDefinitionWrite {
 }
 
 function ApiDefinitionEditor({
-  open, definition, onClose,
+  open, definition, onClose, onOpenSandbox,
 }: {
   open: boolean
   definition: ERPAPIDefinition | null
   onClose: () => void
+  onOpenSandbox: (definition: ERPAPIDefinition) => void
 }) {
   const { data: connections = [] } = useErpConnections()
   const providers = useMemo(() => {
@@ -587,6 +682,7 @@ function ApiDefinitionEditor({
                     placeholder='{"pagina": 1}'
                   />
                 </Row>
+                <div className="flex flex-wrap gap-2">
                 <Button
                   variant="outline"
                   size="sm"
@@ -596,6 +692,15 @@ function ApiDefinitionEditor({
                   <Play className="h-4 w-4" />
                   {testCall.isPending ? "Chamando…" : "Testar"}
                 </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => onOpenSandbox(definition)}
+                >
+                  <Play className="h-4 w-4" />
+                  Abrir no sandbox
+                </Button>
+                </div>
 
                 {testResult ? <TestCallResultView result={testResult} /> : null}
               </Section>

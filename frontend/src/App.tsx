@@ -19,10 +19,13 @@ import { JournalEntriesPage } from "@/pages/accounting/JournalEntriesPage"
 import { AccountingHubPage } from "@/pages/accounting/AccountingHubPage"
 import { EntitiesPage } from "@/pages/settings/EntitiesPage"
 import { TenantConfigPage } from "@/pages/settings/TenantConfigPage"
+import { IntegrationsHubPage } from "@/pages/integrations/IntegrationsHubPage"
+import { IntegrationsOverviewPage } from "@/pages/integrations/IntegrationsOverviewPage"
 import { ApiSandboxPage } from "@/pages/integrations/ApiSandboxPage"
 import { ApiDefinitionsPage } from "@/pages/integrations/ApiDefinitionsPage"
 import { ApiDiscoveryPage } from "@/pages/integrations/ApiDiscoveryPage"
 import { PipelineRoutinesPage } from "@/pages/integrations/PipelineRoutinesPage"
+import { RawRecordsPage } from "@/pages/integrations/RawRecordsPage"
 import { ImportsHubPage } from "@/pages/imports/ImportsHubPage"
 import { ImportsHubWrapper } from "@/pages/imports/ImportsHubWrapper"
 import { SubstitutionRulesPage } from "@/pages/imports/SubstitutionRulesPage"
@@ -154,16 +157,15 @@ export default function App() {
                   <Route path="/operacao/saude" element={<DataHealthPage />} />
                   <Route path="/hr/*" element={<PlaceholderPage title="RH" />} />
                   <Route path="/inventory/*" element={<PlaceholderPage title="Estoque" />} />
-                  <Route path="/integrations/sandbox" element={<ApiSandboxPage />} />
-                  {/* Phase-1 do plano Sandbox API: catálogo estruturado das
-                      definições de API. O sandbox e as rotinas (futuras)
-                      consomem o que é cadastrado aqui. */}
-                  <Route path="/integrations/api-definitions" element={<ApiDefinitionsPage />} />
-                  {/* Phase-2: descoberta de APIs a partir de URL de docs. */}
-                  <Route path="/integrations/api-definitions/discover" element={<ApiDiscoveryPage />} />
-                  {/* Phase-4: rotinas agendadas. */}
-                  <Route path="/integrations/rotinas" element={<PipelineRoutinesPage />} />
-                  <Route path="/integrations/*" element={<PlaceholderPage title="Integrações" />} />
+                  <Route path="/integrations" element={<IntegrationsHubPage />}>
+                    <Route index element={<IntegrationsOverviewPage />} />
+                    <Route path="sandbox" element={<ApiSandboxPage />} />
+                    <Route path="api-definitions" element={<ApiDefinitionsPage />} />
+                    <Route path="api-definitions/discover" element={<ApiDiscoveryPage />} />
+                    <Route path="rotinas" element={<PipelineRoutinesPage />} />
+                    <Route path="registros" element={<RawRecordsPage />} />
+                    <Route path="*" element={<Navigate to="/integrations" replace />} />
+                  </Route>
 
                   {/* ERP — Omie reports powered by ApiPipeline snapshots. */}
                   <Route path="/erp/pedidos" element={<PedidoVendasReportPage />} />

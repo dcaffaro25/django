@@ -12,7 +12,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from multitenancy.mixins import ScopedQuerysetMixin, SoftDeleteQuerysetMixin
 
 from .erp_etl import execute_erp_etl_import
-from .filters import ERPRawRecordFilter, apply_json_field_filters
+from .filters import ERPRawRecordFilter, apply_advanced_raw_record_filter, apply_json_field_filters
 from .models import (
     ERPAPIDefinition,
     ERPConnection,
@@ -38,6 +38,78 @@ from .serializers import (
 )
 from .services.payload_builder import build_payload_by_ids
 from .services.transform_engine import extract_external_id
+
+
+def _merge_discovered_api_candidate(existing: ERPAPIDefinition, candidate: dict) -> list[str]:
+    """Conservatively enrich an existing API definition from discovery output.
+
+    Discovery can be noisy, so this only fills missing structured fields and
+    appends newly found params by name. It never removes operator-entered
+    params or overwrites credentials/auth-sensitive choices.
+    """
+    changed: list[str] = []
+
+    doc_url = candidate.get("documentation_url")
+    if doc_url and not existing.documentation_url:
+        existing.documentation_url = doc_url
+        changed.append("documentation_url")
+
+    description = (candidate.get("description") or "")[:255]
+    if description and not existing.description:
+        existing.description = description
+        changed.append("description")
+
+    records_path = candidate.get("records_path")
+    if records_path and not existing.records_path:
+        existing.records_path = records_path
+        changed.append("records_path")
+
+    pagination_spec = candidate.get("pagination_spec")
+    if pagination_spec and not existing.pagination_spec:
+        existing.pagination_spec = pagination_spec
+        changed.append("pagination_spec")
+
+    existing_params = list(existing.param_schema or [])
+    by_name = {
+        p.get("name"): dict(p)
+        for p in existing_params
+        if isinstance(p, dict) and p.get("name")
+    }
+    appended = False
+    for param in candidate.get("param_schema") or []:
+        if not isinstance(param, dict) or not param.get("name"):
+            continue
+        name = param["name"]
+        current = by_name.get(name)
+        if current is None:
+            existing_params.append(param)
+            by_name[name] = dict(param)
+            appended = True
+            continue
+        enriched_param = dict(current)
+        touched = False
+        for key in ("type", "description", "default", "required", "location", "options"):
+            value = param.get(key)
+            if value not in (None, "", []) and enriched_param.get(key) in (None, "", []):
+                enriched_param[key] = value
+                touched = True
+        if touched:
+            for idx, row in enumerate(existing_params):
+                if isinstance(row, dict) and row.get("name") == name:
+                    existing_params[idx] = enriched_param
+                    break
+            by_name[name] = enriched_param
+            appended = True
+
+    if appended:
+        existing.param_schema = existing_params
+        changed.append("param_schema")
+
+    if changed:
+        existing.source = ERPAPIDefinition.SOURCE_DISCOVERED
+        changed.append("source")
+
+    return changed
 
 
 class ERPRawRecordDataPagination(PageNumberPagination):
@@ -162,12 +234,16 @@ class ERPAPIDefinitionViewSet(SoftDeleteQuerysetMixin, viewsets.ModelViewSet):
         body = request.data or {}
         provider_id = body.get("provider")
         candidates = body.get("candidates") or []
+        mode = body.get("mode") or "create_only"
         if not provider_id:
             return Response({"detail": "provider é obrigatório."}, status=400)
+        if mode not in {"create_only", "enrich_existing", "upsert"}:
+            return Response({"detail": "mode invalido."}, status=400)
         if not isinstance(candidates, list) or not candidates:
             return Response({"detail": "candidates não pode ser vazio."}, status=400)
 
         created: list = []
+        enriched: list = []
         failed: list = []
         for i, cand in enumerate(candidates):
             if not isinstance(cand, dict):
@@ -190,9 +266,22 @@ class ERPAPIDefinitionViewSet(SoftDeleteQuerysetMixin, viewsets.ModelViewSet):
                 provider_id=provider_id, call=cand.get("call"),
             ).first()
             if existing:
+                if mode != "create_only":
+                    changes = _merge_discovered_api_candidate(existing, cand)
+                    if changes:
+                        existing.save(update_fields=changes)
+                    enriched.append({"id": existing.id, "call": existing.call, "fields": changes})
+                    continue
                 failed.append({
                     "index": i, "call": cand.get("call"),
                     "errors": [f"já existe (id={existing.id}). Edite-a manualmente."],
+                })
+                continue
+
+            if mode == "enrich_existing":
+                failed.append({
+                    "index": i, "call": cand.get("call"),
+                    "errors": ["nao existe cadastro para enriquecer."],
                 })
                 continue
 
@@ -221,6 +310,8 @@ class ERPAPIDefinitionViewSet(SoftDeleteQuerysetMixin, viewsets.ModelViewSet):
         return Response({
             "created": created,
             "created_count": len(created),
+            "enriched": enriched,
+            "enriched_count": len(enriched),
             "failed": failed,
             "failed_count": len(failed),
         })
@@ -525,7 +616,8 @@ class ERPRawRecordViewSet(ScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
     def filter_queryset(self, queryset):
         qs = super().filter_queryset(queryset)
         try:
-            return apply_json_field_filters(qs, self.request.query_params)
+            qs = apply_json_field_filters(qs, self.request.query_params)
+            return apply_advanced_raw_record_filter(qs, self.request.query_params.get("advanced_filter"))
         except DjangoValidationError as e:
             raise DRFValidationError(detail=list(e.messages))
 
