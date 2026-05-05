@@ -24,7 +24,7 @@
  *   ``stores/page-context-store.ts``), we ship that blob alongside the
  *   chat call. Privacy-by-default: off until the user flips it.
  */
-import { useEffect, useMemo, useRef, useState } from "react"
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react"
 import { toast } from "sonner"
 import {
   AlertCircle, CheckCircle2, ChevronLeft, Eye, FileText, Image as ImageIcon, Loader2,
@@ -62,6 +62,148 @@ function fmtTokens(n: number | null | undefined): string {
   if (n == null) return "—"
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`
   return String(n)
+}
+
+function parseInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
+  const nodes: ReactNode[] = []
+  const tokenRe = /(`[^`]+`|\*\*[^*]+\*\*)/g
+  let lastIndex = 0
+  let match: RegExpExecArray | null
+
+  while ((match = tokenRe.exec(text)) != null) {
+    if (match.index > lastIndex) {
+      nodes.push(text.slice(lastIndex, match.index))
+    }
+    const token = match[0]
+    const key = `${keyPrefix}-${match.index}`
+    if (token.startsWith("`")) {
+      nodes.push(
+        <code key={key} className="rounded bg-black/5 px-1 py-0.5 font-mono text-[0.92em] dark:bg-white/10">
+          {token.slice(1, -1)}
+        </code>,
+      )
+    } else {
+      nodes.push(<strong key={key}>{token.slice(2, -2)}</strong>)
+    }
+    lastIndex = match.index + token.length
+  }
+
+  if (lastIndex < text.length) nodes.push(text.slice(lastIndex))
+  return nodes
+}
+
+function isMarkdownTable(lines: string[], index: number): boolean {
+  const header = lines[index]?.trim() ?? ""
+  const divider = lines[index + 1]?.trim() ?? ""
+  return header.startsWith("|") && header.endsWith("|") && /^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$/.test(divider)
+}
+
+function splitTableRow(line: string): string[] {
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim())
+}
+
+function MarkdownMessage({ content }: { content: string }) {
+  const lines = content.replace(/\r\n/g, "\n").split("\n")
+  const blocks: ReactNode[] = []
+  let i = 0
+
+  while (i < lines.length) {
+    const line = lines[i] ?? ""
+
+    if (!line.trim()) {
+      i += 1
+      continue
+    }
+
+    if (line.trim().startsWith("```")) {
+      const codeLines: string[] = []
+      i += 1
+      while (i < lines.length && !(lines[i] ?? "").trim().startsWith("```")) {
+        codeLines.push(lines[i] ?? "")
+        i += 1
+      }
+      if (i < lines.length) i += 1
+      blocks.push(
+        <pre key={`code-${i}`} className="my-1 max-w-full overflow-auto rounded-md bg-black/5 px-2.5 py-2 font-mono text-xs leading-relaxed dark:bg-white/10">
+          {codeLines.join("\n")}
+        </pre>,
+      )
+      continue
+    }
+
+    if (isMarkdownTable(lines, i)) {
+      const headers = splitTableRow(lines[i] ?? "")
+      i += 2
+      const rows: string[][] = []
+      while (i < lines.length && (lines[i] ?? "").trim().startsWith("|")) {
+        rows.push(splitTableRow(lines[i] ?? ""))
+        i += 1
+      }
+      blocks.push(
+        <div key={`table-${i}`} className="my-1 max-w-full overflow-x-auto rounded-md border border-zinc-200 dark:border-zinc-700">
+          <table className="w-full min-w-max border-collapse text-left text-xs">
+            <thead className="bg-black/5 dark:bg-white/10">
+              <tr>
+                {headers.map((h, idx) => (
+                  <th key={`${h}-${idx}`} className="border-b border-zinc-200 px-2 py-1.5 font-semibold dark:border-zinc-700">
+                    {parseInlineMarkdown(h, `th-${i}-${idx}`)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, rowIdx) => (
+                <tr key={`row-${rowIdx}`} className="border-t border-zinc-100 dark:border-zinc-800">
+                  {headers.map((_, cellIdx) => (
+                    <td key={`cell-${rowIdx}-${cellIdx}`} className="px-2 py-1.5 align-top">
+                      {parseInlineMarkdown(row[cellIdx] ?? "", `td-${i}-${rowIdx}-${cellIdx}`)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>,
+      )
+      continue
+    }
+
+    if (/^\s*[-*]\s+/.test(line)) {
+      const items: string[] = []
+      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i] ?? "")) {
+        items.push((lines[i] ?? "").replace(/^\s*[-*]\s+/, ""))
+        i += 1
+      }
+      blocks.push(
+        <ul key={`ul-${i}`} className="my-1 list-disc space-y-1 pl-5">
+          {items.map((item, idx) => (
+            <li key={`${idx}-${item.slice(0, 12)}`}>{parseInlineMarkdown(item, `li-${i}-${idx}`)}</li>
+          ))}
+        </ul>,
+      )
+      continue
+    }
+
+    const paragraph: string[] = [line]
+    i += 1
+    while (
+      i < lines.length &&
+      (lines[i] ?? "").trim() &&
+      !(lines[i] ?? "").trim().startsWith("```") &&
+      !isMarkdownTable(lines, i) &&
+      !/^\s*[-*]\s+/.test(lines[i] ?? "")
+    ) {
+      paragraph.push(lines[i] ?? "")
+      i += 1
+    }
+    blocks.push(
+      <p key={`p-${i}`} className="my-1">
+        {parseInlineMarkdown(paragraph.join(" "), `p-${i}`)}
+      </p>,
+    )
+  }
+
+  return <>{blocks.length ? blocks : <span className="text-zinc-400">...</span>}</>
 }
 
 
@@ -184,6 +326,59 @@ function fmtCounter(value: unknown): string {
   return String(value ?? "?")
 }
 
+function compactToolValue(value: unknown): string {
+  if (value == null) return ""
+  if (typeof value === "string") return value
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
+function summarizeToolResult(parsed: Record<string, unknown> | null, raw: string): string {
+  if (!parsed) {
+    const trimmed = raw.trim()
+    return trimmed ? trimmed.slice(0, 120) : "Sem conteúdo retornado"
+  }
+
+  const error = parsed["error"] || parsed["detail"] || parsed["message"]
+  if (error) return compactToolValue(error).slice(0, 120)
+
+  const counters = parsed["counters"]
+  if (counters && typeof counters === "object") {
+    const pairs = Object.entries(counters as Record<string, unknown>)
+      .slice(0, 3)
+      .map(([key, value]) => `${key}: ${fmtCounter(value)}`)
+    if (pairs.length > 0) return pairs.join(" · ")
+  }
+
+  if (Array.isArray(parsed["rows"])) return `${parsed["rows"].length.toLocaleString("pt-BR")} linha(s)`
+  if (Array.isArray(parsed["results"])) return `${parsed["results"].length.toLocaleString("pt-BR")} resultado(s)`
+  if (typeof parsed["count"] === "number") return `${parsed["count"].toLocaleString("pt-BR")} item(ns)`
+  if (typeof parsed["ok"] === "boolean") return parsed["ok"] ? "Concluído" : "Retornou erro"
+
+  const keys = Object.keys(parsed).slice(0, 4)
+  return keys.length > 0 ? keys.join(" · ") : "Resultado recebido"
+}
+
+function ToolOutputPreview({ msg, parsed }: { msg: AgentMessage; parsed: Record<string, unknown> | null }) {
+  const raw = msg.content || ""
+  if (!raw.trim()) return null
+  const pretty = parsed ? compactToolValue(parsed) : raw
+
+  return (
+    <details className="mt-1 w-full min-w-0 max-w-full overflow-hidden rounded-md border border-zinc-200 bg-white/70 dark:border-zinc-800 dark:bg-zinc-950/60">
+      <summary className="cursor-pointer select-none px-2.5 py-1 text-[11px] font-medium text-zinc-500 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200">
+        Ver saída da ferramenta
+      </summary>
+      <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words border-t border-zinc-200 px-2.5 py-2 font-mono text-[11px] leading-relaxed text-zinc-600 dark:border-zinc-800 dark:text-zinc-300">
+        {pretty}
+      </pre>
+    </details>
+  )
+}
+
 function WriteResultChip({ msg, parsed }: { msg: AgentMessage; parsed: Record<string, unknown> }) {
   const tool = msg.tool_name
   const ok = parsed["ok"] !== false
@@ -223,9 +418,9 @@ function WriteResultChip({ msg, parsed }: { msg: AgentMessage; parsed: Record<st
   const Icon = !ok ? AlertCircle : (dryRun || blocked) ? Eye : CheckCircle2
 
   return (
-    <div className={cn("my-1 flex max-w-[90%] items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs", tone)}>
+    <div className={cn("my-1 flex w-fit max-w-full min-w-0 items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs", tone)}>
       <Icon className="h-3.5 w-3.5 shrink-0" />
-      <span className="font-mono text-[11px]">{tool}</span>
+      <span className="min-w-0 truncate font-mono text-[11px]" title={tool}>{tool}</span>
       {summary && <span>· {summary}</span>}
       {dryRun && !blocked && <span className="text-[10px] uppercase opacity-70">· dry-run</span>}
       {blocked && <span className="text-[10px] uppercase opacity-70">· bloqueado</span>}
@@ -244,6 +439,7 @@ function WriteResultChip({ msg, parsed }: { msg: AgentMessage; parsed: Record<st
 function ToolPill({ msg, isResult }: { msg: AgentMessage; isResult: boolean }) {
   const calls = msg.tool_calls ?? []
   const label = isResult ? msg.tool_name : calls[0]?.function?.name ?? "tool"
+  const labels = isResult ? [label] : calls.map((call) => call.function?.name).filter(Boolean)
 
   // For result rows on write tools, render the rich chip.
   if (isResult) {
@@ -254,10 +450,29 @@ function ToolPill({ msg, isResult }: { msg: AgentMessage; isResult: boolean }) {
   }
 
   return (
-    <div className="my-1 flex items-center gap-2 rounded-md border border-zinc-200 bg-zinc-50 px-2.5 py-1.5 text-xs text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900/60 dark:text-zinc-300">
+    <div className="my-1 flex max-w-full min-w-0 items-center gap-2 rounded-md border border-zinc-200 bg-zinc-50 px-2.5 py-1.5 text-xs text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900/60 dark:text-zinc-300">
       <Wrench className="h-3.5 w-3.5 shrink-0 text-zinc-500" />
-      <span className="font-mono">{label}</span>
+      <span className="min-w-0 truncate font-mono" title={labels.join(", ")}>
+        {labels.length > 1 ? labels.join(", ") : label}
+      </span>
       <span className="text-zinc-400">{isResult ? "→ resultado" : "chamando"}</span>
+    </div>
+  )
+}
+
+function ToolResultRow({ msg }: { msg: AgentMessage }) {
+  const parsed = parseToolResult(msg)
+  const summary = summarizeToolResult(parsed, msg.content || "")
+
+  return (
+    <div className="my-1 max-w-full min-w-0">
+      <ToolPill msg={msg} isResult={true} />
+      {summary && (
+        <div className="mt-1 max-w-full truncate pl-1 text-[11px] text-zinc-500 dark:text-zinc-400" title={summary}>
+          {summary}
+        </div>
+      )}
+      <ToolOutputPreview msg={msg} parsed={parsed} />
     </div>
   )
 }
@@ -301,7 +516,7 @@ function MessageRow(props: {
     return <ToolPill msg={msg} isResult={false} />
   }
   if (msg.role === "tool") {
-    return <ToolPill msg={msg} isResult={true} />
+    return <ToolResultRow msg={msg} />
   }
 
   if (ui) {
@@ -328,8 +543,8 @@ function MessageRow(props: {
   const isUser = msg.role === "user"
   const attachments = msg.attachments ?? []
   return (
-    <div className={cn("flex w-full", isUser ? "justify-end" : "justify-start")}>
-      <div className={cn("flex max-w-[85%] flex-col gap-1", isUser ? "items-end" : "items-start")}>
+    <div className={cn("flex w-full min-w-0", isUser ? "justify-end" : "justify-start")}>
+      <div className={cn("flex max-w-[85%] min-w-0 flex-col gap-1", isUser ? "items-end" : "items-start")}>
         {attachments.length > 0 && (
           <div className={cn("flex flex-col gap-1", isUser ? "items-end" : "items-start")}>
             {attachments.map((a) => {
@@ -358,13 +573,14 @@ function MessageRow(props: {
         )}
         <div
           className={cn(
-            "whitespace-pre-wrap rounded-2xl px-3.5 py-2 text-sm shadow-sm",
+            "max-w-full break-words rounded-2xl px-3.5 py-2 text-sm shadow-sm",
+            isUser && "whitespace-pre-wrap",
             isUser
               ? "bg-primary text-primary-foreground"
               : "bg-zinc-100 text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100",
           )}
         >
-          {msg.content || <span className="text-zinc-400">…</span>}
+          {msg.content ? <MarkdownMessage content={msg.content} /> : <span className="text-zinc-400">...</span>}
         </div>
         <MessageMeta msg={msg} />
       </div>
@@ -773,7 +989,7 @@ function ChatThread(props: { conversationId: number }) {
 
   return (
     <div
-      className="relative flex h-full flex-col"
+      className="relative flex h-full min-h-0 flex-col"
       onDragEnter={onDragEnter}
       onDragLeave={onDragLeave}
       onDragOver={onDragOver}
@@ -789,7 +1005,7 @@ function ChatThread(props: { conversationId: number }) {
         </div>
       )}
 
-      <div ref={scroller} className="flex-1 space-y-2 overflow-y-auto p-3">
+      <div ref={scroller} className="min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain p-3">
         {conversation.isLoading ? (
           <div className="flex h-full items-center justify-center">
             <Loader2 className="h-5 w-5 animate-spin text-zinc-400" />
@@ -824,7 +1040,7 @@ function ChatThread(props: { conversationId: number }) {
         )}
       </div>
 
-      <form onSubmit={handleSubmit} className="border-t border-zinc-200 px-2 pt-2 dark:border-zinc-800">
+      <form onSubmit={handleSubmit} className="shrink-0 border-t border-zinc-200 px-2 pt-2 dark:border-zinc-800">
         {attachments.length > 0 && (
           <div className="mb-1.5 flex flex-wrap gap-1.5">
             {attachments.map((att) => (
@@ -893,10 +1109,12 @@ function ChatThread(props: { conversationId: number }) {
 
       {/* Config + metadata toolbar — always visible. */}
       {conv && (
+        <div className="shrink-0">
         <ComposerToolbar
           conversation={conv}
           pageTitle={pageContext?.title ?? null}
         />
+        </div>
       )}
     </div>
   )
@@ -992,7 +1210,7 @@ export function AgentChatWidget() {
         </button>
       </div>
 
-      <div className="grid flex-1 overflow-hidden">
+      <div className="grid min-h-0 flex-1 overflow-hidden">
         {pane === "list" && (
           <ConversationsList
             active={activeId}

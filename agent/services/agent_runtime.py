@@ -166,8 +166,11 @@ class SysnordAgent:
 
         # Token-budget gate — Phase 0 expansion. Reject the new turn
         # cleanly before we burn another LLM call.
+        enforce_cumulative_budget = bool(
+            getattr(settings, "AGENT_ENFORCE_CUMULATIVE_TOKEN_BUDGET", False)
+        )
         budget = int(getattr(settings, "AGENT_TOKEN_BUDGET_PER_CONVERSATION", 0) or 0)
-        if budget > 0:
+        if enforce_cumulative_budget and budget > 0:
             from django.db.models import Sum
             agg = self.conversation.messages.aggregate(
                 p=Sum("prompt_tokens"), c=Sum("completion_tokens"),
@@ -562,6 +565,11 @@ class SysnordAgent:
                 "id", "role", "content", "tool_calls", "tool_call_id", "tool_name",
             )
         )
+        newest_user_id = max(
+            (int(row["id"]) for row in history if row["role"] == AgentMessage.ROLE_USER),
+            default=0,
+        )
+
         for row in history:
             role = row["role"]
             content = row["content"] or ""
@@ -595,6 +603,11 @@ class SysnordAgent:
                 continue
 
             if role == AgentMessage.ROLE_TOOL:
+                if int(row["id"]) < newest_user_id:
+                    content = _compact_historical_tool_output(
+                        tool_name=row["tool_name"] or "",
+                        content=content,
+                    )
                 out.append({
                     "type": "function_call_output",
                     "call_id": row["tool_call_id"] or "",
@@ -714,6 +727,55 @@ def _extract_text_from_items(items: list[dict[str, Any]]) -> str:
             if ptype in ("output_text", "text", "input_text") and text:
                 chunks.append(text)
     return "".join(chunks)
+
+
+def _compact_historical_tool_output(*, tool_name: str, content: str) -> str:
+    """Shrink older tool outputs before sending them back to the model.
+
+    The full payload stays in the database for UI inspection. The next turn
+    only needs a compact reminder; otherwise tables returned by tools get
+    resent on every request and quickly dominate the context window.
+    """
+    limit = int(getattr(settings, "AGENT_HISTORY_TOOL_OUTPUT_CHARS", 1800))
+    if limit <= 0 or len(content) <= limit:
+        return content
+
+    summary: dict[str, Any] = {
+        "tool": tool_name,
+        "historical_output_compacted": True,
+        "original_chars": len(content),
+    }
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError):
+        summary["preview"] = content[:limit]
+        return json.dumps(summary, ensure_ascii=False, default=str)
+
+    if isinstance(parsed, dict):
+        summary["keys"] = list(parsed.keys())[:20]
+        for key in ("count", "ok", "error", "status", "run_id", "dry_run_effective"):
+            if key in parsed:
+                summary[key] = parsed[key]
+        for key, value in parsed.items():
+            if isinstance(value, list):
+                summary[f"{key}_count"] = len(value)
+                if value:
+                    summary[f"{key}_sample"] = value[:2]
+            elif isinstance(value, dict) and key in ("counters", "totals", "summary"):
+                summary[key] = value
+    elif isinstance(parsed, list):
+        summary["items_count"] = len(parsed)
+        summary["items_sample"] = parsed[:2]
+    else:
+        summary["preview"] = str(parsed)[:limit]
+
+    dumped = json.dumps(summary, ensure_ascii=False, default=str)
+    if len(dumped) > limit:
+        summary.pop("rows_sample", None)
+        summary.pop("results_sample", None)
+        summary["preview"] = dumped[:limit]
+        dumped = json.dumps(summary, ensure_ascii=False, default=str)
+    return dumped
 
 
 def _extract_reasoning_summary(items: list[dict[str, Any]]) -> str:

@@ -3395,7 +3395,11 @@ TOOLS: list[ToolDef] = [
             "properties": {
                 "company_id": {"type": "integer"},
                 "call": {"type": "string"},
-                "params": {"type": "object"},
+                "params": {
+                    "type": "object",
+                    "description": "ERP method parameters to send. Example for Omie ListarPedidos: {'pagina': 1, 'registros_por_pagina': 3}. Always set pagination params when the user asks for a small sample.",
+                    "additionalProperties": True,
+                },
                 "provider": {"type": "string"},
                 "cache_ttl_seconds": {
                     "type": "integer",

@@ -12,6 +12,7 @@ import { SectionHeader } from "@/components/ui/section-header"
 import { StatusBadge } from "@/components/ui/status-badge"
 import { useActiveTasks, useBankAccountsDashboardKpis, useBankAccountsList, useDailyBalances, useReconKPIs, useReconTasks } from "@/features/reconciliation"
 import { useUserRole } from "@/features/auth/useUserRole"
+import { usePageContext } from "@/stores/page-context-store"
 import type { BankAccountRowKpis, BookCurrencyMismatch, BookDailyWarning } from "@/features/reconciliation/types"
 import { cn, formatCurrency, formatDateTime, formatDuration } from "@/lib/utils"
 
@@ -144,6 +145,23 @@ export function DashboardPage() {
   const unreconciledBookAmount = kpis ? Number(kpis.unreconciled.book?.amount_abs ?? 0) : 0
   const autoRate = kpis?.tasks_30d.automatch_rate != null ? kpis.tasks_30d.automatch_rate * 100 : null
   const completedTasks = kpis?.tasks_30d.completed ?? 0
+
+  usePageContext({
+    route: "/recon",
+    title: "Conciliacao bancaria",
+    summary: "Painel de conciliacao bancaria do tenant atual, com KPIs de banco/livro em aberto, tarefas recentes e filtros de periodo.",
+    data: {
+      period_days: period,
+      include_pending_book: includePendingBook,
+      bank_open_count: unreconciledCount,
+      bank_open_amount: unreconciledAmount,
+      book_open_count: unreconciledBookCount,
+      book_open_amount: unreconciledBookAmount,
+      completed_tasks_30d: completedTasks,
+      active_tasks: activeTasks.length,
+      recent_task_ids: recentTasks.map((task) => task.id).slice(0, 6),
+    },
+  })
 
   return (
     <div className="space-y-6">
