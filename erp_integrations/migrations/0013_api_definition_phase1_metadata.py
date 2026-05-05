@@ -26,16 +26,34 @@ class Migration(migrations.Migration):
 
     operations = [
         # ---- 1) ErpApiEtlMapping index rename ----
-        migrations.RemoveIndex(
-            model_name='erpapietlmapping',
-            name='erp_integra_company_8d637e_idx',
-        ),
-        migrations.AddIndex(
-            model_name='erpapietlmapping',
-            index=models.Index(
-                fields=['company', 'erp_id'],
-                name='erp_integra_company_d2a479_idx',
-            ),
+        migrations.SeparateDatabaseAndState(
+            database_operations=[
+                migrations.RunSQL(
+                    sql=(
+                        'DROP INDEX IF EXISTS erp_integra_company_8d637e_idx; '
+                        'CREATE INDEX IF NOT EXISTS erp_integra_company_d2a479_idx '
+                        'ON erp_integrations_erpapietlmapping (company_id, erp_id);'
+                    ),
+                    reverse_sql=(
+                        'DROP INDEX IF EXISTS erp_integra_company_d2a479_idx; '
+                        'CREATE INDEX IF NOT EXISTS erp_integra_company_8d637e_idx '
+                        'ON erp_integrations_erpapietlmapping (company_id, erp_id);'
+                    ),
+                ),
+            ],
+            state_operations=[
+                migrations.RemoveIndex(
+                    model_name='erpapietlmapping',
+                    name='erp_integra_company_8d637e_idx',
+                ),
+                migrations.AddIndex(
+                    model_name='erpapietlmapping',
+                    index=models.Index(
+                        fields=['company', 'erp_id'],
+                        name='erp_integra_company_d2a479_idx',
+                    ),
+                ),
+            ],
         ),
 
         # ---- 2) Phase-1 metadata on ERPAPIDefinition ----
